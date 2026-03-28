@@ -1,0 +1,17 @@
+# OS / editor
+.DS_Store
+.vscode/
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local runtime artifacts
+Local_DB/code_cache/
+chat_logs/

@@ -1,0 +1,934 @@
+openapi: 3.0.3
+info:
+  title: PyCloud Internal API
+  version: "1.0.0"
+  description: >
+    V1 API contract for PyCloud internal deployment.
+    Includes InfoCenter APIs, NodeControl client-facing APIs,
+    and NodeControl-Worker internal APIs.
+
+servers:
+  - url: http://infocenter.internal
+    description: InfoCenter service
+  - url: http://nodecontrol.internal
+    description: NodeControl service
+
+tags:
+  - name: InfoCenter
+  - name: NodeControl
+  - name: WorkerInternal
+
+security:
+  - BearerAuth: []
+
+paths:
+  /v1/nodes/register:
+    post:
+      tags: [InfoCenter]
+      summary: Register a node
+      operationId: registerNode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeRegisterRequest"
+      responses:
+        "200":
+          description: Registration accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeRegisterResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/nodes/heartbeat:
+    post:
+      tags: [InfoCenter]
+      summary: Node heartbeat
+      operationId: heartbeatNode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeHeartbeatRequest"
+      responses:
+        "200":
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeHeartbeatResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/nodes:
+    get:
+      tags: [InfoCenter]
+      summary: List available nodes
+      operationId: listNodes
+      parameters:
+        - in: query
+          name: healthy
+          required: false
+          schema:
+            type: boolean
+            default: true
+        - in: query
+          name: tag
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: Node list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodesListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/code/upload:
+    post:
+      tags: [NodeControl]
+      summary: Upload business code artifact
+      operationId: uploadCode
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, sha256, runtime]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                sha256:
+                  type: string
+                runtime:
+                  type: string
+                  example: py3.11
+                entry_module:
+                  type: string
+                entry_callable:
+                  type: string
+      responses:
+        "200":
+          description: Upload accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeUploadResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/tasks/submit:
+    post:
+      tags: [NodeControl]
+      summary: Submit task batch
+      operationId: submitTasks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskSubmitRequest"
+      responses:
+        "200":
+          description: Accepted/rejected details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskSubmitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/tasks/result:
+    get:
+      tags: [NodeControl]
+      summary: Poll task results
+      operationId: pollTaskResults
+      parameters:
+        - in: query
+          name: client_id
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - in: query
+          name: wait_ms
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 60000
+            default: 0
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Result batch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskResultsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/tasks/cancel:
+    post:
+      tags: [NodeControl]
+      summary: Cancel tasks
+      operationId: cancelTasks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskCancelRequest"
+      responses:
+        "200":
+          description: Cancellation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskCancelResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/metrics:
+    get:
+      tags: [NodeControl]
+      summary: Node metrics
+      operationId: getNodeMetrics
+      responses:
+        "200":
+          description: Current node metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeMetricsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/worker/poll:
+    post:
+      tags: [WorkerInternal]
+      summary: Worker polls one task from local NodeControl
+      operationId: workerPollTask
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkerPollRequest"
+      responses:
+        "200":
+          description: Task or empty response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerPollResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/worker/heartbeat:
+    post:
+      tags: [WorkerInternal]
+      summary: Worker heartbeat/progress report
+      operationId: workerHeartbeat
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkerHeartbeatRequest"
+      responses:
+        "200":
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerHeartbeatResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/worker/result:
+    post:
+      tags: [WorkerInternal]
+      summary: Worker reports task result
+      operationId: workerReportResult
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkerResultRequest"
+      responses:
+        "200":
+          description: Result accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerResultResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Conflict
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TooManyRequests:
+      description: No credit / queue full
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Internal error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorCode:
+      type: string
+      enum:
+        - INVALID_REQUEST
+        - UNAUTHORIZED
+        - UNKNOWN_NODE
+        - UNKNOWN_CODE_VERSION
+        - DUPLICATE_TASK
+        - NO_CREDIT
+        - QUEUE_FULL
+        - TASK_NOT_FOUND
+        - NODE_DRAINING
+        - INTERNAL_ERROR
+
+    TaskStatus:
+      type: string
+      enum:
+        - QUEUED
+        - RUNNING
+        - SUCCEEDED
+        - FAILED_USER
+        - FAILED_INFRA
+        - CANCELLED
+
+    ExecutionMode:
+      type: string
+      enum:
+        - persistent
+        - ephemeral
+
+    ErrorResponse:
+      type: object
+      required: [ok, error_code, message, request_id]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error_code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+        request_id:
+          type: string
+
+    NodeRegisterRequest:
+      type: object
+      required:
+        - node_id
+        - control_url
+        - capacity
+        - queue_capacity
+      properties:
+        node_id:
+          type: string
+        control_url:
+          type: string
+          format: uri
+        capacity:
+          type: integer
+          minimum: 1
+        queue_capacity:
+          type: integer
+          minimum: 1
+        tags:
+          type: array
+          items:
+            type: string
+        version:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+
+    NodeRegisterResponse:
+      type: object
+      required:
+        - ok
+        - node_id
+        - lease_ttl_sec
+        - heartbeat_interval_sec
+        - server_time
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        node_id:
+          type: string
+        lease_ttl_sec:
+          type: integer
+          example: 90
+        heartbeat_interval_sec:
+          type: integer
+          example: 30
+        server_time:
+          type: string
+          format: date-time
+
+    NodeHeartbeatMetrics:
+      type: object
+      required:
+        - queued
+        - inflight
+        - running
+        - credit
+      properties:
+        queued:
+          type: integer
+          minimum: 0
+        inflight:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        credit:
+          type: integer
+        cpu_percent:
+          type: number
+          format: float
+        mem_percent:
+          type: number
+          format: float
+
+    NodeHeartbeatRequest:
+      type: object
+      required: [node_id, timestamp, metrics, healthy]
+      properties:
+        node_id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        metrics:
+          $ref: "#/components/schemas/NodeHeartbeatMetrics"
+        healthy:
+          type: boolean
+        reason:
+          type: string
+
+    NodeHeartbeatResponse:
+      type: object
+      required: [ok, accepted, next_heartbeat_in_sec, drain]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        accepted:
+          type: boolean
+        next_heartbeat_in_sec:
+          type: integer
+        drain:
+          type: boolean
+
+    NodeInfo:
+      type: object
+      required:
+        - node_id
+        - control_url
+        - healthy
+        - last_seen_at
+        - capacity
+        - queue_capacity
+        - queued
+        - inflight
+        - credit
+      properties:
+        node_id:
+          type: string
+        control_url:
+          type: string
+          format: uri
+        healthy:
+          type: boolean
+        last_seen_at:
+          type: string
+          format: date-time
+        capacity:
+          type: integer
+        queue_capacity:
+          type: integer
+        queued:
+          type: integer
+        inflight:
+          type: integer
+        credit:
+          type: integer
+        tags:
+          type: array
+          items:
+            type: string
+
+    NodesListResponse:
+      type: object
+      required: [ok, nodes]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeInfo"
+
+    CodeUploadResponse:
+      type: object
+      required: [ok, code_version, cached, size_bytes, created_at]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        code_version:
+          type: string
+        cached:
+          type: boolean
+        size_bytes:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+
+    TaskSubmitItem:
+      type: object
+      required: [task_id, payload]
+      properties:
+        task_id:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        timeout_hint_sec:
+          type: integer
+          minimum: 0
+        priority:
+          type: integer
+          minimum: 1
+
+    TaskSubmitRequest:
+      type: object
+      required: [client_id, code_version, execution_mode, tasks]
+      properties:
+        client_id:
+          type: string
+        code_version:
+          type: string
+        execution_mode:
+          $ref: "#/components/schemas/ExecutionMode"
+        tasks:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/TaskSubmitItem"
+
+    TaskAcceptedItem:
+      type: object
+      required: [task_id, status]
+      properties:
+        task_id:
+          type: string
+        status:
+          type: string
+          enum: [QUEUED]
+
+    TaskRejectedItem:
+      type: object
+      required: [task_id, error_code, message]
+      properties:
+        task_id:
+          type: string
+        error_code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+
+    TaskSubmitResponse:
+      type: object
+      required: [ok, accepted, rejected, node_credit]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        accepted:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskAcceptedItem"
+        rejected:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskRejectedItem"
+        node_credit:
+          type: integer
+
+    TaskError:
+      type: object
+      nullable: true
+      properties:
+        type:
+          type: string
+        message:
+          type: string
+
+    TaskResultItem:
+      type: object
+      required:
+        - task_id
+        - status
+        - attempt
+        - started_at
+        - finished_at
+      properties:
+        task_id:
+          type: string
+        status:
+          $ref: "#/components/schemas/TaskStatus"
+        attempt:
+          type: integer
+          minimum: 1
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        result:
+          type: object
+          nullable: true
+          additionalProperties: true
+        error:
+          $ref: "#/components/schemas/TaskError"
+
+    TaskResultsResponse:
+      type: object
+      required: [ok, results, next_cursor]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskResultItem"
+        next_cursor:
+          type: string
+
+    TaskCancelRequest:
+      type: object
+      required: [client_id, task_ids]
+      properties:
+        client_id:
+          type: string
+        task_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        reason:
+          type: string
+
+    TaskCancelResponse:
+      type: object
+      required: [ok, cancelled, not_found, already_done]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        cancelled:
+          type: array
+          items:
+            type: string
+        not_found:
+          type: array
+          items:
+            type: string
+        already_done:
+          type: array
+          items:
+            type: string
+
+    NodeMetricsResponse:
+      type: object
+      required:
+        - ok
+        - node_id
+        - queued
+        - inflight
+        - running
+        - credit
+        - queue_capacity
+        - worker_capacity
+        - cpu_percent
+        - mem_percent
+        - uptime_sec
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        node_id:
+          type: string
+        queued:
+          type: integer
+        inflight:
+          type: integer
+        running:
+          type: integer
+        credit:
+          type: integer
+        queue_capacity:
+          type: integer
+        worker_capacity:
+          type: integer
+        cpu_percent:
+          type: number
+          format: float
+        mem_percent:
+          type: number
+          format: float
+        uptime_sec:
+          type: integer
+
+    WorkerPollRequest:
+      type: object
+      required: [worker_id, max_tasks]
+      properties:
+        worker_id:
+          type: string
+        max_tasks:
+          type: integer
+          minimum: 1
+
+    WorkerTask:
+      type: object
+      required: [task_id, code_version, attempt, execution_mode, payload]
+      properties:
+        task_id:
+          type: string
+        code_version:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+        execution_mode:
+          $ref: "#/components/schemas/ExecutionMode"
+        payload:
+          type: object
+          additionalProperties: true
+
+    WorkerPollResponse:
+      type: object
+      required: [ok, task]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        task:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/WorkerTask"
+
+    WorkerProgress:
+      type: object
+      properties:
+        done:
+          type: integer
+          minimum: 0
+        total:
+          type: integer
+          minimum: 0
+
+    WorkerHeartbeatRequest:
+      type: object
+      required: [worker_id, task_id, attempt, timestamp, child_alive]
+      properties:
+        worker_id:
+          type: string
+        task_id:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+        timestamp:
+          type: string
+          format: date-time
+        child_alive:
+          type: boolean
+        progress:
+          $ref: "#/components/schemas/WorkerProgress"
+
+    WorkerHeartbeatResponse:
+      type: object
+      required: [ok, accepted, cancel_requested]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        accepted:
+          type: boolean
+        cancel_requested:
+          type: boolean
+
+    WorkerResultRequest:
+      type: object
+      required:
+        - worker_id
+        - task_id
+        - attempt
+        - status
+        - started_at
+        - finished_at
+      properties:
+        worker_id:
+          type: string
+        task_id:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [SUCCEEDED, FAILED_USER]
+        result:
+          type: object
+          nullable: true
+          additionalProperties: true
+        error:
+          $ref: "#/components/schemas/TaskError"
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+
+    WorkerResultResponse:
+      type: object
+      required: [ok, accepted]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        accepted:
+          type: boolean

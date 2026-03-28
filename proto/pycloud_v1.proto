@@ -1,0 +1,332 @@
+syntax = "proto3";
+
+package pycloud.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_multiple_files = true;
+option java_package = "com.pycloud.v1";
+option go_package = "pycloud/proto/v1;pycloudv1";
+
+// -------------------------
+// Common enums
+// -------------------------
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_QUEUED = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_SUCCEEDED = 3;
+  TASK_STATUS_FAILED_USER = 4;
+  TASK_STATUS_FAILED_INFRA = 5;
+  TASK_STATUS_CANCELLED = 6;
+}
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_PERSISTENT = 1;
+  EXECUTION_MODE_EPHEMERAL = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_REQUEST = 1;
+  ERROR_CODE_UNAUTHORIZED = 2;
+  ERROR_CODE_UNKNOWN_NODE = 3;
+  ERROR_CODE_UNKNOWN_CODE_VERSION = 4;
+  ERROR_CODE_DUPLICATE_TASK = 5;
+  ERROR_CODE_NO_CREDIT = 6;
+  ERROR_CODE_QUEUE_FULL = 7;
+  ERROR_CODE_TASK_NOT_FOUND = 8;
+  ERROR_CODE_NODE_DRAINING = 9;
+  ERROR_CODE_INTERNAL_ERROR = 10;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  string request_id = 3;
+}
+
+message TaskError {
+  string type = 1;
+  string message = 2;
+}
+
+// -------------------------
+// InfoCenter service
+// -------------------------
+
+service InfoCenterService {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc HeartbeatNode(HeartbeatNodeRequest) returns (HeartbeatNodeResponse);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+message NodeMetrics {
+  int32 queued = 1;
+  int32 inflight = 2;
+  int32 running = 3;
+  int32 credit = 4;
+  double cpu_percent = 5;
+  double mem_percent = 6;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string control_addr = 2;
+  int32 capacity = 3;
+  int32 queue_capacity = 4;
+  repeated string tags = 5;
+  string version = 6;
+  map<string, string> metadata = 7;
+}
+
+message RegisterNodeResponse {
+  bool ok = 1;
+  string node_id = 2;
+  int32 lease_ttl_sec = 3;
+  int32 heartbeat_interval_sec = 4;
+  google.protobuf.Timestamp server_time = 5;
+  Error error = 6;
+}
+
+message HeartbeatNodeRequest {
+  string node_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  NodeMetrics metrics = 3;
+  bool healthy = 4;
+  string reason = 5;
+}
+
+message HeartbeatNodeResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  int32 next_heartbeat_in_sec = 3;
+  bool drain = 4;
+  Error error = 5;
+}
+
+message ListNodesRequest {
+  bool healthy_only = 1;
+  repeated string tags = 2;
+  int32 limit = 3;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string control_addr = 2;
+  bool healthy = 3;
+  google.protobuf.Timestamp last_seen_at = 4;
+  int32 capacity = 5;
+  int32 queue_capacity = 6;
+  int32 queued = 7;
+  int32 inflight = 8;
+  int32 credit = 9;
+  repeated string tags = 10;
+}
+
+message ListNodesResponse {
+  bool ok = 1;
+  repeated NodeInfo nodes = 2;
+  Error error = 3;
+}
+
+// -------------------------
+// NodeControl service (client facing)
+// -------------------------
+
+service NodeControlService {
+  rpc UploadCode(stream UploadCodeRequest) returns (UploadCodeResponse);
+  rpc SubmitTasks(SubmitTasksRequest) returns (SubmitTasksResponse);
+  rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
+  rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+}
+
+message UploadCodeMeta {
+  string client_id = 1;
+  string filename = 2;
+  string sha256 = 3;
+  string runtime = 4;
+  string entry_module = 5;
+  string entry_callable = 6;
+}
+
+message UploadCodeRequest {
+  oneof body {
+    UploadCodeMeta meta = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadCodeResponse {
+  bool ok = 1;
+  string code_version = 2;
+  bool cached = 3;
+  int64 size_bytes = 4;
+  google.protobuf.Timestamp created_at = 5;
+  Error error = 6;
+}
+
+message TaskSubmitItem {
+  string task_id = 1;
+  google.protobuf.Struct payload = 2;
+  int32 timeout_hint_sec = 3;
+  int32 priority = 4;
+}
+
+message SubmitTasksRequest {
+  string client_id = 1;
+  string code_version = 2;
+  ExecutionMode execution_mode = 3;
+  repeated TaskSubmitItem tasks = 4;
+}
+
+message TaskAccepted {
+  string task_id = 1;
+  TaskStatus status = 2; // expected: TASK_STATUS_QUEUED
+}
+
+message TaskRejected {
+  string task_id = 1;
+  ErrorCode code = 2;
+  string message = 3;
+}
+
+message SubmitTasksResponse {
+  bool ok = 1;
+  repeated TaskAccepted accepted = 2;
+  repeated TaskRejected rejected = 3;
+  int32 node_credit = 4;
+  Error error = 5;
+}
+
+message PullResultsRequest {
+  string client_id = 1;
+  int32 limit = 2;
+  int32 wait_ms = 3;
+  string cursor = 4;
+}
+
+message TaskResult {
+  string task_id = 1;
+  TaskStatus status = 2;
+  int32 attempt = 3;
+  google.protobuf.Timestamp started_at = 4;
+  google.protobuf.Timestamp finished_at = 5;
+  google.protobuf.Struct result = 6;
+  TaskError error = 7;
+}
+
+message PullResultsResponse {
+  bool ok = 1;
+  repeated TaskResult results = 2;
+  string next_cursor = 3;
+  Error error = 4;
+}
+
+message CancelTasksRequest {
+  string client_id = 1;
+  repeated string task_ids = 2;
+  string reason = 3;
+}
+
+message CancelTasksResponse {
+  bool ok = 1;
+  repeated string cancelled = 2;
+  repeated string not_found = 3;
+  repeated string already_done = 4;
+  Error error = 5;
+}
+
+message GetMetricsRequest {}
+
+message GetMetricsResponse {
+  bool ok = 1;
+  string node_id = 2;
+  int32 queued = 3;
+  int32 inflight = 4;
+  int32 running = 5;
+  int32 credit = 6;
+  int32 queue_capacity = 7;
+  int32 worker_capacity = 8;
+  double cpu_percent = 9;
+  double mem_percent = 10;
+  int64 uptime_sec = 11;
+  Error error = 12;
+}
+
+// -------------------------
+// Worker internal service (local)
+// -------------------------
+
+service WorkerInternalService {
+  rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
+  rpc HeartbeatTask(HeartbeatTaskRequest) returns (HeartbeatTaskResponse);
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
+}
+
+message PollTaskRequest {
+  string worker_id = 1;
+  int32 max_tasks = 2; // V1 uses 1 by default
+}
+
+message TaskEnvelope {
+  string task_id = 1;
+  string code_version = 2;
+  int32 attempt = 3;
+  ExecutionMode execution_mode = 4;
+  google.protobuf.Struct payload = 5;
+  string lease_id = 6;
+  int32 lease_ttl_sec = 7;
+}
+
+message PollTaskResponse {
+  bool ok = 1;
+  oneof state {
+    TaskEnvelope task = 2;
+    google.protobuf.Empty idle = 3;
+  }
+  Error error = 4;
+}
+
+message WorkerProgress {
+  int64 done = 1;
+  int64 total = 2;
+}
+
+message HeartbeatTaskRequest {
+  string worker_id = 1;
+  string task_id = 2;
+  int32 attempt = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  bool child_alive = 5;
+  WorkerProgress progress = 6;
+}
+
+message HeartbeatTaskResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  bool cancel_requested = 3;
+  Error error = 4;
+}
+
+message ReportResultRequest {
+  string worker_id = 1;
+  string task_id = 2;
+  int32 attempt = 3;
+  TaskStatus status = 4; // expected: SUCCEEDED / FAILED_USER
+  google.protobuf.Struct result = 5;
+  TaskError error = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp finished_at = 8;
+}
+
+message ReportResultResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  Error error = 3;
+}

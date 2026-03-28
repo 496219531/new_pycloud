@@ -1,0 +1,39 @@
+# 打包与构建配置：定义如何把本项目安装为 pip 包。
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# 项目元信息：名称、版本、Python 版本要求以及基础依赖。
+[project]
+name = "pycloud-parallel"
+version = "0.1.0"
+description = "Decorator-first parallel async for-loop acceleration with multi-cluster routing."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "pycloud" }]
+dependencies = [
+  "cloudpickle>=2.2.0",
+]
+
+[project.optional-dependencies]
+# 可选依赖：按功能分组，减少基础安装体积。
+yaml = ["PyYAML>=6.0"]
+ray = ["ray>=2.9.0"]
+grpc = ["grpcio>=1.78.0", "grpcio-tools>=1.78.0", "protobuf>=6.31.1"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.scripts]
+pycloud-control = "pycloud_parallel.controlplane.server:main"
+
+[tool.setuptools]
+# 使用 src-layout，避免导入路径污染。
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# 测试入口统一配置。
+addopts = "-q"
+testpaths = ["tests"]

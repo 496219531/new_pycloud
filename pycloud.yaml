@@ -1,0 +1,19 @@
+# 集群配置：可定义多个执行集群，网关会按策略路由任务。
+clusters:
+  - name: local
+    address: local
+    weight: 1.0
+    capacity: 8
+    use_ray: false
+
+# 项目配置：用于多项目资源隔离（CPU 配额/优先级/默认容错策略）。
+projects:
+  default:
+    cpu_quota: 8
+    mem_quota: 0
+    priority: 1
+    default_retries: 0
+    default_on_error: skip
+
+# 默认项目：调用端未显式指定 project 时使用。
+default_project: default
