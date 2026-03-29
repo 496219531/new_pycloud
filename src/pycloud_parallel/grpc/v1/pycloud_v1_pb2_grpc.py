@@ -53,6 +53,11 @@ class InfoCenterServiceStub(object):
                 request_serializer=pycloud__v1__pb2.ListNodesRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.ListNodesResponse.FromString,
                 _registered_method=True)
+        self.ListServiceRoutes = channel.unary_unary(
+                '/pycloud.v1.InfoCenterService/ListServiceRoutes',
+                request_serializer=pycloud__v1__pb2.ListServiceRoutesRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.ListServiceRoutesResponse.FromString,
+                _registered_method=True)
 
 
 class InfoCenterServiceServicer(object):
@@ -80,6 +85,12 @@ class InfoCenterServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListServiceRoutes(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_InfoCenterServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -97,6 +108,11 @@ def add_InfoCenterServiceServicer_to_server(servicer, server):
                     servicer.ListNodes,
                     request_deserializer=pycloud__v1__pb2.ListNodesRequest.FromString,
                     response_serializer=pycloud__v1__pb2.ListNodesResponse.SerializeToString,
+            ),
+            'ListServiceRoutes': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListServiceRoutes,
+                    request_deserializer=pycloud__v1__pb2.ListServiceRoutesRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.ListServiceRoutesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -194,6 +210,33 @@ class InfoCenterService(object):
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def ListServiceRoutes(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.InfoCenterService/ListServiceRoutes',
+            pycloud__v1__pb2.ListServiceRoutesRequest.SerializeToString,
+            pycloud__v1__pb2.ListServiceRoutesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class NodeControlServiceStub(object):
     """-------------------------
@@ -232,6 +275,36 @@ class NodeControlServiceStub(object):
                 '/pycloud.v1.NodeControlService/GetMetrics',
                 request_serializer=pycloud__v1__pb2.GetMetricsRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.GetMetricsResponse.FromString,
+                _registered_method=True)
+        self.CreateService = channel.stream_unary(
+                '/pycloud.v1.NodeControlService/CreateService',
+                request_serializer=pycloud__v1__pb2.CreateServiceRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.CreateServiceResponse.FromString,
+                _registered_method=True)
+        self.ListServiceMethods = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/ListServiceMethods',
+                request_serializer=pycloud__v1__pb2.ListServiceMethodsRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.ListServiceMethodsResponse.FromString,
+                _registered_method=True)
+        self.CallService = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/CallService',
+                request_serializer=pycloud__v1__pb2.CallServiceRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.CallServiceResponse.FromString,
+                _registered_method=True)
+        self.HeartbeatService = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/HeartbeatService',
+                request_serializer=pycloud__v1__pb2.HeartbeatServiceRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.HeartbeatServiceResponse.FromString,
+                _registered_method=True)
+        self.EndService = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/EndService',
+                request_serializer=pycloud__v1__pb2.EndServiceRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.EndServiceResponse.FromString,
+                _registered_method=True)
+        self.GetServiceStatus = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/GetServiceStatus',
+                request_serializer=pycloud__v1__pb2.GetServiceStatusRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.GetServiceStatusResponse.FromString,
                 _registered_method=True)
 
 
@@ -272,6 +345,42 @@ class NodeControlServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CreateService(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListServiceMethods(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CallService(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HeartbeatService(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EndService(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetServiceStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_NodeControlServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -299,6 +408,36 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     servicer.GetMetrics,
                     request_deserializer=pycloud__v1__pb2.GetMetricsRequest.FromString,
                     response_serializer=pycloud__v1__pb2.GetMetricsResponse.SerializeToString,
+            ),
+            'CreateService': grpc.stream_unary_rpc_method_handler(
+                    servicer.CreateService,
+                    request_deserializer=pycloud__v1__pb2.CreateServiceRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.CreateServiceResponse.SerializeToString,
+            ),
+            'ListServiceMethods': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListServiceMethods,
+                    request_deserializer=pycloud__v1__pb2.ListServiceMethodsRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.ListServiceMethodsResponse.SerializeToString,
+            ),
+            'CallService': grpc.unary_unary_rpc_method_handler(
+                    servicer.CallService,
+                    request_deserializer=pycloud__v1__pb2.CallServiceRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.CallServiceResponse.SerializeToString,
+            ),
+            'HeartbeatService': grpc.unary_unary_rpc_method_handler(
+                    servicer.HeartbeatService,
+                    request_deserializer=pycloud__v1__pb2.HeartbeatServiceRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.HeartbeatServiceResponse.SerializeToString,
+            ),
+            'EndService': grpc.unary_unary_rpc_method_handler(
+                    servicer.EndService,
+                    request_deserializer=pycloud__v1__pb2.EndServiceRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.EndServiceResponse.SerializeToString,
+            ),
+            'GetServiceStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetServiceStatus,
+                    request_deserializer=pycloud__v1__pb2.GetServiceStatusRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.GetServiceStatusResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -440,6 +579,168 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/GetMetrics',
             pycloud__v1__pb2.GetMetricsRequest.SerializeToString,
             pycloud__v1__pb2.GetMetricsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateService(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/pycloud.v1.NodeControlService/CreateService',
+            pycloud__v1__pb2.CreateServiceRequest.SerializeToString,
+            pycloud__v1__pb2.CreateServiceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListServiceMethods(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/ListServiceMethods',
+            pycloud__v1__pb2.ListServiceMethodsRequest.SerializeToString,
+            pycloud__v1__pb2.ListServiceMethodsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CallService(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/CallService',
+            pycloud__v1__pb2.CallServiceRequest.SerializeToString,
+            pycloud__v1__pb2.CallServiceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HeartbeatService(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/HeartbeatService',
+            pycloud__v1__pb2.HeartbeatServiceRequest.SerializeToString,
+            pycloud__v1__pb2.HeartbeatServiceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EndService(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/EndService',
+            pycloud__v1__pb2.EndServiceRequest.SerializeToString,
+            pycloud__v1__pb2.EndServiceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetServiceStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/GetServiceStatus',
+            pycloud__v1__pb2.GetServiceStatusRequest.SerializeToString,
+            pycloud__v1__pb2.GetServiceStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,

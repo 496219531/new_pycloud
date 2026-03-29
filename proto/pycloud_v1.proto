@@ -44,6 +44,14 @@ enum ErrorCode {
   ERROR_CODE_INTERNAL_ERROR = 10;
 }
 
+enum ServiceStatus {
+  SERVICE_STATUS_UNSPECIFIED = 0;
+  SERVICE_STATUS_STARTING = 1;
+  SERVICE_STATUS_RUNNING = 2;
+  SERVICE_STATUS_DRAINING = 3;
+  SERVICE_STATUS_STOPPED = 4;
+}
+
 message Error {
   ErrorCode code = 1;
   string message = 2;
@@ -63,6 +71,7 @@ service InfoCenterService {
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc HeartbeatNode(HeartbeatNodeRequest) returns (HeartbeatNodeResponse);
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+  rpc ListServiceRoutes(ListServiceRoutesRequest) returns (ListServiceRoutesResponse);
 }
 
 message NodeMetrics {
@@ -82,6 +91,7 @@ message RegisterNodeRequest {
   repeated string tags = 5;
   string version = 6;
   map<string, string> metadata = 7;
+  repeated ServiceRouteReport services = 8;
 }
 
 message RegisterNodeResponse {
@@ -99,6 +109,7 @@ message HeartbeatNodeRequest {
   NodeMetrics metrics = 3;
   bool healthy = 4;
   string reason = 5;
+  repeated ServiceRouteReport services = 6;
 }
 
 message HeartbeatNodeResponse {
@@ -134,6 +145,43 @@ message ListNodesResponse {
   Error error = 3;
 }
 
+message ServiceRouteReport {
+  string service_name = 1;
+  string service_id = 2;
+  ServiceStatus status = 3;
+  int32 worker_count = 4;
+  int32 alive_workers = 5;
+  int32 in_flight = 6;
+  google.protobuf.Timestamp lease_expire_at = 7;
+  string http_base_url = 8;
+}
+
+message ListServiceRoutesRequest {
+  string service_name = 1;
+  bool healthy_only = 2;
+  int32 limit = 3;
+}
+
+message ServiceRouteInfo {
+  string service_name = 1;
+  string service_id = 2;
+  ServiceStatus status = 3;
+  string node_id = 4;
+  string control_addr = 5;
+  bool node_healthy = 6;
+  int32 worker_count = 7;
+  int32 alive_workers = 8;
+  int32 in_flight = 9;
+  google.protobuf.Timestamp lease_expire_at = 10;
+  string http_base_url = 11;
+}
+
+message ListServiceRoutesResponse {
+  bool ok = 1;
+  repeated ServiceRouteInfo routes = 2;
+  Error error = 3;
+}
+
 // -------------------------
 // NodeControl service (client facing)
 // -------------------------
@@ -144,6 +192,18 @@ service NodeControlService {
   rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
   rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+  rpc CreateService(stream CreateServiceRequest) returns (CreateServiceResponse);
+  rpc ListServiceMethods(ListServiceMethodsRequest) returns (ListServiceMethodsResponse);
+  rpc CallService(CallServiceRequest) returns (CallServiceResponse);
+  rpc HeartbeatService(HeartbeatServiceRequest) returns (HeartbeatServiceResponse);
+  rpc EndService(EndServiceRequest) returns (EndServiceResponse);
+  rpc GetServiceStatus(GetServiceStatusRequest) returns (GetServiceStatusResponse);
+}
+
+message ModuleExportSpec {
+  string mode = 1; // decorator | explicit | all | single
+  repeated string methods = 2;
+  string decorator = 3; // default: pycloud_export
 }
 
 message UploadCodeMeta {
@@ -152,7 +212,9 @@ message UploadCodeMeta {
   string sha256 = 3;
   string runtime = 4;
   string entry_module = 5;
-  string entry_callable = 6;
+  string entry_callable = 6; // legacy single-function field
+  string package_format = 7; // py | tar.gz | zip | whl
+  ModuleExportSpec export_spec = 8;
 }
 
 message UploadCodeRequest {
@@ -257,6 +319,131 @@ message GetMetricsResponse {
   double mem_percent = 10;
   int64 uptime_sec = 11;
   Error error = 12;
+}
+
+message CreateServiceMeta {
+  string owner_client_id = 1;
+  string service_name = 2;
+  string filename = 3;
+  string sha256 = 4;
+  string runtime = 5;
+  string entry_module = 6;
+  string entry_callable = 7; // legacy single-function field
+  int32 worker_count = 8;
+  int32 heartbeat_timeout_sec = 9;
+  int32 idle_ttl_sec = 10;
+  bool expose_http = 11;
+  string package_format = 12; // py | tar.gz | zip | whl
+  ModuleExportSpec export_spec = 13;
+}
+
+message CreateServiceRequest {
+  oneof body {
+    CreateServiceMeta meta = 1;
+    bytes chunk = 2;
+  }
+}
+
+message CreateServiceResponse {
+  bool ok = 1;
+  string service_id = 2;
+  string code_version = 3;
+  ServiceStatus status = 4;
+  int32 worker_count = 5;
+  int32 heartbeat_timeout_sec = 6;
+  string owner_client_id = 7;
+  string service_token = 8;
+  string http_base_url = 9;
+  Error error = 10;
+}
+
+message ServiceMethodInfo {
+  string method = 1;
+  string qualified_name = 2;
+  string doc = 3;
+}
+
+message ListServiceMethodsRequest {
+  string service_id = 1;
+  bool include_docs = 2;
+}
+
+message ListServiceMethodsResponse {
+  bool ok = 1;
+  string service_id = 2;
+  repeated ServiceMethodInfo methods = 3;
+  Error error = 4;
+}
+
+message CallServiceRequest {
+  string service_id = 1;
+  string method = 2;
+  google.protobuf.Struct payload = 3;
+  double timeout_sec = 4;
+  string service_token = 5;
+}
+
+message CallServiceResponse {
+  bool ok = 1;
+  string service_id = 2;
+  string method = 3;
+  google.protobuf.Struct data = 4;
+  TaskError task_error = 5;
+  Error error = 6;
+}
+
+message HeartbeatServiceRequest {
+  string owner_client_id = 1;
+  string service_id = 2;
+  int64 seq = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message HeartbeatServiceResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  ServiceStatus status = 3;
+  int32 next_heartbeat_in_sec = 4;
+  Error error = 5;
+}
+
+message EndServiceRequest {
+  string owner_client_id = 1;
+  string service_id = 2;
+  string reason = 3;
+}
+
+message EndServiceResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  ServiceStatus status = 3;
+  Error error = 4;
+}
+
+message GetServiceStatusRequest {
+  string service_id = 1;
+}
+
+message ServiceStatusInfo {
+  string service_id = 1;
+  string owner_client_id = 2;
+  string service_name = 3;
+  string code_version = 4;
+  ServiceStatus status = 5;
+  int32 worker_count = 6;
+  int32 alive_workers = 7;
+  int32 in_flight = 8;
+  int32 queued = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp last_heartbeat_at = 11;
+  google.protobuf.Timestamp lease_expire_at = 12;
+  string http_base_url = 13;
+}
+
+message GetServiceStatusResponse {
+  bool ok = 1;
+  ServiceStatusInfo service = 2;
+  Error error = 3;
 }
 
 // -------------------------

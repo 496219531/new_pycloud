@@ -3,4 +3,20 @@
 Imports are intentionally lazy to avoid side effects on module startup.
 """
 
-__all__ = []
+from .client import (
+    InfoCenterClient,
+    InfoCenterNode,
+    InfoCenterServiceRoute,
+    MultiNodeServiceGroup,
+    NodeControlClient,
+    ServiceSessionClient,
+)
+
+__all__ = [
+    "InfoCenterClient",
+    "InfoCenterNode",
+    "InfoCenterServiceRoute",
+    "MultiNodeServiceGroup",
+    "NodeControlClient",
+    "ServiceSessionClient",
+]

@@ -81,7 +81,9 @@ pycloud-control --role infocenter --bind 0.0.0.0:50051
 Start NodeControl (same binary, different role):
 
 ```bash
-pycloud-control --role nodecontrol --bind 0.0.0.0:50061 --node-id node-local-01
+pycloud-control --role nodecontrol --bind 0.0.0.0:50061 --node-id node-local-01 \
+  --infocenter-addr 127.0.0.1:50051 \
+  --advertise-addr 127.0.0.1:50061
 ```
 
 Windows install and run example:
@@ -89,13 +91,71 @@ Windows install and run example:
 ```powershell
 py -m pip install -e ".[grpc]"
 py -m pycloud_parallel.controlplane.server --role infocenter --bind 0.0.0.0:50051
-py -m pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:50061 --node-id node-win-01
+py -m pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:50061 --node-id node-win-01 --infocenter-addr 127.0.0.1:50051 --advertise-addr 127.0.0.1:50061
 ```
 
 Contract docs:
 
 - `GRPC_CONTRACT_V1.md`
 - `proto/pycloud_v1.proto`
+- `SERVICE_SESSION_PROTOCOL_V1.md`
+
+Complex pure-client demo (requires InfoCenter + NodeControl running):
+
+```bash
+python scripts/grpc_client_complex_demo.py \
+  --infocenter 127.0.0.1:50051 \
+  --nodecontrol 127.0.0.1:50061 \
+  --node-id node-local-01 \
+  --client-id demo-client-01 \
+  --tasks 120
+```
+
+Service-session demo (client uploads service code, keeps heartbeat, invokes over HTTP, then ends service):
+
+```bash
+python scripts/grpc_service_session_demo.py \
+  --nodecontrol 127.0.0.1:50061 \
+  --owner-client-id svc-owner-demo \
+  --service-name square-service \
+  --workers 4 \
+  --heartbeat-timeout-sec 30 \
+  --invoke-count 8
+```
+
+Multi-node service demo (discover nodes from InfoCenter, deploy to all healthy nodes, and invoke with load balancing):
+
+```bash
+python scripts/grpc_multi_node_service_demo.py \
+  --infocenter 127.0.0.1:50051 \
+  --owner-client-id svc-owner-multi-demo \
+  --service-name square-service-multi \
+  --workers 4 \
+  --invoke-count 20 \
+  --strategy least_inflight \
+  --breaker-failure-threshold 3 \
+  --breaker-cooldown-sec 15
+```
+
+Call existing deployed service directly (without re-registering service code):
+
+```bash
+python scripts/grpc_existing_service_client_demo.py \
+  --infocenter 127.0.0.1:50051 \
+  --service-name square-service-multi \
+  --invoke-count 10
+```
+
+Note:
+- Uploaded artifact must provide the configured entry function (default `run`).
+- NodeControl executes that entry inside local subprocess workers.
+- Service-session APIs (`CreateService`/`HeartbeatService`/`EndService`) are implemented in NodeControl.
+- NodeControl can auto register/heartbeat to InfoCenter with deployed service routes.
+- `MultiNodeServiceGroup.deploy_from_infocenter(...)` enforces unique `service_name` by default.
+- Multi-node invoke has circuit-breaker recovery:
+  - `breaker_failure_threshold`: consecutive failures before open-circuit
+  - `breaker_cooldown_sec`: base open-circuit cooldown
+  - `breaker_max_cooldown_sec`: max cooldown with exponential backoff
 
 ## Local Chat Backup (Codex)
 

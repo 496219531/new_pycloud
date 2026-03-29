@@ -12,13 +12,29 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 @dataclass(frozen=True)
 class QueuedResult:
+    """队列结果项。
+
+    Attributes:
+        seq: 序列号
+        result: 任务结果
+    """
     seq: int
     result: pb2.TaskResult
 
 
 class ResultHook(Protocol):
+    """结果钩子协议。
+
+    定义处理任务结果的接口。
+    """
+
     def on_result(self, client_id: str, item: QueuedResult) -> None:
-        """Handle one finished task result."""
+        """处理单个完成的任务结果。
+
+        Args:
+            client_id: 客户端 ID
+            item: 队列结果项
+        """
 
     def pull(
         self,
@@ -28,14 +44,31 @@ class ResultHook(Protocol):
         wait_ms: int,
         cursor: str,
     ) -> Tuple[List[pb2.TaskResult], str]:
-        """Return a batch of results and next cursor."""
+        """返回一批结果和下一个游标。
+
+        Args:
+            client_id: 客户端 ID
+            limit: 批次大小限制
+            wait_ms: 等待时间（毫秒）
+            cursor: 当前游标
+
+        Returns:
+            Tuple[List[pb2.TaskResult], str]: (结果列表, 下一个游标)
+        """
 
 
 class InMemoryResultHook:
-    """Default in-memory result sink.
+    """默认的内存结果钩子。
 
-    This is intentionally bounded to avoid unlimited memory growth.
-    When full, the oldest result for that client is dropped.
+    使用有界队列存储每个客户端的结果，避免无限内存增长。
+    当队列满时，丢弃最旧的结果。
+
+    Attributes:
+        _lock: 线程锁
+        _cv: 条件变量
+        _per_client_limit: 每个客户端的结果数量限制
+        _queues: 客户端 ID 到结果队列的映射
+        _seq: 全局序列号计数器
     """
 
     def __init__(self, per_client_limit: int = 20_000) -> None:
@@ -46,10 +79,21 @@ class InMemoryResultHook:
         self._seq = 0
 
     def _next_seq(self) -> int:
+        """生成下一个序列号。
+
+        Returns:
+            int: 新的序列号
+        """
         self._seq += 1
         return self._seq
 
     def on_result(self, client_id: str, item: QueuedResult) -> None:
+        """处理单个完成的任务结果。
+
+        Args:
+            client_id: 客户端 ID
+            item: 队列结果项
+        """
         with self._cv:
             q = self._queues[client_id]
             if len(q) >= self._per_client_limit:
@@ -58,6 +102,15 @@ class InMemoryResultHook:
             self._cv.notify_all()
 
     def push(self, client_id: str, result: pb2.TaskResult) -> int:
+        """推送一个结果到队列。
+
+        Args:
+            client_id: 客户端 ID
+            result: 任务结果
+
+        Returns:
+            int: 分配的序列号
+        """
         with self._cv:
             seq = self._next_seq()
             q = self._queues[client_id]
@@ -75,6 +128,17 @@ class InMemoryResultHook:
         wait_ms: int,
         cursor: str,
     ) -> Tuple[List[pb2.TaskResult], str]:
+        """拉取一批结果。
+
+        Args:
+            client_id: 客户端 ID
+            limit: 批次大小限制
+            wait_ms: 等待时间（毫秒）
+            cursor: 当前游标
+
+        Returns:
+            Tuple[List[pb2.TaskResult], str]: (结果列表, 下一个游标)
+        """
         timeout = max(0.0, wait_ms / 1000.0)
         start_seq = 0
         if cursor:
@@ -100,11 +164,25 @@ class InMemoryResultHook:
             return out, str(last_seq)
 
     def _has_new_locked(self, client_id: str, seq: int) -> bool:
+        """检查是否有新结果（需要在锁内调用）。
+
+        Args:
+            client_id: 客户端 ID
+            seq: 起始序列号
+
+        Returns:
+            bool: 是否有新结果
+        """
         q = self._queues.get(client_id)
         if not q:
             return False
         return q[-1].seq > seq
 
     def clear_client(self, client_id: str) -> None:
+        """清除客户端的结果队列。
+
+        Args:
+            client_id: 客户端 ID
+        """
         with self._cv:
             self._queues.pop(client_id, None)

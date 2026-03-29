@@ -7,8 +7,11 @@
 3. 支持两种执行模式：
    - `persistent`：常驻执行模式
    - `ephemeral`：一次性执行模式（跑完回收）
-4. 框架不实现业务 `DBReader`、业务 `ResultWriter`，只提供 Hook。
-5. 失败语义固定：
+4. 支持“服务会话模式”：
+   - 客户端注册服务后由 NodeControl 维持进程组
+   - 通过心跳续租实现常驻与断线自动回收
+5. 框架不实现业务 `DBReader`、业务 `ResultWriter`，只提供 Hook。
+6. 失败语义固定：
    - 有返回（成功或业务报错）不重试。
    - 无返回（断网/失联/超时）最多重试 3 次。
 
@@ -20,7 +23,7 @@
 2. `NodeControl`（每台机器一个轻量控制器）
    - 接收代码包。
    - 管理本机任务队列。
-   - 管理本机 worker 进程池。
+   - 动态拉起/回收本机 worker 进程池（多进程，绕开 GIL）。
    - 接收 worker 执行结果并对客户端提供查询。
 3. `WorkerProcess`（本机执行进程）
    - 主动从 `NodeControl` 取任务。
@@ -41,9 +44,9 @@
 3. 任务流
    - 客户端提交任务到各节点 `NodeControl`。
    - 任务必须带 `task_id + code_version`。
-   - `NodeControl` 入本机有界队列，worker 拉取执行。
+   - `NodeControl` 入本机有界队列，并由本机进程池主动消费执行。
 4. 结果流
-   - worker 回传到本机 `NodeControl`。
+   - 本机 worker 执行完成后回传到本机 `NodeControl`。
    - 客户端从各 `NodeControl` 拉取结果。
    - 默认结果 Hook 存在发任务客户端内存中，用户可重载落库逻辑。
 
@@ -123,3 +126,12 @@
 1. Phase 1：InfoCenter + NodeControl + 流式分发 + 背压 + 心跳 + 失败重试。
 2. Phase 2：`ephemeral` 完整回收链路与 TTL 清理。
 3. Phase 3：Redis 后端、多实例、监控告警与审计。
+
+## 12. 服务会话模式（补充）
+
+1. 服务注册由 owner 客户端发起：上传代码并声明 `worker_count`。
+2. NodeControl 返回 `service_id` 与 HTTP 网关地址。
+3. owner 定时心跳续租；超时则 NodeControl 自动回收服务进程与代码上下文。
+4. owner 可主动发起 `EndService` 提前结束服务。
+5. 其他客户端通过 HTTP 网关直接调用该服务。
+6. 详细协议见 `SERVICE_SESSION_PROTOCOL_V1.md`。

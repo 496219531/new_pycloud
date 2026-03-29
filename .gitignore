@@ -13,5 +13,10 @@ build/
 dist/
 
 # Local runtime artifacts
-Local_DB/code_cache/
+code_cache/
 chat_logs/
+logs
+pids
+scripts/code_cache/
+scripts/logs/
+scripts/pids/

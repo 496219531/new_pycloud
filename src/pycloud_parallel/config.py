@@ -15,6 +15,18 @@ from typing import Dict, List, Optional
 
 @dataclass
 class ClusterConfig:
+    """集群配置数据类。
+
+    定义单个计算集群的连接和资源配置。
+
+    Attributes:
+        name: 集群名称（唯一标识符）
+        address: 集群地址，"local" 表示本地集群
+        weight: 集群权重，用于负载均衡（越高越优先）
+        capacity: 集群容量（最大并发任务数）
+        healthcheck: 健康检查端点
+        use_ray: 是否使用 Ray 进行分布���执行
+    """
     name: str
     address: str = "local"
     weight: float = 1.0
@@ -25,6 +37,18 @@ class ClusterConfig:
 
 @dataclass
 class ProjectConfig:
+    """项目配置数据类。
+
+    定义单个项目的资源配额和默认策略。
+
+    Attributes:
+        name: 项目名称
+        cpu_quota: CPU 配额（并发任务数上限）
+        mem_quota: 内存配额（MB，当前版本未使用）
+        priority: 项目优先级（当前版本未使用）
+        default_retries: 默认重试次数
+        default_on_error: 默认错误处理策略
+    """
     name: str
     cpu_quota: int = 1
     mem_quota: int = 0
@@ -35,12 +59,28 @@ class ProjectConfig:
 
 @dataclass
 class RuntimeConfig:
+    """运行时配置数据类。
+
+    定义整个 PyCloud 运行时的配置，包括多集群和多项目配置。
+
+    Attributes:
+        clusters: 集群配置列表
+        projects: 项目配置字典（键为项目名）
+        default_project: 默认项目名称
+    """
     clusters: List[ClusterConfig] = field(default_factory=list)
     projects: Dict[str, ProjectConfig] = field(default_factory=dict)
     default_project: str = "default"
 
     @classmethod
     def default(cls) -> "RuntimeConfig":
+        """创建默认运行时配置。
+
+        使用单个本地集群和默认项目，确保开箱即用。
+
+        Returns:
+            RuntimeConfig: 默认配置实例
+        """
         # 默认使用单本地集群 + default 项目，确保开箱可跑。
         cpu = max(1, os.cpu_count() or 1)
         default_cluster = ClusterConfig(name="local", address="local", weight=1.0, capacity=cpu)
@@ -53,6 +93,15 @@ class RuntimeConfig:
 
 
 def _parse_cluster(raw: dict, fallback_name: str) -> ClusterConfig:
+    """从字典解析集群配置。
+
+    Args:
+        raw: 原始配置字典
+        fallback_name: 当配置中没有 name 字段时使用的后备名称
+
+    Returns:
+        ClusterConfig: 解析后的集群配置
+    """
     return ClusterConfig(
         name=str(raw.get("name", fallback_name)),
         address=str(raw.get("address", "local")),
@@ -64,6 +113,15 @@ def _parse_cluster(raw: dict, fallback_name: str) -> ClusterConfig:
 
 
 def _parse_project(name: str, raw: dict) -> ProjectConfig:
+    """从字典解析项目配置。
+
+    Args:
+        name: 项目名称
+        raw: 原始配置字典
+
+    Returns:
+        ProjectConfig: 解析后的项目配置
+    """
     return ProjectConfig(
         name=name,
         cpu_quota=max(1, int(raw.get("cpu_quota", 1))),
@@ -75,6 +133,18 @@ def _parse_project(name: str, raw: dict) -> ProjectConfig:
 
 
 def _load_yaml(path: Path) -> dict:
+    """从 YAML 文件加载配置。
+
+    Args:
+        path: YAML 文件路径
+
+    Returns:
+        dict: 解析后的配置字典
+
+    Raises:
+        RuntimeError: 当 PyYAML 未安装时
+        ValueError: 当 YAML 格式无效时
+    """
     # YAML 解析做成可选依赖，避免强制安装。
     try:
         import yaml  # type: ignore
@@ -91,6 +161,21 @@ def _load_yaml(path: Path) -> dict:
 
 
 def _merge_env_overrides(cfg: RuntimeConfig) -> RuntimeConfig:
+    """从环境变量合并配置覆盖。
+
+    支持通过环境变量快速配置，便于容器化部署。
+
+    环境变量：
+        PYCLOUD_CLUSTERS: JSON 格式的集群配置列表
+        PYCLOUD_PROJECTS: JSON 格式的项目配置字典
+        PYCLOUD_DEFAULT_PROJECT: 默认项目名称
+
+    Args:
+        cfg: 基础运行时配置
+
+    Returns:
+        RuntimeConfig: 合并环境变量后的配置
+    """
     # 支持用 JSON 字符串快速覆盖集群/项目配置，便于容器化部署。
     clusters_json = os.getenv("PYCLOUD_CLUSTERS", "").strip()
     if clusters_json:
@@ -113,6 +198,16 @@ def _merge_env_overrides(cfg: RuntimeConfig) -> RuntimeConfig:
 
 
 def load_runtime_config(path: Optional[str] = None) -> RuntimeConfig:
+    """加载运行时配置。
+
+    配置加载优先级：默认值 < pycloud.yaml < 环境变量
+
+    Args:
+        path: 可选的配置文件路径（默认为 pycloud.yaml）
+
+    Returns:
+        RuntimeConfig: 加载并合并后的配置
+    """
     # 统一配置入口：先读文件，再应用环境变量覆盖。
     cfg = RuntimeConfig.default()
     config_path = path or os.getenv("PYCLOUD_CONFIG", "pycloud.yaml")

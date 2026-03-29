@@ -15,11 +15,27 @@ from .config import ProjectConfig
 
 @dataclass
 class _ProjectState:
+    """项目内部状态。
+
+    Attributes:
+        config: 项目配置
+        semaphore: 并发控制信号量
+    """
     config: ProjectConfig
     semaphore: threading.BoundedSemaphore
 
 
 class ProjectManager:
+    """项目管理器。
+
+    通过每个项目一个 BoundedSemaphore 控制并发上限，
+    满足"多个项目同时跑但互不抢占"的需求。
+
+    Attributes:
+        _lock: 线程锁
+        _projects: 项目名称到状态的映射
+    """
+
     def __init__(self, projects: Dict[str, ProjectConfig]) -> None:
         self._lock = threading.Lock()
         self._projects: Dict[str, _ProjectState] = {}
@@ -27,6 +43,11 @@ class ProjectManager:
             self.register(config)
 
     def register(self, config: ProjectConfig) -> None:
+        """注册一个新项目。
+
+        Args:
+            config: 项目配置
+        """
         with self._lock:
             self._projects[config.name] = _ProjectState(
                 config=config,
@@ -34,12 +55,31 @@ class ProjectManager:
             )
 
     def get(self, name: str) -> ProjectConfig:
+        """获取项目配置。
+
+        Args:
+            name: 项目名称
+
+        Returns:
+            ProjectConfig: 项目配置
+
+        Raises:
+            KeyError: 当项目不存在时
+        """
         with self._lock:
             if name not in self._projects:
                 raise KeyError(f"project `{name}` is not registered")
             return self._projects[name].config
 
     def ensure(self, name: str, default_cpu: int = 1) -> None:
+        """确保项目存在，不存在则创建。
+
+        惰性创建项目，避免调用端必须先注册才能运行。
+
+        Args:
+            name: 项目名称
+            default_cpu: 默认 CPU 配额
+        """
         # 惰性创建项目，避免调用端必须先注册才能运行。
         with self._lock:
             if name in self._projects:
@@ -51,6 +91,20 @@ class ProjectManager:
             )
 
     def acquire(self, name: str, timeout: Optional[float] = None) -> bool:
+        """获取项目并发令牌。
+
+        拿不到会阻塞，从而形成天然限流。
+
+        Args:
+            name: 项目名称
+            timeout: 超时时间（秒），None 表示无限等待
+
+        Returns:
+            bool: 是否成功获取令牌
+
+        Raises:
+            KeyError: 当项目不存在时
+        """
         # 获取项目并发令牌：拿不到会阻塞，从而形成天然限流。
         with self._lock:
             state = self._projects.get(name)
@@ -62,6 +116,11 @@ class ProjectManager:
         return sem.acquire(timeout=timeout)
 
     def release(self, name: str) -> None:
+        """释放项目并发令牌。
+
+        Args:
+            name: 项目名称
+        """
         with self._lock:
             state = self._projects.get(name)
             if state is None:
@@ -73,5 +132,10 @@ class ProjectManager:
             return
 
     def names(self) -> list:
+        """获取所有项目名称列表。
+
+        Returns:
+            list: 项目名称列表
+        """
         with self._lock:
             return list(self._projects.keys())

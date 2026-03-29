@@ -19,7 +19,18 @@ from .types import ChunkMeta, ForeachResult, TaskError, UserFunctionError
 
 
 def _auto_chunk_size(total_items: Optional[int], width: int) -> int:
-    # 自适应分片：以“并行宽度 * 常数批次数”为目标，兼顾吞吐与开销。
+    """自动计算最优分片大小。
+
+    根据总项数和并行宽度，计算合适的分片大小以平衡吞吐量和调度开销。
+
+    Args:
+        total_items: 总项数（如果未知则为 None）
+        width: 并行宽度（可用的工作线程数）
+
+    Returns:
+        int: 计算出的分片大小
+    """
+    # 自适应分片：以”并行宽度 * 常数批次数”为目标，兼顾吞吐与开销。
     width = max(1, width)
     if total_items is None:
         return max(1, min(64, 4 * width))
@@ -28,6 +39,15 @@ def _auto_chunk_size(total_items: Optional[int], width: int) -> int:
 
 
 def _chunked(indexed_iter: Iterable[Tuple[int, object]], chunk_size: int) -> Iterator[List[Tuple[int, object]]]:
+    """将迭代器分块。
+
+    Args:
+        indexed_iter: 带索引的迭代器
+        chunk_size: 每块的大小
+
+    Yields:
+        List[Tuple[int, object]]: 分块后的列表
+    """
     chunk: List[Tuple[int, object]] = []
     for item in indexed_iter:
         chunk.append(item)
@@ -51,6 +71,29 @@ def run_foreach(
     cluster_policy: str,
     chunk_size: Optional[int],
 ) -> ForeachResult:
+    """并行执行 foreach 操作的核心实现。
+
+    负责任务分片、提交、错误处理和结果收集。
+
+    Args:
+        iterable: 可迭代对象
+        fn: 要执行的函数
+        gateway: 集群网关
+        projects: 项目管理器
+        mode: 返回模式
+        on_error: 错误处理策略
+        retries: 重试次数
+        project: 项目名称
+        cluster_policy: 集群选择策略
+        chunk_size: 分片大小
+
+    Returns:
+        ForeachResult: 包含结果和错误的对象
+
+    Raises:
+        ValueError: 当参数无效时
+        RuntimeError: 当函数序列化失败时
+    """
     # 参数校验：在入口处尽早失败，避免隐藏行为。
     if mode not in ("ordered", "as_completed"):
         raise ValueError("mode must be `ordered` or `as_completed`")
@@ -89,6 +132,13 @@ def run_foreach(
         excluded: Optional[set] = None,
         failovers: int = 0,
     ) -> None:
+        """提交一个分片到集群执行。
+
+        Args:
+            indexed_items: 带索引的项目列表
+            excluded: 要排除的集群集合
+            failovers: 已进行的故障转移次数
+        """
         # 项目级信号量：限制单项目并发，避免多个项目相互抢占。
         projects.acquire(project)
         future, cluster = gateway.submit(

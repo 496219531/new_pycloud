@@ -17,6 +17,16 @@ from .runners import ProcessClusterRunner
 
 @dataclass
 class ClusterStats:
+    """集群统计数据类。
+
+    跟踪单个集群的运行时统计信息。
+
+    Attributes:
+        in_flight: 正在执行的任务数
+        failures: 失败次数
+        unhealthy_until: 不健康状态截止时间（Unix 时间戳）
+        submitted: 已提交的任务总数
+    """
     in_flight: int = 0
     failures: int = 0
     unhealthy_until: float = 0.0
@@ -24,6 +34,18 @@ class ClusterStats:
 
 
 class ClusterGateway:
+    """多集群网关（元调度器）。
+
+    负责维护多个集群 Runner，按 weighted_least_load 策略路由任务，
+    记录健康状态、在途任务数和提交量，为故障转移提供依据。
+
+    Attributes:
+        _lock: 线程锁，保护内部状态
+        _runners: 集群名称到 Runner 的映射
+        _configs: 集群名称到配置的映射
+        _stats: 集群名称到统计数据的映射
+    """
+
     def __init__(self, clusters: Iterable[ClusterConfig]) -> None:
         self._lock = threading.Lock()
         self._runners: Dict[str, ProcessClusterRunner] = {}
@@ -39,13 +61,27 @@ class ClusterGateway:
             raise RuntimeError("at least one cluster is required")
 
     def shutdown(self) -> None:
+        """关闭所有集群 Runner。"""
         for runner in self._runners.values():
             runner.shutdown()
 
     def total_parallelism(self) -> int:
+        """获取总并行度。
+
+        Returns:
+            int: 所有集群的容量之和
+        """
         return max(1, sum(cfg.capacity for cfg in self._configs.values()))
 
     def mark_unhealthy(self, cluster: str, cooldown_sec: int = 15) -> None:
+        """标记集群为不健康状态。
+
+        在冷却窗口内该集群不会被优先选择，避免持续雪崩。
+
+        Args:
+            cluster: 集群名称
+            cooldown_sec: 冷却时间（秒）
+        """
         # 冷却窗口内不再优先选该集群，避免持续雪崩。
         with self._lock:
             stats = self._stats.get(cluster)
@@ -55,6 +91,14 @@ class ClusterGateway:
             stats.unhealthy_until = time.time() + cooldown_sec
 
     def _healthy_candidates(self, exclude: Optional[Set[str]] = None) -> Dict[str, ClusterConfig]:
+        """获取健康的集群候选列表。
+
+        Args:
+            exclude: 要排除的集群集合
+
+        Returns:
+            Dict[str, ClusterConfig]: 健康集群的配置字典
+        """
         now = time.time()
         excluded = exclude or set()
         with self._lock:
@@ -73,6 +117,15 @@ class ClusterGateway:
         policy: str = "weighted_least_load",
         exclude: Optional[Set[str]] = None,
     ) -> str:
+        """根据策略选择一个集群。
+
+        Args:
+            policy: 选择策略（当前仅支持 "weighted_least_load"）
+            exclude: 要排除的集群集合
+
+        Returns:
+            str: 选中的集群名称
+        """
         # weighted_least_load：低负载且高权重集群优先。
         candidates = self._healthy_candidates(exclude=exclude)
         if not candidates:
@@ -110,6 +163,20 @@ class ClusterGateway:
         force_cluster: Optional[str] = None,
         exclude: Optional[Set[str]] = None,
     ) -> Tuple[object, str]:
+        """提交任务到集群执行。
+
+        Args:
+            serialized_fn: 序列化的函数
+            indexed_items: 带索引的项目列表
+            retries: 重试次数
+            on_error: 错误处理策略
+            policy: 集群选择策略
+            force_cluster: 强制指定的集群（可选）
+            exclude: 要排除的集群集合
+
+        Returns:
+            Tuple[object, str]: (Future 对象, 集群名称)
+        """
         # 提交前后维护 in_flight 计数，供后续调度决策使用。
         cluster_name = force_cluster or self.select_cluster(policy=policy, exclude=exclude)
         runner = self._runners[cluster_name]
@@ -136,5 +203,10 @@ class ClusterGateway:
         return future, cluster_name
 
     def snapshot(self) -> Dict[str, ClusterStats]:
+        """获取所有集群的统计快照。
+
+        Returns:
+            Dict[str, ClusterStats]: 集群名称到统计数据的映射
+        """
         with self._lock:
             return {name: ClusterStats(**vars(stats)) for name, stats in self._stats.items()}
