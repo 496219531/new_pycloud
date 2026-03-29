@@ -1,18 +1,30 @@
 """中文说明：验证 gRPC 控制面的核心状态流转（内存后端）。"""
 
 import hashlib
+import json
+import time
 from datetime import timedelta
+from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.state import NodeControlState, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 def _seed_code(state: NodeControlState) -> str:
-    blob = b"print('hello grpc')\n"
+    blob = (
+        b"def run(payload):\n"
+        b"    value = payload.get('value', 0)\n"
+        b"    if payload.get('should_fail'):\n"
+        b"        raise ValueError(f'intentional failure value={value}')\n"
+        b"    return {'input': value, 'output': value * value}\n"
+    )
     digest = hashlib.sha256(blob).hexdigest()
     artifact, _ = state.put_code(
         sha256=f"sha256:{digest}",
         filename="demo.py",
+        runtime="py3.11",
+        entry_module="demo",
+        entry_callable="run",
         chunks=[blob],
     )
     return artifact.code_version
@@ -24,6 +36,8 @@ def test_submit_poll_report_and_pull_results(tmp_path):
         queue_capacity=16,
         worker_capacity=4,
         artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
     )
     try:
         code_version = _seed_code(state)
@@ -74,6 +88,8 @@ def test_infra_timeout_requeue_then_retry(tmp_path):
         max_retries=2,
         monitor_interval_sec=60,  # disable periodic checks in test
         artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
     )
     try:
         code_version = _seed_code(state)
@@ -99,5 +115,148 @@ def test_infra_timeout_requeue_then_retry(tmp_path):
         second = state.poll_task(worker_id="worker-3")
         assert second is not None
         assert second.attempt == 2
+    finally:
+        state.close()
+
+
+def test_internal_executor_runs_tasks_without_external_worker(tmp_path):
+    state = NodeControlState(
+        node_id="node-test-03",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        code_version = _seed_code(state)
+        submit_req = pb2.SubmitTasksRequest(
+            client_id="client-c",
+            code_version=code_version,
+            execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+            tasks=[
+                pb2.TaskSubmitItem(task_id="task-auto-1", payload={"value": 9, "sleep_ms": 20}, priority=1),
+                pb2.TaskSubmitItem(task_id="task-auto-2", payload={"value": 5, "sleep_ms": 20, "should_fail": True}, priority=1),
+            ],
+        )
+        accepted, rejected, _ = state.submit_tasks(submit_req)
+        assert len(accepted) == 2
+        assert not rejected
+
+        deadline = time.time() + 5
+        results = []
+        cursor = ""
+        while time.time() < deadline and len(results) < 2:
+            batch, cursor = state.pull_results(
+                pb2.PullResultsRequest(client_id="client-c", limit=10, wait_ms=200, cursor=cursor)
+            )
+            results.extend(batch)
+
+        assert len(results) == 2
+        statuses = sorted(item.status for item in results)
+        assert statuses == [pb2.TASK_STATUS_SUCCEEDED, pb2.TASK_STATUS_FAILED_USER]
+    finally:
+        state.close()
+
+
+def test_service_session_http_call_and_end(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(payload):\n"
+            b"    v = int(payload.get('value', 0))\n"
+            b"    return {'v': v, 'square': v * v}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-a",
+            service_name="svc-a",
+            filename="svc_entry.py",
+            sha256=f"sha256:{digest}",
+            runtime="py3.11",
+            entry_module="svc_entry",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=True,
+            chunks=[blob],
+        )
+        assert session.status == pb2.SERVICE_STATUS_RUNNING
+        assert session.http_base_url.startswith("http://")
+
+        req = Request(
+            url=f"{session.http_base_url}/call/run",
+            method="POST",
+            data=json.dumps({"value": 8}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["ok"] is True
+        assert body["data"]["square"] == 64
+
+        hb = state.heartbeat_service(owner_client_id="owner-a", service_id=session.service_id)
+        assert hb.status == pb2.SERVICE_STATUS_RUNNING
+
+        ended = state.end_service(owner_client_id="owner-a", service_id=session.service_id, reason="done")
+        assert ended.status == pb2.SERVICE_STATUS_STOPPED
+    finally:
+        state.close()
+
+
+def test_service_session_heartbeat_timeout_recycles(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-02",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=60,
+    )
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(payload):\n"
+            b"    return {'ok': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-b",
+            service_name="svc-b",
+            filename="svc_entry.py",
+            sha256=f"sha256:{digest}",
+            runtime="py3.11",
+            entry_module="svc_entry",
+            entry_callable="run",
+            worker_count=1,
+            heartbeat_timeout_sec=1,
+            idle_ttl_sec=0,
+            expose_http=True,
+            chunks=[blob],
+        )
+        assert session.status == pb2.SERVICE_STATUS_RUNNING
+        session.last_heartbeat_at = utc_now() - timedelta(seconds=5)
+        session.lease_expire_at = utc_now() - timedelta(seconds=1)
+        state._handle_service_timeouts()  # noqa: SLF001
+        info = state.service_status_info(session.service_id)
+        assert info["status"] == pb2.SERVICE_STATUS_STOPPED
     finally:
         state.close()

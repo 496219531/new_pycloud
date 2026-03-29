@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+"""Integration tests for multi-node service deployment client helpers."""
+
+from concurrent import futures
+import time
+
+import grpc
+from typing import Tuple
+
+from pycloud_parallel.controlplane.client import InfoCenterClient, MultiNodeServiceGroup
+from pycloud_parallel.controlplane.services import InfoCenterService, NodeControlService, WorkerInternalService
+from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
+from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+
+
+def _start_infocenter_server() -> Tuple[grpc.Server, str, InfoCenterState]:
+    state = InfoCenterState()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_InfoCenterServiceServicer_to_server(InfoCenterService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    return server, f"127.0.0.1:{port}", state
+
+
+def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Server, str, NodeControlState]:
+    state = NodeControlState(
+        node_id=node_id,
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=artifact_dir,
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=24))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    pb2_grpc.add_WorkerInternalServiceServicer_to_server(WorkerInternalService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    return server, f"127.0.0.1:{port}", state
+
+
+def test_multi_node_group_deploy_and_call(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-multi-01", str(tmp_path / "n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-multi-02", str(tmp_path / "n2_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-multi-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["test"])
+            infocenter.register_node(node_id="node-multi-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["test"])
+
+        blob = (
+            b"def run(payload):\n"
+            b"    value = int(payload.get('value', 0))\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+
+        group = MultiNodeServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-multi-test",
+            service_name="svc-multi-test",
+            blob=blob,
+            filename="svc_multi_test.py",
+            runtime="py3.11",
+            entry_module="svc_multi_test",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["test"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+        )
+
+        try:
+            assert len(group.sessions) == 2
+            assert set(group.sessions.keys()) == {"node-multi-01", "node-multi-02"}
+
+            group.start_keepalive(interval_sec=1.0)
+
+            r1 = group.call_on_node("node-multi-01", "run", {"value": 3}, timeout_sec=8.0)
+            r2 = group.call_on_node("node-multi-02", "run", {"value": 5}, timeout_sec=8.0)
+            assert r1["ok"] is True and r1["data"]["square"] == 9
+            assert r2["ok"] is True and r2["data"]["square"] == 25
+
+            selected_node, r3 = group.call_balanced("run", {"value": 7}, timeout_sec=8.0, strategy="least_inflight")
+            assert selected_node in group.sessions
+            assert r3["ok"] is True and r3["data"]["square"] == 49
+
+            statuses = group.status_map()
+            assert set(statuses.keys()) == {"node-multi-01", "node-multi-02"}
+            for info in statuses.values():
+                assert info.status == pb2.SERVICE_STATUS_RUNNING
+
+            ended = group.end("test complete")
+            assert set(ended.keys()) == {"node-multi-01", "node-multi-02"}
+            for resp in ended.values():
+                assert resp is not None
+                assert resp.ok is True
+                assert resp.accepted is True
+                assert resp.status == pb2.SERVICE_STATUS_STOPPED
+        finally:
+            group.close(end_services=False)
+    finally:
+        info_server.stop(grace=0)
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()
+
+
+def test_multi_node_group_circuit_breaker_recovery(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-cb-01", str(tmp_path / "cb_n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-cb-02", str(tmp_path / "cb_n2_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-cb-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["cb"])
+            infocenter.register_node(node_id="node-cb-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["cb"])
+
+        blob = (
+            b"def run(payload):\n"
+            b"    value = int(payload.get('value', 0))\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+
+        group = MultiNodeServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-cb-test",
+            service_name="svc-cb-test",
+            blob=blob,
+            filename="svc_cb_test.py",
+            runtime="py3.11",
+            entry_module="svc_cb_test",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["cb"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+            breaker_enabled=True,
+            breaker_failure_threshold=1,
+            breaker_cooldown_sec=0.8,
+            breaker_max_cooldown_sec=2.0,
+        )
+
+        try:
+            group.start_keepalive(interval_sec=1.0)
+            session_n1 = group.sessions["node-cb-01"]
+            origin_call = session_n1.call
+            fault_once = {"count": 0}
+
+            def flaky_call(method, payload, *, timeout_sec=60.0, token=None, via="http"):
+                if fault_once["count"] == 0:
+                    fault_once["count"] += 1
+                    raise RuntimeError("synthetic first failure on node-cb-01")
+                return origin_call(method, payload, timeout_sec=timeout_sec, token=token, via=via)
+
+            session_n1.call = flaky_call  # type: ignore[assignment]
+
+            node_id_first, resp_first = group.call_balanced(
+                "run",
+                {"value": 4},
+                timeout_sec=8.0,
+                strategy="round_robin",
+                refresh_status=False,
+                max_attempts=2,
+            )
+            assert node_id_first == "node-cb-02"
+            assert resp_first["ok"] is True
+
+            snap1 = group.breaker_snapshot()
+            assert snap1["node-cb-01"]["state"] == "open"
+            assert snap1["node-cb-01"]["consecutive_failures"] >= 1
+
+            node_id_second, resp_second = group.call_balanced(
+                "run",
+                {"value": 6},
+                timeout_sec=8.0,
+                strategy="round_robin",
+                refresh_status=False,
+                max_attempts=2,
+            )
+            assert node_id_second == "node-cb-02"
+            assert resp_second["ok"] is True
+
+            time.sleep(1.0)
+
+            node_id_third, resp_third = group.call_balanced(
+                "run",
+                {"value": 7},
+                timeout_sec=8.0,
+                strategy="round_robin",
+                refresh_status=False,
+                max_attempts=2,
+            )
+            assert resp_third["ok"] is True
+            assert resp_third["data"]["square"] == 49
+
+            recovered_node = node_id_third
+            if recovered_node != "node-cb-01":
+                node_id_fourth, resp_fourth = group.call_balanced(
+                    "run",
+                    {"value": 8},
+                    timeout_sec=8.0,
+                    strategy="round_robin",
+                    refresh_status=False,
+                    max_attempts=2,
+                )
+                assert resp_fourth["ok"] is True
+                recovered_node = node_id_fourth
+
+            assert recovered_node == "node-cb-01"
+
+            snap2 = group.breaker_snapshot()
+            assert snap2["node-cb-01"]["state"] == "closed"
+            assert snap2["node-cb-01"]["consecutive_failures"] == 0
+        finally:
+            group.close(end_services=True, reason="cb test complete")
+    finally:
+        info_server.stop(grace=0)
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()
+
+
+def test_service_route_query_and_duplicate_guard(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-route-01",
+                control_addr="127.0.0.1:59999",
+                capacity=16,
+                queue_capacity=64,
+                tags=["route"],
+                services=[
+                    pb2.ServiceRouteReport(
+                        service_name="svc-existing",
+                        service_id="svc-existing-id-01",
+                        status=pb2.SERVICE_STATUS_RUNNING,
+                        worker_count=4,
+                        alive_workers=4,
+                        in_flight=1,
+                        http_base_url="http://127.0.0.1:18099/svc/svc-existing-id-01",
+                    )
+                ],
+            )
+
+            routes = infocenter.list_service_routes(service_name="svc-existing", healthy_only=True, limit=20)
+            assert len(routes) == 1
+            assert routes[0].service_name == "svc-existing"
+            assert routes[0].service_id == "svc-existing-id-01"
+            assert routes[0].node_id == "node-route-01"
+            assert routes[0].status == pb2.SERVICE_STATUS_RUNNING
+
+        blob = (
+            b"def run(payload):\n"
+            b"    return {'ok': True}\n"
+        )
+        try:
+            MultiNodeServiceGroup.deploy_from_infocenter(
+                infocenter_target=info_target,
+                owner_client_id="owner-dup-check",
+                service_name="svc-existing",
+                blob=blob,
+                filename="svc_dup_check.py",
+                runtime="py3.11",
+                entry_module="svc_dup_check",
+                entry_callable="run",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                healthy_only=True,
+                tags=["route"],
+                min_success_nodes=1,
+                allow_partial=True,
+                timeout_sec=5.0,
+                ensure_unique_service_name=True,
+            )
+            assert False, "expected duplicate service name to be rejected"
+        except RuntimeError as exc:
+            assert "service_name already exists" in str(exc)
+    finally:
+        info_server.stop(grace=0)
