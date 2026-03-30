@@ -23,42 +23,20 @@ def pycloud_export(fn):
     fn.__pycloud_export__ = True
     return fn
 
-# 内联算法实现，避免跨模块导入
-def quick_sort(arr):
-    """快速排序实现"""
-    if len(arr) <= 1:
-        return arr
-    pivot = arr[len(arr) // 2]
-    left = [x for x in arr if x < pivot]
-    middle = [x for x in arr if x == pivot]
-    right = [x for x in arr if x > pivot]
-    return quick_sort(left) + middle + quick_sort(right)
-
-def binary_search(arr, target):
-    """二分查找实现"""
-    left, right = 0, len(arr) - 1
-    while left <= right:
-        mid = (left + right) // 2
-        if arr[mid] == target:
-            return mid
-        elif arr[mid] < target:
-            left = mid + 1
-        else:
-            right = mid - 1
-    return -1
+from .algorithms import sort, search
 
 @pycloud_export
 def quick_sort(payload):
     """快速排序"""
     data = payload.get("data", [])
-    return {"result": quick_sort(data), "algorithm": "quick_sort"}
+    return {"result": sort.quick_sort(data), "algorithm": "quick_sort"}
 
 @pycloud_export
 def binary_search(payload):
     """二分查找"""
     data = payload.get("data", [])
     target = payload.get("target", 0)
-    idx = binary_search(data, target)
+    idx = search.binary_search(data, target)
     return {"result": idx, "target": target, "found": idx >= 0}
 
 @pycloud_export
@@ -267,7 +245,7 @@ def cleanup_existing_services():
                     except Exception as exc:
                         print(f"  ✗ 清理 {route.node_id} 失败: {exc}")
                 print()
-                time.sleep(1)  # 等待清理完成
+               
     except Exception as exc:
         print(f"  跳过清理: {exc}")
         print()
@@ -354,12 +332,12 @@ def main():
 
                 # 使用 artifact_paths 部署多个文件/文件夹
                 artifact_paths=[
-                    str(service_dir / "main.py"),
+                    str(service_dir),
                 ],
 
                 # 入口配置
-                entry_module="main",                # 对应 main.py（去掉 .py）
-                entry_callable="process",            # 默认函数
+                entry_module="compute_service.main",  # zip 内路径：compute_service/main.py
+                entry_callable="process",             # 默认函数
 
                 # 导出配置
                 export_mode="decorator",

@@ -27,6 +27,11 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 
+def pycloud_export(fn):
+    fn.__pycloud_export__ = True
+    return fn
+
+
 def _now_timestamp() -> timestamp_pb2.Timestamp:
     ts = timestamp_pb2.Timestamp()
     ts.FromDatetime(datetime.now(timezone.utc))
@@ -871,14 +876,26 @@ class MultiNodeServiceGroup:
                     if not p.exists():
                         raise FileNotFoundError(f"Path not found: {p}")
                     if p.is_file():
-                        # 单个文件
+                        # 单个文件：直接添加，保持原名
                         zf.write(p, p.name)
                     elif p.is_dir():
-                        # 文件夹：递归添加所有文件
+                        # 收集所有需要写入 zip 的目录（用于自动补全 __init__.py）
+                        dirs_to_check = {p}  # 顶级目录本身
+                        for child in p.rglob('*'):
+                            if child.is_dir():
+                                dirs_to_check.add(child)
+
+                        # 为缺少 __init__.py 的目录写入空文件
+                        for d in sorted(dirs_to_check, key=lambda x: str(x)):
+                            if not (d / "__init__.py").exists():
+                                init_arcname = p.name / d.relative_to(p) / "__init__.py"
+                                zf.writestr(str(init_arcname), "")
+
+                        # 文件夹：将文件夹本身作为 zip 内的一层目录，写入所有文件
                         for file_path in p.rglob('*'):
                             if file_path.is_file():
-                                arcname = file_path.relative_to(p)
-                                zf.write(file_path, arcname)
+                                arcname = p.name / file_path.relative_to(p)
+                                zf.write(file_path, str(arcname))
 
             effective_blob = Path(tmp_zip_path).read_bytes()
             if not effective_filename:

@@ -4,8 +4,8 @@ info:
   version: "1.0.0"
   description: >
     V1 API contract for PyCloud internal deployment.
-    Includes InfoCenter APIs, NodeControl client-facing APIs,
-    and NodeControl-Worker internal APIs.
+    gRPC is the primary control-plane protocol.
+    This OpenAPI file documents the HTTP-facing surface plus REST-style mappings.
 
 servers:
   - url: http://infocenter.internal
@@ -16,6 +16,7 @@ servers:
 tags:
   - name: InfoCenter
   - name: NodeControl
+  - name: ServiceGateway
   - name: WorkerInternal
 
 security:
@@ -140,6 +141,11 @@ paths:
                   type: string
                 entry_callable:
                   type: string
+                package_format:
+                  type: string
+                  enum: [py, tar.gz, zip, whl]
+                export_spec:
+                  $ref: "#/components/schemas/ModuleExportSpec"
       responses:
         "200":
           description: Upload accepted
@@ -151,6 +157,80 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /svc/{service_id}/call/{method}:
+    post:
+      tags: [ServiceGateway]
+      summary: Call a deployed service method
+      operationId: callServiceMethod
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: service_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: method
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: timeout_sec
+          required: false
+          schema:
+            type: number
+            format: float
+            minimum: 0.1
+            default: 60
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Method executed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceCallResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /svc/{service_id}/status:
+    get:
+      tags: [ServiceGateway]
+      summary: Get deployed service status
+      operationId: getServiceStatusHttp
+      parameters:
+        - in: path
+          name: service_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Service status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceStatusHttpResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -391,6 +471,19 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
+    ModuleExportSpec:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [decorator, explicit, all, single]
+        methods:
+          type: array
+          items:
+            type: string
+        decorator:
+          type: string
+
     ErrorCode:
       type: string
       enum:
@@ -690,6 +783,94 @@ components:
         type:
           type: string
         message:
+          type: string
+
+    ServiceMethodInfo:
+      type: object
+      required: [method, qualified_name, doc]
+      properties:
+        method:
+          type: string
+        qualified_name:
+          type: string
+        doc:
+          type: string
+
+    ServiceStatusInfo:
+      type: object
+      required:
+        - service_id
+        - owner_client_id
+        - service_name
+        - code_version
+        - status
+        - worker_count
+        - alive_workers
+        - in_flight
+        - queued
+        - created_at
+        - last_heartbeat_at
+        - lease_expire_at
+        - http_base_url
+      properties:
+        service_id:
+          type: string
+        owner_client_id:
+          type: string
+        service_name:
+          type: string
+        code_version:
+          type: string
+        status:
+          type: integer
+        worker_count:
+          type: integer
+        alive_workers:
+          type: integer
+        in_flight:
+          type: integer
+        queued:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        last_heartbeat_at:
+          type: string
+          format: date-time
+        lease_expire_at:
+          type: string
+          format: date-time
+        http_base_url:
+          type: string
+        methods:
+          type: array
+          items:
+            type: string
+
+    ServiceStatusHttpResponse:
+      type: object
+      required: [ok, service]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        service:
+          $ref: "#/components/schemas/ServiceStatusInfo"
+
+    ServiceCallResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+        method:
+          type: string
+        data:
+          type: object
+          additionalProperties: true
+        error_type:
+          type: string
+        error:
           type: string
 
     TaskResultItem:

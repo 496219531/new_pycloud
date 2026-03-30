@@ -1,19 +1,11 @@
 # pycloud-parallel
 
-`pycloud-parallel` is a Python 3.8+ package for low-intrusion loop parallelization.
+`pycloud-parallel` 是一个 Python 3.8+ 并行执行框架，包含两层能力：
 
-> 中文说明：这个包的目标是“尽量少改原代码”把 `for` 循环并行化，并支持多集群与多项目并行。
+1. `@parallel_for / foreach` 的业务并行 API。
+2. 基于 gRPC 的分布式控制面（InfoCenter + NodeControl）。
 
-## Highlights
-
-- Decorator-first API: `@parallel_for(...)`
-- Explicit fallback API: `foreach(iterable, fn, ...)`
-- Multi-cluster routing with weighted least-load policy
-- Multi-project concurrency isolation with per-project CPU quota
-- Error semantics: skip (default) or raise
-- Result semantics: ordered (default) or as-completed
-
-## Quick start
+## 快速开始（并行 API）
 
 ```python
 from pc import parallel_for
@@ -28,57 +20,19 @@ def calc(nums):
 print(calc(list(range(10))))
 ```
 
-## Benchmark
+## 控制面（当前实现）
 
-```bash
-python benchmarks/cpu_benchmark.py --size 200 --clusters 2 --capacity 4
-```
+### 组件
 
-## Config file (`pycloud.yaml`)
+1. `InfoCenter`：节点注册、心跳、服务路由查询。
+2. `NodeControl`：代码上传、任务执行、服务会话生命周期管理。
+3. `Service HTTP Gateway`：NodeControl 暴露 `/svc/{service_id}/call/{method}`。
 
-```yaml
-clusters:
-  - name: local
-    address: local
-    weight: 1.0
-    capacity: 8
-projects:
-  default:
-    cpu_quota: 8
-    mem_quota: 0
-    priority: 1
-    default_retries: 0
-    default_on_error: skip
-default_project: default
-```
-
-## gRPC Control Plane (V1)
-
-Generate protobuf stubs:
-
-```bash
-bash scripts/gen_grpc_stubs.sh
-```
-
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\gen_grpc_stubs.ps1
-```
-
-Cross-platform (Python direct):
-
-```bash
-python scripts/gen_grpc_stubs.py
-```
-
-Start InfoCenter:
+### 启动
 
 ```bash
 pycloud-control --role infocenter --bind 0.0.0.0:50051
 ```
-
-Start NodeControl (same binary, different role):
 
 ```bash
 pycloud-control --role nodecontrol --bind 0.0.0.0:50061 --node-id node-local-01 \
@@ -86,95 +40,58 @@ pycloud-control --role nodecontrol --bind 0.0.0.0:50061 --node-id node-local-01 
   --advertise-addr 127.0.0.1:50061
 ```
 
-Windows install and run example:
+### gRPC Stub 生成
+
+```bash
+bash scripts/gen_grpc_stubs.sh
+```
+
+Windows:
 
 ```powershell
-py -m pip install -e ".[grpc]"
-py -m pycloud_parallel.controlplane.server --role infocenter --bind 0.0.0.0:50051
-py -m pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:50061 --node-id node-win-01 --infocenter-addr 127.0.0.1:50051 --advertise-addr 127.0.0.1:50061
+powershell -ExecutionPolicy Bypass -File .\scripts\gen_grpc_stubs.ps1
 ```
 
-Contract docs:
+## 服务会话模型（V1）
 
-- `GRPC_CONTRACT_V1.md`
-- `proto/pycloud_v1.proto`
-- `SERVICE_SESSION_PROTOCOL_V1.md`
+当前默认是“模块 + 多函数路由”模式：
 
-Complex pure-client demo (requires InfoCenter + NodeControl running):
+1. 上传支持 `py / tar.gz / zip / whl`。
+2. 注册时指定：`entry_module + export_spec`。
+3. 方法导出支持：`decorator / explicit / all / single`。
+4. 调用按方法名：gRPC `CallService` 或 HTTP `POST /svc/{service_id}/call/{method}`。
+5. 支持 `ListServiceMethods` 先查再调。
+
+默认推荐：`export_mode="decorator"` + `export_decorator="pycloud_export"`。
+
+## Python 客户端能力（controlplane.client）
+
+1. `NodeControlClient.create_service_from_file(...)`
+   - 支持单文件或目录（目录会自动打包）。
+2. `NodeControlClient.create_service_from_paths(...)`
+   - 支持按相对路径列表打包上传。
+3. `ServiceSessionClient.list_methods()`
+4. `ServiceSessionClient.call(method, payload, via="http"|"grpc")`
+5. `MultiNodeServiceGroup.call_balanced(...)`
+6. `MultiNodeServiceGroup.acall_balanced(...)`
+7. `MultiNodeServiceGroup.acall_all(...)`
+
+## 示例脚本
+
+当前 `scripts/grpc*.py` 示例已改为“无参数解析”，运行即使用脚本内默认值：
 
 ```bash
-python scripts/grpc_client_complex_demo.py \
-  --infocenter 127.0.0.1:50051 \
-  --nodecontrol 127.0.0.1:50061 \
-  --node-id node-local-01 \
-  --client-id demo-client-01 \
-  --tasks 120
+python scripts/grpc_service_session_demo.py
+python scripts/grpc_multi_node_service_demo.py
+python scripts/grpc_existing_service_client_demo.py
+python scripts/grpc_register_service_client_demo.py
+python scripts/grpc_client_complex_demo.py
 ```
 
-Service-session demo (client uploads service code, keeps heartbeat, invokes over HTTP, then ends service):
+## 协议文档
 
-```bash
-python scripts/grpc_service_session_demo.py \
-  --nodecontrol 127.0.0.1:50061 \
-  --owner-client-id svc-owner-demo \
-  --service-name square-service \
-  --workers 4 \
-  --heartbeat-timeout-sec 30 \
-  --invoke-count 8
-```
-
-Multi-node service demo (discover nodes from InfoCenter, deploy to all healthy nodes, and invoke with load balancing):
-
-```bash
-python scripts/grpc_multi_node_service_demo.py \
-  --infocenter 127.0.0.1:50051 \
-  --owner-client-id svc-owner-multi-demo \
-  --service-name square-service-multi \
-  --workers 4 \
-  --invoke-count 20 \
-  --strategy least_inflight \
-  --breaker-failure-threshold 3 \
-  --breaker-cooldown-sec 15
-```
-
-Call existing deployed service directly (without re-registering service code):
-
-```bash
-python scripts/grpc_existing_service_client_demo.py \
-  --infocenter 127.0.0.1:50051 \
-  --service-name square-service-multi \
-  --invoke-count 10
-```
-
-Note:
-- Uploaded artifact must provide the configured entry function (default `run`).
-- NodeControl executes that entry inside local subprocess workers.
-- Service-session APIs (`CreateService`/`HeartbeatService`/`EndService`) are implemented in NodeControl.
-- NodeControl can auto register/heartbeat to InfoCenter with deployed service routes.
-- `MultiNodeServiceGroup.deploy_from_infocenter(...)` enforces unique `service_name` by default.
-- Multi-node invoke has circuit-breaker recovery:
-  - `breaker_failure_threshold`: consecutive failures before open-circuit
-  - `breaker_cooldown_sec`: base open-circuit cooldown
-  - `breaker_max_cooldown_sec`: max cooldown with exponential backoff
-
-## Local Chat Backup (Codex)
-
-Sync all Codex session logs from `~/.codex/sessions` into this repo:
-
-```bash
-python3 scripts/sync_codex_chat_logs.py --workspace .
-```
-
-Enable auto-sync every 60 seconds on macOS (`launchd`):
-
-```bash
-bash scripts/install_chatlog_sync_launchd.sh ~/.codex/chat_backup .
-```
-
-This creates a project link at `chat_logs/auto_sessions` that points to the auto-updated archive.
-
-Disable auto-sync:
-
-```bash
-bash scripts/uninstall_chatlog_sync_launchd.sh ~/.codex/chat_backup .
-```
+1. `proto/pycloud_v1.proto`
+2. `GRPC_CONTRACT_V1.md`
+3. `SERVICE_SESSION_PROTOCOL_V1.md`
+4. `ARCHITECTURE_V1.md`
+5. `API_CONTRACT_V1.md`（REST 草案，gRPC 为当前基线）
