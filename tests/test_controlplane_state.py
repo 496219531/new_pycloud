@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import sys
 import time
 from datetime import timedelta
 from urllib.request import Request, urlopen
@@ -208,11 +209,72 @@ def test_service_session_http_call_and_end(tmp_path):
         assert body["ok"] is True
         assert body["data"]["square"] == 64
 
-        hb = state.heartbeat_service(owner_client_id="owner-a", service_id=session.service_id)
+        hb = state.heartbeat_service(
+            owner_client_id="owner-a",
+            service_id=session.service_id,
+            service_token=session.service_token,
+        )
         assert hb.status == pb2.SERVICE_STATUS_RUNNING
 
-        ended = state.end_service(owner_client_id="owner-a", service_id=session.service_id, reason="done")
+        ended = state.end_service(
+            owner_client_id="owner-a",
+            service_id=session.service_id,
+            service_token=session.service_token,
+            reason="done",
+        )
         assert ended.status == pb2.SERVICE_STATUS_STOPPED
+    finally:
+        state.close()
+
+
+def test_service_session_management_requires_token(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-auth-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = b"def run(payload):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-auth",
+            service_name="svc-auth",
+            filename="svc_auth.py",
+            sha256=f"sha256:{digest}",
+            runtime="py3.11",
+            entry_module="svc_auth",
+            entry_callable="run",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        try:
+            state.heartbeat_service(
+                owner_client_id="owner-auth",
+                service_id=session.service_id,
+                service_token="",
+            )
+            assert False, "expected missing token to be rejected"
+        except PermissionError as exc:
+            assert "service_token mismatch" in str(exc)
+
+        try:
+            state.end_service(
+                owner_client_id="owner-auth",
+                service_id=session.service_id,
+                service_token="bad-token",
+                reason="should fail",
+            )
+            assert False, "expected bad token to be rejected"
+        except PermissionError as exc:
+            assert "service_token mismatch" in str(exc)
     finally:
         state.close()
 
@@ -258,5 +320,61 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
         state._handle_service_timeouts()  # noqa: SLF001
         info = state.service_status_info(session.service_id)
         assert info["status"] == pb2.SERVICE_STATUS_STOPPED
+    finally:
+        state.close()
+
+
+def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-03",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(payload):\n"
+            b"    return {'ok': True}\n"
+        )
+
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("compute_service/__init__.py", "")
+            zf.writestr("compute_service/main.py", blob)
+        archive = buf.getvalue()
+        digest = hashlib.sha256(archive).hexdigest()
+
+        session = state.create_service(
+            owner_client_id="owner-c",
+            service_name="svc-c",
+            filename="compute_service.zip",
+            sha256=f"sha256:{digest}",
+            runtime="py3.11",
+            entry_module="compute_service.main",
+            entry_callable="run",
+            package_format="zip",
+            export_mode="decorator",
+            export_methods=(),
+            export_decorator="pycloud_export",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=True,
+            chunks=[archive],
+        )
+
+        assert session.status == pb2.SERVICE_STATUS_RUNNING
+        assert "compute_service" not in sys.modules
+        assert "compute_service.main" not in sys.modules
     finally:
         state.close()

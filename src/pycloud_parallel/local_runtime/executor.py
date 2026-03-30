@@ -5,7 +5,7 @@ from __future__ import annotations
 职责：
 1) 迭代数据分片（chunk）并批量提交，降低调度开销。
 2) 支持 ordered/as_completed 两种返回语义。
-3) 支持任务失败跳过、重试与集群失败自动切换（failover）。
+3) 支持任务失败跳过与重试。
 """
 
 from concurrent.futures import FIRST_COMPLETED, wait
@@ -13,9 +13,9 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Un
 
 import cloudpickle
 
-from .gateway import ClusterGateway
 from .project_manager import ProjectManager
-from .types import ChunkMeta, ForeachResult, TaskError, UserFunctionError
+from .runners import ProcessClusterRunner
+from .types import ForeachResult, TaskError, UserFunctionError
 
 
 def _auto_chunk_size(total_items: Optional[int], width: int) -> int:
@@ -61,14 +61,13 @@ def _chunked(indexed_iter: Iterable[Tuple[int, object]], chunk_size: int) -> Ite
 def run_foreach(
     iterable: Union[Sequence[object], Iterable[object]],
     fn,
-    gateway: ClusterGateway,
+    runner: ProcessClusterRunner,
     projects: ProjectManager,
     *,
     mode: str,
     on_error: str,
     retries: int,
     project: str,
-    cluster_policy: str,
     chunk_size: Optional[int],
 ) -> ForeachResult:
     """并行执行 foreach 操作的核心实现。
@@ -78,13 +77,12 @@ def run_foreach(
     Args:
         iterable: 可迭代对象
         fn: 要执行的函数
-        gateway: 集群网关
+        runner: 本地进程池执行器
         projects: 项目管理器
         mode: 返回模式
         on_error: 错误处理策略
         retries: 重试次数
         project: 项目名称
-        cluster_policy: 集群选择策略
         chunk_size: 分片大小
 
     Returns:
@@ -115,12 +113,11 @@ def run_foreach(
     except Exception:
         total_items = None
 
-    actual_chunk_size = chunk_size or _auto_chunk_size(total_items=total_items, width=gateway.total_parallelism())
+    actual_chunk_size = chunk_size or _auto_chunk_size(total_items=total_items, width=runner.capacity)
     indexed_chunks = _chunked(enumerate(iterable), chunk_size=actual_chunk_size)
 
-    max_pending = max(1, gateway.total_parallelism() * 2)
-    max_failovers = 2
-    pending: Dict[object, ChunkMeta] = {}
+    max_pending = max(1, runner.capacity * 2)
+    pending: Dict[object, List[Tuple[int, object]]] = {}
     all_errors: List[TaskError] = []
     ordered_values: Dict[int, object] = {}
     completed_values: List[object] = []
@@ -128,34 +125,22 @@ def run_foreach(
 
     def _submit_chunk(
         indexed_items: List[Tuple[int, object]],
-        *,
-        excluded: Optional[set] = None,
-        failovers: int = 0,
     ) -> None:
         """提交一个分片到集群执行。
 
         Args:
             indexed_items: 带索引的项目列表
-            excluded: 要排除的集群集合
-            failovers: 已进行的故障转移次数
         """
         # 项目级信号量：限制单项目并发，避免多个项目相互抢占。
         projects.acquire(project)
-        future, cluster = gateway.submit(
+        future = runner.submit_chunk(
             serialized_fn=serialized_fn,
             indexed_items=indexed_items,
             retries=retries,
             on_error=on_error,
-            policy=cluster_policy,
-            exclude=excluded,
         )
         future.add_done_callback(lambda _f, _project=project: projects.release(_project))
-        pending[future] = ChunkMeta(
-            indexed_items=indexed_items,
-            cluster=cluster,
-            failovers=failovers,
-            excluded_clusters=set(excluded or set()),
-        )
+        pending[future] = indexed_items
 
     while len(pending) < max_pending and not input_exhausted:
         try:
@@ -168,7 +153,7 @@ def run_foreach(
     while pending:
         done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
         for fut in done:
-            meta = pending.pop(fut)
+            indexed_items = pending.pop(fut)
             try:
                 values, errors = fut.result()
             except UserFunctionError as exc:
@@ -179,33 +164,20 @@ def run_foreach(
                         index=exc.index,
                         item_repr=exc.item_repr,
                         error=exc.cause,
-                        cluster=exc.cluster,
                         attempts=retries + 1,
                     )
                 )
             except Exception as exc:
-                # 集群级异常按块重投到其他集群，提升可用性。
-                gateway.mark_unhealthy(meta.cluster)
-                excluded = set(meta.excluded_clusters or set())
-                excluded.add(meta.cluster)
-                if meta.failovers < max_failovers:
-                    try:
-                        _submit_chunk(meta.indexed_items, excluded=excluded, failovers=meta.failovers + 1)
-                        continue
-                    except Exception:
-                        pass
+                # 本地模式下不存在跨集群 failover，按 on_error 策略处理。
                 if on_error == "raise":
-                    raise RuntimeError(
-                        f"cluster execution failed after failover attempts on {meta.cluster}: {exc}"
-                    ) from exc
-                for idx, item in meta.indexed_items:
+                    raise RuntimeError(f"local execution failed: {exc}") from exc
+                for idx, item in indexed_items:
                     all_errors.append(
                         TaskError(
                             index=idx,
                             item_repr=repr(item),
-                            error=f"cluster execution failure: {repr(exc)}",
-                            cluster=meta.cluster,
-                            attempts=meta.failovers + 1,
+                            error=f"local execution failure: {repr(exc)}",
+                            attempts=1,
                         )
                     )
             else:

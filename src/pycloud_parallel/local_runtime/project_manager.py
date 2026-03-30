@@ -54,23 +54,6 @@ class ProjectManager:
                 semaphore=threading.BoundedSemaphore(value=max(1, config.cpu_quota)),
             )
 
-    def get(self, name: str) -> ProjectConfig:
-        """获取项目配置。
-
-        Args:
-            name: 项目名称
-
-        Returns:
-            ProjectConfig: 项目配置
-
-        Raises:
-            KeyError: 当项目不存在时
-        """
-        with self._lock:
-            if name not in self._projects:
-                raise KeyError(f"project `{name}` is not registered")
-            return self._projects[name].config
-
     def ensure(self, name: str, default_cpu: int = 1) -> None:
         """确保项目存在，不存在则创建。
 
@@ -84,7 +67,7 @@ class ProjectManager:
         with self._lock:
             if name in self._projects:
                 return
-            cfg = ProjectConfig(name=name, cpu_quota=max(1, default_cpu), mem_quota=0, priority=1)
+            cfg = ProjectConfig(name=name, cpu_quota=max(1, default_cpu))
             self._projects[name] = _ProjectState(
                 config=cfg,
                 semaphore=threading.BoundedSemaphore(value=cfg.cpu_quota),

@@ -26,6 +26,7 @@
 1. 支持 `py / tar.gz / zip / whl`。
 2. 客户端以 gRPC chunk 流上传，NodeControl 边收边写临时文件。
 3. `sha256` 校验通过后生成 `code_version`。
+4. 对于同名包的重复部署，导入前会清理父包模块缓存，避免导入到旧版本路径。
 
 ### 4.2 导出规则（`export_spec`）
 
@@ -39,6 +40,7 @@
 1. 服务启动时建立 `method -> callable` 路由表。
 2. `ListServiceMethods` 返回可调用方法列表。
 3. `CallService` 与 HTTP 都按 `method` 分发。
+4. `CallService` 可携带 `service_token`；HTTP 可通过 `X-Service-Token` 或 `Authorization: Bearer ...` 传递。
 
 ## 6. HTTP 数据面
 
@@ -61,19 +63,45 @@
 ## 7. 生命周期
 
 1. 创建后进入 `RUNNING`。
-2. owner 周期性 `HeartbeatService` 续租。
-3. 超时或主动 `EndService` 后进入回收并 `STOPPED`。
-4. NodeControl 心跳上报服务路由到 InfoCenter，供 `ListServiceRoutes` 查询。
+2. `CreateService` 返回 `service_token`，owner 需要持久化该 token。
+3. owner 周期性 `HeartbeatService(owner_client_id, service_id, service_token)` 续租。
+4. 主动结束时调用 `EndService(owner_client_id, service_id, service_token)`。
+5. 超时或主动 `EndService` 后进入回收并 `STOPPED`。
+6. NodeControl 心跳上报服务路由到 InfoCenter，供 `ListServiceRoutes` 查询。
 
-## 8. 客户端建议流程
+## 8. 命名约束
+
+1. `service_name` 在活跃服务范围内应视为全局唯一。
+2. 服务发现按 `service_name` 聚合，不按 `owner_client_id` 做二次路由区分。
+3. 如果需要多租户隔离命名，应由客户端自行生成唯一名字。
+
+## 9. 客户端重启复用
+
+1. 客户端本地应缓存：
+   - `owner_client_id`
+   - `service_name`
+   - `artifact_code_version`
+   - 每个节点的 `service_id + service_token`
+2. 同一个客户端重启后，如果远端活跃服务与本地缓存满足：
+   - 同 `owner_client_id`
+   - 同 `service_name`
+   - 同 `artifact_code_version`
+   则可直接复用，不需要重复上传部署包。
+3. 如果同名服务存在但 `artifact_code_version` 不同，默认拒绝覆盖；客户端需要显式选择“replace”语义。
+4. 当前 Python 客户端默认提供：
+   - `reuse_existing_same_code=True`
+   - `replace_existing_if_code_changed=False`
+
+## 10. 客户端建议流程
 
 1. `CreateService`
-2. `ListServiceMethods`
-3. 按需 `CallService`
-4. 开启 keepalive（owner）
-5. 完成后 `EndService`
+2. 落盘保存 `service_token`
+3. `ListServiceMethods`
+4. 按需 `CallService`
+5. 开启 keepalive（owner）
+6. 完成后 `EndService`
 
-## 9. 与任务模式关系
+## 11. 与任务模式关系
 
 1. 服务会话与任务模式可并存。
 2. 两者共享 NodeControl 与代码版本管理。

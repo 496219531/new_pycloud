@@ -88,7 +88,12 @@ def test_node_registrar_syncs_service_routes(tmp_path):
 
             assert _wait_until(_route_ready, timeout_sec=6.0)
 
-            node_state.end_service(owner_client_id="owner-reg", service_id=session.service_id, reason="done")
+            node_state.end_service(
+                owner_client_id="owner-reg",
+                service_id=session.service_id,
+                service_token=session.service_token,
+                reason="done",
+            )
 
             def _route_cleared() -> bool:
                 routes = infocenter.list_service_routes(service_name="svc-reg-sync", healthy_only=True, limit=20)

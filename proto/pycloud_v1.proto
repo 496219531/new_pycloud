@@ -397,6 +397,7 @@ message HeartbeatServiceRequest {
   string service_id = 2;
   int64 seq = 3;
   google.protobuf.Timestamp timestamp = 4;
+  string service_token = 5;
 }
 
 message HeartbeatServiceResponse {
@@ -411,6 +412,7 @@ message EndServiceRequest {
   string owner_client_id = 1;
   string service_id = 2;
   string reason = 3;
+  string service_token = 4;
 }
 
 message EndServiceResponse {

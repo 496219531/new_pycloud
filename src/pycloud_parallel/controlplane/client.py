@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import os
+import re
+import socket
 import tarfile
 import tempfile
 import threading
@@ -30,6 +32,23 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 def pycloud_export(fn):
     fn.__pycloud_export__ = True
     return fn
+
+
+def _get_local_ip() -> str:
+    """获取本机 IP 地址。
+
+    Returns:
+        str: 本机 IP 地址，如果获取失败返回 "localhost"
+    """
+    try:
+        # 创建一个 UDP socket，不实际发送数据
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # 连接到一个外部地址（不实际发送数据）
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            return local_ip
+    except Exception:
+        return "localhost"
 
 
 def _now_timestamp() -> timestamp_pb2.Timestamp:
@@ -122,6 +141,96 @@ def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
             rel = p.relative_to(root)
             tf.add(p, arcname=str(rel))
     return out
+
+
+_SERVICE_SESSION_SCHEMA_VERSION = 1
+
+
+def _artifact_code_version(blob: bytes) -> str:
+    return f"sha256:{hashlib.sha256(blob).hexdigest()}"
+
+
+def _default_service_session_cache_dir() -> Path:
+    custom = str(os.environ.get("PYCLOUD_SERVICE_SESSION_DIR", "")).strip()
+    if custom:
+        return Path(custom).expanduser()
+    return Path.home() / ".pycloud_parallel" / "service_sessions"
+
+
+def _sanitize_session_cache_part(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    return text.strip("._") or "default"
+
+
+def _service_session_cache_file(
+    *,
+    owner_client_id: str,
+    service_name: str,
+    cache_dir: str = "",
+) -> Path:
+    base_dir = Path(cache_dir).expanduser() if str(cache_dir).strip() else _default_service_session_cache_dir()
+    return (
+        base_dir
+        / _sanitize_session_cache_part(owner_client_id)
+        / f"{_sanitize_session_cache_part(service_name)}.json"
+    )
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _write_private_json(path: Path, payload: Dict[str, object]) -> None:
+    _ensure_private_dir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=True, indent=2, sort_keys=True)
+            fp.write("\n")
+        try:
+            os.chmod(tmp_name, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _load_service_session_cache(
+    *,
+    owner_client_id: str,
+    service_name: str,
+    cache_dir: str = "",
+) -> Optional[Dict[str, object]]:
+    path = _service_session_cache_file(
+        owner_client_id=owner_client_id,
+        service_name=service_name,
+        cache_dir=cache_dir,
+    )
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("schema_version", 0) or 0) != _SERVICE_SESSION_SCHEMA_VERSION:
+        return None
+    if payload.get("owner_client_id") != owner_client_id or payload.get("service_name") != service_name:
+        return None
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict):
+        return None
+    return payload
 
 
 @dataclass(frozen=True)
@@ -332,6 +441,7 @@ class ServiceSessionClient:
                 service_id=self.service_id,
                 seq=self._hb_seq,
                 timestamp=_now_timestamp(),
+                service_token=self.service_token,
             ),
             timeout=self._client.timeout_sec,
         )
@@ -349,6 +459,7 @@ class ServiceSessionClient:
                 owner_client_id=self.owner_client_id,
                 service_id=self.service_id,
                 reason=reason,
+                service_token=self.service_token,
             ),
             timeout=self._client.timeout_sec,
         )
@@ -720,13 +831,21 @@ class NodeControlClient:
             raise RuntimeError(reason)
         return resp
 
-    def heartbeat_service(self, *, owner_client_id: str, service_id: str, seq: int = 0) -> pb2.HeartbeatServiceResponse:
+    def heartbeat_service(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        seq: int = 0,
+    ) -> pb2.HeartbeatServiceResponse:
         resp = self.stub.HeartbeatService(
             pb2.HeartbeatServiceRequest(
                 owner_client_id=owner_client_id,
                 service_id=service_id,
                 seq=seq,
                 timestamp=_now_timestamp(),
+                service_token=service_token,
             ),
             timeout=self.timeout_sec,
         )
@@ -734,12 +853,20 @@ class NodeControlClient:
             raise RuntimeError(_err_msg(resp.error, "heartbeat service failed"))
         return resp
 
-    def end_service(self, *, owner_client_id: str, service_id: str, reason: str = "") -> pb2.EndServiceResponse:
+    def end_service(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        reason: str = "",
+    ) -> pb2.EndServiceResponse:
         resp = self.stub.EndService(
             pb2.EndServiceRequest(
                 owner_client_id=owner_client_id,
                 service_id=service_id,
                 reason=reason,
+                service_token=service_token,
             ),
             timeout=self.timeout_sec,
         )
@@ -771,6 +898,8 @@ class MultiNodeServiceGroup:
     breaker_cooldown_sec: float = 15.0
     breaker_max_cooldown_sec: float = 120.0
     _clients: Dict[str, NodeControlClient] = field(default_factory=dict, repr=False)
+    _session_cache_file: Optional[Path] = field(default=None, repr=False)
+    _artifact_code_version: str = field(default="", repr=False)
     _route_index: int = field(default=0, repr=False)
     _route_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _breaker_states: Dict[str, NodeCircuitState] = field(default_factory=dict, repr=False)
@@ -780,8 +909,8 @@ class MultiNodeServiceGroup:
         cls,
         *,
         infocenter_target: str,
-        owner_client_id: str,
-        service_name: str,
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
         artifact_path: str = "",
         artifact_paths: Optional[Sequence[str]] = None,
         blob: Optional[bytes] = None,
@@ -805,6 +934,9 @@ class MultiNodeServiceGroup:
         min_success_nodes: int = 1,
         timeout_sec: float = 10.0,
         ensure_unique_service_name: bool = True,
+        reuse_existing_same_code: bool = True,
+        replace_existing_if_code_changed: bool = False,
+        session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
         breaker_cooldown_sec: float = 15.0,
@@ -819,7 +951,6 @@ class MultiNodeServiceGroup:
             artifact_path: 单个文件路径（优先级低于 blob，优先级高于 artifact_paths）
             artifact_paths: 文件/文件夹路径列表，会自动打包成 zip
             blob: 直接提供代码内容（优先级最高）
-            filename: 文件名（当 blob 提供时必须指定）
             runtime: 运行时版本
             entry_module: 入口模块名
             entry_callable: 入口函数名
@@ -839,6 +970,9 @@ class MultiNodeServiceGroup:
             min_success_nodes: 最小成功节点数
             timeout_sec: 超时时间
             ensure_unique_service_name: 是否确保服务名唯一
+            reuse_existing_same_code: 同 owner + 同代码时是否直接复用已存在服务
+            replace_existing_if_code_changed: 同 owner + 同服务名但代码变化时是否替换
+            session_cache_dir: 本地 service session token 缓存目录
             breaker_enabled: 是否启用熔断器
             breaker_failure_threshold: 熔断失败阈值
             breaker_cooldown_sec: 熔断冷却时间
@@ -847,9 +981,49 @@ class MultiNodeServiceGroup:
         Returns:
             MultiNodeServiceGroup: 部署的服务组
         """
-        if not owner_client_id:
+        # 生成默认的 owner_client_id 和 service_name
+        local_ip = _get_local_ip()
+
+        # 如果 owner_client_id 为空，使用本机 IP
+        effective_owner_client_id = owner_client_id
+        if not effective_owner_client_id:
+            effective_owner_client_id = f"client-{local_ip}"
+
+        # 先确定 entry_module（用于生成 service_name）
+        effective_entry_module = entry_module
+        if not effective_entry_module:
+            if filename:
+                # 优先使用 filename
+                if filename.endswith(".py"):
+                    effective_entry_module = Path(filename).stem
+            else:
+                # 尝试从 artifact_path 推断
+                if artifact_path:
+                    path = Path(artifact_path)
+                    if path.suffix == ".py":
+                        effective_entry_module = path.stem
+                # 尝试从 artifact_paths 推断
+                elif artifact_paths and len(artifact_paths) > 0:
+                    first_path = Path(artifact_paths[0])
+                    if first_path.suffix == ".py":
+                        effective_entry_module = first_path.stem
+
+        # 如果 service_name 为空，使用 entry_module + 本机 IP + 时间戳（精确到秒）
+        # 添加时间戳确保唯一性，避免服务名冲突
+        effective_service_name = service_name
+        if not effective_service_name:
+            # 生成时间戳（精确到秒）
+            timestamp = time.strftime("%Y%m%d%H%M%S")  # 格式: 20250330120000
+
+            if effective_entry_module:
+                effective_service_name = f"{effective_entry_module}-{local_ip}-{timestamp}"
+            else:
+                effective_service_name = f"service-{local_ip}-{timestamp}"
+
+        # 现在才进行校验
+        if not effective_owner_client_id:
             raise ValueError("owner_client_id is required")
-        if not service_name:
+        if not effective_service_name:
             raise ValueError("service_name is required")
 
         effective_blob = blob
@@ -896,10 +1070,9 @@ class MultiNodeServiceGroup:
                             if file_path.is_file():
                                 arcname = p.name / file_path.relative_to(p)
                                 zf.write(file_path, str(arcname))
-
-            effective_blob = Path(tmp_zip_path).read_bytes()
             if not effective_filename:
-                effective_filename = Path(tmp_zip_path).name
+                effective_filename=tmp_zip_path
+            effective_blob = Path(tmp_zip_path).read_bytes()
             effective_package_format = "zip"
 
             # 清理临时文件
@@ -917,37 +1090,28 @@ class MultiNodeServiceGroup:
             effective_blob = path.read_bytes()
             if not effective_filename:
                 effective_filename = path.name
+                # 再次尝试从文件名推断 entry_module
+                if not effective_entry_module and effective_filename.endswith(".py"):
+                    effective_entry_module = Path(effective_filename).stem
 
         if effective_blob is None:
             raise ValueError("artifact content is empty")
-        if not effective_filename:
-            raise ValueError("filename is required when blob is provided")
 
-        effective_entry_module = entry_module
-        if not effective_entry_module and effective_filename.endswith(".py"):
-            effective_entry_module = Path(effective_filename).stem
+        effective_code_version = _artifact_code_version(effective_blob)
+        session_cache_file = _service_session_cache_file(
+            owner_client_id=effective_owner_client_id,
+            service_name=effective_service_name,
+            cache_dir=session_cache_dir,
+        )
 
         with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+            existing_routes: Sequence[InfoCenterServiceRoute] = ()
             if ensure_unique_service_name:
                 existing_routes = infocenter.list_service_routes(
-                    service_name=service_name,
+                    service_name=effective_service_name,
                     healthy_only=True,
                     limit=max(100, node_limit * 10),
                 )
-                active_routes = [
-                    x
-                    for x in existing_routes
-                    if x.status in (
-                        pb2.SERVICE_STATUS_STARTING,
-                        pb2.SERVICE_STATUS_RUNNING,
-                        pb2.SERVICE_STATUS_DRAINING,
-                    )
-                ]
-                if active_routes:
-                    node_list = sorted({x.node_id for x in active_routes})
-                    raise RuntimeError(
-                        f"service_name already exists and is active: {service_name}; nodes={node_list}"
-                    )
             discovered_nodes = infocenter.list_nodes(
                 healthy_only=healthy_only,
                 tags=tags,
@@ -956,6 +1120,83 @@ class MultiNodeServiceGroup:
 
         if not discovered_nodes:
             raise RuntimeError("no available nodes from InfoCenter")
+
+        discovered_node_map = {node.node_id: node for node in discovered_nodes}
+
+        if ensure_unique_service_name:
+            active_routes = cls._select_active_routes(existing_routes)
+            if active_routes:
+                existing_infos = cls._inspect_existing_routes(active_routes=active_routes, timeout_sec=timeout_sec)
+                existing_owners = {info.owner_client_id for _, info in existing_infos}
+                existing_versions = {info.code_version for _, info in existing_infos}
+                if len(existing_owners) != 1 or len(existing_versions) != 1:
+                    raise RuntimeError(
+                        f"service_name already exists but active routes are inconsistent: {effective_service_name}"
+                    )
+
+                existing_owner = next(iter(existing_owners))
+                existing_code_version = next(iter(existing_versions))
+                if existing_owner != effective_owner_client_id:
+                    raise RuntimeError(
+                        f"service_name already exists and belongs to another owner: "
+                        f"service_name={effective_service_name}; owner={existing_owner}"
+                    )
+
+                cached_session = _load_service_session_cache(
+                    owner_client_id=effective_owner_client_id,
+                    service_name=effective_service_name,
+                    cache_dir=session_cache_dir,
+                )
+
+                if existing_code_version == effective_code_version:
+                    if not reuse_existing_same_code:
+                        raise RuntimeError(
+                            f"service_name already exists with same code_version: {effective_service_name}; "
+                            "set reuse_existing_same_code=True to reuse"
+                        )
+                    if cached_session is None or cached_session.get("artifact_code_version") != effective_code_version:
+                        raise RuntimeError(
+                            f"service_name already exists with same code_version but no reusable local token cache was found: "
+                            f"{effective_service_name}"
+                        )
+                    return cls._reuse_existing_group(
+                        owner_client_id=effective_owner_client_id,
+                        service_name=effective_service_name,
+                        artifact_code_version=effective_code_version,
+                        cache_payload=cached_session,
+                        active_routes=existing_infos,
+                        discovered_node_map=discovered_node_map,
+                        timeout_sec=timeout_sec,
+                        breaker_enabled=breaker_enabled,
+                        breaker_failure_threshold=breaker_failure_threshold,
+                        breaker_cooldown_sec=breaker_cooldown_sec,
+                        breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+                        session_cache_file=session_cache_file,
+                    )
+
+                if not replace_existing_if_code_changed:
+                    raise RuntimeError(
+                        f"service_name already exists with different code_version: {effective_service_name}; "
+                        f"existing={existing_code_version}; incoming={effective_code_version}; "
+                        "set replace_existing_if_code_changed=True to replace"
+                    )
+                if cached_session is None:
+                    raise RuntimeError(
+                        f"service_name already exists with different code_version but no local token cache was found for replacement: "
+                        f"{effective_service_name}"
+                    )
+
+                cls._end_existing_group(
+                    owner_client_id=effective_owner_client_id,
+                    cache_payload=cached_session,
+                    active_routes=existing_infos,
+                    timeout_sec=timeout_sec,
+                    reason=f"replace service due to code change: {effective_code_version}",
+                )
+                try:
+                    session_cache_file.unlink()
+                except FileNotFoundError:
+                    pass
 
         sessions: Dict[str, ServiceSessionClient] = {}
         clients: Dict[str, NodeControlClient] = {}
@@ -966,8 +1207,8 @@ class MultiNodeServiceGroup:
             client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
             try:
                 session = client.create_service_from_bytes(
-                    owner_client_id=owner_client_id,
-                    service_name=service_name,
+                    owner_client_id=effective_owner_client_id,
+                    service_name=effective_service_name,
                     filename=effective_filename,
                     blob=effective_blob,
                     runtime=runtime,
@@ -1002,9 +1243,9 @@ class MultiNodeServiceGroup:
                 f"failures={failures}"
             )
 
-        return cls(
-            owner_client_id=owner_client_id,
-            service_name=service_name,
+        group = cls(
+            owner_client_id=effective_owner_client_id,
+            service_name=effective_service_name,
             sessions=sessions,
             nodes=nodes,
             failures=failures,
@@ -1013,7 +1254,192 @@ class MultiNodeServiceGroup:
             breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
             breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
             _clients=clients,
+            _session_cache_file=session_cache_file,
+            _artifact_code_version=effective_code_version,
         )
+        group._persist_session_cache()
+        return group
+
+    @staticmethod
+    def _select_active_routes(routes: Sequence[InfoCenterServiceRoute]) -> List[InfoCenterServiceRoute]:
+        return [
+            route
+            for route in routes
+            if route.status in (
+                pb2.SERVICE_STATUS_STARTING,
+                pb2.SERVICE_STATUS_RUNNING,
+                pb2.SERVICE_STATUS_DRAINING,
+            )
+        ]
+
+    @classmethod
+    def _inspect_existing_routes(
+        cls,
+        *,
+        active_routes: Sequence[InfoCenterServiceRoute],
+        timeout_sec: float,
+    ) -> List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]]:
+        out: List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]] = []
+        failures: Dict[str, str] = {}
+        for route in active_routes:
+            client = NodeControlClient(route.control_addr, timeout_sec=timeout_sec)
+            try:
+                info = client.get_service_status(service_id=route.service_id)
+                out.append((route, info))
+            except Exception as exc:
+                failures[route.node_id] = repr(exc)
+            finally:
+                client.close()
+        if failures:
+            raise RuntimeError(f"failed to inspect existing active service routes: {failures}")
+        return out
+
+    @classmethod
+    def _reuse_existing_group(
+        cls,
+        *,
+        owner_client_id: str,
+        service_name: str,
+        artifact_code_version: str,
+        cache_payload: Dict[str, object],
+        active_routes: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
+        discovered_node_map: Dict[str, InfoCenterNode],
+        timeout_sec: float,
+        breaker_enabled: bool,
+        breaker_failure_threshold: int,
+        breaker_cooldown_sec: float,
+        breaker_max_cooldown_sec: float,
+        session_cache_file: Path,
+    ) -> "MultiNodeServiceGroup":
+        cache_nodes = cache_payload.get("nodes")
+        if not isinstance(cache_nodes, dict):
+            raise RuntimeError("invalid local service session cache: nodes missing")
+
+        sessions: Dict[str, ServiceSessionClient] = {}
+        clients: Dict[str, NodeControlClient] = {}
+        nodes: Dict[str, InfoCenterNode] = {}
+
+        try:
+            for route, info in active_routes:
+                node = discovered_node_map.get(route.node_id)
+                if node is None:
+                    raise RuntimeError(
+                        f"existing service route is outside current discovery scope: node_id={route.node_id}"
+                    )
+
+                cached_node = cache_nodes.get(route.node_id)
+                if not isinstance(cached_node, dict):
+                    raise RuntimeError(
+                        f"local service session cache missing node entry for reuse: node_id={route.node_id}"
+                    )
+
+                cached_service_id = str(cached_node.get("service_id", "")).strip()
+                cached_token = str(cached_node.get("service_token", "")).strip()
+                if cached_service_id != route.service_id:
+                    raise RuntimeError(
+                        f"local service session cache is stale for node={route.node_id}: "
+                        f"cached_service_id={cached_service_id} route_service_id={route.service_id}"
+                    )
+                if not cached_token:
+                    raise RuntimeError(f"local service session cache missing token for node={route.node_id}")
+
+                client = NodeControlClient(route.control_addr, timeout_sec=timeout_sec)
+                try:
+                    hb = client.heartbeat_service(
+                        owner_client_id=owner_client_id,
+                        service_id=route.service_id,
+                        service_token=cached_token,
+                        seq=0,
+                    )
+                except Exception:
+                    client.close()
+                    raise
+
+                sessions[route.node_id] = ServiceSessionClient(
+                    _client=client,
+                    owner_client_id=owner_client_id,
+                    service_id=route.service_id,
+                    service_token=cached_token,
+                    http_base_url=str(cached_node.get("http_base_url", "") or info.http_base_url or route.http_base_url),
+                    heartbeat_timeout_sec=max(
+                        1,
+                        int(
+                            cached_node.get("heartbeat_timeout_sec", 0)
+                            or (max(1, int(hb.next_heartbeat_in_sec or 0)) * 2)
+                            or 30
+                        ),
+                    ),
+                    worker_count=max(1, int(cached_node.get("worker_count", 0) or info.worker_count or route.worker_count or 1)),
+                    status=hb.status or info.status,
+                )
+                clients[route.node_id] = client
+                nodes[route.node_id] = node
+        except Exception:
+            for client in clients.values():
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            raise
+
+        group = cls(
+            owner_client_id=owner_client_id,
+            service_name=service_name,
+            sessions=sessions,
+            nodes=nodes,
+            failures={},
+            breaker_enabled=bool(breaker_enabled),
+            breaker_failure_threshold=max(1, int(breaker_failure_threshold)),
+            breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
+            breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
+            _clients=clients,
+            _session_cache_file=session_cache_file,
+            _artifact_code_version=artifact_code_version,
+        )
+        group._persist_session_cache()
+        return group
+
+    @classmethod
+    def _end_existing_group(
+        cls,
+        *,
+        owner_client_id: str,
+        cache_payload: Dict[str, object],
+        active_routes: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
+        timeout_sec: float,
+        reason: str,
+    ) -> None:
+        cache_nodes = cache_payload.get("nodes")
+        if not isinstance(cache_nodes, dict):
+            raise RuntimeError("invalid local service session cache: nodes missing")
+
+        failures: Dict[str, str] = {}
+        for route, _info in active_routes:
+            cached_node = cache_nodes.get(route.node_id)
+            if not isinstance(cached_node, dict):
+                failures[route.node_id] = "missing cached node entry"
+                continue
+            cached_service_id = str(cached_node.get("service_id", "")).strip()
+            cached_token = str(cached_node.get("service_token", "")).strip()
+            if cached_service_id != route.service_id or not cached_token:
+                failures[route.node_id] = "stale or missing cached token"
+                continue
+
+            client = NodeControlClient(route.control_addr, timeout_sec=timeout_sec)
+            try:
+                client.end_service(
+                    owner_client_id=owner_client_id,
+                    service_id=route.service_id,
+                    service_token=cached_token,
+                    reason=reason,
+                )
+            except Exception as exc:
+                failures[route.node_id] = repr(exc)
+            finally:
+                client.close()
+
+        if failures:
+            raise RuntimeError(f"failed to end existing active service before replace: {failures}")
 
     @staticmethod
     def _cleanup_created_services(
@@ -1032,6 +1458,44 @@ class MultiNodeServiceGroup:
                 client.close()
             except Exception:
                 pass
+
+    def _persist_session_cache(self) -> None:
+        if self._session_cache_file is None or not self.sessions:
+            return
+        payload: Dict[str, object] = {
+            "schema_version": _SERVICE_SESSION_SCHEMA_VERSION,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "owner_client_id": self.owner_client_id,
+            "service_name": self.service_name,
+            "artifact_code_version": self._artifact_code_version,
+            "nodes": {},
+        }
+        nodes_payload: Dict[str, object] = {}
+        for node_id, session in sorted(self.sessions.items()):
+            node = self.nodes.get(node_id)
+            control_addr = ""
+            if node is not None:
+                control_addr = node.control_addr
+            elif node_id in self._clients:
+                control_addr = self._clients[node_id].target
+            nodes_payload[node_id] = {
+                "control_addr": control_addr,
+                "service_id": session.service_id,
+                "service_token": session.service_token,
+                "http_base_url": session.http_base_url,
+                "heartbeat_timeout_sec": int(session.heartbeat_timeout_sec),
+                "worker_count": int(session.worker_count),
+            }
+        payload["nodes"] = nodes_payload
+        _write_private_json(self._session_cache_file, payload)
+
+    def _clear_session_cache(self) -> None:
+        if self._session_cache_file is None:
+            return
+        try:
+            self._session_cache_file.unlink()
+        except FileNotFoundError:
+            pass
 
     def __post_init__(self) -> None:
         if self.breaker_max_cooldown_sec < self.breaker_cooldown_sec:
@@ -1371,6 +1835,11 @@ class MultiNodeServiceGroup:
                 out[node_id] = session.end(reason)
             except Exception:
                 out[node_id] = None
+        if out and all(
+            resp is not None and resp.ok and resp.accepted and resp.status == pb2.SERVICE_STATUS_STOPPED
+            for resp in out.values()
+        ):
+            self._clear_session_cache()
         return out
 
     def close(self, *, end_services: bool = False, reason: str = "group close") -> None:
@@ -1383,3 +1852,376 @@ class MultiNodeServiceGroup:
             except Exception:
                 pass
         self._clients.clear()
+
+
+class _CallProxy:
+    """服务方法调用代理。
+
+    支持多种调用方式：
+    - await proxy(x=1, y=2)  # 异步调用
+    - proxy.sync(x=1, y=2)    # 同步调用
+    - await proxy.broadcast(x=1)  # 广播到所有节点
+    """
+
+    def __init__(
+        self,
+        method: str,
+        group: "MultiNodeServiceGroup",
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        via: str = "http",
+    ) -> None:
+        self._method = method
+        self._group = group
+        self._timeout_sec = timeout_sec
+        self._strategy = strategy
+        self._refresh_status = refresh_status
+        self._via = via
+
+    def __repr__(self) -> str:
+        return f"<CallProxy method={self._method!r}>"
+
+    @property
+    def method(self) -> str:
+        """返回方法名。"""
+        return self._method
+
+    async def __call__(self, **kwargs) -> Dict[str, object]:
+        """异步调用服务方法。
+
+        Args:
+            **kwargs: 方法参数
+
+        Returns:
+            Dict[str, object]: 服务的返回值
+
+        Example:
+            >>> result = await group.square(x=7)
+            >>> result = await group.fibonacci(n=10)
+        """
+        _, resp = await self._group.acall_balanced(
+            self._method,
+            kwargs,
+            timeout_sec=self._timeout_sec,
+            strategy=self._strategy,
+            refresh_status=self._refresh_status,
+            via=self._via,
+        )
+        return resp.get("data", resp)
+
+    def __await__(self):
+        """支持 await proxy() 语法。"""
+        return self().__await__()
+
+    @property
+    def sync(self) -> "_SyncCallProxy":
+        """返回同步调用代理。
+
+        Example:
+            >>> result = group.square.sync(x=7)
+        """
+        return _SyncCallProxy(
+            method=self._method,
+            group=self._group,
+            timeout_sec=self._timeout_sec,
+            strategy=self._strategy,
+            refresh_status=self._refresh_status,
+            via=self._via,
+        )
+
+    @property
+    def broadcast(self) -> "_BroadcastProxy":
+        """返回广播调用代理。
+
+        Example:
+            >>> results = await group.square.broadcast(x=7)
+            >>> # results = [(node_id, result, error), ...]
+        """
+        return _BroadcastProxy(
+            method=self._method,
+            group=self._group,
+            timeout_sec=self._timeout_sec,
+            via=self._via,
+        )
+
+    def with_options(
+        self,
+        *,
+        timeout_sec: Optional[float] = None,
+        strategy: Optional[str] = None,
+        refresh_status: Optional[bool] = None,
+        via: Optional[str] = None,
+    ) -> "_CallProxy":
+        """返回一个新的代理，使用指定的选项。
+
+        Example:
+            >>> proxy = group.square.with_options(timeout_sec=30)
+            >>> result = await proxy(x=7)
+        """
+        return _CallProxy(
+            method=self._method,
+            group=self._group,
+            timeout_sec=timeout_sec if timeout_sec is not None else self._timeout_sec,
+            strategy=strategy if strategy is not None else self._strategy,
+            refresh_status=refresh_status if refresh_status is not None else self._refresh_status,
+            via=via if via is not None else self._via,
+        )
+
+
+class _SyncCallProxy:
+    """同步调用代理。"""
+
+    def __init__(
+        self,
+        method: str,
+        group: "MultiNodeServiceGroup",
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        via: str = "http",
+    ) -> None:
+        self._method = method
+        self._group = group
+        self._timeout_sec = timeout_sec
+        self._strategy = strategy
+        self._refresh_status = refresh_status
+        self._via = via
+
+    def __repr__(self) -> str:
+        return f"<SyncCallProxy method={self._method!r}>"
+
+    def __call__(self, **kwargs) -> Dict[str, object]:
+        """同步调用服务方法。
+
+        Args:
+            **kwargs: 方法参数
+
+        Returns:
+            Dict[str, object]: 服务的返回值
+
+        Example:
+            >>> result = group.square.sync(x=7)
+        """
+        _, resp = self._group.call_balanced(
+            self._method,
+            kwargs,
+            timeout_sec=self._timeout_sec,
+            strategy=self._strategy,
+            refresh_status=self._refresh_status,
+            via=self._via,
+        )
+        return resp.get("data", resp)
+
+
+class _BroadcastProxy:
+    """广播调用代理，调用所有节点。"""
+
+    def __init__(
+        self,
+        method: str,
+        group: "MultiNodeServiceGroup",
+        *,
+        timeout_sec: float = 60.0,
+        via: str = "http",
+        max_concurrency: int = 100,
+    ) -> None:
+        self._method = method
+        self._group = group
+        self._timeout_sec = timeout_sec
+        self._via = via
+        self._max_concurrency = max_concurrency
+
+    def __repr__(self) -> str:
+        return f"<BroadcastProxy method={self._method!r}>"
+
+    async def __call__(
+        self,
+        **kwargs,
+    ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
+        """异步广播调用所有节点。
+
+        Args:
+            **kwargs: 方法参数
+
+        Returns:
+            List[Tuple[节点ID, 结果, 异常]]: 所有节点的结果
+
+        Example:
+            >>> results = await group.square.broadcast(x=7)
+            >>> for node_id, result, error in results:
+            ...     if error:
+            ...         print(f"{node_id}: FAILED - {error}")
+            ...     else:
+            ...         print(f"{node_id}: {result}")
+        """
+        return await self._group.acall_all(
+            self._method,
+            kwargs,
+            timeout_sec=self._timeout_sec,
+            via=self._via,
+            max_concurrency=self._max_concurrency,
+        )
+
+    def __await__(self):
+        return self().__await__()
+
+
+class ModuleLikeServiceGroup(MultiNodeServiceGroup):
+    """模块化的服务组，像使用 Python 模块一样调用远程服务。
+
+    支持多种调用方式：
+    - await group.square(x=7)        # 异步调用
+    - group.square.sync(x=7)         # 同步调用
+    - await group.square.broadcast() # 广播到所有节点
+    - group.list_methods()           # 列出所有可用方法
+
+    Example:
+        >>> group = ModuleLikeServiceGroup.deploy_from_infocenter(...)
+        >>>
+        >>> # 异步调用
+        >>> result = await group.square(x=7)
+        >>>
+        >>> # 批量调用
+        >>> results = await asyncio.gather(
+        ...     group.square(x=i) for i in range(100)
+        ... )
+        >>>
+        >>> # 同步调用
+        >>> result = group.square.sync(x=7)
+        >>>
+        >>> # 广播调用
+        >>> results = await group.square.broadcast(x=7)
+    """
+
+    # 缓存已发现的方法列表（使用普通属性，不是 dataclass field）
+    _discovered_methods: Optional[List[str]] = None
+
+    def __getattr__(self, name: str):
+        """动态代理服务方法。
+
+        Args:
+            name: 方法名
+
+        Returns:
+            _CallProxy: 方法调用代理
+
+        Raises:
+            AttributeError: 如果方法不存在且已成功获取到非空方法列表
+        """
+        # 避免无限递归和处理特殊属性
+        if name.startswith("_"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+        # 如果还没有尝试过发现方法，先尝试发现
+        if self._discovered_methods is None:
+            self._ensure_methods_discovered()
+
+        # 验证方法是否存在（空列表也应该验证）
+        if self._discovered_methods is not None and name not in self._discovered_methods:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no method '{name}'. "
+                f"Available methods: {self._discovered_methods}"
+            )
+
+        return _CallProxy(
+            method=name,
+            group=self,
+            timeout_sec=60.0,
+            strategy="least_inflight",
+            refresh_status=True,
+            via="http",
+        )
+
+    def _ensure_methods_discovered(self) -> None:
+        """确保方法列表已发现。"""
+        if self._discovered_methods is not None:
+            return
+
+        # 尝试从 session 获取方法
+        if self.sessions:
+            first_session = next(iter(self.sessions.values()))
+            try:
+                methods = first_session.list_methods(include_docs=True)
+                # ServiceMethodInfo 的字段名是 method
+                self._discovered_methods = [m.method for m in methods]
+                return
+            except Exception:
+                pass
+
+        # 无法获取，设置为空列表
+        self._discovered_methods = []
+
+    def list_methods(self) -> List[str]:
+        """列出所有可用的服务方法。
+
+        Returns:
+            List[str]: 方法名列表
+        """
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    @property
+    def methods(self) -> List[str]:
+        """返回所有方法名的列表。
+
+        Example:
+            >>> print(group.methods)
+            ['square', 'fibonacci', ...]
+        """
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    async def call(self, method: str, **kwargs) -> Dict[str, object]:
+        """通用异步调用接口。
+
+        Args:
+            method: 方法名
+            **kwargs: 方法参数
+
+        Returns:
+            Dict[str, object]: 服务的返回值
+        """
+        _, resp = await self.acall_balanced(method, kwargs)
+        return resp.get("data", resp)
+
+    def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
+        """通用同步调用接口。
+
+        Args:
+            method: 方法名
+            **kwargs: 方法参数
+
+        Returns:
+            Dict[str, object]: 服务的返回值
+        """
+        _, resp = self.call_balanced(method, kwargs)
+        return resp.get("data", resp)
+
+    async def call_all(
+        self,
+        method: str,
+        **kwargs,
+    ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
+        """异步调用所有节点。
+
+        Args:
+            method: 方法名
+            **kwargs: 方法参数
+
+        Returns:
+            List[Tuple[节点ID, 结果, 异常]]: 所有节点的结果
+        """
+        return await self.acall_all(method, kwargs)
+
+    def __repr__(self) -> str:
+        node_ids = list(self.sessions.keys()) if self.sessions else []
+        methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
+        return (
+            f"<ModuleLikeServiceGroup "
+            f"service={self.service_name!r} "
+            f"nodes={len(node_ids)} "
+            f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
+        )

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-调用已部署服务示例
+调用已部署服务示例。
 
-通过 InfoCenter 服务发现，从已部署的服务列表中选择节点进行调用。
-支持同步和异步两种模式。
+这个脚本只做“发现已有服务并调用数据面”：
+1. 通过 InfoCenter 查询 service route
+2. 直接走 HTTP 调用 `POST /svc/{service_id}/call/{method}`
+
+它不持有 owner 的 `service_token`，因此不负责：
+1. HeartbeatService
+2. EndService
+3. 服务重启复用
 """
 from __future__ import annotations
 
@@ -173,8 +179,9 @@ async def batch_call(
 def main() -> None:
     # 配置
     infocenter_addr = "127.0.0.1:50051"
-    service_name = "square-service"  # 修改为你的服务名
-    method = "square"                  # 修改为你的方法名
+    service_name = "square-service"
+    method = "square"
+    run_async_demo = False
 
     print("=" * 60)
     print("  PyCloud Service Client Demo")
@@ -225,6 +232,9 @@ def main() -> None:
     except Exception as exc:
         print(f"  [ERROR] {exc}")
     print()
+
+    if run_async_demo:
+        demo_async()
 
 
 def demo_async():
@@ -292,11 +302,5 @@ def demo_async():
 
     asyncio.run(run())
 
-
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "--async":
-        demo_async()
-    else:
-        main()
+    main()

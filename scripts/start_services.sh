@@ -229,6 +229,41 @@ case "${1:-start}" in
         check_service "node-2"
 
         echo ""
+        echo "  Loaded Services By Node"
+        echo "  ------------------------------------------"
+        python - "$INFOCENTER_PORT" <<'PY'
+from collections import defaultdict
+import sys
+
+target = f"127.0.0.1:{sys.argv[1]}"
+try:
+    from pycloud_parallel.controlplane.client import InfoCenterClient
+    with InfoCenterClient(target, timeout_sec=3) as client:
+        nodes = list(client.list_nodes(healthy_only=False, limit=500))
+        routes = list(client.list_service_routes(healthy_only=False, limit=5000))
+except Exception as exc:
+    print(f"  (query failed: {exc})")
+    raise SystemExit(0)
+
+service_names = defaultdict(set)
+for route in routes:
+    if route.node_id:
+        name = (route.service_name or "").strip()
+        if name:
+            service_names[route.node_id].add(name)
+
+if not nodes:
+    print("  (no nodes)")
+else:
+    for node in sorted(nodes, key=lambda x: x.node_id):
+        names = sorted(service_names.get(node.node_id, set()))
+        if names:
+            print(f"  - {node.node_id}: {', '.join(names)}")
+        else:
+            print(f"  - {node.node_id}: (none)")
+PY
+
+        echo ""
         ;;
 
     logs)

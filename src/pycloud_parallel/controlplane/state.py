@@ -62,6 +62,10 @@ _ROUTER_CACHE_LOCK = threading.Lock()
 _ROUTER_CACHE: Dict[str, Tuple[Dict[str, Any], Dict[str, Tuple[str, str]]]] = {}
 
 
+def _artifact_module_name(artifact_path: str) -> str:
+    return f"_pycloud_user_{hashlib.sha1(artifact_path.encode('utf-8')).hexdigest()}"
+
+
 def _normalize_package_format(package_format: str, filename: str) -> str:
     raw = str(package_format or "").strip().lower().replace("_", "").replace(".", "")
     if raw in ("py", "python"):
@@ -131,7 +135,7 @@ def _load_user_module(
     format_name = _normalize_package_format(package_format, path.name)
 
     if format_name == "py" and path.is_file() and path.suffix.lower() == ".py":
-        module_name = f"_pycloud_user_{hashlib.sha1(artifact_path.encode('utf-8')).hexdigest()}"
+        module_name = _artifact_module_name(artifact_path)
         loaded = sys.modules.get(module_name)
         if loaded is not None:
             return loaded
@@ -147,6 +151,10 @@ def _load_user_module(
         raise RuntimeError("entry_module is required for package artifacts")
 
     importlib.invalidate_caches()
+    # 清理父包缓存，避免重复部署同名包时命中旧 __path__。
+    root_module = entry_module.split(".", 1)[0].strip()
+    if root_module:
+        _purge_module_tree(root_module)
     _purge_module_tree(entry_module)
     sys.path.insert(0, artifact_path)
     try:
@@ -156,6 +164,22 @@ def _load_user_module(
             sys.path.remove(artifact_path)
         except ValueError:
             pass
+
+
+def _purge_loaded_artifact_modules(
+    artifact_path: str,
+    *,
+    entry_module: str,
+    package_format: str,
+) -> None:
+    format_name = _normalize_package_format(package_format, Path(artifact_path).name)
+    if format_name == "py":
+        _purge_module_tree(_artifact_module_name(artifact_path))
+        return
+    root_module = str(entry_module or "").split(".", 1)[0].strip()
+    if root_module:
+        _purge_module_tree(root_module)
+    _purge_module_tree(str(entry_module or "").strip())
 
 
 def _build_callable_router(
@@ -283,6 +307,44 @@ def _load_callable_router(
     with _ROUTER_CACHE_LOCK:
         _ROUTER_CACHE[key] = loaded
     return loaded
+
+
+def _discover_callable_methods(
+    artifact_path: str,
+    *,
+    entry_module: str,
+    package_format: str,
+    export_mode: str,
+    export_methods: Sequence[str],
+    export_decorator: str,
+    entry_callable: str,
+) -> Dict[str, Tuple[str, str]]:
+    mode, methods, decorator = _normalize_export_spec(
+        mode=export_mode,
+        methods=export_methods,
+        decorator=export_decorator,
+        entry_callable=entry_callable,
+    )
+    module = _load_user_module(
+        artifact_path,
+        entry_module=entry_module,
+        package_format=package_format,
+    )
+    try:
+        _router, method_info = _build_callable_router(
+            module,
+            mode=mode,
+            methods=methods,
+            decorator=decorator,
+            entry_callable=entry_callable,
+        )
+        return dict(method_info)
+    finally:
+        _purge_loaded_artifact_modules(
+            artifact_path,
+            entry_module=entry_module,
+            package_format=package_format,
+        )
 
 
 def _invoke_user_callable(fn, payload: dict):
@@ -979,10 +1041,10 @@ class NodeControlState:
         runtime: str,
         entry_module: str,
         entry_callable: str,
-        package_format: str,
-        export_mode: str,
-        export_methods: Sequence[str],
-        export_decorator: str,
+        package_format: str = "",
+        export_mode: str = "",
+        export_methods: Sequence[str] = (),
+        export_decorator: str = "",
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -1004,7 +1066,7 @@ class NodeControlState:
             export_decorator=export_decorator,
             chunks=chunks,
         )
-        _router, method_info = _load_callable_router(
+        method_info = _discover_callable_methods(
             artifact.path,
             entry_module=artifact.entry_module,
             package_format=artifact.package_format,
@@ -1047,7 +1109,7 @@ class NodeControlState:
             self._services[service_id] = session
         return session
 
-    def heartbeat_service(self, *, owner_client_id: str, service_id: str) -> ServiceSession:
+    def heartbeat_service(self, *, owner_client_id: str, service_id: str, service_token: str) -> ServiceSession:
         now = utc_now()
         with self._lock:
             session = self._services.get(service_id)
@@ -1055,6 +1117,8 @@ class NodeControlState:
                 raise KeyError("service not found")
             if session.owner_client_id != owner_client_id:
                 raise PermissionError("owner_client_id mismatch")
+            if not service_token or session.service_token != service_token:
+                raise PermissionError("service_token mismatch")
             if session.status == pb2.SERVICE_STATUS_STOPPED:
                 raise RuntimeError("service is stopped")
             session.last_heartbeat_at = now
@@ -1063,13 +1127,15 @@ class NodeControlState:
                 session.status = pb2.SERVICE_STATUS_RUNNING
             return session
 
-    def end_service(self, *, owner_client_id: str, service_id: str, reason: str) -> ServiceSession:
+    def end_service(self, *, owner_client_id: str, service_id: str, service_token: str, reason: str) -> ServiceSession:
         with self._lock:
             session = self._services.get(service_id)
             if session is None:
                 raise KeyError("service not found")
             if session.owner_client_id != owner_client_id:
                 raise PermissionError("owner_client_id mismatch")
+            if not service_token or session.service_token != service_token:
+                raise PermissionError("service_token mismatch")
             self._stop_service_locked(session, reason=reason or "owner requested")
             return session
 

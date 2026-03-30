@@ -44,7 +44,7 @@
 ### 4.1 `UploadCodeMeta` / `CreateServiceMeta` 关键字段
 
 1. `entry_module`
-2. `entry_callable`（兼容字段）
+2. `entry_callable`（兼容字段，建议新代码优先使用 `export_spec` + `method` 调用）
 3. `package_format`：`py | tar.gz | zip | whl`
 4. `export_spec`：`ModuleExportSpec`
 
@@ -59,8 +59,15 @@
 1. 客户端先 `ListServiceMethods(service_id)` 获取可调用方法。
 2. 再 `CallService(service_id, method, payload, timeout_sec, service_token)`。
 3. 成功返回 `data`；失败返回 `task_error/error`。
+4. `service_token` 也是服务管理面的凭证；`HeartbeatService` 与 `EndService` 也需要携带它。
 
-## 6. WorkerInternalService（本机内部）
+## 6. 服务命名约束
+
+1. `service_name` 用于服务发现与路由查询。
+2. 当前实现默认将活跃 `service_name` 视为全局唯一。
+3. `owner_client_id` 用于权限与生命周期控制，不参与同名服务的路由区分。
+
+## 7. WorkerInternalService（本机内部）
 
 1. `PollTask`
 2. `HeartbeatTask`
@@ -68,16 +75,22 @@
 
 > 该服务用于本机 worker 协同，生产场景一般不直接给业务客户端调用。
 
-## 7. 错误语义（实现约定）
+## 8. 错误语义（实现约定）
 
 1. 业务执行异常：`FAILED_USER`
 2. 基础设施异常：`FAILED_INFRA`（任务模式可重试至 `max_retries`）
 3. 服务方法不存在：`NOT_FOUND`
 4. 服务 token 错误：`PERMISSION_DENIED`
+5. `owner_client_id` 不匹配：`PERMISSION_DENIED`
 
-## 8. 当前实现补充
+## 9. 当前实现补充
 
 1. 上传是“流式分块 + NodeControl 边收边写临时文件”。
 2. 校验 `sha256` 后落地为 `code_version=sha256:<digest>`。
 3. 包格式为归档时会解压到独立目录并按 `entry_module` 导入。
 4. 服务会话调用支持 gRPC 与 HTTP 双通道（见 `SERVICE_SESSION_PROTOCOL_V1.md`）。
+5. 重复部署同名包时，服务端会在导入前清理父包模块缓存，避免命中旧路径。
+6. `MultiNodeServiceGroup.deploy_from_infocenter(...)` 当前支持：
+   - 同 `service_name + owner_client_id + code_version` 时直接复用活跃服务
+   - 同名但代码变化时默认拒绝，只有 `replace_existing_if_code_changed=True` 才会先结束旧服务再重建
+7. Python 客户端会把 `service_id/service_token` 本地落盘，供重启后复用管理权限。

@@ -1,0 +1,467 @@
+"""测试 ModuleLikeServiceGroup 的模块化调用功能。"""
+
+import asyncio
+from unittest.mock import MagicMock, AsyncMock, patch
+
+import pytest
+
+
+class TestCallProxy:
+    """测试 _CallProxy 类。"""
+
+    def test_repr(self):
+        """测试 __repr__ 方法。"""
+        from pycloud_parallel.controlplane.client import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        assert "square" in repr(proxy)
+
+    def test_method_property(self):
+        """测试 method 属性。"""
+        from pycloud_parallel.controlplane.client import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("fibonacci", mock_group)
+
+        assert proxy.method == "fibonacci"
+
+    def test_sync_property(self):
+        """测试 sync 属性。"""
+        from pycloud_parallel.controlplane.client import _CallProxy, _SyncCallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        sync_proxy = proxy.sync
+
+        assert isinstance(sync_proxy, _SyncCallProxy)
+        assert sync_proxy._method == "square"
+
+    def test_broadcast_property(self):
+        """测试 broadcast 属性。"""
+        from pycloud_parallel.controlplane.client import _CallProxy, _BroadcastProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        broadcast_proxy = proxy.broadcast
+
+        assert isinstance(broadcast_proxy, _BroadcastProxy)
+        assert broadcast_proxy._method == "square"
+
+    def test_with_options(self):
+        """测试 with_options 方法。"""
+        from pycloud_parallel.controlplane.client import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group, timeout_sec=60.0)
+
+        new_proxy = proxy.with_options(timeout_sec=30.0, strategy="round_robin")
+
+        assert new_proxy._timeout_sec == 30.0
+        assert new_proxy._strategy == "round_robin"
+        assert new_proxy._method == "square"
+
+    def test_async_call(self):
+        """测试异步调用。"""
+        from pycloud_parallel.controlplane.client import _CallProxy
+
+        mock_group = AsyncMock()
+        mock_group.acall_balanced = AsyncMock(return_value=("node1", {"data": {"result": 49}}))
+        proxy = _CallProxy("square", mock_group)
+
+        async def test():
+            result = await proxy(x=7)
+            # resp.get("data", resp) 返回 {"result": 49}
+            assert result == {"result": 49}
+            mock_group.acall_balanced.assert_called_once_with(
+                "square",
+                {"x": 7},
+                timeout_sec=60.0,
+                strategy="least_inflight",
+                refresh_status=True,
+                via="http",
+            )
+
+        asyncio.run(test())
+
+    def test_await_syntax(self):
+        """测试 await 语法。"""
+        from pycloud_parallel.controlplane.client import _CallProxy
+
+        mock_group = AsyncMock()
+        mock_group.acall_balanced = AsyncMock(return_value=("node1", {"data": {"y": 100}}))
+        proxy = _CallProxy("square", mock_group)
+
+        async def test():
+            result = await proxy(x=10)
+            assert result == {"y": 100}
+
+        asyncio.run(test())
+
+
+class TestSyncCallProxy:
+    """测试 _SyncCallProxy 类。"""
+
+    def test_repr(self):
+        """测试 __repr__ 方法。"""
+        from pycloud_parallel.controlplane.client import _SyncCallProxy
+
+        mock_group = MagicMock()
+        proxy = _SyncCallProxy("square", mock_group)
+
+        assert "square" in repr(proxy)
+
+    def test_sync_call(self):
+        """测试同步调用。"""
+        from pycloud_parallel.controlplane.client import _SyncCallProxy
+
+        mock_group = MagicMock()
+        mock_group.call_balanced = MagicMock(return_value=("node1", {"data": {"result": 64}}))
+        proxy = _SyncCallProxy("square", mock_group)
+
+        result = proxy(x=8)
+
+        assert result == {"result": 64}
+        mock_group.call_balanced.assert_called_once()
+
+
+class TestBroadcastProxy:
+    """测试 _BroadcastProxy 类。"""
+
+    def test_repr(self):
+        """测试 __repr__ 方法。"""
+        from pycloud_parallel.controlplane.client import _BroadcastProxy
+
+        mock_group = MagicMock()
+        proxy = _BroadcastProxy("square", mock_group)
+
+        assert "square" in repr(proxy)
+
+    def test_async_broadcast(self):
+        """测试异步广播调用。"""
+        from pycloud_parallel.controlplane.client import _BroadcastProxy
+
+        mock_group = AsyncMock()
+        mock_results = [
+            ("node1", {"data": {"result": 49}}, None),
+            ("node2", {"data": {"result": 49}}, None),
+        ]
+        mock_group.acall_all = AsyncMock(return_value=mock_results)
+        proxy = _BroadcastProxy("square", mock_group)
+
+        async def test():
+            results = await proxy(x=7)
+            assert len(results) == 2
+            # acall_all 返回的是完整响应，不是 data 部分
+            assert results[0][1] == {"data": {"result": 49}}
+
+        asyncio.run(test())
+
+
+class TestModuleLikeServiceGroup:
+    """测试 ModuleLikeServiceGroup 类。"""
+
+    def test_getattr_creates_proxy(self):
+        """测试 __getattr__ 创建代理。"""
+        from pycloud_parallel.controlplane.client import (
+            ModuleLikeServiceGroup,
+            _CallProxy,
+        )
+        from unittest.mock import MagicMock
+
+        # 模拟有方法的 session
+        mock_session = MagicMock()
+        mock_method_info = MagicMock()
+        mock_method_info.method = "square"
+        mock_session.list_methods.return_value = [mock_method_info]
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={"node1": mock_session},
+            nodes={"node1": MagicMock()},
+        )
+        group._discovered_methods = None
+
+        proxy = group.square
+
+        assert isinstance(proxy, _CallProxy)
+        assert proxy._method == "square"
+
+    def test_getattr_with_empty_methods_raises(self):
+        """测试当方法列表为空时，访问任何方法都应该报错。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from unittest.mock import MagicMock
+
+        # 模拟返回空方法列表的 session
+        mock_session = MagicMock()
+        mock_session.list_methods.return_value = []
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={"node1": mock_session},
+            nodes={"node1": MagicMock()},
+        )
+        group._discovered_methods = None
+
+        # 当列表为空时，访问任何方法都应该报错
+        with pytest.raises(AttributeError, match="has no method 'square'"):
+            _ = group.square
+
+    def test_getattr_with_discovered_methods(self):
+        """测试已发现方法时的 __getattr__。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+        group._discovered_methods = ["square", "fibonacci"]
+
+        proxy = group.square
+        assert proxy._method == "square"
+
+    def test_getattr_unknown_method_raises(self):
+        """测试访问已知列表中不存在的方法时抛出异常。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+        # 设置已知的非空方法列表
+        group._discovered_methods = ["square", "fibonacci"]
+
+        # 当列表非空且包含已知方法时，访问未知方法应该报错
+        with pytest.raises(AttributeError, match="has no method 'unknown'"):
+            _ = group.unknown
+
+    def test_getattr_private_raises(self):
+        """测试访问私有属性时抛出异常。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+
+        with pytest.raises(AttributeError):
+            _ = group._private
+
+    def test_methods_property(self):
+        """测试 methods 属性。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+        group._discovered_methods = ["square", "fibonacci"]
+
+        assert group.methods == ["square", "fibonacci"]
+
+    def test_repr(self):
+        """测试 __repr__ 方法。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="compute-service",
+            sessions={"node1": MagicMock()},
+            nodes={"node1": MagicMock()},
+        )
+        group._discovered_methods = ["square", "fibonacci"]
+
+        repr_str = repr(group)
+
+        assert "compute-service" in repr_str
+        assert "square" in repr_str
+
+    def test_repr_not_discovered(self):
+        """测试未发现方法时的 __repr__。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="compute-service",
+            sessions={},
+            nodes={},
+        )
+        group._discovered_methods = None
+
+        repr_str = repr(group)
+
+        assert "compute-service" in repr_str
+
+    def test_async_call_interface(self):
+        """测试异步 call 接口。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+        group.acall_balanced = AsyncMock(return_value=("node1", {"data": {"result": 100}}))
+
+        async def test():
+            result = await group.call("square", x=10)
+            assert result == {"result": 100}
+
+        asyncio.run(test())
+
+    def test_sync_call_interface(self):
+        """测试同步 call_sync 接口。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+        group.call_balanced = MagicMock(return_value=("node1", {"data": {"result": 100}}))
+
+        result = group.call_sync("square", x=10)
+        assert result == {"result": 100}
+
+    def test_async_call_all_interface(self):
+        """测试异步 call_all 接口。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="test-service",
+            sessions={},
+            nodes={},
+        )
+        mock_results = [("node1", {"result": 49}, None)]
+        group.acall_all = AsyncMock(return_value=mock_results)
+
+        async def test():
+            results = await group.call_all("square", x=7)
+            assert len(results) == 1
+
+        asyncio.run(test())
+
+
+class TestIntegration:
+    """集成测试，测试完整的调用流程。"""
+
+    def test_full_async_flow(self):
+        """测试完整的异步调用流程。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        # 模拟 session
+        mock_session = MagicMock()
+        mock_method_info = MagicMock()
+        mock_method_info.method = "square"
+        mock_session.list_methods.return_value = [mock_method_info]
+
+        # 模拟 group
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="compute-service",
+            sessions={"node1": mock_session, "node2": MagicMock()},
+            nodes={"node1": MagicMock(), "node2": MagicMock()},
+        )
+
+        # 模拟 acall_balanced
+        async def mock_acall(method, payload, **kwargs):
+            if method == "square":
+                x = payload.get("x", 0)
+                return ("node1", {"data": {"x": x, "y": x * x}})
+            raise ValueError(f"Unknown method: {method}")
+
+        group.acall_balanced = mock_acall
+
+        async def run_test():
+            # 调用远程方法，就像本地函数一样
+            result1 = await group.square(x=7)
+            assert result1 == {"x": 7, "y": 49}
+
+            result2 = await group.square(x=10)
+            assert result2 == {"x": 10, "y": 100}
+
+        asyncio.run(run_test())
+
+    def test_full_sync_flow(self):
+        """测试完整的同步调用流程。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        # 模拟 session
+        mock_session = MagicMock()
+        mock_method_info = MagicMock()
+        mock_method_info.method = "square"
+        mock_session.list_methods.return_value = [mock_method_info]
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="compute-service",
+            sessions={"node1": mock_session},
+            nodes={"node1": MagicMock()},
+        )
+
+        def mock_call(method, payload, **kwargs):
+            if method == "square":
+                x = payload.get("x", 0)
+                return ("node1", {"data": {"x": x, "y": x * x}})
+            raise ValueError(f"Unknown method: {method}")
+
+        group.call_balanced = mock_call
+
+        # 同步调用
+        result = group.square.sync(x=5)
+        assert result == {"x": 5, "y": 25}
+
+    def test_full_broadcast_flow(self):
+        """测试完整的广播调用流程。"""
+        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+
+        # 模拟 session
+        mock_session = MagicMock()
+        mock_method_info = MagicMock()
+        mock_method_info.method = "square"
+        mock_session.list_methods.return_value = [mock_method_info]
+
+        group = ModuleLikeServiceGroup(
+            owner_client_id="test",
+            service_name="compute-service",
+            sessions={"node1": mock_session, "node2": MagicMock()},
+            nodes={"node1": MagicMock(), "node2": MagicMock()},
+        )
+
+        async def mock_acall_all(method, payload, **kwargs):
+            return [
+                ("node1", {"data": {"x": 7, "y": 49}}, None),
+                ("node2", {"data": {"x": 7, "y": 49}}, None),
+            ]
+
+        group.acall_all = mock_acall_all
+
+        async def run_test():
+            results = await group.square.broadcast(x=7)
+
+            assert len(results) == 2
+            for node_id, result, error in results:
+                assert error is None
+                assert result == {"data": {"x": 7, "y": 49}}
+
+        asyncio.run(run_test())
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

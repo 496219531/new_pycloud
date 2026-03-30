@@ -56,7 +56,12 @@ def test_service_session_client_roundtrip(tmp_path):
             )
             assert session.status == pb2.SERVICE_STATUS_RUNNING
 
-            hb = client.heartbeat_service(owner_client_id=session.owner_client_id, service_id=session.service_id, seq=1)
+            hb = client.heartbeat_service(
+                owner_client_id=session.owner_client_id,
+                service_id=session.service_id,
+                service_token=session.service_token,
+                seq=1,
+            )
             assert hb.accepted is True
             assert hb.status == pb2.SERVICE_STATUS_RUNNING
 

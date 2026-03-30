@@ -15,31 +15,27 @@ import warnings
 from typing import Callable, Iterable, Optional
 
 from .ast_rewriter import rewrite_function
-from .config import ProjectConfig, RuntimeConfig
-from .runtime import configure_runtime, get_runtime
+from .config import ProjectConfig, RuntimeConfig, normalize_runtime_config
+from .runtime import Runtime, configure_runtime, get_runtime
 
 
-def configure(*, config: Optional[RuntimeConfig] = None, config_path: Optional[str] = None, reset: bool = True):
+def configure(*, config: Optional[RuntimeConfig] = None, reset: bool = True):
     """��置 PyCloud 运行时环境。
 
-    这是统一的配置入口点，支持以下配置方式：
-    - 直接传入 RuntimeConfig 对象
-    - 从 pycloud.yaml 文件加载
-    - 从环境变量加载（优先级最高）
+    这是统一的配置入口点，仅支持代码内传入 RuntimeConfig。
 
     Args:
         config: 可选的运行时配置对象
-        config_path: 配置文件路径（默认为 pycloud.yaml）
         reset: 是否重置现有运行时（默认为 True）
 
     Returns:
         Runtime: 配置好的运行时实例
     """
-    # 统一入口：支持代码内传配置或从 pycloud.yaml/环境变量加载。
-    return configure_runtime(config=config, config_path=config_path, reset=reset)
+    # 统一入口：仅支持代码配置，未传则使用默认本地配置。
+    return configure_runtime(config=config, reset=reset)
 
 
-def project(name: str, cpu_quota: int, mem_quota: int = 0, priority: int = 1) -> str:
+def project(name: str, cpu_quota: int) -> str:
     """注册一个项目并设置其资源配额。
 
     项目用于隔离不同任务的资源使用，确保多个项目可以同时运行而不会相互抢占资源。
@@ -47,14 +43,12 @@ def project(name: str, cpu_quota: int, mem_quota: int = 0, priority: int = 1) ->
     Args:
         name: 项目名称
         cpu_quota: CPU 配额（并发任务数上限）
-        mem_quota: 内存配额（MB，当前版本未使用）
-        priority: 项目优先级（当前版本未使用）
 
     Returns:
         str: 返回项目名称
 
     Example:
-        >>> project("data-processing", cpu_quota=4, mem_quota=8192)
+        >>> project("data-processing", cpu_quota=4)
         'data-processing'
     """
     runtime = get_runtime()
@@ -62,8 +56,6 @@ def project(name: str, cpu_quota: int, mem_quota: int = 0, priority: int = 1) ->
         ProjectConfig(
             name=name,
             cpu_quota=max(1, int(cpu_quota)),
-            mem_quota=max(0, int(mem_quota)),
-            priority=max(1, int(priority)),
         )
     )
     return name
@@ -77,9 +69,9 @@ def foreach(
     on_error: Optional[str] = "skip",
     retries: Optional[int] = 0,
     project: Optional[str] = None,
-    cluster_policy: str = "weighted_least_load",
     chunk_size: Optional[int] = None,
     include_errors: bool = False,
+    max_workers: Optional[int] = None,
 ):
     """显式并行执行函数。
 
@@ -92,9 +84,9 @@ def foreach(
         on_error: 错误处理策略，"skip" 跳过错误，"raise" 抛出异常
         retries: 失败重试次数
         project: 项目名称（用于资源隔离）
-        cluster_policy: 集群选择策略
         chunk_size: 分片大小（None 表示自动计算）
         include_errors: 是否在返回值中包含错误信息
+        max_workers: 进程数（None 表示使用现有 runtime，>0 表示创建新的 runtime 并在函数结束时关闭）
 
     Returns:
         如果 include_errors=False，返回结果列表
@@ -103,22 +95,54 @@ def foreach(
     Example:
         >>> results = foreach([1, 2, 3], lambda x: x * 2)
         >>> print(results)  # [2, 4, 6]
+
+        >>> # 使用自定义进程数，函数结束后自动关闭进程池
+        >>> results = foreach([1, 2, 3], lambda x: x * 2, max_workers=8)
     """
     # 显式并行 API：当自动 AST 改写不适用时，调用方可直接使用。
-    runtime = get_runtime()
-    result = runtime.foreach(
-        iterable=iterable,
-        fn=fn,
-        mode=mode,
-        on_error=on_error,
-        retries=retries,
-        project=project,
-        cluster_policy=cluster_policy,
-        chunk_size=chunk_size,
-    )
-    if include_errors:
-        return result
-    return result.values
+
+    # 如果指定了 max_workers，创建临时 runtime 并在函数结束时清理
+    should_cleanup = False
+    temp_runtime = None
+    if max_workers is not None and max_workers > 0:
+        # 直接创建新的 Runtime 实例，不影响全局 runtime
+        cfg = normalize_runtime_config(RuntimeConfig(max_workers=max_workers))
+        temp_runtime = Runtime(cfg)
+        should_cleanup = True
+
+    try:
+        runtime = temp_runtime if temp_runtime is not None else get_runtime()
+        result = runtime.foreach(
+            iterable=iterable,
+            fn=fn,
+            mode=mode,
+            on_error=on_error,
+            retries=retries,
+            project=project,
+            chunk_size=chunk_size,
+        )
+
+        # 如果使用了临时 runtime，将其错误和指标同步到全局 runtime
+        if should_cleanup and temp_runtime is not None:
+            global_runtime = get_runtime()
+            # 同步错误信息
+            temp_errors = temp_runtime.get_last_errors()
+            if temp_errors:
+                global_runtime._last_errors.value = temp_errors
+            # 同步指标
+            temp_metrics = temp_runtime.snapshot_metrics()
+            with global_runtime._metrics_lock:
+                global_runtime.metrics.submitted_jobs += temp_metrics["submitted_jobs"]
+                global_runtime.metrics.succeeded_jobs += temp_metrics["succeeded_jobs"]
+                global_runtime.metrics.failed_jobs += temp_metrics["failed_jobs"]
+
+        if include_errors:
+            return result
+        return result.values
+    finally:
+        # 清理临时创建的 runtime
+        if should_cleanup and temp_runtime is not None:
+            temp_runtime.shutdown()
 
 
 def last_errors():
@@ -160,7 +184,7 @@ def parallel_for(
     on_error: str = "skip",
     retries: int = 0,
     project: Optional[str] = None,
-    cluster_policy: str = "weighted_least_load",
+    max_workers: Optional[int] = None,
 ):
     """并行 for 循环装饰器。
 
@@ -177,7 +201,7 @@ def parallel_for(
         on_error: 错误处理策略（"skip" 或 "raise"）
         retries: 失败重试次数
         project: 项目名称
-        cluster_policy: 集群选择策略
+        max_workers: 进程数（None 表示使用现有 runtime，>0 表示创建新的 runtime 并在函数结束时关闭）
 
     Returns:
         Callable: 装饰器函数
@@ -191,6 +215,14 @@ def parallel_for(
         ...     return results
         >>> process_items([1, 2, 3])  # 会并行执行
         [2, 4, 6]
+
+        >>> # 使用自定义进程数，函数结束后自动关闭进程池
+        >>> @parallel_for(max_workers=8)
+        ... def process_items(items):
+        ...     results = []
+        ...     for item in items:
+        ...             results.append(item * 2)
+        ...     return results
     """
     # 装饰器入口：首次调用时尝试 AST 改写，可改写则并行，不可改写则回退串行。
     def decorator(func: Callable):
@@ -219,7 +251,7 @@ def parallel_for(
                             on_error=on_error,
                             retries=retries,
                             project=project,
-                            cluster_policy=cluster_policy,
+                            max_workers=max_workers,
                         )
                         rewrite = rewrite_function(func, parallel_foreach)
                         if rewrite.function is not None:

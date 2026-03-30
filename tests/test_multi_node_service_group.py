@@ -43,6 +43,25 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Ser
     return server, f"127.0.0.1:{port}", state
 
 
+def _sync_node_services(
+    info_target: str,
+    *,
+    node_id: str,
+    control_addr: str,
+    tags: list[str],
+    state: NodeControlState,
+) -> None:
+    with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+        infocenter.register_node(
+            node_id=node_id,
+            control_addr=control_addr,
+            capacity=16,
+            queue_capacity=64,
+            tags=tags,
+            services=state.service_reports(),
+        )
+
+
 def test_multi_node_group_deploy_and_call(tmp_path):
     info_server, info_target, _info_state = _start_infocenter_server()
     n1_server, n1_target, n1_state = _start_nodecontrol_server("node-multi-01", str(tmp_path / "n1_code"))
@@ -75,6 +94,7 @@ def test_multi_node_group_deploy_and_call(tmp_path):
             min_success_nodes=2,
             allow_partial=False,
             timeout_sec=10.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
         )
 
         try:
@@ -150,6 +170,7 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             breaker_failure_threshold=1,
             breaker_cooldown_sec=0.8,
             breaker_max_cooldown_sec=2.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
         )
 
         try:
@@ -235,39 +256,50 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
 
 def test_service_route_query_and_duplicate_guard(tmp_path):
     info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-route-01", str(tmp_path / "route_n1_code"))
     try:
         with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
-            infocenter.register_node(
-                node_id="node-route-01",
-                control_addr="127.0.0.1:59999",
-                capacity=16,
-                queue_capacity=64,
-                tags=["route"],
-                services=[
-                    pb2.ServiceRouteReport(
-                        service_name="svc-existing",
-                        service_id="svc-existing-id-01",
-                        status=pb2.SERVICE_STATUS_RUNNING,
-                        worker_count=4,
-                        alive_workers=4,
-                        in_flight=1,
-                        http_base_url="http://127.0.0.1:18099/svc/svc-existing-id-01",
-                    )
-                ],
-            )
-
-            routes = infocenter.list_service_routes(service_name="svc-existing", healthy_only=True, limit=20)
-            assert len(routes) == 1
-            assert routes[0].service_name == "svc-existing"
-            assert routes[0].service_id == "svc-existing-id-01"
-            assert routes[0].node_id == "node-route-01"
-            assert routes[0].status == pb2.SERVICE_STATUS_RUNNING
+            infocenter.register_node(node_id="node-route-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["route"])
 
         blob = (
             b"def run(payload):\n"
             b"    return {'ok': True}\n"
         )
+
+        existing_group = MultiNodeServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-existing",
+            service_name="svc-existing",
+            blob=blob,
+            filename="svc_existing.py",
+            runtime="py3.11",
+            entry_module="svc_existing",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["route"],
+            min_success_nodes=1,
+            allow_partial=False,
+            timeout_sec=5.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
+        )
+        _sync_node_services(
+            info_target,
+            node_id="node-route-01",
+            control_addr=n1_target,
+            tags=["route"],
+            state=n1_state,
+        )
+
         try:
+            with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+                routes = infocenter.list_service_routes(service_name="svc-existing", healthy_only=True, limit=20)
+                assert len(routes) == 1
+                assert routes[0].service_name == "svc-existing"
+                assert routes[0].node_id == "node-route-01"
+                assert routes[0].status == pb2.SERVICE_STATUS_RUNNING
+
             MultiNodeServiceGroup.deploy_from_infocenter(
                 infocenter_target=info_target,
                 owner_client_id="owner-dup-check",
@@ -285,9 +317,197 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
                 allow_partial=True,
                 timeout_sec=5.0,
                 ensure_unique_service_name=True,
+                session_cache_dir=str(tmp_path / "session_cache"),
             )
             assert False, "expected duplicate service name to be rejected"
         except RuntimeError as exc:
             assert "service_name already exists" in str(exc)
+        finally:
+            existing_group.close(end_services=True, reason="duplicate guard cleanup")
     finally:
         info_server.stop(grace=0)
+        n1_server.stop(grace=0)
+        n1_state.close()
+
+
+def test_multi_node_group_reuses_existing_same_code(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-reuse-01", str(tmp_path / "reuse_n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-reuse-02", str(tmp_path / "reuse_n2_code"))
+    cache_dir = tmp_path / "session_cache"
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-reuse-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["reuse"])
+            infocenter.register_node(node_id="node-reuse-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["reuse"])
+
+        blob = (
+            b"def run(payload):\n"
+            b"    value = int(payload.get('value', 0))\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+
+        group1 = MultiNodeServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-reuse-test",
+            service_name="svc-reuse-test",
+            blob=blob,
+            filename="svc_reuse_test.py",
+            runtime="py3.11",
+            entry_module="svc_reuse_test",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["reuse"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(cache_dir),
+        )
+        _sync_node_services(info_target, node_id="node-reuse-01", control_addr=n1_target, tags=["reuse"], state=n1_state)
+        _sync_node_services(info_target, node_id="node-reuse-02", control_addr=n2_target, tags=["reuse"], state=n2_state)
+
+        try:
+            first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
+            group1.close(end_services=False)
+
+            group2 = MultiNodeServiceGroup.deploy_from_infocenter(
+                infocenter_target=info_target,
+                owner_client_id="owner-reuse-test",
+                service_name="svc-reuse-test",
+                blob=blob,
+                filename="svc_reuse_test.py",
+                runtime="py3.11",
+                entry_module="svc_reuse_test",
+                entry_callable="run",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                healthy_only=True,
+                tags=["reuse"],
+                min_success_nodes=2,
+                allow_partial=False,
+                timeout_sec=10.0,
+                session_cache_dir=str(cache_dir),
+            )
+
+            try:
+                second_ids = {node_id: session.service_id for node_id, session in group2.sessions.items()}
+                assert second_ids == first_ids
+
+                node_id, resp = group2.call_balanced("run", {"value": 9}, timeout_sec=8.0, refresh_status=False)
+                assert node_id in group2.sessions
+                assert resp["ok"] is True
+                assert resp["data"]["square"] == 81
+            finally:
+                group2.close(end_services=True, reason="reuse test done")
+        finally:
+            group1.close(end_services=False)
+
+        assert not (cache_dir / "owner-reuse-test" / "svc-reuse-test.json").exists()
+    finally:
+        info_server.stop(grace=0)
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()
+
+
+def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-replace-01", str(tmp_path / "replace_n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-replace-02", str(tmp_path / "replace_n2_code"))
+    cache_dir = tmp_path / "session_cache"
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-replace-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["replace"])
+            infocenter.register_node(node_id="node-replace-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["replace"])
+
+        blob_v1 = b"def run(payload):\n    return {'version': 1}\n"
+        blob_v2 = b"def run(payload):\n    return {'version': 2}\n"
+
+        group1 = MultiNodeServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-replace-test",
+            service_name="svc-replace-test",
+            blob=blob_v1,
+            filename="svc_replace_test.py",
+            runtime="py3.11",
+            entry_module="svc_replace_test",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["replace"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(cache_dir),
+        )
+        _sync_node_services(info_target, node_id="node-replace-01", control_addr=n1_target, tags=["replace"], state=n1_state)
+        _sync_node_services(info_target, node_id="node-replace-02", control_addr=n2_target, tags=["replace"], state=n2_state)
+
+        first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
+        group1.close(end_services=False)
+
+        try:
+            MultiNodeServiceGroup.deploy_from_infocenter(
+                infocenter_target=info_target,
+                owner_client_id="owner-replace-test",
+                service_name="svc-replace-test",
+                blob=blob_v2,
+                filename="svc_replace_test.py",
+                runtime="py3.11",
+                entry_module="svc_replace_test",
+                entry_callable="run",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                healthy_only=True,
+                tags=["replace"],
+                min_success_nodes=2,
+                allow_partial=False,
+                timeout_sec=10.0,
+                session_cache_dir=str(cache_dir),
+            )
+            assert False, "expected code-changed deploy to require replace flag"
+        except RuntimeError as exc:
+            assert "different code_version" in str(exc)
+
+        group2 = MultiNodeServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-replace-test",
+            service_name="svc-replace-test",
+            blob=blob_v2,
+            filename="svc_replace_test.py",
+            runtime="py3.11",
+            entry_module="svc_replace_test",
+            entry_callable="run",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["replace"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+            replace_existing_if_code_changed=True,
+            session_cache_dir=str(cache_dir),
+        )
+
+        try:
+            second_ids = {node_id: session.service_id for node_id, session in group2.sessions.items()}
+            assert second_ids != first_ids
+
+            _, resp = group2.call_balanced("run", {}, timeout_sec=8.0, refresh_status=False)
+            assert resp["ok"] is True
+            assert resp["data"]["version"] == 2
+        finally:
+            group2.close(end_services=True, reason="replace test done")
+
+        assert not (cache_dir / "owner-replace-test" / "svc-replace-test.json").exists()
+    finally:
+        info_server.stop(grace=0)
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()

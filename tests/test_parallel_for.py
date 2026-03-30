@@ -2,7 +2,7 @@
 
 import warnings
 
-from pc import ClusterConfig, ProjectConfig, RuntimeConfig, configure, parallel_for, project
+from pc import ProjectConfig, RuntimeConfig, configure, parallel_for, project
 
 
 @parallel_for(mode="ordered", on_error="skip", retries=0, project="p1")
@@ -25,12 +25,12 @@ def _decorated_cumulative(nums):
 
 def _setup_runtime():
     cfg = RuntimeConfig(
-        clusters=[ClusterConfig(name="local", address="local", weight=1.0, capacity=4, use_ray=False)],
-        projects={"default": ProjectConfig(name="default", cpu_quota=4, mem_quota=0, priority=1)},
+        max_workers=4,
+        projects={"default": ProjectConfig(name="default", cpu_quota=4)},
         default_project="default",
     )
     configure(config=cfg, reset=True)
-    project("p1", cpu_quota=4, mem_quota=0, priority=1)
+    project("p1", cpu_quota=4)
 
 
 def test_parallel_for_rewrite_success():

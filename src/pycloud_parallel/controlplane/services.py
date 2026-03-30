@@ -684,20 +684,21 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.service_id,
             int(request.seq),
         )
-        if not request.owner_client_id or not request.service_id:
+        if not request.owner_client_id or not request.service_id or not request.service_token:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("owner_client_id and service_id are required")
+            context.set_details("owner_client_id, service_id and service_token are required")
             logger.warning("[NodeControl] HeartbeatService invalid request peer=%s", _peer(context))
             return pb2.HeartbeatServiceResponse(
                 ok=False,
                 accepted=False,
                 status=pb2.SERVICE_STATUS_UNSPECIFIED,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "owner_client_id and service_id are required"),
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "owner_client_id, service_id and service_token are required"),
             )
         try:
             session = self._state.heartbeat_service(
                 owner_client_id=request.owner_client_id,
                 service_id=request.service_id,
+                service_token=request.service_token,
             )
         except KeyError:
             context.set_code(grpc.StatusCode.NOT_FOUND)
@@ -751,20 +752,21 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.service_id,
             request.reason,
         )
-        if not request.owner_client_id or not request.service_id:
+        if not request.owner_client_id or not request.service_id or not request.service_token:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("owner_client_id and service_id are required")
+            context.set_details("owner_client_id, service_id and service_token are required")
             logger.warning("[NodeControl] EndService invalid request peer=%s", _peer(context))
             return pb2.EndServiceResponse(
                 ok=False,
                 accepted=False,
                 status=pb2.SERVICE_STATUS_UNSPECIFIED,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "owner_client_id and service_id are required"),
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "owner_client_id, service_id and service_token are required"),
             )
         try:
             session = self._state.end_service(
                 owner_client_id=request.owner_client_id,
                 service_id=request.service_id,
+                service_token=request.service_token,
                 reason=request.reason,
             )
         except KeyError:
