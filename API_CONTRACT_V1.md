@@ -1,46 +1,207 @@
-# PyCloud API 文档（V1）
+# PyCloud HTTP / JSON 契约（V1）
 
-> 说明：本仓库当前生效基线是 gRPC（`proto/pycloud_v1.proto`）。  
-> 本文保留 REST 视角，用于网关映射与外部系统对接说明。
+> 当前实现里，`HTTP + JSON` 主要覆盖两部分：
+> 1. `InfoCenter` 控制面
+> 2. `NodeControl` 暴露的服务 HTTP 数据面
 
-## 1. 状态说明
+## 1. InfoCenter HTTP API
 
-1. gRPC：当前主协议（已实现）。
-2. HTTP：当前仅服务会话数据面与状态查询是稳定实现。
-3. 其余 REST 路径保留为草案，不作为当前强约束。
+### 1.1 `POST /nodes/register`
 
-## 2. 当前已实现 HTTP 路径
+用途：节点首次注册。
 
-### 2.1 调用服务方法
+请求体示例：
 
-`POST /svc/{service_id}/call/{method}?timeout_sec=60`
+```json
+{
+  "node_id": "node-1",
+  "control_addr": "127.0.0.1:50061",
+  "capacity": 4,
+  "queue_capacity": 1000,
+  "tags": ["compute"],
+  "version": "v1",
+  "metadata": {"role": "compute-node"},
+  "service_worker_capacity": 4,
+  "service_worker_used": 0,
+  "services": []
+}
+```
 
-Headers（可选）：
+响应示例：
+
+```json
+{
+  "ok": true,
+  "heartbeat_interval_sec": 5,
+  "node": {
+    "node_id": "node-1",
+    "control_addr": "127.0.0.1:50061",
+    "healthy": true,
+    "schedulable": true,
+    "drain": false,
+    "service_worker_available": 4,
+    "loaded_services": []
+  }
+}
+```
+
+### 1.2 `POST /nodes/heartbeat`
+
+用途：节点续租并上报当前服务路由。
+
+请求体示例：
+
+```json
+{
+  "node_id": "node-1",
+  "healthy": true,
+  "metrics": {
+    "queued": 0,
+    "inflight": 0,
+    "running": 0,
+    "credit": 1000,
+    "cpu_percent": 0.0,
+    "mem_percent": 0.0
+  },
+  "service_worker_capacity": 4,
+  "service_worker_used": 1,
+  "services": [
+    {
+      "service_name": "square-service",
+      "service_id": "svc-001",
+      "status": 2,
+      "worker_count": 1,
+      "alive_workers": 1,
+      "in_flight": 0,
+      "http_base_url": "http://127.0.0.1:18081/svc/svc-001"
+    }
+  ]
+}
+```
+
+响应示例：
+
+```json
+{
+  "ok": true,
+  "accepted": true,
+  "next_heartbeat_in_sec": 5
+}
+```
+
+### 1.3 `GET /nodes`
+
+查询参数：
+
+1. `healthy_only=true|false`
+2. `tags=compute,gpu`
+3. `limit=100`
+
+响应示例：
+
+```json
+{
+  "ok": true,
+  "nodes": [
+    {
+      "node_id": "node-1",
+      "control_addr": "127.0.0.1:50061",
+      "healthy": true,
+      "schedulable": true,
+      "drain": false,
+      "capacity": 4,
+      "queue_capacity": 1000,
+      "service_worker_capacity": 4,
+      "service_worker_used": 1,
+      "service_worker_available": 3,
+      "loaded_services": ["square-service"]
+    }
+  ]
+}
+```
+
+### 1.4 `GET /services/routes`
+
+查询参数：
+
+1. `service_name=<name>`
+2. `healthy_only=true|false`
+3. `limit=500`
+
+响应示例：
+
+```json
+{
+  "ok": true,
+  "routes": [
+    {
+      "service_name": "square-service",
+      "service_id": "svc-001",
+      "status": 2,
+      "node_id": "node-1",
+      "control_addr": "127.0.0.1:50061",
+      "node_healthy": true,
+      "worker_count": 1,
+      "alive_workers": 1,
+      "in_flight": 0,
+      "lease_expire_at": "2026-03-31T00:00:00+00:00",
+      "http_base_url": "http://127.0.0.1:18081/svc/svc-001"
+    }
+  ]
+}
+```
+
+### 1.5 运维接口
+
+1. `GET /ops`
+2. `POST /ops/nodes/{node_id}/cordon`
+3. `POST /ops/nodes/{node_id}/uncordon`
+4. `POST /ops/nodes/{node_id}/drain`
+5. `POST /ops/nodes/{node_id}/undrain`
+
+这些接口当前是轻量运维开关，不做复杂的自动迁移。
+
+## 2. 服务 HTTP 数据面
+
+### 2.1 `POST /svc/{service_id}/call/{method}`
+
+查询参数：
+
+1. `timeout_sec`
+
+Header 可选：
 
 1. `X-Service-Token: <token>`
 2. `Authorization: Bearer <token>`
 
-请求体（JSON）：
+请求体示例：
 
 ```json
-{"value": 3}
+{"x": 7}
 ```
 
 成功响应：
 
 ```json
-{"ok": true, "method": "square", "data": {"value": 3, "square": 9}}
+{
+  "ok": true,
+  "method": "square",
+  "data": {"x": 7, "y": 49}
+}
 ```
 
 失败响应：
 
 ```json
-{"ok": false, "method": "square", "error_type": "UserError", "error": "..."}
+{
+  "ok": false,
+  "method": "square",
+  "error_type": "ValueError",
+  "error": "bad input"
+}
 ```
 
-### 2.2 查询服务状态
-
-`GET /svc/{service_id}/status`
+### 2.2 `GET /svc/{service_id}/status`
 
 成功响应示例：
 
@@ -48,58 +209,37 @@ Headers（可选）：
 {
   "ok": true,
   "service": {
-    "service_id": "...",
-    "owner_client_id": "...",
-    "service_name": "...",
+    "service_id": "svc-001",
+    "owner_client_id": "demo-owner",
+    "service_name": "square-service",
     "status": 2,
-    "worker_count": 4,
-    "alive_workers": 4,
+    "worker_count": 1,
+    "alive_workers": 1,
     "in_flight": 0,
-    "http_base_url": "http://127.0.0.1:18080/svc/...",
-    "methods": ["square", "cube"]
+    "http_base_url": "http://127.0.0.1:18081/svc/svc-001",
+    "methods": ["square"]
   }
 }
 ```
 
-## 3. gRPC 到 HTTP 的映射建议
+## 3. 当前协议定位
 
-1. `CallService` <-> `POST /svc/{service_id}/call/{method}`
-2. `GetServiceStatus` <-> `GET /svc/{service_id}/status`
-3. `ListServiceMethods`：建议保留 gRPC 为主；若要补 HTTP 可扩展为 `GET /svc/{service_id}/methods`
-4. `HeartbeatService / EndService` 当前只定义 gRPC 管理面，不建议通过 HTTP 暴露。
+1. InfoCenter：HTTP 为当前正式协议。
+2. NodeControl 管理面：gRPC 为当前正式协议。
+3. 服务调用：gRPC 和 HTTP 都可用。
 
-## 4. 上传与导出语义（与 gRPC 对齐）
+## 4. 不在 HTTP 中暴露的管理面
 
-1. 包格式：`py / tar.gz / zip / whl`
-2. 导出规则：`decorator / explicit / all / single`
-3. 推荐：`decorator + pycloud_export`
+以下能力当前仍建议走 NodeControl gRPC：
 
-## 5. 服务管理权限与重启复用
+1. `CreateService`
+2. `ListServiceMethods`
+3. `HeartbeatService`
+4. `EndService`
+5. `GetServiceStatus`（虽然 HTTP 也能查服务状态，但管理面主入口仍是 gRPC）
 
-1. `CreateService` 返回 `service_token`。
-2. 管理面接口 `HeartbeatService / EndService` 需要 `owner_client_id + service_id + service_token`。
-3. 数据面 `CallService` / HTTP `POST /svc/{service_id}/call/{method}` 可选择携带 `service_token`。
-4. Python 客户端会把 `service_id/service_token` 本地落盘，用于客户端重启后继续续租或主动结束。
-5. `MultiNodeServiceGroup.deploy_from_infocenter(...)` 当前默认策略：
-   - 同 `owner_client_id + service_name + code_version` 时直接复用已有活跃服务
-   - 同名但代码版本不同默认拒绝
-   - 显式 `replace_existing_if_code_changed=True` 才允许先结束旧服务再重建
+## 5. 参考文档
 
-## 6. 文档参考
-
-1. gRPC 详细契约：`GRPC_CONTRACT_V1.md`
-2. 服务会话细节：`SERVICE_SESSION_PROTOCOL_V1.md`
-3. 架构层说明：`ARCHITECTURE_V1.md`
-
-## 7. 运维观察（脚本）
-
-配套脚本：
-
-```bash
-./scripts/start_services.sh status
-```
-
-输出包含：
-
-1. `infocenter/node-*` 进程状态
-2. `Loaded Services By Node`（每个节点当前加载的服务名）
+1. `GRPC_CONTRACT_V1.md`
+2. `SERVICE_SESSION_PROTOCOL_V1.md`
+3. `ARCHITECTURE_V1.md`

@@ -523,6 +523,16 @@ class NodeState:
     last_seen_at: datetime = field(default_factory=utc_now)
     metrics: NodeMetricsState = field(default_factory=NodeMetricsState)
     services: Dict[str, NodeServiceState] = field(default_factory=dict)
+    service_worker_capacity: int = 0
+    service_worker_used: int = 0
+    schedulable: bool = True
+    drain: bool = False
+    reason: str = ""
+
+    def service_worker_available(self) -> int:
+        capacity = max(0, int(self.service_worker_capacity or 0))
+        used = max(0, int(self.service_worker_used or 0))
+        return max(0, capacity - used)
 
 
 class InfoCenterState:
@@ -532,49 +542,106 @@ class InfoCenterState:
         self._lock = threading.Lock()
         self._nodes: Dict[str, NodeState] = {}
 
-    def register_node(self, request: pb2.RegisterNodeRequest) -> NodeState:
+    def register_node_record(
+        self,
+        *,
+        node_id: str,
+        control_addr: str,
+        capacity: int,
+        queue_capacity: int,
+        tags: Iterable[str] = (),
+        version: str = "",
+        metadata: Optional[Dict[str, str]] = None,
+        services: Optional[Dict[str, NodeServiceState]] = None,
+        service_worker_capacity: int = 0,
+        service_worker_used: int = 0,
+    ) -> NodeState:
         now = utc_now()
         with self._lock:
-            state = self._nodes.get(request.node_id)
+            state = self._nodes.get(node_id)
             if state is None:
                 state = NodeState(
-                    node_id=request.node_id,
-                    control_addr=request.control_addr,
-                    capacity=max(1, request.capacity),
-                    queue_capacity=max(1, request.queue_capacity),
+                    node_id=node_id,
+                    control_addr=control_addr,
+                    capacity=max(1, capacity),
+                    queue_capacity=max(1, queue_capacity),
                 )
-                self._nodes[request.node_id] = state
-            state.control_addr = request.control_addr
-            state.capacity = max(1, request.capacity)
-            state.queue_capacity = max(1, request.queue_capacity)
-            state.tags = list(request.tags)
-            state.version = request.version
-            state.metadata = dict(request.metadata)
+                self._nodes[node_id] = state
+            state.control_addr = control_addr
+            state.capacity = max(1, capacity)
+            state.queue_capacity = max(1, queue_capacity)
+            state.tags = list(tags or [])
+            state.version = str(version or "")
+            state.metadata = dict(metadata or {})
             state.healthy = True
             state.last_seen_at = now
-            state.services = self._parse_services(request.services)
+            state.services = dict(services or {})
+            state.service_worker_capacity = max(0, int(service_worker_capacity or 0))
+            state.service_worker_used = max(0, min(int(service_worker_used or 0), state.service_worker_capacity or int(service_worker_used or 0)))
             if state.metrics.credit == 0:
                 state.metrics.credit = state.queue_capacity
             return state
 
-    def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
+    def register_node(self, request: pb2.RegisterNodeRequest) -> NodeState:
+        metadata = dict(request.metadata)
+        return self.register_node_record(
+            node_id=request.node_id,
+            control_addr=request.control_addr,
+            capacity=max(1, request.capacity),
+            queue_capacity=max(1, request.queue_capacity),
+            tags=request.tags,
+            version=request.version,
+            metadata=metadata,
+            services=self._parse_services(request.services),
+            service_worker_capacity=int(metadata.get("service_worker_capacity", "0") or 0),
+            service_worker_used=int(metadata.get("service_worker_used", "0") or 0),
+        )
+
+    def heartbeat_record(
+        self,
+        *,
+        node_id: str,
+        healthy: bool,
+        metrics: Optional[NodeMetricsState] = None,
+        services: Optional[Dict[str, NodeServiceState]] = None,
+        service_worker_capacity: int = 0,
+        service_worker_used: int = 0,
+    ) -> Optional[NodeState]:
         now = utc_now()
         with self._lock:
-            state = self._nodes.get(request.node_id)
+            state = self._nodes.get(node_id)
             if state is None:
                 return None
-            state.healthy = bool(request.healthy)
+            state.healthy = bool(healthy)
             state.last_seen_at = now
-            state.metrics = NodeMetricsState(
+            if metrics is not None:
+                state.metrics = metrics
+            state.services = dict(services or {})
+            if service_worker_capacity > 0:
+                state.service_worker_capacity = max(0, int(service_worker_capacity))
+            state.service_worker_used = max(
+                0,
+                min(
+                    int(service_worker_used or 0),
+                    state.service_worker_capacity or int(service_worker_used or 0),
+                ),
+            )
+            return state
+
+    def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
+        return self.heartbeat_record(
+            node_id=request.node_id,
+            healthy=bool(request.healthy),
+            metrics=NodeMetricsState(
                 queued=max(0, request.metrics.queued),
                 inflight=max(0, request.metrics.inflight),
                 running=max(0, request.metrics.running),
                 credit=request.metrics.credit,
                 cpu_percent=float(request.metrics.cpu_percent),
                 mem_percent=float(request.metrics.mem_percent),
-            )
-            state.services = self._parse_services(request.services)
-            return state
+            ),
+            services=self._parse_services(request.services),
+        )
 
     def _parse_services(self, reports: Iterable[pb2.ServiceRouteReport]) -> Dict[str, NodeServiceState]:
         out: Dict[str, NodeServiceState] = {}
@@ -657,10 +724,52 @@ class InfoCenterState:
                         last_seen_at=state.last_seen_at,
                         metrics=NodeMetricsState(**vars(state.metrics)),
                         services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                        service_worker_capacity=state.service_worker_capacity,
+                        service_worker_used=state.service_worker_used,
+                        schedulable=state.schedulable,
+                        drain=state.drain,
+                        reason=state.reason,
                     )
                 )
-            out.sort(key=lambda n: (not n.healthy, -(n.metrics.credit)))
+            out.sort(key=lambda n: (not n.healthy, not n.schedulable, n.drain, -(n.service_worker_available())))
             return out[: max(1, limit)]
+
+    def update_node_schedule_state(
+        self,
+        node_id: str,
+        *,
+        schedulable: Optional[bool] = None,
+        drain: Optional[bool] = None,
+        reason: Optional[str] = None,
+    ) -> NodeState:
+        with self._lock:
+            state = self._nodes.get(node_id)
+            if state is None:
+                raise KeyError("node not found")
+            if schedulable is not None:
+                state.schedulable = bool(schedulable)
+            if drain is not None:
+                state.drain = bool(drain)
+            if reason is not None:
+                state.reason = str(reason or "")
+            return NodeState(
+                node_id=state.node_id,
+                control_addr=state.control_addr,
+                capacity=state.capacity,
+                queue_capacity=state.queue_capacity,
+                tags=list(state.tags),
+                version=state.version,
+                metadata=dict(state.metadata),
+                healthy=state.healthy,
+                last_seen_at=state.last_seen_at,
+                metrics=NodeMetricsState(**vars(state.metrics)),
+                services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                service_worker_capacity=state.service_worker_capacity,
+                service_worker_used=state.service_worker_used,
+                schedulable=state.schedulable,
+                drain=state.drain,
+                reason=state.reason,
+            )
 
 
 @dataclass
@@ -800,6 +909,7 @@ class NodeControlState:
         enable_service_session: bool = True,
         service_default_worker_count: int = 10,
         service_default_heartbeat_timeout_sec: int = 30,
+        service_worker_capacity: int = 0,
         service_http_bind: str = "127.0.0.1:18080",
         service_http_base_url: str = "",
     ) -> None:
@@ -814,6 +924,7 @@ class NodeControlState:
         self.enable_service_session = bool(enable_service_session)
         self.service_default_worker_count = max(1, service_default_worker_count)
         self.service_default_heartbeat_timeout_sec = max(5, service_default_heartbeat_timeout_sec)
+        self.service_worker_capacity = max(1, int(service_worker_capacity or worker_capacity))
         self.service_http_bind = service_http_bind
         self.service_http_base_url = service_http_base_url.strip()
         self.started_at = utc_now()
@@ -872,6 +983,21 @@ class NodeControlState:
     @property
     def artifact_dir(self) -> Path:
         return self._artifact_dir
+
+    def service_worker_used(self) -> int:
+        with self._lock:
+            return sum(
+                max(0, int(session.worker_count))
+                for session in self._services.values()
+                if session.status in (
+                    pb2.SERVICE_STATUS_STARTING,
+                    pb2.SERVICE_STATUS_RUNNING,
+                    pb2.SERVICE_STATUS_DRAINING,
+                )
+            )
+
+    def service_worker_available(self) -> int:
+        return max(0, int(self.service_worker_capacity) - int(self.service_worker_used()))
 
     def _extract_archive(self, *, archive_path: Path, package_format: str, out_dir: Path) -> None:
         if out_dir.exists():
@@ -1076,7 +1202,11 @@ class NodeControlState:
             entry_callable=artifact.entry_callable,
         )
 
-        actual_workers = max(1, worker_count or self.service_default_worker_count)
+        requested_workers = max(1, worker_count or self.service_default_worker_count)
+        available_workers = self.service_worker_available()
+        if available_workers <= 0:
+            raise RuntimeError("service worker capacity exhausted")
+        actual_workers = min(requested_workers, available_workers)
         actual_hb_timeout = max(5, heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec)
         actual_idle_ttl = max(0, idle_ttl_sec)
         now = utc_now()

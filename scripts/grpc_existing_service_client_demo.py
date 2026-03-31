@@ -40,6 +40,30 @@ def _call_http(route_url: str, method: str, payload: dict, timeout_sec: float) -
         raise RuntimeError(f"HTTP {exc.code}: {body or exc.reason}")
 
 
+def _wait_for_routes(
+    *,
+    infocenter_addr: str,
+    service_name: str,
+    timeout_sec: float = 8.0,
+    poll_interval_sec: float = 1.0,
+) -> list[InfoCenterServiceRoute]:
+    deadline = time.time() + max(0.5, float(timeout_sec))
+    while True:
+        with InfoCenterClient(infocenter_addr) as client:
+            routes = list(
+                client.list_service_routes(
+                    service_name=service_name,
+                    healthy_only=True,
+                    limit=200,
+                )
+            )
+        if routes:
+            return routes
+        if time.time() >= deadline:
+            return []
+        time.sleep(max(0.1, float(poll_interval_sec)))
+
+
 def call_service(
     routes: list[InfoCenterServiceRoute],
     method: str,
@@ -197,12 +221,13 @@ def main() -> None:
     print("  Step 1: 查询服务路由")
     print("-" * 60)
 
-    with InfoCenterClient(infocenter_addr) as client:
-        routes = list(client.list_service_routes(
-            service_name=service_name,
-            healthy_only=True,
-            limit=200,
-        ))
+    print("  等待服务路由同步...")
+    routes = _wait_for_routes(
+        infocenter_addr=infocenter_addr,
+        service_name=service_name,
+        timeout_sec=10.0,
+        poll_interval_sec=1.0,
+    )
 
     if not routes:
         print(f"  [!] 没有找到服务: {service_name}")
@@ -249,11 +274,12 @@ def demo_async():
     print()
 
     # 获取路由
-    with InfoCenterClient(infocenter_addr) as client:
-        routes = list(client.list_service_routes(
-            service_name=service_name,
-            healthy_only=True,
-        ))
+    routes = _wait_for_routes(
+        infocenter_addr=infocenter_addr,
+        service_name=service_name,
+        timeout_sec=10.0,
+        poll_interval_sec=1.0,
+    )
 
     if not routes:
         print(f"  [!] 没有找到服务: {service_name}")

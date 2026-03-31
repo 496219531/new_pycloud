@@ -37,6 +37,7 @@ def main():
             filename="compute.py",
             runtime="py3.11",
             entry_module="compute",
+            worker_count=1,
         )
         groups.append(group1)
         print(f"  自动生成的 owner_client_id: {group1.owner_client_id}")
@@ -52,6 +53,7 @@ def main():
             blob=blob,
             filename="my_service.py",
             entry_module="my_service",  # 指定 entry_module
+            worker_count=1,
         )
         groups.append(group2)
         print(f"  自动生成的 service_name: {group2.service_name}")
@@ -65,6 +67,7 @@ def main():
             owner_client_id="my-custom-client",  # 自定义 owner
             blob=blob,
             filename="service.py",
+            worker_count=1,
         )
         groups.append(group3)
         print(f"  使用的 owner_client_id: {group3.owner_client_id}")
@@ -81,6 +84,7 @@ def main():
             service_name=custom_name,  # 自定义 service_name
             blob=blob,
             filename="service.py",
+            worker_count=1,
         )
         groups.append(group4)
         print(f"  自动生成的 owner_client_id: {group4.owner_client_id}")

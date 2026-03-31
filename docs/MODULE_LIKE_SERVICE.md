@@ -1,47 +1,46 @@
 # ModuleLikeServiceGroup
 
-`ModuleLikeServiceGroup` 是 `MultiNodeServiceGroup` 的一个薄封装，让远程服务更像本地 Python 模块来用。
+`ModuleLikeServiceGroup` 是 `MultiNodeServiceGroup` 的薄封装，让远程服务更像本地 Python 模块来调用。
 
-## 核心体验
+## 1. 核心体验
 
-1. 异步调用：
+### 1.1 异步调用
 
 ```python
 result = await group.square(x=7)
 ```
 
-2. 同步调用：
+### 1.2 同步调用
 
 ```python
 result = group.square.sync(x=7)
 ```
 
-3. 广播到所有节点：
+### 1.3 广播调用
 
 ```python
 results = await group.square.broadcast(x=7)
 ```
 
-4. 通用接口：
+### 1.4 通用接口
 
 ```python
 result = await group.call("square", x=7)
 result = group.call_sync("square", x=7)
 ```
 
-## 相关类
+## 2. 适合的场景
 
-实现位于 `src/pycloud_parallel/controlplane/client.py`：
+它适合这类服务：
 
-1. `_CallProxy`
-2. `_SyncCallProxy`
-3. `_BroadcastProxy`
-4. `ModuleLikeServiceGroup`
+1. 一个模块导出多个函数。
+2. 希望调用体验接近本地模块。
+3. 希望保留多节点部署、keepalive、熔断器和节点均衡能力。
 
-## 基本示例
+## 3. 基本示例
 
 ```python
-from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup, pycloud_export
+from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
 
 blob = (
     b"def pycloud_export(fn):\n"
@@ -61,20 +60,22 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
     filename="square_service.py",
     entry_module="square_service",
     export_mode="decorator",
+    export_decorator="pycloud_export",
+    worker_count=1,
+    node_count=1,
 )
 
 group.start_keepalive()
 
 try:
-    result = group.square.sync(x=7)
-    print(result)
+    print(group.square.sync(x=7))
 finally:
     group.close(end_services=True)
 ```
 
-## 方法发现
+## 4. 方法发现
 
-`ModuleLikeServiceGroup` 会先从首个 session 拉取 `ListServiceMethods`，然后缓存方法名。
+`ModuleLikeServiceGroup` 会从某个已建立的 session 调 `ListServiceMethods`，然后缓存方法名。
 
 可直接查看：
 
@@ -83,17 +84,11 @@ print(group.methods)
 print(group.list_methods())
 ```
 
-返回值都是 `List[str]`，例如：
-
-```python
-["square", "cube", "fibonacci"]
-```
-
 如果访问不存在的方法，会抛 `AttributeError`。
 
-## 与 MultiNodeServiceGroup 的关系
+## 5. 与 MultiNodeServiceGroup 的关系
 
-`ModuleLikeServiceGroup` 继承自 `MultiNodeServiceGroup`，所以这些能力都还在：
+它继承自 `MultiNodeServiceGroup`，所以这些能力都还在：
 
 1. `start_keepalive()`
 2. `stop_keepalive()`
@@ -102,19 +97,18 @@ print(group.list_methods())
 5. `acall_all(...)`
 6. `end(...)`
 7. `close(...)`
-8. 熔断器与节点选择策略
+8. 熔断器和节点选择策略
 
-换句话说，它只是把调用入口包装得更像模块，不是另一套运行时。
+## 6. 当前部署语义
 
-## 当前部署语义
+`deploy_from_infocenter(...)` 当前默认策略：
 
-`ModuleLikeServiceGroup.deploy_from_infocenter(...)` 继承了 `MultiNodeServiceGroup` 的当前默认策略：
-
-1. `service_name` 在活跃服务里视为全局唯一。
-2. 同 `owner_client_id + service_name + code_version` 时，默认直接复用已有服务。
-3. 同名但代码版本变化时，默认拒绝覆盖。
-4. 只有显式传 `replace_existing_if_code_changed=True` 才会替换。
+1. 活跃 `service_name` 视为全局唯一。
+2. 同 `owner_client_id + service_name + code_version` 时，默认复用已有服务。
+3. 同名但代码变化时，默认拒绝覆盖。
+4. 显式 `replace_existing_if_code_changed=True` 才会替换。
 5. 客户端会把 `service_id/service_token` 本地落盘，供重启后复用。
+6. 默认只选择需要的节点数，不会默认铺满所有节点。
 
 常用参数：
 
@@ -126,20 +120,34 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
     blob=blob,
     filename="square_service.py",
     entry_module="square_service",
+    worker_count=1,
+    node_count=1,
     reuse_existing_same_code=True,
     replace_existing_if_code_changed=False,
     session_cache_dir="./.demo_service_sessions",
 )
 ```
 
-## 权限边界
+## 7. 节点选择
+
+如果不显式传 `node_ids`，客户端会：
+
+1. 从 InfoCenter 查询节点。
+2. 过滤 `healthy=false`。
+3. 过滤 `schedulable=false`。
+4. 过滤 `drain=true`。
+5. 按 `service_worker_available` 选择前 N 个节点。
+
+适合本地轻量部署或简单多节点部署。
+
+## 8. 权限边界
 
 1. owner 管理面依赖 `service_token`。
 2. `ModuleLikeServiceGroup` 适合“我自己部署、我自己持有 token、我自己持续心跳”的场景。
-3. 如果只是“发现已有服务并调用”，更适合用 InfoCenter 路由查询 + HTTP/gRPC 调用，而不是把自己当成 owner。
+3. 如果只是“发现已有服务并调用”，更适合走 InfoCenter 路由查询 + HTTP 调用，不把自己当 owner。
 
-## 推荐验证
+## 9. 推荐验证
 
-1. 运行 `python scripts/demo_module_like_client.py`
-2. 查看 `SERVICE_SESSION_PROTOCOL_V1.md`
-3. 查看 `GRPC_CONTRACT_V1.md`
+1. `python scripts/demo_module_like_client.py`
+2. `python scripts/demo_simple_deploy.py`
+3. `SERVICE_SESSION_PROTOCOL_V1.md`

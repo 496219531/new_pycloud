@@ -1,96 +1,197 @@
 # PyCloud 架构说明（V1）
 
-## 0. 范围说明（当前代码）
+## 1. 当前范围
 
-1. `pycloud_parallel` 并行 API：纯本地多进程运行时（轻量模式）。
-2. 跨节点/服务化能力：统一通过 `controlplane + grpc` 提供。
+当前仓库已经分成两块：
 
-## 1. 架构目标
+1. `pycloud_parallel/local_runtime`
+   - 只负责单机本地多进程并行。
+2. `pycloud_parallel/controlplane`
+   - 负责跨节点部署、服务发现、任务与服务会话。
 
-1. 并行任务执行（任务模式）。
-2. 多方法长驻服务（服务会话模式）。
-3. 控制面统一使用 gRPC；服务数据面支持 HTTP/gRPC 调用。
+本地运行时不再承担跨集群职责。
 
-## 2. 组件
+## 2. 当前设计原则
+
+这版实现刻意偏“简单而稳定”：
+
+1. 协议边界尽量少。
+2. 组件职责尽量直白。
+3. 节点选择尽量可预期。
+4. 不做复杂调度器和自动 reconcile。
+5. 宁可粗暴，也避免难以调试的隐式行为。
+
+## 3. 组件图
+
+### 3.1 控制面
 
 1. `InfoCenter`
-   - 节点注册与健康维护。
-   - 服务路由聚合与查询。
+   - `HTTP + JSON`
+   - 节点注册/心跳
+   - 路由查询
+   - 简单运维接口和页面
 2. `NodeControl`
-   - 代码接收与版本化。
-   - 任务队列与本机进程池执行。
-   - 服务会话生命周期管理。
-   - HTTP Gateway 暴露服务调用入口。
-3. `Worker Process Pool`
-   - 使用多进程执行用户代码（spawn）。
-4. `Local Runtime`（并行 API）
-   - 本地 `ProcessPoolRunner` + `executor`。
-   - 无本地网关层，不做跨节点调度。
+   - `gRPC`
+   - 代码上传
+   - 任务执行
+   - 服务会话管理
+3. `Service HTTP Gateway`
+   - 节点本地 HTTP 数据面
+   - `POST /svc/{service_id}/call/{method}`
+   - `GET /svc/{service_id}/status`
 
-## 3. 两种执行模型
+### 3.2 本地运行时
 
-### 3.1 任务模式
+1. `Runtime`
+2. `ProcessPoolRunner`
+3. 本地 executor
 
-1. 上传代码得到 `code_version`。
-2. `SubmitTasks` 提交批量任务。
-3. NodeControl 分发到本机进程池。
-4. `PullResults` 拉取结果。
+不再保留本地 gateway、cluster adapter、跨节点调度壳子。
 
-### 3.2 服务会话模式
+## 4. 协议边界
 
-1. `CreateService` 上传工程包并启动服务进程池。
-2. 加载 `entry_module`，按 `export_spec` 构建方法路由。
-3. `ListServiceMethods` 暴露可调用方法。
-4. `CallService` / `POST /svc/{id}/call/{method}` 执行方法。
-5. `CreateService` 返回 `service_token`，用于管理面续租/结束。
-6. `HeartbeatService` 续租，`EndService` 主动结束。
-7. Python 客户端本地落盘 `service_id/service_token`，用于客户端重启后的服务复用。
+### 4.1 InfoCenter
 
-## 4. 上传链路（当前实现）
+InfoCenter 当前只保留 HTTP：
 
-1. gRPC chunk 到达 NodeControl。
-2. NodeControl 边收边写临时文件（不整包驻留内存）。
-3. 完成后校验 `sha256`。
-4. 依据 `package_format`：
-   - `py`：直接保存。
-   - `tar.gz/zip/whl`：保存归档并解压到独立目录。
-5. 生成 `code_version=sha256:<digest>`。
+1. `POST /nodes/register`
+2. `POST /nodes/heartbeat`
+3. `GET /nodes`
+4. `GET /services/routes`
+5. `GET /ops`
+6. 节点运维切换接口
 
-## 5. 方法导出与安全
+### 4.2 NodeControl
 
-1. 默认建议 `decorator` 白名单导出。
-2. `explicit` 适合严格控制 API 面。
-3. `all` 风险较高，通常仅用于内部调试。
-4. 方法名不允许以下划线开头，防止私有函数误暴露。
+NodeControl 当前保留 gRPC：
 
-## 6. 可靠性机制
+1. `UploadCode`
+2. `SubmitTasks`
+3. `PullResults`
+4. `CancelTasks`
+5. `GetMetrics`
+6. `CreateService`
+7. `ListServiceMethods`
+8. `CallService`
+9. `HeartbeatService`
+10. `EndService`
+11. `GetServiceStatus`
 
-1. 任务模式：
-   - `FAILED_USER` 终态不重试。
-   - `FAILED_INFRA` 可按 `max_retries` 重试。
-2. 服务模式：
-   - owner 心跳超时自动回收。
-   - `HeartbeatService / EndService` 需要 `service_token`。
-   - 同代码重启可直接复用；代码变化默认拒绝覆盖，显式 replace 才允许重建。
-3. 节点与服务路由通过 InfoCenter 心跳维护。
+### 4.3 已移除
 
-## 7. 调度与路由
+1. `InfoCenterService` gRPC service 已移除。
+2. `WorkerInternalService` 已移除。
+3. Worker 内部不再走一层 gRPC 壳子。
 
-1. 节点发现：`ListNodes` / `ListServiceRoutes`。
-2. 多节点服务组（client）：
-   - `least_inflight` 或 `round_robin`。
-   - 内置断路器（open/half-open/closed）。
+## 5. 两种执行模型
 
-## 8. 协议文档索引
+### 5.1 任务模式
 
-1. `proto/pycloud_v1.proto`
-2. `GRPC_CONTRACT_V1.md`
-3. `SERVICE_SESSION_PROTOCOL_V1.md`
-4. `API_CONTRACT_V1.md`（REST 草案）
+1. 客户端上传代码。
+2. 获得 `code_version`。
+3. 提交任务到 NodeControl。
+4. NodeControl 用本机进程池执行。
+5. 客户端拉取结果。
 
-## 9. 运维脚本补充
+这条链路适合高频任务提交，因此仍保留 gRPC。
 
-`scripts/start_services.sh status` 除了进程存活状态外，还会输出：
+### 5.2 服务会话模式
 
-1. `Loaded Services By Node`
-2. 每个节点当前加载的服务名列表（来自 InfoCenter 路由聚合）
+1. 客户端上传工程包。
+2. NodeControl 按 `entry_module + export_spec` 发现可调用方法。
+3. 建立 `method -> callable` 路由。
+4. 返回 `service_id + service_token`。
+5. owner 通过心跳保活。
+6. 其他调用方可通过 gRPC 或 HTTP 调服务方法。
+
+## 6. 上传与导入
+
+### 6.1 上传
+
+1. 客户端把目录或文件列表打包成 `tar.gz` / `zip`。
+2. 通过 gRPC 流式上传到 NodeControl。
+3. NodeControl 边收边写临时文件。
+4. 上传完成后校验 `sha256`。
+
+### 6.2 落地
+
+1. `py` 文件直接保存。
+2. `tar.gz / zip / whl` 会解压到独立目录。
+3. 代码版本统一命名为 `sha256:<digest>`。
+
+### 6.3 导入污染防护
+
+对于归档包：
+
+1. 导入前会清理 `entry_module` 及其父包缓存。
+2. 这样重复部署同名包时，不会命中旧 `sys.modules` 路径。
+
+## 7. 服务导出模型
+
+支持四种导出模式：
+
+1. `decorator`
+2. `explicit`
+3. `all`
+4. `single`
+
+默认推荐：
+
+1. `export_mode="decorator"`
+2. `export_decorator="pycloud_export"`
+
+原因：
+
+1. 更安全。
+2. 更容易控制对外 API 面。
+3. 不容易误暴露辅助函数。
+
+## 8. 节点选择与部署策略
+
+当前客户端部署策略尽量简单：
+
+1. 从 InfoCenter 拉节点列表。
+2. 过滤不健康节点。
+3. 过滤 `schedulable=false`。
+4. 过滤 `drain=true`。
+5. 按 `service_worker_available` 倒序排序。
+6. 取 `node_ids` 或 `node_count` / `min_success_nodes` 决定的前 N 个节点。
+
+默认不是全量铺节点。
+
+## 9. 服务唯一性与权限
+
+### 9.1 命名
+
+1. 活跃 `service_name` 视为全局唯一。
+2. 服务端不再用 `owner_client_id + service_name` 做二次区分。
+3. 如果需要多租户命名，交给客户端自己编码到 `service_name`。
+
+### 9.2 管理权限
+
+1. `owner_client_id` 主要用于标识 owner。
+2. 真正的服务管理权限依赖 `service_token`。
+3. `HeartbeatService` 和 `EndService` 都要求 `service_token`。
+
+## 10. 运维模型
+
+运维入口放在 InfoCenter：
+
+1. 统一查看节点状态。
+2. 统一查看路由聚合结果。
+3. 统一做节点 `cordon/drain`。
+
+节点状态由谁真正执行：
+
+1. 运维动作先写入 InfoCenter 状态。
+2. 客户端选点时遵守这些状态。
+3. 当前不做复杂的自动迁移与重平衡。
+
+## 11. 当前不做的事
+
+1. 不做复杂调度器。
+2. 不做自动故障迁移闭环。
+3. 不做统一调用鉴权网关。
+4. 不做 node/cluster 间复杂协商。
+
+这些都可以以后再加，但不作为当前基础架构的一部分。

@@ -1,96 +1,130 @@
 # PyCloud gRPC 契约文档（V1）
 
-> 当前生效基线：`proto/pycloud_v1.proto` 与 `src/pycloud_parallel/controlplane/*` 实现。  
-> 本文是实现导向摘要，不替代 proto。
+> 当前实现里，gRPC 只保留 `NodeControlService`。  
+> `InfoCenterService` 和 `WorkerInternalService` 都已经从 proto 中移除。
 
-## 1. 服务划分
+## 1. 当前 gRPC 服务
 
-1. `InfoCenterService`
-2. `NodeControlService`
-3. `WorkerInternalService`
+只有一个：
 
-## 2. InfoCenterService
+1. `NodeControlService`
 
-1. `RegisterNode`
-   - 节点注册，支持附带服务路由 `services`。
-2. `HeartbeatNode`
-   - 节点续租，支持持续上报服务路由状态。
-3. `ListNodes`
-   - 查询节点健康与负载。
-4. `ListServiceRoutes`
-   - 按 `service_name` 查询服务路由。
+定义来源：`proto/pycloud_v1.proto`
 
-## 3. NodeControlService
+## 2. NodeControlService 方法
 
-### 3.1 任务模式
+### 2.1 任务模式
 
 1. `UploadCode(stream UploadCodeRequest)`
-2. `SubmitTasks`
-3. `PullResults`
-4. `CancelTasks`
-5. `GetMetrics`
+2. `SubmitTasks(SubmitTasksRequest)`
+3. `PullResults(PullResultsRequest)`
+4. `CancelTasks(CancelTasksRequest)`
+5. `GetMetrics(GetMetricsRequest)`
 
-### 3.2 服务会话模式
+### 2.2 服务会话模式
 
 1. `CreateService(stream CreateServiceRequest)`
-2. `ListServiceMethods`
-3. `CallService`
-4. `HeartbeatService`
-5. `EndService`
-6. `GetServiceStatus`
+2. `ListServiceMethods(ListServiceMethodsRequest)`
+3. `CallService(CallServiceRequest)`
+4. `HeartbeatService(HeartbeatServiceRequest)`
+5. `EndService(EndServiceRequest)`
+6. `GetServiceStatus(GetServiceStatusRequest)`
 
-## 4. 上传与导出模型
+## 3. 上传与工程包
 
-### 4.1 `UploadCodeMeta` / `CreateServiceMeta` 关键字段
+`UploadCodeMeta` / `CreateServiceMeta` 的关键字段：
 
-1. `entry_module`
-2. `entry_callable`（兼容字段，建议新代码优先使用 `export_spec` + `method` 调用）
-3. `package_format`：`py | tar.gz | zip | whl`
-4. `export_spec`：`ModuleExportSpec`
+1. `filename`
+2. `sha256`
+3. `runtime`
+4. `entry_module`
+5. `entry_callable`
+6. `package_format`
+7. `export_spec`
 
-### 4.2 `ModuleExportSpec`
+支持的包格式：
 
-1. `mode`：`decorator | explicit | all | single`
-2. `methods`：当 `explicit/single` 时使用
-3. `decorator`：装饰器标记名（默认 `pycloud_export`）
+1. `py`
+2. `tar.gz`
+3. `zip`
+4. `whl`
 
-## 5. 方法调用模型
+## 4. 方法导出模型
 
-1. 客户端先 `ListServiceMethods(service_id)` 获取可调用方法。
-2. 再 `CallService(service_id, method, payload, timeout_sec, service_token)`。
-3. 成功返回 `data`；失败返回 `task_error/error`。
-4. `service_token` 也是服务管理面的凭证；`HeartbeatService` 与 `EndService` 也需要携带它。
+`ModuleExportSpec`：
 
-## 6. 服务命名约束
+1. `mode`
+   - `decorator`
+   - `explicit`
+   - `all`
+   - `single`
+2. `methods`
+3. `decorator`
 
-1. `service_name` 用于服务发现与路由查询。
-2. 当前实现默认将活跃 `service_name` 视为全局唯一。
-3. `owner_client_id` 用于权限与生命周期控制，不参与同名服务的路由区分。
+当前推荐：
 
-## 7. WorkerInternalService（本机内部）
+1. `mode="decorator"`
+2. `decorator="pycloud_export"`
 
-1. `PollTask`
-2. `HeartbeatTask`
-3. `ReportResult`
+## 5. 服务会话权限
 
-> 该服务用于本机 worker 协同，生产场景一般不直接给业务客户端调用。
+### 5.1 创建
 
-## 8. 错误语义（实现约定）
+`CreateService` 返回：
 
-1. 业务执行异常：`FAILED_USER`
-2. 基础设施异常：`FAILED_INFRA`（任务模式可重试至 `max_retries`）
-3. 服务方法不存在：`NOT_FOUND`
-4. 服务 token 错误：`PERMISSION_DENIED`
-5. `owner_client_id` 不匹配：`PERMISSION_DENIED`
+1. `service_id`
+2. `code_version`
+3. `status`
+4. `worker_count`
+5. `heartbeat_timeout_sec`
+6. `owner_client_id`
+7. `service_token`
+8. `http_base_url`
 
-## 9. 当前实现补充
+### 5.2 后续管理
 
-1. 上传是“流式分块 + NodeControl 边收边写临时文件”。
-2. 校验 `sha256` 后落地为 `code_version=sha256:<digest>`。
-3. 包格式为归档时会解压到独立目录并按 `entry_module` 导入。
-4. 服务会话调用支持 gRPC 与 HTTP 双通道（见 `SERVICE_SESSION_PROTOCOL_V1.md`）。
-5. 重复部署同名包时，服务端会在导入前清理父包模块缓存，避免命中旧路径。
-6. `MultiNodeServiceGroup.deploy_from_infocenter(...)` 当前支持：
-   - 同 `service_name + owner_client_id + code_version` 时直接复用活跃服务
-   - 同名但代码变化时默认拒绝，只有 `replace_existing_if_code_changed=True` 才会先结束旧服务再重建
-7. Python 客户端会把 `service_id/service_token` 本地落盘，供重启后复用管理权限。
+以下接口要求使用 `service_token`：
+
+1. `HeartbeatService`
+2. `EndService`
+3. `CallService` 可选携带 `service_token`
+
+当前真正的管理权限依赖 `service_token`，不是仅靠 `owner_client_id`。
+
+## 6. 当前语义补充
+
+### 6.1 `service_name`
+
+1. 活跃 `service_name` 视为全局唯一。
+2. 服务端不再兼容 `owner_client_id + service_name` 的同名区分。
+
+### 6.2 客户端复用
+
+Python 客户端当前支持：
+
+1. 同 `owner_client_id + service_name + code_version` 时复用已有活跃服务。
+2. 同名但代码变化时默认拒绝。
+3. 只有 `replace_existing_if_code_changed=True` 才会替换。
+
+### 6.3 节点部署选择
+
+`deploy_from_infocenter(...)` 当前不会默认铺满所有节点，而是：
+
+1. 按 InfoCenter 返回的节点状态过滤。
+2. 按 `service_worker_available` 选前 N 个节点。
+3. N 由 `node_ids` / `node_count` / `min_success_nodes` 决定。
+
+## 7. 已移除的旧项
+
+以下 gRPC service 已不再存在：
+
+1. `InfoCenterService`
+2. `WorkerInternalService`
+
+如果旧文档或旧代码还在引用它们，应以当前 proto 为准。
+
+## 8. 参考
+
+1. `proto/pycloud_v1.proto`
+2. `API_CONTRACT_V1.md`
+3. `SERVICE_SESSION_PROTOCOL_V1.md`

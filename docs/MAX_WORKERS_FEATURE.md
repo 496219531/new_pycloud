@@ -10,4 +10,4 @@
 2. `RuntimeConfig.max_workers` 仅用于配置该运行时的本地进程池大小。
 3. `foreach` / `parallel_for` 不再支持函数级 `max_workers` 参数。
 
-如需分布式并行，请使用 `controlplane + grpc` 路径。
+如需跨节点能力，请使用 `controlplane` 路径。

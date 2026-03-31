@@ -1,166 +1,127 @@
-# 部署默认值最终总结
+# 当前部署模型总结
 
-## ✅ 实现的功能
+## 1. 当前部署模型
 
-### 1. `owner_client_id` 可选
-- **默认值**：`"client-{本机IP}"`
-- **示例**：`"client-192.168.1.100"`
+这版部署模型已经收敛为：
 
-### 2. `service_name` 可选
-- **默认值**：`"{模块名}-{本机IP}-{时间戳}"`
-- **时间戳格式**：`YYYYMMDDHHMMSS`（精确到秒）
-- **示例**：`"my_service-192.168.1.100-20260330183235"`
+1. `InfoCenter` 负责发现和简单运维。
+2. `NodeControl` 负责真正执行。
+3. 客户端负责命名、选点和是否替换旧服务。
 
-### 3. 自动推断 entry_module
-推断顺序：
-1. `entry_module` 参数
-2. `filename`（如果是 .py 文件）
-3. `artifact_path`（如果是 .py 文件）
-4. `artifact_paths` 第一个（如果是 .py 文件）
-5. 回退到 `"service"`
+整体偏向：
 
-### 4. service_name 语义
-- `service_name` 在活跃服务范围内应视为全局唯一
-- 服务端不按 `owner_client_id` 做同名兼容路由
-- 多租户命名由客户端自行处理
+1. 简单
+2. 直接
+3. 可预测
+4. 易调试
 
-### 4. 自动获取本机 IP
-使用 UDP socket 获取，不实际发送数据：
+## 2. 关键结论
+
+### 2.1 控制面拆分
+
+1. `InfoCenter = HTTP + JSON`
+2. `NodeControl = gRPC`
+3. 服务数据面 = HTTP
+
+### 2.2 本地运行时收敛
+
+1. `local_runtime` 只做单机多进程。
+2. 不再承担跨集群功能。
+3. 跨节点统一走 `controlplane`。
+
+### 2.3 服务命名
+
+1. 活跃 `service_name` 视为全局唯一。
+2. 服务端不再兼容 `owner_client_id + service_name` 的多租户路由。
+3. 如果需要多租户隔离，应由客户端自己生成唯一名字。
+
+### 2.4 权限
+
+1. `owner_client_id` 只是 owner 身份标识。
+2. 真正的服务管理权限依赖 `service_token`。
+3. 当前方法调用权限不做复杂内建鉴权，必要时建议接外部网关。
+
+### 2.5 选点策略
+
+客户端当前只做简单选点：
+
+1. 过滤 unhealthy
+2. 过滤 cordon
+3. 过滤 drain
+4. 按剩余 service worker 容量排序
+5. 选择前 N 个节点
+
+不做复杂调度器。
+
+## 3. 当前部署路径
+
+### 3.1 上传
+
+1. 目录或文件列表打包为 `tar.gz` / `zip`
+2. gRPC 流式上传到 NodeControl
+3. NodeControl 边收边写临时文件
+4. 校验 `sha256`
+5. 落地为 `code_version=sha256:<digest>`
+
+### 3.2 启动服务
+
+1. 发现导出方法
+2. 创建服务进程池
+3. 返回 `service_id + service_token + http_base_url`
+4. 节点通过心跳把路由上报给 InfoCenter
+
+### 3.3 调用
+
+1. owner 可走 gRPC `CallService`
+2. 普通调用方也可先查 InfoCenter 路由，再走 HTTP 调用
+
+## 4. 当前推荐默认值
+
+对本地轻量场景，推荐：
+
 ```python
-def _get_local_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except Exception:
-        return "localhost"
+worker_count=1
+node_count=1
+export_mode="decorator"
+export_decorator="pycloud_export"
+reuse_existing_same_code=True
+replace_existing_if_code_changed=False
 ```
 
-## 服务名格式
+这样更接近“本地轻量服务”的预期，也更不容易把节点 service capacity 一次吃满。
 
-### 组成部分
-```
-{模块名}-{IP地址}-{时间戳}
-```
+## 5. 当前脚本建议
 
-### 示例
-```
-compute-192.168.1.100-20260330183235
-my_service-172.16.10.202-20260330183236
-service-10.0.0.5-20260330183237
-```
-
-### 优势
-1. **跨机器唯一**：包含 IP 地址
-2. **跨时间唯一**：包含时间戳（精确到秒）
-3. **语义清晰**：包含模块名
-4. **独享计算**：每次运行都是独立实例
-5. **易于调试**：从服务名就能看出创建时间和位置
-
-## 最小化部署
-
-### 只需 2 个参数（使用本地文件）
-```python
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    artifact_path="service.py",
-)
-```
-
-### 只需 3 个参数（使用 blob）
-```python
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    blob=b"code here...",
-    filename="service.py",
-)
-```
-
-## 实际运行示例
+### 5.1 启动本地环境
 
 ```bash
-$ python scripts/demo_simple_deploy.py
-
-方式 1：使用所有默认值
-  自动生成的 owner_client_id: client-172.16.10.202
-  自动生成的 service_name: compute-172.16.10.202-20260330183235
-
-方式 2：提供 entry_module
-  自动生成的 service_name: my_service-172.16.10.202-20260330183235
-
-方式 3：只提供 owner_client_id
-  使用的 owner_client_id: my-custom-client
-  自动生成的 service_name: service-172.16.10.202-20260330183235
-
-方式 4：只提供 service_name
-  自动生成的 owner_client_id: client-172.16.10.202
-  使用的 service_name: my-custom-service-1774872491
+./scripts/start_services.sh start
 ```
 
-## 向后兼容性
+### 5.2 查看状态
 
-✅ **完全向后兼容**：所有现有代码无需修改
-
-```python
-# 旧代码仍然正常工作
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    owner_client_id="my-client",
-    service_name="my-service",
-    blob=blob,
-    filename="service.py",
-)
+```bash
+./scripts/start_services.sh status
 ```
 
-## 验证方式
+会显示：
+
+1. 进程状态
+2. 每个节点当前加载的服务名
+
+### 5.3 典型 demo
 
 ```bash
 python scripts/demo_simple_deploy.py
+python scripts/demo_deploy_from_files.py
+python scripts/grpc_existing_service_client_demo.py
 ```
 
-示例脚本会自动清理创建的服务，可重复执行。
+## 6. 当前不做的复杂功能
 
-## 文件变更
+1. 不做自动节点替换闭环。
+2. 不做复杂资源协调器。
+3. 不做统一调用鉴权中心。
+4. 不做基于 owner 的同名服务兼容。
 
-### 修改的文件
-- [src/pycloud_parallel/controlplane/client.py](src/pycloud_parallel/controlplane/client.py)
-  - 添加 `_get_local_ip()` 函数
-  - 修改 `deploy_from_infocenter()` 参数
-  - 实现默认值生成逻辑
-
-### 新增的文件
-- [scripts/demo_simple_deploy.py](scripts/demo_simple_deploy.py) - 简化部署演示
-- [docs/DEPLOY_DEFAULT_VALUES.md](docs/DEPLOY_DEFAULT_VALUES.md) - 完整文档
-
-## 使用建议
-
-### 开发/测试环境
-```python
-# 使用所有默认值，每次运行都是独立实例
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    artifact_path="my_service.py",
-)
-# 服务名自动生成，不会与其他服务冲突 ✅
-```
-
-### 生产环境
-```python
-# 手动指定，确保可控性和一致性
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
-    infocenter_target="prod-server:50051",
-    owner_client_id="prod-worker-01",
-    service_name="data-processor-v1",
-    blob=blob,
-    filename="service.py",
-)
-```
-
-## 关键特性
-
-1. ✅ **自动化**：减少手动配置
-2. ✅ **唯一性**：时空双维度保证不冲突
-3. ✅ **灵活性**：可选手动指定
-4. ✅ **兼容性**：完全向后兼容
-5. ✅ **可调试**：服务名包含关键信息
-6. ✅ **独享性**：每次运行独立实例，不共享资源
+这些都不是当前版本的目标。

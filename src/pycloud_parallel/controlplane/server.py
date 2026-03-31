@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Server bootstrap for PyCloud control-plane gRPC services."""
+"""Server bootstrap for PyCloud control-plane services."""
 
 import argparse
 import logging
@@ -10,19 +10,21 @@ from typing import Callable, Optional, Tuple
 
 import grpc
 
+from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
-from pycloud_parallel.controlplane.services import InfoCenterService, NodeControlService, WorkerInternalService
+from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)
 
 
-def build_infocenter_server(bind: str, *, max_workers: int = 32) -> grpc.Server:
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max(1, max_workers)))
-    state = InfoCenterState()
-    pb2_grpc.add_InfoCenterServiceServicer_to_server(InfoCenterService(state), server)
-    server.add_insecure_port(bind)
+def build_infocenter_server(bind: str, *, max_workers: int = 32) -> InfoCenterHttpServer:
+    del max_workers
+    server = InfoCenterHttpServer(
+        bind=bind,
+        state=InfoCenterState(heartbeat_interval_sec=5),
+    )
     return server
 
 
@@ -49,13 +51,12 @@ def build_nodecontrol_server(
         service_default_heartbeat_timeout_sec=service_default_heartbeat_timeout_sec,
     )
     pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
-    pb2_grpc.add_WorkerInternalServiceServicer_to_server(WorkerInternalService(state), server)
     server.add_insecure_port(bind)
     return server, state
 
 
 def _wait_until_stopped(
-    server: grpc.Server,
+    server,
     on_stop: Callable[[], None],
     *,
     on_start: Optional[Callable[[], None]] = None,

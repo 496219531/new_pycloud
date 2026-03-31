@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import time
-from concurrent import futures
-
-import grpc
 
 from pycloud_parallel.controlplane.client import InfoCenterClient
+from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
-from pycloud_parallel.controlplane.services import InfoCenterService
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 
 def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) -> bool:
@@ -27,11 +23,9 @@ def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) 
 
 def test_node_registrar_syncs_service_routes(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
-    info_server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-    pb2_grpc.add_InfoCenterServiceServicer_to_server(InfoCenterService(info_state), info_server)
-    info_port = info_server.add_insecure_port("127.0.0.1:0")
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
     info_server.start()
-    info_target = f"127.0.0.1:{info_port}"
+    info_target = info_server.base_url
 
     node_state = NodeControlState(
         node_id="node-reg-01",
@@ -103,4 +97,4 @@ def test_node_registrar_syncs_service_routes(tmp_path):
     finally:
         registrar.close()
         node_state.close()
-        info_server.stop(grace=0)
+        info_server.stop()

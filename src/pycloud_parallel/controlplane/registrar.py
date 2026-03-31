@@ -5,11 +5,9 @@ from __future__ import annotations
 import threading
 from typing import Dict, Iterable, Optional
 
-import grpc
-
-from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, utc_now
+from pycloud_parallel.controlplane.client import InfoCenterClient
+from pycloud_parallel.controlplane.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 
 class NodeInfoCenterRegistrar:
@@ -40,8 +38,7 @@ class NodeInfoCenterRegistrar:
         self.fallback_heartbeat_sec = max(1, int(fallback_heartbeat_sec))
         self.rpc_timeout_sec = max(0.5, float(rpc_timeout_sec))
 
-        self._channel = grpc.insecure_channel(self.infocenter_addr)
-        self._stub = pb2_grpc.InfoCenterServiceStub(self._channel)
+        self._client = InfoCenterClient(self.infocenter_addr, timeout_sec=self.rpc_timeout_sec)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._registered = False
@@ -59,10 +56,10 @@ class NodeInfoCenterRegistrar:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        self._channel.close()
+        self._client.close()
 
     def _register_once(self) -> bool:
-        req = pb2.RegisterNodeRequest(
+        resp = self._client.register_node(
             node_id=self.node_id,
             control_addr=self.control_addr,
             capacity=self.capacity,
@@ -71,35 +68,34 @@ class NodeInfoCenterRegistrar:
             version=self.version,
             metadata=self.metadata,
             services=self.state.service_reports(),
+            service_worker_capacity=self.state.service_worker_capacity,
+            service_worker_used=self.state.service_worker_used(),
         )
-        resp = self._stub.RegisterNode(req, timeout=self.rpc_timeout_sec)
-        if not resp.ok:
-            return False
         self._registered = True
-        self._next_hb_sec = max(1, int(resp.heartbeat_interval_sec or self.fallback_heartbeat_sec))
+        self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
         return True
 
     def _heartbeat_once(self) -> bool:
         metrics = self.state.metrics()
-        req = pb2.HeartbeatNodeRequest(
+        resp = self._client.heartbeat_node(
             node_id=self.node_id,
-            timestamp=dt_to_ts(utc_now()),
             healthy=True,
-            metrics=pb2.NodeMetrics(
-                queued=metrics["queued"],
-                inflight=metrics["inflight"],
-                running=metrics["running"],
-                credit=metrics["credit"],
-                cpu_percent=0.0,
-                mem_percent=0.0,
-            ),
+            metrics={
+                "queued": metrics["queued"],
+                "inflight": metrics["inflight"],
+                "running": metrics["running"],
+                "credit": metrics["credit"],
+                "cpu_percent": 0.0,
+                "mem_percent": 0.0,
+            },
             services=self.state.service_reports(),
+            service_worker_capacity=self.state.service_worker_capacity,
+            service_worker_used=self.state.service_worker_used(),
         )
-        resp = self._stub.HeartbeatNode(req, timeout=self.rpc_timeout_sec)
-        if not resp.ok or not resp.accepted:
+        if not resp.get("accepted", False):
             self._registered = False
             return False
-        self._next_hb_sec = max(1, int(resp.next_heartbeat_in_sec or self.fallback_heartbeat_sec))
+        self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
         return True
 
     def _loop(self) -> None:
@@ -109,11 +105,8 @@ class NodeInfoCenterRegistrar:
                     self._register_once()
                 else:
                     self._heartbeat_once()
-            except grpc.RpcError:
-                self._registered = False
             except Exception:
                 self._registered = False
 
             wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
             self._stop_event.wait(max(1, int(wait_sec)))
-

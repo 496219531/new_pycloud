@@ -46,22 +46,39 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $(date '+%H:%M:%S') $1"
 }
 
+kill_pid() {
+    local pid=$1
+    local label=$2
+    if kill -0 "$pid" 2>/dev/null; then
+        log_info "Stopping $label (PID: $pid)..."
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+}
+
 stop_process() {
     local name=$1
+    local match_pattern=${2:-}
     local pid_file="$PID_DIR/${name}.pid"
 
     if [ -f "$pid_file" ]; then
         local pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
-            log_info "Stopping $name (PID: $pid)..."
-            kill "$pid" 2>/dev/null || true
-            sleep 1
-            # 强制 kill 如果还没停
-            if kill -0 "$pid" 2>/dev/null; then
-                kill -9 "$pid" 2>/dev/null || true
-            fi
-        fi
+        kill_pid "$pid" "$name"
         rm -f "$pid_file"
+    fi
+
+    if [ -n "$match_pattern" ]; then
+        local found=0
+        for pid in $(pgrep -f "$match_pattern" 2>/dev/null || true); do
+            found=1
+            kill_pid "$pid" "$name (matched)"
+        done
+        if [ "$found" -eq 1 ]; then
+            rm -f "$pid_file"
+        fi
     fi
 }
 
@@ -143,9 +160,9 @@ case "${1:-start}" in
 
         # 停止已有进程
         log_info "Stopping existing services..."
-        stop_infocenter 2>/dev/null || true
-        stop_process "node-1" 2>/dev/null || true
-        stop_process "node-2" 2>/dev/null || true
+        stop_process "infocenter" "pycloud_parallel.controlplane.server --role infocenter" 2>/dev/null || true
+        stop_process "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1" 2>/dev/null || true
+        stop_process "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2" 2>/dev/null || true
         sleep 1
 
         echo ""
@@ -186,9 +203,9 @@ case "${1:-start}" in
         echo "============================================"
         echo ""
 
-        stop_process "node-1"
-        stop_process "node-2"
-        stop_process "infocenter"
+        stop_process "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1"
+        stop_process "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2"
+        stop_process "infocenter" "pycloud_parallel.controlplane.server --role infocenter"
 
         log_success "All services stopped"
         ;;
@@ -207,6 +224,7 @@ case "${1:-start}" in
 
         check_service() {
             local name=$1
+            local match_pattern=${2:-}
             local pid_file="$PID_DIR/${name}.pid"
 
             if [ -f "$pid_file" ]; then
@@ -219,14 +237,23 @@ case "${1:-start}" in
                     return 1
                 fi
             else
+                if [ -n "$match_pattern" ]; then
+                    local pid
+                    pid=$(pgrep -f "$match_pattern" 2>/dev/null | head -n 1)
+                    if [ -n "$pid" ]; then
+                        echo "$pid" > "$pid_file"
+                        echo -e "  ${GREEN}●${NC} $name (PID: $pid) - RUNNING"
+                        return 0
+                    fi
+                fi
                 echo -e "  ${YELLOW}●${NC} $name - NOT STARTED"
                 return 2
             fi
         }
 
-        check_service "infocenter"
-        check_service "node-1"
-        check_service "node-2"
+        check_service "infocenter" "pycloud_parallel.controlplane.server --role infocenter"
+        check_service "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1"
+        check_service "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2"
 
         echo ""
         echo "  Loaded Services By Node"

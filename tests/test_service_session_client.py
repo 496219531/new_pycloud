@@ -6,7 +6,7 @@ import grpc
 import pytest
 
 from pycloud_parallel.controlplane.client import NodeControlClient
-from pycloud_parallel.controlplane.services import NodeControlService, WorkerInternalService
+from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
@@ -25,7 +25,6 @@ def test_service_session_client_roundtrip(tmp_path):
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
-    pb2_grpc.add_WorkerInternalServiceServicer_to_server(WorkerInternalService(state), server)
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     target = f"127.0.0.1:{port}"

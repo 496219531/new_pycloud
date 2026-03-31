@@ -82,7 +82,6 @@ class TestCallProxy:
                 timeout_sec=60.0,
                 strategy="least_inflight",
                 refresh_status=True,
-                via="http",
             )
 
         asyncio.run(test())

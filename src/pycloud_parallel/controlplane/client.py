@@ -18,11 +18,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import grpc
-from google.protobuf import json_format
 from google.protobuf import timestamp_pb2
 
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -61,6 +60,51 @@ def _err_msg(resp_error: pb2.Error, default_msg: str) -> str:
     if resp_error and resp_error.message:
         return resp_error.message
     return default_msg
+
+
+def _target_to_base_url(target: str) -> str:
+    text = str(target or "").strip()
+    if not text:
+        raise ValueError("target is required")
+    parsed = urlparse(text)
+    if parsed.scheme in ("http", "https"):
+        return text.rstrip("/")
+    return f"http://{text}"
+
+
+def _http_json_request(
+    *,
+    base_url: str,
+    path: str,
+    method: str,
+    timeout_sec: float,
+    payload: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    raw = None
+    headers = {}
+    if payload is not None:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    req = Request(
+        f"{base_url.rstrip('/')}{path}",
+        method=method.upper(),
+        headers=headers,
+        data=raw,
+    )
+    try:
+        with urlopen(req, timeout=max(0.1, float(timeout_sec))) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            body = json.loads((exc.read() or b"{}").decode("utf-8"))
+        except Exception:
+            body = {"ok": False, "error": exc.reason}
+        raise RuntimeError(str(body.get("error", exc.reason))) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("invalid json response")
+    if data.get("ok", False) is False:
+        raise RuntimeError(str(data.get("error", "request failed")))
+    return data
 
 
 def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -244,6 +288,12 @@ class InfoCenterNode:
     inflight: int
     credit: int
     tags: Tuple[str, ...] = ()
+    service_worker_capacity: int = 0
+    service_worker_used: int = 0
+    service_worker_available: int = 0
+    schedulable: bool = True
+    drain: bool = False
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -272,16 +322,15 @@ class NodeCircuitState:
 
 
 class InfoCenterClient:
-    """Thin gRPC client wrapper for InfoCenter service."""
+    """Thin HTTP + JSON client wrapper for InfoCenter service."""
 
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
         self.target = target
+        self.base_url = _target_to_base_url(target)
         self.timeout_sec = max(0.1, float(timeout_sec))
-        self.channel = grpc.insecure_channel(target)
-        self.stub = pb2_grpc.InfoCenterServiceStub(self.channel)
 
     def close(self) -> None:
-        self.channel.close()
+        return None
 
     def __enter__(self) -> "InfoCenterClient":
         return self
@@ -300,23 +349,78 @@ class InfoCenterClient:
         version: str = "",
         metadata: Optional[Dict[str, str]] = None,
         services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
-    ) -> pb2.RegisterNodeResponse:
-        resp = self.stub.RegisterNode(
-            pb2.RegisterNodeRequest(
-                node_id=node_id,
-                control_addr=control_addr,
-                capacity=max(1, int(capacity)),
-                queue_capacity=max(1, int(queue_capacity)),
-                tags=list(tags or []),
-                version=version,
-                metadata=dict(metadata or {}),
-                services=list(services or []),
-            ),
-            timeout=self.timeout_sec,
+        service_worker_capacity: int = 0,
+        service_worker_used: int = 0,
+    ) -> Dict[str, object]:
+        serialized_services = []
+        for item in services or []:
+            serialized_services.append(
+                {
+                    "service_name": str(item.service_name),
+                    "service_id": str(item.service_id),
+                    "status": int(item.status),
+                    "worker_count": int(item.worker_count),
+                    "alive_workers": int(item.alive_workers),
+                    "in_flight": int(item.in_flight),
+                    "http_base_url": str(item.http_base_url),
+                }
+            )
+        return _http_json_request(
+            base_url=self.base_url,
+            path="/nodes/register",
+            method="POST",
+            timeout_sec=self.timeout_sec,
+            payload={
+                "node_id": node_id,
+                "control_addr": control_addr,
+                "capacity": max(1, int(capacity)),
+                "queue_capacity": max(1, int(queue_capacity)),
+                "tags": list(tags or []),
+                "version": version,
+                "metadata": dict(metadata or {}),
+                "services": serialized_services,
+                "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
+                "service_worker_used": max(0, int(service_worker_used or 0)),
+            },
         )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "register node failed"))
-        return resp
+
+    def heartbeat_node(
+        self,
+        *,
+        node_id: str,
+        healthy: bool = True,
+        metrics: Optional[Dict[str, object]] = None,
+        services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
+        service_worker_capacity: int = 0,
+        service_worker_used: int = 0,
+    ) -> Dict[str, object]:
+        serialized_services = []
+        for item in services or []:
+            serialized_services.append(
+                {
+                    "service_name": str(item.service_name),
+                    "service_id": str(item.service_id),
+                    "status": int(item.status),
+                    "worker_count": int(item.worker_count),
+                    "alive_workers": int(item.alive_workers),
+                    "in_flight": int(item.in_flight),
+                    "http_base_url": str(item.http_base_url),
+                }
+            )
+        return _http_json_request(
+            base_url=self.base_url,
+            path="/nodes/heartbeat",
+            method="POST",
+            timeout_sec=self.timeout_sec,
+            payload={
+                "node_id": node_id,
+                "healthy": bool(healthy),
+                "metrics": dict(metrics or {}),
+                "services": serialized_services,
+                "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
+                "service_worker_used": max(0, int(service_worker_used or 0)),
+            },
+        )
 
     def list_nodes(
         self,
@@ -325,29 +429,38 @@ class InfoCenterClient:
         tags: Optional[Sequence[str]] = None,
         limit: int = 100,
     ) -> Sequence[InfoCenterNode]:
-        resp = self.stub.ListNodes(
-            pb2.ListNodesRequest(
-                healthy_only=bool(healthy_only),
-                tags=list(tags or []),
-                limit=max(1, int(limit)),
-            ),
-            timeout=self.timeout_sec,
+        params = urlencode(
+            {
+                "healthy_only": "true" if healthy_only else "false",
+                "tags": ",".join([x for x in (tags or []) if x]),
+                "limit": str(max(1, int(limit))),
+            }
         )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "list nodes failed"))
+        resp = _http_json_request(
+            base_url=self.base_url,
+            path=f"/nodes?{params}",
+            method="GET",
+            timeout_sec=self.timeout_sec,
+        )
         out = []
-        for item in resp.nodes:
+        for item in resp.get("nodes", []):
             out.append(
                 InfoCenterNode(
-                    node_id=item.node_id,
-                    control_addr=item.control_addr,
-                    healthy=bool(item.healthy),
-                    capacity=int(item.capacity),
-                    queue_capacity=int(item.queue_capacity),
-                    queued=int(item.queued),
-                    inflight=int(item.inflight),
-                    credit=int(item.credit),
-                    tags=tuple(item.tags),
+                    node_id=str(item.get("node_id", "")),
+                    control_addr=str(item.get("control_addr", "")),
+                    healthy=bool(item.get("healthy", False)),
+                    capacity=int(item.get("capacity", 0) or 0),
+                    queue_capacity=int(item.get("queue_capacity", 0) or 0),
+                    queued=int(item.get("queued", 0) or 0),
+                    inflight=int(item.get("inflight", 0) or 0),
+                    credit=int(item.get("credit", 0) or 0),
+                    tags=tuple(item.get("tags") or ()),
+                    service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
+                    service_worker_used=int(item.get("service_worker_used", 0) or 0),
+                    service_worker_available=int(item.get("service_worker_available", 0) or 0),
+                    schedulable=bool(item.get("schedulable", True)),
+                    drain=bool(item.get("drain", False)),
+                    reason=str(item.get("reason", "") or ""),
                 )
             )
         return out
@@ -359,34 +472,38 @@ class InfoCenterClient:
         healthy_only: bool = True,
         limit: int = 500,
     ) -> Sequence[InfoCenterServiceRoute]:
-        resp = self.stub.ListServiceRoutes(
-            pb2.ListServiceRoutesRequest(
-                service_name=service_name,
-                healthy_only=bool(healthy_only),
-                limit=max(1, int(limit)),
-            ),
-            timeout=self.timeout_sec,
+        params = urlencode(
+            {
+                "service_name": service_name,
+                "healthy_only": "true" if healthy_only else "false",
+                "limit": str(max(1, int(limit))),
+            }
         )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "list service routes failed"))
+        resp = _http_json_request(
+            base_url=self.base_url,
+            path=f"/services/routes?{params}",
+            method="GET",
+            timeout_sec=self.timeout_sec,
+        )
         out = []
-        for item in resp.routes:
-            dt = item.lease_expire_at.ToDatetime()
+        for item in resp.get("routes", []):
+            dt_text = str(item.get("lease_expire_at", "") or "")
+            dt = datetime.fromisoformat(dt_text) if dt_text else datetime.now(timezone.utc)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             out.append(
                 InfoCenterServiceRoute(
-                    service_name=item.service_name,
-                    service_id=item.service_id,
-                    status=int(item.status),
-                    node_id=item.node_id,
-                    control_addr=item.control_addr,
-                    node_healthy=bool(item.node_healthy),
-                    worker_count=int(item.worker_count),
-                    alive_workers=int(item.alive_workers),
-                    in_flight=int(item.in_flight),
+                    service_name=str(item.get("service_name", "")),
+                    service_id=str(item.get("service_id", "")),
+                    status=int(item.get("status", 0) or 0),
+                    node_id=str(item.get("node_id", "")),
+                    control_addr=str(item.get("control_addr", "")),
+                    node_healthy=bool(item.get("node_healthy", False)),
+                    worker_count=int(item.get("worker_count", 0) or 0),
+                    alive_workers=int(item.get("alive_workers", 0) or 0),
+                    in_flight=int(item.get("in_flight", 0) or 0),
                     lease_expire_at=dt.astimezone(timezone.utc),
-                    http_base_url=item.http_base_url,
+                    http_base_url=str(item.get("http_base_url", "")),
                 )
             )
         return out
@@ -435,18 +552,12 @@ class ServiceSessionClient:
 
     def heartbeat(self) -> pb2.HeartbeatServiceResponse:
         self._hb_seq += 1
-        resp = self._client.stub.HeartbeatService(
-            pb2.HeartbeatServiceRequest(
-                owner_client_id=self.owner_client_id,
-                service_id=self.service_id,
-                seq=self._hb_seq,
-                timestamp=_now_timestamp(),
-                service_token=self.service_token,
-            ),
-            timeout=self._client.timeout_sec,
+        resp = self._client.heartbeat_service(
+            owner_client_id=self.owner_client_id,
+            service_id=self.service_id,
+            service_token=self.service_token,
+            seq=self._hb_seq,
         )
-        if not resp.ok or not resp.accepted:
-            raise RuntimeError(_err_msg(resp.error, "heartbeat rejected"))
         self.status = resp.status
         if resp.next_heartbeat_in_sec > 0:
             self._hb_interval_sec = float(resp.next_heartbeat_in_sec)
@@ -454,29 +565,19 @@ class ServiceSessionClient:
 
     def end(self, reason: str = "client requested end") -> pb2.EndServiceResponse:
         self.stop_keepalive()
-        resp = self._client.stub.EndService(
-            pb2.EndServiceRequest(
-                owner_client_id=self.owner_client_id,
-                service_id=self.service_id,
-                reason=reason,
-                service_token=self.service_token,
-            ),
-            timeout=self._client.timeout_sec,
+        resp = self._client.end_service(
+            owner_client_id=self.owner_client_id,
+            service_id=self.service_id,
+            service_token=self.service_token,
+            reason=reason,
         )
-        if not resp.ok or not resp.accepted:
-            raise RuntimeError(_err_msg(resp.error, "end service rejected"))
         self.status = resp.status
         return resp
 
     def get_status(self) -> pb2.ServiceStatusInfo:
-        resp = self._client.stub.GetServiceStatus(
-            pb2.GetServiceStatusRequest(service_id=self.service_id),
-            timeout=self._client.timeout_sec,
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "get service status failed"))
-        self.status = resp.service.status
-        return resp.service
+        info = self._client.get_service_status(service_id=self.service_id)
+        self.status = info.status
+        return info
 
     def list_methods(self, *, include_docs: bool = False) -> Sequence[pb2.ServiceMethodInfo]:
         return self._client.list_service_methods(service_id=self.service_id, include_docs=include_docs)
@@ -488,22 +589,7 @@ class ServiceSessionClient:
         *,
         timeout_sec: float = 60.0,
         token: Optional[str] = None,
-        via: str = "http",
     ) -> Dict[str, object]:
-        if via == "grpc":
-            resp = self._client.call_service(
-                service_id=self.service_id,
-                method=method,
-                payload=payload,
-                timeout_sec=timeout_sec,
-                service_token=(self.service_token if token is None else (token or "")),
-            )
-            return {
-                "ok": True,
-                "method": method,
-                "data": json_format.MessageToDict(resp.data, preserving_proto_field_name=True),
-            }
-
         if not self.http_base_url:
             raise RuntimeError("service has no http_base_url; expose_http may be false")
         if not method:
@@ -929,6 +1015,8 @@ class MultiNodeServiceGroup:
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
         min_success_nodes: int = 1,
@@ -965,6 +1053,8 @@ class MultiNodeServiceGroup:
             chunk_size: 上传分片大小
             healthy_only: 是否只使用健康节点
             tags: 节点标签过滤
+            node_ids: 显式指定要部署到哪些节点
+            node_count: 需要挑选的节点数量；未指定时默认使用 min_success_nodes
             node_limit: 节点数量限制
             allow_partial: 是否允许部分失败
             min_success_nodes: 最小成功节点数
@@ -1071,7 +1161,7 @@ class MultiNodeServiceGroup:
                                 arcname = p.name / file_path.relative_to(p)
                                 zf.write(file_path, str(arcname))
             if not effective_filename:
-                effective_filename=tmp_zip_path
+                effective_filename = Path(tmp_zip_path).name
             effective_blob = Path(tmp_zip_path).read_bytes()
             effective_package_format = "zip"
 
@@ -1104,24 +1194,62 @@ class MultiNodeServiceGroup:
             cache_dir=session_cache_dir,
         )
 
+        requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
+        desired_node_count = max(0, int(node_count or 0))
+        required_success_nodes = max(1, int(min_success_nodes))
+        discovery_limit = max(
+            1,
+            int(node_limit),
+            len(requested_node_ids),
+            desired_node_count or required_success_nodes,
+        )
+
         with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
             existing_routes: Sequence[InfoCenterServiceRoute] = ()
             if ensure_unique_service_name:
                 existing_routes = infocenter.list_service_routes(
                     service_name=effective_service_name,
                     healthy_only=True,
-                    limit=max(100, node_limit * 10),
+                    limit=max(100, discovery_limit * 10),
                 )
             discovered_nodes = infocenter.list_nodes(
                 healthy_only=healthy_only,
                 tags=tags,
-                limit=node_limit,
+                limit=discovery_limit,
             )
 
         if not discovered_nodes:
             raise RuntimeError("no available nodes from InfoCenter")
 
         discovered_node_map = {node.node_id: node for node in discovered_nodes}
+        if requested_node_ids:
+            missing_node_ids = [node_id for node_id in requested_node_ids if node_id not in discovered_node_map]
+            if missing_node_ids:
+                raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
+            selected_nodes = [discovered_node_map[node_id] for node_id in requested_node_ids]
+        else:
+            candidate_nodes = [
+                node
+                for node in discovered_nodes
+                if node.healthy and node.schedulable and not node.drain
+            ]
+            if not candidate_nodes:
+                raise RuntimeError("no schedulable nodes from InfoCenter")
+            candidate_nodes.sort(
+                key=lambda node: (
+                    -int(node.service_worker_available),
+                    -int(node.capacity),
+                    int(node.queued),
+                    node.node_id,
+                )
+            )
+            effective_node_count = max(1, desired_node_count or required_success_nodes)
+            selected_nodes = candidate_nodes[:effective_node_count]
+            if len(selected_nodes) < required_success_nodes:
+                raise RuntimeError(
+                    "not enough schedulable nodes from InfoCenter: "
+                    f"selected={len(selected_nodes)} required={required_success_nodes}"
+                )
 
         if ensure_unique_service_name:
             active_routes = cls._select_active_routes(existing_routes)
@@ -1203,7 +1331,7 @@ class MultiNodeServiceGroup:
         nodes: Dict[str, InfoCenterNode] = {}
         failures: Dict[str, str] = {}
 
-        for node in discovered_nodes:
+        for node in selected_nodes:
             client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
             try:
                 session = client.create_service_from_bytes(
@@ -1236,10 +1364,10 @@ class MultiNodeServiceGroup:
             clients[node.node_id] = client
             nodes[node.node_id] = node
 
-        if len(sessions) < max(1, int(min_success_nodes)):
+        if len(sessions) < required_success_nodes:
             cls._cleanup_created_services(sessions=sessions, clients=clients, reason="insufficient success nodes")
             raise RuntimeError(
-                f"deploy success nodes={len(sessions)} < min_success_nodes={max(1, int(min_success_nodes))}; "
+                f"deploy success nodes={len(sessions)} < min_success_nodes={required_success_nodes}; "
                 f"failures={failures}"
             )
 
@@ -1626,12 +1754,11 @@ class MultiNodeServiceGroup:
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        via: str = "http",
     ) -> Dict[str, object]:
         session = self.sessions.get(node_id)
         if session is None:
             raise KeyError(f"unknown node_id: {node_id}")
-        return session.call(method, payload, timeout_sec=timeout_sec, via=via)
+        return session.call(method, payload, timeout_sec=timeout_sec)
 
     def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
         excluded = exclude or set()
@@ -1691,7 +1818,6 @@ class MultiNodeServiceGroup:
         strategy: str = "least_inflight",
         refresh_status: bool = True,
         max_attempts: int = 0,
-        via: str = "http",
     ) -> Tuple[str, Dict[str, object]]:
         if not self.sessions:
             raise RuntimeError("no active service sessions")
@@ -1706,7 +1832,7 @@ class MultiNodeServiceGroup:
             if not self._breaker_before_invoke(node_id):
                 continue
             try:
-                resp = self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec, via=via)
+                resp = self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec)
                 self._breaker_mark_success(node_id)
                 return node_id, resp
             except Exception as exc:
@@ -1724,7 +1850,6 @@ class MultiNodeServiceGroup:
         strategy: str = "least_inflight",
         refresh_status: bool = True,
         max_attempts: int = 0,
-        via: str = "http",
     ) -> Tuple[str, Dict[str, object]]:
         """异步版本的 call_balanced。
 
@@ -1737,8 +1862,6 @@ class MultiNodeServiceGroup:
             strategy: 节点选择策略（"least_inflight" 或 "round_robin"）
             refresh_status: 是否在选择节点前刷新状态
             max_attempts: 最大尝试次数
-            via: 调用方式（"http" 或 "grpc"）
-
         Returns:
             Tuple[str, Dict[str, object]]: (节点 ID, 响应结果)
 
@@ -1762,7 +1885,7 @@ class MultiNodeServiceGroup:
                 # 在线程池中执行同步调用，不阻塞事件循环
                 resp = await loop.run_in_executor(
                     None,
-                    lambda: self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec, via=via),
+                    lambda: self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec),
                 )
                 self._breaker_mark_success(node_id)
                 return node_id, resp
@@ -1778,7 +1901,6 @@ class MultiNodeServiceGroup:
         payloads: Union[List[Dict[str, object]], Dict[str, object]],
         *,
         timeout_sec: float = 60.0,
-        via: str = "http",
         max_concurrency: int = 100,
     ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
         """并发调用所有节点。
@@ -1789,7 +1911,6 @@ class MultiNodeServiceGroup:
             method: 服务方法名
             payloads: 可以是单个 payload（发送给所有节点）或 payload 列表（与节点一一对应）
             timeout_sec: 单次调用超时时间
-            via: 调用方式（"http" 或 "grpc"）
             max_concurrency: 最大并发数
 
         Returns:
@@ -1816,7 +1937,7 @@ class MultiNodeServiceGroup:
                 try:
                     resp = await loop.run_in_executor(
                         None,
-                        lambda: self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec, via=via),
+                        lambda: self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec),
                     )
                     self._breaker_mark_success(node_id)
                     return node_id, resp, None
@@ -1871,14 +1992,12 @@ class _CallProxy:
         timeout_sec: float = 60.0,
         strategy: str = "least_inflight",
         refresh_status: bool = True,
-        via: str = "http",
     ) -> None:
         self._method = method
         self._group = group
         self._timeout_sec = timeout_sec
         self._strategy = strategy
         self._refresh_status = refresh_status
-        self._via = via
 
     def __repr__(self) -> str:
         return f"<CallProxy method={self._method!r}>"
@@ -1907,7 +2026,6 @@ class _CallProxy:
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
-            via=self._via,
         )
         return resp.get("data", resp)
 
@@ -1928,7 +2046,6 @@ class _CallProxy:
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
-            via=self._via,
         )
 
     @property
@@ -1943,7 +2060,6 @@ class _CallProxy:
             method=self._method,
             group=self._group,
             timeout_sec=self._timeout_sec,
-            via=self._via,
         )
 
     def with_options(
@@ -1952,7 +2068,6 @@ class _CallProxy:
         timeout_sec: Optional[float] = None,
         strategy: Optional[str] = None,
         refresh_status: Optional[bool] = None,
-        via: Optional[str] = None,
     ) -> "_CallProxy":
         """返回一个新的代理，使用指定的选项。
 
@@ -1966,7 +2081,6 @@ class _CallProxy:
             timeout_sec=timeout_sec if timeout_sec is not None else self._timeout_sec,
             strategy=strategy if strategy is not None else self._strategy,
             refresh_status=refresh_status if refresh_status is not None else self._refresh_status,
-            via=via if via is not None else self._via,
         )
 
 
@@ -1981,14 +2095,12 @@ class _SyncCallProxy:
         timeout_sec: float = 60.0,
         strategy: str = "least_inflight",
         refresh_status: bool = True,
-        via: str = "http",
     ) -> None:
         self._method = method
         self._group = group
         self._timeout_sec = timeout_sec
         self._strategy = strategy
         self._refresh_status = refresh_status
-        self._via = via
 
     def __repr__(self) -> str:
         return f"<SyncCallProxy method={self._method!r}>"
@@ -2011,7 +2123,6 @@ class _SyncCallProxy:
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
-            via=self._via,
         )
         return resp.get("data", resp)
 
@@ -2025,13 +2136,11 @@ class _BroadcastProxy:
         group: "MultiNodeServiceGroup",
         *,
         timeout_sec: float = 60.0,
-        via: str = "http",
         max_concurrency: int = 100,
     ) -> None:
         self._method = method
         self._group = group
         self._timeout_sec = timeout_sec
-        self._via = via
         self._max_concurrency = max_concurrency
 
     def __repr__(self) -> str:
@@ -2061,7 +2170,6 @@ class _BroadcastProxy:
             self._method,
             kwargs,
             timeout_sec=self._timeout_sec,
-            via=self._via,
             max_concurrency=self._max_concurrency,
         )
 
@@ -2132,7 +2240,6 @@ class ModuleLikeServiceGroup(MultiNodeServiceGroup):
             timeout_sec=60.0,
             strategy="least_inflight",
             refresh_status=True,
-            via="http",
         )
 
     def _ensure_methods_discovered(self) -> None:

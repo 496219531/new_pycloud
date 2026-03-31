@@ -2,107 +2,198 @@
 
 ## 1. 目标
 
-服务会话用于“上传一份工程包，长期暴露多个可调用方法”，并通过 owner 心跳控制生命周期。
+服务会话用于“上传一份工程包，在节点上长期驻留，并暴露多个可调用方法”。
 
-## 2. 角色
+它适合：
 
-1. `OwnerClient`：创建/续租/结束服务。
-2. `NodeControl`：管理服务进程池、路由与回收。
-3. `CallerClient`：通过 gRPC 或 HTTP 调用已注册服务。
+1. `viewer.py` / `compute_service.main` 这种模块型服务。
+2. 一个包里导出多个业务函数。
+3. owner 通过心跳控制生命周期。
 
-## 3. gRPC 控制流
+## 2. 参与角色
 
-1. `CreateService(stream CreateServiceRequest)`
-2. `ListServiceMethods(ListServiceMethodsRequest)`
-3. `CallService(CallServiceRequest)`
-4. `HeartbeatService(HeartbeatServiceRequest)`
-5. `EndService(EndServiceRequest)`
-6. `GetServiceStatus(GetServiceStatusRequest)`
+1. `OwnerClient`
+   - 创建服务
+   - 持有 `service_token`
+   - 发送心跳
+   - 主动结束服务
+2. `NodeControl`
+   - 保存代码
+   - 建立方法路由
+   - 启动服务进程池
+3. `CallerClient`
+   - 查询路由
+   - 调用服务方法
+4. `InfoCenter`
+   - 汇总节点和服务路由
 
-## 4. 上传形态与导出规则
+## 3. 协议拆分
 
-### 4.1 上传形态
+### 3.1 NodeControl gRPC
 
-1. 支持 `py / tar.gz / zip / whl`。
-2. 客户端以 gRPC chunk 流上传，NodeControl 边收边写临时文件。
-3. `sha256` 校验通过后生成 `code_version`。
-4. 对于同名包的重复部署，导入前会清理父包模块缓存，避免导入到旧版本路径。
+负责：
 
-### 4.2 导出规则（`export_spec`）
+1. `CreateService`
+2. `ListServiceMethods`
+3. `CallService`
+4. `HeartbeatService`
+5. `EndService`
+6. `GetServiceStatus`
 
-1. `decorator`：按装饰器白名单导出（默认推荐）。
-2. `explicit`：按 `methods` 显式列表导出。
-3. `all`：导出模块所有公开可调用对象。
-4. `single`：只导出一个方法（兼容旧入口风格）。
+### 3.2 InfoCenter HTTP + JSON
 
-## 5. 方法路由
+负责：
 
-1. 服务启动时建立 `method -> callable` 路由表。
-2. `ListServiceMethods` 返回可调用方法列表。
-3. `CallService` 与 HTTP 都按 `method` 分发。
-4. `CallService` 可携带 `service_token`；HTTP 可通过 `X-Service-Token` 或 `Authorization: Bearer ...` 传递。
+1. 节点注册
+2. 节点心跳
+3. 路由查询
+4. 运维查看
 
-## 6. HTTP 数据面
+### 3.3 服务 HTTP 数据面
 
-1. `POST /svc/{service_id}/call/{method}?timeout_sec=...`
+负责：
+
+1. `POST /svc/{service_id}/call/{method}`
 2. `GET /svc/{service_id}/status`
-3. 支持 `X-Service-Token` 或 `Authorization: Bearer ...`
 
-成功响应示例：
+## 4. 上传形态
 
-```json
-{"ok": true, "method": "square", "data": {"value": 3, "square": 9}}
-```
+### 4.1 支持的内容
 
-失败响应示例：
+1. 单文件 `py`
+2. `tar.gz`
+3. `zip`
+4. `whl`
 
-```json
-{"ok": false, "method": "square", "error_type": "UserError", "error": "..."}
-```
+### 4.2 当前上传过程
 
-## 7. 生命周期
+1. 客户端准备工程包。
+2. 通过 `CreateService(stream ...)` 分块上传。
+3. NodeControl 边收边写临时文件。
+4. 完成后校验 `sha256`。
+5. 生成 `code_version=sha256:<digest>`。
+6. 对归档文件解压到独立目录。
 
-1. 创建后进入 `RUNNING`。
-2. `CreateService` 返回 `service_token`，owner 需要持久化该 token。
-3. owner 周期性 `HeartbeatService(owner_client_id, service_id, service_token)` 续租。
-4. 主动结束时调用 `EndService(owner_client_id, service_id, service_token)`。
-5. 超时或主动 `EndService` 后进入回收并 `STOPPED`。
-6. NodeControl 心跳上报服务路由到 InfoCenter，供 `ListServiceRoutes` 查询。
+### 4.3 导入污染防护
 
-## 8. 命名约束
+对于包导入：
 
-1. `service_name` 在活跃服务范围内应视为全局唯一。
-2. 服务发现按 `service_name` 聚合，不按 `owner_client_id` 做二次路由区分。
-3. 如果需要多租户隔离命名，应由客户端自行生成唯一名字。
+1. 导入前会清理 `entry_module` 及其父包缓存。
+2. 避免重复部署同名包时命中旧路径。
+
+## 5. 方法导出
+
+### 5.1 导出规则
+
+支持：
+
+1. `decorator`
+2. `explicit`
+3. `all`
+4. `single`
+
+### 5.2 推荐模式
+
+默认推荐：
+
+1. `export_mode="decorator"`
+2. `export_decorator="pycloud_export"`
+
+原因：
+
+1. 更安全。
+2. 更可控。
+3. 不会把模块里的所有函数都暴露出去。
+
+### 5.3 方法路由
+
+服务启动后会建立：
+
+1. `method_name -> callable`
+
+`ListServiceMethods` 可用于查询可调方法。
+
+## 6. 生命周期
+
+### 6.1 创建
+
+1. Owner 调 `CreateService`。
+2. NodeControl 创建服务进程池。
+3. 返回 `service_id + service_token + http_base_url`。
+4. 节点下一次向 InfoCenter 心跳时，路由会出现在 `/services/routes`。
+
+注意：
+
+1. 路由聚合不是强同步返回。
+2. 刚创建后立刻查 InfoCenter，可能要等一个短心跳周期。
+
+### 6.2 保活
+
+1. Owner 周期性调用 `HeartbeatService`。
+2. 超时未续租则服务会被回收。
+
+### 6.3 主动结束
+
+1. Owner 调用 `EndService`。
+2. 服务进入停止并释放 worker 额度。
+
+## 7. 权限与身份
+
+### 7.1 当前权限边界
+
+1. `owner_client_id` 表示谁是 owner。
+2. `service_token` 才是管理权限凭证。
+
+### 7.2 当前调用权限
+
+1. 服务方法调用当前默认不做外部统一鉴权网关。
+2. `CallService` / HTTP 调用可以选择携带 `service_token`。
+3. 如果要做更严格的调用权限，建议由外部网关拦截。
+
+## 8. 服务唯一性
+
+1. 活跃 `service_name` 视为全局唯一。
+2. 服务端不再按 `owner_client_id + service_name` 做二次路由区分。
+3. 如果多个客户端需要不同实例，应自行生成不同 `service_name`。
 
 ## 9. 客户端重启复用
 
-1. 客户端本地应缓存：
-   - `owner_client_id`
-   - `service_name`
-   - `artifact_code_version`
-   - 每个节点的 `service_id + service_token`
-2. 同一个客户端重启后，如果远端活跃服务与本地缓存满足：
-   - 同 `owner_client_id`
-   - 同 `service_name`
-   - 同 `artifact_code_version`
-   则可直接复用，不需要重复上传部署包。
-3. 如果同名服务存在但 `artifact_code_version` 不同，默认拒绝覆盖；客户端需要显式选择“replace”语义。
-4. 当前 Python 客户端默认提供：
-   - `reuse_existing_same_code=True`
-   - `replace_existing_if_code_changed=False`
+Python 客户端当前会在本地缓存：
 
-## 10. 客户端建议流程
+1. `owner_client_id`
+2. `service_name`
+3. `artifact_code_version`
+4. 每个节点的 `service_id`
+5. 每个节点的 `service_token`
+
+复用条件：
+
+1. 同 `owner_client_id`
+2. 同 `service_name`
+3. 同 `artifact_code_version`
+4. 本地 token 缓存仍然存在
+
+如果满足这些条件，可以直接复用远端活跃服务，而不重新上传。
+
+## 10. 节点选择
+
+`deploy_from_infocenter(...)` 当前部署逻辑：
+
+1. 查询 InfoCenter 节点。
+2. 过滤：
+   - `healthy=false`
+   - `schedulable=false`
+   - `drain=true`
+3. 按 `service_worker_available` 排序。
+4. 选出 `node_ids` 或 `node_count` / `min_success_nodes` 决定的节点数。
+
+这版默认是“按需选点”，不是“默认部署到所有节点”。
+
+## 11. 当前推荐流程
 
 1. `CreateService`
-2. 落盘保存 `service_token`
+2. 把 `service_token` 落本地
 3. `ListServiceMethods`
-4. 按需 `CallService`
-5. 开启 keepalive（owner）
+4. 开启 keepalive
+5. 通过 HTTP 或 gRPC 调方法
 6. 完成后 `EndService`
-
-## 11. 与任务模式关系
-
-1. 服务会话与任务模式可并存。
-2. 两者共享 NodeControl 与代码版本管理。
-3. 任务模式是“task_id 驱动”，服务会话是“method 驱动”。

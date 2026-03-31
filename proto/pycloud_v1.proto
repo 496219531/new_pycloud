@@ -63,17 +63,6 @@ message TaskError {
   string message = 2;
 }
 
-// -------------------------
-// InfoCenter service
-// -------------------------
-
-service InfoCenterService {
-  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
-  rpc HeartbeatNode(HeartbeatNodeRequest) returns (HeartbeatNodeResponse);
-  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
-  rpc ListServiceRoutes(ListServiceRoutesRequest) returns (ListServiceRoutesResponse);
-}
-
 message NodeMetrics {
   int32 queued = 1;
   int32 inflight = 2;
@@ -446,16 +435,6 @@ message GetServiceStatusResponse {
   bool ok = 1;
   ServiceStatusInfo service = 2;
   Error error = 3;
-}
-
-// -------------------------
-// Worker internal service (local)
-// -------------------------
-
-service WorkerInternalService {
-  rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
-  rpc HeartbeatTask(HeartbeatTaskRequest) returns (HeartbeatTaskResponse);
-  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
 }
 
 message PollTaskRequest {
