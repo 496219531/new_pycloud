@@ -4,7 +4,7 @@
 
 这版部署模型已经收敛为：
 
-1. `InfoCenter` 负责发现和简单运维。
+1. `ControlPlane(InfoCenter + Gateway)` 负责发现、简单运维、对外服务入口。
 2. `NodeControl` 负责真正执行。
 3. 客户端负责命名、选点和是否替换旧服务。
 
@@ -19,9 +19,9 @@
 
 ### 2.1 控制面拆分
 
-1. `InfoCenter = HTTP + JSON`
+1. `ControlPlane = HTTP + JSON`
 2. `NodeControl = gRPC`
-3. 服务数据面 = HTTP
+3. 节点内部服务数据面 = HTTP
 
 ### 2.2 本地运行时收敛
 
@@ -70,10 +70,31 @@
 3. 返回 `service_id + service_token + http_base_url`
 4. 节点通过心跳把路由上报给 InfoCenter
 
+owner 推荐用法：
+
+1. 部署完成后 keepalive 已自动启动
+2. 做少量预热调用
+3. 然后直接 `group.join(...)` 长驻
+4. 用 `Ctrl+C` 作为正常结束路径
+5. 异常退出时再由 `group.close(...)` 兜底
+
 ### 3.3 调用
 
-1. owner 可走 gRPC `CallService`
-2. 普通调用方也可先查 InfoCenter 路由，再走 HTTP 调用
+1. 默认推荐路径：调用方直接走 `ControlPlane Gateway` 的 `POST /svc/{service_name}/call/{method}`
+2. Gateway 内部按 `service_name` 选 route，并转发到对应 `NodeControl`
+3. `service_id` 主要用于实例级管理，不是业务侧主发现名
+4. gRPC `CallService` 仍保留为内部兼容入口
+
+如果不想经过 Gateway，也支持客户端自己做发现和选路：
+
+1. `DiscoveryServiceClient`
+2. `DiscoveryModuleClient`
+
+它们会：
+
+1. 先查 `InfoCenter`
+2. 客户端本地维护 route cache
+3. 直接调用节点内部 `service_id` 数据面
 
 ## 4. 当前推荐默认值
 
@@ -109,9 +130,25 @@ replace_existing_if_code_changed=False
 1. 进程状态
 2. 每个节点当前加载的服务名
 
+## 7. 当前推荐部署形态
+
+默认推荐：
+
+1. 起一个 `controlplane`
+2. 起多个 `nodecontrol`
+
+可选支持：
+
+1. 单独起 `infocenter`
+2. 单独起 `gateway`
+
+但默认本地/轻量部署优先用一体化 `controlplane`，更简单、更稳。
+
 ### 5.3 典型 demo
 
 ```bash
+python scripts/grpc_register_service_client_demo.py
+python scripts/demo_service_module_group.py
 python scripts/demo_simple_deploy.py
 python scripts/demo_deploy_from_files.py
 python scripts/grpc_existing_service_client_demo.py

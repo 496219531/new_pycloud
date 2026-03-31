@@ -98,3 +98,99 @@ def test_node_registrar_syncs_service_routes(tmp_path):
         registrar.close()
         node_state.close()
         info_server.stop()
+
+
+def test_infocenter_client_select_task_nodes_prefers_credit():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-low",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            client.register_node(
+                node_id="node-high",
+                control_addr="127.0.0.1:50062",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            client.register_node(
+                node_id="node-drain",
+                control_addr="127.0.0.1:50063",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+
+            client.heartbeat_node(
+                node_id="node-low",
+                healthy=True,
+                metrics={"queued": 3, "inflight": 2, "running": 2, "credit": 4},
+            )
+            client.heartbeat_node(
+                node_id="node-high",
+                healthy=True,
+                metrics={"queued": 1, "inflight": 1, "running": 1, "credit": 9},
+            )
+            info_state.update_node_schedule_state("node-drain", drain=True)
+            client.heartbeat_node(
+                node_id="node-drain",
+                healthy=True,
+                metrics={"queued": 0, "inflight": 0, "running": 0, "credit": 15},
+            )
+
+            selected = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    tags=["compute"],
+                    node_count=2,
+                    limit=10,
+                    require_credit=True,
+                )
+            )
+            assert [node.node_id for node in selected] == ["node-high", "node-low"]
+    finally:
+        info_server.stop()
+
+
+def test_infocenter_client_select_task_nodes_accepts_explicit_node_ids():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-a",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            client.register_node(
+                node_id="node-b",
+                control_addr="127.0.0.1:50062",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+
+            selected = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    node_ids=["node-b"],
+                    limit=10,
+                )
+            )
+            assert [node.node_id for node in selected] == ["node-b"]
+    finally:
+        info_server.stop()

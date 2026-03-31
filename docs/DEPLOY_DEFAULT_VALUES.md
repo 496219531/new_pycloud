@@ -51,9 +51,9 @@ service-{本机IP}-{时间戳}
 ### 3.1 使用本地文件
 
 ```python
-from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
+group = ServiceModuleGroup.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     artifact_path="service.py",
 )
@@ -62,7 +62,7 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
 ### 3.2 使用 blob
 
 ```python
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
+group = ServiceModuleGroup.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="service.py",
@@ -88,7 +88,7 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
 ### 4.1 显式指定节点
 
 ```python
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
+group = ServiceModuleGroup.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="service.py",
@@ -99,7 +99,7 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
 ### 4.2 指定节点数
 
 ```python
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
+group = ServiceModuleGroup.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="service.py",
@@ -114,6 +114,7 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
 1. 活跃 `service_name` 视为全局唯一。
 2. 服务端不再按 `owner_client_id` 区分同名服务。
 3. 如果多个客户端需要不同实例，应自行生成不同 `service_name`。
+4. 发现服务时先按 `service_name` 查 route，`service_id` 主要用于实例管理。
 
 ## 6. 复用与替换
 
@@ -143,7 +144,7 @@ replace_existing_if_code_changed=True
 ## 7. 一个更贴近当前实现的示例
 
 ```python
-group = ModuleLikeServiceGroup.deploy_from_infocenter(
+group = ServiceModuleGroup.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="square_service.py",
@@ -156,3 +157,44 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
 ```
 
 这更适合当前“本地轻量、简单稳定”的默认思路。
+
+## 8. owner 推荐长驻方式
+
+部署成功后，owner 侧推荐直接进入：
+
+```python
+joined = False
+try:
+    group.join(
+        end_services_on_interrupt=True,
+        end_reason="owner ctrl+c",
+    )
+    joined = True
+finally:
+    group.close(end_services=not joined)
+```
+
+也就是：
+
+1. `deploy_from_infocenter(...)` 成功后就会自动启动 keepalive
+2. 不再推荐手写 `start_keepalive() + while True`
+3. `join()` 只负责长驻等待
+4. `Ctrl+C` 作为正常退出路径
+5. `close(...)` 负责异常时兜底清理
+
+## 9. 部署后怎么调
+
+部署完成后，对外推荐调用方式是：
+
+1. 直接连 `controlplane`
+2. 按 `service_name` 调 Gateway
+
+例如：
+
+```bash
+curl -X POST 'http://127.0.0.1:50051/svc/square-service/call/square' \
+  -H 'Content-Type: application/json' \
+  -d '{"x": 7}'
+```
+
+而不是优先自己查 route 再直接拼某个节点上的 `service_id` URL。

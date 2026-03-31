@@ -1,5 +1,7 @@
-from pycloud_parallel.controlplane.client import MultiNodeServiceGroup
+from pycloud_parallel.controlplane.client import ServiceGroup
 import asyncio
+import time
+
 
 async def main():
     # 部署服务（同步）
@@ -17,10 +19,11 @@ async def main():
         b"    return {'x': x, 'y': x * x * x}\n"
     )
 
-    group = MultiNodeServiceGroup.deploy_from_infocenter(
+    suffix = int(time.time())
+    group = ServiceGroup.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
-        owner_client_id="client-owner-001",
-        service_name="square-service",          # 同名已存在会直接抛错
+        owner_client_id=f"client-owner-{suffix}",
+        service_name=f"square-service-{suffix}",
         blob=blob,
         filename="square_service.py",
         runtime="py3.11",
@@ -31,51 +34,61 @@ async def main():
         worker_count=4,
         heartbeat_timeout_sec=30,
         healthy_only=True,
-        tags=["compute"],                       # 可按节点标签筛选
+        tags=["compute"],
         min_success_nodes=1,
         allow_partial=True,
-        ensure_unique_service_name=True,        # 默认就是 True
+        ensure_unique_service_name=True,
     )
+    joined = False
 
-    group.start_keepalive()
+    try:
+        # ✅ 单次异步调用
+        node_id, resp = await group.acall_balanced(
+            "square",
+            {"x": 7},
+            timeout_sec=10
+        )
+        print(f"节点 {node_id}: {resp['data']}")
 
-    # ✅ 单次异步调用
-    node_id, resp = await group.acall_balanced(
-        "square",
-        {"x": 7},
-        timeout_sec=10
-    )
-    print(f"节点 {node_id}: {resp['data']}")
+        # ✅ 批量并发调用所有节点
+        results = await group.acall_all(
+            "square",
+            {"x": 100},  # 单个 payload 发送给所有节点
+            timeout_sec=10,
+            max_concurrency=50
+        )
+        for node_id, resp, exc in results:
+            if exc:
+                print(f"节点 {node_id} 失败: {exc}")
+            else:
+                print(f"节点 {node_id} 成功: {resp['data']}")
 
-    # ✅ 批量并发调用所有节点
-    results = await group.acall_all(
-        "square",
-        {"x": 100},  # 单个 payload 发送给所有节点
-        timeout_sec=10,
-        max_concurrency=50
-    )
-    for node_id, resp, exc in results:
-        if exc:
-            print(f"节点 {node_id} 失败: {exc}")
-        else:
-            print(f"节点 {node_id} 成功: {resp['data']}")
+        # ✅ 高并发场景：批量异步调用
+        async def batch_call():
+            tasks = [
+                group.acall_balanced("cube", {"x": i}, timeout_sec=10)
+                for i in range(1000)
+            ]
+            return await asyncio.gather(*tasks, return_exceptions=True)
 
-    # ✅ 高并发场景：批量异步调用
-    async def batch_call():
-        tasks = [
-            group.acall_balanced("cube", {"x": i}, timeout_sec=10)
-            for i in range(1000)
-        ]
-        return await asyncio.gather(*tasks, return_exceptions=True)
-    
-    results = await batch_call()
-    for result in results:
-        if isinstance(result, Exception):
-            print(f"失败: {result}")
-        else:
-            node_id, resp = result
-            print(f"节点 {node_id}: {resp['data']}")
+        results = await batch_call()
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"失败: {result}")
+            else:
+                node_id, resp = result
+                print(f"节点 {node_id}: {resp['data']}")
 
-    group.close()
+        print("服务已进入长驻模式，按 Ctrl+C 会自动结束远端服务。")
+        group.join(
+            end_services_on_interrupt=True,
+            end_reason="owner ctrl+c",
+        )
+        joined = True
+    finally:
+        group.close(
+            end_services=not joined,
+            reason="grpc_async_demo cleanup",
+        )
 
 asyncio.run(main())

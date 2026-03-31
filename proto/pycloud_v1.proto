@@ -180,6 +180,7 @@ service NodeControlService {
   rpc SubmitTasks(SubmitTasksRequest) returns (SubmitTasksResponse);
   rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
   rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
   rpc CreateService(stream CreateServiceRequest) returns (CreateServiceResponse);
   rpc ListServiceMethods(ListServiceMethodsRequest) returns (ListServiceMethodsResponse);
@@ -234,6 +235,7 @@ message SubmitTasksRequest {
   string code_version = 2;
   ExecutionMode execution_mode = 3;
   repeated TaskSubmitItem tasks = 4;
+  string job_id = 5;
 }
 
 message TaskAccepted {
@@ -270,6 +272,7 @@ message TaskResult {
   google.protobuf.Timestamp finished_at = 5;
   google.protobuf.Struct result = 6;
   TaskError error = 7;
+  string job_id = 8;
 }
 
 message PullResultsResponse {
@@ -291,6 +294,21 @@ message CancelTasksResponse {
   repeated string not_found = 3;
   repeated string already_done = 4;
   Error error = 5;
+}
+
+message CancelJobRequest {
+  string client_id = 1;
+  string job_id = 2;
+  string reason = 3;
+}
+
+message CancelJobResponse {
+  bool ok = 1;
+  int32 queued_cancelled = 2;
+  int32 running_marked = 3;
+  int32 already_done = 4;
+  int32 not_found = 5;
+  Error error = 6;
 }
 
 message GetMetricsRequest {}

@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+"""HTTP gateway for service-mode callers."""
+
+import json
+import threading
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, Optional, Sequence, Tuple
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
+
+from pycloud_parallel.controlplane.client import InfoCenterServiceRoute, NodeControlClient
+from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
+
+
+def _split_host_port(bind: str) -> Tuple[str, int]:
+    if ":" not in bind:
+        raise ValueError("bind must be host:port")
+    host, port = bind.rsplit(":", 1)
+    return host.strip(), int(port)
+
+
+@dataclass
+class GatewayCallError(Exception):
+    status_code: int
+    data: Dict[str, object]
+
+    def __str__(self) -> str:
+        return str(self.data.get("error", f"http {self.status_code}"))
+
+
+class GatewayHttpApp:
+    def __init__(self, *, route_cache: GatewayRouteCache, timeout_sec: float = 10.0) -> None:
+        self.route_cache = route_cache
+        self.timeout_sec = max(0.1, float(timeout_sec))
+
+    def start(self) -> None:
+        self.route_cache.start()
+
+    def stop(self) -> None:
+        self.route_cache.stop()
+
+    def handle_post(self, *, path: str, headers, body: bytes) -> Optional[Tuple[int, Dict[str, object]]]:
+        parsed = urlparse(path)
+        parts = [x for x in parsed.path.split("/") if x]
+        if len(parts) != 4 or parts[0] != "svc" or parts[2] != "call":
+            return None
+
+        service_name = parts[1]
+        method = parts[3]
+        try:
+            payload = json.loads(body.decode("utf-8") if body else "{}")
+        except Exception:
+            return 400, {"ok": False, "error": "invalid json body"}
+        if not isinstance(payload, dict):
+            return 400, {"ok": False, "error": "json body must be object"}
+
+        qs = parse_qs(parsed.query)
+        timeout_sec = self.timeout_sec
+        if "timeout_sec" in qs:
+            try:
+                timeout_sec = max(0.1, float(qs["timeout_sec"][0]))
+            except Exception:
+                timeout_sec = self.timeout_sec
+        service_token = self._extract_token(headers)
+
+        tried = set()
+        try:
+            route = self.route_cache.select_route(service_name)
+            tried.add(route.service_id)
+            resp = self._invoke_route(route, method=method, payload=payload, timeout_sec=timeout_sec, service_token=service_token)
+            self.route_cache.mark_success(route)
+            return 200, resp
+        except GatewayCallError as exc:
+            if not tried or not self._is_route_failure(exc):
+                return exc.status_code, exc.data
+            self.route_cache.mark_failure(route, str(exc))
+            try:
+                self.route_cache.refresh(service_name, force=True)
+                retry_route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                resp = self._invoke_route(retry_route, method=method, payload=payload, timeout_sec=timeout_sec, service_token=service_token)
+                self.route_cache.mark_success(retry_route)
+                return 200, resp
+            except GatewayCallError as retry_exc:
+                if self._is_route_failure(retry_exc):
+                    self.route_cache.mark_failure(retry_route, str(retry_exc))
+                return retry_exc.status_code, retry_exc.data
+            except Exception as retry_exc:
+                return 502, {"ok": False, "error": f"gateway retry failed: {retry_exc}"}
+        except Exception as exc:
+            return 502, {"ok": False, "error": f"gateway call failed: {exc}"}
+
+    def handle_get(self, *, path: str, headers) -> Optional[Tuple[int, Dict[str, object]]]:
+        del headers
+        parsed = urlparse(path)
+        parts = [x for x in parsed.path.split("/") if x]
+        if len(parts) == 3 and parts[0] == "svc" and parts[2] == "methods":
+            service_name = parts[1]
+            qs = parse_qs(parsed.query)
+            include_docs = str((qs.get("include_docs", ["false"]) or ["false"])[0]).lower() in ("1", "true", "yes")
+            return self._methods(service_name, include_docs=include_docs)
+        if len(parts) == 3 and parts[0] == "svc" and parts[2] == "status":
+            service_name = parts[1]
+            return self._status(service_name)
+        return None
+
+    def _methods(self, service_name: str, *, include_docs: bool) -> Tuple[int, Dict[str, object]]:
+        tried = set()
+        try:
+            route = self.route_cache.select_route(service_name)
+            tried.add(route.service_id)
+            resp = self._list_methods(route, include_docs=include_docs)
+            self.route_cache.mark_success(route)
+            return 200, resp
+        except Exception as exc:
+            if tried:
+                self.route_cache.mark_failure(route, str(exc))
+            try:
+                self.route_cache.refresh(service_name, force=True)
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                resp = self._list_methods(route, include_docs=include_docs)
+                self.route_cache.mark_success(route)
+                return 200, resp
+            except Exception as exc:
+                return 502, {"ok": False, "error": f"gateway list methods failed: {exc}"}
+
+    def _status(self, service_name: str) -> Tuple[int, Dict[str, object]]:
+        try:
+            info = self.route_cache.snapshot_info(service_name)
+        except Exception as exc:
+            return 502, {"ok": False, "error": f"gateway status failed: {exc}"}
+        routes: Sequence[InfoCenterServiceRoute] = info["routes"]
+        if not routes:
+            return 404, {"ok": False, "error": f"service not found: {service_name}"}
+        serialized = []
+        for route in routes:
+            serialized.append(
+                {
+                    "service_name": route.service_name,
+                    "service_id": route.service_id,
+                    "node_id": route.node_id,
+                    "control_addr": route.control_addr,
+                    "node_healthy": route.node_healthy,
+                    "worker_count": route.worker_count,
+                    "alive_workers": route.alive_workers,
+                    "in_flight": route.in_flight,
+                    "http_base_url": route.http_base_url,
+                    "status": int(route.status),
+                    "lease_expire_at": route.lease_expire_at.isoformat(),
+                }
+            )
+        return 200, {
+            "ok": True,
+            "service_name": service_name,
+            "refreshed_at": info["refreshed_at"],
+            "route_count": info["route_count"],
+            "routes": serialized,
+        }
+
+    def _list_methods(self, route: InfoCenterServiceRoute, *, include_docs: bool) -> Dict[str, object]:
+        with NodeControlClient(route.control_addr, timeout_sec=self.timeout_sec) as client:
+            methods = client.list_service_methods(service_id=route.service_id, include_docs=include_docs)
+        return {
+            "ok": True,
+            "service_name": route.service_name,
+            "service_id": route.service_id,
+            "methods": [
+                {
+                    "method": item.method,
+                    "qualified_name": item.qualified_name,
+                    "doc": item.doc,
+                }
+                for item in methods
+            ],
+        }
+
+    def _invoke_route(
+        self,
+        route: InfoCenterServiceRoute,
+        *,
+        method: str,
+        payload: Dict[str, object],
+        timeout_sec: float,
+        service_token: str,
+    ) -> Dict[str, object]:
+        url = f"{route.http_base_url}/call/{quote(method, safe='')}?timeout_sec={max(0.1, timeout_sec):.3f}"
+        headers = {"Content-Type": "application/json"}
+        if service_token:
+            headers["X-Service-Token"] = service_token
+        req = Request(
+            url=url,
+            method="POST",
+            headers=headers,
+            data=json.dumps(payload or {}).encode("utf-8"),
+        )
+        try:
+            with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+        except HTTPError as exc:
+            try:
+                data = json.loads((exc.read() or b"{}").decode("utf-8"))
+            except Exception:
+                data = {"ok": False, "error": exc.reason}
+            raise GatewayCallError(status_code=exc.code, data=data) from exc
+        except Exception as exc:
+            raise GatewayCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
+        if not isinstance(data, dict):
+            raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
+        if not data.get("ok", False):
+            raise GatewayCallError(status_code=502, data=data)
+        return data
+
+    def _extract_token(self, headers) -> str:
+        x_token = str(headers.get("X-Service-Token", "") or "").strip()
+        if x_token:
+            return x_token
+        auth = str(headers.get("Authorization", "") or "").strip()
+        low = auth.lower()
+        if low.startswith("bearer "):
+            return auth[7:].strip()
+        return ""
+
+    def _is_route_failure(self, exc: GatewayCallError) -> bool:
+        if exc.status_code == 502:
+            return True
+        if exc.status_code not in (404, 409, 500):
+            return False
+        msg = str(exc.data.get("error", "") or "").lower()
+        return any(text in msg for text in ("service not found", "service not running", "service executor stopped", "artifact missing"))
+
+
+class GatewayHttpServer:
+    def __init__(self, *, bind: str, app: GatewayHttpApp) -> None:
+        self._bind = bind
+        self.app = app
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.base_url = ""
+
+    def start(self) -> None:
+        if self._server is not None:
+            return
+        host, port = _split_host_port(self._bind)
+        app = self.app
+        app.start()
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+                handled = app.handle_post(path=self.path, headers=self.headers, body=body)
+                if handled is None:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                code, resp = handled
+                self._send_json(code, resp)
+
+            def do_GET(self):  # noqa: N802
+                handled = app.handle_get(path=self.path, headers=self.headers)
+                if handled is None:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                code, resp = handled
+                self._send_json(code, resp)
+
+            def log_message(self, fmt, *args):  # noqa: A003
+                return
+
+            def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
+                raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self._server = ThreadingHTTPServer((host, port), _Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, name="gateway-http", daemon=True)
+        self._thread.start()
+        public_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+        actual_port = int(self._server.server_address[1])
+        self.base_url = f"http://{public_host}:{actual_port}"
+
+    def wait_for_termination(self) -> None:
+        thread = self._thread
+        if thread is not None:
+            thread.join()
+
+    def stop(self, grace: int = 0) -> None:
+        del grace
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self.app.stop()

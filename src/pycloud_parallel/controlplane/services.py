@@ -193,9 +193,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
 
     def SubmitTasks(self, request: pb2.SubmitTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
         logger.info(
-            "[NodeControl] SubmitTasks peer=%s client_id=%s code_version=%s tasks=%d",
+            "[NodeControl] SubmitTasks peer=%s client_id=%s job_id=%s code_version=%s tasks=%d",
             _peer(context),
             request.client_id,
+            request.job_id,
             request.code_version,
             len(request.tasks),
         )
@@ -278,6 +279,47 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             cancelled=cancelled,
             not_found=not_found,
             already_done=already_done,
+        )
+
+    def CancelJob(self, request: pb2.CancelJobRequest, context: grpc.ServicerContext) -> pb2.CancelJobResponse:
+        logger.info(
+            "[NodeControl] CancelJob peer=%s client_id=%s job_id=%s",
+            _peer(context),
+            request.client_id,
+            request.job_id,
+        )
+        if not request.client_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("client_id is required")
+            logger.warning("[NodeControl] CancelJob invalid request peer=%s missing client_id", _peer(context))
+            return pb2.CancelJobResponse(
+                ok=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "client_id is required"),
+            )
+        if not request.job_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("job_id is required")
+            logger.warning("[NodeControl] CancelJob invalid request peer=%s missing job_id", _peer(context))
+            return pb2.CancelJobResponse(
+                ok=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "job_id is required"),
+            )
+
+        queued_cancelled, running_marked, already_done, not_found = self._state.cancel_job(request)
+        logger.info(
+            "[NodeControl] CancelJob result peer=%s queued_cancelled=%d running_marked=%d already_done=%d not_found=%d",
+            _peer(context),
+            queued_cancelled,
+            running_marked,
+            already_done,
+            not_found,
+        )
+        return pb2.CancelJobResponse(
+            ok=True,
+            queued_cancelled=queued_cancelled,
+            running_marked=running_marked,
+            already_done=already_done,
+            not_found=not_found,
         )
 
     def GetMetrics(self, request: pb2.GetMetricsRequest, context: grpc.ServicerContext) -> pb2.GetMetricsResponse:

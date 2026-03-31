@@ -6,10 +6,9 @@ PyCloud 部署服务示例：从多个文件/文件夹部署
 
 使用方式：
     1. 确保 InfoCenter 和 NodeControl 已启动
-       或使用 --start-services 自动启动
     2. 运行脚本
 """
-from pycloud_parallel.controlplane.client import MultiNodeServiceGroup
+from pycloud_parallel.controlplane.client import ServiceGroup
 
 
 def demo_service_code():
@@ -217,46 +216,10 @@ def check_and_start_services():
         return False
 
 
-def cleanup_existing_services():
-    """清理已存在的服务"""
-    from pycloud_parallel.controlplane.client import InfoCenterClient
-
-    print("检查并清理已存在的服务...")
-    try:
-        with InfoCenterClient('127.0.0.1:50051') as client:
-            routes = list(client.list_service_routes(
-                service_name="compute-service",
-                healthy_only=False,
-                limit=10
-            ))
-            if routes:
-                print(f"  找到 {len(routes)} 个已存在的服务实例")
-                # 自动结束这些服务
-                from pycloud_parallel.controlplane.client import NodeControlClient
-                for route in routes:
-                    try:
-                        nc = NodeControlClient(route.control_addr, timeout_sec=5)
-                        nc.end_service(
-                            owner_client_id="demo-compute-001",
-                            service_id=route.service_id,
-                            reason="demo cleanup"
-                        )
-                        print(f"  ✓ 清理 {route.node_id}")
-                    except Exception as exc:
-                        print(f"  ✗ 清理 {route.node_id} 失败: {exc}")
-                print()
-               
-    except Exception as exc:
-        print(f"  跳过清理: {exc}")
-        print()
-
-
 def main():
     """主函数：部署服务"""
-    import tempfile
     import time
     import shutil
-    from pathlib import Path
 
     print("=" * 60)
     print("  PyCloud 部署服务示例：多文件项目")
@@ -267,36 +230,9 @@ def main():
     check_and_start_services()
     print()
 
-    # 清理已存在的服务
-    print("-" * 60)
-    print("  清理已存在的服务...")
-    print("-" * 60)
-    try:
-        from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient
-
-        with InfoCenterClient('127.0.0.1:50051', timeout_sec=5) as client:
-            routes = list(client.list_service_routes(
-                service_name="compute-service",
-                healthy_only=False,
-                limit=10
-            ))
-            if routes:
-                print(f"  找到 {len(routes)} 个已存在的服务实例，正在清理...")
-                for route in routes:
-                    try:
-                        nc = NodeControlClient(route.control_addr, timeout_sec=5)
-                        nc.end_service(
-                            owner_client_id="demo-compute-001",
-                            service_id=route.service_id,
-                            reason="demo cleanup"
-                        )
-                        print(f"    ✓ {route.node_id}")
-                    except Exception as exc:
-                        print(f"    ✗ {route.node_id}: {exc}")
-                time.sleep(1)
-    except Exception as exc:
-        print(f"  跳过清理: {exc}")
-    print()
+    service_suffix = int(time.time())
+    service_name = f"compute-service-{service_suffix}"
+    owner_client_id = f"demo-compute-{service_suffix}"
 
     # 方式 1: 使用 artifact_paths 部署
     print("-" * 60)
@@ -317,6 +253,7 @@ def main():
     print()
 
     group = None
+    joined = False
     try:
         # 部署服务
         print("-" * 60)
@@ -325,10 +262,10 @@ def main():
         print()
 
         try:
-            group = MultiNodeServiceGroup.deploy_from_infocenter(
+            group = ServiceGroup.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
-                owner_client_id="demo-compute-001",
-                service_name="compute-service",
+                owner_client_id=owner_client_id,
+                service_name=service_name,
 
                 # 使用 artifact_paths 部署多个文件/文件夹
                 artifact_paths=[
@@ -361,9 +298,6 @@ def main():
                 print()
                 print("  请先启动 PyCloud 服务：")
                 print("    ./scripts/start_services.sh start")
-                print()
-                print("  或在运行此脚本时使用：")
-                print("    python scripts/demo_deploy_from_files.py --start-services")
                 return
             raise
 
@@ -372,9 +306,6 @@ def main():
         print(f"  部署节点: {list(group.sessions.keys())}")
         print(f"  所有者: {group.owner_client_id}")
         print()
-
-        # 启动心跳
-        group.start_keepalive()
 
         # 测试调用
         print("-" * 60)
@@ -419,6 +350,14 @@ def main():
         print("=" * 60)
         print("  示例完成")
         print("=" * 60)
+        print("  服务进入长驻模式，按 Ctrl+C 自动回收")
+        print("=" * 60)
+        print()
+        group.join(
+            end_services_on_interrupt=True,
+            end_reason="owner ctrl+c",
+        )
+        joined = True
 
     finally:
         # 清理
@@ -429,24 +368,11 @@ def main():
             print(f"\n✗ 清理失败: {exc}")
 
         if group is not None:
-            group.close(end_services=False)
+            group.close(
+                end_services=not joined,
+                reason="demo_deploy_from_files cleanup",
+            )
 
 
 if __name__ == "__main__":
-    import sys
-
-    print("""
-    PyCloud 部署示例
-    ================
-    """)
-
-    # 检查命令行参数
-    if "--start-services" in sys.argv:
-        print("参数: --start-services")
-        print("自动启动 PyCloud 服务...")
-        print()
-        check_and_start_services()
-        print()
-
-    # 运行主函数
     main()

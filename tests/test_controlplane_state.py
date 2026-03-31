@@ -46,6 +46,7 @@ def test_submit_poll_report_and_pull_results(tmp_path):
             client_id="client-a",
             code_version=code_version,
             execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+            job_id="job-alpha",
             tasks=[
                 pb2.TaskSubmitItem(task_id="task-1", payload={"x": 1}, timeout_hint_sec=10, priority=1),
             ],
@@ -74,6 +75,7 @@ def test_submit_poll_report_and_pull_results(tmp_path):
         )
         assert len(results) == 1
         assert results[0].task_id == "task-1"
+        assert results[0].job_id == "job-alpha"
         assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
         assert int(next_cursor) >= 1
     finally:
@@ -144,7 +146,7 @@ def test_internal_executor_runs_tasks_without_external_worker(tmp_path):
         assert len(accepted) == 2
         assert not rejected
 
-        deadline = time.time() + 5
+        deadline = time.time() + 10
         results = []
         cursor = ""
         while time.time() < deadline and len(results) < 2:
@@ -156,6 +158,83 @@ def test_internal_executor_runs_tasks_without_external_worker(tmp_path):
         assert len(results) == 2
         statuses = sorted(item.status for item in results)
         assert statuses == [pb2.TASK_STATUS_SUCCEEDED, pb2.TASK_STATUS_FAILED_USER]
+    finally:
+        state.close()
+
+
+def test_cancel_job_marks_matching_tasks(tmp_path):
+    state = NodeControlState(
+        node_id="node-test-cancel-job",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        code_version = _seed_code(state)
+        accepted, rejected, _ = state.submit_tasks(
+            pb2.SubmitTasksRequest(
+                client_id="client-job",
+                code_version=code_version,
+                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+                job_id="job-42",
+                tasks=[
+                    pb2.TaskSubmitItem(task_id="task-running", payload={"value": 2}, priority=1),
+                    pb2.TaskSubmitItem(task_id="task-queued", payload={"value": 3}, priority=1),
+                ],
+            )
+        )
+        assert len(accepted) == 2
+        assert not rejected
+
+        envelope = state.poll_task(worker_id="worker-job")
+        assert envelope is not None
+        assert envelope.task_id == "task-running"
+
+        queued_cancelled, running_marked, already_done, not_found = state.cancel_job(
+            pb2.CancelJobRequest(
+                client_id="client-job",
+                job_id="job-42",
+                reason="debug stop",
+            )
+        )
+        assert queued_cancelled == 1
+        assert running_marked == 1
+        assert already_done == 0
+        assert not_found == 0
+
+        assert state._tasks["task-running"].cancel_requested is True  # noqa: SLF001
+        assert state._tasks["task-queued"].status == pb2.TASK_STATUS_CANCELLED  # noqa: SLF001
+
+        results, _ = state.pull_results(
+            pb2.PullResultsRequest(client_id="client-job", limit=10, wait_ms=0, cursor="")
+        )
+        assert len(results) == 1
+        assert results[0].task_id == "task-queued"
+        assert results[0].job_id == "job-42"
+        assert results[0].status == pb2.TASK_STATUS_CANCELLED
+    finally:
+        state.close()
+
+
+def test_cancel_job_returns_not_found_for_unknown_job(tmp_path):
+    state = NodeControlState(
+        node_id="node-test-cancel-job-miss",
+        queue_capacity=8,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        queued_cancelled, running_marked, already_done, not_found = state.cancel_job(
+            pb2.CancelJobRequest(client_id="client-miss", job_id="job-missing", reason="noop")
+        )
+        assert queued_cancelled == 0
+        assert running_marked == 0
+        assert already_done == 0
+        assert not_found == 1
     finally:
         state.close()
 

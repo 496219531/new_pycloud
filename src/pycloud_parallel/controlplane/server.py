@@ -10,6 +10,9 @@ from typing import Callable, Optional, Tuple
 
 import grpc
 
+from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
+from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp, GatewayHttpServer
+from pycloud_parallel.controlplane.gateway_source import InProcessInfoCenterSource, RemoteInfoCenterSource
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.services import NodeControlService
@@ -26,6 +29,47 @@ def build_infocenter_server(bind: str, *, max_workers: int = 32) -> InfoCenterHt
         state=InfoCenterState(heartbeat_interval_sec=5),
     )
     return server
+
+
+def build_controlplane_server(
+    bind: str,
+    *,
+    gateway_refresh_interval_sec: float = 3.0,
+    gateway_failure_threshold: int = 3,
+    gateway_open_sec: float = 5.0,
+) -> InfoCenterHttpServer:
+    info_state = InfoCenterState(heartbeat_interval_sec=5)
+    route_cache = GatewayRouteCache(
+        source=InProcessInfoCenterSource(info_state),
+        refresh_interval_sec=gateway_refresh_interval_sec,
+        failure_threshold=gateway_failure_threshold,
+        open_sec=gateway_open_sec,
+    )
+    gateway_app = GatewayHttpApp(route_cache=route_cache)
+    return InfoCenterHttpServer(
+        bind=bind,
+        state=info_state,
+        gateway_app=gateway_app,
+    )
+
+
+def build_gateway_server(
+    bind: str,
+    *,
+    infocenter_addr: str,
+    gateway_refresh_interval_sec: float = 3.0,
+    gateway_failure_threshold: int = 3,
+    gateway_open_sec: float = 5.0,
+) -> GatewayHttpServer:
+    if not infocenter_addr:
+        raise ValueError("infocenter_addr is required for gateway role")
+    route_cache = GatewayRouteCache(
+        source=RemoteInfoCenterSource(infocenter_addr),
+        refresh_interval_sec=gateway_refresh_interval_sec,
+        failure_threshold=gateway_failure_threshold,
+        open_sec=gateway_open_sec,
+    )
+    return GatewayHttpServer(bind=bind, app=GatewayHttpApp(route_cache=route_cache))
 
 
 def build_nodecontrol_server(
@@ -101,8 +145,8 @@ def main() -> None:
 
     根据命令行参数启动 InfoCenter 或 NodeControl 服务器。
     """
-    parser = argparse.ArgumentParser(description="PyCloud gRPC control-plane server")
-    parser.add_argument("--role", choices=["infocenter", "nodecontrol"], required=True)
+    parser = argparse.ArgumentParser(description="PyCloud control-plane server")
+    parser.add_argument("--role", choices=["infocenter", "gateway", "controlplane", "nodecontrol"], required=True)
     parser.add_argument("--bind", default="0.0.0.0:50051")
     parser.add_argument("--node-id", default="node-local-01")
     parser.add_argument("--queue-capacity", type=int, default=4000)
@@ -116,6 +160,9 @@ def main() -> None:
     parser.add_argument("--advertise-addr", default="")
     parser.add_argument("--node-tags", default="compute")
     parser.add_argument("--node-version", default="v1")
+    parser.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0)
+    parser.add_argument("--gateway-failure-threshold", type=int, default=3)
+    parser.add_argument("--gateway-open-sec", type=float, default=5.0)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -129,6 +176,34 @@ def main() -> None:
     if args.role == "infocenter":
         logger.info("[Server] starting InfoCenter bind=%s log_level=%s", args.bind, level_name)
         server = build_infocenter_server(args.bind, max_workers=args.max_workers)
+        _wait_until_stopped(server, on_stop=lambda: None)
+        return
+
+    if args.role == "controlplane":
+        logger.info("[Server] starting ControlPlane bind=%s log_level=%s", args.bind, level_name)
+        server = build_controlplane_server(
+            args.bind,
+            gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
+            gateway_failure_threshold=args.gateway_failure_threshold,
+            gateway_open_sec=args.gateway_open_sec,
+        )
+        _wait_until_stopped(server, on_stop=lambda: None)
+        return
+
+    if args.role == "gateway":
+        logger.info(
+            "[Server] starting Gateway bind=%s infocenter=%s log_level=%s",
+            args.bind,
+            args.infocenter_addr,
+            level_name,
+        )
+        server = build_gateway_server(
+            args.bind,
+            infocenter_addr=args.infocenter_addr,
+            gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
+            gateway_failure_threshold=args.gateway_failure_threshold,
+            gateway_open_sec=args.gateway_open_sec,
+        )
         _wait_until_stopped(server, on_stop=lambda: None)
         return
 

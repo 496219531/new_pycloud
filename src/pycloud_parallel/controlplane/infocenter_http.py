@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, utc_now
 
 
@@ -118,9 +119,16 @@ def _render_ops_page(state: InfoCenterState) -> str:
 
 
 class InfoCenterHttpServer:
-    def __init__(self, *, bind: str, state: Optional[InfoCenterState] = None) -> None:
+    def __init__(
+        self,
+        *,
+        bind: str,
+        state: Optional[InfoCenterState] = None,
+        gateway_app: Optional[GatewayHttpApp] = None,
+    ) -> None:
         self._bind = bind
         self.state = state or InfoCenterState()
+        self.gateway_app = gateway_app
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
@@ -130,6 +138,9 @@ class InfoCenterHttpServer:
             return
         host, port = _split_host_port(self._bind)
         state = self.state
+        gateway_app = self.gateway_app
+        if gateway_app is not None:
+            gateway_app.start()
 
         class _Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
@@ -199,6 +210,13 @@ class InfoCenterHttpServer:
                         return
                     self._send_json(200, {"ok": True})
                     return
+                if gateway_app is not None:
+                    body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+                    handled = gateway_app.handle_post(path=self.path, headers=self.headers, body=body)
+                    if handled is not None:
+                        code, resp = handled
+                        self._send_json(code, resp)
+                        return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
             def do_GET(self):  # noqa: N802
@@ -232,6 +250,12 @@ class InfoCenterHttpServer:
                     self.end_headers()
                     self.wfile.write(raw)
                     return
+                if gateway_app is not None:
+                    handled = gateway_app.handle_get(path=self.path, headers=self.headers)
+                    if handled is not None:
+                        code, resp = handled
+                        self._send_json(code, resp)
+                        return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
             def log_message(self, fmt, *args):  # noqa: A003
@@ -278,3 +302,5 @@ class InfoCenterHttpServer:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+        if self.gateway_app is not None:
+            self.gateway_app.stop()

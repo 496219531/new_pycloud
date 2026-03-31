@@ -1,4 +1,4 @@
-"""测试 ModuleLikeServiceGroup 的模块化调用功能。"""
+"""测试 ServiceModuleGroup 的模块化调用功能。"""
 
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -160,13 +160,13 @@ class TestBroadcastProxy:
         asyncio.run(test())
 
 
-class TestModuleLikeServiceGroup:
-    """测试 ModuleLikeServiceGroup 类。"""
+class TestServiceModuleGroup:
+    """测试 ServiceModuleGroup 类。"""
 
     def test_getattr_creates_proxy(self):
         """测试 __getattr__ 创建代理。"""
         from pycloud_parallel.controlplane.client import (
-            ModuleLikeServiceGroup,
+            ServiceModuleGroup,
             _CallProxy,
         )
         from unittest.mock import MagicMock
@@ -177,7 +177,7 @@ class TestModuleLikeServiceGroup:
         mock_method_info.method = "square"
         mock_session.list_methods.return_value = [mock_method_info]
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={"node1": mock_session},
@@ -192,14 +192,14 @@ class TestModuleLikeServiceGroup:
 
     def test_getattr_with_empty_methods_raises(self):
         """测试当方法列表为空时，访问任何方法都应该报错。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
         from unittest.mock import MagicMock
 
         # 模拟返回空方法列表的 session
         mock_session = MagicMock()
         mock_session.list_methods.return_value = []
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={"node1": mock_session},
@@ -213,9 +213,9 @@ class TestModuleLikeServiceGroup:
 
     def test_getattr_with_discovered_methods(self):
         """测试已发现方法时的 __getattr__。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -228,9 +228,9 @@ class TestModuleLikeServiceGroup:
 
     def test_getattr_unknown_method_raises(self):
         """测试访问已知列表中不存在的方法时抛出异常。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -245,9 +245,9 @@ class TestModuleLikeServiceGroup:
 
     def test_getattr_private_raises(self):
         """测试访问私有属性时抛出异常。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -259,9 +259,9 @@ class TestModuleLikeServiceGroup:
 
     def test_methods_property(self):
         """测试 methods 属性。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -273,9 +273,9 @@ class TestModuleLikeServiceGroup:
 
     def test_repr(self):
         """测试 __repr__ 方法。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": MagicMock()},
@@ -290,9 +290,9 @@ class TestModuleLikeServiceGroup:
 
     def test_repr_not_discovered(self):
         """测试未发现方法时的 __repr__。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="compute-service",
             sessions={},
@@ -306,9 +306,9 @@ class TestModuleLikeServiceGroup:
 
     def test_async_call_interface(self):
         """测试异步 call 接口。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -324,9 +324,9 @@ class TestModuleLikeServiceGroup:
 
     def test_sync_call_interface(self):
         """测试同步 call_sync 接口。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -339,9 +339,9 @@ class TestModuleLikeServiceGroup:
 
     def test_async_call_all_interface(self):
         """测试异步 call_all 接口。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -362,7 +362,7 @@ class TestIntegration:
 
     def test_full_async_flow(self):
         """测试完整的异步调用流程。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
         # 模拟 session
         mock_session = MagicMock()
@@ -371,7 +371,7 @@ class TestIntegration:
         mock_session.list_methods.return_value = [mock_method_info]
 
         # 模拟 group
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": mock_session, "node2": MagicMock()},
@@ -399,7 +399,7 @@ class TestIntegration:
 
     def test_full_sync_flow(self):
         """测试完整的同步调用流程。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
         # 模拟 session
         mock_session = MagicMock()
@@ -407,7 +407,7 @@ class TestIntegration:
         mock_method_info.method = "square"
         mock_session.list_methods.return_value = [mock_method_info]
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": mock_session},
@@ -428,7 +428,7 @@ class TestIntegration:
 
     def test_full_broadcast_flow(self):
         """测试完整的广播调用流程。"""
-        from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+        from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
         # 模拟 session
         mock_session = MagicMock()
@@ -436,7 +436,7 @@ class TestIntegration:
         mock_method_info.method = "square"
         mock_session.list_methods.return_value = [mock_method_info]
 
-        group = ModuleLikeServiceGroup(
+        group = ServiceModuleGroup(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": mock_session, "node2": MagicMock()},

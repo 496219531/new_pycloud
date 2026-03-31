@@ -58,6 +58,11 @@ class NodeControlServiceStub(object):
                 request_serializer=pycloud__v1__pb2.CancelTasksRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.CancelTasksResponse.FromString,
                 _registered_method=True)
+        self.CancelJob = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/CancelJob',
+                request_serializer=pycloud__v1__pb2.CancelJobRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.CancelJobResponse.FromString,
+                _registered_method=True)
         self.GetMetrics = channel.unary_unary(
                 '/pycloud.v1.NodeControlService/GetMetrics',
                 request_serializer=pycloud__v1__pb2.GetMetricsRequest.SerializeToString,
@@ -121,6 +126,12 @@ class NodeControlServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def CancelTasks(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CancelJob(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -190,6 +201,11 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     servicer.CancelTasks,
                     request_deserializer=pycloud__v1__pb2.CancelTasksRequest.FromString,
                     response_serializer=pycloud__v1__pb2.CancelTasksResponse.SerializeToString,
+            ),
+            'CancelJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelJob,
+                    request_deserializer=pycloud__v1__pb2.CancelJobRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.CancelJobResponse.SerializeToString,
             ),
             'GetMetrics': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMetrics,
@@ -339,6 +355,33 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/CancelTasks',
             pycloud__v1__pb2.CancelTasksRequest.SerializeToString,
             pycloud__v1__pb2.CancelTasksResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/CancelJob',
+            pycloud__v1__pb2.CancelJobRequest.SerializeToString,
+            pycloud__v1__pb2.CancelJobResponse.FromString,
             options,
             channel_credentials,
             insecure,

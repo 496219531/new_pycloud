@@ -6,7 +6,7 @@ PyCloud 模块化客户端示例
 """
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import ModuleLikeServiceGroup
+from pycloud_parallel.controlplane.client import ServiceModuleGroup
 
 
 def main():
@@ -43,9 +43,9 @@ def main():
     print("=" * 60)
     print()
 
-    # 使用 ModuleLikeServiceGroup 代替 MultiNodeServiceGroup
+    # 使用 ServiceModuleGroup 代替 ServiceGroup
     import time
-    group = ModuleLikeServiceGroup.deploy_from_infocenter(
+    group = ServiceModuleGroup.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"module-demo-{int(time.time())}",
         service_name=f"compute-service-{int(time.time())}",
@@ -63,15 +63,13 @@ def main():
         min_success_nodes=1,
         allow_partial=True,
     )
+    joined = False
 
     print(f"[+] Service deployed on nodes: {list(group.sessions.keys())}")
     print(f"[+] HTTP endpoints:")
     for node_id, session in group.sessions.items():
         print(f"    {node_id}: {session.http_base_url}")
     print()
-
-    # 启动心跳
-    group.start_keepalive()
 
     # 打印可用方法
     print(f"[+] Available methods: {group.methods}")
@@ -250,9 +248,20 @@ def main():
         print("=" * 60)
         print("  Demo 完成!")
         print("=" * 60)
+        print("  服务进入长驻模式，按 Ctrl+C 自动回收")
+        print("=" * 60)
+        print()
+        group.join(
+            end_services_on_interrupt=True,
+            end_reason="owner ctrl+c",
+        )
+        joined = True
 
     finally:
-        group.close(end_services=False)
+        group.close(
+            end_services=not joined,
+            reason="demo_service_module_group cleanup",
+        )
 
 
 if __name__ == "__main__":

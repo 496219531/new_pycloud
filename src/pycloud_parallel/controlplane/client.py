@@ -79,16 +79,17 @@ def _http_json_request(
     method: str,
     timeout_sec: float,
     payload: Optional[Dict[str, object]] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, object]:
     raw = None
-    headers = {}
+    request_headers = dict(headers or {})
     if payload is not None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
+        request_headers["Content-Type"] = "application/json; charset=utf-8"
     req = Request(
         f"{base_url.rstrip('/')}{path}",
         method=method.upper(),
-        headers=headers,
+        headers=request_headers,
         data=raw,
     )
     try:
@@ -321,6 +322,20 @@ class NodeCircuitState:
     last_error: str = ""
 
 
+@dataclass
+class _RouteLocalState:
+    consecutive_failures: int = 0
+    open_until_monotonic: float = 0.0
+    last_error: str = ""
+
+
+@dataclass
+class _ServiceRouteSnapshot:
+    service_name: str
+    routes: List[InfoCenterServiceRoute] = field(default_factory=list)
+    refreshed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class InfoCenterClient:
     """Thin HTTP + JSON client wrapper for InfoCenter service."""
 
@@ -508,10 +523,497 @@ class InfoCenterClient:
             )
         return out
 
+    def select_task_nodes(
+        self,
+        *,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        limit: int = 100,
+        require_credit: bool = True,
+    ) -> Sequence[InfoCenterNode]:
+        nodes = list(self.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit))
+        requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
+        discovered_node_map = {node.node_id: node for node in nodes}
+
+        if requested_node_ids:
+            missing_node_ids = [node_id for node_id in requested_node_ids if node_id not in discovered_node_map]
+            if missing_node_ids:
+                raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
+            selected = [discovered_node_map[node_id] for node_id in requested_node_ids]
+        else:
+            candidates = [
+                node
+                for node in nodes
+                if node.healthy and node.schedulable and not node.drain and (not require_credit or node.credit > 0)
+            ]
+            if not candidates:
+                raise RuntimeError("no schedulable task nodes from InfoCenter")
+            candidates.sort(key=lambda node: (-int(node.credit), int(node.queued), int(node.inflight), node.node_id))
+            requested_count = int(node_count or 0)
+            selected = candidates if requested_count <= 0 else candidates[:requested_count]
+
+        if not selected:
+            raise RuntimeError("no task nodes selected from InfoCenter")
+        return selected
+
+
+class GatewayServiceClient:
+    """Thin HTTP + JSON client wrapper for ControlPlane Gateway service calls."""
+
+    def __init__(self, target: str, *, timeout_sec: float = 10.0, service_token: str = "") -> None:
+        self.target = target
+        self.base_url = _target_to_base_url(target)
+        self.timeout_sec = max(0.1, float(timeout_sec))
+        self.service_token = str(service_token or "").strip()
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "GatewayServiceClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def call(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        payload: Optional[Dict[str, object]] = None,
+        timeout_sec: float = 60.0,
+        service_token: Optional[str] = None,
+    ) -> Dict[str, object]:
+        name = str(service_name or "").strip()
+        method_name = str(method or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        if not method_name:
+            raise ValueError("method is required")
+        token = self.service_token if service_token is None else str(service_token or "").strip()
+        headers: Dict[str, str] = {}
+        if token:
+            headers["X-Service-Token"] = token
+        params = urlencode({"timeout_sec": f"{max(0.1, float(timeout_sec)):.3f}"})
+        return _http_json_request(
+            base_url=self.base_url,
+            path=f"/svc/{quote(name, safe='')}/call/{quote(method_name, safe='')}?{params}",
+            method="POST",
+            timeout_sec=max(self.timeout_sec, max(0.1, float(timeout_sec)) + 1.0),
+            payload=payload or {},
+            headers=headers,
+        )
+
+    def list_methods(self, *, service_name: str, include_docs: bool = False) -> Sequence[Dict[str, object]]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        params = urlencode({"include_docs": "true" if include_docs else "false"})
+        resp = _http_json_request(
+            base_url=self.base_url,
+            path=f"/svc/{quote(name, safe='')}/methods?{params}",
+            method="GET",
+            timeout_sec=self.timeout_sec,
+        )
+        methods = resp.get("methods", [])
+        if not isinstance(methods, list):
+            raise RuntimeError("invalid methods response")
+        return [item for item in methods if isinstance(item, dict)]
+
+    def get_status(self, *, service_name: str) -> Dict[str, object]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        return _http_json_request(
+            base_url=self.base_url,
+            path=f"/svc/{quote(name, safe='')}/status",
+            method="GET",
+            timeout_sec=self.timeout_sec,
+        )
+
+
+@dataclass
+class DiscoveryCallError(Exception):
+    status_code: int
+    data: Dict[str, object]
+
+    def __str__(self) -> str:
+        return str(self.data.get("error", f"http {self.status_code}"))
+
+
+class _DiscoveryRouteCache:
+    def __init__(
+        self,
+        *,
+        infocenter_target: str,
+        timeout_sec: float = 10.0,
+        refresh_interval_sec: float = 3.0,
+        failure_threshold: int = 3,
+        open_sec: float = 5.0,
+        route_limit: int = 500,
+    ) -> None:
+        self.infocenter_target = str(infocenter_target or "").strip()
+        self.timeout_sec = max(0.1, float(timeout_sec))
+        self.refresh_interval_sec = max(0.2, float(refresh_interval_sec))
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.open_sec = max(0.1, float(open_sec))
+        self.route_limit = max(1, int(route_limit))
+
+        self._lock = threading.Lock()
+        self._snapshots: Dict[str, _ServiceRouteSnapshot] = {}
+        self._local_state: Dict[Tuple[str, str], _RouteLocalState] = {}
+        self._route_index: Dict[str, int] = {}
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._refresh_loop,
+                name="discovery-route-cache",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+        with self._lock:
+            self._thread = None
+
+    def _refresh_loop(self) -> None:
+        while not self._stop_event.wait(self.refresh_interval_sec):
+            with self._lock:
+                service_names = list(self._snapshots.keys())
+            for service_name in service_names:
+                try:
+                    self.refresh(service_name, force=True)
+                except Exception:
+                    continue
+
+    def refresh(self, service_name: str, *, force: bool = False) -> Sequence[InfoCenterServiceRoute]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        with InfoCenterClient(self.infocenter_target, timeout_sec=self.timeout_sec) as client:
+            rows = list(
+                client.list_service_routes(
+                    service_name=name,
+                    healthy_only=True,
+                    limit=self.route_limit,
+                )
+            )
+        snapshot = _ServiceRouteSnapshot(
+            service_name=name,
+            routes=rows,
+            refreshed_at=datetime.now(timezone.utc),
+        )
+        with self._lock:
+            if force or name not in self._snapshots or rows:
+                self._snapshots[name] = snapshot
+        return rows
+
+    def get_routes(self, service_name: str) -> Sequence[InfoCenterServiceRoute]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        with self._lock:
+            snapshot = self._snapshots.get(name)
+        if snapshot is None:
+            return list(self.refresh(name, force=True))
+        return list(snapshot.routes)
+
+    def snapshot_info(self, service_name: str) -> Dict[str, object]:
+        routes = list(self.get_routes(service_name))
+        with self._lock:
+            snapshot = self._snapshots.get(str(service_name or "").strip())
+        return {
+            "service_name": str(service_name or "").strip(),
+            "refreshed_at": snapshot.refreshed_at.isoformat() if snapshot is not None else "",
+            "route_count": len(routes),
+            "routes": routes,
+        }
+
+    def select_route(
+        self,
+        service_name: str,
+        *,
+        exclude_service_ids: Optional[Set[str]] = None,
+        force_refresh: bool = False,
+        strategy: str = "least_inflight",
+    ) -> InfoCenterServiceRoute:
+        name = str(service_name or "").strip()
+        routes = list(self.refresh(name, force=True)) if force_refresh else list(self.get_routes(name))
+        excluded = exclude_service_ids or set()
+        candidates = [
+            route
+            for route in routes
+            if route.node_healthy
+            and route.status == pb2.SERVICE_STATUS_RUNNING
+            and route.http_base_url
+            and route.service_id not in excluded
+            and self._route_available(name, route.service_id)
+        ]
+        if not candidates:
+            raise RuntimeError(f"no available route for service_name={name}")
+        if strategy == "round_robin":
+            candidates.sort(key=lambda route: (route.node_id, route.service_id))
+            with self._lock:
+                idx = self._route_index.get(name, 0)
+                self._route_index[name] = idx + 1
+            return candidates[idx % len(candidates)]
+        if strategy != "least_inflight":
+            raise ValueError("strategy must be one of: least_inflight, round_robin")
+        candidates.sort(key=lambda route: (int(route.in_flight), -int(route.alive_workers), route.node_id, route.service_id))
+        return candidates[0]
+
+    def _route_available(self, service_name: str, service_id: str) -> bool:
+        key = (service_name, service_id)
+        now = time.monotonic()
+        with self._lock:
+            state = self._local_state.get(key)
+            if state is None:
+                return True
+            return now >= state.open_until_monotonic
+
+    def mark_success(self, route: InfoCenterServiceRoute) -> None:
+        key = (route.service_name, route.service_id)
+        with self._lock:
+            state = self._local_state.get(key)
+            if state is None:
+                return
+            state.consecutive_failures = 0
+            state.open_until_monotonic = 0.0
+            state.last_error = ""
+
+    def mark_failure(self, route: InfoCenterServiceRoute, error: str) -> None:
+        key = (route.service_name, route.service_id)
+        with self._lock:
+            state = self._local_state.get(key)
+            if state is None:
+                state = _RouteLocalState()
+                self._local_state[key] = state
+            state.consecutive_failures += 1
+            state.last_error = str(error or "")
+            if state.consecutive_failures >= self.failure_threshold:
+                state.open_until_monotonic = time.monotonic() + self.open_sec
+
+
+def _serialize_route(route: InfoCenterServiceRoute) -> Dict[str, object]:
+    return {
+        "service_name": route.service_name,
+        "service_id": route.service_id,
+        "node_id": route.node_id,
+        "control_addr": route.control_addr,
+        "node_healthy": route.node_healthy,
+        "worker_count": route.worker_count,
+        "alive_workers": route.alive_workers,
+        "in_flight": route.in_flight,
+        "http_base_url": route.http_base_url,
+        "status": int(route.status),
+        "lease_expire_at": route.lease_expire_at.isoformat(),
+    }
+
+
+def _call_route_http(
+    route: InfoCenterServiceRoute,
+    *,
+    method: str,
+    payload: Dict[str, object],
+    timeout_sec: float,
+    service_token: str,
+) -> Dict[str, object]:
+    url = f"{route.http_base_url}/call/{quote(method, safe='')}?timeout_sec={max(0.1, timeout_sec):.3f}"
+    headers = {"Content-Type": "application/json"}
+    if service_token:
+        headers["X-Service-Token"] = service_token
+    req = Request(
+        url=url,
+        method="POST",
+        headers=headers,
+        data=json.dumps(payload or {}).encode("utf-8"),
+    )
+    try:
+        with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            data = json.loads((exc.read() or b"{}").decode("utf-8"))
+        except Exception:
+            data = {"ok": False, "error": exc.reason}
+        raise DiscoveryCallError(status_code=exc.code, data=data) from exc
+    except Exception as exc:
+        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
+    if not isinstance(data, dict):
+        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
+    if not data.get("ok", False):
+        raise DiscoveryCallError(status_code=502, data=data)
+    return data
+
+
+def _is_route_failure(exc: DiscoveryCallError) -> bool:
+    if exc.status_code == 502:
+        return True
+    if exc.status_code not in (404, 409, 500):
+        return False
+    msg = str(exc.data.get("error", "") or "").lower()
+    return any(text in msg for text in ("service not found", "service not running", "service executor stopped", "artifact missing"))
+
+
+class DiscoveryServiceClient:
+    """Client-side service discovery caller.
+
+    通过 InfoCenter 查 route，再直接调用节点上的 service_id HTTP 数据面。
+    带本地 route cache、后台刷新和失败切换，整体行为尽量对齐 Gateway。
+    """
+
+    def __init__(
+        self,
+        infocenter_target: str,
+        *,
+        timeout_sec: float = 10.0,
+        service_token: str = "",
+        refresh_interval_sec: float = 3.0,
+        failure_threshold: int = 3,
+        open_sec: float = 5.0,
+        route_limit: int = 500,
+    ) -> None:
+        self.infocenter_target = str(infocenter_target or "").strip()
+        self.timeout_sec = max(0.1, float(timeout_sec))
+        self.service_token = str(service_token or "").strip()
+        self._route_cache = _DiscoveryRouteCache(
+            infocenter_target=self.infocenter_target,
+            timeout_sec=self.timeout_sec,
+            refresh_interval_sec=refresh_interval_sec,
+            failure_threshold=failure_threshold,
+            open_sec=open_sec,
+            route_limit=route_limit,
+        )
+        self._route_cache.start()
+
+    def close(self) -> None:
+        self._route_cache.stop()
+
+    def __enter__(self) -> "DiscoveryServiceClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def refresh_routes(self, *, service_name: str, force: bool = False) -> Sequence[InfoCenterServiceRoute]:
+        return list(self._route_cache.refresh(service_name, force=force))
+
+    def list_routes(self, *, service_name: str) -> Sequence[InfoCenterServiceRoute]:
+        return list(self._route_cache.get_routes(service_name))
+
+    def get_status(self, *, service_name: str) -> Dict[str, object]:
+        info = self._route_cache.snapshot_info(service_name)
+        routes = info["routes"]
+        return {
+            "ok": True,
+            "service_name": str(info["service_name"]),
+            "refreshed_at": info["refreshed_at"],
+            "route_count": int(info["route_count"]),
+            "routes": [_serialize_route(route) for route in routes],
+        }
+
+    def list_methods(
+        self,
+        *,
+        service_name: str,
+        include_docs: bool = False,
+        strategy: str = "least_inflight",
+    ) -> Sequence[Dict[str, object]]:
+        tried: Set[str] = set()
+        try:
+            route = self._route_cache.select_route(service_name, strategy=strategy)
+            tried.add(route.service_id)
+            methods = self._list_methods_via_route(route, include_docs=include_docs)
+            self._route_cache.mark_success(route)
+            return methods
+        except Exception as exc:
+            if tried:
+                self._route_cache.mark_failure(route, str(exc))
+            self._route_cache.refresh(service_name, force=True)
+            retry_route = self._route_cache.select_route(service_name, exclude_service_ids=tried, strategy=strategy)
+            methods = self._list_methods_via_route(retry_route, include_docs=include_docs)
+            self._route_cache.mark_success(retry_route)
+            return methods
+
+    def call(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        payload: Optional[Dict[str, object]] = None,
+        timeout_sec: float = 60.0,
+        service_token: Optional[str] = None,
+        strategy: str = "least_inflight",
+    ) -> Dict[str, object]:
+        name = str(service_name or "").strip()
+        method_name = str(method or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        if not method_name:
+            raise ValueError("method is required")
+        token = self.service_token if service_token is None else str(service_token or "").strip()
+        tried: Set[str] = set()
+        route = self._route_cache.select_route(name, strategy=strategy)
+        tried.add(route.service_id)
+        try:
+            resp = _call_route_http(
+                route,
+                method=method_name,
+                payload=payload or {},
+                timeout_sec=max(0.1, float(timeout_sec)),
+                service_token=token,
+            )
+            self._route_cache.mark_success(route)
+            return resp
+        except DiscoveryCallError as exc:
+            if not _is_route_failure(exc):
+                raise RuntimeError(str(exc)) from exc
+            self._route_cache.mark_failure(route, str(exc))
+            self._route_cache.refresh(name, force=True)
+            retry_route = self._route_cache.select_route(name, exclude_service_ids=tried, strategy=strategy)
+            try:
+                resp = _call_route_http(
+                    retry_route,
+                    method=method_name,
+                    payload=payload or {},
+                    timeout_sec=max(0.1, float(timeout_sec)),
+                    service_token=token,
+                )
+                self._route_cache.mark_success(retry_route)
+                return resp
+            except DiscoveryCallError as retry_exc:
+                if _is_route_failure(retry_exc):
+                    self._route_cache.mark_failure(retry_route, str(retry_exc))
+                raise RuntimeError(str(retry_exc)) from retry_exc
+
+    def _list_methods_via_route(self, route: InfoCenterServiceRoute, *, include_docs: bool) -> List[Dict[str, object]]:
+        with NodeControlClient(route.control_addr, timeout_sec=self.timeout_sec) as client:
+            methods = client.list_service_methods(service_id=route.service_id, include_docs=include_docs)
+        return [
+            {
+                "method": item.method,
+                "qualified_name": item.qualified_name,
+                "doc": item.doc,
+            }
+            for item in methods
+        ]
+
 
 @dataclass
 class ServiceSessionClient:
-    """Client-side service session handle with optional keepalive loop."""
+    """Low-level client-side service session handle."""
 
     _client: "NodeControlClient" = field(repr=False)
     owner_client_id: str
@@ -527,7 +1029,7 @@ class ServiceSessionClient:
     _hb_seq: int = field(default=0, repr=False)
     _hb_interval_sec: float = field(default=0.0, repr=False)
 
-    def start_keepalive(self, interval_sec: Optional[float] = None) -> None:
+    def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:
             if self._hb_thread is not None and self._hb_thread.is_alive():
                 return
@@ -541,7 +1043,7 @@ class ServiceSessionClient:
             )
             self._hb_thread.start()
 
-    def stop_keepalive(self) -> None:
+    def _stop_keepalive(self) -> None:
         with self._hb_lock:
             self._hb_stop.set()
             thread = self._hb_thread
@@ -564,7 +1066,7 @@ class ServiceSessionClient:
         return resp
 
     def end(self, reason: str = "client requested end") -> pb2.EndServiceResponse:
-        self.stop_keepalive()
+        self._stop_keepalive()
         resp = self._client.end_service(
             owner_client_id=self.owner_client_id,
             service_id=self.service_id,
@@ -646,6 +1148,239 @@ class NodeControlClient:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def upload_code_from_file(
+        self,
+        *,
+        client_id: str,
+        artifact_path: str,
+        filename: str = "",
+        runtime: str = "py3",
+        entry_module: str = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        chunk_size: int = 256 * 1024,
+    ) -> pb2.UploadCodeResponse:
+        path = Path(artifact_path)
+        if not path.exists():
+            raise FileNotFoundError(f"artifact_path not found: {artifact_path}")
+
+        tmp_pkg: Optional[Path] = None
+        upload_file = path
+        effective_filename = filename or path.name
+        inferred_format = package_format
+        if path.is_dir():
+            tmp_pkg = _package_directory_to_targz(path)
+            upload_file = tmp_pkg
+            effective_filename = filename or f"{path.name}.tar.gz"
+            inferred_format = package_format or "tar.gz"
+
+        try:
+            return self._upload_code_from_local_file(
+                client_id=client_id,
+                file_path=upload_file,
+                filename=effective_filename,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=inferred_format,
+                export_mode=export_mode,
+                export_methods=export_methods,
+                export_decorator=export_decorator,
+                chunk_size=chunk_size,
+            )
+        finally:
+            if tmp_pkg is not None:
+                tmp_pkg.unlink(missing_ok=True)
+
+    def upload_code_from_bytes(
+        self,
+        *,
+        client_id: str,
+        filename: str,
+        blob: bytes,
+        runtime: str = "py3",
+        entry_module: str = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        chunk_size: int = 256 * 1024,
+    ) -> pb2.UploadCodeResponse:
+        if not client_id:
+            raise ValueError("client_id is required")
+        if not filename:
+            raise ValueError("filename is required")
+
+        effective_format = package_format or _package_format_from_filename(filename)
+        effective_module = entry_module or (Path(filename).stem if filename.endswith(".py") else "")
+        export_spec = _build_export_spec(
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+
+        def _iter() -> Iterator[pb2.UploadCodeRequest]:
+            yield pb2.UploadCodeRequest(
+                meta=pb2.UploadCodeMeta(
+                    client_id=client_id,
+                    filename=filename,
+                    sha256=f"sha256:{digest}",
+                    runtime=runtime,
+                    entry_module=effective_module,
+                    entry_callable=entry_callable or "run",
+                    package_format=effective_format,
+                    export_spec=export_spec,
+                )
+            )
+            for i in range(0, len(blob), max(1, int(chunk_size))):
+                yield pb2.UploadCodeRequest(chunk=blob[i : i + chunk_size])
+
+        resp = self.stub.UploadCode(_iter(), timeout=self.timeout_sec)
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "upload code failed"))
+        return resp
+
+    def _upload_code_from_local_file(
+        self,
+        *,
+        client_id: str,
+        file_path: Path,
+        filename: str,
+        runtime: str,
+        entry_module: str,
+        entry_callable: str,
+        package_format: str,
+        export_mode: str,
+        export_methods: Optional[Sequence[str]],
+        export_decorator: str,
+        chunk_size: int,
+    ) -> pb2.UploadCodeResponse:
+        effective_filename = filename or file_path.name
+        effective_module = entry_module or (Path(effective_filename).stem if effective_filename.endswith(".py") else "")
+        effective_format = package_format or _package_format_from_filename(effective_filename)
+        export_spec = _build_export_spec(
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+        )
+        digest = _sha256_file(file_path)
+
+        def _iter() -> Iterator[pb2.UploadCodeRequest]:
+            yield pb2.UploadCodeRequest(
+                meta=pb2.UploadCodeMeta(
+                    client_id=client_id,
+                    filename=effective_filename,
+                    sha256=f"sha256:{digest}",
+                    runtime=runtime,
+                    entry_module=effective_module,
+                    entry_callable=entry_callable or "run",
+                    package_format=effective_format,
+                    export_spec=export_spec,
+                )
+            )
+            yield from (pb2.UploadCodeRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
+
+        resp = self.stub.UploadCode(_iter(), timeout=self.timeout_sec)
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "upload code failed"))
+        return resp
+
+    def submit_tasks(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        tasks: Sequence[pb2.TaskSubmitItem],
+        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        resp = self.stub.SubmitTasks(
+            pb2.SubmitTasksRequest(
+                client_id=client_id,
+                code_version=code_version,
+                execution_mode=execution_mode,
+                tasks=list(tasks),
+                job_id=job_id,
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "submit tasks failed"))
+        return resp
+
+    def pull_results(
+        self,
+        *,
+        client_id: str,
+        limit: int = 100,
+        wait_ms: int = 0,
+        cursor: str = "",
+    ) -> pb2.PullResultsResponse:
+        resp = self.stub.PullResults(
+            pb2.PullResultsRequest(
+                client_id=client_id,
+                limit=max(1, int(limit)),
+                wait_ms=max(0, int(wait_ms)),
+                cursor=cursor,
+            ),
+            timeout=max(self.timeout_sec, max(0.1, float(wait_ms) / 1000.0) + 1.0),
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "pull results failed"))
+        return resp
+
+    def cancel_tasks(
+        self,
+        *,
+        client_id: str,
+        task_ids: Sequence[str],
+        reason: str = "",
+    ) -> pb2.CancelTasksResponse:
+        resp = self.stub.CancelTasks(
+            pb2.CancelTasksRequest(
+                client_id=client_id,
+                task_ids=[str(task_id) for task_id in task_ids],
+                reason=reason,
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "cancel tasks failed"))
+        return resp
+
+    def cancel_job(
+        self,
+        *,
+        client_id: str,
+        job_id: str,
+        reason: str = "",
+    ) -> pb2.CancelJobResponse:
+        resp = self.stub.CancelJob(
+            pb2.CancelJobRequest(
+                client_id=client_id,
+                job_id=job_id,
+                reason=reason,
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "cancel job failed"))
+        return resp
+
+    def get_metrics(self) -> pb2.GetMetricsResponse:
+        resp = self.stub.GetMetrics(
+            pb2.GetMetricsRequest(),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "get metrics failed"))
+        return resp
 
     def create_service_from_file(
         self,
@@ -971,7 +1706,448 @@ class NodeControlClient:
 
 
 @dataclass
-class MultiNodeServiceGroup:
+class TaskBatchClient:
+    """Multi-node task-mode helper bound to a selected set of NodeControl nodes."""
+
+    _clients: Dict[str, NodeControlClient] = field(repr=False)
+    client_id: str
+    job_id: str
+    nodes: Dict[str, InfoCenterNode]
+    code_version: str
+    _cursors_by_node: Dict[str, str] = field(default_factory=dict, repr=False)
+    _submit_seq: int = field(default=0, repr=False)
+    _submitted_task_ids_by_job: Dict[str, List[str]] = field(default_factory=dict, repr=False)
+    _seen_result_task_ids_by_job: Dict[str, Set[str]] = field(default_factory=dict, repr=False)
+    _task_node_by_job: Dict[str, Dict[str, str]] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_infocenter(
+        cls,
+        *,
+        infocenter_target: str,
+        client_id: str = "",
+        job_id: str = "",
+        code_version: str = "",
+        artifact_path: str = "",
+        blob: Optional[bytes] = None,
+        filename: str = "",
+        runtime: str = "py3",
+        entry_module: str = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        timeout_sec: float = 10.0,
+    ) -> "TaskBatchClient":
+        effective_client_id = str(client_id or f"task-client-{int(time.time())}").strip()
+        effective_job_id = str(job_id or f"job-{int(time.time())}").strip()
+        if not effective_client_id:
+            raise ValueError("client_id is required")
+        if not effective_job_id:
+            raise ValueError("job_id is required")
+
+        with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+            selected_nodes = list(
+                infocenter.select_task_nodes(
+                    healthy_only=healthy_only,
+                    tags=tags,
+                    node_ids=node_ids,
+                    node_count=node_count,
+                    limit=node_limit,
+                    require_credit=require_credit,
+                )
+            )
+
+        clients = {
+            node.node_id: NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
+            for node in selected_nodes
+        }
+        try:
+            effective_code_version = str(code_version or "").strip()
+            if not effective_code_version:
+                uploaded_versions: Dict[str, str] = {}
+                if blob is not None:
+                    if not filename:
+                        raise ValueError("filename is required when blob is provided")
+                    for node_id, client in clients.items():
+                        upload = client.upload_code_from_bytes(
+                            client_id=effective_client_id,
+                            filename=filename,
+                            blob=blob,
+                            runtime=runtime,
+                            entry_module=entry_module,
+                            entry_callable=entry_callable,
+                            package_format=package_format,
+                            export_mode=export_mode,
+                            export_methods=export_methods,
+                            export_decorator=export_decorator,
+                            chunk_size=chunk_size,
+                        )
+                        uploaded_versions[node_id] = upload.code_version
+                elif artifact_path:
+                    for node_id, client in clients.items():
+                        upload = client.upload_code_from_file(
+                            client_id=effective_client_id,
+                            artifact_path=artifact_path,
+                            filename=filename,
+                            runtime=runtime,
+                            entry_module=entry_module,
+                            entry_callable=entry_callable,
+                            package_format=package_format,
+                            export_mode=export_mode,
+                            export_methods=export_methods,
+                            export_decorator=export_decorator,
+                            chunk_size=chunk_size,
+                        )
+                        uploaded_versions[node_id] = upload.code_version
+                else:
+                    raise ValueError("code_version or artifact_path or blob must be provided")
+
+                unique_versions = {version for version in uploaded_versions.values() if str(version).strip()}
+                if len(unique_versions) != 1:
+                    raise RuntimeError(f"inconsistent code_version across nodes: {uploaded_versions}")
+                effective_code_version = next(iter(unique_versions))
+
+            return cls(
+                _clients=clients,
+                client_id=effective_client_id,
+                job_id=effective_job_id,
+                nodes={node.node_id: node for node in selected_nodes},
+                code_version=effective_code_version,
+                _cursors_by_node={node.node_id: "" for node in selected_nodes},
+            )
+        except Exception:
+            for client in clients.values():
+                client.close()
+            raise
+
+    def close(self) -> None:
+        for client in self._clients.values():
+            client.close()
+
+    def __enter__(self) -> "TaskBatchClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def submit_tasks(
+        self,
+        tasks: Sequence[pb2.TaskSubmitItem],
+        *,
+        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        effective_job_id = str(job_id or self.job_id)
+        if not tasks:
+            return pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[], node_credit=0)
+
+        task_by_id = {item.task_id: item for item in tasks}
+        task_positions = {item.task_id: idx for idx, item in enumerate(tasks)}
+        task_attempted_nodes: Dict[str, Set[str]] = {item.task_id: set() for item in tasks}
+        accepted_by_task_id: Dict[str, pb2.TaskAccepted] = {}
+        rejected_by_task_id: Dict[str, pb2.TaskRejected] = {}
+        latest_credit_by_node: Dict[str, int] = {node_id: int(node.credit) for node_id, node in self.nodes.items()}
+
+        pending_task_ids = [item.task_id for item in tasks]
+        while pending_task_ids:
+            node_order = self._node_order(latest_credit_by_node)
+            batches: Dict[str, List[pb2.TaskSubmitItem]] = {}
+            for task_id in pending_task_ids:
+                target_node_id = next((node_id for node_id in node_order if node_id not in task_attempted_nodes[task_id]), "")
+                if not target_node_id:
+                    rejected_by_task_id[task_id] = pb2.TaskRejected(
+                        task_id=task_id,
+                        code=pb2.ERROR_CODE_NO_CREDIT,
+                        message="no available task node accepted this task",
+                    )
+                    continue
+                task_attempted_nodes[task_id].add(target_node_id)
+                batches.setdefault(target_node_id, []).append(task_by_id[task_id])
+
+            retriable_task_ids: List[str] = []
+            for node_id, node_tasks in batches.items():
+                client = self._clients[node_id]
+                node_task_ids = {item.task_id for item in node_tasks}
+                try:
+                    resp = client.submit_tasks(
+                        client_id=self.client_id,
+                        code_version=self.code_version,
+                        tasks=node_tasks,
+                        execution_mode=execution_mode,
+                        job_id=effective_job_id,
+                    )
+                    latest_credit_by_node[node_id] = int(resp.node_credit)
+                except Exception as exc:
+                    latest_credit_by_node[node_id] = 0
+                    for task_id in node_task_ids:
+                        if len(task_attempted_nodes[task_id]) < len(self._clients):
+                            retriable_task_ids.append(task_id)
+                        else:
+                            rejected_by_task_id[task_id] = pb2.TaskRejected(
+                                task_id=task_id,
+                                code=pb2.ERROR_CODE_INTERNAL_ERROR,
+                                message=f"submit to node {node_id} failed: {exc}",
+                            )
+                    continue
+
+                accepted_ids = {item.task_id for item in resp.accepted}
+                submitted = self._submitted_task_ids_by_job.setdefault(effective_job_id, [])
+                task_node_map = self._task_node_by_job.setdefault(effective_job_id, {})
+                for item in resp.accepted:
+                    accepted_by_task_id[item.task_id] = item
+                    task_node_map[item.task_id] = node_id
+                    if item.task_id not in submitted:
+                        submitted.append(item.task_id)
+
+                for item in resp.rejected:
+                    if (
+                        item.code in (pb2.ERROR_CODE_NO_CREDIT, pb2.ERROR_CODE_QUEUE_FULL)
+                        and len(task_attempted_nodes[item.task_id]) < len(self._clients)
+                    ):
+                        retriable_task_ids.append(item.task_id)
+                    else:
+                        rejected_by_task_id[item.task_id] = item
+
+                unresolved_ids = node_task_ids - accepted_ids - {item.task_id for item in resp.rejected}
+                for task_id in unresolved_ids:
+                    if len(task_attempted_nodes[task_id]) < len(self._clients):
+                        retriable_task_ids.append(task_id)
+                    else:
+                        rejected_by_task_id[task_id] = pb2.TaskRejected(
+                            task_id=task_id,
+                            code=pb2.ERROR_CODE_INTERNAL_ERROR,
+                            message=f"node {node_id} returned no final status for task",
+                        )
+
+            pending_task_ids = []
+            seen_retry: Set[str] = set()
+            for task_id in retriable_task_ids:
+                if task_id in accepted_by_task_id or task_id in rejected_by_task_id or task_id in seen_retry:
+                    continue
+                seen_retry.add(task_id)
+                pending_task_ids.append(task_id)
+
+        accepted = sorted(accepted_by_task_id.values(), key=lambda item: task_positions.get(item.task_id, 0))
+        rejected = sorted(rejected_by_task_id.values(), key=lambda item: task_positions.get(item.task_id, 0))
+        return pb2.SubmitTasksResponse(
+            ok=True,
+            accepted=accepted,
+            rejected=rejected,
+            node_credit=sum(max(0, int(value)) for value in latest_credit_by_node.values()),
+        )
+
+    def submit_payloads(
+        self,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
+        job_id: str = "",
+        task_id_prefix: str = "",
+        timeout_hint_sec: int = 0,
+        priority: int = 1,
+    ) -> pb2.SubmitTasksResponse:
+        effective_job_id = str(job_id or self.job_id)
+        prefix = str(task_id_prefix or f"{effective_job_id}-task").strip()
+        items: List[pb2.TaskSubmitItem] = []
+        for payload in payloads:
+            self._submit_seq += 1
+            items.append(
+                pb2.TaskSubmitItem(
+                    task_id=f"{prefix}-{self._submit_seq:04d}",
+                    payload=payload or {},
+                    timeout_hint_sec=max(0, int(timeout_hint_sec)),
+                    priority=max(1, int(priority)),
+                )
+            )
+        return self.submit_tasks(items, execution_mode=execution_mode, job_id=effective_job_id)
+
+    def pull_results(
+        self,
+        *,
+        limit: int = 100,
+        wait_ms: int = 0,
+        cursor: str = "",
+    ) -> pb2.PullResultsResponse:
+        del cursor
+        results: List[pb2.TaskResult] = []
+        for node_id, client in self._clients.items():
+            resp = client.pull_results(
+                client_id=self.client_id,
+                limit=limit,
+                wait_ms=wait_ms,
+                cursor=self._cursors_by_node.get(node_id, ""),
+            )
+            self._cursors_by_node[node_id] = resp.next_cursor
+            results.extend(resp.results)
+        results.sort(key=lambda item: (str(item.job_id or ""), item.task_id))
+        return pb2.PullResultsResponse(ok=True, results=results, next_cursor="")
+
+    def pull_new_results(
+        self,
+        *,
+        limit: int = 100,
+        wait_ms: int = 0,
+        job_id: str = "",
+    ) -> Sequence[pb2.TaskResult]:
+        resp = self.pull_results(limit=limit, wait_ms=wait_ms, cursor="")
+        out = list(resp.results)
+        for item in out:
+            seen = self._seen_result_task_ids_by_job.setdefault(str(item.job_id or ""), set())
+            seen.add(item.task_id)
+        effective_job_id = str(job_id or "")
+        if not effective_job_id:
+            return out
+        return [item for item in out if str(item.job_id or "") == effective_job_id]
+
+    def wait_for_results(
+        self,
+        *,
+        expected_count: int = 0,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+    ) -> Sequence[pb2.TaskResult]:
+        effective_job_id = str(job_id or self.job_id)
+        remaining = int(expected_count or 0)
+        if remaining <= 0:
+            submitted = self._submitted_task_ids_by_job.get(effective_job_id, [])
+            seen = self._seen_result_task_ids_by_job.get(effective_job_id, set())
+            remaining = max(0, len(submitted) - len(seen))
+
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        results: List[pb2.TaskResult] = []
+        while time.time() < deadline and len(results) < remaining:
+            batch = list(self.pull_new_results(limit=limit, wait_ms=wait_ms, job_id=effective_job_id))
+            if batch:
+                results.extend(batch)
+                continue
+            if remaining <= 0:
+                break
+        return results
+
+    def submitted_task_ids(self, *, job_id: str = "") -> Sequence[str]:
+        effective_job_id = str(job_id or self.job_id)
+        return list(self._submitted_task_ids_by_job.get(effective_job_id, ()))
+
+    def cancel_tasks(
+        self,
+        task_ids: Sequence[str],
+        *,
+        reason: str = "",
+    ) -> pb2.CancelTasksResponse:
+        task_ids = [str(task_id) for task_id in task_ids if str(task_id).strip()]
+        status_by_task_id: Dict[str, str] = {task_id: "not_found" for task_id in task_ids}
+        grouped: Dict[str, List[str]] = {}
+        unknown: List[str] = []
+        for task_id in task_ids:
+            node_id = self._lookup_task_node(task_id)
+            if node_id:
+                grouped.setdefault(node_id, []).append(task_id)
+            else:
+                unknown.append(task_id)
+
+        for node_id, ids in grouped.items():
+            resp = self._clients[node_id].cancel_tasks(
+                client_id=self.client_id,
+                task_ids=ids,
+                reason=reason,
+            )
+            for task_id in resp.cancelled:
+                status_by_task_id[task_id] = "cancelled"
+            for task_id in resp.already_done:
+                if status_by_task_id.get(task_id) != "cancelled":
+                    status_by_task_id[task_id] = "already_done"
+
+        if unknown:
+            for node_id, client in self._clients.items():
+                resp = client.cancel_tasks(
+                    client_id=self.client_id,
+                    task_ids=unknown,
+                    reason=reason,
+                )
+                for task_id in resp.cancelled:
+                    status_by_task_id[task_id] = "cancelled"
+                for task_id in resp.already_done:
+                    if status_by_task_id.get(task_id) != "cancelled":
+                        status_by_task_id[task_id] = "already_done"
+
+        cancelled = [task_id for task_id in task_ids if status_by_task_id.get(task_id) == "cancelled"]
+        already_done = [task_id for task_id in task_ids if status_by_task_id.get(task_id) == "already_done"]
+        not_found = [task_id for task_id in task_ids if status_by_task_id.get(task_id) == "not_found"]
+        return pb2.CancelTasksResponse(
+            ok=True,
+            cancelled=cancelled,
+            already_done=already_done,
+            not_found=not_found,
+        )
+
+    def cancel_job(self, *, reason: str = "", job_id: str = "") -> pb2.CancelJobResponse:
+        effective_job_id = str(job_id or self.job_id)
+        queued_cancelled = 0
+        running_marked = 0
+        already_done = 0
+        matched = 0
+        for client in self._clients.values():
+            resp = client.cancel_job(
+                client_id=self.client_id,
+                job_id=effective_job_id,
+                reason=reason,
+            )
+            queued_cancelled += int(resp.queued_cancelled)
+            running_marked += int(resp.running_marked)
+            already_done += int(resp.already_done)
+            if int(resp.not_found or 0) == 0:
+                matched += 1
+        return pb2.CancelJobResponse(
+            ok=True,
+            queued_cancelled=queued_cancelled,
+            running_marked=running_marked,
+            already_done=already_done,
+            not_found=0 if matched or queued_cancelled or running_marked or already_done else 1,
+        )
+
+    def get_metrics(self) -> Dict[str, pb2.GetMetricsResponse]:
+        return {
+            node_id: client.get_metrics()
+            for node_id, client in self._clients.items()
+        }
+
+    @property
+    def node_ids(self) -> Sequence[str]:
+        return list(self.nodes.keys())
+
+    def _lookup_task_node(self, task_id: str) -> str:
+        for task_map in self._task_node_by_job.values():
+            node_id = task_map.get(task_id, "")
+            if node_id:
+                return node_id
+        return ""
+
+    def _node_order(self, latest_credit_by_node: Dict[str, int]) -> List[str]:
+        ordered_nodes = list(self.nodes.values())
+        ordered_nodes.sort(
+            key=lambda node: (
+                -int(latest_credit_by_node.get(node.node_id, node.credit)),
+                int(node.queued),
+                int(node.inflight),
+                node.node_id,
+            )
+        )
+        return [node.node_id for node in ordered_nodes]
+
+
+@dataclass
+class ServiceGroup:
     """A deployed service group spread across multiple NodeControl nodes."""
 
     owner_client_id: str
@@ -1029,7 +2205,7 @@ class MultiNodeServiceGroup:
         breaker_failure_threshold: int = 3,
         breaker_cooldown_sec: float = 15.0,
         breaker_max_cooldown_sec: float = 120.0,
-    ) -> "MultiNodeServiceGroup":
+    ) -> "ServiceGroup":
         """从 InfoCenter 发现节点并部署服务。
 
         Args:
@@ -1069,7 +2245,7 @@ class MultiNodeServiceGroup:
             breaker_max_cooldown_sec: 熔断最大冷却时间
 
         Returns:
-            MultiNodeServiceGroup: 部署的服务组
+            ServiceGroup: 部署的服务组
         """
         # 生成默认的 owner_client_id 和 service_name
         local_ip = _get_local_ip()
@@ -1386,6 +2562,7 @@ class MultiNodeServiceGroup:
             _artifact_code_version=effective_code_version,
         )
         group._persist_session_cache()
+        group._start_keepalive()
         return group
 
     @staticmethod
@@ -1438,7 +2615,7 @@ class MultiNodeServiceGroup:
         breaker_cooldown_sec: float,
         breaker_max_cooldown_sec: float,
         session_cache_file: Path,
-    ) -> "MultiNodeServiceGroup":
+    ) -> "ServiceGroup":
         cache_nodes = cache_payload.get("nodes")
         if not isinstance(cache_nodes, dict):
             raise RuntimeError("invalid local service session cache: nodes missing")
@@ -1525,6 +2702,7 @@ class MultiNodeServiceGroup:
             _artifact_code_version=artifact_code_version,
         )
         group._persist_session_cache()
+        group._start_keepalive()
         return group
 
     @classmethod
@@ -1724,7 +2902,7 @@ class MultiNodeServiceGroup:
                 }
         return out
 
-    def __enter__(self) -> "MultiNodeServiceGroup":
+    def __enter__(self) -> "ServiceGroup":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1733,13 +2911,39 @@ class MultiNodeServiceGroup:
     def node_ids(self) -> Sequence[str]:
         return list(self.sessions.keys())
 
-    def start_keepalive(self, interval_sec: Optional[float] = None) -> None:
+    def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         for session in self.sessions.values():
-            session.start_keepalive(interval_sec=interval_sec)
+            session._start_keepalive(interval_sec=interval_sec)
 
-    def stop_keepalive(self) -> None:
+    def join(
+        self,
+        *,
+        poll_interval_sec: float = 1.0,
+        end_services_on_interrupt: bool = True,
+        end_reason: str = "owner interrupted",
+    ) -> None:
+        wait_sec = max(0.1, float(poll_interval_sec))
+        try:
+            while True:
+                alive = False
+                for session in self.sessions.values():
+                    with session._hb_lock:
+                        thread = session._hb_thread
+                    if thread is not None and thread.is_alive():
+                        alive = True
+                        break
+                if not alive:
+                    return
+                time.sleep(wait_sec)
+        except KeyboardInterrupt:
+            if end_services_on_interrupt:
+                self.end(reason=end_reason)
+            else:
+                self._stop_keepalive()
+
+    def _stop_keepalive(self) -> None:
         for session in self.sessions.values():
-            session.stop_keepalive()
+            session._stop_keepalive()
 
     def status_map(self) -> Dict[str, pb2.ServiceStatusInfo]:
         out: Dict[str, pb2.ServiceStatusInfo] = {}
@@ -1949,7 +3153,7 @@ class MultiNodeServiceGroup:
         return await asyncio.gather(*tasks)
 
     def end(self, reason: str = "group end") -> Dict[str, Optional[pb2.EndServiceResponse]]:
-        self.stop_keepalive()
+        self._stop_keepalive()
         out: Dict[str, Optional[pb2.EndServiceResponse]] = {}
         for node_id, session in self.sessions.items():
             try:
@@ -1964,7 +3168,7 @@ class MultiNodeServiceGroup:
         return out
 
     def close(self, *, end_services: bool = False, reason: str = "group close") -> None:
-        self.stop_keepalive()
+        self._stop_keepalive()
         if end_services:
             self.end(reason=reason)
         for client in self._clients.values():
@@ -1987,7 +3191,7 @@ class _CallProxy:
     def __init__(
         self,
         method: str,
-        group: "MultiNodeServiceGroup",
+        group: "ServiceGroup",
         *,
         timeout_sec: float = 60.0,
         strategy: str = "least_inflight",
@@ -2090,7 +3294,7 @@ class _SyncCallProxy:
     def __init__(
         self,
         method: str,
-        group: "MultiNodeServiceGroup",
+        group: "ServiceGroup",
         *,
         timeout_sec: float = 60.0,
         strategy: str = "least_inflight",
@@ -2133,7 +3337,7 @@ class _BroadcastProxy:
     def __init__(
         self,
         method: str,
-        group: "MultiNodeServiceGroup",
+        group: "ServiceGroup",
         *,
         timeout_sec: float = 60.0,
         max_concurrency: int = 100,
@@ -2177,7 +3381,7 @@ class _BroadcastProxy:
         return self().__await__()
 
 
-class ModuleLikeServiceGroup(MultiNodeServiceGroup):
+class ServiceModuleGroup(ServiceGroup):
     """模块化的服务组，像使用 Python 模块一样调用远程服务。
 
     支持多种调用方式：
@@ -2187,7 +3391,7 @@ class ModuleLikeServiceGroup(MultiNodeServiceGroup):
     - group.list_methods()           # 列出所有可用方法
 
     Example:
-        >>> group = ModuleLikeServiceGroup.deploy_from_infocenter(...)
+        >>> group = ServiceModuleGroup.deploy_from_infocenter(...)
         >>>
         >>> # 异步调用
         >>> result = await group.square(x=7)
@@ -2327,8 +3531,324 @@ class ModuleLikeServiceGroup(MultiNodeServiceGroup):
         node_ids = list(self.sessions.keys()) if self.sessions else []
         methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
         return (
-            f"<ModuleLikeServiceGroup "
+            f"<ServiceModuleGroup "
             f"service={self.service_name!r} "
             f"nodes={len(node_ids)} "
+            f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
+        )
+
+class GatewayModuleClient(GatewayServiceClient):
+    """Module-like caller on top of ControlPlane Gateway.
+
+    只负责 caller 侧体验：
+    - await client.square(x=7)
+    - client.square.sync(x=7)
+    - await client.call("square", x=7)
+    - client.call_sync("square", x=7)
+
+    不负责：
+    - 上传代码
+    - 创建服务
+    - 心跳
+    - EndService
+    """
+
+    def __init__(
+        self,
+        target: str,
+        *,
+        service_name: str,
+        timeout_sec: float = 10.0,
+        service_token: str = "",
+    ) -> None:
+        super().__init__(target, timeout_sec=timeout_sec, service_token=service_token)
+        self.service_name = str(service_name or "").strip()
+        if not self.service_name:
+            raise ValueError("service_name is required")
+        self._discovered_methods: Optional[List[str]] = None
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        if self._discovered_methods is None:
+            self._ensure_methods_discovered()
+        if self._discovered_methods is not None and name not in self._discovered_methods:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no method '{name}'. "
+                f"Available methods: {self._discovered_methods}"
+            )
+        return _CallProxy(
+            method=name,
+            group=self,
+            timeout_sec=self.timeout_sec,
+            strategy="gateway",
+            refresh_status=False,
+        )
+
+    def _ensure_methods_discovered(self) -> None:
+        if self._discovered_methods is not None:
+            return
+        try:
+            methods = self.list_methods(include_docs=True)
+            self._discovered_methods = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
+        except Exception:
+            self._discovered_methods = []
+
+    def refresh_methods(self) -> List[str]:
+        self._discovered_methods = None
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    def list_methods(self, *, include_docs: bool = False) -> List[Dict[str, object]]:  # type: ignore[override]
+        return list(super().list_methods(service_name=self.service_name, include_docs=include_docs))
+
+    @property
+    def methods(self) -> List[str]:
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    def status(self) -> Dict[str, object]:
+        return self.get_status(service_name=self.service_name)
+
+    def call_balanced(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "gateway",
+        refresh_status: bool = False,
+        max_attempts: int = 0,
+    ) -> Tuple[str, Dict[str, object]]:
+        del strategy, refresh_status, max_attempts
+        resp = super().call(
+            service_name=self.service_name,
+            method=method,
+            payload=payload,
+            timeout_sec=timeout_sec,
+        )
+        return "gateway", resp
+
+    async def acall_balanced(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "gateway",
+        refresh_status: bool = False,
+        max_attempts: int = 0,
+    ) -> Tuple[str, Dict[str, object]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.call_balanced(
+                method,
+                payload,
+                timeout_sec=timeout_sec,
+                strategy=strategy,
+                refresh_status=refresh_status,
+                max_attempts=max_attempts,
+            ),
+        )
+
+    async def call(self, method: str, **kwargs) -> Dict[str, object]:
+        _, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return resp.get("data", resp)
+
+    def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
+        _, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return resp.get("data", resp)
+
+    async def acall_all(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        max_concurrency: int = 100,
+    ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
+        del method, payload, timeout_sec, max_concurrency
+        raise NotImplementedError("GatewayModuleClient does not support broadcast; use Gateway for single-route calls")
+
+    def __repr__(self) -> str:
+        methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
+        return (
+            f"<GatewayModuleClient "
+            f"service={self.service_name!r} "
+            f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
+        )
+
+
+class DiscoveryModuleClient(DiscoveryServiceClient):
+    """Module-like caller built on InfoCenter discovery + direct instance calls."""
+
+    def __init__(
+        self,
+        infocenter_target: str,
+        *,
+        service_name: str,
+        timeout_sec: float = 10.0,
+        service_token: str = "",
+        refresh_interval_sec: float = 3.0,
+        failure_threshold: int = 3,
+        open_sec: float = 5.0,
+        route_limit: int = 500,
+    ) -> None:
+        super().__init__(
+            infocenter_target,
+            timeout_sec=timeout_sec,
+            service_token=service_token,
+            refresh_interval_sec=refresh_interval_sec,
+            failure_threshold=failure_threshold,
+            open_sec=open_sec,
+            route_limit=route_limit,
+        )
+        self.service_name = str(service_name or "").strip()
+        if not self.service_name:
+            raise ValueError("service_name is required")
+        self._discovered_methods: Optional[List[str]] = None
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        if self._discovered_methods is None:
+            self._ensure_methods_discovered()
+        if self._discovered_methods is not None and name not in self._discovered_methods:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no method '{name}'. "
+                f"Available methods: {self._discovered_methods}"
+            )
+        return _CallProxy(
+            method=name,
+            group=self,
+            timeout_sec=self.timeout_sec,
+            strategy="least_inflight",
+            refresh_status=False,
+        )
+
+    def _ensure_methods_discovered(self) -> None:
+        if self._discovered_methods is not None:
+            return
+        try:
+            methods = self.list_methods(include_docs=True)
+            self._discovered_methods = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
+        except Exception:
+            self._discovered_methods = []
+
+    def refresh_methods(self) -> List[str]:
+        self._discovered_methods = None
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    def list_methods(self, *, include_docs: bool = False, strategy: str = "least_inflight") -> List[Dict[str, object]]:  # type: ignore[override]
+        return list(
+            super().list_methods(
+                service_name=self.service_name,
+                include_docs=include_docs,
+                strategy=strategy,
+            )
+        )
+
+    @property
+    def methods(self) -> List[str]:
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    def status(self) -> Dict[str, object]:
+        return self.get_status(service_name=self.service_name)
+
+    def call_balanced(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_attempts: int = 0,
+    ) -> Tuple[str, Dict[str, object]]:
+        del refresh_status, max_attempts
+        route = self._route_cache.select_route(self.service_name, strategy=strategy)
+        tried = {route.service_id}
+        token = self.service_token
+        try:
+            resp = _call_route_http(
+                route,
+                method=method,
+                payload=payload,
+                timeout_sec=max(0.1, float(timeout_sec)),
+                service_token=token,
+            )
+            self._route_cache.mark_success(route)
+            return route.node_id, resp
+        except DiscoveryCallError as exc:
+            if not _is_route_failure(exc):
+                raise RuntimeError(str(exc)) from exc
+            self._route_cache.mark_failure(route, str(exc))
+            self._route_cache.refresh(self.service_name, force=True)
+            retry_route = self._route_cache.select_route(self.service_name, exclude_service_ids=tried, strategy=strategy)
+            try:
+                resp = _call_route_http(
+                    retry_route,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=max(0.1, float(timeout_sec)),
+                    service_token=token,
+                )
+                self._route_cache.mark_success(retry_route)
+                return retry_route.node_id, resp
+            except DiscoveryCallError as retry_exc:
+                if _is_route_failure(retry_exc):
+                    self._route_cache.mark_failure(retry_route, str(retry_exc))
+                raise RuntimeError(str(retry_exc)) from retry_exc
+
+    async def acall_balanced(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_attempts: int = 0,
+    ) -> Tuple[str, Dict[str, object]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.call_balanced(
+                method,
+                payload,
+                timeout_sec=timeout_sec,
+                strategy=strategy,
+                refresh_status=refresh_status,
+                max_attempts=max_attempts,
+            ),
+        )
+
+    async def call(self, method: str, **kwargs) -> Dict[str, object]:
+        _, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return resp.get("data", resp)
+
+    def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
+        _, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return resp.get("data", resp)
+
+    async def acall_all(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        max_concurrency: int = 100,
+    ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
+        del method, payload, timeout_sec, max_concurrency
+        raise NotImplementedError("DiscoveryModuleClient does not support broadcast; use direct discovery for single-route calls")
+
+    def __repr__(self) -> str:
+        methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
+        return (
+            f"<DiscoveryModuleClient "
+            f"service={self.service_name!r} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )

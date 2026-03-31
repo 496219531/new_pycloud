@@ -6,10 +6,11 @@ PyCloud 异步客户端示例
 """
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import MultiNodeServiceGroup
+from pycloud_parallel.controlplane.client import ServiceGroup
 
 
 def main():
+    suffix = int(time.time())
     # 同步方式（保留原有功能）
     blob = (
         b"def pycloud_export(fn):\n"
@@ -35,10 +36,10 @@ def main():
     print("=" * 60)
     print()
 
-    group = MultiNodeServiceGroup.deploy_from_infocenter(
+    group = ServiceGroup.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
-        owner_client_id="async-demo-001",
-        service_name="compute-service",
+        owner_client_id=f"async-demo-{suffix}",
+        service_name=f"compute-service-{suffix}",
         blob=blob,
         filename="compute.py",
         runtime="py3.11",
@@ -53,14 +54,13 @@ def main():
         min_success_nodes=1,
         allow_partial=True,
     )
+    joined = False
 
     print(f"[+] Service deployed on nodes: {list(group.sessions.keys())}")
     print(f"[+] HTTP endpoints:")
     for node_id, session in group.sessions.items():
         print(f"    {node_id}: {session.http_base_url}")
     print()
-
-    group.start_keepalive()
 
     try:
         # ================================================================
@@ -190,9 +190,20 @@ def main():
         print("=" * 60)
         print("  Demo 完成!")
         print("=" * 60)
+        print("  服务进入长驻模式，按 Ctrl+C 自动回收")
+        print("=" * 60)
+        print()
+        group.join(
+            end_services_on_interrupt=True,
+            end_reason="owner ctrl+c",
+        )
+        joined = True
 
     finally:
-        group.close(end_services=False)
+        group.close(
+            end_services=not joined,
+            reason="demo_async_client cleanup",
+        )
 
 
 if __name__ == "__main__":

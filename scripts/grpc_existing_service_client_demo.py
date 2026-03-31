@@ -2,54 +2,39 @@
 """
 调用已部署服务示例。
 
-这个脚本只做“发现已有服务并调用数据面”：
-1. 通过 InfoCenter 查询 service route
-2. 直接走 HTTP 调用 `POST /svc/{service_id}/call/{method}`
+这个脚本演示“不通过 Gateway，而是像 Eureka client 一样”：
+1. 先通过 InfoCenter 发现 service route
+2. 客户端本地维护 route cache
+3. 直接调用节点内部 `/svc/{service_id}/call/{method}`
 
-它不持有 owner 的 `service_token`，因此不负责：
-1. HeartbeatService
-2. EndService
-3. 服务重启复用
+脚本里同时展示：
+1. `DiscoveryServiceClient`：薄封装
+2. `DiscoveryModuleClient`：module-like caller
 """
+
 from __future__ import annotations
 
 import asyncio
-import json
 import time
-from typing import Optional
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.client import InfoCenterClient, InfoCenterServiceRoute
-
-
-def _call_http(route_url: str, method: str, payload: dict, timeout_sec: float) -> dict:
-    """通过 HTTP 调用服务节点。"""
-    url = f"{route_url}/call/{method}?timeout_sec={max(0.1, timeout_sec):.3f}"
-    req = Request(
-        url=url,
-        method="POST",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(payload).encode("utf-8"),
-    )
-    try:
-        with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8") if hasattr(exc, 'read') else ""
-        raise RuntimeError(f"HTTP {exc.code}: {body or exc.reason}")
+from pycloud_parallel.controlplane.client import (
+    DiscoveryModuleClient,
+    DiscoveryServiceClient,
+    InfoCenterClient,
+)
 
 
-def _wait_for_routes(
+def _wait_for_service_name(
     *,
-    infocenter_addr: str,
-    service_name: str,
+    infocenter_target: str,
+    service_name: str = "",
+    service_name_prefix: str = "",
     timeout_sec: float = 8.0,
     poll_interval_sec: float = 1.0,
-) -> list[InfoCenterServiceRoute]:
+) -> str:
     deadline = time.time() + max(0.5, float(timeout_sec))
     while True:
-        with InfoCenterClient(infocenter_addr) as client:
+        with InfoCenterClient(infocenter_target, timeout_sec=5.0) as client:
             routes = list(
                 client.list_service_routes(
                     service_name=service_name,
@@ -57,276 +42,84 @@ def _wait_for_routes(
                     limit=200,
                 )
             )
-        if routes:
-            return routes
+        if service_name:
+            if routes:
+                return service_name
+        else:
+            matched = sorted({route.service_name for route in routes if route.service_name.startswith(service_name_prefix)})
+            if matched:
+                return matched[0]
         if time.time() >= deadline:
-            return []
+            return ""
         time.sleep(max(0.1, float(poll_interval_sec)))
 
 
-def call_service(
-    routes: list[InfoCenterServiceRoute],
-    method: str,
-    payload: dict,
-    timeout_sec: float = 10.0,
-    strategy: str = "least_inflight",
-) -> tuple[InfoCenterServiceRoute, dict]:
-    """同步调用服务（自动选择最优节点）。
-
-    Args:
-        routes: 服务路由列表
-        method: 方法名
-        payload: 调用参数
-        timeout_sec: 超时时间
-        strategy: 选择策略 ("least_inflight" | "round_robin")
-
-    Returns:
-        (路由, 响应结果)
-    """
-    if not routes:
-        raise RuntimeError("no routes available")
-
-    if strategy == "least_inflight":
-        # 按 in_flight 升序，然后按 alive_workers 降序
-        routes = sorted(routes, key=lambda x: (x.in_flight, -x.alive_workers))
-    # else: round_robin 可以通过外部计数器实现
-
-    route = routes[0]
-    body = _call_http(route.http_base_url, method, payload, timeout_sec=timeout_sec)
-
-    if not body.get("ok", False):
-        raise RuntimeError(f"call failed: {body.get('error', 'unknown')}")
-
-    return route, body
-
-
-async def acall_service(
-    routes: list[InfoCenterServiceRoute],
-    method: str,
-    payload: dict,
-    timeout_sec: float = 10.0,
-    strategy: str = "least_inflight",
-) -> tuple[InfoCenterServiceRoute, dict]:
-    """异步调用服务（自动选择最优节点）。"""
-    if not routes:
-        raise RuntimeError("no routes available")
-
-    if strategy == "least_inflight":
-        routes = sorted(routes, key=lambda x: (x.in_flight, -x.alive_workers))
-
-    route = routes[0]
-
-    # 在线程池中执行同步 HTTP 调用
-    loop = asyncio.get_running_loop()
-    body = await loop.run_in_executor(
-        None,
-        lambda: _call_http(route.http_base_url, method, payload, timeout_sec)
-    )
-
-    if not body.get("ok", False):
-        raise RuntimeError(f"call failed: {body.get('error', 'unknown')}")
-
-    return route, body
-
-
-async def acall_all_nodes(
-    routes: list[InfoCenterServiceRoute],
-    method: str,
-    payload: dict,
-    timeout_sec: float = 10.0,
-    max_concurrency: int = 50,
-) -> list[tuple[Optional[InfoCenterServiceRoute], Optional[dict], Optional[Exception]]]:
-    """并发调用所有节点。
-
-    Returns:
-        [(路由, 响应, 异常), ...]
-    """
-    if not routes:
-        return []
-
-    semaphore = asyncio.Semaphore(max_concurrency)
-    loop = asyncio.get_running_loop()
-
-    async def _call_one(route: InfoCenterServiceRoute):
-        async with semaphore:
-            try:
-                body = await loop.run_in_executor(
-                    None,
-                    lambda: _call_http(route.http_base_url, method, payload, timeout_sec)
-                )
-                if not body.get("ok", False):
-                    return route, None, RuntimeError(body.get('error', 'unknown'))
-                return route, body, None
-            except Exception as exc:
-                return route, None, exc
-
-    tasks = [_call_one(route) for route in routes]
-    return await asyncio.gather(*tasks)
-
-
-async def batch_call(
-    routes: list[InfoCenterServiceRoute],
-    method: str,
-    payloads: list[dict],
-    timeout_sec: float = 10.0,
-    max_concurrency: int = 100,
-) -> list[tuple[Optional[InfoCenterServiceRoute], Optional[dict], Optional[Exception]]]:
-    """批量并发调用（自动分配到最优节点）。"""
-    if not routes:
-        return []
-
-    semaphore = asyncio.Semaphore(max_concurrency)
-    loop = asyncio.get_running_loop()
-
-    async def _call_one(i: int):
-        async with semaphore:
-            # 每次选择最优节点
-            sorted_routes = sorted(routes, key=lambda x: (x.in_flight, -x.alive_workers))
-            route = sorted_routes[i % len(sorted_routes)]
-            payload = payloads[i]
-
-            try:
-                body = await loop.run_in_executor(
-                    None,
-                    lambda: _call_http(route.http_base_url, method, payload, timeout_sec)
-                )
-                if not body.get("ok", False):
-                    return route, None, RuntimeError(body.get('error', 'unknown'))
-                return route, body, None
-            except Exception as exc:
-                return route, None, exc
-
-    tasks = [_call_one(i) for i in range(len(payloads))]
-    return await asyncio.gather(*tasks)
-
-
 def main() -> None:
-    # 配置
-    infocenter_addr = "127.0.0.1:50051"
-    service_name = "square-service"
-    method = "square"
-    run_async_demo = False
+    infocenter_target = "127.0.0.1:50051"
+    service_name = ""
+    service_name_prefix = "square-service"
 
     print("=" * 60)
-    print("  PyCloud Service Client Demo")
+    print("  PyCloud Discovery Client Demo")
     print("=" * 60)
     print()
-    print(f"  InfoCenter: {infocenter_addr}")
-    print(f"  Service:     {service_name}")
-    print(f"  Method:      {method}")
-    print()
+    print(f"  InfoCenter: {infocenter_target}")
 
-    # 获取服务路由
-    print("-" * 60)
-    print("  Step 1: 查询服务路由")
-    print("-" * 60)
-
-    print("  等待服务路由同步...")
-    routes = _wait_for_routes(
-        infocenter_addr=infocenter_addr,
+    active_service_name = _wait_for_service_name(
+        infocenter_target=infocenter_target,
         service_name=service_name,
-        timeout_sec=10.0,
-        poll_interval_sec=1.0,
+        service_name_prefix=service_name_prefix,
+        timeout_sec=8.0,
     )
-
-    if not routes:
-        print(f"  [!] 没有找到服务: {service_name}")
-        print()
-        print("  请先部署服务，或检查服务名是否正确")
-        print("  可用的服务名示例: compute-service, square-service")
+    if not active_service_name:
+        print("[!] 未发现可用服务，请先部署一个服务")
         return
 
-    print(f"  找到 {len(routes)} 个可用节点:")
-    for route in routes:
-        print(f"    - {route.node_id}: {route.http_base_url}")
-        print(f"      in_flight={route.in_flight}, alive_workers={route.alive_workers}")
+    print(f"  Service: {active_service_name}")
     print()
 
-    # 单次调用测试
-    print("-" * 60)
-    print("  Step 2: 单次调用测试")
-    print("-" * 60)
+    with DiscoveryServiceClient(infocenter_target, timeout_sec=10.0) as client:
+        print("[DiscoveryServiceClient]")
+        methods = client.list_methods(service_name=active_service_name, include_docs=False)
+        print(f"[+] Methods: {[item.get('method') for item in methods]}")
 
-    payload = {"x": 42}
-    print(f"  Payload: {payload}")
+        status = client.get_status(service_name=active_service_name)
+        print(f"[+] Route count: {status.get('route_count')}")
+        for route in status.get("routes", []):
+            print(
+                "    - "
+                f"node={route.get('node_id')} "
+                f"service_id={route.get('service_id')} "
+                f"in_flight={route.get('in_flight')}"
+            )
 
-    try:
-        route, resp = call_service(routes, method, payload, timeout_sec=10.0)
-        print(f"  节点: {route.node_id}")
-        print(f"  结果: {resp.get('data')}")
-    except Exception as exc:
-        print(f"  [ERROR] {exc}")
-    print()
-
-    if run_async_demo:
-        demo_async()
-
-
-def demo_async():
-    """异步调用演示"""
-    infocenter_addr = "127.0.0.1:50051"
-    service_name = "compute-service"
-    method = "square"
-
-    print("=" * 60)
-    print("  PyCloud Async Service Client Demo")
-    print("=" * 60)
-    print()
-
-    # 获取路由
-    routes = _wait_for_routes(
-        infocenter_addr=infocenter_addr,
-        service_name=service_name,
-        timeout_sec=10.0,
-        poll_interval_sec=1.0,
-    )
-
-    if not routes:
-        print(f"  [!] 没有找到服务: {service_name}")
-        return
-
-    print(f"  找到 {len(routes)} 个节点")
-    print()
-
-    async def run():
-        # 示例 1: 批量并发调用
-        print("-" * 60)
-        print("  示例 1: 批量并发调用 (100 次)")
-        print("-" * 60)
-
-        payloads = [{"x": i} for i in range(100)]
-        start = time.time()
-
-        results = await batch_call(
-            routes,
-            method,
-            payloads,
+        resp = client.call(
+            service_name=active_service_name,
+            method="square",
+            payload={"x": 7},
             timeout_sec=10.0,
-            max_concurrency=50,
         )
+        print(f"[+] sync call: {resp.get('data')}")
 
-        success = sum(1 for _, _, exc in results if exc is None)
-        elapsed = time.time() - start
-        print(f"  成功: {success}/{len(results)}")
-        print(f"  耗时: {elapsed:.3f}s, QPS: {success/elapsed:.1f}")
-        print()
+    print()
+    print("[DiscoveryModuleClient]")
+    module_client = DiscoveryModuleClient(
+        infocenter_target,
+        service_name=active_service_name,
+        timeout_sec=10.0,
+    )
+    try:
+        print(f"[+] Methods: {module_client.methods}")
+        print(f"[+] sync call: {module_client.square.sync(x=9)}")
 
-        # 示例 2: 调用所有节点
-        print("-" * 60)
-        print("  示例 2: 同时调用所有节点")
-        print("-" * 60)
+        async def _run() -> None:
+            result = await module_client.square(x=11)
+            print(f"[+] async call: {result}")
 
-        payload = {"x": 999}
-        results = await acall_all_nodes(routes, method, payload, timeout_sec=10.0)
+        asyncio.run(_run())
+    finally:
+        module_client.close()
 
-        for route, resp, exc in results:
-            if exc:
-                print(f"  {route.node_id}: FAILED - {exc}")
-            else:
-                print(f"  {route.node_id}: {resp.get('data')}")
-        print()
-
-    asyncio.run(run())
 
 if __name__ == "__main__":
     main()

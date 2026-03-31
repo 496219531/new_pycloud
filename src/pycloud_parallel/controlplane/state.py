@@ -821,6 +821,7 @@ class TaskState:
     """
     task_id: str
     client_id: str
+    job_id: str
     code_version: str
     execution_mode: int
     payload: dict
@@ -846,6 +847,7 @@ class TaskState:
         """
         item = pb2.TaskResult(
             task_id=self.task_id,
+            job_id=self.job_id,
             status=self.status,
             attempt=self.attempt,
             started_at=dt_to_ts(self.started_at or utc_now()),
@@ -1486,6 +1488,7 @@ class NodeControlState:
                 record = TaskState(
                     task_id=item.task_id,
                     client_id=request.client_id,
+                    job_id=str(request.job_id or "").strip(),
                     code_version=request.code_version,
                     execution_mode=request.execution_mode,
                     payload=struct_to_dict(item.payload),
@@ -1601,7 +1604,12 @@ class NodeControlState:
                     not_found.append(task_id)
                     continue
 
-                if task.status in (pb2.TASK_STATUS_SUCCEEDED, pb2.TASK_STATUS_FAILED_USER, pb2.TASK_STATUS_FAILED_INFRA):
+                if task.status in (
+                    pb2.TASK_STATUS_SUCCEEDED,
+                    pb2.TASK_STATUS_FAILED_USER,
+                    pb2.TASK_STATUS_FAILED_INFRA,
+                    pb2.TASK_STATUS_CANCELLED,
+                ):
                     already_done.append(task_id)
                     continue
 
@@ -1616,6 +1624,45 @@ class NodeControlState:
             if cancelled:
                 self._cv.notify_all()
         return cancelled, not_found, already_done
+
+    def cancel_job(self, request: pb2.CancelJobRequest) -> Tuple[int, int, int, int]:
+        queued_cancelled = 0
+        running_marked = 0
+        already_done = 0
+        matched = 0
+        with self._cv:
+            for task in self._tasks.values():
+                if task.client_id != request.client_id:
+                    continue
+                if task.job_id != request.job_id:
+                    continue
+                matched += 1
+
+                if task.status in (
+                    pb2.TASK_STATUS_SUCCEEDED,
+                    pb2.TASK_STATUS_FAILED_USER,
+                    pb2.TASK_STATUS_FAILED_INFRA,
+                    pb2.TASK_STATUS_CANCELLED,
+                ):
+                    already_done += 1
+                    continue
+
+                task.cancel_requested = True
+                if task.status == pb2.TASK_STATUS_QUEUED:
+                    task.status = pb2.TASK_STATUS_CANCELLED
+                    task.finished_at = utc_now()
+                    task.error_type = "Cancelled"
+                    task.error_message = request.reason or f"cancelled by job_id={request.job_id}"
+                    self._publish_result_locked(task)
+                    queued_cancelled += 1
+                elif task.status == pb2.TASK_STATUS_RUNNING:
+                    running_marked += 1
+
+            if queued_cancelled or running_marked:
+                self._cv.notify_all()
+
+        not_found = 0 if matched else 1
+        return queued_cancelled, running_marked, already_done, not_found
 
     def metrics(self) -> Dict[str, int]:
         with self._lock:

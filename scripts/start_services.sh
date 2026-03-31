@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # PyCloud 服务启动脚本
-# 启动 InfoCenter + 2 个 NodeControl 节点
+# 启动 ControlPlane(InfoCenter + Gateway) + 2 个 NodeControl 节点
 # =============================================================================
 
 set -e
@@ -86,26 +86,26 @@ stop_process() {
 # 启动函数
 # =============================================================================
 
-start_infocenter() {
+start_controlplane() {
     local port=${1:-$INFOCENTER_PORT}
 
-    log_info "Starting InfoCenter on port $port..."
+    log_info "Starting ControlPlane on port $port..."
 
     python -m $MODULE \
-        --role infocenter \
+        --role controlplane \
         --bind "0.0.0.0:$port" \
         --log-level INFO \
-        >> "$LOG_DIR/infocenter.log" 2>&1 &
+        >> "$LOG_DIR/controlplane.log" 2>&1 &
 
     local pid=$!
-    echo $pid > "$PID_DIR/infocenter.pid"
+    echo $pid > "$PID_DIR/controlplane.pid"
     sleep 1
 
     if kill -0 "$pid" 2>/dev/null; then
-        log_success "InfoCenter started (PID: $pid, Port: $port)"
+        log_success "ControlPlane started (PID: $pid, Port: $port)"
         return 0
     else
-        log_error "InfoCenter failed to start"
+        log_error "ControlPlane failed to start"
         return 1
     fi
 }
@@ -160,16 +160,18 @@ case "${1:-start}" in
 
         # 停止已有进程
         log_info "Stopping existing services..."
+        stop_process "controlplane" "pycloud_parallel.controlplane.server --role controlplane" 2>/dev/null || true
         stop_process "infocenter" "pycloud_parallel.controlplane.server --role infocenter" 2>/dev/null || true
+        stop_process "gateway" "pycloud_parallel.controlplane.server --role gateway" 2>/dev/null || true
         stop_process "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1" 2>/dev/null || true
         stop_process "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2" 2>/dev/null || true
         sleep 1
 
         echo ""
         echo "--------------------------------------------"
-        echo "  Starting InfoCenter..."
+        echo "  Starting ControlPlane..."
         echo "--------------------------------------------"
-        start_infocenter || exit 1
+        start_controlplane || exit 1
 
         sleep 2
 
@@ -185,7 +187,7 @@ case "${1:-start}" in
         echo "  All Services Started!"
         echo "============================================"
         echo ""
-        echo "  InfoCenter:  127.0.0.1:$INFOCENTER_PORT"
+        echo "  ControlPlane: 127.0.0.1:$INFOCENTER_PORT"
         echo "  Node-1:      127.0.0.1:$NODE1_PORT (HTTP: $NODE1_HTTP)"
         echo "  Node-2:      127.0.0.1:$NODE2_PORT (HTTP: $NODE2_HTTP)"
         echo ""
@@ -205,7 +207,9 @@ case "${1:-start}" in
 
         stop_process "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1"
         stop_process "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2"
+        stop_process "controlplane" "pycloud_parallel.controlplane.server --role controlplane"
         stop_process "infocenter" "pycloud_parallel.controlplane.server --role infocenter"
+        stop_process "gateway" "pycloud_parallel.controlplane.server --role gateway"
 
         log_success "All services stopped"
         ;;
@@ -251,7 +255,7 @@ case "${1:-start}" in
             fi
         }
 
-        check_service "infocenter" "pycloud_parallel.controlplane.server --role infocenter"
+        check_service "controlplane" "pycloud_parallel.controlplane.server --role controlplane"
         check_service "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1"
         check_service "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2"
 
@@ -296,8 +300,8 @@ PY
     logs)
         shift
         case "${1:-all}" in
-            infocenter|info)
-                tail -f "$LOG_DIR/infocenter.log" 2>/dev/null || echo "Log not found"
+            controlplane|infocenter|info)
+                tail -f "$LOG_DIR/controlplane.log" 2>/dev/null || echo "Log not found"
                 ;;
             node-1)
                 tail -f "$LOG_DIR/node-1.log" 2>/dev/null || echo "Log not found"
@@ -306,10 +310,10 @@ PY
                 tail -f "$LOG_DIR/node-2.log" 2>/dev/null || echo "Log not found"
                 ;;
             all)
-                tail -f "$LOG_DIR/infocenter.log" "$LOG_DIR/node-1.log" "$LOG_DIR/node-2.log" 2>/dev/null || echo "Logs not found"
+                tail -f "$LOG_DIR/controlplane.log" "$LOG_DIR/node-1.log" "$LOG_DIR/node-2.log" 2>/dev/null || echo "Logs not found"
                 ;;
             *)
-                echo "Usage: $0 logs [infocenter|node-1|node-2|all]"
+                echo "Usage: $0 logs [controlplane|node-1|node-2|all]"
                 ;;
         esac
         ;;
@@ -322,13 +326,13 @@ PY
         echo "Usage: $0 {start|stop|restart|status|logs}"
         echo ""
         echo "Commands:"
-        echo "  start   - Start InfoCenter + 2 Nodes (default)"
+        echo "  start   - Start ControlPlane + 2 Nodes (default)"
         echo "  stop    - Stop all services"
         echo "  restart - Restart all services"
         echo "  status  - Check service status"
         echo "  logs    - View logs (default: all)"
         echo ""
-        echo "  logs infocenter  - View InfoCenter logs"
+        echo "  logs controlplane - View ControlPlane (InfoCenter + Gateway) logs"
         echo "  logs node-1      - View node-1 logs"
         echo "  logs node-2      - View node-2 logs"
         echo "  logs all         - View all logs"
