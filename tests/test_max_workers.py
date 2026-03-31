@@ -3,7 +3,7 @@
 import os
 import time
 
-from pycloud_parallel import foreach, parallel_for, RuntimeConfig, configure
+from pycloud_parallel import configure, foreach, parallel_for
 
 
 def _square(x):
@@ -19,20 +19,20 @@ def test_foreach_with_max_workers():
         _square,
         max_workers=2,
     )
-    assert result == [1, 4, 9, 16]
+    assert result.values == [1, 4, 9, 16]
 
 
 def test_foreach_without_max_workers():
     """测试 foreach 不指定 max_workers 时使用全局 runtime。"""
     # 先配置全局 runtime
-    configure(config=RuntimeConfig(max_workers=2))
+    configure(max_workers=2)
 
     # 不指定 max_workers，应该使用全局 runtime
     result = foreach(
         [1, 2, 3, 4],
         _square,
     )
-    assert result == [1, 4, 9, 16]
+    assert result.values == [1, 4, 9, 16]
 
 
 def test_parallel_for_with_max_workers():
@@ -53,48 +53,48 @@ def test_max_workers_cleanup():
     """测试 max_workers 指定的进程池在函数结束后被清理。"""
     # 多次调用使用不同的 max_workers，应该不会冲突
     result1 = foreach([1, 2], _square, max_workers=2)
-    assert result1 == [1, 4]
+    assert result1.values == [1, 4]
 
     result2 = foreach([3, 4], _square, max_workers=4)
-    assert result2 == [9, 16]
+    assert result2.values == [9, 16]
 
     result3 = foreach([5, 6], _square, max_workers=2)
-    assert result3 == [25, 36]
+    assert result3.values == [25, 36]
 
 
 def test_foreach_mixed_usage():
     """测试混合使用全局 runtime 和临时 runtime。"""
     # 配置全局 runtime
-    configure(config=RuntimeConfig(max_workers=2))
+    configure(max_workers=2)
 
     # 使用全局 runtime
     result1 = foreach([1, 2], _square)
-    assert result1 == [1, 4]
+    assert result1.values == [1, 4]
 
     # 使用临时 runtime
     result2 = foreach([3, 4], _square, max_workers=4)
-    assert result2 == [9, 16]
+    assert result2.values == [9, 16]
 
     # 再次使用全局 runtime
     result3 = foreach([5, 6], _square)
-    assert result3 == [25, 36]
+    assert result3.values == [25, 36]
 
 
 def test_max_workers_zero_or_none():
     """测试 max_workers 为 0、None 或负数时的行为。"""
-    configure(config=RuntimeConfig(max_workers=2))
+    configure(max_workers=2)
 
     # max_workers=None 应该使用全局 runtime
     result1 = foreach([1, 2], _square, max_workers=None)
-    assert result1 == [1, 4]
+    assert result1.values == [1, 4]
 
     # max_workers=0 应该使用全局 runtime
     result2 = foreach([3, 4], _square, max_workers=0)
-    assert result2 == [9, 16]
+    assert result2.values == [9, 16]
 
     # 不指定 max_workers 应该使用全局 runtime
     result3 = foreach([5, 6], _square)
-    assert result3 == [25, 36]
+    assert result3.values == [25, 36]
 
 
 if __name__ == "__main__":

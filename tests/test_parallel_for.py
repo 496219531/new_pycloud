@@ -2,10 +2,9 @@
 
 import warnings
 
-from pc import ProjectConfig, RuntimeConfig, configure, parallel_for, project
+from pycloud_parallel import configure, parallel_for
 
-
-@parallel_for(mode="ordered", on_error="skip", retries=0, project="p1")
+@parallel_for()
 def _decorated_square(nums):
     out = []
     for n in nums:
@@ -13,7 +12,7 @@ def _decorated_square(nums):
     return out
 
 
-@parallel_for(mode="ordered", on_error="skip", retries=0, project="p1")
+@parallel_for()
 def _decorated_cumulative(nums):
     out = []
     total = 0
@@ -24,13 +23,7 @@ def _decorated_cumulative(nums):
 
 
 def _setup_runtime():
-    cfg = RuntimeConfig(
-        max_workers=4,
-        projects={"default": ProjectConfig(name="default", cpu_quota=4)},
-        default_project="default",
-    )
-    configure(config=cfg, reset=True)
-    project("p1", cpu_quota=4)
+    configure(max_workers=4, reset=True)
 
 
 def test_parallel_for_rewrite_success():

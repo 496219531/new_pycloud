@@ -1,190 +1,126 @@
 from __future__ import annotations
 
-"""中文说明：运行时编排层（本地多进程）。
+"""Internal runtime state for lightweight local multiprocessing."""
 
-负责把配置、网关、项目管理和执行器组装起来，
-并提供全局 Runtime 单例（便于业务代码低侵入接入）。
-"""
-
+from concurrent.futures import ProcessPoolExecutor
+import itertools
+import multiprocessing as mp
+import os
 import threading
-from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
-from .config import ProjectConfig, RuntimeConfig, load_runtime_config, normalize_runtime_config
-from .executor import run_foreach
-from .project_manager import ProjectManager
-from .runners import ProcessClusterRunner
-from .types import ForeachResult
+import cloudpickle
+
+from .types import ForeachResult, TaskError
 
 
-@dataclass
-class RuntimeMetrics:
-    """运行时指标数据类。
-
-    用于跟踪运行时的任务执行统计信息。
-    """
-    submitted_jobs: int = 0  # 已提交的任务总数
-    succeeded_jobs: int = 0  # 成功完成的任务数
-    failed_jobs: int = 0  # 失败的任务数
+_STATE_LOCK = threading.Lock()
+_CONFIG = max(1, os.cpu_count() or 1)
+_POOL: Optional[ProcessPoolExecutor] = None
+_POOL_WORKERS = 0
 
 
-class Runtime:
-    """PyCloud 运行时核心类（本地模式）。
-
-    负责编排配置、项目管理和本地执行器，提供统一的并行执行接口。
-    采用单例模式，确保全局只有一个运行时实例。
-
-    Attributes:
-        config: 运行时配置
-        runner: 本地进程池执行器
-        projects: 项目管理器，负责项目级资源隔离
-        metrics: 运行时指标
-        _metrics_lock: 指标锁，保护并发访问
-        _last_errors: 线程本地存储，保存每个线程的最后错误
-    """
-
-    def __init__(self, config: RuntimeConfig) -> None:
-        self.config = config
-        self.runner = ProcessClusterRunner(config.max_workers)
-        self.projects = ProjectManager(config.projects)
-        self.metrics = RuntimeMetrics()
-        self._metrics_lock = threading.Lock()
-        self._last_errors = threading.local()
-
-    def shutdown(self) -> None:
-        """关闭运行时，释放所有资源。
-
-        会关闭本地进程池，清理资源。
-        """
-        self.runner.shutdown()
-
-    def register_project(self, cfg: ProjectConfig) -> None:
-        """注册一个新项目。
-
-        Args:
-            cfg: 项目配置对象
-        """
-        self.projects.register(cfg)
-
-    def foreach(
-        self,
-        iterable,
-        fn,
-        *,
-        mode: str,
-        on_error: Optional[str],
-        retries: Optional[int],
-        project: Optional[str],
-        chunk_size: Optional[int],
-    ) -> ForeachResult:
-        """并行执行 foreach 操作。
-
-        这是运行时的核心方法，负责协调各个组件完成并行执行。
-
-        Args:
-            iterable: 可迭代对象
-            fn: 要应用的函数
-            mode: 返回模式（"ordered" 或 "as_completed"）
-            on_error: 错误处理策略
-            retries: 重试次数
-            project: 项目名称
-            chunk_size: 分片大小
-
-        Returns:
-            ForeachResult: 包含结果和错误的对象
-        """
-        # on_error/retries 直接使用调用参数（未传则回落到固定默认值）。
-        project_name = project or self.config.default_project
-        self.projects.ensure(project_name, default_cpu=1)
-        effective_on_error = on_error or "skip"
-        effective_retries = 0 if retries is None else retries
-        with self._metrics_lock:
-            self.metrics.submitted_jobs += 1
-        try:
-            result = run_foreach(
-                iterable=iterable,
-                fn=fn,
-                runner=self.runner,
-                projects=self.projects,
-                mode=mode,
-                on_error=effective_on_error,
-                retries=effective_retries,
-                project=project_name,
-                chunk_size=chunk_size,
-            )
-        except Exception:
-            with self._metrics_lock:
-                self.metrics.failed_jobs += 1
-            raise
-        else:
-            with self._metrics_lock:
-                self.metrics.succeeded_jobs += 1
-            self._last_errors.value = result.errors
-            return result
-
-    def get_last_errors(self):
-        """获取最后一次 foreach 调用的错误列表。
-
-        Returns:
-            List[TaskError]: 错误列表
-        """
-        return getattr(self._last_errors, "value", [])
-
-    def snapshot_metrics(self) -> Dict[str, int]:
-        """获取运行时指标的快照。
-
-        Returns:
-            Dict[str, int]: 包含 submitted_jobs, succeeded_jobs, failed_jobs 的字典
-        """
-        with self._metrics_lock:
-            return {
-                "submitted_jobs": self.metrics.submitted_jobs,
-                "succeeded_jobs": self.metrics.succeeded_jobs,
-                "failed_jobs": self.metrics.failed_jobs,
-            }
+def _normalize_max_workers(max_workers: Optional[int]) -> int:
+    if max_workers is None:
+        return max(1, os.cpu_count() or 1)
+    return max(1, int(max_workers))
 
 
-_RUNTIME_LOCK = threading.Lock()
-_RUNTIME: Optional[Runtime] = None
+def _build_pool(max_workers: int) -> ProcessPoolExecutor:
+    workers = max(1, min(int(max_workers), os.cpu_count() or int(max_workers)))
+    try:
+        mp_context = mp.get_context("spawn")
+    except ValueError:
+        mp_context = None
+    return ProcessPoolExecutor(max_workers=workers, mp_context=mp_context)
 
 
-def get_runtime() -> Runtime:
-    """获取运行时单例实例。
-
-    采用懒加载模式，首次调用时才初始化资源。
-
-    Returns:
-        Runtime: 运行时实例
-    """
-    # 懒加载单例：首次调用才真正初始化资源。
-    global _RUNTIME
-    with _RUNTIME_LOCK:
-        if _RUNTIME is None:
-            _RUNTIME = Runtime(load_runtime_config())
-        return _RUNTIME
+def _shutdown_pool(pool: Optional[ProcessPoolExecutor]) -> None:
+    if pool is None:
+        return
+    pool.shutdown(wait=False, cancel_futures=False)
 
 
-def configure_runtime(
+def _ensure_global_pool() -> ProcessPoolExecutor:
+    global _POOL, _POOL_WORKERS
+    with _STATE_LOCK:
+        workers = int(_CONFIG)
+        if _POOL is None or _POOL_WORKERS != workers:
+            old_pool = _POOL
+            _POOL = _build_pool(workers)
+            _POOL_WORKERS = workers
+            _shutdown_pool(old_pool)
+        return _POOL
+
+
+def _execute_item(
+    serialized_fn: bytes,
+    indexed_item: Tuple[int, object],
+) -> Tuple[int, bool, object]:
+    fn = cloudpickle.loads(serialized_fn)
+    index, item = indexed_item
+    try:
+        return index, True, fn(item)
+    except Exception as exc:
+        return index, False, TaskError(
+            index=index,
+            item_repr=repr(item),
+            error=repr(exc),
+            attempts=1,
+        )
+
+
+def _run_with_pool(
     *,
-    config: Optional[RuntimeConfig] = None,
-    reset: bool = True,
-) -> Runtime:
-    """配置或重新配置运行时。
+    pool: ProcessPoolExecutor,
+    iterable: Union[Sequence[object], Iterable[object]],
+    fn,
+) -> ForeachResult:
+    try:
+        serialized_fn = cloudpickle.dumps(fn)
+    except Exception as exc:
+        raise RuntimeError(f"failed to serialize function for parallel execution: {exc}") from exc
 
-    Args:
-        config: 可选的运行时配置对象
-        reset: 是否重置现有运行时（默认 True）
+    values: List[object] = []
+    errors: List[TaskError] = []
+    iterator = pool.map(
+        _execute_item,
+        itertools.repeat(serialized_fn),
+        enumerate(iterable),
+    )
+    for _, ok, payload in iterator:
+        if ok:
+            values.append(payload)
+        else:
+            errors.append(payload)
+    return ForeachResult(values=values, errors=errors)
 
-    Returns:
-        Runtime: 配置好的运行时实例
-    """
-    # reset=True 时会关闭旧资源并重建，便于测试和热更新配置。
-    global _RUNTIME
-    with _RUNTIME_LOCK:
-        if _RUNTIME is not None and reset:
-            _RUNTIME.shutdown()
-            _RUNTIME = None
-        if _RUNTIME is None:
-            cfg = normalize_runtime_config(config) if config is not None else load_runtime_config()
-            _RUNTIME = Runtime(cfg)
-        return _RUNTIME
+
+def _configure_runtime(*, max_workers: Optional[int] = None, reset: bool = True) -> int:
+    global _CONFIG, _POOL, _POOL_WORKERS
+    with _STATE_LOCK:
+        if reset:
+            old_pool = _POOL
+            _POOL = None
+            _POOL_WORKERS = 0
+            _CONFIG = _normalize_max_workers(max_workers)
+            _shutdown_pool(old_pool)
+        elif max_workers is not None:
+            _CONFIG = _normalize_max_workers(max_workers)
+    return _CONFIG
+
+
+def _foreach(
+    iterable: Union[Sequence[object], Iterable[object]],
+    fn,
+    *,
+    max_workers: Optional[int],
+) -> ForeachResult:
+    if max_workers is not None and max_workers > 0:
+        pool = _build_pool(int(max_workers))
+        try:
+            return _run_with_pool(pool=pool, iterable=iterable, fn=fn)
+        finally:
+            _shutdown_pool(pool)
+
+    return _run_with_pool(pool=_ensure_global_pool(), iterable=iterable, fn=fn)

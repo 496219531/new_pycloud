@@ -36,21 +36,3 @@ class ForeachResult:
     """
     values: List[Any] = field(default_factory=list)
     errors: List[TaskError] = field(default_factory=list)
-
-
-class UserFunctionError(RuntimeError):
-    """用户函数执行错误。
-
-    用户函数执行失败时抛出（任务级错误），用于区分与集群级故障。
-
-    Attributes:
-        index: 任务索引
-        item_repr: 项目表示
-        cause: 错误原因
-    """
-    # 用户函数执行失败（任务级）。
-    def __init__(self, index: int, item_repr: str, cause: str) -> None:
-        super().__init__(f"user function failed at index={index}: {cause}")
-        self.index = index
-        self.item_repr = item_repr
-        self.cause = cause
