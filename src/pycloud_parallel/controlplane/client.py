@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
+import inspect
 import json
 import os
 import queue
 import re
 import socket
+import sys
 import tarfile
 import tempfile
 import threading
@@ -18,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Awaitable, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -33,6 +36,114 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 def pycloud_export(fn):
     fn.__pycloud_export__ = True
     return fn
+
+
+def _auto_package_function(func: Callable) -> bytes:
+    """自动打包函数及其依赖。
+
+    Args:
+        func: 要打包的函数
+
+    Returns:
+        bytes: tar.gz 格式的包内容
+    """
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    packager = DependencyPackager()
+
+    # 创建临时文件
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # 打包函数和依赖
+        packager.package_function(
+            func,
+            output_file=tmp_path,
+            include_tests=False,
+        )
+
+        # 读取包内容
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        # 清理临时文件
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def _prepare_code_blob(
+    func: Optional[Callable] = None,
+    artifact_path: str = "",
+    blob: Optional[bytes] = None,
+) -> Tuple[Optional[bytes], str]:
+    """准备代码 blob 和文件名。
+
+    智能处理函数自动打包、文件路径、直接 blob 三种情况。
+
+    Args:
+        func: 函数对象（自动打包依赖）
+        artifact_path: 文件路径
+        blob: 直接提供的 blob
+
+    Returns:
+        (blob, filename): blob 内容和文件名
+    """
+    # 优先级 1: 函数对象（自动打包）
+    if func is not None:
+        if not callable(func):
+            raise ValueError("func must be callable")
+
+        # 自动打包函数和依赖
+        blob = _auto_package_function(func)
+
+        # 确定文件名
+        filename = f"{func.__module__}_{func.__name__}.tar.gz"
+
+        return blob, filename
+
+    # 优先级 2: 直接提供的 blob
+    if blob is not None:
+        return blob, ""
+
+    # 优先级 3: 文件路径
+    if artifact_path:
+        path = Path(artifact_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Artifact path not found: {artifact_path}")
+
+        # 如果是单个文件，直接读取
+        if path.is_file():
+            with open(path, "rb") as f:
+                return f.read(), path.name
+
+        # 如果是目录，打包成 tar.gz
+        if path.is_dir():
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                with tarfile.open(tmp_path, "w:gz") as tar:
+                    for item in path.rglob("*"):
+                        if item.is_file():
+                            arcname = item.relative_to(path)
+                            tar.add(item, arcname=arcname)
+
+                with open(tmp_path, "rb") as f:
+                    blob = f.read()
+
+                filename = f"{path.name}.tar.gz"
+                return blob, filename
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    # 没有提供任何代码
+    return None, ""
 
 
 def _serialize_arrow_compatible(obj: Any) -> Dict[str, object]:
@@ -2055,6 +2166,7 @@ class TaskBatchClient:
         infocenter_target: str,
         client_id: Optional[str] = None,
         job_id: Optional[str] = None,
+        func: Optional[Callable] = None,
         code_version: str = "",
         artifact_path: str = "",
         blob: Optional[bytes] = None,
@@ -2076,6 +2188,30 @@ class TaskBatchClient:
         preferred_runtime_key: str = "",
         timeout_sec: float = 10.0,
     ) -> "TaskBatchClient":
+        # 自动依赖检测：处理函数对象
+        if func is not None:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=func,
+                artifact_path="",
+                blob=blob,
+            )
+            effective_filename = effective_filename or filename
+            effective_package_format = "tar.gz"
+
+            # 自动推断 entry_module 和 entry_callable
+            if not entry_module:
+                entry_module = func.__module__
+            if not entry_callable or entry_callable == "run":
+                entry_callable = func.__name__
+        else:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=None,
+                artifact_path=artifact_path,
+                blob=blob,
+            )
+            effective_filename = effective_filename or filename
+            effective_package_format = package_format
+
         # 自动生成 client_id（如果未提供）
         effective_client_id = client_id
         if not effective_client_id:
@@ -2102,8 +2238,8 @@ class TaskBatchClient:
         try:
             effective_code_version = str(code_version or "").strip()
             if not effective_code_version:
-                if blob is not None:
-                    effective_code_version = f"sha256:{hashlib.sha256(blob).hexdigest()}"
+                if effective_blob is not None:
+                    effective_code_version = f"sha256:{hashlib.sha256(effective_blob).hexdigest()}"
                 elif artifact_path:
                     upload_path = Path(artifact_path)
                     upload_file = upload_path
@@ -2117,7 +2253,7 @@ class TaskBatchClient:
                         if tmp_pkg is not None:
                             tmp_pkg.unlink(missing_ok=True)
                 else:
-                    raise ValueError("code_version or artifact_path or blob must be provided")
+                    raise ValueError("code_version or artifact_path or blob or func must be provided")
 
             desired_runtime_key = str(preferred_runtime_key or effective_code_version).strip() or effective_code_version
 
@@ -2143,18 +2279,18 @@ class TaskBatchClient:
                 effective_code_version = str(code_version).strip()
             else:
                 uploaded_versions: Dict[str, str] = {}
-                if blob is not None:
-                    if not filename:
+                if effective_blob is not None:
+                    if not effective_filename:
                         raise ValueError("filename is required when blob is provided")
                     for node_id, client in clients.items():
                         upload = client.upload_code_from_bytes(
                             client_id=effective_client_id,
-                            filename=filename,
-                            blob=blob,
+                            filename=effective_filename,
+                            blob=effective_blob,
                             runtime=runtime,
                             entry_module=entry_module,
                             entry_callable=entry_callable,
-                            package_format=package_format,
+                            package_format=effective_package_format,
                             export_mode=export_mode,
                             export_methods=export_methods,
                             export_decorator=export_decorator,
@@ -2166,11 +2302,11 @@ class TaskBatchClient:
                         upload = client.upload_code_from_file(
                             client_id=effective_client_id,
                             artifact_path=artifact_path,
-                            filename=filename,
+                            filename=effective_filename,
                             runtime=runtime,
                             entry_module=entry_module,
                             entry_callable=entry_callable,
-                            package_format=package_format,
+                            package_format=effective_package_format,
                             export_mode=export_mode,
                             export_methods=export_methods,
                             export_decorator=export_decorator,
@@ -2570,6 +2706,7 @@ class ServiceGroup:
         infocenter_target: str,
         owner_client_id: Optional[str] = None,
         service_name: Optional[str] = None,
+        func: Optional[Callable] = None,
         artifact_path: str = "",
         artifact_paths: Optional[Sequence[str]] = None,
         blob: Optional[bytes] = None,
@@ -2609,9 +2746,11 @@ class ServiceGroup:
             infocenter_target: InfoCenter 地址
             owner_client_id: 所有者客户端 ID
             service_name: 服务名称
-            artifact_path: 单个文件路径（优先级低于 blob，优先级高于 artifact_paths）
+            func: 函数对象（自动打包依赖，优先级最高）
+            artifact_path: 单个文件路径
             artifact_paths: 文件/文件夹路径列表，会自动打包成 zip
-            blob: 直接提供代码内容（优先级最高）
+            blob: 直接提供代码内容
+            filename: 文件名
             runtime: 运行时版本
             entry_module: 入口模块名
             entry_callable: 入口函数名
@@ -2644,6 +2783,30 @@ class ServiceGroup:
         Returns:
             ServiceGroup: 部署的服务组
         """
+        # 自动依赖检测：处理函数对象
+        if func is not None:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=func,
+                artifact_path="",
+                blob=blob,
+            )
+            effective_filename = effective_filename or filename
+            effective_package_format = "tar.gz"
+
+            # 自动推断 entry_module 和 entry_callable
+            if not entry_module:
+                entry_module = func.__module__
+            if not entry_callable or entry_callable == "run":
+                entry_callable = func.__name__
+        else:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=None,
+                artifact_path=artifact_path,
+                blob=blob,
+            )
+            effective_filename = effective_filename or filename
+            effective_package_format = package_format
+
         # 生成默认的 owner_client_id 和 service_name
         local_ip = _get_local_ip()
 
@@ -2655,10 +2818,10 @@ class ServiceGroup:
         # 先确定 entry_module（用于生成 service_name）
         effective_entry_module = entry_module
         if not effective_entry_module:
-            if filename:
+            if effective_filename:
                 # 优先使用 filename
-                if filename.endswith(".py"):
-                    effective_entry_module = Path(filename).stem
+                if effective_filename.endswith(".py"):
+                    effective_entry_module = Path(effective_filename).stem
             else:
                 # 尝试从 artifact_path 推断
                 if artifact_path:
@@ -2689,11 +2852,8 @@ class ServiceGroup:
         if not effective_service_name:
             raise ValueError("service_name is required")
 
-        effective_blob = blob
-        effective_filename = filename
-        effective_package_format = package_format
-
-        # 优先级: blob > artifact_path > artifact_paths
+        # 优先级: func > blob > artifact_path > artifact_paths
+        # 如果 func 参数已处理，effective_blob 已经设置，跳过后续处理
         if effective_blob is None and artifact_paths:
             # artifact_paths 列表：打包成 zip
             import zipfile
