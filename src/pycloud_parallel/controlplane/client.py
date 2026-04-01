@@ -76,22 +76,60 @@ def _auto_package_function(func: Callable) -> bytes:
 
 def _prepare_code_blob(
     func: Optional[Callable] = None,
+    module: Optional[Any] = None,
     artifact_path: str = "",
     blob: Optional[bytes] = None,
 ) -> Tuple[Optional[bytes], str]:
     """准备代码 blob 和文件名。
 
-    智能处理函数自动打包、文件路径、直接 blob 三种情况。
+    智能处理模块对象、函数对象、文件路径、直接 blob 四种情况。
 
     Args:
         func: 函数对象（自动打包依赖）
+        module: 模块对象（自动打包整个模块）
         artifact_path: 文件路径
         blob: 直接提供的 blob
 
     Returns:
         (blob, filename): blob 内容和文件名
     """
-    # 优先级 1: 函数对象（自动打包）
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    # 优先级 1: 模块对象（自动打包整个模块）
+    if module is not None:
+        if not inspect.ismodule(module):
+            raise ValueError("module must be a module object")
+
+        packager = DependencyPackager()
+
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # 打包模块和依赖
+            packager.package_module(
+                module_name=module.__name__,
+                output_file=tmp_path,
+                include_tests=False,
+            )
+
+            # 读取包内容
+            with open(tmp_path, "rb") as f:
+                blob = f.read()
+
+            # 确定文件名
+            filename = f"{module.__name__}.tar.gz"
+
+            return blob, filename
+        finally:
+            # 清理临时文件
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    # 优先级 2: 函数对象（自动打包）
     if func is not None:
         if not callable(func):
             raise ValueError("func must be callable")
@@ -104,11 +142,11 @@ def _prepare_code_blob(
 
         return blob, filename
 
-    # 优先级 2: 直接提供的 blob
+    # 优先级 3: 直接提供的 blob
     if blob is not None:
         return blob, ""
 
-    # 优先级 3: 文件路径
+    # 优先级 4: 文件路径
     if artifact_path:
         path = Path(artifact_path)
         if not path.exists():
@@ -2167,6 +2205,7 @@ class TaskBatchClient:
         client_id: Optional[str] = None,
         job_id: Optional[str] = None,
         func: Optional[Callable] = None,
+        module: Optional[Any] = None,
         code_version: str = "",
         artifact_path: str = "",
         blob: Optional[bytes] = None,
@@ -2188,10 +2227,24 @@ class TaskBatchClient:
         preferred_runtime_key: str = "",
         timeout_sec: float = 10.0,
     ) -> "TaskBatchClient":
-        # 自动依赖检测：处理函数对象
-        if func is not None:
+        # 自动依赖检测：处理模块对象和函数对象
+        if module is not None:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=None,
+                module=module,
+                artifact_path="",
+                blob=blob,
+            )
+            effective_filename = effective_filename or filename
+            effective_package_format = "tar.gz"
+
+            # 自动推断 entry_module
+            if not entry_module:
+                entry_module = module.__name__
+        elif func is not None:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=func,
+                module=None,
                 artifact_path="",
                 blob=blob,
             )
@@ -2206,6 +2259,7 @@ class TaskBatchClient:
         else:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=None,
+                module=None,
                 artifact_path=artifact_path,
                 blob=blob,
             )
@@ -2707,6 +2761,7 @@ class ServiceGroup:
         owner_client_id: Optional[str] = None,
         service_name: Optional[str] = None,
         func: Optional[Callable] = None,
+        module: Optional[Any] = None,
         artifact_path: str = "",
         artifact_paths: Optional[Sequence[str]] = None,
         blob: Optional[bytes] = None,
@@ -2783,10 +2838,24 @@ class ServiceGroup:
         Returns:
             ServiceGroup: 部署的服务组
         """
-        # 自动依赖检测：处理函数对象
-        if func is not None:
+        # 自动依赖检测：处理模块对象和函数对象
+        if module is not None:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=None,
+                module=module,
+                artifact_path="",
+                blob=blob,
+            )
+            effective_filename = effective_filename or filename
+            effective_package_format = "tar.gz"
+
+            # 自动推断 entry_module
+            if not entry_module:
+                entry_module = module.__name__
+        elif func is not None:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=func,
+                module=None,
                 artifact_path="",
                 blob=blob,
             )
@@ -2801,6 +2870,7 @@ class ServiceGroup:
         else:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=None,
+                module=None,
                 artifact_path=artifact_path,
                 blob=blob,
             )
