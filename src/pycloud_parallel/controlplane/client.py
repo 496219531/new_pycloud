@@ -4270,12 +4270,22 @@ class _TaskCallProxy:
         """返回任务的 payload。"""
         return self._payload
 
-    def submit(self, *args, **kwargs) -> pb2.SubmitTasksResponse:
+    def submit(
+        self,
+        *args,
+        timeout_hint_sec: Optional[float] = None,
+        priority: Optional[int] = None,
+        runtime_key: Optional[str] = None,
+        **kwargs,
+    ) -> pb2.SubmitTasksResponse:
         """提交任务，不等待结果。
 
         Args:
-            *args: 位置参数
-            **kwargs: 额外的提交参数（会覆盖初始化时的参数）
+            *args: 任务的位置参数
+            timeout_hint_sec: 超时提示（框架控制参数，不传给任务函数）
+            priority: 优先级（框架控制参数，不传给任务函数）
+            runtime_key: 运行时键（框架控制参数，不传给任务函数）
+            **kwargs: 任务的命名参数
 
         Returns:
             pb2.SubmitTasksResponse: 提交响应
@@ -4287,12 +4297,15 @@ class _TaskCallProxy:
             >>> resp = task.submit(value=7)
             >>> # 混合参数
             >>> resp = task.submit(7, sleep_ms=100)
+            >>> # 带控制参数
+            >>> resp = task.submit(7, timeout_hint_sec=60, priority=1)
         """
-        timeout_hint = kwargs.pop('timeout_hint_sec', self._timeout_hint_sec)
-        priority = kwargs.pop('priority', self._priority)
-        runtime_key = kwargs.pop('runtime_key', self._runtime_key)
+        # 使用传入的控制参数，或回退到默认值
+        timeout_hint = timeout_hint_sec if timeout_hint_sec is not None else self._timeout_hint_sec
+        prio = priority if priority is not None else self._priority
+        rt_key = runtime_key if runtime_key is not None else self._runtime_key
 
-        # 构造 payload
+        # 构造 payload（只包含业务参数）
         payload = dict(self._payload)
 
         # 如果有位置参数或命名参数，使用新格式
@@ -4308,8 +4321,8 @@ class _TaskCallProxy:
         return self._batch.submit_payloads(
             [payload],
             timeout_hint_sec=timeout_hint,
-            priority=priority,
-            runtime_key=runtime_key,
+            priority=prio,
+            runtime_key=rt_key,
         )
 
     def submit_and_wait(

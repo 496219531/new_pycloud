@@ -366,17 +366,29 @@ def _invoke_user_callable(fn, payload: dict):
         return fn()
 
     # 检查是否是新的 args/kwargs 格式
-    # 判断标准：payload 包含 args 或 kwargs 键
+    # 判断标准：payload 只包含 args 和 kwargs 键（不包含其他键）
     if isinstance(payload, dict) and ("args" in payload or "kwargs" in payload):
-        args = payload.get("args", [])
-        kwargs = payload.get("kwargs", {})
-        # 确保 args 是列表类型
-        if not isinstance(args, list):
-            args = list(args) if args else []
-        # 确保 kwargs 是字典类型
-        if not isinstance(kwargs, dict):
-            kwargs = {}
-        return fn(*args, **kwargs)
+        # 检查是否还有其他键（除了 args 和 kwargs）
+        other_keys = set(payload.keys()) - {"args", "kwargs"}
+        if not other_keys:
+            # 纯净的 args/kwargs 格式
+            args = payload.get("args", [])
+            kwargs = payload.get("kwargs", {})
+            # 确保 args 是列表类型
+            if not isinstance(args, list):
+                args = list(args) if args else []
+            # 确保 kwargs 是字典类型
+            if not isinstance(kwargs, dict):
+                kwargs = {}
+            return fn(*args, **kwargs)
+
+    # HTTP 风格：整个 payload 作为 kwargs
+    # 这样服务端可以用 def square(**payload) 或 def square(x) 接收
+    if isinstance(payload, dict):
+        return fn(**payload)
+
+    # 其他情况：直接传递 payload
+    return fn(payload)
 
     # HTTP 风格：整个 payload 作为 kwargs
     # 这样服务端可以用 def square(**payload) 或 def square(x) 接收
