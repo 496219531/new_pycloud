@@ -348,6 +348,14 @@ def _discover_callable_methods(
 
 
 def _invoke_user_callable(fn, payload: dict):
+    """调用用户函数，支持多种参数传递方式。
+
+    支持的 payload 格式：
+    1. {"args": [...], "kwargs": {...}} - 新格式，支持位置参数和命名参数
+    2. {"args": [...]} - 只有位置参数，kwargs 为空
+    3. {"kwargs": {...}} - 只有命名参数，args 为空
+    4. {"key": value, ...} - HTTP 风格，直接作为 kwargs
+    """
     try:
         signature = inspect.signature(fn)
         params = list(signature.parameters.values())
@@ -357,14 +365,25 @@ def _invoke_user_callable(fn, payload: dict):
     if not params:
         return fn()
 
-    if len(params) == 1 and params[0].kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-        return fn(payload)
+    # 检查是否是新的 args/kwargs 格式
+    # 判断标准：payload 包含 args 或 kwargs 键
+    if isinstance(payload, dict) and ("args" in payload or "kwargs" in payload):
+        args = payload.get("args", [])
+        kwargs = payload.get("kwargs", {})
+        # 确保 args 是列表类型
+        if not isinstance(args, list):
+            args = list(args) if args else []
+        # 确保 kwargs 是字典类型
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        return fn(*args, **kwargs)
 
+    # HTTP 风格：整个 payload 作为 kwargs
+    # 这样服务端可以用 def square(**payload) 或 def square(x) 接收
     if isinstance(payload, dict):
-        try:
-            return fn(**payload)
-        except TypeError:
-            return fn(payload)
+        return fn(**payload)
+
+    # 其他情况：直接传递 payload
     return fn(payload)
 
 
@@ -523,6 +542,7 @@ class NodeState:
     last_seen_at: datetime = field(default_factory=utc_now)
     metrics: NodeMetricsState = field(default_factory=NodeMetricsState)
     services: Dict[str, NodeServiceState] = field(default_factory=dict)
+    active_runtimes: List[str] = field(default_factory=list)
     service_worker_capacity: int = 0
     service_worker_used: int = 0
     schedulable: bool = True
@@ -533,6 +553,9 @@ class NodeState:
         capacity = max(0, int(self.service_worker_capacity or 0))
         used = max(0, int(self.service_worker_used or 0))
         return max(0, capacity - used)
+
+    def active_runtime_count(self) -> int:
+        return len(self.active_runtimes)
 
 
 class InfoCenterState:
@@ -553,6 +576,7 @@ class InfoCenterState:
         version: str = "",
         metadata: Optional[Dict[str, str]] = None,
         services: Optional[Dict[str, NodeServiceState]] = None,
+        active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
     ) -> NodeState:
@@ -576,6 +600,7 @@ class InfoCenterState:
             state.healthy = True
             state.last_seen_at = now
             state.services = dict(services or {})
+            state.active_runtimes = [str(x).strip() for x in (active_runtimes or []) if str(x).strip()]
             state.service_worker_capacity = max(0, int(service_worker_capacity or 0))
             state.service_worker_used = max(0, min(int(service_worker_used or 0), state.service_worker_capacity or int(service_worker_used or 0)))
             if state.metrics.credit == 0:
@@ -593,6 +618,7 @@ class InfoCenterState:
             version=request.version,
             metadata=metadata,
             services=self._parse_services(request.services),
+            active_runtimes=(),
             service_worker_capacity=int(metadata.get("service_worker_capacity", "0") or 0),
             service_worker_used=int(metadata.get("service_worker_used", "0") or 0),
         )
@@ -604,6 +630,7 @@ class InfoCenterState:
         healthy: bool,
         metrics: Optional[NodeMetricsState] = None,
         services: Optional[Dict[str, NodeServiceState]] = None,
+        active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
     ) -> Optional[NodeState]:
@@ -617,6 +644,8 @@ class InfoCenterState:
             if metrics is not None:
                 state.metrics = metrics
             state.services = dict(services or {})
+            if active_runtimes is not None:
+                state.active_runtimes = [str(x).strip() for x in active_runtimes if str(x).strip()]
             if service_worker_capacity > 0:
                 state.service_worker_capacity = max(0, int(service_worker_capacity))
             state.service_worker_used = max(
@@ -724,6 +753,7 @@ class InfoCenterState:
                         last_seen_at=state.last_seen_at,
                         metrics=NodeMetricsState(**vars(state.metrics)),
                         services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                        active_runtimes=list(state.active_runtimes),
                         service_worker_capacity=state.service_worker_capacity,
                         service_worker_used=state.service_worker_used,
                         schedulable=state.schedulable,
@@ -764,6 +794,7 @@ class InfoCenterState:
                 last_seen_at=state.last_seen_at,
                 metrics=NodeMetricsState(**vars(state.metrics)),
                 services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                active_runtimes=list(state.active_runtimes),
                 service_worker_capacity=state.service_worker_capacity,
                 service_worker_used=state.service_worker_used,
                 schedulable=state.schedulable,
@@ -823,6 +854,7 @@ class TaskState:
     client_id: str
     job_id: str
     code_version: str
+    runtime_key: str
     execution_mode: int
     payload: dict
     timeout_hint_sec: int
@@ -882,6 +914,19 @@ class ServiceSession:
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
 
 
+@dataclass
+class RuntimeSlotState:
+    runtime_key: str
+    code_version: str
+    task_ids: Deque[str] = field(default_factory=deque)
+    executor: Optional[ProcessPoolExecutor] = None
+    future: Optional[Future] = None
+    current_task_id: str = ""
+    current_attempt: int = 0
+    last_used_at: datetime = field(default_factory=utc_now)
+    waiting: bool = False
+
+
 class NodeControlState:
     """NodeControl 状态管理。
 
@@ -902,6 +947,8 @@ class NodeControlState:
         node_id: str,
         worker_capacity: int = 32,
         queue_capacity: int = 4000,
+        runtime_slot_capacity: int = 0,
+        runtime_slot_idle_ttl_sec: int = 30,
         heartbeat_timeout_sec: int = 90,
         max_retries: int = 3,
         monitor_interval_sec: int = 10,
@@ -918,6 +965,8 @@ class NodeControlState:
         self.node_id = node_id
         self.worker_capacity = max(1, worker_capacity)
         self.queue_capacity = max(1, queue_capacity)
+        self.runtime_slot_capacity = max(1, int(runtime_slot_capacity or worker_capacity))
+        self.runtime_slot_idle_ttl_sec = max(1, int(runtime_slot_idle_ttl_sec))
         self.heartbeat_timeout_sec = max(5, heartbeat_timeout_sec)
         self.max_retries = max(0, max_retries)
         self.monitor_interval_sec = max(1, monitor_interval_sec)
@@ -936,6 +985,8 @@ class NodeControlState:
         self._pending: Deque[str] = deque()
         self._tasks: Dict[str, TaskState] = {}
         self._codes: Dict[str, CodeArtifact] = {}
+        self._runtime_slots: Dict[str, RuntimeSlotState] = {}
+        self._runtime_waiting: Deque[str] = deque()
         self._services: Dict[str, ServiceSession] = {}
         self._result_hook = InMemoryResultHook()
 
@@ -946,14 +997,11 @@ class NodeControlState:
         self._monitor = threading.Thread(target=self._monitor_loop, name="nodecontrol-monitor", daemon=True)
         self._monitor.start()
         self._done_queue: "queue.Queue[Future]" = queue.Queue()
-        self._inflight_futures: Dict[Future, Tuple[str, int]] = {}
-        self._internal_executor: Optional[ProcessPoolExecutor] = None
+        self._inflight_futures: Dict[Future, Tuple[str, str, int]] = {}
         self._dispatcher: Optional[threading.Thread] = None
         self._service_http_gateway: Optional[ServiceHttpGateway] = None
 
         if self.enable_internal_executor:
-            mp_ctx = mp.get_context("spawn")
-            self._internal_executor = ProcessPoolExecutor(max_workers=self.worker_capacity, mp_context=mp_ctx)
             self._dispatcher = threading.Thread(
                 target=self._dispatch_loop,
                 name="nodecontrol-dispatcher",
@@ -976,8 +1024,11 @@ class NodeControlState:
         self._monitor.join(timeout=1.0)
         if self._dispatcher is not None:
             self._dispatcher.join(timeout=1.0)
-        if self._internal_executor is not None:
-            self._internal_executor.shutdown(wait=True, cancel_futures=True)
+        for slot in list(self._runtime_slots.values()):
+            if slot.executor is not None:
+                slot.executor.shutdown(wait=True, cancel_futures=True)
+                slot.executor = None
+                slot.future = None
         if self._service_http_gateway is not None:
             self._service_http_gateway.stop()
         self._shutdown_all_services()
@@ -1465,6 +1516,7 @@ class NodeControlState:
                 return accepted, rejected, self.credit_locked()
 
             for item in request.tasks:
+                runtime_key = str(item.runtime_key or request.code_version).strip() or str(request.code_version)
                 if item.task_id in self._tasks:
                     rejected.append(
                         pb2.TaskRejected(
@@ -1485,18 +1537,41 @@ class NodeControlState:
                     )
                     continue
 
+                existing_slot = self._runtime_slots.get(runtime_key)
+                if existing_slot is not None and existing_slot.code_version != request.code_version:
+                    rejected.append(
+                        pb2.TaskRejected(
+                            task_id=item.task_id,
+                            code=pb2.ERROR_CODE_INVALID_REQUEST,
+                            message=f"runtime_key `{runtime_key}` already bound to {existing_slot.code_version}",
+                        )
+                    )
+                    continue
+
                 record = TaskState(
                     task_id=item.task_id,
                     client_id=request.client_id,
                     job_id=str(request.job_id or "").strip(),
                     code_version=request.code_version,
+                    runtime_key=runtime_key,
                     execution_mode=request.execution_mode,
                     payload=struct_to_dict(item.payload),
                     timeout_hint_sec=max(0, item.timeout_hint_sec),
                     priority=max(1, item.priority or 1),
                 )
                 self._tasks[item.task_id] = record
-                self._pending.append(item.task_id)
+                if self.enable_internal_executor:
+                    slot = self._runtime_slots.get(runtime_key)
+                    if slot is None:
+                        slot = RuntimeSlotState(runtime_key=runtime_key, code_version=request.code_version)
+                        self._runtime_slots[runtime_key] = slot
+                    slot.task_ids.append(item.task_id)
+                    slot.last_used_at = utc_now()
+                    if slot.executor is None and not slot.waiting and self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
+                        slot.waiting = True
+                        self._runtime_waiting.append(runtime_key)
+                else:
+                    self._pending.append(item.task_id)
                 accepted.append(pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED))
             if accepted:
                 self._cv.notify_all()
@@ -1699,8 +1774,22 @@ class NodeControlState:
                 )
             return out
 
+    def active_runtime_keys(self, *, limit: int = 10) -> List[str]:
+        with self._lock:
+            rows: List[Tuple[int, int, float, str]] = []
+            for runtime_key, slot in self._runtime_slots.items():
+                queued = len(slot.task_ids)
+                hot = 1 if slot.executor is not None else 0
+                last_used = slot.last_used_at.timestamp() if slot.last_used_at else 0.0
+                rows.append((hot, queued, last_used, runtime_key))
+            rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+            return [runtime_key for _hot, _queued, _last_used, runtime_key in rows[: max(1, int(limit))]]
+
     def credit_locked(self) -> int:
         return max(0, self.queue_capacity - (self._queued_count_locked() + self._inflight_count_locked()))
+
+    def _active_runtime_slot_count_locked(self) -> int:
+        return sum(1 for slot in self._runtime_slots.values() if slot.executor is not None)
 
     def _queued_count_locked(self) -> int:
         return sum(1 for task in self._tasks.values() if task.status == pb2.TASK_STATUS_QUEUED)
@@ -1723,7 +1812,18 @@ class NodeControlState:
             task.last_heartbeat_at = None
             task.error_type = ""
             task.error_message = ""
-            self._pending.append(task.task_id)
+            if self.enable_internal_executor:
+                slot = self._runtime_slots.get(task.runtime_key)
+                if slot is None:
+                    slot = RuntimeSlotState(runtime_key=task.runtime_key, code_version=task.code_version)
+                    self._runtime_slots[task.runtime_key] = slot
+                slot.task_ids.append(task.task_id)
+                slot.last_used_at = now
+                if slot.executor is None and not slot.waiting and self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
+                    slot.waiting = True
+                    self._runtime_waiting.append(task.runtime_key)
+            else:
+                self._pending.append(task.task_id)
             return
 
         task.status = pb2.TASK_STATUS_FAILED_INFRA
@@ -1735,9 +1835,115 @@ class NodeControlState:
     def _on_future_done(self, future: Future) -> None:
         self._done_queue.put(future)
 
+    def _start_runtime_slot_locked(self, slot: RuntimeSlotState) -> None:
+        if slot.executor is not None:
+            return
+        mp_ctx = mp.get_context("spawn")
+        slot.executor = ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx)
+        slot.future = None
+        slot.current_task_id = ""
+        slot.current_attempt = 0
+        slot.last_used_at = utc_now()
+        slot.waiting = False
+
+    def _activate_waiting_runtime_slots_locked(self) -> None:
+        while self._active_runtime_slot_count_locked() < self.runtime_slot_capacity and self._runtime_waiting:
+            runtime_key = self._runtime_waiting.popleft()
+            slot = self._runtime_slots.get(runtime_key)
+            if slot is None:
+                continue
+            slot.waiting = False
+            if slot.executor is not None:
+                continue
+            if not slot.task_ids:
+                continue
+            self._start_runtime_slot_locked(slot)
+
+    def _reclaim_idle_runtime_slots_locked(self) -> None:
+        now = utc_now()
+        for runtime_key, slot in list(self._runtime_slots.items()):
+            if slot.executor is None:
+                if not slot.task_ids and not slot.waiting:
+                    self._runtime_slots.pop(runtime_key, None)
+                continue
+            if slot.future is not None or slot.task_ids:
+                continue
+            idle_sec = (now - slot.last_used_at).total_seconds()
+            if idle_sec < self.runtime_slot_idle_ttl_sec:
+                continue
+            slot.executor.shutdown(wait=False, cancel_futures=True)
+            slot.executor = None
+            slot.future = None
+            slot.current_task_id = ""
+            slot.current_attempt = 0
+            slot.last_used_at = now
+
+    def _dispatch_runtime_slots_locked(self) -> None:
+        if not self.enable_internal_executor:
+            return
+        self._activate_waiting_runtime_slots_locked()
+        if self._active_runtime_slot_count_locked() < self.runtime_slot_capacity:
+            for slot in self._runtime_slots.values():
+                if self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
+                    break
+                if slot.executor is None and slot.task_ids and not slot.waiting:
+                    self._start_runtime_slot_locked(slot)
+
+        for slot in self._runtime_slots.values():
+            if slot.executor is None or slot.future is not None:
+                continue
+            while slot.task_ids:
+                task_id = slot.task_ids[0]
+                task = self._tasks.get(task_id)
+                if task is None or task.status != pb2.TASK_STATUS_QUEUED:
+                    slot.task_ids.popleft()
+                    continue
+                if task.cancel_requested:
+                    slot.task_ids.popleft()
+                    task.status = pb2.TASK_STATUS_CANCELLED
+                    task.finished_at = utc_now()
+                    task.error_type = "Cancelled"
+                    task.error_message = "cancelled by client"
+                    self._publish_result_locked(task)
+                    continue
+
+                artifact = self._codes.get(task.code_version)
+                if artifact is None:
+                    slot.task_ids.popleft()
+                    now = utc_now()
+                    self._handle_infra_failure_locked(task, reason="missing code artifact", now=now)
+                    continue
+
+                slot.task_ids.popleft()
+                now = utc_now()
+                task.status = pb2.TASK_STATUS_RUNNING
+                task.worker_id = f"runtime-slot:{slot.runtime_key}"
+                task.lease_id = str(uuid.uuid4())
+                task.started_at = now
+                task.last_heartbeat_at = now
+                future = slot.executor.submit(
+                    _execute_payload_in_subprocess,
+                    artifact.path,
+                    artifact.entry_module,
+                    artifact.package_format,
+                    artifact.export_mode,
+                    artifact.export_methods,
+                    artifact.export_decorator,
+                    artifact.entry_callable,
+                    artifact.entry_callable,
+                    task.payload,
+                )
+                slot.future = future
+                slot.current_task_id = task.task_id
+                slot.current_attempt = task.attempt
+                slot.last_used_at = now
+                self._inflight_futures[future] = (slot.runtime_key, task.task_id, task.attempt)
+                future.add_done_callback(self._on_future_done)
+                break
+
     def _touch_internal_heartbeats_locked(self) -> None:
         now = utc_now()
-        for task_id, attempt in self._inflight_futures.values():
+        for _runtime_key, task_id, attempt in self._inflight_futures.values():
             task = self._tasks.get(task_id)
             if task is None:
                 continue
@@ -1758,7 +1964,15 @@ class NodeControlState:
                 meta = self._inflight_futures.pop(future, None)
             if meta is None:
                 continue
-            task_id, attempt = meta
+            runtime_key, task_id, attempt = meta
+            slot = None
+            with self._cv:
+                slot = self._runtime_slots.get(runtime_key)
+                if slot is not None and slot.future is future:
+                    slot.future = None
+                    slot.current_task_id = ""
+                    slot.current_attempt = 0
+                    slot.last_used_at = utc_now()
 
             try:
                 status_text, result, err_type, err_message = future.result()
@@ -1808,33 +2022,8 @@ class NodeControlState:
             self._drain_completed_futures()
             with self._cv:
                 self._touch_internal_heartbeats_locked()
-                if self._internal_executor is not None:
-                    while len(self._inflight_futures) < self.worker_capacity:
-                        slot = len(self._inflight_futures) + 1
-                        envelope = self._claim_task_locked(worker_id=f"local-proc-{slot:02d}")
-                        if envelope is None:
-                            break
-                        artifact = self._codes.get(envelope.code_version)
-                        if artifact is None:
-                            task = self._tasks.get(envelope.task_id)
-                            if task is not None:
-                                now = utc_now()
-                                self._handle_infra_failure_locked(task, reason="missing code artifact", now=now)
-                            continue
-                        future = self._internal_executor.submit(
-                            _execute_payload_in_subprocess,
-                            artifact.path,
-                            artifact.entry_module,
-                            artifact.package_format,
-                            artifact.export_mode,
-                            artifact.export_methods,
-                            artifact.export_decorator,
-                            artifact.entry_callable,
-                            artifact.entry_callable,
-                            struct_to_dict(envelope.payload),
-                        )
-                        self._inflight_futures[future] = (envelope.task_id, envelope.attempt)
-                        future.add_done_callback(self._on_future_done)
+                self._reclaim_idle_runtime_slots_locked()
+                self._dispatch_runtime_slots_locked()
             self._drain_completed_futures()
             self._stop_event.wait(self.executor_poll_interval_sec)
 
