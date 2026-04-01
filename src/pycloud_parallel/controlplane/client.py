@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Awaitable, Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -33,6 +33,47 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 def pycloud_export(fn):
     fn.__pycloud_export__ = True
     return fn
+
+
+def _serialize_arrow_compatible(obj: Any) -> Dict[str, object]:
+    """序列化 Arrow 兼容对象为字典。
+
+    用于 Service Session 模式的 HTTP 调用。
+
+    Args:
+        obj: 要序列化的对象
+
+    Returns:
+        Dict[str, object]: 可 JSON 序列化的字典
+    """
+    # 快速路径：基本类型直接返回
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Arrow 兼容类型转换
+    try:
+        import pandas as pd
+        if isinstance(obj, pd.DataFrame):
+            return {"__type__": "DataFrame", "data": obj.to_dict(orient="records")}
+        if isinstance(obj, pd.Series):
+            return {"__type__": "Series", "data": obj.to_dict(), "name": obj.name}
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return {"__type__": "ndarray", "data": obj.tolist(), "dtype": str(obj.dtype)}
+    except ImportError:
+        pass
+
+    # 容器类型递归处理
+    if isinstance(obj, dict):
+        return {k: _serialize_arrow_compatible(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialize_arrow_compatible(item) for item in obj]
+
+    return obj
 
 
 def _get_local_ip() -> str:
@@ -3382,6 +3423,9 @@ class ServiceGroup:
         if not self.sessions:
             raise RuntimeError("no active service sessions")
 
+        # 序列化 Arrow 兼容对象
+        serialized_payload = _serialize_arrow_compatible(payload)
+
         tries = max(1, int(max_attempts or len(self.sessions)))
         excluded: Set[str] = set()
         last_error: Optional[Exception] = None
@@ -3595,9 +3639,12 @@ class _CallProxy:
         # 如果两者都有，使用新格式；否则保持向后兼容
         final_payload = payload if payload else kwargs
 
+        # 序列化 Arrow 兼容对象（DataFrame, Series, ndarray）
+        serialized_payload = _serialize_arrow_compatible(final_payload)
+
         _, resp = await self._group.acall_balanced(
             self._method,
-            final_payload,
+            serialized_payload,
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
@@ -3708,9 +3755,12 @@ class _SyncCallProxy:
         # 如果两者都有，使用新格式；否则保持向后兼容
         final_payload = payload if payload else kwargs
 
+        # 序列化 Arrow 兼容对象（DataFrame, Series, ndarray）
+        serialized_payload = _serialize_arrow_compatible(final_payload)
+
         _, resp = self._group.call_balanced(
             self._method,
-            final_payload,
+            serialized_payload,
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,

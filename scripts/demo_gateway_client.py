@@ -5,12 +5,49 @@ PyCloud Gateway 调用示例
 演示如何通过 controlplane 的 Gateway 按 service_name 调用服务。
 同一个脚本里同时展示：
 1. GatewayServiceClient：薄 HTTP helper
-2. GatewayModuleClient：module-like caller
+2. GatewayConnect：module-like caller
+
+前置条件：
+- 需要先部署名为 "square-service" 的服务
+- 可以运行 demo_gateway_complete.py 来自动部署和演示
+
+或者手动部署：
+```python
+from pycloud_parallel import DeployedService
+
+blob = (
+    b"def pycloud_export(fn):\n"
+    b"    fn.__pycloud_export__ = True\n"
+    b"    return fn\n\n"
+    b"@pycloud_export\n"
+    b"def square(payload):\n"
+    b"    x = int(payload.get('x', 0))\n"
+    b"    return {'x': x, 'y': x * x}\n"
+)
+
+group = DeployedService.deploy_from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    service_name="square-service",
+    blob=blob,
+    filename="square_service.py",
+)
+```
 """
 
 import asyncio
+import sys
 
-from pycloud_parallel.controlplane.client import GatewayModuleClient, GatewayServiceClient
+from pycloud_parallel import GatewayConnect
+
+
+def check_service_exists(gateway_target: str, service_name: str) -> bool:
+    """检查服务是否存在。"""
+    try:
+        with GatewayConnect(gateway_target, timeout_sec=5.0) as client:
+            status = client.get_status(service_name=service_name)
+            return status.get("route_count", 0) > 0
+    except Exception:
+        return False
 
 
 def main() -> None:
@@ -25,47 +62,66 @@ def main() -> None:
     print(f"  Service: {service_name}")
     print()
 
-    with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
-        print("[GatewayServiceClient]")
+    # 检查服务是否存在
+    if not check_service_exists(gateway_target, service_name):
+        print(f"✗ 服务 '{service_name}' 不存在")
+        print()
+        print("请先部署服务：")
+        print("  方式 1: 运行 python scripts/demo_gateway_complete.py")
+        print("  方式 2: 手动部署服务（参考脚本注释）")
+        print()
+        sys.exit(1)
+
+    print("[GatewayServiceClient]")
+    print("-" * 60)
+
+    with GatewayConnect(gateway_target, timeout_sec=10.0) as client:
         methods = client.list_methods(service_name=service_name, include_docs=False)
-        print("[+] Methods:")
+        print("可用方法:")
         for item in methods:
-            print(f"    - {item.get('method')}")
+            print(f"  - {item.get('method')}")
         print()
 
         status = client.get_status(service_name=service_name)
-        print(f"[+] Route count: {status.get('route_count')}")
+        print(f"路由数量: {status.get('route_count')}")
         for route in status.get("routes", []):
             print(
-                "    - "
+                "  - "
                 f"node={route.get('node_id')} "
-                f"service_id={route.get('service_id')} "
+                f"service_id={route.get('service_id')[:8]}... "
                 f"in_flight={route.get('in_flight')}"
             )
         print()
 
+        print("调用服务:")
         resp = client.call(
             service_name=service_name,
             method="square",
             payload={"x": 7},
             timeout_sec=10.0,
         )
-        print("[+] Call result:")
-        print(f"    {resp}")
+        print(f"  square(7) = {resp}")
 
     print()
-    print("[GatewayModuleClient]")
-    module_client = GatewayModuleClient(
+    print("[GatewayConnect]")
+    print("-" * 60)
+    module_client = GatewayConnect(
         gateway_target,
         service_name=service_name,
         timeout_sec=10.0,
     )
-    print(f"[+] Methods: {module_client.methods}")
-    print(f"[+] sync call: {module_client.square.sync(x=9)}")
+    print(f"可用方法: {module_client.methods}")
+    print()
+
+    print("同步调用:")
+    print(f"  square(9) = {module_client.square.sync(x=9)}")
+    print()
+
+    print("异步调用:")
 
     async def _run() -> None:
         result = await module_client.square(x=11)
-        print(f"[+] async call: {result}")
+        print(f"  square(11) = {result}")
 
     asyncio.run(_run())
 

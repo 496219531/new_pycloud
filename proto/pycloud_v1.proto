@@ -177,6 +177,7 @@ message ListServiceRoutesResponse {
 
 service NodeControlService {
   rpc UploadCode(stream UploadCodeRequest) returns (UploadCodeResponse);
+  rpc TaskStream(stream TaskStreamRequest) returns (stream TaskStreamResponse);
   rpc SubmitTasks(SubmitTasksRequest) returns (SubmitTasksResponse);
   rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
   rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
@@ -228,6 +229,7 @@ message TaskSubmitItem {
   google.protobuf.Struct payload = 2;
   int32 timeout_hint_sec = 3;
   int32 priority = 4;
+  string runtime_key = 5;
 }
 
 message SubmitTasksRequest {
@@ -280,6 +282,94 @@ message PullResultsResponse {
   repeated TaskResult results = 2;
   string next_cursor = 3;
   Error error = 4;
+}
+
+message TaskStreamOpen {
+  string client_id = 1;
+  string code_version = 2;
+  int32 result_limit = 3;
+  int32 result_wait_ms = 4;
+}
+
+message TaskStreamOpenAck {
+  string client_id = 1;
+  string code_version = 2;
+  int32 node_credit = 3;
+}
+
+message TaskStreamSubmit {
+  string request_id = 1;
+  string job_id = 2;
+  ExecutionMode execution_mode = 3;
+  repeated TaskSubmitItem tasks = 4;
+}
+
+message TaskStreamSubmitAck {
+  string request_id = 1;
+  string job_id = 2;
+  repeated TaskAccepted accepted = 3;
+  repeated TaskRejected rejected = 4;
+  int32 node_credit = 5;
+  Error error = 6;
+}
+
+message TaskStreamResultBatch {
+  repeated TaskResult results = 1;
+  string next_cursor = 2;
+  int32 node_credit = 3;
+}
+
+message TaskStreamCancelJob {
+  string request_id = 1;
+  string job_id = 2;
+  string reason = 3;
+}
+
+message TaskStreamCancelJobAck {
+  string request_id = 1;
+  string job_id = 2;
+  int32 queued_cancelled = 3;
+  int32 running_marked = 4;
+  int32 already_done = 5;
+  int32 not_found = 6;
+  Error error = 7;
+}
+
+message TaskStreamCreditUpdate {
+  int32 node_credit = 1;
+  int32 queued = 2;
+  int32 inflight = 3;
+  int32 running = 4;
+}
+
+message TaskStreamClose {
+  bool drain = 1;
+}
+
+message TaskStreamClosed {
+  string reason = 1;
+  int32 node_credit = 2;
+}
+
+message TaskStreamRequest {
+  oneof body {
+    TaskStreamOpen open = 1;
+    TaskStreamSubmit submit = 2;
+    TaskStreamCancelJob cancel_job = 3;
+    TaskStreamClose close = 4;
+  }
+}
+
+message TaskStreamResponse {
+  oneof body {
+    TaskStreamOpenAck open_ack = 1;
+    TaskStreamSubmitAck submit_ack = 2;
+    TaskStreamResultBatch result_batch = 3;
+    TaskStreamCancelJobAck cancel_job_ack = 4;
+    TaskStreamCreditUpdate credit_update = 5;
+    TaskStreamClosed closed = 6;
+    Error error = 7;
+  }
 }
 
 message CancelTasksRequest {

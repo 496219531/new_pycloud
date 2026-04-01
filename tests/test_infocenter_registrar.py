@@ -161,6 +161,58 @@ def test_infocenter_client_select_task_nodes_prefers_credit():
         info_server.stop()
 
 
+def test_infocenter_client_select_task_nodes_prefers_hot_runtime():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-cold-high-credit",
+                control_addr="127.0.0.1:50071",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            client.register_node(
+                node_id="node-hot-lower-credit",
+                control_addr="127.0.0.1:50072",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+
+            client.heartbeat_node(
+                node_id="node-cold-high-credit",
+                healthy=True,
+                metrics={"queued": 0, "inflight": 0, "running": 0, "credit": 10},
+                active_runtimes=["other-runtime"],
+            )
+            client.heartbeat_node(
+                node_id="node-hot-lower-credit",
+                healthy=True,
+                metrics={"queued": 1, "inflight": 1, "running": 1, "credit": 6},
+                active_runtimes=["runtime-hot", "other-runtime"],
+            )
+
+            selected = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    tags=["compute"],
+                    node_count=2,
+                    limit=10,
+                    require_credit=True,
+                    preferred_runtime_key="runtime-hot",
+                )
+            )
+            assert [node.node_id for node in selected] == ["node-hot-lower-credit", "node-cold-high-credit"]
+            assert selected[0].active_runtimes == ("runtime-hot", "other-runtime")
+    finally:
+        info_server.stop()
+
+
 def test_infocenter_client_select_task_nodes_accepts_explicit_node_ids():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
@@ -193,4 +245,84 @@ def test_infocenter_client_select_task_nodes_accepts_explicit_node_ids():
             )
             assert [node.node_id for node in selected] == ["node-b"]
     finally:
+        info_server.stop()
+
+
+def test_node_registrar_syncs_active_runtimes(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    node_state = NodeControlState(
+        node_id="node-reg-runtime-01",
+        queue_capacity=32,
+        worker_capacity=1,
+        runtime_slot_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_runtime"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+        executor_poll_interval_sec=0.02,
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_target,
+        node_id="node-reg-runtime-01",
+        control_addr="127.0.0.1:50081",
+        state=node_state,
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute", "task"],
+        version="test-v1",
+        fallback_heartbeat_sec=1,
+    )
+
+    try:
+        blob = (
+            b"import time\n"
+            b"def run(payload):\n"
+            b"    sleep_ms = int(payload.get('sleep_ms', 0))\n"
+            b"    if sleep_ms > 0:\n"
+            b"        time.sleep(sleep_ms / 1000.0)\n"
+            b"    return {'ok': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _ = node_state.put_code(
+            sha256=f"sha256:{digest}",
+            filename="runtime_registrar_demo.py",
+            runtime="py3.11",
+            entry_module="runtime_registrar_demo",
+            entry_callable="run",
+            chunks=[blob],
+        )
+        node_state.submit_tasks(
+            pb2.SubmitTasksRequest(
+                client_id="client-runtime-reg",
+                code_version=artifact.code_version,
+                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+                job_id="job-runtime-reg",
+                tasks=[
+                    pb2.TaskSubmitItem(
+                        task_id="runtime-reg-task-1",
+                        payload={"sleep_ms": 800},
+                        priority=1,
+                        runtime_key="runtime-hot-sync",
+                    )
+                ],
+            )
+        )
+
+        registrar.start()
+
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            assert _wait_until(
+                lambda: any(
+                    node.node_id == "node-reg-runtime-01" and "runtime-hot-sync" in node.active_runtimes
+                    for node in client.list_nodes(healthy_only=True, tags=["task"], limit=20)
+                ),
+                timeout_sec=6.0,
+            )
+    finally:
+        registrar.close()
+        node_state.close()
         info_server.stop()

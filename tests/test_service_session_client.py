@@ -156,6 +156,64 @@ def test_nodecontrol_client_task_helpers_roundtrip(tmp_path):
         state.close()
 
 
+def test_nodecontrol_client_task_stream_roundtrip(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-task-stream-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_stream"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"def run(payload):\n"
+            b"    value = int(payload.get('value', 0))\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            upload = client.upload_code_from_bytes(
+                client_id="task-stream-client",
+                filename="task_stream_demo.py",
+                blob=blob,
+                runtime="py3.11",
+                entry_module="task_stream_demo",
+                entry_callable="run",
+            )
+            with client.open_task_stream(
+                client_id="task-stream-client",
+                code_version=upload.code_version,
+                result_limit=10,
+                result_wait_ms=100,
+            ) as stream:
+                submit = stream.submit_tasks(
+                    [
+                        pb2.TaskSubmitItem(task_id="stream-task-1", payload={"value": 2}, priority=1, runtime_key="demo-runtime"),
+                        pb2.TaskSubmitItem(task_id="stream-task-2", payload={"value": 3}, priority=1, runtime_key="demo-runtime"),
+                    ],
+                    job_id="job-stream-demo",
+                )
+                assert [item.task_id for item in submit.accepted] == ["stream-task-1", "stream-task-2"]
+
+                cancel = stream.cancel_job(job_id="job-stream-demo", reason="stream cancel")
+                assert cancel.queued_cancelled == 2
+                assert cancel.running_marked == 0
+
+                pulled = stream.pull_results(limit=10, wait_ms=500)
+                assert sorted(item.task_id for item in pulled.results) == ["stream-task-1", "stream-task-2"]
+                assert {item.job_id for item in pulled.results} == {"job-stream-demo"}
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
 def test_task_batch_client_from_infocenter_roundtrip(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)

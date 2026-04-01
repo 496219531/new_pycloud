@@ -7,11 +7,11 @@ PyCloud Gateway module-like caller 示例。
 
 import asyncio
 
-from pycloud_parallel.controlplane.client import GatewayModuleClient
+from pycloud_parallel import GatewayConnect
 
 
 def main() -> None:
-    client = GatewayModuleClient(
+    client = GatewayConnect(
         "127.0.0.1:50051",
         service_name="square-service",
         timeout_sec=10.0,

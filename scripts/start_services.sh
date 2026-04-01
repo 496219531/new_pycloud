@@ -255,9 +255,10 @@ case "${1:-start}" in
             fi
         }
 
-        check_service "controlplane" "pycloud_parallel.controlplane.server --role controlplane"
-        check_service "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1"
-        check_service "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2"
+        overall_status=0
+        check_service "controlplane" "pycloud_parallel.controlplane.server --role controlplane" || overall_status=$?
+        check_service "node-1" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE1_PORT --node-id node-1" || overall_status=$?
+        check_service "node-2" "pycloud_parallel.controlplane.server --role nodecontrol --bind 0.0.0.0:$NODE2_PORT --node-id node-2" || overall_status=$?
 
         echo ""
         echo "  Loaded Services By Node"
@@ -295,6 +296,7 @@ else:
 PY
 
         echo ""
+        exit $overall_status
         ;;
 
     logs)

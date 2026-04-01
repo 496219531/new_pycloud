@@ -44,6 +44,8 @@ def _normalize_user_return(ret: Any) -> Tuple[str, Optional[dict], str, str]:
 
     if isinstance(ret, tuple) and len(ret) == 4:
         status_text, result, err_type, err_message = ret
+        # 序列化返回值中的 Arrow 对象
+        result = _serialize_result_for_json(result)
         return _normalize_status(status_text), result, str(err_type), str(err_message)
 
     if isinstance(ret, dict) and "status" in ret:
@@ -51,11 +53,66 @@ def _normalize_user_return(ret: Any) -> Tuple[str, Optional[dict], str, str]:
         result = ret.get("result")
         err_type = str(ret.get("error_type", ""))
         err_message = str(ret.get("error_message", ""))
+        # 序列化返回值中的 Arrow 对象
+        result = _serialize_result_for_json(result)
         return status_text, result, err_type, err_message
 
     if isinstance(ret, dict):
+        # 序列化返回值中的 Arrow 对象
+        ret = _serialize_result_for_json(ret)
         return "SUCCEEDED", ret, "", ""
+    # 序列化返回值中的 Arrow 对象
+    ret = _serialize_result_for_json(ret)
     return "SUCCEEDED", {"value": ret}, "", ""
+
+
+def _serialize_result_for_json(obj: Any) -> Any:
+    """序列化返回值中的 Arrow 对象和 numpy 类型，使其可被 JSON 序列化。
+
+    Args:
+        obj: 用户函数返回值
+
+    Returns:
+        可 JSON 序列化的对象
+    """
+    # 处理 None
+    if obj is None:
+        return None
+
+    # 处理基本类型
+    if isinstance(obj, (str, int, float, bool)):
+        # 转换 numpy 标量类型为 Python 原生类型
+        if hasattr(obj, 'item'):
+            return obj.item()
+        return obj
+
+    # 处理 Arrow 兼容类型
+    try:
+        import pandas as pd
+        if isinstance(obj, pd.DataFrame):
+            return {"__type__": "DataFrame", "data": obj.to_dict(orient="records")}
+        if isinstance(obj, pd.Series):
+            return {"__type__": "Series", "data": obj.to_dict(), "name": obj.name}
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return {"__type__": "ndarray", "data": obj.tolist(), "dtype": str(obj.dtype)}
+        # 转换 numpy 标量类型
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+    except ImportError:
+        pass
+
+    # 处理容器类型
+    if isinstance(obj, dict):
+        return {k: _serialize_result_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialize_result_for_json(item) for item in obj]
+
+    return obj
 
 
 _ROUTER_CACHE_LOCK = threading.Lock()
@@ -347,6 +404,44 @@ def _discover_callable_methods(
         )
 
 
+def _validate_arrow_compatible(obj: Any) -> None:
+    """验证对象是否 Arrow 兼容，如果不兼容则抛出错误。
+
+    Args:
+        obj: 要验证的对象
+
+    Raises:
+        TypeError: 如果对象不 Arrow 兼容
+    """
+    # 基本类型
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return
+
+    # 容器类型
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            _validate_arrow_compatible(item)
+        return
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            _validate_arrow_compatible(key)
+            _validate_arrow_compatible(value)
+        return
+
+    # Arrow 兼容类型
+    if is_arrow_compatible(obj):
+        return
+
+    # 不支持的类型
+    raise TypeError(
+        f"Type {type(obj).__name__} is not supported in PyCloud. "
+        f"Supported types: basic types (str, int, float, bool, None), "
+        f"list, tuple, dict, pd.DataFrame, pd.Series, np.ndarray (basic dtypes only). "
+        f"For complex objects, please convert to JSON or use external storage."
+    )
+
+
 def _invoke_user_callable(fn, payload: dict):
     """调用用户函数，支持多种参数传递方式。
 
@@ -355,6 +450,11 @@ def _invoke_user_callable(fn, payload: dict):
     2. {"args": [...]} - 只有位置参数，kwargs 为空
     3. {"kwargs": {...}} - 只有命名参数，args 为空
     4. {"key": value, ...} - HTTP 风格，直接作为 kwargs
+
+    Arrow 兼容类型自动转换：
+    - DataFrame → dict (JSON records)
+    - Series → dict
+    - ndarray → list
     """
     try:
         signature = inspect.signature(fn)
@@ -374,6 +474,15 @@ def _invoke_user_callable(fn, payload: dict):
             # 纯净的 args/kwargs 格式
             args = payload.get("args", [])
             kwargs = payload.get("kwargs", {})
+
+            # 验证 Arrow 兼容性
+            _validate_arrow_compatible(args)
+            _validate_arrow_compatible(kwargs)
+
+            # 反序列化 Arrow 对象
+            args = convert_dict_to_arrow(args)
+            kwargs = convert_dict_to_arrow(kwargs)
+
             # 确保 args 是列表类型
             if not isinstance(args, list):
                 args = list(args) if args else []
@@ -385,15 +494,9 @@ def _invoke_user_callable(fn, payload: dict):
     # HTTP 风格：整个 payload 作为 kwargs
     # 这样服务端可以用 def square(**payload) 或 def square(x) 接收
     if isinstance(payload, dict):
-        return fn(**payload)
-
-    # 其他情况：直接传递 payload
-    return fn(payload)
-
-    # HTTP 风格：整个 payload 作为 kwargs
-    # 这样服务端可以用 def square(**payload) 或 def square(x) 接收
-    if isinstance(payload, dict):
-        return fn(**payload)
+        # 反序列化 Arrow 对象
+        deserialized = convert_dict_to_arrow(payload)
+        return fn(**deserialized)
 
     # 其他情况：直接传递 payload
     return fn(payload)
@@ -471,28 +574,140 @@ def ts_to_dt(ts: timestamp_pb2.Timestamp) -> datetime:
 def struct_to_dict(data: struct_pb2.Struct) -> dict:
     """将 protobuf Struct 转换为字典。
 
+    自动将标记为 DataFrame/Series 的字典转换回原始对象。
+
     Args:
         data: protobuf Struct 对象
 
     Returns:
-        dict: 转换后的字典
+        dict: 转换后的字典，DataFrame/Series 自动还原
     """
-    return json_format.MessageToDict(data, preserving_proto_field_name=True)
+    result = json_format.MessageToDict(data, preserving_proto_field_name=True)
+    return convert_dict_to_arrow(result)
+
+
+def convert_dict_to_arrow(data: Any) -> Any:
+    """将字典转换回 Arrow 对象。
+
+    Args:
+        data: 字典或特殊标记的对象
+
+    Returns:
+        还原后的对象（DataFrame/Series/ndarray）
+    """
+    if isinstance(data, dict):
+        # 检查类型标记
+        obj_type = data.get("__type__")
+        if obj_type == "DataFrame":
+            try:
+                import pandas as pd
+                return pd.DataFrame(data["data"])
+            except ImportError:
+                raise RuntimeError("pandas not available, cannot deserialize DataFrame")
+        elif obj_type == "Series":
+            try:
+                import pandas as pd
+                return pd.Series(data["data"], name=data.get("name"))
+            except ImportError:
+                raise RuntimeError("pandas not available, cannot deserialize Series")
+        elif obj_type == "ndarray":
+            try:
+                import numpy as np
+                return np.array(data["data"], dtype=data.get("dtype"))
+            except ImportError:
+                raise RuntimeError("numpy not available, cannot deserialize ndarray")
+
+        # 递归处理嵌套字典
+        return {k: convert_dict_to_arrow(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [convert_dict_to_arrow(item) for item in data]
+    else:
+        return data
 
 
 def dict_to_struct(data: Optional[dict]) -> struct_pb2.Struct:
     """将字典转换为 protobuf Struct。
 
+    自动处理 Arrow 兼容类型（DataFrame, Series）。
+
     Args:
-        data: 输入字典
+        data: 输入字典或 Arrow 兼容对象
 
     Returns:
         struct_pb2.Struct: protobuf Struct 对象
     """
     out = struct_pb2.Struct()
     if data:
+        # 处理 Arrow 兼容对象
+        if is_arrow_compatible(data):
+            data = convert_arrow_to_dict(data)
         out.update(data)
     return out
+
+
+def is_arrow_compatible(obj: Any) -> bool:
+    """检查对象是否 Arrow 兼容。
+
+    Arrow 兼容类型可以直接转换为 dict 格式：
+    - pd.DataFrame
+    - pd.Series
+    - np.ndarray (基础类型)
+    - 以及嵌套结构
+
+    Args:
+        obj: 要检查的对象
+
+    Returns:
+        bool: 是否 Arrow 兼容
+    """
+    # 检查 pandas
+    try:
+        import pandas as pd
+        if isinstance(obj, (pd.DataFrame, pd.Series)):
+            return True
+    except ImportError:
+        pass
+
+    # 检查 numpy array
+    try:
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            # 只支持基础类型数组
+            return obj.dtype.kind in ('i', 'u', 'f', 'b', 'U', 'S')
+    except ImportError:
+        pass
+
+    return False
+
+
+def convert_arrow_to_dict(obj: Any) -> dict:
+    """将 Arrow 兼容对象转换为字典。
+
+    Args:
+        obj: Arrow 兼容对象（DataFrame, Series, ndarray）
+
+    Returns:
+        dict: 可序列化的字典
+    """
+    try:
+        import pandas as pd
+        if isinstance(obj, pd.DataFrame):
+            # 转换为 JSON records 格式（HTTP 兼容）
+            return {"__type__": "DataFrame", "data": obj.to_dict(orient="records")}
+        if isinstance(obj, pd.Series):
+            return {"__type__": "Series", "data": obj.to_dict(), "name": obj.name}
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            # 转换为 list（HTTP 兼容）
+            return {"__type__": "ndarray", "data": obj.tolist(), "dtype": str(obj.dtype)}
+    except ImportError:
+        pass
+
+    raise TypeError(f"Cannot convert {type(obj)} to dict: not Arrow compatible")
 
 
 @dataclass

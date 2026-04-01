@@ -68,6 +68,7 @@ class NodeInfoCenterRegistrar:
             version=self.version,
             metadata=self.metadata,
             services=self.state.service_reports(),
+            active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
         )
@@ -89,6 +90,7 @@ class NodeInfoCenterRegistrar:
                 "mem_percent": 0.0,
             },
             services=self.state.service_reports(),
+            active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
         )

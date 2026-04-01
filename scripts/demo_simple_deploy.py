@@ -5,7 +5,7 @@ PyCloud 简化部署示例
 展示使用默认值简化服务部署。
 """
 import time
-from pycloud_parallel.controlplane.client import ServiceModuleGroup
+from pycloud_parallel import DeployedService
 
 
 def main():
@@ -15,8 +15,7 @@ def main():
         b"    fn.__pycloud_export__ = True\n"
         b"    return fn\n\n"
         b"@pycloud_export\n"
-        b"def square(payload):\n"
-        b"    x = int(payload.get('x', 0))\n"
+        b"def square(x):\n"
         b"    return {'x': x, 'y': x * x}\n"
     )
 
@@ -30,7 +29,7 @@ def main():
         # 方式 1：完全不提供 service_name 和 owner_client_id
         print("方式 1：使用所有默认值")
         print("-" * 60)
-        group1 = ServiceModuleGroup.deploy_from_infocenter(
+        group1 = DeployedService.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             # service_name 和 owner_client_id 会自动生成
             blob=blob,
@@ -47,7 +46,7 @@ def main():
         # 方式 2：只提供 entry_module，自动生成 service_name
         print("方式 2：提供 entry_module")
         print("-" * 60)
-        group2 = ServiceModuleGroup.deploy_from_infocenter(
+        group2 = DeployedService.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             # entry_module 会用于生成 service_name
             blob=blob,
@@ -62,7 +61,7 @@ def main():
         # 方式 3：只提供 owner_client_id，使用默认 service_name
         print("方式 3：只提供 owner_client_id")
         print("-" * 60)
-        group3 = ServiceModuleGroup.deploy_from_infocenter(
+        group3 = DeployedService.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             owner_client_id="my-custom-client",  # 自定义 owner
             blob=blob,
@@ -79,7 +78,7 @@ def main():
         print("方式 4：只提供 service_name")
         print("-" * 60)
         custom_name = f"my-custom-service-{int(time.time())}"
-        group4 = ServiceModuleGroup.deploy_from_infocenter(
+        group4 = DeployedService.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             service_name=custom_name,  # 自定义 service_name
             blob=blob,

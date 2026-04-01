@@ -2,128 +2,128 @@
 
 ## 1. 当前边界
 
-当前实现收敛为三条明确链路：
+当前实现收敛为三条链路：
 
 1. `ControlPlane(InfoCenter + Gateway) = HTTP + JSON`
-2. `NodeControl 管理面/任务面 = gRPC`
-3. `NodeControl 服务内部数据面 = HTTP + JSON`
+2. `NodeControl 管理面与任务面 = gRPC`
+3. `NodeControl 服务实例数据面 = HTTP + JSON`
 
-对应职责：
+默认部署建议：
 
-1. `ControlPlane / InfoCenter`
-   - 节点注册
-   - 节点心跳
-   - 服务路由聚合
-   - 简单运维状态
-2. `ControlPlane / Gateway`
-   - 对外稳定服务调用入口
-   - `service_name -> route` 缓存
-   - 失败实例切换
-3. `NodeControl`
-   - 工程包上传
-   - 代码缓存
-   - 任务执行
-   - 服务实例生命周期
-4. `Caller Client`
-   - 直接调 `ControlPlane Gateway`
-   - 必要时查询路由事实
+1. 一个 `controlplane` 进程
+2. 多个 `nodecontrol` 进程
 
-对 Python 调用方，当前已提供 `GatewayServiceClient` 作为薄封装。
-
-## 2. 角色定义
+## 2. 角色
 
 ### 2.1 owner client
 
 负责：
 
-1. 创建服务
+1. 上传代码并创建服务
 2. 持有 `service_token`
-3. 进入长驻态并持续心跳
-4. 正常退出时发 `EndService`
+3. 长驻并维持心跳
+4. 正常退出时 `EndService`
 
-推荐 owner 侧路径：
-
-1. 部署服务
-2. `deploy_from_infocenter(...)` 返回后 keepalive 已自动启动
-3. 做少量预热调用
-4. `group.join(...)`
-5. `Ctrl+C` 自动结束服务
+推荐入口：`DeployedService.deploy_from_infocenter(...)`
 
 ### 2.2 caller client
 
 负责：
 
-1. 调 `ControlPlane Gateway`
-2. 以 `service_name` 作为发现键调用服务方法
-3. 必要时可查 `service_name` 对应的 route 事实
+1. 按 `service_name` 调用已有服务
+2. 不拥有服务生命周期
+3. 不持有 owner token
 
-它不持有 owner 权限，也不负责服务生命周期。
+推荐入口：
 
-### 2.4 Python client 分层
-
-当前 Python client 可以分成几类：
-
-1. `InfoCenterClient`
-   - 查节点 / 查 route / 任务选点
+1. `GatewayConnect`
 2. `GatewayServiceClient`
-   - 走 Gateway 的薄调用 client
-3. `GatewayModuleClient`
-   - 走 Gateway 的 module-like caller
-4. `DiscoveryServiceClient`
-   - 客户端侧服务发现 + 本地 route cache + 直连实例
-5. `DiscoveryModuleClient`
-   - Discovery 风格的 module-like caller
-6. `ServiceModuleGroup`
-   - owner / deploy 侧的 module-like group
-   - 推荐用 `join()` 长驻
-7. `NodeControlClient`
-   - 底层 gRPC 管理与任务 client
-8. `TaskBatchClient`
-   - 任务模式 helper
+3. `DirectConnect`（调试或旁路直连）
 
 ### 2.3 task client
 
 负责：
 
 1. 上传任务代码
-2. 选节点
-3. 提交任务
-4. 拉取结果
-5. 取消任务或取消一批任务
+2. 从 `InfoCenter` 取节点事实
+3. 向目标 `NodeControl` 建立任务流
+4. 提交任务并接收结果
+
+推荐入口：
+
+1. `TaskSubmitter`
+2. `TaskBatchClient`
+3. 低层：`NodeControlClient.open_task_stream(...)`
 
 ## 3. 服务模式
 
-### 3.1 命名语义
-
-1. `service_name` 是逻辑服务名，也是对外发现主键。
-2. `service_id` 是某个实例的内部唯一标识。
-3. 一个 `service_name` 可以对应多个 route，表示同一逻辑服务的多个实例/副本。
-4. 不兼容“不同客户端注册同名但语义不同”的场景，命名唯一性由客户端自己保证。
-
-### 3.2 调用语义
+服务模式当前是“模块 + 多函数导出”模型：
 
 1. 上传支持 `py / tar.gz / zip / whl`
 2. 注册时指定 `entry_module + export_spec`
-3. 服务方法通过 `method_name -> callable` 路由
-4. 对外推荐调用路径是 `ControlPlane Gateway HTTP + JSON`
-5. 节点内部实际执行入口仍是 `NodeControl` 上的 `service_id` 级别 HTTP
+3. 导出模式：`decorator / explicit / all / single`
+4. 默认推荐 `decorator + pycloud_export`
+5. 调用路由为 `service_name -> route -> service_id -> method`
+
+对外推荐入口：
+
+1. `POST /svc/{service_name}/call/{method}`
+2. `GET /svc/{service_name}/methods`
+3. `GET /svc/{service_name}/status`
 
 ## 4. 任务模式
 
-### 4.1 当前模型
+### 4.1 通信模型
 
-1. 任务模式仍然走 `NodeControl gRPC`
-2. 不引入 task-client heartbeat
-3. 节点内使用本地多进程共享执行池
-4. 结果当前保存在内存中，不做持久化
+任务模式当前已经从“批量提交 + 轮询”收敛为“流式入口 + 高层 helper”：
 
-### 4.2 标识语义
+1. gRPC 协议包含 `TaskStream`
+2. `TaskBatchClient` / `TaskSubmitter` 内部已经走任务流
+3. 低层 `SubmitTasks / PullResults / CancelJob` 仍保留
 
-1. `task_id` 是单个任务的唯一标识
-2. `job_id` 是一批任务的分组标识
-3. `job_id` 不是 session，也不需要心跳
+### 4.2 节点内执行模型
 
-## 5. 设计取向
+节点内部不是简单共享池，而是 runtime slot 模型：
+
+1. 任务可带 `runtime_key`
+2. `runtime_key` 绑定到节点内 runtime slot
+3. 每个 slot 复用单进程 worker
+4. 同一 slot 内尽量少切代码
+5. 节点只保留前 `K` 个活跃 slot
+6. 空闲 slot 超过 `idle TTL` 自动回收
+
+### 4.3 热点路由
+
+任务选点目标不是单纯均衡 credit，而是：
+
+1. 尽量少切代码
+2. 尽量让热代码持续热
+3. 同时避免把某个 node 撑爆
+
+因此：
+
+1. 节点会向 `InfoCenter` 心跳上报 `active_runtimes`
+2. `InfoCenter.select_task_nodes(...)` 支持 `preferred_runtime_key`
+3. `TaskBatchClient.from_infocenter(...)` 会优先选择热点 node
+
+### 4.4 结果与生命周期
+
+1. 结果当前保存在节点内存中
+2. 不做持久化
+3. `job_id` 是分组键，不是 heartbeat session
+4. 任务模式没有 Gateway
+5. 任务 client 不需要服务模式那种长驻 keepalive
+
+## 5. ControlPlane
+
+`ControlPlane` 默认是 `InfoCenter + Gateway` 同进程：
+
+1. `InfoCenter` 维护节点与服务事实
+2. `Gateway` 维护 route cache
+3. 同进程时不需要本机网络回环
+4. 也支持单独起 `infocenter` 和 `gateway`
+
+## 6. 设计取向
 
 当前优先级是：
 
@@ -134,35 +134,7 @@
 
 因此当前刻意不做：
 
-1. InfoCenter 内建调度器
-2. InfoCenter 代理任务和服务调用
-3. 复杂的任务会话模型
-4. 复杂的内建鉴权中心
-
-## 6. 部署形态
-
-### 6.1 默认形态
-
-默认推荐：
-
-1. 一个 `controlplane` 进程
-2. 多个 `nodecontrol` 进程
-
-也就是：
-
-1. `InfoCenter` 和 `Gateway` 同进程
-2. Gateway 直接共享 `InfoCenterState`
-3. 不走 `Gateway -> InfoCenter` 的本机网络回环
-
-### 6.2 可选形态
-
-如果需要，也支持：
-
-1. 单独启动 `infocenter`
-2. 单独启动 `gateway`
-
-此时：
-
-1. Gateway 仍保留本地 `GatewayRouteCache`
-2. Gateway 通过 `InfoCenter HTTP + JSON` 拉取 route
-3. 不会每次请求都查 InfoCenter，而是走缓存、失败刷新和后台刷新
+1. `InfoCenter` 内建复杂调度器
+2. `InfoCenter` 代理任务执行
+3. 任务结果持久化系统
+4. 复杂鉴权中心

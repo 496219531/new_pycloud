@@ -162,6 +162,80 @@ def test_internal_executor_runs_tasks_without_external_worker(tmp_path):
         state.close()
 
 
+def test_internal_executor_runtime_slots_queue_and_reclaim(tmp_path):
+    state = NodeControlState(
+        node_id="node-test-runtime-slot-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        runtime_slot_capacity=1,
+        runtime_slot_idle_ttl_sec=1,
+        artifact_dir=str(tmp_path / "code_cache_runtime_slot"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        blob = (
+            b"import time\n"
+            b"def run(payload):\n"
+            b"    sleep_ms = int(payload.get('sleep_ms', 0))\n"
+            b"    if sleep_ms > 0:\n"
+            b"        time.sleep(sleep_ms / 1000.0)\n"
+            b"    value = int(payload.get('value', 0))\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _ = state.put_code(
+            sha256=f"sha256:{digest}",
+            filename="runtime_slot_demo.py",
+            runtime="py3.11",
+            entry_module="runtime_slot_demo",
+            entry_callable="run",
+            chunks=[blob],
+        )
+        code_version = artifact.code_version
+        accepted, rejected, _ = state.submit_tasks(
+            pb2.SubmitTasksRequest(
+                client_id="client-slot",
+                code_version=code_version,
+                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+                tasks=[
+                    pb2.TaskSubmitItem(task_id="slot-a-1", payload={"value": 2, "sleep_ms": 40}, priority=1, runtime_key="rt-a"),
+                    pb2.TaskSubmitItem(task_id="slot-a-2", payload={"value": 3, "sleep_ms": 40}, priority=1, runtime_key="rt-a"),
+                    pb2.TaskSubmitItem(task_id="slot-b-1", payload={"value": 4, "sleep_ms": 40}, priority=1, runtime_key="rt-b"),
+                ],
+            )
+        )
+        assert len(accepted) == 3
+        assert not rejected
+
+        time.sleep(0.1)
+        with state._lock:  # noqa: SLF001
+            assert "rt-a" in state._runtime_slots  # noqa: SLF001
+            assert "rt-b" in state._runtime_slots  # noqa: SLF001
+            assert state._runtime_slots["rt-a"].executor is not None  # noqa: SLF001
+            assert state._runtime_slots["rt-b"].executor is None  # noqa: SLF001
+
+        deadline = time.time() + 10
+        cursor = ""
+        results = []
+        while time.time() < deadline and len(results) < 3:
+            batch, cursor = state.pull_results(
+                pb2.PullResultsRequest(client_id="client-slot", limit=10, wait_ms=200, cursor=cursor)
+            )
+            results.extend(batch)
+
+        assert len(results) == 3
+        assert {item.status for item in results} == {pb2.TASK_STATUS_SUCCEEDED}
+
+        time.sleep(1.3)
+        with state._lock:  # noqa: SLF001
+            active_slots = [slot for slot in state._runtime_slots.values() if slot.executor is not None]  # noqa: SLF001
+        assert active_slots == []
+    finally:
+        state.close()
+
+
 def test_cancel_job_marks_matching_tasks(tmp_path):
     state = NodeControlState(
         node_id="node-test-cancel-job",

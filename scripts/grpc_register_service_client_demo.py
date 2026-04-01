@@ -8,8 +8,7 @@ def main():
         b"    fn.__pycloud_export__ = True\n"
         b"    return fn\n\n"
         b"@pycloud_export\n"
-        b"def square(payload):\n"
-        b"    x = int(payload.get('x', 0))\n"
+        b"def square(x):\n"
         b"    return {'x': x, 'y': x * x}\n"
     )
 
@@ -17,7 +16,7 @@ def main():
     group = ServiceGroup.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"client-owner-{suffix}",
-        service_name=f"square-service-{suffix}",
+        service_name=f"square-service",
         blob=blob,
         filename="square_service.py",
         runtime="py3.11",

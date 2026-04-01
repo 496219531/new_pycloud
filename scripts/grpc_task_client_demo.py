@@ -4,9 +4,10 @@
 
 演示：
 1. 上传任务代码
-2. 带 job_id 提交一批任务
-3. 拉取结果
+2. 建立多节点流式任务会话
+3. 带 runtime_key 提交一批任务
 4. 用 CancelJob 取消另一批任务
+5. 等待流式回传结果
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ def main() -> None:
     client_id = f"task-demo-{int(time.time())}"
     run_job_id = f"job-run-{int(time.time())}"
     cancel_job_id = f"job-cancel-{int(time.time())}"
+    runtime_key = "demo-runtime-v1"
 
     blob = (
         b"def run(payload):\n"
@@ -71,17 +73,17 @@ def main() -> None:
 
         submit = batch.submit_tasks(
             [
-                pb2.TaskSubmitItem(task_id=f"{run_job_id}-1", payload={"value": 2}, priority=1),
-                pb2.TaskSubmitItem(task_id=f"{run_job_id}-2", payload={"value": 3, "should_fail": True}, priority=1),
+                pb2.TaskSubmitItem(task_id=f"{run_job_id}-1", payload={"value": 2}, priority=1, runtime_key=runtime_key),
+                pb2.TaskSubmitItem(task_id=f"{run_job_id}-2", payload={"value": 3, "should_fail": True}, priority=1, runtime_key=runtime_key),
             ],
             job_id=run_job_id,
         )
-        print(f"[2] 已提交运行批次 job_id={run_job_id}, accepted={len(submit.accepted)}")
+        print(f"[2] 已提交运行批次 job_id={run_job_id}, runtime_key={runtime_key}, accepted={len(submit.accepted)}")
 
         cancel_submit = batch.submit_tasks(
             [
-                pb2.TaskSubmitItem(task_id=f"{cancel_job_id}-1", payload={"value": 10, "sleep_ms": 3000}, priority=1),
-                pb2.TaskSubmitItem(task_id=f"{cancel_job_id}-2", payload={"value": 11, "sleep_ms": 3000}, priority=1),
+                pb2.TaskSubmitItem(task_id=f"{cancel_job_id}-1", payload={"value": 10, "sleep_ms": 3000}, priority=1, runtime_key=runtime_key),
+                pb2.TaskSubmitItem(task_id=f"{cancel_job_id}-2", payload={"value": 11, "sleep_ms": 3000}, priority=1, runtime_key=runtime_key),
             ],
             execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
             job_id=cancel_job_id,

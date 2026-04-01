@@ -6,7 +6,7 @@ PyCloud 模块化客户端示例
 """
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import ServiceModuleGroup
+from pycloud_parallel import DeployedService
 
 
 def main():
@@ -16,12 +16,12 @@ def main():
         b"    fn.__pycloud_export__ = True\n"
         b"    return fn\n\n"
         b"@pycloud_export\n"
-        b"def square(payload):\n"
-        b"    x = int(payload.get('x', 0))\n"
+        b"def square(**payload):\n"
+        b"    x = payload.get('x', 0)\n"
         b"    return {'x': x, 'y': x * x}\n\n"
         b"@pycloud_export\n"
-        b"def fibonacci(payload):\n"
-        b"    n = int(payload.get('n', 0))\n"
+        b"def fibonacci(**payload):\n"
+        b"    n = payload.get('n', 0)\n"
         b"    if n <= 1:\n"
         b"        return n\n"
         b"    a, b = 0, 1\n"
@@ -29,9 +29,9 @@ def main():
         b"        a, b = b, a + b\n"
         b"    return {'n': n, 'result': b}\n\n"
         b"@pycloud_export\n"
-        b"def slow_add(payload):\n"
-        b"    a = int(payload.get('a', 0))\n"
-        b"    b = int(payload.get('b', 0))\n"
+        b"def slow_add(**payload):\n"
+        b"    a = payload.get('a', 0)\n"
+        b"    b = payload.get('b', 0)\n"
         b"    import time\n"
         b"    time.sleep(0.1)\n"
         b"    return {'a': a, 'b': b, 'result': a + b}\n"
@@ -43,9 +43,9 @@ def main():
     print("=" * 60)
     print()
 
-    # 使用 ServiceModuleGroup 代替 ServiceGroup
+    # 使用 DeployedService 代替 ServiceGroup
     import time
-    group = ServiceModuleGroup.deploy_from_infocenter(
+    group = DeployedService.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"module-demo-{int(time.time())}",
         service_name=f"compute-service-{int(time.time())}",

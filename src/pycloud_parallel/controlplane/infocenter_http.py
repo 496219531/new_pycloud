@@ -64,6 +64,8 @@ def _serialize_node(state) -> Dict[str, object]:
         "inflight": int(state.metrics.inflight),
         "running": int(state.metrics.running),
         "credit": int(state.metrics.credit),
+        "active_runtimes": list(state.active_runtimes),
+        "active_runtime_count": int(state.active_runtime_count()),
         "cpu_percent": float(state.metrics.cpu_percent),
         "mem_percent": float(state.metrics.mem_percent),
         "tags": list(state.tags),
@@ -82,6 +84,7 @@ def _render_ops_page(state: InfoCenterState) -> str:
     rows: List[str] = []
     for node in nodes:
         loaded = ", ".join(sorted({svc.service_name for svc in node.services.values()})) or "-"
+        active_runtimes = ", ".join(node.active_runtimes[:10]) or "-"
         rows.append(
             "<tr>"
             f"<td>{html.escape(node.node_id)}</td>"
@@ -89,6 +92,7 @@ def _render_ops_page(state: InfoCenterState) -> str:
             f"<td>{'yes' if node.healthy else 'no'}</td>"
             f"<td>{'yes' if node.schedulable else 'no'}</td>"
             f"<td>{'yes' if node.drain else 'no'}</td>"
+            f"<td>{html.escape(active_runtimes)}</td>"
             f"<td>{node.service_worker_capacity}</td>"
             f"<td>{node.service_worker_used}</td>"
             f"<td>{node.service_worker_available()}</td>"
@@ -111,7 +115,7 @@ def _render_ops_page(state: InfoCenterState) -> str:
         "<h1>InfoCenter Ops</h1>"
         "<table><thead><tr>"
         "<th>node_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th>"
-        "<th>svc cap</th><th>svc used</th><th>svc avail</th><th>loaded services</th><th>reason</th><th>actions</th>"
+        "<th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>loaded services</th><th>reason</th><th>actions</th>"
         "</tr></thead><tbody>"
         f"{body}"
         "</tbody></table></body></html>"
@@ -159,6 +163,7 @@ class InfoCenterHttpServer:
                         version=str(payload.get("version", "") or ""),
                         metadata=dict(payload.get("metadata") or {}),
                         services=_parse_services(payload.get("services")),
+                        active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
                         service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                     )
@@ -181,6 +186,7 @@ class InfoCenterHttpServer:
                             mem_percent=float(metrics_raw.get("mem_percent", 0.0) or 0.0),
                         ),
                         services=_parse_services(payload.get("services")),
+                        active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
                         service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                     )

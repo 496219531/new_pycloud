@@ -1,46 +1,19 @@
-# ServiceModuleGroup
+# ServiceModuleGroup / DeployedService
 
-`ServiceModuleGroup` 是 `ServiceGroup` 的薄封装，让远程服务更像本地 Python 模块来调用。
+`DeployedService` 是 `ServiceModuleGroup` 的推荐别名。
 
-## 1. 核心体验
+它面向 owner 侧，职责是：
 
-### 1.1 异步调用
+1. 部署服务
+2. 持有 `service_token`
+3. 自动 keepalive
+4. 需要时 `join()` 长驻
+5. 正常退出时 `EndService`
 
-```python
-result = await group.square(x=7)
-```
-
-### 1.2 同步调用
-
-```python
-result = group.square.sync(x=7)
-```
-
-### 1.3 广播调用
+## 1. 基本用法
 
 ```python
-results = await group.square.broadcast(x=7)
-```
-
-### 1.4 通用接口
-
-```python
-result = await group.call("square", x=7)
-result = group.call_sync("square", x=7)
-```
-
-## 2. 适合的场景
-
-它适合这类服务：
-
-1. 一个模块导出多个函数。
-2. 希望调用体验接近本地模块。
-3. 希望保留多节点部署、owner 长驻、熔断器和节点均衡能力。
-
-## 3. 基本示例
-
-```python
-from pycloud_parallel.controlplane.client import ServiceModuleGroup
+from pycloud_parallel import DeployedService
 
 blob = (
     b"def pycloud_export(fn):\n"
@@ -52,9 +25,9 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = ServiceModuleGroup.deploy_from_infocenter(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
-    owner_client_id="demo-client",
+    owner_client_id="demo-owner",
     service_name="square-service",
     blob=blob,
     filename="square_service.py",
@@ -65,130 +38,129 @@ group = ServiceModuleGroup.deploy_from_infocenter(
     node_count=1,
 )
 
-joined = False
+print(group.square.sync(x=7))
+```
 
+## 2. 长驻与退出
+
+`deploy_from_infocenter(...)` 成功后会自动开始 keepalive。
+
+owner 长驻推荐：
+
+```python
+joined = False
 try:
-    print(group.square.sync(x=7))
-    print("service is now running; press Ctrl+C to stop")
-    group.join(
-        end_services_on_interrupt=True,
-        end_reason="owner ctrl+c",
-    )
+    group.join(end_services_on_interrupt=True, end_reason="owner ctrl+c")
     joined = True
 finally:
     group.close(end_services=not joined)
 ```
 
-## 4. 方法发现
+要点：
 
-`ServiceModuleGroup` 会从某个已建立的 session 调 `ListServiceMethods`，然后缓存方法名。
+1. keepalive 只在 owner 侧部署路径自动开启
+2. `join()` 用于把 owner 进程挂住
+3. `Ctrl+C` 是正常退出路径
 
-可直接查看：
+## 3. 调用体验
+
+### 3.1 异步调用
 
 ```python
-print(group.methods)
-print(group.list_methods())
+result = await group.square(x=7)
 ```
 
-如果访问不存在的方法，会抛 `AttributeError`。
-
-## 5. 与 ServiceGroup 的关系
-
-它继承自 `ServiceGroup`，所以这些能力都还在：
-
-1. `join()`
-2. `call_balanced(...)`
-3. `acall_balanced(...)`
-4. `acall_all(...)`
-5. `end(...)`
-6. `close(...)`
-7. 熔断器和节点选择策略
-
-推荐 owner 侧优先使用：
-
-1. 复用 `ServiceGroup.deploy_from_infocenter(...)` 的 owner 部署逻辑
-2. `deploy_from_infocenter(...)` 成功后自动开始 keepalive
-3. `group.join(...)` 作为长驻入口
-4. `Ctrl+C` 作为正常结束路径
-5. `group.close(...)` 作为异常场景兜底
-
-## 6. 当前部署语义
-
-`deploy_from_infocenter(...)` 当前默认策略：
-
-1. 活跃 `service_name` 视为全局唯一。
-2. 调用方对外仍然按 `service_name` 发现服务，`service_id` 只在实例管理时使用。
-3. 同 `owner_client_id + service_name + code_version` 时，默认复用已有服务。
-4. 同名但代码变化时，默认拒绝覆盖。
-5. 显式 `replace_existing_if_code_changed=True` 才会替换。
-6. 客户端会把 `service_id/service_token` 本地落盘，供重启后复用。
-7. 默认只选择需要的节点数，不会默认铺满所有节点。
-
-常用参数：
+### 3.2 同步调用
 
 ```python
-group = ServiceModuleGroup.deploy_from_infocenter(
+result = group.square.sync(x=7)
+```
+
+### 3.3 广播调用
+
+```python
+results = await group.square.broadcast(x=7)
+```
+
+### 3.4 通用接口
+
+```python
+result = await group.call("square", x=7)
+result = group.call_sync("square", x=7)
+```
+
+## 4. 当前导出模型
+
+服务已经不是单入口函数模型，而是模块导出模型：
+
+1. 指定 `entry_module`
+2. 决定 `export_mode`
+3. 调用时按 `method` 路由
+
+推荐默认：
+
+1. `export_mode="decorator"`
+2. 使用 `pycloud_export`
+
+## 5. 常用部署参数
+
+```python
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
-    owner_client_id="demo-client",
+    owner_client_id="demo-owner",
     service_name="square-service",
-    blob=blob,
-    filename="square_service.py",
-    entry_module="square_service",
-    worker_count=1,
-    node_count=1,
+    artifact_path="./service_dir",
+    entry_module="viewer",
+    export_mode="decorator",
+    worker_count=2,
+    node_count=2,
     reuse_existing_same_code=True,
     replace_existing_if_code_changed=False,
-    session_cache_dir="./.demo_service_sessions",
 )
 ```
 
-## 7. 节点选择
+语义：
 
-如果不显式传 `node_ids`，客户端会：
+1. 同 `owner_client_id + service_name + code_version` 时可复用
+2. 同名但代码变化时默认不覆盖
+3. 显式 `replace_existing_if_code_changed=True` 才会替换
+4. 客户端会本地缓存 `service_id/service_token`，便于重启后复用
 
-1. 从 InfoCenter 查询节点。
-2. 过滤 `healthy=false`。
-3. 过滤 `schedulable=false`。
-4. 过滤 `drain=true`。
-5. 按 `service_worker_available` 选择前 N 个节点。
+## 6. 节点选择
 
-适合本地轻量部署或简单多节点部署。
+如果不显式传 `node_ids`，部署时会：
 
-## 8. 权限边界
+1. 从 `InfoCenter` 查询节点
+2. 过滤 `healthy=false`
+3. 过滤 `schedulable=false`
+4. 过滤 `drain=true`
+5. 按 `service_worker_available` 选节点
 
-1. owner 管理面依赖 `service_token`。
-2. `ServiceModuleGroup` 适合“我自己部署、我自己持有 token、我自己长驻并维持服务”的场景。
-3. 如果只是“发现已有服务并调用”，更适合走 `ControlPlane Gateway` 的 `POST /svc/{service_name}/call/{method}`，不把自己当 owner。
-4. 只有在调试、旁路排查或内部直连时，才建议自己查 route 再打某个节点上的 `service_id` 数据面。
+## 7. 与 GatewayConnect 的区别
 
-## 9. 推荐验证
+`DeployedService`：
 
-1. `python scripts/demo_service_module_group.py`
-2. `python scripts/demo_simple_deploy.py`
-3. `python scripts/grpc_register_service_client_demo.py`
-4. `docs/ARCHITECTURE_OVERVIEW.md`
+1. 是 owner
+2. 会上传代码
+3. 会创建服务
+4. 会 keepalive
+5. 可以 `end()` 服务
 
-## 10. 轻量 Caller 版本
+`GatewayConnect`：
 
-如果你不是 owner，只想像本地模块一样调一个已经存在的服务，更适合使用 `GatewayModuleClient`：
+1. 只是 caller
+2. 不上传代码
+3. 不持有 token
+4. 不管理服务生命周期
 
-```python
-from pycloud_parallel.controlplane.client import GatewayModuleClient
+## 8. 何时用 DirectConnect
 
-client = GatewayModuleClient(
-    "127.0.0.1:50051",
-    service_name="square-service",
-)
+如果你只是想调已有服务，一般优先：
 
-print(client.square.sync(x=7))
-# 或
-# result = await client.square(x=7)
-```
+1. `GatewayConnect`
 
-它和 `ServiceModuleGroup` 的差别是：
+只有在这些场景才更适合 `DirectConnect`：
 
-1. 只做 caller
-2. 不部署服务
-3. 不心跳
-4. 不结束服务
-5. 底层统一走 `controlplane Gateway`
+1. 调试具体实例
+2. 旁路 Gateway
+3. 客户端本地自己维护 route cache
