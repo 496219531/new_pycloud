@@ -7,21 +7,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pycloud-parallel"
 version = "0.1.0"
-description = "Decorator-first parallel async for-loop acceleration with multi-cluster routing."
+description = "Cluster-first task/service orchestration with gRPC control plane, plus lightweight local parallel helpers."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "pycloud" }]
 dependencies = [
   "cloudpickle>=2.2.0",
+  "grpcio>=1.78.0",
+  "protobuf>=6.31.1",
 ]
 
 [project.optional-dependencies]
 # 可选依赖：按功能分组，减少基础安装体积。
 yaml = ["PyYAML>=6.0"]
 ray = ["ray>=2.9.0"]
-grpc = ["grpcio>=1.78.0", "grpcio-tools>=1.78.0", "protobuf>=6.31.1"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "grpcio-tools>=1.78.0"]
 
 [project.scripts]
 pycloud-control = "pycloud_parallel.controlplane.server:main"

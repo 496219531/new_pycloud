@@ -1,9 +1,17 @@
 # pycloud-parallel
 
-`pycloud-parallel` 当前有两条主线：
+`pycloud-parallel` 当前定位：
 
-1. 本地多进程并行 API
-2. 轻量控制面与节点执行框架
+1. 主功能：多节点/跨集群任务与服务调度（ControlPlane + NodeControl）
+2. 辅功能：本地多进程并行 API（轻量兜底）
+
+## 安装
+
+默认安装即包含集群控制面所需依赖：
+
+```bash
+pip install pycloud-parallel
+```
 
 ## 当前架构
 
@@ -110,16 +118,7 @@ from pycloud_parallel import (
 4. `node-1 service HTTP`: `127.0.0.1:18081`
 5. `node-2 service HTTP`: `127.0.0.1:18082`
 
-### 2. 本地并行
-
-```python
-from pycloud_parallel import foreach, parallel_for
-
-print(foreach(lambda x: x * x, [1, 2, 3], max_workers=2))
-print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
-```
-
-### 3. 服务模式
+### 2. 服务模式
 
 ```python
 from pycloud_parallel import DeployedService
@@ -165,7 +164,7 @@ group = DeployedService.deploy_from_infocenter(
 )
 ```
 
-### 4. 任务模式
+### 3. 任务模式
 
 ```python
 from pycloud_parallel import TaskSubmitter
@@ -191,13 +190,22 @@ with TaskSubmitter.from_infocenter(
 如果上传校验报 `ModuleNotFoundError`，默认会严格失败。
 只有显式传了 `dependency_allowlist`，节点才会尝试在当前 `code_version` 的隔离目录里补装依赖。
 
-### 5. Gateway 调用
+### 4. Gateway 调用
 
 ```python
 from pycloud_parallel import GatewayConnect
 
 client = GatewayConnect("127.0.0.1:50051", service_name="square-service")
 print(client.square.sync(x=9))
+```
+
+### 5. 本地并行（辅助能力）
+
+```python
+from pycloud_parallel import foreach, parallel_for
+
+print(foreach(lambda x: x * x, [1, 2, 3], max_workers=2))
+print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 ```
 
 ## 服务模式说明
