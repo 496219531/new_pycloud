@@ -2265,8 +2265,10 @@ class TaskBatchClient:
 
     # 类级别序列号，配合锁用于并发安全的自动 ID 生成。
     _class_id_lock: ClassVar[threading.Lock] = threading.Lock()
+    _class_default_client_id_lock: ClassVar[threading.Lock] = threading.Lock()
     _class_client_seq: ClassVar[int] = 0
     _class_job_seq: ClassVar[int] = 0
+    _class_default_client_id: ClassVar[str] = ""
 
     @classmethod
     def _next_class_seq(cls, *, id_type: str) -> int:
@@ -2287,6 +2289,18 @@ class TaskBatchClient:
         seq = cls._next_class_seq(id_type=prefix)
         entropy = uuid.uuid4().hex[:6]
         return f"{prefix}-{local_ip}-{timestamp_ms}-{pid}-{seq:04d}-{entropy}"
+
+    @classmethod
+    def _default_client_id(cls) -> str:
+        cached = str(cls._class_default_client_id or "").strip()
+        if cached:
+            return cached
+        with cls._class_default_client_id_lock:
+            cached = str(cls._class_default_client_id or "").strip()
+            if not cached:
+                cached = cls._build_auto_id(prefix="client")
+                cls._class_default_client_id = cached
+            return cached
 
     def _next_submit_seq(self) -> int:
         with self._submit_seq_lock:
@@ -2366,7 +2380,8 @@ class TaskBatchClient:
         # 自动生成 client_id（如果未提供）
         effective_client_id = client_id
         if not effective_client_id:
-            effective_client_id = cls._build_auto_id(prefix="client")
+            # 默认复用进程级 client_id，便于追踪同一客户端。
+            effective_client_id = cls._default_client_id()
 
         # 自动生成 job_id（如果未提供）
         effective_job_id = job_id

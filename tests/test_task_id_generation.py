@@ -72,6 +72,22 @@ def test_auto_job_id_uniqueness_under_concurrency() -> None:
     assert len(all_ids) == rounds_per_thread * thread_count
 
 
+def test_default_client_id_reused_and_job_id_still_unique() -> None:
+    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mock_infocenter:
+        _mock_empty_infocenter(mock_infocenter)
+        batch1 = TaskBatchClient.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            code_version="sha256:test",
+        )
+        batch2 = TaskBatchClient.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            code_version="sha256:test",
+        )
+
+    assert batch1.client_id == batch2.client_id
+    assert batch1.job_id != batch2.job_id
+
+
 def test_manual_client_id_and_job_id_keep_compatibility() -> None:
     with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mock_infocenter:
         _mock_empty_infocenter(mock_infocenter)
@@ -147,4 +163,3 @@ def test_task_id_increment_is_thread_safe() -> None:
     assert len(set(captured_task_ids)) == thread_count
     suffixes = sorted(int(task_id.rsplit("-", 1)[1]) for task_id in captured_task_ids)
     assert suffixes == list(range(1, thread_count + 1))
-
