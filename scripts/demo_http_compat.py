@@ -14,6 +14,8 @@ from pycloud_parallel import DeployedService
 def main():
     gateway_target = "127.0.0.1:50051"
     service_name = "compat-demo"
+    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
+    dependency_allowlist = []
 
     print("=" * 60)
     print("  HTTP 风格兼容性演示")
@@ -43,10 +45,11 @@ def main():
             service_name=service_name,
             blob=blob,
             filename="compat_demo.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="compat_demo",
             export_mode="decorator",
             export_decorator="pycloud_export",
+            dependency_allowlist=dependency_allowlist,
             worker_count=2,
             tags=["demo"],
             min_success_nodes=1,

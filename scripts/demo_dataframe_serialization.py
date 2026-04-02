@@ -52,7 +52,7 @@ def main():
             service_name=service_name,
             blob=blob,
             filename="dataframe_service.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="dataframe_service",
             export_mode="decorator",
             export_decorator="pycloud_export",

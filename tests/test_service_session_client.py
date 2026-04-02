@@ -1,6 +1,8 @@
 """Integration tests for NodeControl service-session client helpers."""
 
 from concurrent import futures
+import hashlib
+from pathlib import Path
 
 import grpc
 import pytest
@@ -11,6 +13,268 @@ from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+
+
+def _make_local_dependency_package(base_dir: Path, *, folder_name: str = "dep_pkg") -> Path:
+    pkg_root = base_dir / folder_name
+    module_dir = pkg_root / "pycloud_local_dep"
+    module_dir.mkdir(parents=True, exist_ok=True)
+    (pkg_root / "setup.py").write_text(
+        "from setuptools import setup\n"
+        "setup(name='pycloud-local-dep', version='0.0.1', packages=['pycloud_local_dep'])\n",
+        encoding="utf-8",
+    )
+    (module_dir / "__init__.py").write_text(
+        "def multiply(value):\n"
+        "    return int(value) * 10\n",
+        encoding="utf-8",
+    )
+    return pkg_root
+
+
+def test_upload_code_preflight_rejects_bad_import(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-upload-preflight-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    blob = (
+        b"import pycloud_missing_dep_for_test_case\n\n"
+        b"def run(**_kwargs):\n"
+        b"    return {'ok': True}\n"
+    )
+    digest = hashlib.sha256(blob).hexdigest()
+    code_version = f"sha256:{digest}"
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            with pytest.raises(grpc.RpcError) as excinfo:
+                client.upload_code_from_bytes(
+                    client_id="upload-client",
+                    filename="bad_upload.py",
+                    blob=blob,
+                    runtime="py3",
+                    entry_module="bad_upload",
+                    entry_callable="run",
+                )
+        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "artifact validation failed while loading" in excinfo.value.details()
+        assert "dependency_allowlist" in excinfo.value.details()
+        assert state.has_code_version(code_version) is False
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_create_service_surfaces_user_import_error(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-create-service-err-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    blob = (
+        b"import pycloud_missing_dep_for_service_case\n\n"
+        b"def run(**_kwargs):\n"
+        b"    return {'ok': True}\n"
+    )
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            with pytest.raises(grpc.RpcError) as excinfo:
+                client.create_service_from_bytes(
+                    owner_client_id="owner-client",
+                    service_name="svc-bad",
+                    filename="svc_bad.py",
+                    blob=blob,
+                    runtime="py3",
+                    entry_module="svc_bad",
+                    entry_callable="run",
+                    worker_count=1,
+                    heartbeat_timeout_sec=30,
+                    idle_ttl_sec=0,
+                    expose_http=False,
+                )
+        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "artifact validation failed while loading" in excinfo.value.details()
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_upload_code_allowlist_installs_missing_dep(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-upload-dep-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    dep_pkg = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_a")
+    blob = (
+        b"from pycloud_local_dep import multiply\n\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': multiply(value)}\n"
+    )
+    try:
+        with NodeControlClient(target, timeout_sec=30.0) as client:
+            upload = client.upload_code_from_bytes(
+                client_id="upload-client",
+                filename="dep_upload.py",
+                blob=blob,
+                runtime="py3",
+                entry_module="dep_upload",
+                entry_callable="run",
+                dependency_allowlist=[str(dep_pkg)],
+            )
+            assert upload.ok is True
+
+            submit = client.submit_tasks(
+                client_id="upload-client",
+                code_version=upload.code_version,
+                job_id="job-upload-dep",
+                tasks=[pb2.TaskSubmitItem(task_id="task-dep-1", payload={"value": 7}, priority=1)],
+            )
+            assert [item.task_id for item in submit.accepted] == ["task-dep-1"]
+
+            results = client.pull_results(client_id="upload-client", limit=10, wait_ms=3000, cursor="")
+            assert results.ok is True
+            assert len(results.results) == 1
+            assert results.results[0].status == pb2.TASK_STATUS_SUCCEEDED
+            assert results.results[0].result["value"] == 70
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_create_service_allowlist_installs_missing_dep(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-create-service-dep-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    dep_pkg = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_service")
+    blob = (
+        b"from pycloud_local_dep import multiply\n\n"
+        b"def pycloud_export(fn):\n"
+        b"    fn.__pycloud_export__ = True\n"
+        b"    return fn\n\n"
+        b"@pycloud_export\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': multiply(value)}\n"
+    )
+    try:
+        with NodeControlClient(target, timeout_sec=30.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-client",
+                service_name="svc-dep",
+                filename="svc_dep.py",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_dep",
+                entry_callable="run",
+                dependency_allowlist=[str(dep_pkg)],
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            resp = session.call("run", {"value": 9}, timeout_sec=10.0)
+            assert resp["ok"] is True
+            assert resp["data"]["value"] == 90
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_upload_code_cached_version_rejects_different_dependency_allowlist(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-upload-dep-mismatch-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    dep_pkg_a = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_first")
+    dep_pkg_b = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_second")
+    blob = (
+        b"from pycloud_local_dep import multiply\n\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': multiply(value)}\n"
+    )
+    try:
+        with NodeControlClient(target, timeout_sec=30.0) as client:
+            first = client.upload_code_from_bytes(
+                client_id="upload-client",
+                filename="dep_upload_same.py",
+                blob=blob,
+                runtime="py3",
+                entry_module="dep_upload_same",
+                entry_callable="run",
+                dependency_allowlist=[str(dep_pkg_a)],
+            )
+            assert first.ok is True
+
+            with pytest.raises(grpc.RpcError) as excinfo:
+                client.upload_code_from_bytes(
+                    client_id="upload-client",
+                    filename="dep_upload_same.py",
+                    blob=blob,
+                    runtime="py3",
+                    entry_module="dep_upload_same",
+                    entry_callable="run",
+                    dependency_allowlist=[str(dep_pkg_b)],
+                )
+        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "different dependency_allowlist" in excinfo.value.details()
+    finally:
+        server.stop(grace=0)
+        state.close()
 
 
 def test_service_session_client_roundtrip(tmp_path):
@@ -36,8 +300,8 @@ def test_service_session_client_roundtrip(tmp_path):
             b"    fn.__pycloud_export__ = True\n"
             b"    return fn\n\n"
             b"@pycloud_export\n"
-            b"def run(payload):\n"
-            b"    v = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    v = int(value)\n"
             b"    return {'value': v, 'square': v * v}\n"
         )
         with NodeControlClient(target, timeout_sec=10.0) as client:
@@ -46,7 +310,7 @@ def test_service_session_client_roundtrip(tmp_path):
                 service_name="svc-demo",
                 filename="svc_demo.py",
                 blob=blob,
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="svc_demo",
                 entry_callable="run",
                 worker_count=2,
@@ -104,8 +368,8 @@ def test_nodecontrol_client_task_helpers_roundtrip(tmp_path):
 
     try:
         blob = (
-            b"def run(payload):\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
         with NodeControlClient(target, timeout_sec=10.0) as client:
@@ -113,7 +377,7 @@ def test_nodecontrol_client_task_helpers_roundtrip(tmp_path):
                 client_id="task-client",
                 filename="task_demo.py",
                 blob=blob,
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="task_demo",
                 entry_callable="run",
             )
@@ -174,8 +438,8 @@ def test_nodecontrol_client_task_stream_roundtrip(tmp_path):
 
     try:
         blob = (
-            b"def run(payload):\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
         with NodeControlClient(target, timeout_sec=10.0) as client:
@@ -183,7 +447,7 @@ def test_nodecontrol_client_task_stream_roundtrip(tmp_path):
                 client_id="task-stream-client",
                 filename="task_stream_demo.py",
                 blob=blob,
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="task_stream_demo",
                 entry_callable="run",
             )
@@ -277,8 +541,8 @@ def test_task_batch_client_from_infocenter_roundtrip(tmp_path):
             )
 
         blob = (
-            b"def run(payload):\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
         with TaskBatchClient.from_infocenter(
@@ -287,7 +551,7 @@ def test_task_batch_client_from_infocenter_roundtrip(tmp_path):
             job_id="job-batch",
             blob=blob,
             filename="task_batch_demo.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="task_batch_demo",
             entry_callable="run",
             tags=["compute"],
@@ -339,4 +603,151 @@ def test_task_batch_client_from_infocenter_roundtrip(tmp_path):
         state_a.close()
         server_b.stop(grace=0)
         state_b.close()
+        info_server.stop()
+
+
+def test_service_session_http_supports_nested_dataframe_series_ndarray(tmp_path):
+    pd = pytest.importorskip("pandas")
+    np = pytest.importorskip("numpy")
+
+    state = NodeControlState(
+        node_id="node-client-http-serialize-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_http_nested"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(bundle=None, **_kwargs):\n"
+            b"    return {\n"
+            b"        'df_rows': int(bundle['df'].shape[0]),\n"
+            b"        'series_name': str(bundle['series'].name),\n"
+            b"        'arr_sum': int(bundle['arr'].sum()),\n"
+            b"    }\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-http-client",
+                service_name="svc-http-nested",
+                filename="svc_http_nested.py",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_http_nested",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            resp = session.call(
+                "run",
+                {
+                    "bundle": {
+                        "df": pd.DataFrame([{"x": 1}, {"x": 2}]),
+                        "series": pd.Series([10, 20], name="alpha"),
+                        "arr": np.array([3, 4, 5], dtype=np.int64),
+                    }
+                },
+                timeout_sec=10.0,
+            )
+        assert resp["ok"] is True
+        assert resp["data"] == {"df_rows": 2, "series_name": "alpha", "arr_sum": 12}
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_task_batch_grpc_supports_nested_dataframe_series_ndarray(tmp_path):
+    pd = pytest.importorskip("pandas")
+    np = pytest.importorskip("numpy")
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-grpc-serialize-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_grpc_nested"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-grpc-serialize-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"def run(bundle=None, **_kwargs):\n"
+            b"    return {\n"
+            b"        'df_rows': int(bundle['df'].shape[0]),\n"
+            b"        'series_name': str(bundle['series'].name),\n"
+            b"        'arr_sum': int(bundle['arr'].sum()),\n"
+            b"    }\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="grpc-serialize-client",
+            job_id="job-grpc-serialize",
+            blob=blob,
+            filename="task_grpc_nested.py",
+            runtime="py3",
+            entry_module="task_grpc_nested",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            submit = batch.submit_payloads(
+                [
+                    {
+                        "bundle": {
+                            "df": pd.DataFrame([{"x": 1}, {"x": 2}]),
+                            "series": pd.Series([10, 20], name="alpha"),
+                            "arr": np.array([3, 4, 5], dtype=np.int64),
+                        }
+                    }
+                ]
+            )
+            assert len(submit.accepted) == 1
+
+            pulled = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled.results) == 1
+            assert pulled.results[0].status == pb2.TASK_STATUS_SUCCEEDED
+            assert dict(pulled.results[0].result) == {
+                "df_rows": 2,
+                "series_name": "alpha",
+                "arr_sum": 12,
+            }
+    finally:
+        server.stop(grace=0)
+        state.close()
         info_server.stop()

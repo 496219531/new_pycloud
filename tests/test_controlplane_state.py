@@ -7,15 +7,17 @@ import time
 from datetime import timedelta
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.state import NodeControlState, utc_now
+import pytest
+
+from pycloud_parallel.controlplane.state import NodeControlState, dict_to_struct, struct_to_dict, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 def _seed_code(state: NodeControlState) -> str:
     blob = (
-        b"def run(payload):\n"
-        b"    value = payload.get('value', 0)\n"
-        b"    if payload.get('should_fail'):\n"
+        b"def run(value=0, should_fail=False, **_kwargs):\n"
+        b"    value = int(value)\n"
+        b"    if should_fail:\n"
         b"        raise ValueError(f'intentional failure value={value}')\n"
         b"    return {'input': value, 'output': value * value}\n"
     )
@@ -23,7 +25,7 @@ def _seed_code(state: NodeControlState) -> str:
     artifact, _ = state.put_code(
         sha256=f"sha256:{digest}",
         filename="demo.py",
-        runtime="py3.11",
+        runtime="py3",
         entry_module="demo",
         entry_callable="run",
         chunks=[blob],
@@ -80,6 +82,43 @@ def test_submit_poll_report_and_pull_results(tmp_path):
         assert int(next_cursor) >= 1
     finally:
         state.close()
+
+
+def test_nested_arrow_payload_roundtrip():
+    pd = pytest.importorskip("pandas")
+    np = pytest.importorskip("numpy")
+
+    payload = {
+        "bundle": {
+            "df": pd.DataFrame([{"x": 1}, {"x": 2}]),
+            "series": pd.Series([10, 20], name="s"),
+            "arr": np.array([3, 4, 5], dtype=np.int64),
+        },
+        "plain": [1, True, None],
+    }
+
+    restored = struct_to_dict(dict_to_struct(payload))
+
+    assert list(restored["bundle"]["df"]["x"]) == [1, 2]
+    assert restored["bundle"]["series"].name == "s"
+    assert restored["bundle"]["series"].tolist() == [10, 20]
+    assert restored["bundle"]["arr"].tolist() == [3, 4, 5]
+    assert restored["plain"] == [1, True, None]
+
+
+def test_dict_to_struct_rejects_unsupported_object_with_clear_path():
+    class DemoObject:
+        pass
+
+    with pytest.raises(TypeError, match=r"payload\.bundle\.bad has unsupported type DemoObject"):
+        dict_to_struct({"bundle": {"bad": DemoObject()}})
+
+
+def test_dict_to_struct_rejects_complex_ndarray_dtype():
+    np = pytest.importorskip("numpy")
+
+    with pytest.raises(TypeError, match=r"payload\.arr uses numpy\.ndarray dtype object"):
+        dict_to_struct({"arr": np.array([{"x": 1}], dtype=object)})
 
 
 def test_infra_timeout_requeue_then_retry(tmp_path):
@@ -177,18 +216,18 @@ def test_internal_executor_runtime_slots_queue_and_reclaim(tmp_path):
     try:
         blob = (
             b"import time\n"
-            b"def run(payload):\n"
-            b"    sleep_ms = int(payload.get('sleep_ms', 0))\n"
+            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
+            b"    sleep_ms = int(sleep_ms)\n"
             b"    if sleep_ms > 0:\n"
             b"        time.sleep(sleep_ms / 1000.0)\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
         digest = hashlib.sha256(blob).hexdigest()
         artifact, _ = state.put_code(
             sha256=f"sha256:{digest}",
             filename="runtime_slot_demo.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="runtime_slot_demo",
             entry_callable="run",
             chunks=[blob],
@@ -329,8 +368,8 @@ def test_service_session_http_call_and_end(tmp_path):
             b"    fn.__pycloud_export__ = True\n"
             b"    return fn\n\n"
             b"@pycloud_export\n"
-            b"def run(payload):\n"
-            b"    v = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    v = int(value)\n"
             b"    return {'v': v, 'square': v * v}\n"
         )
         digest = hashlib.sha256(blob).hexdigest()
@@ -339,7 +378,7 @@ def test_service_session_http_call_and_end(tmp_path):
             service_name="svc-a",
             filename="svc_entry.py",
             sha256=f"sha256:{digest}",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_entry",
             entry_callable="run",
             worker_count=2,
@@ -391,14 +430,14 @@ def test_service_session_management_requires_token(tmp_path):
         service_http_bind="127.0.0.1:0",
     )
     try:
-        blob = b"def run(payload):\n    return {'ok': True}\n"
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
         digest = hashlib.sha256(blob).hexdigest()
         session = state.create_service(
             owner_client_id="owner-auth",
             service_name="svc-auth",
             filename="svc_auth.py",
             sha256=f"sha256:{digest}",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_auth",
             entry_callable="run",
             worker_count=1,
@@ -449,7 +488,7 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
             b"    fn.__pycloud_export__ = True\n"
             b"    return fn\n\n"
             b"@pycloud_export\n"
-            b"def run(payload):\n"
+            b"def run(**_kwargs):\n"
             b"    return {'ok': True}\n"
         )
         digest = hashlib.sha256(blob).hexdigest()
@@ -458,7 +497,7 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
             service_name="svc-b",
             filename="svc_entry.py",
             sha256=f"sha256:{digest}",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_entry",
             entry_callable="run",
             worker_count=1,
@@ -493,7 +532,7 @@ def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
             b"    fn.__pycloud_export__ = True\n"
             b"    return fn\n\n"
             b"@pycloud_export\n"
-            b"def run(payload):\n"
+            b"def run(**_kwargs):\n"
             b"    return {'ok': True}\n"
         )
 
@@ -512,7 +551,7 @@ def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
             service_name="svc-c",
             filename="compute_service.zip",
             sha256=f"sha256:{digest}",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="compute_service.main",
             entry_callable="run",
             package_format="zip",

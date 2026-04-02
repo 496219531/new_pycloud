@@ -30,6 +30,7 @@
    - 节点注册/心跳
    - 路由查询
    - 简单运维接口和页面
+   - 暴露节点 `python_version`
 2. `NodeControl`
    - `gRPC`
    - 代码上传
@@ -66,16 +67,18 @@ InfoCenter 当前只保留 HTTP：
 NodeControl 当前保留 gRPC：
 
 1. `UploadCode`
-2. `SubmitTasks`
-3. `PullResults`
-4. `CancelTasks`
-5. `GetMetrics`
-6. `CreateService`
-7. `ListServiceMethods`
-8. `CallService`
-9. `HeartbeatService`
-10. `EndService`
-11. `GetServiceStatus`
+2. `TaskStream`
+3. `SubmitTasks`
+4. `PullResults`
+5. `CancelTasks`
+6. `CancelJob`
+7. `GetMetrics`
+8. `CreateService`
+9. `ListServiceMethods`
+10. `CallService`
+11. `HeartbeatService`
+12. `EndService`
+13. `GetServiceStatus`
 
 ### 4.3 已移除
 
@@ -89,9 +92,11 @@ NodeControl 当前保留 gRPC：
 
 1. 客户端上传代码。
 2. 获得 `code_version`。
-3. 提交任务到 NodeControl。
-4. NodeControl 用本机进程池执行。
-5. 客户端拉取结果。
+3. 从 `InfoCenter` 选任务节点。
+4. 向目标 `NodeControl` 建立 `TaskStream`。
+5. 提交任务到 NodeControl。
+6. NodeControl 用 runtime slot + 本机进程执行。
+7. 客户端拉取结果。
 
 这条链路适合高频任务提交，因此仍保留 gRPC。
 
@@ -103,6 +108,14 @@ NodeControl 当前保留 gRPC：
 4. 返回 `service_id + service_token`。
 5. owner 通过心跳保活。
 6. 其他调用方可通过 gRPC 或 HTTP 调服务方法。
+
+两种模式都支持 `runtime` 作为 Python 版本约束：
+
+1. `py3`
+2. `py3.11`
+3. `>=py3.11`
+
+客户端会先按 `InfoCenter` 提供的 `python_version` 过滤，节点侧再做二次校验。
 
 ## 6. 上传与导入
 
@@ -154,8 +167,9 @@ NodeControl 当前保留 gRPC：
 2. 过滤不健康节点。
 3. 过滤 `schedulable=false`。
 4. 过滤 `drain=true`。
-5. 按 `service_worker_available` 倒序排序。
-6. 取 `node_ids` 或 `node_count` / `min_success_nodes` 决定的前 N 个节点。
+5. 如果指定了 `runtime`，先按节点 `python_version` 过滤。
+6. 按 `service_worker_available` 倒序排序。
+7. 取 `node_ids` 或 `node_count` / `min_success_nodes` 决定的前 N 个节点。
 
 默认不是全量铺节点。
 

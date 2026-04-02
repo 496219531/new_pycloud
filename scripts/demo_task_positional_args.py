@@ -39,7 +39,7 @@ def main():
         infocenter_target="127.0.0.1:50051",
         blob=blob,
         filename="task_demo.py",
-        runtime="py3.11",
+        runtime="py3",
         entry_module="task_demo",
         entry_callable="run",
         tags=["compute"],

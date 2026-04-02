@@ -21,8 +21,10 @@
   "tags": ["compute"],
   "version": "v1",
   "metadata": {"role": "compute-node"},
+  "python_version": "py3.13",
   "service_worker_capacity": 4,
   "service_worker_used": 0,
+  "active_runtimes": [],
   "services": []
 }
 ```
@@ -39,6 +41,7 @@
     "healthy": true,
     "schedulable": true,
     "drain": false,
+    "python_version": "py3.13",
     "service_worker_available": 4,
     "loaded_services": []
   }
@@ -63,8 +66,10 @@
     "cpu_percent": 0.0,
     "mem_percent": 0.0
   },
+  "python_version": "py3.13",
   "service_worker_capacity": 4,
   "service_worker_used": 1,
+  "active_runtimes": ["runtime-hot-a"],
   "services": [
     {
       "service_name": "square-service",
@@ -111,6 +116,8 @@
       "drain": false,
       "capacity": 4,
       "queue_capacity": 1000,
+      "python_version": "py3.13",
+      "active_runtimes": ["runtime-hot-a"],
       "service_worker_capacity": 4,
       "service_worker_used": 1,
       "service_worker_available": 3,
@@ -180,6 +187,16 @@ Header 可选：
 {"x": 7}
 ```
 
+当前调用约定：
+
+1. 普通 JSON object 会按 kwargs 展开
+2. 推荐服务函数写成 `def square(x=0, **_kwargs): ...`
+3. 如果要传位置参数，可用：
+
+```json
+{"args": [7], "kwargs": {"scale": 2}}
+```
+
 成功响应：
 
 ```json
@@ -237,6 +254,13 @@ Header 可选：
 3. `HeartbeatService`
 4. `EndService`
 5. `GetServiceStatus`（虽然 HTTP 也能查服务状态，但管理面主入口仍是 gRPC）
+
+这也包括：
+
+1. 上传代码时的 `dependency_allowlist`
+2. 创建服务时的 `dependency_allowlist`
+
+它们当前只在 NodeControl gRPC 管理面里提供，不在 HTTP 数据面里开放。
 
 ## 5. 参考文档
 

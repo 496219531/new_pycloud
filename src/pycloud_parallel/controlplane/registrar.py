@@ -71,6 +71,7 @@ class NodeInfoCenterRegistrar:
             active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
+            python_version=self.state.python_version,
         )
         self._registered = True
         self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
@@ -93,6 +94,7 @@ class NodeInfoCenterRegistrar:
             active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
+            python_version=self.state.python_version,
         )
         if not resp.get("accepted", False):
             self._registered = False

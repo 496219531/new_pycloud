@@ -46,8 +46,6 @@ from pycloud_parallel import (
 4. `DirectConnect`
    - 客户端发现后直连实例
 
-旧类名仍可从 `pycloud_parallel.controlplane` 导入，但顶层包推荐只用新名字。
-
 ## 3. 本地多进程
 
 ```python
@@ -67,8 +65,8 @@ blob = (
     b"    fn.__pycloud_export__ = True\n"
     b"    return fn\n\n"
     b"@pycloud_export\n"
-    b"def square(payload):\n"
-    b"    x = int(payload.get('x', 0))\n"
+    b"def square(x=0, **_kwargs):\n"
+    b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
@@ -77,6 +75,7 @@ group = DeployedService.deploy_from_infocenter(
     service_name="square-service",
     blob=blob,
     filename="square_service.py",
+    runtime="py3",
     entry_module="square_service",
     export_mode="decorator",
     node_count=1,
@@ -84,6 +83,19 @@ group = DeployedService.deploy_from_infocenter(
 
 print(group.square.sync(x=7))
 # owner 长驻时可调用 group.join()
+```
+
+依赖缺失时可显式给补装白名单：
+
+```python
+group = DeployedService.deploy_from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    service_name="dep-service",
+    artifact_path="./service_src",
+    runtime="py3",
+    entry_module="viewer",
+    dependency_allowlist=["./third_party/my_local_pkg"],
+)
 ```
 
 ## 5. 任务模式
@@ -94,8 +106,8 @@ print(group.square.sync(x=7))
 from pycloud_parallel import TaskSubmitter
 
 blob = (
-    b"def run(payload):\n"
-    b"    value = int(payload.get('value', 0))\n"
+    b"def run(value=0, **_kwargs):\n"
+    b"    value = int(value)\n"
     b"    return {'value': value, 'square': value * value}\n"
 )
 
@@ -103,10 +115,24 @@ with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="task_demo.py",
+    runtime="py3",
     entry_module="task_demo",
 ) as task:
     results = task.run(value=7, runtime_key="demo-runtime")
     print(results)
+```
+
+如果任务代码 import 了节点上没有的包：
+
+```python
+with TaskSubmitter.from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    artifact_path="./task_src",
+    runtime="py3",
+    entry_module="task_src.main",
+    dependency_allowlist=["./third_party/my_local_pkg"],
+) as task:
+    print(task.run(value=7))
 ```
 
 ### 5.2 批量方式
@@ -118,6 +144,7 @@ with TaskBatchClient.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="task_demo.py",
+    runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
 ) as batch:
@@ -160,9 +187,31 @@ python scripts/demo_gateway_module_client.py
 python scripts/demo_service_module_group.py
 ```
 
-## 9. 下一步
+## 9. Runtime 约束速记
+
+`runtime` 当前表示 Python 版本约束：
+
+1. `py3`
+   - 任意 Python 3 节点
+2. `py3.11`
+   - 只匹配 Python 3.11 节点
+3. `>=py3.11`
+   - 匹配 Python 3.11 及以上节点
+
+普通示例优先写 `runtime="py3"`，更可移植。
+
+## 10. 下一步
 
 1. [TASK_MODE.md](TASK_MODE.md)
 2. [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
 3. [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
 4. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
+5. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
+
+## 11. 依赖补装约定
+
+1. 默认严格校验，缺依赖直接报错
+2. 显式传 `dependency_allowlist` 后，节点才会尝试补装
+3. 支持本地路径、wheel 路径、普通 pip requirement 字符串
+4. 安装目录位于节点 `code_cache/<sha>_deps`
+5. 同一 `code_version` 不允许混用不同白名单

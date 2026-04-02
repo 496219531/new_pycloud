@@ -64,6 +64,7 @@
 3. 导出模式：`decorator / explicit / all / single`
 4. 默认推荐 `decorator + pycloud_export`
 5. 调用路由为 `service_name -> route -> service_id -> method`
+6. 依赖缺失时默认严格失败，只有显式 `dependency_allowlist` 才允许节点补装
 
 对外推荐入口：
 
@@ -113,6 +114,35 @@
 3. `job_id` 是分组键，不是 heartbeat session
 4. 任务模式没有 Gateway
 5. 任务 client 不需要服务模式那种长驻 keepalive
+
+### 4.5 `runtime` 约束
+
+`runtime` 当前统一表示 Python 版本约束：
+
+1. `py3`
+2. `py3.11`
+3. `>=py3.11`
+4. `<=py3.11`
+
+当前链路：
+
+1. 节点向 `InfoCenter` 暴露 `python_version`
+2. 服务部署和任务选点会先按 `runtime` 过滤节点
+3. 节点侧上传代码 / 建服务时再做一次本地校验
+
+注意：
+
+1. 精确 `py3.11` 只匹配 Python 3.11
+2. 如果你想表达“3.11 及以上”，要显式写 `>=py3.11`
+
+### 4.6 依赖补装
+
+当前实现保持保守：
+
+1. 不做盲目自动安装
+2. 只有调用方显式提供 `dependency_allowlist` 才允许节点补装
+3. 依赖安装目录跟随 `code_version`
+4. 这样能保持缓存语义简单、排障路径清晰
 
 ## 5. ControlPlane
 

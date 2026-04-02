@@ -2,7 +2,7 @@
 
 ## 📊 三种方案总览
 
-| 方案 | 手动打包 | Cloudpickle | 自动依赖检测 |
+| 方案 | 手动打包 | Cloudpickle | 本地源码自动打包 |
 |------|---------|-------------|-------------|
 | **实现状态** | ✅ 已实现 | ❌ 未实现 | ✅ 已实现 |
 | **API 简洁性** | ⚠️ 需要打包步骤 | ✅ 一行代码 | ✅ 一行代码 |
@@ -99,11 +99,11 @@ pickle_bytes = cloudpickle.dumps(my_function)
 **不推荐实现 Cloudpickle 方案**，因为：
 1. 跨版本不兼容是致命缺陷
 2. 生产环境通常有多个 Python 版本
-3. 自动依赖检测方案提供了相同的便利性
+3. 本地源码自动打包方案提供了接近的便利性
 
 ---
 
-## 3️⃣ 自动依赖检测（推荐，已实现）
+## 3️⃣ 本地源码自动打包（推荐，已实现）
 
 ### 使用方式
 
@@ -116,7 +116,7 @@ def process_data(df):
     import numpy as np
     return helper(df, np.mean)
 
-# 一键部署（自动检测依赖并打包）
+# 一键部署（自动打包本地源码依赖）
 submitter = auto_deploy_function(
     func=process_data,
     infocenter_target="127.0.0.1:50051",
@@ -171,13 +171,13 @@ result = submitter.submit(df)
 
 ✅ **结合了手动打包和 Cloudpickle 的优点：**
 
-| 特性 | 手动打包 | 自动依赖检测 |
+| 特性 | 手动打包 | 本地源码自动打包 |
 |------|---------|-------------|
 | 操作步骤 | 3-5 步 | **1 步** |
 | 跨版本兼容 | ✅ | ✅ |
-| 依赖检测 | ❌ 手动 | ✅ **自动** |
+| 本地源码收集 | ❌ 手动 | ✅ **自动** |
 | 可调试性 | ✅ | ✅ |
-| 依赖遗漏 | 可能 | **不会** |
+| 本地源码遗漏 | 可能 | **更少，但仍不是完美静态分析** |
 
 ### 实际效果
 
@@ -217,7 +217,7 @@ submitter = auto_deploy_function(func=process, ...)
 
 ### 中期（正在进行）
 
-✅ **推广自动依赖检测**
+✅ **推广本地源码自动打包**
 ```python
 # 统一 API，自动选择最优方案
 from pycloud_parallel import auto_deploy_function
@@ -231,7 +231,7 @@ submitter = auto_deploy_function(
 
 **优势：**
 - 1 行代码完成部署
-- 自动检测依赖
+- 自动收集本地源码依赖
 - 跨版本兼容
 - 可调试
 
@@ -240,7 +240,7 @@ submitter = auto_deploy_function(
 ❌ **不推荐 Cloudpickle**
 - 跨版本不兼容是致命缺陷
 - 生产环境风险太高
-- 自动依赖检测提供了相同的便利性
+- 本地源码自动打包提供了接近的便利性
 
 ✅ **可能的方向：**
 - 混合方案：闭包用 cloudpickle，普通函数用自动检测
@@ -261,10 +261,10 @@ submitter = TaskSubmitter.deploy_from_code(
 )
 ```
 
-### 阶段 2: 添加自动依赖检测（进行中）
+### 阶段 2: 添加本地源码自动打包（进行中）
 
 ```python
-# 自动检测依赖
+# 自动收集本地源码依赖
 submitter = auto_deploy_function(
     func=process_data,
     runtime="py3.11",
@@ -303,7 +303,7 @@ result = process_data.remote(df)
    - Cloudpickle 不清楚实际依赖了什么
    - 隐式依赖导致运行时错误
 
-### 自动依赖检测的优势
+### 本地源码自动打包的优势
 
 1. **结合了两种方案的优点**
    - Cloudpickle 的便利性
@@ -322,7 +322,7 @@ result = process_data.remote(df)
 ## 📚 相关文档
 
 - [Cloudpickle vs 文件上传对比](./CLOUDPICKLE_VS_FILE_UPLOAD.md)
-- [自动依赖检测系统设计](./AUTO_DEPENDENCY_DETECTION.md)
+- [本地源码自动打包系统设计](./AUTO_DEPENDENCY_DETECTION.md)
 - [实现代码](../src/pycloud_parallel/controlplane/dependency.py)
 - [演示脚本](../scripts/demo_auto_dependency.py)
 
@@ -330,11 +330,11 @@ result = process_data.remote(df)
 
 ## ✅ 结论
 
-**推荐使用自动依赖检测方案**，原因：
+**推荐使用本地源码自动打包方案**，原因：
 
 1. ✅ **便利性**：1 行代码完成部署
 2. ✅ **兼容性**：跨版本 Python 完全兼容
-3. ✅ **可靠性**：自动检测依赖，不会遗漏
+3. ✅ **可靠性**：本地源码收集更省心，但第三方依赖仍建议显式声明
 4. ✅ **可调试性**：源码可见，易于调试
 5. ✅ **可扩展性**：可以添加更多智能功能
 

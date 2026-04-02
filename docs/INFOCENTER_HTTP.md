@@ -13,6 +13,7 @@
 3. 服务路由查询
 4. 轻量运维页面 `/ops`
 5. 为任务模式提供热点提示字段
+6. 暴露节点 `python_version`
 
 它本身不代理任务执行。
 
@@ -32,9 +33,10 @@
 6. `version`
 7. `metadata`
 8. `services`
-9. `active_runtimes`
-10. `service_worker_capacity`
-11. `service_worker_used`
+9. `python_version`
+10. `active_runtimes`
+11. `service_worker_capacity`
+12. `service_worker_used`
 
 ### 2.2 `POST /nodes/heartbeat`
 
@@ -46,9 +48,10 @@
 2. `healthy`
 3. `metrics`
 4. `services`
-5. `active_runtimes`
-6. `service_worker_capacity`
-7. `service_worker_used`
+5. `python_version`
+6. `active_runtimes`
+7. `service_worker_capacity`
+8. `service_worker_used`
 
 ### 2.3 `GET /nodes`
 
@@ -69,11 +72,12 @@
 5. `queued`
 6. `inflight`
 7. `loaded_services`
-8. `active_runtimes`
-9. `active_runtime_count`
-10. `service_worker_capacity`
-11. `service_worker_used`
-12. `service_worker_available`
+8. `python_version`
+9. `active_runtimes`
+10. `active_runtime_count`
+11. `service_worker_capacity`
+12. `service_worker_used`
+13. `service_worker_available`
 
 ### 2.4 `GET /services/routes`
 
@@ -111,9 +115,10 @@ http://127.0.0.1:50051/ops
 
 1. 节点健康状态
 2. `schedulable / drain`
-3. `service_worker` 容量与占用
-4. 当前已加载的服务名
-5. 当前 `active_runtimes`
+3. `python_version`
+4. `service_worker` 容量与占用
+5. 当前已加载的服务名
+6. 当前 `active_runtimes`
 
 ### 2.6 运维动作
 
@@ -134,7 +139,7 @@ from pycloud_parallel.controlplane.client import InfoCenterClient
 with InfoCenterClient("127.0.0.1:50051", timeout_sec=5.0) as client:
     nodes = client.list_nodes(healthy_only=False, tags=["compute"], limit=100)
     for node in nodes:
-        print(node.node_id, node.credit, node.active_runtimes)
+        print(node.node_id, node.python_version, node.credit, node.active_runtimes)
 ```
 
 ### 3.2 查询服务路由
@@ -154,6 +159,7 @@ with InfoCenterClient("127.0.0.1:50051", timeout_sec=5.0) as client:
         healthy_only=True,
         tags=["compute"],
         node_count=2,
+        runtime=">=py3.11",
         preferred_runtime_key="demo-runtime",
     )
 ```
@@ -163,6 +169,18 @@ with InfoCenterClient("127.0.0.1:50051", timeout_sec=5.0) as client:
 1. 命中 `preferred_runtime_key` 的热 node 优先
 2. 再按 `credit`
 3. 再按 `queued / inflight`
+
+`runtime` 过滤规则：
+
+1. `py3`
+2. `py3.11`
+3. `>=py3.11`
+4. `<=py3.11`
+
+注意：
+
+1. 精确 `py3.11` 只匹配 Python 3.11
+2. 只有显式写 `>=py3.11` 才表示“3.11 及以上”
 
 ## 4. 命令行与 curl
 

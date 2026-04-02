@@ -22,8 +22,8 @@
 from pycloud_parallel import TaskSubmitter
 
 blob = (
-    b"def run(payload):\n"
-    b"    value = int(payload.get('value', 0))\n"
+    b"def run(value=0, **_kwargs):\n"
+    b"    value = int(value)\n"
     b"    return {'value': value, 'square': value * value}\n"
 )
 
@@ -31,6 +31,7 @@ with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="task_demo.py",
+    runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
 ) as task:
@@ -93,6 +94,21 @@ resp = task.run.submit(value=8, runtime_key="factor-alpha")
 1. 任务更容易被回打到热 node
 2. 节点内更容易复用 runtime slot
 3. 减少代码切换和冷启动
+
+`runtime_key` 只影响热点复用，不负责 Python 版本筛选。
+
+如果你需要约束节点 Python 版本，请在创建客户端时传 `runtime`：
+
+```python
+with TaskSubmitter.from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    blob=blob,
+    filename="task_demo.py",
+    runtime=">=py3.11",
+    entry_module="task_demo",
+) as task:
+    ...
+```
 
 ## 5. 常用能力
 

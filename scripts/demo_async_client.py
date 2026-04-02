@@ -12,6 +12,8 @@ from pycloud_parallel.controlplane.client import ServiceGroup
 def main():
     suffix = int(time.time())
     # 同步方式（保留原有功能）
+    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
+    dependency_allowlist = []
     blob = (
         b"def pycloud_export(fn):\n"
         b"    fn.__pycloud_export__ = True\n"
@@ -42,11 +44,12 @@ def main():
         service_name=f"compute-service-{suffix}",
         blob=blob,
         filename="compute.py",
-        runtime="py3.11",
+        runtime="py3",
         entry_module="compute",
         entry_callable="square",
         export_mode="decorator",
         export_decorator="pycloud_export",
+        dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,
         healthy_only=True,

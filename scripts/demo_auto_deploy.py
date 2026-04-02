@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-自动依赖检测部署演示
+本地源码自动打包部署演示
 
-展示 DeployedService 和 TaskSubmitter 的自动依赖检测功能。
+展示 DeployedService 和 TaskSubmitter 如何直接接收函数对象，
+并自动打包本地源码依赖。
 """
 
 import sys
@@ -30,13 +31,13 @@ def demo_deployed_service_with_function():
         return {"result": result, "status": "ok"}
 
     try:
-        print("[1] 部署服务（自动检测依赖）...")
+        print("[1] 部署服务（自动打包本地源码依赖）...")
         print("-" * 70)
 
         group = DeployedService.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             func=process_data,  # ← 直接传函数对象
-            runtime="py3.11",
+            runtime="py3",
             worker_count=2,
             tags=["compute"],
             min_success_nodes=1,
@@ -84,13 +85,13 @@ def demo_task_submitter_with_function():
         return x ** 2
 
     try:
-        print("[1] 创建任务客户端（自动检测依赖）...")
+        print("[1] 创建任务客户端（自动打包本地源码依赖）...")
         print("-" * 70)
 
         submitter = TaskSubmitter.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             func=square,  # ← 直接传函数对象
-            runtime="py3.11",
+            runtime="py3",
             tags=["compute"],
         )
 
@@ -167,7 +168,8 @@ submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="my_module.py",
-    runtime="py3.11",
+    runtime="py3",
+    dependency_allowlist=["./third_party/my_local_pkg"],  # 可选
 )
 """)
     print()
@@ -179,14 +181,16 @@ submitter = TaskSubmitter.from_infocenter(
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     func=my_function,  # ← 一行搞定！
-    runtime="py3.11",
+    runtime="py3",
+    # 如果远端节点缺第三方包，可再显式传 dependency_allowlist
 )
 
 # 自动完成：
-# ✓ 分析函数依赖
-# ✓ 打包函数和依赖文件
+# ✓ 收集本地源码依赖
+# ✓ 打包函数所在模块 / package
 # ✓ 推断 entry_module 和 entry_callable
 # ✓ 上传到 PyCloud
+# 第三方包如果远端缺失，仍建议显式传 dependency_allowlist
 """)
     print()
 
@@ -194,7 +198,7 @@ submitter = TaskSubmitter.from_infocenter(
 def main():
     print()
     print("╔" + "=" * 68 + "╗")
-    print("║" + " " * 20 + "自动依赖检测部署演示" + " " * 28 + "║")
+    print("║" + " " * 18 + "本地源码自动打包部署演示" + " " * 26 + "║")
     print("╚" + "=" * 68 + "╝")
     print()
 
@@ -215,17 +219,17 @@ def main():
         print("✅ 新功能:")
         print("  1. ✅ DeployedService.deploy_from_infocenter(func=...)")
         print("  2. ✅ TaskSubmitter.from_infocenter(func=...)")
-        print("  3. ✅ 自动检测依赖并打包")
+        print("  3. ✅ 自动打包本地源码依赖")
         print("  4. ✅ 自动推断 entry_module 和 entry_callable")
         print()
         print("📋 使用方式:")
         print("  - 之前：需要手动打包代码或创建 blob")
-        print("  - 现在：直接传函数对象，自动处理一切")
+        print("  - 现在：直接传函数对象，自动处理本地源码打包")
         print()
         print("💡 提示:")
         print("  - 函数会被自动打包成 tar.gz")
-        print("  - 本地依赖模块会自动包含")
-        print("  - 标准库和第三方库假设目标环境已安装")
+        print("  - 本地源码依赖和 package 资源会自动包含")
+        print("  - 如果远端缺第三方包，可显式传 dependency_allowlist")
         print()
 
     except Exception as e:

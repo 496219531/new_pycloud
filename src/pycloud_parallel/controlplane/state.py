@@ -9,6 +9,7 @@ import inspect
 import multiprocessing as mp
 import os
 import queue
+import subprocess
 import secrets
 import shutil
 import sys
@@ -19,17 +20,29 @@ import uuid
 import zipfile
 from concurrent.futures import Future, ProcessPoolExecutor, TimeoutError as FutureTimeout
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from google.protobuf import json_format
 from google.protobuf import struct_pb2
 from google.protobuf import timestamp_pb2
 
 from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
+from pycloud_parallel.controlplane.runtime_spec import (
+    matches_python_runtime,
+    normalize_python_runtime_spec,
+)
+from pycloud_parallel.controlplane.serialization import (
+    convert_arrow_to_dict,
+    convert_dict_to_arrow,
+    dict_to_struct,
+    is_arrow_compatible,
+    serialize_arrow_compatible,
+    struct_to_dict,
+)
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -67,52 +80,8 @@ def _normalize_user_return(ret: Any) -> Tuple[str, Optional[dict], str, str]:
 
 
 def _serialize_result_for_json(obj: Any) -> Any:
-    """序列化返回值中的 Arrow 对象和 numpy 类型，使其可被 JSON 序列化。
-
-    Args:
-        obj: 用户函数返回值
-
-    Returns:
-        可 JSON 序列化的对象
-    """
-    # 处理 None
-    if obj is None:
-        return None
-
-    # 处理基本类型
-    if isinstance(obj, (str, int, float, bool)):
-        # 转换 numpy 标量类型为 Python 原生类型
-        if hasattr(obj, 'item'):
-            return obj.item()
-        return obj
-
-    # 处理 Arrow 兼容类型
-    try:
-        import pandas as pd
-        if isinstance(obj, pd.DataFrame):
-            return {"__type__": "DataFrame", "data": obj.to_dict(orient="records")}
-        if isinstance(obj, pd.Series):
-            return {"__type__": "Series", "data": obj.to_dict(), "name": obj.name}
-    except ImportError:
-        pass
-
-    try:
-        import numpy as np
-        if isinstance(obj, np.ndarray):
-            return {"__type__": "ndarray", "data": obj.tolist(), "dtype": str(obj.dtype)}
-        # 转换 numpy 标量类型
-        if isinstance(obj, (np.integer, np.floating, np.bool_)):
-            return obj.item()
-    except ImportError:
-        pass
-
-    # 处理容器类型
-    if isinstance(obj, dict):
-        return {k: _serialize_result_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_serialize_result_for_json(item) for item in obj]
-
-    return obj
+    """序列化返回值中的 Arrow 对象和 numpy 类型，使其可被 JSON 序列化。"""
+    return serialize_arrow_compatible(obj)
 
 
 _ROUTER_CACHE_LOCK = threading.Lock()
@@ -174,6 +143,157 @@ def _normalize_export_spec(
     return normalized_mode, normalized_methods, normalized_decorator
 
 
+def _validate_python_runtime_or_raise(*, node_python_version: str, runtime: str) -> str:
+    normalized_runtime = normalize_python_runtime_spec(runtime)
+    if not normalized_runtime:
+        return ""
+    if not matches_python_runtime(node_python_version, normalized_runtime):
+        raise ValueError(
+            f"runtime {normalized_runtime} is incompatible with node python_version {node_python_version}"
+        )
+    return normalized_runtime
+
+
+def _is_user_artifact_error(exc: BaseException) -> bool:
+    user_error_types = (
+        SyntaxError,
+        ImportError,
+        ModuleNotFoundError,
+        AttributeError,
+        NameError,
+        TypeError,
+        ValueError,
+    )
+    runtime_error_markers = (
+        "cannot load python module",
+        "entry_module is required",
+        "not found",
+        "not callable",
+        "no exported methods found",
+        "duplicate exported method",
+        "exported method cannot start with",
+    )
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, user_error_types):
+            return True
+        if isinstance(current, RuntimeError):
+            message = str(current)
+            if any(marker in message for marker in runtime_error_markers):
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _describe_artifact_error(
+    exc: BaseException,
+    *,
+    entry_module: str,
+    entry_callable: str,
+    package_format: str,
+) -> str:
+    if isinstance(exc, SyntaxError):
+        line = int(exc.lineno or 0)
+        filename = str(exc.filename or entry_module or "<artifact>")
+        if line > 0:
+            detail = f"SyntaxError at {filename}:{line}: {exc.msg}"
+        else:
+            detail = f"SyntaxError at {filename}: {exc.msg}"
+    else:
+        message = str(exc) or repr(exc)
+        detail = f"{exc.__class__.__name__}: {message}"
+    normalized_module = str(entry_module or "").strip() or "<auto>"
+    normalized_callable = str(entry_callable or "").strip() or "run"
+    normalized_format = _normalize_package_format(package_format, package_format or "artifact.py")
+    missing_import = _missing_import_name(exc)
+    repair_hint = (
+        f" Missing dependency `{missing_import}` detected; retry with dependency_allowlist if node-side install is allowed."
+        if missing_import
+        else ""
+    )
+    return (
+        "artifact validation failed while loading "
+        f"(entry_module={normalized_module}, entry_callable={normalized_callable}, package_format={normalized_format}): "
+        f"{detail}{repair_hint}"
+    )
+
+
+def _normalize_dependency_allowlist(requirements: Sequence[str]) -> Tuple[str, ...]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in requirements or ():
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _missing_import_name(exc: BaseException) -> str:
+    current: Optional[BaseException] = exc
+    while current is not None:
+        if isinstance(current, ModuleNotFoundError):
+            name = str(getattr(current, "name", "") or "").strip()
+            if name:
+                return name
+        current = current.__cause__ or current.__context__
+    return ""
+
+
+@contextmanager
+def _temporary_import_paths(*paths: str):
+    inserted: List[str] = []
+    for raw in paths:
+        path = str(raw or "").strip()
+        if not path:
+            continue
+        sys.path.insert(0, path)
+        inserted.append(path)
+    try:
+        yield
+    finally:
+        for path in reversed(inserted):
+            try:
+                sys.path.remove(path)
+            except ValueError:
+                pass
+
+
+def _install_dependency_allowlist(requirements: Sequence[str], *, target_dir: Path) -> None:
+    normalized = _normalize_dependency_allowlist(requirements)
+    if not normalized:
+        return
+    shutil.rmtree(target_dir, ignore_errors=True)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-input",
+        "--disable-pip-version-check",
+        "--target",
+        str(target_dir),
+        *normalized,
+    ]
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = str(completed.stderr or "").strip()
+        stdout = str(completed.stdout or "").strip()
+        detail = stderr or stdout or f"pip exited with code {completed.returncode}"
+        raise RuntimeError(f"dependency install failed for {list(normalized)}: {detail}")
+
+
 def _purge_module_tree(module_name: str) -> None:
     if not module_name:
         return
@@ -187,6 +307,7 @@ def _load_user_module(
     *,
     entry_module: str,
     package_format: str,
+    dependency_path: str = "",
 ):
     path = Path(artifact_path)
     format_name = _normalize_package_format(package_format, path.name)
@@ -200,8 +321,9 @@ def _load_user_module(
         if spec is None or spec.loader is None:
             raise RuntimeError(f"cannot load python module from {artifact_path}")
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        sys.modules[module_name] = module
+        with _temporary_import_paths(dependency_path):
+            spec.loader.exec_module(module)
+            sys.modules[module_name] = module
         return module
 
     if not entry_module:
@@ -213,14 +335,8 @@ def _load_user_module(
     if root_module:
         _purge_module_tree(root_module)
     _purge_module_tree(entry_module)
-    sys.path.insert(0, artifact_path)
-    try:
+    with _temporary_import_paths(dependency_path, artifact_path):
         return importlib.import_module(entry_module)
-    finally:
-        try:
-            sys.path.remove(artifact_path)
-        except ValueError:
-            pass
 
 
 def _purge_loaded_artifact_modules(
@@ -228,15 +344,33 @@ def _purge_loaded_artifact_modules(
     *,
     entry_module: str,
     package_format: str,
+    dependency_path: str = "",
 ) -> None:
     format_name = _normalize_package_format(package_format, Path(artifact_path).name)
     if format_name == "py":
         _purge_module_tree(_artifact_module_name(artifact_path))
-        return
-    root_module = str(entry_module or "").split(".", 1)[0].strip()
-    if root_module:
-        _purge_module_tree(root_module)
-    _purge_module_tree(str(entry_module or "").strip())
+    else:
+        root_module = str(entry_module or "").split(".", 1)[0].strip()
+        if root_module:
+            _purge_module_tree(root_module)
+        _purge_module_tree(str(entry_module or "").strip())
+
+    prefixes = [str(Path(artifact_path).resolve())]
+    if dependency_path:
+        prefixes.append(str(Path(dependency_path).resolve()))
+
+    for name, module in list(sys.modules.items()):
+        module_file = getattr(module, "__file__", None)
+        if module_file:
+            resolved_file = str(Path(module_file).resolve())
+            if any(resolved_file.startswith(prefix) for prefix in prefixes):
+                sys.modules.pop(name, None)
+                continue
+        module_paths = getattr(module, "__path__", None)
+        if module_paths:
+            resolved_paths = [str(Path(p).resolve()) for p in module_paths]
+            if any(any(path.startswith(prefix) for prefix in prefixes) for path in resolved_paths):
+                sys.modules.pop(name, None)
 
 
 def _build_callable_router(
@@ -322,6 +456,7 @@ def _load_callable_router(
     *,
     entry_module: str,
     package_format: str,
+    dependency_path: str,
     export_mode: str,
     export_methods: Sequence[str],
     export_decorator: str,
@@ -338,6 +473,7 @@ def _load_callable_router(
             artifact_path,
             entry_module,
             package_format,
+            dependency_path,
             mode,
             ",".join(methods),
             decorator,
@@ -353,6 +489,7 @@ def _load_callable_router(
         artifact_path,
         entry_module=entry_module,
         package_format=package_format,
+        dependency_path=dependency_path,
     )
     loaded = _build_callable_router(
         module,
@@ -371,6 +508,7 @@ def _discover_callable_methods(
     *,
     entry_module: str,
     package_format: str,
+    dependency_path: str,
     export_mode: str,
     export_methods: Sequence[str],
     export_decorator: str,
@@ -386,6 +524,7 @@ def _discover_callable_methods(
         artifact_path,
         entry_module=entry_module,
         package_format=package_format,
+        dependency_path=dependency_path,
     )
     try:
         _router, method_info = _build_callable_router(
@@ -401,7 +540,43 @@ def _discover_callable_methods(
             artifact_path,
             entry_module=entry_module,
             package_format=package_format,
+            dependency_path=dependency_path,
         )
+
+
+def _discover_callable_methods_or_raise_user_error(
+    artifact_path: str,
+    *,
+    entry_module: str,
+    package_format: str,
+    dependency_path: str,
+    export_mode: str,
+    export_methods: Sequence[str],
+    export_decorator: str,
+    entry_callable: str,
+) -> Dict[str, Tuple[str, str]]:
+    try:
+        return _discover_callable_methods(
+            artifact_path,
+            entry_module=entry_module,
+            package_format=package_format,
+            dependency_path=dependency_path,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            entry_callable=entry_callable,
+        )
+    except Exception as exc:
+        if _is_user_artifact_error(exc):
+            raise ValueError(
+                _describe_artifact_error(
+                    exc,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                )
+            ) from exc
+        raise
 
 
 def _validate_arrow_compatible(obj: Any) -> None:
@@ -506,6 +681,7 @@ def _execute_payload_in_subprocess(
     artifact_path: str,
     entry_module: str,
     package_format: str,
+    dependency_path: str,
     export_mode: str,
     export_methods: Sequence[str],
     export_decorator: str,
@@ -523,11 +699,27 @@ def _execute_payload_in_subprocess(
             artifact_path,
             entry_module=entry_module,
             package_format=package_format,
+            dependency_path=dependency_path,
             export_mode=export_mode,
             export_methods=export_methods,
             export_decorator=export_decorator,
             entry_callable=entry_callable,
         )
+    except Exception as exc:
+        if _is_user_artifact_error(exc):
+            return (
+                "FAILED_USER",
+                None,
+                "ArtifactLoadError",
+                _describe_artifact_error(
+                    exc,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                ),
+            )
+        return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc))
+    try:
         method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
         fn = router.get(method)
         if fn is None:
@@ -571,143 +763,6 @@ def ts_to_dt(ts: timestamp_pb2.Timestamp) -> datetime:
         return utc_now()
 
 
-def struct_to_dict(data: struct_pb2.Struct) -> dict:
-    """将 protobuf Struct 转换为字典。
-
-    自动将标记为 DataFrame/Series 的字典转换回原始对象。
-
-    Args:
-        data: protobuf Struct 对象
-
-    Returns:
-        dict: 转换后的字典，DataFrame/Series 自动还原
-    """
-    result = json_format.MessageToDict(data, preserving_proto_field_name=True)
-    return convert_dict_to_arrow(result)
-
-
-def convert_dict_to_arrow(data: Any) -> Any:
-    """将字典转换回 Arrow 对象。
-
-    Args:
-        data: 字典或特殊标记的对象
-
-    Returns:
-        还原后的对象（DataFrame/Series/ndarray）
-    """
-    if isinstance(data, dict):
-        # 检查类型标记
-        obj_type = data.get("__type__")
-        if obj_type == "DataFrame":
-            try:
-                import pandas as pd
-                return pd.DataFrame(data["data"])
-            except ImportError:
-                raise RuntimeError("pandas not available, cannot deserialize DataFrame")
-        elif obj_type == "Series":
-            try:
-                import pandas as pd
-                return pd.Series(data["data"], name=data.get("name"))
-            except ImportError:
-                raise RuntimeError("pandas not available, cannot deserialize Series")
-        elif obj_type == "ndarray":
-            try:
-                import numpy as np
-                return np.array(data["data"], dtype=data.get("dtype"))
-            except ImportError:
-                raise RuntimeError("numpy not available, cannot deserialize ndarray")
-
-        # 递归处理嵌套字典
-        return {k: convert_dict_to_arrow(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [convert_dict_to_arrow(item) for item in data]
-    else:
-        return data
-
-
-def dict_to_struct(data: Optional[dict]) -> struct_pb2.Struct:
-    """将字典转换为 protobuf Struct。
-
-    自动处理 Arrow 兼容类型（DataFrame, Series）。
-
-    Args:
-        data: 输入字典或 Arrow 兼容对象
-
-    Returns:
-        struct_pb2.Struct: protobuf Struct 对象
-    """
-    out = struct_pb2.Struct()
-    if data:
-        # 处理 Arrow 兼容对象
-        if is_arrow_compatible(data):
-            data = convert_arrow_to_dict(data)
-        out.update(data)
-    return out
-
-
-def is_arrow_compatible(obj: Any) -> bool:
-    """检查对象是否 Arrow 兼容。
-
-    Arrow 兼容类型可以直接转换为 dict 格式：
-    - pd.DataFrame
-    - pd.Series
-    - np.ndarray (基础类型)
-    - 以及嵌套结构
-
-    Args:
-        obj: 要检查的对象
-
-    Returns:
-        bool: 是否 Arrow 兼容
-    """
-    # 检查 pandas
-    try:
-        import pandas as pd
-        if isinstance(obj, (pd.DataFrame, pd.Series)):
-            return True
-    except ImportError:
-        pass
-
-    # 检查 numpy array
-    try:
-        import numpy as np
-        if isinstance(obj, np.ndarray):
-            # 只支持基础类型数组
-            return obj.dtype.kind in ('i', 'u', 'f', 'b', 'U', 'S')
-    except ImportError:
-        pass
-
-    return False
-
-
-def convert_arrow_to_dict(obj: Any) -> dict:
-    """将 Arrow 兼容对象转换为字典。
-
-    Args:
-        obj: Arrow 兼容对象（DataFrame, Series, ndarray）
-
-    Returns:
-        dict: 可序列化的字典
-    """
-    try:
-        import pandas as pd
-        if isinstance(obj, pd.DataFrame):
-            # 转换为 JSON records 格式（HTTP 兼容）
-            return {"__type__": "DataFrame", "data": obj.to_dict(orient="records")}
-        if isinstance(obj, pd.Series):
-            return {"__type__": "Series", "data": obj.to_dict(), "name": obj.name}
-    except ImportError:
-        pass
-
-    try:
-        import numpy as np
-        if isinstance(obj, np.ndarray):
-            # 转换为 list（HTTP 兼容）
-            return {"__type__": "ndarray", "data": obj.tolist(), "dtype": str(obj.dtype)}
-    except ImportError:
-        pass
-
-    raise TypeError(f"Cannot convert {type(obj)} to dict: not Arrow compatible")
 
 
 @dataclass
@@ -764,6 +819,7 @@ class NodeState:
     queue_capacity: int
     tags: List[str] = field(default_factory=list)
     version: str = ""
+    python_version: str = ""
     metadata: Dict[str, str] = field(default_factory=dict)
     healthy: bool = True
     last_seen_at: datetime = field(default_factory=utc_now)
@@ -806,6 +862,7 @@ class InfoCenterState:
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        python_version: str = "",
     ) -> NodeState:
         now = utc_now()
         with self._lock:
@@ -816,6 +873,7 @@ class InfoCenterState:
                     control_addr=control_addr,
                     capacity=max(1, capacity),
                     queue_capacity=max(1, queue_capacity),
+                    python_version=str(python_version or "").strip(),
                 )
                 self._nodes[node_id] = state
             state.control_addr = control_addr
@@ -823,6 +881,7 @@ class InfoCenterState:
             state.queue_capacity = max(1, queue_capacity)
             state.tags = list(tags or [])
             state.version = str(version or "")
+            state.python_version = str(python_version or state.python_version or "").strip()
             state.metadata = dict(metadata or {})
             state.healthy = True
             state.last_seen_at = now
@@ -848,6 +907,7 @@ class InfoCenterState:
             active_runtimes=(),
             service_worker_capacity=int(metadata.get("service_worker_capacity", "0") or 0),
             service_worker_used=int(metadata.get("service_worker_used", "0") or 0),
+            python_version=metadata.get("python_version", ""),
         )
 
     def heartbeat_record(
@@ -860,6 +920,7 @@ class InfoCenterState:
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        python_version: str = "",
     ) -> Optional[NodeState]:
         now = utc_now()
         with self._lock:
@@ -871,6 +932,8 @@ class InfoCenterState:
             if metrics is not None:
                 state.metrics = metrics
             state.services = dict(services or {})
+            if python_version:
+                state.python_version = str(python_version).strip()
             if active_runtimes is not None:
                 state.active_runtimes = [str(x).strip() for x in active_runtimes if str(x).strip()]
             if service_worker_capacity > 0:
@@ -975,6 +1038,7 @@ class InfoCenterState:
                         queue_capacity=state.queue_capacity,
                         tags=list(state.tags),
                         version=state.version,
+                        python_version=state.python_version,
                         metadata=dict(state.metadata),
                         healthy=is_healthy,
                         last_seen_at=state.last_seen_at,
@@ -1016,6 +1080,7 @@ class InfoCenterState:
                 queue_capacity=state.queue_capacity,
                 tags=list(state.tags),
                 version=state.version,
+                python_version=state.python_version,
                 metadata=dict(state.metadata),
                 healthy=state.healthy,
                 last_seen_at=state.last_seen_at,
@@ -1049,6 +1114,8 @@ class CodeArtifact:
     export_mode: str
     export_methods: Tuple[str, ...]
     export_decorator: str
+    dependency_allowlist: Tuple[str, ...]
+    dependency_path: str
     size_bytes: int
     created_at: datetime
 
@@ -1217,6 +1284,9 @@ class NodeControlState:
         self._services: Dict[str, ServiceSession] = {}
         self._result_hook = InMemoryResultHook()
 
+        # 检测并保存当前 Python 版本
+        self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
+
         self._artifact_dir = Path(artifact_dir)
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1263,6 +1333,82 @@ class NodeControlState:
     @property
     def artifact_dir(self) -> Path:
         return self._artifact_dir
+
+    def _dependency_dir_for_code_version(self, code_version: str) -> Path:
+        digest = str(code_version or "").replace("sha256:", "").strip().lower()
+        if not digest:
+            raise ValueError("invalid code_version for dependency directory")
+        return self._artifact_dir / f"{digest}_deps"
+
+    def _validate_artifact_methods(
+        self,
+        artifact: CodeArtifact,
+        *,
+        dependency_path: str,
+    ) -> Dict[str, Tuple[str, str]]:
+        return _discover_callable_methods(
+            artifact.path,
+            entry_module=artifact.entry_module,
+            package_format=artifact.package_format,
+            dependency_path=dependency_path,
+            export_mode=artifact.export_mode,
+            export_methods=artifact.export_methods,
+            export_decorator=artifact.export_decorator,
+            entry_callable=artifact.entry_callable,
+        )
+
+    def _ensure_artifact_ready(
+        self,
+        artifact: CodeArtifact,
+        *,
+        dependency_allowlist: Sequence[str],
+    ) -> Dict[str, Tuple[str, str]]:
+        normalized_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
+        installed_dependency_path = str(artifact.dependency_path or "").strip()
+        if artifact.dependency_allowlist and normalized_allowlist and artifact.dependency_allowlist != normalized_allowlist:
+            raise ValueError(
+                "cached code_version exists with different dependency_allowlist: "
+                f"existing={list(artifact.dependency_allowlist)} incoming={list(normalized_allowlist)}"
+            )
+
+        try:
+            return self._validate_artifact_methods(artifact, dependency_path=installed_dependency_path)
+        except Exception as exc:
+            if not normalized_allowlist or not _missing_import_name(exc):
+                if _is_user_artifact_error(exc):
+                    raise ValueError(
+                        _describe_artifact_error(
+                            exc,
+                            entry_module=artifact.entry_module,
+                            entry_callable=artifact.entry_callable,
+                            package_format=artifact.package_format,
+                        )
+                    ) from exc
+                raise
+
+            target_dir = self._dependency_dir_for_code_version(artifact.code_version)
+            created_dir = False
+            try:
+                _install_dependency_allowlist(normalized_allowlist, target_dir=target_dir)
+                created_dir = True
+                method_info = self._validate_artifact_methods(artifact, dependency_path=str(target_dir))
+            except Exception as repair_exc:
+                if created_dir:
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                if _is_user_artifact_error(repair_exc):
+                    raise ValueError(
+                        _describe_artifact_error(
+                            repair_exc,
+                            entry_module=artifact.entry_module,
+                            entry_callable=artifact.entry_callable,
+                            package_format=artifact.package_format,
+                        )
+                    ) from repair_exc
+                raise
+
+            artifact.dependency_allowlist = normalized_allowlist
+            artifact.dependency_path = str(target_dir)
+            return method_info
 
     def service_worker_used(self) -> int:
         with self._lock:
@@ -1319,9 +1465,11 @@ class NodeControlState:
         export_mode: str = "",
         export_methods: Sequence[str] = (),
         export_decorator: str = "",
+        dependency_allowlist: Sequence[str] = (),
         uploaded_path: str,
         actual_sha256: str,
         size_bytes: int,
+        validate_load: bool = False,
     ) -> Tuple[CodeArtifact, bool]:
         expected = str(sha256 or "").replace("sha256:", "").strip().lower()
         digest = str(actual_sha256 or "").strip().lower()
@@ -1331,12 +1479,22 @@ class NodeControlState:
             raise ValueError(f"sha256 mismatch: expected={expected}, actual={digest}")
 
         code_version = f"sha256:{digest}"
+        normalized_dependency_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
         with self._lock:
             existing = self._codes.get(code_version)
             if existing is not None:
+                if validate_load:
+                    self._ensure_artifact_ready(
+                        existing,
+                        dependency_allowlist=normalized_dependency_allowlist,
+                    )
                 return existing, True
 
         normalized_format = _normalize_package_format(package_format, filename)
+        normalized_runtime = _validate_python_runtime_or_raise(
+            node_python_version=self.python_version,
+            runtime=runtime,
+        )
         normalized_callable = str(entry_callable or "").strip() or "run"
         normalized_module = str(entry_module or "").strip()
         if not normalized_module and normalized_format == "py":
@@ -1358,10 +1516,12 @@ class NodeControlState:
             raise ValueError(f"uploaded file missing: {uploaded_path}")
 
         now = utc_now()
+        cleanup_paths: List[Path] = []
         if normalized_format == "py":
             final_path = self._artifact_dir / f"{digest}.py"
             os.replace(str(tmp_path), str(final_path))
             artifact_exec_path = str(final_path)
+            cleanup_paths.append(final_path)
         else:
             ext = "tar.gz" if normalized_format == "tar.gz" else normalized_format
             archive_path = self._artifact_dir / f"{digest}.{ext}"
@@ -1369,20 +1529,38 @@ class NodeControlState:
             extract_dir = self._artifact_dir / f"{digest}_pkg"
             self._extract_archive(archive_path=archive_path, package_format=normalized_format, out_dir=extract_dir)
             artifact_exec_path = str(extract_dir)
+            cleanup_paths.extend((archive_path, extract_dir))
 
         artifact = CodeArtifact(
             code_version=code_version,
             path=artifact_exec_path,
-            runtime=str(runtime or "").strip(),
+            runtime=normalized_runtime,
             entry_module=normalized_module,
             entry_callable=normalized_callable,
             package_format=normalized_format,
             export_mode=normalized_export_mode,
             export_methods=normalized_export_methods,
             export_decorator=normalized_export_decorator,
+            dependency_allowlist=normalized_dependency_allowlist,
+            dependency_path="",
             size_bytes=max(0, int(size_bytes)),
             created_at=now,
         )
+        if validate_load:
+            try:
+                self._ensure_artifact_ready(
+                    artifact,
+                    dependency_allowlist=normalized_dependency_allowlist,
+                )
+            except Exception:
+                for target in cleanup_paths:
+                    if target.is_dir():
+                        shutil.rmtree(target, ignore_errors=True)
+                    else:
+                        target.unlink(missing_ok=True)
+                if artifact.dependency_path:
+                    shutil.rmtree(artifact.dependency_path, ignore_errors=True)
+                raise
         with self._lock:
             self._codes[code_version] = artifact
         return artifact, False
@@ -1399,7 +1577,9 @@ class NodeControlState:
         export_mode: str = "",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "",
+        dependency_allowlist: Sequence[str] = (),
         chunks: Iterable[bytes],
+        validate_load: bool = False,
     ) -> Tuple[CodeArtifact, bool]:
         h = hashlib.sha256()
         size = 0
@@ -1425,9 +1605,11 @@ class NodeControlState:
                 export_mode=export_mode,
                 export_methods=list(export_methods or ()),
                 export_decorator=export_decorator,
+                dependency_allowlist=dependency_allowlist,
                 uploaded_path=str(tmp_path),
                 actual_sha256=h.hexdigest(),
                 size_bytes=size,
+                validate_load=validate_load,
             )
         finally:
             if tmp_path.exists():
@@ -1451,6 +1633,7 @@ class NodeControlState:
         export_mode: str = "",
         export_methods: Sequence[str] = (),
         export_decorator: str = "",
+        dependency_allowlist: Sequence[str] = (),
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -1470,16 +1653,13 @@ class NodeControlState:
             export_mode=export_mode,
             export_methods=export_methods,
             export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
             chunks=chunks,
+            validate_load=True,
         )
-        method_info = _discover_callable_methods(
-            artifact.path,
-            entry_module=artifact.entry_module,
-            package_format=artifact.package_format,
-            export_mode=artifact.export_mode,
-            export_methods=artifact.export_methods,
-            export_decorator=artifact.export_decorator,
-            entry_callable=artifact.entry_callable,
+        method_info = self._ensure_artifact_ready(
+            artifact,
+            dependency_allowlist=dependency_allowlist,
         )
 
         requested_workers = max(1, worker_count or self.service_default_worker_count)
@@ -1623,6 +1803,7 @@ class NodeControlState:
                 artifact.path,
                 artifact.entry_module,
                 artifact.package_format,
+                artifact.dependency_path,
                 artifact.export_mode,
                 artifact.export_methods,
                 artifact.export_decorator,
@@ -2012,6 +2193,15 @@ class NodeControlState:
             rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
             return [runtime_key for _hot, _queued, _last_used, runtime_key in rows[: max(1, int(limit))]]
 
+    @property
+    def python_version(self) -> str:
+        """获取节点的 Python 版本。
+
+        Returns:
+            str: Python 版本，如 "py3.11", "py3.10"
+        """
+        return self._python_version
+
     def credit_locked(self) -> int:
         return max(0, self.queue_capacity - (self._queued_count_locked() + self._inflight_count_locked()))
 
@@ -2153,6 +2343,7 @@ class NodeControlState:
                     artifact.path,
                     artifact.entry_module,
                     artifact.package_format,
+                    artifact.dependency_path,
                     artifact.export_mode,
                     artifact.export_methods,
                     artifact.export_decorator,

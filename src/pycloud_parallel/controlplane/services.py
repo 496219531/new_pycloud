@@ -160,9 +160,11 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 export_mode=export_spec.mode,
                 export_methods=list(export_spec.methods),
                 export_decorator=export_spec.decorator,
+                dependency_allowlist=list(meta.dependency_allowlist),
                 uploaded_path=tmp_path,
                 actual_sha256=h.hexdigest(),
                 size_bytes=size_bytes,
+                validate_load=True,
             )
         except ValueError as exc:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
@@ -671,6 +673,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 export_mode=export_spec.mode,
                 export_methods=list(export_spec.methods),
                 export_decorator=export_spec.decorator,
+                dependency_allowlist=list(meta.dependency_allowlist),
                 worker_count=meta.worker_count,
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
                 idle_ttl_sec=meta.idle_ttl_sec,

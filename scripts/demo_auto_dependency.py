@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-自动依赖检测演示
+本地源码自动打包演示
 
 展示如何使用 DependencyAnalyzer 和 DependencyPackager
-自动检测函数/模块的依赖并打包。
+分析函数/模块的本地源码依赖并打包。
 """
 
 import sys
@@ -145,7 +145,7 @@ def process_data(data):
 def demo_auto_packaging():
     """演示 3: 自动打包"""
     print("=" * 70)
-    print("  演示 3: 自动打包函数和依赖")
+    print("  演示 3: 自动打包函数和本地源码依赖")
     print("=" * 70)
     print()
 
@@ -269,7 +269,7 @@ def demo_module_analysis():
 def main():
     print()
     print("╔" + "=" * 68 + "╗")
-    print("║" + " " * 15 + "自动依赖检测演示" + " " * 33 + "║")
+    print("║" + " " * 13 + "本地源码自动打包演示" + " " * 31 + "║")
     print("╚" + "=" * 68 + "╝")
     print()
 
@@ -284,7 +284,7 @@ def main():
         print("  所有演示完成!")
         print("=" * 70)
         print()
-        print("✅ 自动依赖检测功能:")
+        print("✅ 本地源码自动打包功能:")
         print("  1. ✅ 分析函数的 import 语句")
         print("  2. ✅ 区分标准库、第三方库、本地模块")
         print("  3. ✅ 自动查找本地依赖文件")

@@ -10,6 +10,8 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 def main():
     # 任务代码
+    # 如果任务代码依赖节点未预装的包，可显式填 dependency_allowlist。
+    dependency_allowlist = []
     blob = (
         b"def run(value, sleep_ms=0, should_fail=False):\n"
         b"    if sleep_ms > 0:\n"
@@ -33,9 +35,10 @@ def main():
         infocenter_target="127.0.0.1:50051",
         blob=blob,
         filename="task_demo.py",
-        runtime="py3.11",
+        runtime="py3",
         entry_module="task_demo",
         entry_callable="run",
+        dependency_allowlist=dependency_allowlist,
         tags=["compute"],
         node_count=2,
     )

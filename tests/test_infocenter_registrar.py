@@ -8,6 +8,7 @@ import time
 from pycloud_parallel.controlplane.client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
+from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -56,8 +57,8 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert _wait_until(lambda: len(infocenter.list_nodes(healthy_only=True, tags=["compute"], limit=20)) >= 1)
 
             blob = (
-                b"def run(payload):\n"
-                b"    value = int(payload.get('value', 0))\n"
+                b"def run(value=0, **_kwargs):\n"
+                b"    value = int(value)\n"
                 b"    return {'value': value, 'square': value * value}\n"
             )
             digest = hashlib.sha256(blob).hexdigest()
@@ -66,7 +67,7 @@ def test_node_registrar_syncs_service_routes(tmp_path):
                 service_name="svc-reg-sync",
                 filename="svc_reg.py",
                 sha256=f"sha256:{digest}",
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="svc_reg",
                 entry_callable="run",
                 worker_count=2,
@@ -248,6 +249,83 @@ def test_infocenter_client_select_task_nodes_accepts_explicit_node_ids():
         info_server.stop()
 
 
+def test_runtime_spec_helpers_support_exact_major_and_comparators():
+    assert normalize_python_runtime_spec("3.11") == "py3.11"
+    assert normalize_python_runtime_spec(">=3.11") == ">=py3.11"
+    assert matches_python_runtime("py3.13", "py3") is True
+    assert matches_python_runtime("py3.13", "py3.11") is False
+    assert matches_python_runtime("py3.13", ">=py3.11") is True
+    assert matches_python_runtime("py3.10", ">=py3.11") is False
+
+
+def test_infocenter_client_select_task_nodes_filters_by_python_runtime():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-py310",
+                control_addr="127.0.0.1:50101",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+                python_version="py3.10",
+            )
+            client.register_node(
+                node_id="node-py311",
+                control_addr="127.0.0.1:50102",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+                python_version="py3.11",
+            )
+            client.register_node(
+                node_id="node-py313",
+                control_addr="127.0.0.1:50103",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+                python_version="py3.13",
+            )
+
+            for node_id in ("node-py310", "node-py311", "node-py313"):
+                client.heartbeat_node(
+                    node_id=node_id,
+                    healthy=True,
+                    metrics={"queued": 0, "inflight": 0, "running": 0, "credit": 8},
+                    python_version={
+                        "node-py310": "py3.10",
+                        "node-py311": "py3.11",
+                        "node-py313": "py3.13",
+                    }[node_id],
+                )
+
+            selected_exact = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    tags=["compute"],
+                    node_count=10,
+                    runtime="py3.11",
+                )
+            )
+            assert [node.node_id for node in selected_exact] == ["node-py311"]
+
+            selected_ge = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    tags=["compute"],
+                    node_count=10,
+                    runtime=">=py3.11",
+                )
+            )
+            assert [node.node_id for node in selected_ge] == ["node-py311", "node-py313"]
+    finally:
+        info_server.stop()
+
+
 def test_node_registrar_syncs_active_runtimes(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
@@ -280,8 +358,8 @@ def test_node_registrar_syncs_active_runtimes(tmp_path):
     try:
         blob = (
             b"import time\n"
-            b"def run(payload):\n"
-            b"    sleep_ms = int(payload.get('sleep_ms', 0))\n"
+            b"def run(sleep_ms=0, **_kwargs):\n"
+            b"    sleep_ms = int(sleep_ms)\n"
             b"    if sleep_ms > 0:\n"
             b"        time.sleep(sleep_ms / 1000.0)\n"
             b"    return {'ok': True}\n"
@@ -290,7 +368,7 @@ def test_node_registrar_syncs_active_runtimes(tmp_path):
         artifact, _ = node_state.put_code(
             sha256=f"sha256:{digest}",
             filename="runtime_registrar_demo.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="runtime_registrar_demo",
             entry_callable="run",
             chunks=[blob],
@@ -317,11 +395,17 @@ def test_node_registrar_syncs_active_runtimes(tmp_path):
         with InfoCenterClient(info_target, timeout_sec=5.0) as client:
             assert _wait_until(
                 lambda: any(
-                    node.node_id == "node-reg-runtime-01" and "runtime-hot-sync" in node.active_runtimes
+                    node.node_id == "node-reg-runtime-01"
+                    and "runtime-hot-sync" in node.active_runtimes
+                    and node.python_version == node_state.python_version
                     for node in client.list_nodes(healthy_only=True, tags=["task"], limit=20)
                 ),
                 timeout_sec=6.0,
             )
+
+            nodes = list(client.list_nodes(healthy_only=True, tags=["task"], limit=20))
+            target = next(node for node in nodes if node.node_id == "node-reg-runtime-01")
+            assert target.python_version == node_state.python_version
     finally:
         registrar.close()
         node_state.close()

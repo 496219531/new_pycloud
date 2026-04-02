@@ -70,8 +70,8 @@ blob = (
     b"    fn.__pycloud_export__ = True\n"
     b"    return fn\n\n"
     b"@pycloud_export\n"
-    b"def square(payload):\n"
-    b"    x = int(payload.get('x', 0))\n"
+    b"def square(x=0, **_kwargs):\n"
+    b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
@@ -80,6 +80,7 @@ group = DeployedService.deploy_from_infocenter(
     service_name="square-service",
     blob=blob,
     filename="square_service.py",
+    runtime="py3",
     entry_module="square_service",
     export_mode="decorator",
     node_count=1,
@@ -146,6 +147,13 @@ curl -X POST 'http://127.0.0.1:50051/svc/square-service/call/square' \
 
 ```python
 print(client.methods)
+```
+
+另外，Gateway 调服务时默认把 JSON body 展开成 kwargs，所以服务函数推荐写成：
+
+```python
+def square(x=0, **_kwargs):
+    ...
 ```
 
 ### 6.3 Gateway 可以发任务吗

@@ -82,6 +82,89 @@ stop_process() {
     fi
 }
 
+wait_controlplane_ready() {
+    local port=$1
+    local timeout_sec=${2:-15}
+    python - "$port" "$timeout_sec" <<'PY'
+import json
+import sys
+import time
+from urllib.request import urlopen
+
+port = int(sys.argv[1])
+timeout_sec = float(sys.argv[2])
+deadline = time.time() + timeout_sec
+url = f"http://127.0.0.1:{port}/nodes?healthy_only=false&limit=1"
+
+while time.time() < deadline:
+    try:
+        with urlopen(url, timeout=1.0) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        if isinstance(data, dict) and data.get("ok") is True:
+            raise SystemExit(0)
+    except Exception:
+        time.sleep(0.2)
+
+raise SystemExit(1)
+PY
+}
+
+check_http_endpoint() {
+    local url=$1
+    local timeout_sec=${2:-5}
+    python - "$url" "$timeout_sec" <<'PY'
+import sys
+from urllib.request import urlopen
+
+url = sys.argv[1]
+timeout_sec = float(sys.argv[2])
+
+try:
+    with urlopen(url, timeout=timeout_sec) as resp:
+        status = int(getattr(resp, "status", 0) or 0)
+        if 200 <= status < 300:
+            raise SystemExit(0)
+except Exception:
+    pass
+
+raise SystemExit(1)
+PY
+}
+
+wait_node_registered() {
+    local infocenter_target=$1
+    local node_id=$2
+    local timeout_sec=${3:-15}
+    python - "$infocenter_target" "$node_id" "$timeout_sec" <<'PY'
+import json
+import sys
+import time
+from urllib.request import urlopen
+
+target = str(sys.argv[1]).strip()
+node_id = sys.argv[2]
+timeout_sec = float(sys.argv[3])
+deadline = time.time() + timeout_sec
+if not target.startswith(("http://", "https://")):
+    target = f"http://{target}"
+url = f"{target.rstrip('/')}/nodes?healthy_only=false&limit=500"
+
+while time.time() < deadline:
+    try:
+        with urlopen(url, timeout=1.0) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        if isinstance(data, dict):
+            nodes = data.get("nodes") or []
+            if any(str(item.get("node_id", "")) == node_id for item in nodes if isinstance(item, dict)):
+                raise SystemExit(0)
+    except Exception:
+        pass
+    time.sleep(0.2)
+
+raise SystemExit(1)
+PY
+}
+
 # =============================================================================
 # 启动函数
 # =============================================================================
@@ -98,13 +181,13 @@ start_controlplane() {
         >> "$LOG_DIR/controlplane.log" 2>&1 &
 
     local pid=$!
-    echo $pid > "$PID_DIR/controlplane.pid"
-    sleep 1
 
-    if kill -0 "$pid" 2>/dev/null; then
+    if kill -0 "$pid" 2>/dev/null && wait_controlplane_ready "$port" 15; then
+        echo $pid > "$PID_DIR/controlplane.pid"
         log_success "ControlPlane started (PID: $pid, Port: $port)"
         return 0
     else
+        rm -f "$PID_DIR/controlplane.pid"
         log_error "ControlPlane failed to start"
         return 1
     fi
@@ -132,13 +215,13 @@ start_node() {
         >> "$LOG_DIR/${name}.log" 2>&1 &
 
     local pid=$!
-    echo $pid > "$PID_DIR/${name}.pid"
-    sleep 1
 
-    if kill -0 "$pid" 2>/dev/null; then
+    if kill -0 "$pid" 2>/dev/null && wait_node_registered "$infocenter" "$name" 15; then
+        echo $pid > "$PID_DIR/${name}.pid"
         log_success "$name started (PID: $pid, Port: $port, HTTP: $http_port)"
         return 0
     else
+        rm -f "$PID_DIR/${name}.pid"
         log_error "$name failed to start"
         return 1
     fi
@@ -237,6 +320,16 @@ case "${1:-start}" in
                     echo -e "  ${GREEN}●${NC} $name (PID: $pid) - RUNNING"
                     return 0
                 else
+                    rm -f "$pid_file"
+                    if [ -n "$match_pattern" ]; then
+                        local recovered_pid
+                        recovered_pid=$(pgrep -f "$match_pattern" 2>/dev/null | head -n 1)
+                        if [ -n "$recovered_pid" ]; then
+                            echo "$recovered_pid" > "$pid_file"
+                            echo -e "  ${GREEN}●${NC} $name (PID: $recovered_pid) - RUNNING"
+                            return 0
+                        fi
+                    fi
                     echo -e "  ${RED}●${NC} $name - DEAD (stale PID file)"
                     return 1
                 fi
@@ -265,14 +358,17 @@ case "${1:-start}" in
         echo "  ------------------------------------------"
         python - "$INFOCENTER_PORT" <<'PY'
 from collections import defaultdict
+from contextlib import redirect_stdout
+import io
 import sys
 
 target = f"127.0.0.1:{sys.argv[1]}"
 try:
     from pycloud_parallel.controlplane.client import InfoCenterClient
     with InfoCenterClient(target, timeout_sec=3) as client:
-        nodes = list(client.list_nodes(healthy_only=False, limit=500))
-        routes = list(client.list_service_routes(healthy_only=False, limit=5000))
+        with redirect_stdout(io.StringIO()):
+            nodes = list(client.list_nodes(healthy_only=False, limit=500))
+            routes = list(client.list_service_routes(healthy_only=False, limit=5000))
 except Exception as exc:
     print(f"  (query failed: {exc})")
     raise SystemExit(0)
@@ -289,10 +385,11 @@ if not nodes:
 else:
     for node in sorted(nodes, key=lambda x: x.node_id):
         names = sorted(service_names.get(node.node_id, set()))
+        pyver = (getattr(node, "python_version", "") or "").strip() or "unknown"
         if names:
-            print(f"  - {node.node_id}: {', '.join(names)}")
+            print(f"  - {node.node_id} [{pyver}]: {', '.join(names)}")
         else:
-            print(f"  - {node.node_id}: (none)")
+            print(f"  - {node.node_id} [{pyver}]: (none)")
 PY
 
         echo ""
@@ -320,18 +417,46 @@ PY
         esac
         ;;
 
+    health)
+        echo "============================================"
+        echo "  HTTP Health Check"
+        echo "============================================"
+        echo ""
+
+        base_url="http://127.0.0.1:$INFOCENTER_PORT"
+        overall_status=0
+
+        if check_http_endpoint "$base_url/nodes?healthy_only=false&limit=1" 5; then
+            echo -e "  ${GREEN}●${NC} controlplane /nodes - OK"
+        else
+            echo -e "  ${RED}●${NC} controlplane /nodes - FAILED"
+            overall_status=1
+        fi
+
+        if check_http_endpoint "$base_url/ops" 5; then
+            echo -e "  ${GREEN}●${NC} controlplane /ops - OK"
+        else
+            echo -e "  ${RED}●${NC} controlplane /ops - FAILED"
+            overall_status=1
+        fi
+
+        echo ""
+        exit $overall_status
+        ;;
+
     *)
         echo "============================================"
         echo "  PyCloud Services Controller"
         echo "============================================"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|logs}"
+        echo "Usage: $0 {start|stop|restart|status|health|logs}"
         echo ""
         echo "Commands:"
         echo "  start   - Start ControlPlane + 2 Nodes (default)"
         echo "  stop    - Stop all services"
         echo "  restart - Restart all services"
         echo "  status  - Check service status"
+        echo "  health  - Check ControlPlane HTTP health"
         echo "  logs    - View logs (default: all)"
         echo ""
         echo "  logs controlplane - View ControlPlane (InfoCenter + Gateway) logs"

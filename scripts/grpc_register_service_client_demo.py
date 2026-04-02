@@ -3,6 +3,8 @@ import time
 
 def main():
     # 你的业务代码（也可以用 artifact_path 指向本地 .py 文件）
+    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
+    dependency_allowlist = []
     blob = (
         b"def pycloud_export(fn):\n"
         b"    fn.__pycloud_export__ = True\n"
@@ -19,11 +21,12 @@ def main():
         service_name=f"square-service",
         blob=blob,
         filename="square_service.py",
-        runtime="py3.11",
+        runtime="py3",
         entry_module="square_service",
         entry_callable="square",
         export_mode="decorator",
         export_decorator="pycloud_export",
+        dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,
         healthy_only=True,

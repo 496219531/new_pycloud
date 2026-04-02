@@ -50,7 +50,7 @@ def main():
             service_name=service_name,
             blob=blob,
             filename="args_demo.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="args_demo",
             export_mode="decorator",
             export_decorator="pycloud_export",

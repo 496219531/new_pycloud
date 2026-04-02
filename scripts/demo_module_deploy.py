@@ -3,6 +3,7 @@
 模块对象部署演示
 
 展示 DeployedService 和 TaskSubmitter 的模块对象自动部署功能。
+当前会自动打包模块对应的本地 package 树与资源文件。
 """
 
 import sys
@@ -90,13 +91,13 @@ def demo_task_submitter_with_module():
     print()
 
     try:
-        print("[2] 部署模块（自动检测依赖）...")
+        print("[2] 部署模块（自动打包本地 package）...")
         print("-" * 70)
 
         submitter = TaskSubmitter.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             module=my_processor,  # ← 直接传模块对象！
-            runtime="py3.11",
+            runtime="py3",
             tags=["compute"],
         )
 
@@ -156,7 +157,7 @@ def demo_comparison():
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     artifact_path="./my_module.py",
-    runtime="py3.11",
+    runtime="py3",
 )
 """)
     print()
@@ -170,7 +171,7 @@ def square(x):
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     func=square,  # ← 传函数对象
-    runtime="py3.11",
+    runtime="py3",
 )
 """)
     print()
@@ -183,7 +184,7 @@ import my_module
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     module=my_module,  # ← 传模块对象
-    runtime="py3.11",
+    runtime="py3",
 )
 
 # ��以调用模块中的任何函数
@@ -215,19 +216,20 @@ def main():
         print("✅ 新功能:")
         print("  1. ✅ DeployedService.deploy_from_infocenter(module=...)")
         print("  2. ✅ TaskSubmitter.from_infocenter(module=...)")
-        print("  3. ✅ 自动打包整个模块及其依赖")
+        print("  3. ✅ 自动打包整个本地模块 / package")
         print("  4. ✅ 可以调用模块中的任何导出函数")
         print()
         print("📋 优势:")
         print("  - 一次性部署整个模块")
         print("  - 可以调用模块中的多个函数")
-        print("  - 自动处理模块依赖")
+        print("  - 自动带上本地源码依赖和资源文件")
         print("  - entry_module 自动推断为模块名")
         print()
         print("💡 使用场景:")
         print("  - 模块包含多个相关函数")
         print("  - 需要共享代码和依赖")
         print("  - 模块级别的代码组织")
+        print("  - 第三方包缺失时，再显式传 dependency_allowlist")
         print()
 
     except Exception as e:

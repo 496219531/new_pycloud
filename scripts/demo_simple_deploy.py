@@ -10,6 +10,8 @@ from pycloud_parallel import DeployedService
 
 def main():
     # 服务代码
+    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
+    dependency_allowlist = []
     blob = (
         b"def pycloud_export(fn):\n"
         b"    fn.__pycloud_export__ = True\n"
@@ -34,8 +36,9 @@ def main():
             # service_name 和 owner_client_id 会自动生成
             blob=blob,
             filename="compute.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="compute",
+            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group1)
@@ -52,6 +55,7 @@ def main():
             blob=blob,
             filename="my_service.py",
             entry_module="my_service",  # 指定 entry_module
+            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group2)
@@ -66,6 +70,7 @@ def main():
             owner_client_id="my-custom-client",  # 自定义 owner
             blob=blob,
             filename="service.py",
+            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group3)
@@ -83,6 +88,7 @@ def main():
             service_name=custom_name,  # 自定义 service_name
             blob=blob,
             filename="service.py",
+            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group4)

@@ -58,12 +58,12 @@ def _create_exported_service(target: str, service_name: str) -> str:
         b"    fn.__pycloud_export__ = True\n"
         b"    return fn\n\n"
         b"@pycloud_export\n"
-        b"def add(payload):\n"
-        b"    value = int(payload.get('value', 0))\n"
+        b"def add(value=0, **_kwargs):\n"
+        b"    value = int(value)\n"
         b"    return {'value': value, 'plus_one': value + 1}\n\n"
         b"@pycloud_export\n"
-        b"def mul(payload):\n"
-        b"    value = int(payload.get('value', 0))\n"
+        b"def mul(value=0, **_kwargs):\n"
+        b"    value = int(value)\n"
         b"    return {'value': value, 'square': value * value}\n"
     )
     with NodeControlClient(target, timeout_sec=10.0) as client:
@@ -72,7 +72,7 @@ def _create_exported_service(target: str, service_name: str) -> str:
             service_name=service_name,
             filename=f"{service_name}.py",
             blob=blob,
-            runtime="py3.11",
+            runtime="py3",
             entry_module=service_name,
             entry_callable="add",
             worker_count=2,

@@ -1,19 +1,22 @@
 """
-自动依赖检测和打包系统
+本地源码依赖分析与打包系统。
 
-参考 cloudpickle 的逻辑，自动分析函数/模块的依赖，并打包成可上传的文件。
+当前能力边界：
+1. 自动收集本地源码模块与 package 资源
+2. 保留 package 目录结构
+3. 第三方依赖不自动打包，建议显式使用 dependency_allowlist
 """
 
 import ast
 import importlib
+import importlib.util
 import inspect
 import os
 import sys
 import tempfile
 import tarfile
-import hashlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 class DependencyAnalyzer:
@@ -76,34 +79,23 @@ class DependencyAnalyzer:
         except (ImportError, AttributeError):
             pass
 
+        current_package = ""
+        try:
+            current_package = str(getattr(module, "__package__", "") or "")
+        except Exception:
+            current_package = ""
+
         # 分析函数所在模块的源码（包含函数体内的 import）
         module_source = self._get_module_source(func)
         if module_source:
             imports_ast = self._extract_imports_from_source(module_source)
             result["imports"] = imports_ast
-
-            # 分类导入
-            for imp in imports_ast:
-                module_name = imp["module"]
-
-                if not module_name:
-                    continue
-
-                # 检查是否是标准库
-                if module_name.split('.')[0] in self.stdlib_modules:
-                    result["stdlib_modules"].append(module_name)
-                else:
-                    # 检查是否是本地模块
-                    module_file = self._find_module_file(module_name)
-                    if module_file and self._is_local_module(module_file):
-                        result["local_modules"].append({
-                            "name": module_name,
-                            "file": module_file,
-                        })
-                        result["local_files"].append(module_file)
-                    else:
-                        # 第三方库
-                        result["third_party_modules"].append(module_name)
+            self._classify_imports(
+                imports_ast,
+                result,
+                current_module_name=str(func.__module__ or ""),
+                current_package=current_package,
+            )
 
         return result
 
@@ -143,26 +135,12 @@ class DependencyAnalyzer:
 
                 imports_ast = self._extract_imports_from_source(source)
                 result["imports"] = imports_ast
-
-                # 分类导入
-                for imp in imports_ast:
-                    module_name_imp = imp["module"]
-
-                    if not module_name_imp:
-                        continue
-
-                    if module_name_imp.split('.')[0] in self.stdlib_modules:
-                        result["stdlib_modules"].append(module_name_imp)
-                    else:
-                        module_file_imp = self._find_module_file(module_name_imp)
-                        if module_file_imp and self._is_local_module(module_file_imp):
-                            result["local_modules"].append({
-                                "name": module_name_imp,
-                                "file": module_file_imp,
-                            })
-                            result["local_files"].append(module_file_imp)
-                        else:
-                            result["third_party_modules"].append(module_name_imp)
+                self._classify_imports(
+                    imports_ast,
+                    result,
+                    current_module_name=module_name,
+                    current_package=str(getattr(module, "__package__", "") or ""),
+                )
 
             except Exception as e:
                 result["error"] = f"读取模块文件失败: {e}"
@@ -215,9 +193,101 @@ class DependencyAnalyzer:
                         "module": module,
                         "name": alias.name,
                         "asname": alias.asname or "",
+                        "level": int(getattr(node, "level", 0) or 0),
                     })
 
         return imports
+
+    def _classify_imports(
+        self,
+        imports_ast: Iterable[Dict[str, str]],
+        result: Dict[str, Any],
+        *,
+        current_module_name: str,
+        current_package: str,
+    ) -> None:
+        seen_stdlib: Set[str] = set(result.get("stdlib_modules", []))
+        seen_third_party: Set[str] = set(result.get("third_party_modules", []))
+        seen_local_names: Set[str] = {item.get("name", "") for item in result.get("local_modules", [])}
+        seen_local_files: Set[str] = set(result.get("local_files", []))
+
+        for imp in imports_ast:
+            resolved_module = self._resolve_import_module(
+                imp,
+                current_module_name=current_module_name,
+                current_package=current_package,
+            )
+            module_name = str(resolved_module or imp.get("module") or "").strip()
+            if not module_name:
+                continue
+
+            if module_name.split(".")[0] in self.stdlib_modules:
+                if module_name not in seen_stdlib:
+                    result["stdlib_modules"].append(module_name)
+                    seen_stdlib.add(module_name)
+                continue
+
+            module_file = self._find_module_file(module_name)
+            if module_file and self._is_local_module(module_file):
+                if module_name not in seen_local_names:
+                    result["local_modules"].append({
+                        "name": module_name,
+                        "file": module_file,
+                    })
+                    seen_local_names.add(module_name)
+                if module_file not in seen_local_files:
+                    result["local_files"].append(module_file)
+                    seen_local_files.add(module_file)
+                continue
+
+            if module_name not in seen_third_party:
+                result["third_party_modules"].append(module_name)
+                seen_third_party.add(module_name)
+
+    def _resolve_import_module(
+        self,
+        imp: Dict[str, str],
+        *,
+        current_module_name: str,
+        current_package: str,
+    ) -> str:
+        imp_type = str(imp.get("type", "") or "")
+        module_name = str(imp.get("module", "") or "").strip()
+        if imp_type == "import":
+            return module_name
+
+        if imp_type != "from...import":
+            return module_name
+
+        alias_name = str(imp.get("name", "") or "").strip()
+        level = int(imp.get("level", 0) or 0)
+        anchor_package = str(current_package or "").strip()
+        if not anchor_package and current_module_name and "." in current_module_name:
+            anchor_package = current_module_name.rsplit(".", 1)[0]
+
+        resolved_base = module_name
+        if level > 0:
+            relative_name = "." * level + module_name
+            try:
+                resolved_base = importlib.util.resolve_name(relative_name, anchor_package)
+            except Exception:
+                resolved_base = ""
+
+        resolved_base = str(resolved_base or "").strip()
+        if alias_name and alias_name != "*" and resolved_base:
+            alias_candidate = f"{resolved_base}.{alias_name}"
+            if self._find_module_file(alias_candidate):
+                return alias_candidate
+
+        if not resolved_base and alias_name and alias_name != "*" and level > 0:
+            try:
+                alias_only = importlib.util.resolve_name("." * level + alias_name, anchor_package)
+            except Exception:
+                alias_only = ""
+            if alias_only and self._find_module_file(alias_only):
+                return alias_only
+
+        return resolved_base
 
     def _find_module_file(self, module_name: str) -> Optional[str]:
         """查找模块文件路径"""
@@ -280,31 +350,13 @@ class DependencyPackager:
         if deps.get("error"):
             raise RuntimeError(deps["error"])
 
-        # 收集需要打包的文件
-        files_to_package = []
-
-        # 1. 函数所在文件
-        if deps["source_file"]:
-            files_to_package.append(deps["source_file"])
-
-        # 2. 本地依赖文件
-        for file_path in deps["local_files"]:
-            if file_path not in files_to_package:
-                files_to_package.append(file_path)
-
-        # 3. 查找相关文件（__init__.py 等）
-        for file_path in list(files_to_package):
-            related_files = self._find_related_files(file_path, include_tests)
-            files_to_package.extend(related_files)
-
-        # 去重
-        files_to_package = list(set(files_to_package))
+        roots_to_package = self._collect_function_roots(func, deps=deps)
 
         # 创建 tar.gz
         if output_file is None:
             output_file = tempfile.mktemp(suffix=".tar.gz", prefix="pycloud_func_")
 
-        self._create_tar_package(files_to_package, output_file, func.__name__)
+        self._create_tar_package(roots_to_package, output_file, include_tests=include_tests)
 
         return output_file
 
@@ -331,104 +383,127 @@ class DependencyPackager:
         if deps.get("error"):
             raise RuntimeError(deps["error"])
 
-        # 收集需要打包的文件
-        files_to_package = []
-
-        # 1. 模块文件
-        if deps["file"]:
-            files_to_package.append(deps["file"])
-
-        # 2. 本地依赖文件
-        for file_path in deps["local_files"]:
-            if file_path not in files_to_package:
-                files_to_package.append(file_path)
-
-        # 3. 查找相关文件
-        for file_path in list(files_to_package):
-            related_files = self._find_related_files(file_path, include_tests)
-            files_to_package.extend(related_files)
-
-        # 去重
-        files_to_package = list(set(files_to_package))
+        roots_to_package = self._collect_module_roots(module_name, deps=deps)
 
         # 创建 tar.gz
         if output_file is None:
             output_file = tempfile.mktemp(suffix=".tar.gz", prefix="pycloud_module_")
 
-        self._create_tar_package(files_to_package, output_file, module_name)
+        self._create_tar_package(roots_to_package, output_file, include_tests=include_tests)
 
         return output_file
 
-    def _find_related_files(
-        self,
-        file_path: str,
-        include_tests: bool = False,
-    ) -> List[str]:
-        """查找相关文件（__init__.py, __init__.pyi 等）"""
-        related = []
-        path = Path(file_path)
+    def _collect_function_roots(self, func: Callable, *, deps: Dict[str, Any]) -> List[Path]:
+        roots: List[Path] = []
+        module_name = str(func.__module__ or "").strip()
+        source_file = str(deps.get("source_file") or "").strip()
+        if source_file:
+            roots.append(self._module_root_from_name_and_file(module_name, source_file))
 
-        # 如果是 .py 文件，检查同目录的 __init__.py
-        if path.suffix == ".py":
-            dir_path = path.parent
-            init_file = dir_path / "__init__.py"
+        for item in deps.get("local_modules", []):
+            item_name = str(item.get("name", "") or "").strip()
+            item_file = str(item.get("file", "") or "").strip()
+            if not item_name or not item_file:
+                continue
+            roots.append(self._module_root_from_name_and_file(item_name, item_file))
+        return self._dedupe_roots(roots)
 
-            if init_file.exists() and init_file != path:
-                related.append(str(init_file))
+    def _collect_module_roots(self, module_name: str, *, deps: Dict[str, Any]) -> List[Path]:
+        roots: List[Path] = []
+        module_file = str(deps.get("file") or "").strip()
+        if module_file:
+            roots.append(self._module_root_from_name_and_file(module_name, module_file))
 
-            # 检查 .pyi 类型文件
-            pyi_file = path.with_suffix(".pyi")
-            if pyi_file.exists():
-                related.append(str(pyi_file))
+        for item in deps.get("local_modules", []):
+            item_name = str(item.get("name", "") or "").strip()
+            item_file = str(item.get("file", "") or "").strip()
+            if not item_name or not item_file:
+                continue
+            roots.append(self._module_root_from_name_and_file(item_name, item_file))
+        return self._dedupe_roots(roots)
 
-            # 递归检查父目录的 __init__.py
-            parent = dir_path
-            while parent != Path.cwd():
-                parent_init = parent / "__init__.py"
-                if parent_init.exists():
-                    related.append(str(parent_init))
-                    parent = parent.parent
-                else:
-                    break
+    def _module_root_from_name_and_file(self, module_name: str, module_file: str) -> Path:
+        path = Path(module_file).resolve()
+        parts = [part for part in str(module_name or "").split(".") if part]
+        if path.name == "__init__.py":
+            package_depth = len(parts)
+            current = path.parent
+            for _ in range(max(0, package_depth - 1)):
+                current = current.parent
+            return current
+        if len(parts) <= 1:
+            return path
+        current = path.parent
+        for _ in range(max(0, len(parts) - 2)):
+            current = current.parent
+        return current
 
-        # 可选：包含测试文件
-        if include_tests:
-            test_patterns = [
-                "test_*.py",
-                "*_test.py",
-                "tests/*.py",
-                "test/*.py",
-            ]
-            # 简化实现，暂不展开
+    def _dedupe_roots(self, roots: Iterable[Path]) -> List[Path]:
+        normalized: List[Path] = []
+        for raw in roots:
+            path = Path(raw).resolve()
+            if not path.exists():
+                continue
+            normalized.append(path)
 
-        return related
+        normalized = sorted(set(normalized), key=lambda item: (len(item.parts), str(item)))
+        deduped: List[Path] = []
+        for path in normalized:
+            if any(path == existing or existing in path.parents for existing in deduped if existing.is_dir()):
+                continue
+            deduped.append(path)
+        return deduped
 
     def _create_tar_package(
         self,
-        files: List[str],
+        roots: List[Path],
         output_file: str,
-        base_name: str,
+        *,
+        include_tests: bool = False,
     ) -> None:
         """创建 tar.gz 包"""
         with tarfile.open(output_file, "w:gz") as tar:
-            for file_path in files:
-                path = Path(file_path)
-
-                if not path.exists():
+            for root in roots:
+                root = Path(root).resolve()
+                if root.is_dir():
+                    base_arcname = Path(root.name)
+                    for file_path in sorted(root.rglob("*")):
+                        if not file_path.is_file():
+                            continue
+                        if not include_tests and self._should_skip_path(file_path):
+                            continue
+                        arcname = base_arcname / file_path.relative_to(root)
+                        tar.add(file_path, arcname=str(arcname))
                     continue
 
-                # 计算包内路径（保持相对结构）
-                if path.is_absolute():
-                    # 使用相对于当前工作目录的路径
-                    try:
-                        arcname = path.relative_to(Path.cwd())
-                    except ValueError:
-                        # 如果不在 cwd 下，使用文件名
-                        arcname = path.name
-                else:
-                    arcname = path
+                if not include_tests and self._should_skip_path(root):
+                    continue
+                tar.add(root, arcname=root.name)
 
-                tar.add(path, arcname=arcname)
+    def _should_skip_path(self, path: Path) -> bool:
+        lowered_parts = {part.lower() for part in path.parts}
+        if "__pycache__" in lowered_parts:
+            return True
+        name = path.name.lower()
+        if name.endswith((".pyc", ".pyo")):
+            return True
+        if name.startswith("test_") or name.endswith("_test.py"):
+            return True
+        if "tests" in lowered_parts or "test" in lowered_parts:
+            return True
+        return False
+
+
+def _infer_entry_module_from_source_file(source_file: str) -> str:
+    path = Path(str(source_file or "")).resolve()
+    if not path.exists() or path.suffix != ".py":
+        return ""
+    parts = [path.stem]
+    parent = path.parent
+    while (parent / "__init__.py").exists():
+        parts.append(parent.name)
+        parent = parent.parent
+    return ".".join(reversed(parts))
 
 
 def auto_deploy_function(
@@ -441,7 +516,7 @@ def auto_deploy_function(
     include_tests: bool = False,
     **kwargs
 ):
-    """自动部署函数（自动检测依赖并打包）
+    """自动部署函数（自动打包本地源码依赖）
 
     Args:
         func: 要部署的函数
@@ -464,13 +539,15 @@ def auto_deploy_function(
         include_tests=include_tests,
     )
 
-    # 计算 SHA256
-    with open(package_path, "rb") as f:
-        sha256 = hashlib.sha256(f.read()).hexdigest()
-
     # 确定入口点
     if entry_module is None:
-        entry_module = func.__module__
+        raw_module_name = str(getattr(func, "__module__", "") or "").strip()
+        if raw_module_name and raw_module_name != "__main__":
+            entry_module = raw_module_name
+        else:
+            entry_module = _infer_entry_module_from_source_file(
+                inspect.getsourcefile(func) or inspect.getfile(func) or ""
+            ) or raw_module_name or "user_function"
     if entry_callable is None:
         entry_callable = func.__name__
 
@@ -479,7 +556,7 @@ def auto_deploy_function(
         blob = f.read()
 
     # 上传并部署
-    return TaskSubmitter.deploy_from_blob(
+    return TaskSubmitter.from_infocenter(
         infocenter_target=infocenter_target,
         blob=blob,
         filename=Path(package_path).name,

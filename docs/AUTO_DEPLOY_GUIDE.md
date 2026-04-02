@@ -1,8 +1,9 @@
-# 自动依赖检测部署功能
+# 本地源码自动打包部署功能
 
 ## 🎯 新功能
 
-**DeployedService** 和 **TaskSubmitter** 现在支持直接传递函数对象，自动检测依赖并打包部署！
+**DeployedService** 和 **TaskSubmitter** 现在支持直接传递函数对象，
+自动打包本地源码依赖并部署。
 
 ---
 
@@ -46,7 +47,7 @@ def process_data(x):
     import numpy as np
     return np.sum(x)
 
-# 直接传函数对象，自动打包依赖
+# 直接传函数对象，自动打包本地源码依赖
 group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     func=process_data,  # ← 直接传函数！
@@ -97,7 +98,7 @@ def square(x):
     """计算平方"""
     return x ** 2
 
-# 直接传函数对象，自动打包依赖
+# 直接传函数对象，自动打包本地源码依赖
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     func=square,  # ← 直接传函数！
@@ -118,7 +119,7 @@ completed = submitter.wait_for_results(expected_count=5)
 
 ## 🔄 自动处理的内容
 
-### 1. 依赖检测
+### 1. 本地源码依赖分析
 
 ```python
 def complex_function(data):
@@ -131,19 +132,19 @@ def complex_function(data):
     return helper(data, np.mean)
 ```
 
-**检测结果：**
-- ✅ 标准库：`os`, `json` → 不打包（假设目标环境已有）
-- ✅ 第三方库：`numpy` → 不打包（假设目标环境已有）
+**当前结果：**
+- ✅ 标准库：`os`, `json` → 不打包
+- ✅ 第三方库：`numpy` → 不自动打包；远端缺失时建议显式传 `dependency_allowlist`
 - ✅ 本地模块：`my_utils` → **自动打包**
 
 ### 2. 自动打包
 
 ```python
 # 自动创建 tar.gz 包，包含：
-# - 函数所在文件
-# - my_utils.py
-# - __init__.py (如果存在)
-# - 其他本地依赖
+# - 函数所在模块 / package
+# - 本地源码依赖
+# - __init__.py
+# - package 内资源文件
 ```
 
 ### 3. 自动推断
@@ -153,7 +154,7 @@ def my_process(x):
     return x * 2
 
 # 自动推断：
-# - entry_module = "__main__" (函数所在模块)
+# - entry_module = 基于源码文件推断的模块路径
 # - entry_callable = "my_process" (函数名)
 ```
 
@@ -377,7 +378,7 @@ elif artifact_path:
 ## ✅ 优势
 
 1. **极简 API**：一行代码完成部署
-2. **自动依赖检测**：不需要手动分析依赖
+2. **自动本地源码打包**：不需要手动整理本地模块文件
 3. **跨版本兼容**：源码级别，完全兼容
 4. **调试友好**：可以看到实际执行的代码
 5. **向后兼容**：传统方式仍然支持
@@ -386,7 +387,7 @@ elif artifact_path:
 
 ## 🎓 总结
 
-新的自动依赖检测功能让 PyCloud 的使用变得更加简单：
+新的本地源码自动打包功能让 PyCloud 的使用变得更加简单：
 
 **之前：**
 ```python

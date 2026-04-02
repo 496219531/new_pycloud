@@ -9,6 +9,7 @@
 5. [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
 6. [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
 7. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
+8. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
 
 ## 入口文档
 
@@ -39,8 +40,14 @@
 
 - [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
   - `/nodes`、`/services/routes`、`/ops`、节点事实字段
+- [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
+  - `runtime` 作为 Python 版本约束的当前语义
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
   - `ControlPlane` 与 `NodeControl` 的职责划分
+- [../SERVICE_SESSION_PROTOCOL_V1.md](../SERVICE_SESSION_PROTOCOL_V1.md)
+  - 服务创建、导出、keepalive、`dependency_allowlist`
+- [../API_CONTRACT_V1.md](../API_CONTRACT_V1.md)
+  - HTTP/JSON 契约与管理面边界
 
 ## 示例脚本
 

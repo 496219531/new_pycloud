@@ -70,7 +70,7 @@ submitter = TaskSubmitter.from_infocenter(
 
 # 问题：
 # ❌ 还是需要手动指定 entry_module 和 entry_callable
-# ❌ 不会自动检测依赖（如 utils/helpers.py）
+# ❌ 不会自动收集本地源码依赖（如 utils/helpers.py）
 # ❌ 如果依赖其他本地文件，会报错
 ```
 
@@ -78,7 +78,7 @@ submitter = TaskSubmitter.from_infocenter(
 
 ```python
 # ✅✅ 改进：直接传函数对象
-# ✅ 自动检测依赖
+# ✅ 自动打包本地源码依赖
 # ✅ 自动推断 entry_module 和 entry_callable
 
 # 定义函数
@@ -306,7 +306,7 @@ submitter = TaskSubmitter.from_infocenter(
 # ✅ 现在：自动推断，不会出错
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="...",
-    func=process_data,  # 自动处理一切
+    func=process_data,  # 自动处理本地源码打包
     runtime="py3.11",
 )
 ```

@@ -36,6 +36,11 @@
 2. `TaskBatchClient`
 3. `NodeControlClient.open_task_stream(...)`
 
+上传侧现在支持可选参数：
+
+1. `dependency_allowlist`
+2. 用于显式声明“节点允许补装哪些依赖”
+
 ## 3. 标识语义
 
 ### 3.1 `task_id`
@@ -55,6 +60,25 @@
 1. 表示这批任务希望复用同一热 runtime
 2. 不传时通常退化为 `code_version`
 3. 是任务模式热点路由和 slot 复用的关键键
+
+### 3.4 `runtime`
+
+`runtime` 不是 `runtime_key`。
+
+区别：
+
+1. `runtime`
+   - Python 版本约束
+   - 用于选点和节点侧校验
+2. `runtime_key`
+   - 热点粘性键
+   - 用于 runtime slot 复用和热路由
+
+常见写法：
+
+1. `runtime="py3"`
+2. `runtime="py3.11"`
+3. `runtime=">=py3.11"`
 
 ## 4. 节点内执行模型
 
@@ -119,6 +143,34 @@
 3. 节点重启后结果丢失
 4. 当前没有内建结果持久化
 
+## 7.1 参数序列化边界
+
+任务模式当前只额外支持这 3 种 Python 类型：
+
+1. `pandas.DataFrame`
+2. `pandas.Series`
+3. `numpy.ndarray`
+
+行为约定：
+
+1. `client -> NodeControl gRPC` 会对这 3 种类型做显式包装
+2. node 内执行用户函数前会自动还原回 `DataFrame / Series / ndarray`
+3. 用户函数返回值里如果包含这 3 种类型，也会再包装后回传
+4. `numpy.ndarray` 只支持简单 `dtype`
+5. 其他复杂 Python 对象不支持，直接报错
+
+报错原则：
+
+1. 尽量在提交前或编码阶段就失败
+2. 错误信息会尽量带字段路径
+3. 例如会提示 `payload.bundle.bad has unsupported type ...`
+
+建议：
+
+1. 任务参数尽量保持为基础 JSON 结构
+2. 只有确实需要时，再传 `DataFrame / Series / ndarray`
+3. 更复杂对象由业务侧自己转普通结构或外部落地
+
 ## 8. 推荐用法
 
 ### 8.1 `TaskSubmitter`
@@ -130,6 +182,7 @@ with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="task_demo.py",
+    runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
 ) as task:
@@ -149,6 +202,7 @@ with TaskBatchClient.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="task_demo.py",
+    runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
 ) as batch:
@@ -170,7 +224,7 @@ with NodeControlClient("127.0.0.1:50061") as client:
         client_id="demo-client",
         filename="task_demo.py",
         blob=blob,
-        runtime="py3.11",
+        runtime="py3",
         entry_module="task_demo",
     )
     with client.open_task_stream(
@@ -180,6 +234,37 @@ with NodeControlClient("127.0.0.1:50061") as client:
         stream.submit_tasks([...], job_id="job-demo")
         results = stream.pull_results(limit=10, wait_ms=500)
 ```
+
+### 8.4 缺依赖时的补装
+
+默认行为：
+
+1. 上传校验时如果发现 `ModuleNotFoundError`
+2. 直接返回错误
+3. 不会自动执行 `pip install`
+
+如果你确认允许节点补装，可以显式传：
+
+```python
+with TaskBatchClient.from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    artifact_path="./task_src",
+    runtime="py3",
+    entry_module="task_src.main",
+    dependency_allowlist=[
+        "./third_party/my_local_pkg",
+        "/abs/path/to/pkg.whl",
+        "orjson==3.10.18",
+    ],
+) as batch:
+    batch.submit_payloads([{"value": 1}])
+```
+
+当前约束：
+
+1. 节点不会把 `import yaml` 自动猜成 `PyYAML`
+2. 白名单会整批安装到当前 `code_version` 绑定的隔离目录
+3. 同一个 `code_version` 如果换一套白名单，会被拒绝
 
 ## 9. 与服务模式的区别
 
@@ -195,3 +280,16 @@ with NodeControlClient("127.0.0.1:50061") as client:
 2. 不需要 owner keepalive
 3. 面向 `job_id / task_id / runtime_key`
 4. 更关注热代码复用与流式提交
+
+## 10. Python 版本筛选
+
+如果你使用 `TaskSubmitter.from_infocenter(...)` 或 `TaskBatchClient.from_infocenter(...)`：
+
+1. 客户端会先读取 `InfoCenter` 返回的节点 `python_version`
+2. 再按 `runtime` 做筛选
+3. 节点侧上传代码时还会再次校验
+
+因此：
+
+1. `runtime="py3"` 适合大多数通用任务
+2. 精确版本只在你确实依赖该版本特性时使用

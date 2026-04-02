@@ -29,6 +29,11 @@ from urllib.request import Request, urlopen
 import grpc
 from google.protobuf import timestamp_pb2
 
+from pycloud_parallel.controlplane.runtime_spec import (
+    matches_python_runtime,
+    normalize_python_runtime_spec,
+)
+from pycloud_parallel.controlplane.serialization import dict_to_struct, serialize_arrow_compatible
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -72,6 +77,39 @@ def _auto_package_function(func: Callable) -> bytes:
             os.unlink(tmp_path)
         except Exception:
             pass
+
+
+def _infer_entry_module_from_source_file(source_file: str) -> str:
+    path = Path(str(source_file or "")).resolve()
+    if not path.exists() or path.suffix != ".py":
+        return ""
+    parts = [path.stem]
+    parent = path.parent
+    while (parent / "__init__.py").exists():
+        parts.append(parent.name)
+        parent = parent.parent
+    return ".".join(reversed(parts))
+
+
+def _default_entry_module_for_func(func: Callable) -> str:
+    module_name = str(getattr(func, "__module__", "") or "").strip()
+    if module_name and module_name != "__main__":
+        return module_name
+    try:
+        source_file = inspect.getsourcefile(func) or inspect.getfile(func)
+    except Exception:
+        source_file = ""
+    inferred = _infer_entry_module_from_source_file(str(source_file or ""))
+    return inferred or module_name or "user_function"
+
+
+def _default_entry_module_for_module(module: Any) -> str:
+    module_name = str(getattr(module, "__name__", "") or "").strip()
+    if module_name and module_name != "__main__":
+        return module_name
+    module_file = str(getattr(module, "__file__", "") or "").strip()
+    inferred = _infer_entry_module_from_source_file(module_file)
+    return inferred or module_name or "user_module"
 
 
 def _prepare_code_blob(
@@ -184,7 +222,7 @@ def _prepare_code_blob(
     return None, ""
 
 
-def _serialize_arrow_compatible(obj: Any) -> Dict[str, object]:
+def _serialize_arrow_compatible(obj: Any) -> Any:
     """序列化 Arrow 兼容对象为字典。
 
     用于 Service Session 模式的 HTTP 调用。
@@ -193,36 +231,9 @@ def _serialize_arrow_compatible(obj: Any) -> Dict[str, object]:
         obj: 要序列化的对象
 
     Returns:
-        Dict[str, object]: 可 JSON 序列化的字典
+        Any: 可 JSON 序列化的对象
     """
-    # 快速路径：基本类型直接返回
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
-    # Arrow 兼容类型转换
-    try:
-        import pandas as pd
-        if isinstance(obj, pd.DataFrame):
-            return {"__type__": "DataFrame", "data": obj.to_dict(orient="records")}
-        if isinstance(obj, pd.Series):
-            return {"__type__": "Series", "data": obj.to_dict(), "name": obj.name}
-    except ImportError:
-        pass
-
-    try:
-        import numpy as np
-        if isinstance(obj, np.ndarray):
-            return {"__type__": "ndarray", "data": obj.tolist(), "dtype": str(obj.dtype)}
-    except ImportError:
-        pass
-
-    # 容器类型递归处理
-    if isinstance(obj, dict):
-        return {k: _serialize_arrow_compatible(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_serialize_arrow_compatible(item) for item in obj]
-
-    return obj
+    return serialize_arrow_compatible(obj)
 
 
 def _get_local_ip() -> str:
@@ -254,6 +265,22 @@ def _err_msg(resp_error: pb2.Error, default_msg: str) -> str:
     return default_msg
 
 
+def _filter_nodes_by_runtime(
+    nodes: Sequence["InfoCenterNode"],
+    *,
+    runtime: str,
+) -> List["InfoCenterNode"]:
+    normalized_runtime = normalize_python_runtime_spec(runtime)
+    if not normalized_runtime:
+        return list(nodes)
+    return [
+        node
+        for node in nodes
+        if not str(node.python_version or "").strip()
+        or matches_python_runtime(node.python_version, normalized_runtime)
+    ]
+
+
 def _target_to_base_url(target: str) -> str:
     text = str(target or "").strip()
     if not text:
@@ -276,6 +303,7 @@ def _http_json_request(
     raw = None
     request_headers = dict(headers or {})
     if payload is not None:
+        payload = _serialize_arrow_compatible(payload)
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request_headers["Content-Type"] = "application/json; charset=utf-8"
 
@@ -488,6 +516,7 @@ class InfoCenterNode:
     queued: int
     inflight: int
     credit: int
+    python_version: str = ""
     active_runtimes: Tuple[str, ...] = ()
     tags: Tuple[str, ...] = ()
     service_worker_capacity: int = 0
@@ -568,6 +597,7 @@ class InfoCenterClient:
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        python_version: str = "",
     ) -> Dict[str, object]:
         serialized_services = []
         for item in services or []:
@@ -596,6 +626,7 @@ class InfoCenterClient:
                 "version": version,
                 "metadata": dict(metadata or {}),
                 "services": serialized_services,
+                "python_version": str(python_version or "").strip(),
                 "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
                 "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
                 "service_worker_used": max(0, int(service_worker_used or 0)),
@@ -612,6 +643,7 @@ class InfoCenterClient:
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        python_version: str = "",
     ) -> Dict[str, object]:
         serialized_services = []
         for item in services or []:
@@ -636,6 +668,7 @@ class InfoCenterClient:
                 "healthy": bool(healthy),
                 "metrics": dict(metrics or {}),
                 "services": serialized_services,
+                "python_version": str(python_version or "").strip(),
                 "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
                 "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
                 "service_worker_used": max(0, int(service_worker_used or 0)),
@@ -674,6 +707,7 @@ class InfoCenterClient:
                     queued=int(item.get("queued", 0) or 0),
                     inflight=int(item.get("inflight", 0) or 0),
                     credit=int(item.get("credit", 0) or 0),
+                    python_version=str(item.get("python_version", "") or ""),
                     active_runtimes=tuple(item.get("active_runtimes") or ()),
                     tags=tuple(item.get("tags") or ()),
                     service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
@@ -739,10 +773,12 @@ class InfoCenterClient:
         limit: int = 100,
         require_credit: bool = True,
         preferred_runtime_key: str = "",
+        runtime: str = "",
     ) -> Sequence[InfoCenterNode]:
         nodes = list(self.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit))
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
         preferred_runtime = str(preferred_runtime_key or "").strip()
+        normalized_runtime = normalize_python_runtime_spec(runtime)
         discovered_node_map = {node.node_id: node for node in nodes}
 
         if requested_node_ids:
@@ -750,13 +786,30 @@ class InfoCenterClient:
             if missing_node_ids:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
             selected = [discovered_node_map[node_id] for node_id in requested_node_ids]
+            if normalized_runtime:
+                incompatible = [
+                    node.node_id
+                    for node in selected
+                    if str(node.python_version or "").strip()
+                    and not matches_python_runtime(node.python_version, normalized_runtime)
+                ]
+                if incompatible:
+                    raise RuntimeError(
+                        f"requested node_ids do not satisfy runtime {normalized_runtime}: {incompatible}"
+                    )
         else:
             candidates = [
                 node
                 for node in nodes
                 if node.healthy and node.schedulable and not node.drain and (not require_credit or node.credit > 0)
             ]
+            if normalized_runtime:
+                candidates = _filter_nodes_by_runtime(candidates, runtime=normalized_runtime)
             if not candidates:
+                if normalized_runtime:
+                    raise RuntimeError(
+                        f"no schedulable task nodes from InfoCenter for runtime {normalized_runtime}"
+                    )
                 raise RuntimeError("no schedulable task nodes from InfoCenter")
             candidates.sort(
                 key=lambda node: (
@@ -1050,11 +1103,12 @@ def _call_route_http(
     headers = {"Content-Type": "application/json"}
     if service_token:
         headers["X-Service-Token"] = service_token
+    serialized_payload = _serialize_arrow_compatible(payload or {})
     req = Request(
         url=url,
         method="POST",
         headers=headers,
-        data=json.dumps(payload or {}).encode("utf-8"),
+        data=json.dumps(serialized_payload).encode("utf-8"),
     )
     try:
         with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
@@ -1319,11 +1373,12 @@ class ServiceSessionClient:
         auth_token = self.service_token if token is None else token
         if auth_token:
             headers["X-Service-Token"] = auth_token
+        serialized_payload = _serialize_arrow_compatible(payload or {})
         req = Request(
             url=url,
             method="POST",
             headers=headers,
-            data=json.dumps(payload or {}).encode("utf-8"),
+            data=json.dumps(serialized_payload).encode("utf-8"),
         )
         try:
             with urlopen(req, timeout=max(2.0, float(timeout_sec) + 1.0)) as resp:
@@ -1378,6 +1433,7 @@ class NodeControlClient:
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
     ) -> pb2.UploadCodeResponse:
         path = Path(artifact_path)
@@ -1406,6 +1462,7 @@ class NodeControlClient:
                 export_mode=export_mode,
                 export_methods=export_methods,
                 export_decorator=export_decorator,
+                dependency_allowlist=dependency_allowlist,
                 chunk_size=chunk_size,
             )
         finally:
@@ -1425,6 +1482,7 @@ class NodeControlClient:
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
     ) -> pb2.UploadCodeResponse:
         if not client_id:
@@ -1452,6 +1510,7 @@ class NodeControlClient:
                     entry_callable=entry_callable or "run",
                     package_format=effective_format,
                     export_spec=export_spec,
+                    dependency_allowlist=list(dependency_allowlist or ()),
                 )
             )
             for i in range(0, len(blob), max(1, int(chunk_size))):
@@ -1475,6 +1534,7 @@ class NodeControlClient:
         export_mode: str,
         export_methods: Optional[Sequence[str]],
         export_decorator: str,
+        dependency_allowlist: Optional[Sequence[str]],
         chunk_size: int,
     ) -> pb2.UploadCodeResponse:
         effective_filename = filename or file_path.name
@@ -1498,6 +1558,7 @@ class NodeControlClient:
                     entry_callable=entry_callable or "run",
                     package_format=effective_format,
                     export_spec=export_spec,
+                    dependency_allowlist=list(dependency_allowlist or ()),
                 )
             )
             yield from (pb2.UploadCodeRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
@@ -1628,6 +1689,7 @@ class NodeControlClient:
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -1661,6 +1723,7 @@ class NodeControlClient:
                 export_mode=export_mode,
                 export_methods=export_methods,
                 export_decorator=export_decorator,
+                dependency_allowlist=dependency_allowlist,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -1685,6 +1748,7 @@ class NodeControlClient:
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -1705,6 +1769,7 @@ class NodeControlClient:
                 export_mode=export_mode,
                 export_methods=export_methods,
                 export_decorator=export_decorator,
+                dependency_allowlist=dependency_allowlist,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -1728,6 +1793,7 @@ class NodeControlClient:
         export_mode: str,
         export_methods: Optional[Sequence[str]],
         export_decorator: str,
+        dependency_allowlist: Optional[Sequence[str]],
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -1762,6 +1828,7 @@ class NodeControlClient:
                     expose_http=bool(expose_http),
                     package_format=effective_format,
                     export_spec=export_spec,
+                    dependency_allowlist=list(dependency_allowlist or ()),
                 )
             )
             yield from (pb2.CreateServiceRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
@@ -1794,6 +1861,7 @@ class NodeControlClient:
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -1829,6 +1897,7 @@ class NodeControlClient:
                     expose_http=bool(expose_http),
                     package_format=effective_format,
                     export_spec=export_spec,
+                    dependency_allowlist=list(dependency_allowlist or ()),
                 )
             )
             for i in range(0, len(blob), max(1, int(chunk_size))):
@@ -1873,7 +1942,7 @@ class NodeControlClient:
             pb2.CallServiceRequest(
                 service_id=service_id,
                 method=method,
-                payload=payload or {},
+                payload=dict_to_struct(_serialize_arrow_compatible(payload or {})),
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=service_token or "",
             ),
@@ -2217,6 +2286,7 @@ class TaskBatchClient:
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -2227,7 +2297,7 @@ class TaskBatchClient:
         preferred_runtime_key: str = "",
         timeout_sec: float = 10.0,
     ) -> "TaskBatchClient":
-        # 自动依赖检测：处理模块对象和函数对象
+        # 自动本地源码打包：处理模块对象和函数对象
         if module is not None:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=None,
@@ -2240,7 +2310,7 @@ class TaskBatchClient:
 
             # 自动推断 entry_module
             if not entry_module:
-                entry_module = module.__name__
+                entry_module = _default_entry_module_for_module(module)
         elif func is not None:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=func,
@@ -2253,7 +2323,7 @@ class TaskBatchClient:
 
             # 自动推断 entry_module 和 entry_callable
             if not entry_module:
-                entry_module = func.__module__
+                entry_module = _default_entry_module_for_func(func)
             if not entry_callable or entry_callable == "run":
                 entry_callable = func.__name__
         else:
@@ -2321,6 +2391,7 @@ class TaskBatchClient:
                         limit=node_limit,
                         require_credit=require_credit,
                         preferred_runtime_key=desired_runtime_key,
+                        runtime=runtime,
                     )
                 )
 
@@ -2348,6 +2419,7 @@ class TaskBatchClient:
                             export_mode=export_mode,
                             export_methods=export_methods,
                             export_decorator=export_decorator,
+                            dependency_allowlist=dependency_allowlist,
                             chunk_size=chunk_size,
                         )
                         uploaded_versions[node_id] = upload.code_version
@@ -2364,6 +2436,7 @@ class TaskBatchClient:
                             export_mode=export_mode,
                             export_methods=export_methods,
                             export_decorator=export_decorator,
+                            dependency_allowlist=dependency_allowlist,
                             chunk_size=chunk_size,
                         )
                         uploaded_versions[node_id] = upload.code_version
@@ -2543,7 +2616,7 @@ class TaskBatchClient:
             items.append(
                 pb2.TaskSubmitItem(
                     task_id=f"{prefix}-{self._submit_seq:04d}",
-                    payload=payload or {},
+                    payload=dict_to_struct(_serialize_arrow_compatible(payload or {})),
                     timeout_hint_sec=max(0, int(timeout_hint_sec)),
                     priority=max(1, int(priority)),
                     runtime_key=normalized_runtime_key,
@@ -2773,6 +2846,7 @@ class ServiceGroup:
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2838,7 +2912,7 @@ class ServiceGroup:
         Returns:
             ServiceGroup: 部署的服务组
         """
-        # 自动依赖检测：处理模块对象和函数对象
+        # 自动本地源码打包：处理模块对象和函数对象
         if module is not None:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=None,
@@ -2851,7 +2925,7 @@ class ServiceGroup:
 
             # 自动推断 entry_module
             if not entry_module:
-                entry_module = module.__name__
+                entry_module = _default_entry_module_for_module(module)
         elif func is not None:
             effective_blob, effective_filename = _prepare_code_blob(
                 func=func,
@@ -2864,7 +2938,7 @@ class ServiceGroup:
 
             # 自动推断 entry_module 和 entry_callable
             if not entry_module:
-                entry_module = func.__module__
+                entry_module = _default_entry_module_for_func(func)
             if not entry_callable or entry_callable == "run":
                 entry_callable = func.__name__
         else:
@@ -3024,19 +3098,37 @@ class ServiceGroup:
         if not discovered_nodes:
             raise RuntimeError("no available nodes from InfoCenter")
 
+        normalized_runtime = normalize_python_runtime_spec(runtime)
         discovered_node_map = {node.node_id: node for node in discovered_nodes}
         if requested_node_ids:
             missing_node_ids = [node_id for node_id in requested_node_ids if node_id not in discovered_node_map]
             if missing_node_ids:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
             selected_nodes = [discovered_node_map[node_id] for node_id in requested_node_ids]
+            if normalized_runtime:
+                incompatible = [
+                    node.node_id
+                    for node in selected_nodes
+                    if str(node.python_version or "").strip()
+                    and not matches_python_runtime(node.python_version, normalized_runtime)
+                ]
+                if incompatible:
+                    raise RuntimeError(
+                        f"requested node_ids do not satisfy runtime {normalized_runtime}: {incompatible}"
+                    )
         else:
             candidate_nodes = [
                 node
                 for node in discovered_nodes
                 if node.healthy and node.schedulable and not node.drain
             ]
+            if normalized_runtime:
+                candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=normalized_runtime)
             if not candidate_nodes:
+                if normalized_runtime:
+                    raise RuntimeError(
+                        f"no schedulable nodes from InfoCenter for runtime {normalized_runtime}"
+                    )
                 raise RuntimeError("no schedulable nodes from InfoCenter")
             candidate_nodes.sort(
                 key=lambda node: (
@@ -3149,6 +3241,7 @@ class ServiceGroup:
                     export_mode=export_mode,
                     export_methods=export_methods,
                     export_decorator=export_decorator,
+                    dependency_allowlist=dependency_allowlist,
                     worker_count=worker_count,
                     heartbeat_timeout_sec=heartbeat_timeout_sec,
                     idle_ttl_sec=idle_ttl_sec,
@@ -3666,7 +3759,7 @@ class ServiceGroup:
             if not self._breaker_before_invoke(node_id):
                 continue
             try:
-                resp = self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec)
+                resp = self.sessions[node_id].call(method, serialized_payload, timeout_sec=timeout_sec)
                 self._breaker_mark_success(node_id)
                 return node_id, resp
             except Exception as exc:
@@ -3710,6 +3803,7 @@ class ServiceGroup:
         last_error: Optional[Exception] = None
 
         loop = asyncio.get_running_loop()
+        serialized_payload = _serialize_arrow_compatible(payload)
         for _ in range(tries):
             node_id = self._select_node(strategy=strategy, refresh_status=refresh_status, exclude=excluded)
             excluded.add(node_id)
@@ -3719,7 +3813,7 @@ class ServiceGroup:
                 # 在线程池中执行同步调用，不阻塞事件循环
                 resp = await loop.run_in_executor(
                     None,
-                    lambda: self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec),
+                    lambda: self.sessions[node_id].call(method, serialized_payload, timeout_sec=timeout_sec),
                 )
                 self._breaker_mark_success(node_id)
                 return node_id, resp
@@ -3756,10 +3850,12 @@ class ServiceGroup:
         nodes = list(self.sessions.keys())
         # 如果是单个 payload，复制给所有节点
         if isinstance(payloads, dict):
-            payloads = [dict(payloads) for _ in nodes]
+            shared_payload = _serialize_arrow_compatible(payloads)
+            payloads = [dict(shared_payload) for _ in nodes]
         elif isinstance(payloads, list):
             if len(payloads) != len(nodes):
                 raise ValueError(f"payload list length ({len(payloads)}) must match node count ({len(nodes)})")
+            payloads = [_serialize_arrow_compatible(payload) for payload in payloads]
 
         loop = asyncio.get_running_loop()
         semaphore = asyncio.Semaphore(max_concurrency)
@@ -3863,11 +3959,13 @@ class _CallProxy:
         payload = {}
         if args:
             payload["args"] = list(args)
-        if kwargs:
+        if args and kwargs:
             payload["kwargs"] = kwargs
 
-        # 如果两者都有，使用新格式；否则保持向后兼容
-        final_payload = payload if payload else kwargs
+        if args:
+            final_payload = payload
+        else:
+            final_payload = kwargs
 
         # 序列化 Arrow 兼容对象（DataFrame, Series, ndarray）
         serialized_payload = _serialize_arrow_compatible(final_payload)
@@ -3979,11 +4077,13 @@ class _SyncCallProxy:
         payload = {}
         if args:
             payload["args"] = list(args)
-        if kwargs:
+        if args and kwargs:
             payload["kwargs"] = kwargs
 
-        # 如果两者都有，使用新格式；否则保持向后兼容
-        final_payload = payload if payload else kwargs
+        if args:
+            final_payload = payload
+        else:
+            final_payload = kwargs
 
         # 序列化 Arrow 兼容对象（DataFrame, Series, ndarray）
         serialized_payload = _serialize_arrow_compatible(final_payload)
@@ -4439,11 +4539,12 @@ class DiscoveryModuleClient(DiscoveryServiceClient):
         route = self._route_cache.select_route(self.service_name, strategy=strategy)
         tried = {route.service_id}
         token = self.service_token
+        serialized_payload = _serialize_arrow_compatible(payload)
         try:
             resp = _call_route_http(
                 route,
                 method=method,
-                payload=payload,
+                payload=serialized_payload,
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=token,
             )
@@ -4459,7 +4560,7 @@ class DiscoveryModuleClient(DiscoveryServiceClient):
                 resp = _call_route_http(
                     retry_route,
                     method=method,
-                    payload=payload,
+                    payload=serialized_payload,
                     timeout_sec=max(0.1, float(timeout_sec)),
                     service_token=token,
                 )
@@ -4588,18 +4689,21 @@ class _TaskCallProxy:
         # 构造 payload（只包含业务参数）
         payload = dict(self._payload)
 
-        # 如果有位置参数或命名参数，使用新格式
-        if args or kwargs:
-            if args:
-                payload["args"] = list(args)
+        # 只有 kwargs 时保持旧格式；存在 args 时使用 args/kwargs 格式。
+        if args:
+            payload["args"] = list(args)
             if kwargs:
                 payload["kwargs"] = kwargs
+        elif kwargs:
+            payload.update(kwargs)
+
+        serialized_payload = _serialize_arrow_compatible(payload)
 
         # 打印任务提交信息
-        print(f"[gRPC SubmitTasks] payload={json.dumps(payload, ensure_ascii=False)}")
+        print(f"[gRPC SubmitTasks] payload={json.dumps(serialized_payload, ensure_ascii=False)}")
 
         return self._batch.submit_payloads(
-            [payload],
+            [serialized_payload],
             timeout_hint_sec=timeout_hint,
             priority=prio,
             runtime_key=rt_key,
@@ -4662,19 +4766,21 @@ class _TaskCallProxy:
             >>> # 位置参数
             >>> results = task.run(7)
         """
-        # 如果有位置参数或命名参数，使用新格式
+        # 只有 kwargs 时保持旧格式；存在 args 时使用 args/kwargs 格式。
         if args or kwargs:
-            # 构造新的 payload
             payload = dict(self._payload)
             if args:
                 payload["args"] = list(args)
-            if kwargs:
-                payload["kwargs"] = kwargs
+                if kwargs:
+                    payload["kwargs"] = kwargs
+            else:
+                payload.update(kwargs)
+            serialized_payload = _serialize_arrow_compatible(payload)
             return self.submit_and_wait(
                 timeout_hint_sec=self._timeout_hint_sec,
                 priority=self._priority,
                 runtime_key=self._runtime_key,
-                _payload=payload,  # 使用内部参数名避免冲突
+                _payload=serialized_payload,  # 使用内部参数名避免冲突
             )
 
         return self.submit_and_wait()
@@ -4739,6 +4845,7 @@ class TaskModuleClient:
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -4771,6 +4878,7 @@ class TaskModuleClient:
             export_mode=export_mode,
             export_methods=export_methods,
             export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,

@@ -13,6 +13,8 @@ from pycloud_parallel import DeployedService
 def main():
     gateway_target = "127.0.0.1:50051"
     service_name = "arrow-demo"
+    # pandas / numpy 如果目标节点未预装，也可以通过 dependency_allowlist 显式补装。
+    dependency_allowlist = []
 
     print("=" * 60)
     print("  Arrow 兼容类型序列化演示")
@@ -63,10 +65,11 @@ def main():
             service_name=service_name,
             blob=blob,
             filename="arrow_service.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="arrow_service",
             export_mode="decorator",
             export_decorator="pycloud_export",
+            dependency_allowlist=dependency_allowlist,
             worker_count=2,
             tags=["compute"],  # 修改为 compute 标签
             min_success_nodes=1,

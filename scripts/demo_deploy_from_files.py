@@ -281,7 +281,7 @@ def main():
                 export_decorator="pycloud_export",
 
                 # 运行时配置
-                runtime="py3.11",
+                runtime="py3",
                 worker_count=4,
                 heartbeat_timeout_sec=30,
 

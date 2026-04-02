@@ -278,6 +278,8 @@ result = await group.test(1, 2, 3, a=4, b=5)
 
 1. **服务端函数必须可调用**：使用 `@pycloud_export` 或在 `export_methods` 中声明
 2. **参数类型必须可序列化**：通过 JSON/gRPC 传输
+3. 当前框架只额外支持 `DataFrame / Series / ndarray` 三类对象
+4. 更复杂对象需要业务侧自己转普通结构
 3. **不支持 `**kwargs` 捕获所有参数**：因为框架已经处理了参数解包
 
 ## HTTP 风格兼容性
@@ -333,4 +335,3 @@ result = client.call(..., payload={"a": 10, "b": 20})
 - ✅ 向后兼容旧代码
 
 服务端代码可以像写本地函数一样自然！
-

@@ -71,8 +71,8 @@ def test_multi_node_group_deploy_and_call(tmp_path):
             infocenter.register_node(node_id="node-multi-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["test"])
 
         blob = (
-            b"def run(payload):\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
 
@@ -82,7 +82,7 @@ def test_multi_node_group_deploy_and_call(tmp_path):
             service_name="svc-multi-test",
             blob=blob,
             filename="svc_multi_test.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_multi_test",
             entry_callable="run",
             worker_count=2,
@@ -142,8 +142,8 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             infocenter.register_node(node_id="node-cb-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["cb"])
 
         blob = (
-            b"def run(payload):\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
 
@@ -153,7 +153,7 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             service_name="svc-cb-test",
             blob=blob,
             filename="svc_cb_test.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_cb_test",
             entry_callable="run",
             worker_count=2,
@@ -258,10 +258,7 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
         with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
             infocenter.register_node(node_id="node-route-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["route"])
 
-        blob = (
-            b"def run(payload):\n"
-            b"    return {'ok': True}\n"
-        )
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
 
         existing_group = ServiceGroup.deploy_from_infocenter(
             infocenter_target=info_target,
@@ -269,7 +266,7 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
             service_name="svc-existing",
             blob=blob,
             filename="svc_existing.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_existing",
             entry_callable="run",
             worker_count=2,
@@ -303,7 +300,7 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
                 service_name="svc-existing",
                 blob=blob,
                 filename="svc_dup_check.py",
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="svc_dup_check",
                 entry_callable="run",
                 worker_count=2,
@@ -339,8 +336,8 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
             infocenter.register_node(node_id="node-reuse-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["reuse"])
 
         blob = (
-            b"def run(payload):\n"
-            b"    value = int(payload.get('value', 0))\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
 
@@ -350,7 +347,7 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
             service_name="svc-reuse-test",
             blob=blob,
             filename="svc_reuse_test.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_reuse_test",
             entry_callable="run",
             worker_count=2,
@@ -375,7 +372,7 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
                 service_name="svc-reuse-test",
                 blob=blob,
                 filename="svc_reuse_test.py",
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="svc_reuse_test",
                 entry_callable="run",
                 worker_count=2,
@@ -421,8 +418,8 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
             infocenter.register_node(node_id="node-replace-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["replace"])
             infocenter.register_node(node_id="node-replace-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["replace"])
 
-        blob_v1 = b"def run(payload):\n    return {'version': 1}\n"
-        blob_v2 = b"def run(payload):\n    return {'version': 2}\n"
+        blob_v1 = b"def run(**_kwargs):\n    return {'version': 1}\n"
+        blob_v2 = b"def run(**_kwargs):\n    return {'version': 2}\n"
 
         group1 = ServiceGroup.deploy_from_infocenter(
             infocenter_target=info_target,
@@ -430,7 +427,7 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
             service_name="svc-replace-test",
             blob=blob_v1,
             filename="svc_replace_test.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_replace_test",
             entry_callable="run",
             worker_count=2,
@@ -455,7 +452,7 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
                 service_name="svc-replace-test",
                 blob=blob_v2,
                 filename="svc_replace_test.py",
-                runtime="py3.11",
+                runtime="py3",
                 entry_module="svc_replace_test",
                 entry_callable="run",
                 worker_count=2,
@@ -477,7 +474,7 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
             service_name="svc-replace-test",
             blob=blob_v2,
             filename="svc_replace_test.py",
-            runtime="py3.11",
+            runtime="py3",
             entry_module="svc_replace_test",
             entry_callable="run",
             worker_count=2,
@@ -502,6 +499,63 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
             group2.close(end_services=True, reason="replace test done")
 
         assert not (cache_dir / "owner-replace-test" / "svc-replace-test.json").exists()
+    finally:
+        info_server.stop()
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()
+
+
+def test_service_group_deploy_from_infocenter_filters_nodes_by_runtime(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-runtime-310", str(tmp_path / "runtime_n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-runtime-313", str(tmp_path / "runtime_n2_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-runtime-310",
+                control_addr=n1_target,
+                capacity=16,
+                queue_capacity=64,
+                tags=["runtime"],
+                python_version="py3.10",
+            )
+            infocenter.register_node(
+                node_id="node-runtime-313",
+                control_addr=n2_target,
+                capacity=16,
+                queue_capacity=64,
+                tags=["runtime"],
+                python_version="py3.13",
+            )
+
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+
+        group = ServiceGroup.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-runtime-test",
+            service_name="svc-runtime-test",
+            blob=blob,
+            filename="svc_runtime_test.py",
+            runtime=">=py3.11",
+            entry_module="svc_runtime_test",
+            entry_callable="run",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["runtime"],
+            min_success_nodes=1,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
+        )
+
+        try:
+            assert set(group.sessions.keys()) == {"node-runtime-313"}
+        finally:
+            group.close(end_services=True, reason="runtime filter test done")
     finally:
         info_server.stop()
         n1_server.stop(grace=0)

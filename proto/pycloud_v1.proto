@@ -206,6 +206,7 @@ message UploadCodeMeta {
   string entry_callable = 6; // legacy single-function field
   string package_format = 7; // py | tar.gz | zip | whl
   ModuleExportSpec export_spec = 8;
+  repeated string dependency_allowlist = 9;
 }
 
 message UploadCodeRequest {
@@ -432,6 +433,7 @@ message CreateServiceMeta {
   bool expose_http = 11;
   string package_format = 12; // py | tar.gz | zip | whl
   ModuleExportSpec export_spec = 13;
+  repeated string dependency_allowlist = 14;
 }
 
 message CreateServiceRequest {

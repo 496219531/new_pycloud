@@ -7,17 +7,36 @@
 
 ## 当前架构
 
-当前默认部署形态是：
+当前默认部署形态：
 
 1. `ControlPlane = InfoCenter + Gateway`，对外 `HTTP + JSON`
 2. `NodeControl`，对外 `gRPC`
 3. 服务实例数据面，节点内 `HTTP + JSON`
+
+## Payload 序列化边界
+
+当前运行时数据流只额外支持很窄的一组 Python 类型：
+
+1. `pandas.DataFrame`
+2. `pandas.Series`
+3. `numpy.ndarray`
+
+其中：
+
+1. `HTTP` 调服务时，底层仍然是 `JSON`
+2. 框架会把上面 3 种类型自动转成简单 JSON 结构
+3. 复杂对象不会自动兼容，直接报错
+4. `gRPC` 任务/服务控制面会对这 3 种类型做显式包装与还原
+5. `numpy.ndarray` 只接受简单 `dtype`：数值 / bool / 字符串
+
+如果业务参数里有更复杂的 Python 对象，当前建议用户自己先转成普通 JSON 结构，或落到外部存储后只传引用。
 
 职责划分：
 
 1. `InfoCenter`
    - 节点注册与心跳
    - 节点与服务路由事实查询
+   - 暴露节点 `python_version`
    - 轻量运维页面 `/ops`
 2. `Gateway`
    - 对外服务调用入口
@@ -31,15 +50,15 @@
 
 ### 服务模式
 
-- 对外推荐入口：`ControlPlane Gateway HTTP + JSON`
-- 节点管理面：`NodeControl gRPC`
-- 节点内服务执行：`POST /svc/{service_id}/call/{method}`
+1. 对外推荐入口：`ControlPlane Gateway HTTP + JSON`
+2. 节点管理面：`NodeControl gRPC`
+3. 节点内服务执行：`POST /svc/{service_id}/call/{method}`
 
 ### 任务模式
 
-- 高频任务链路仍然走 `NodeControl gRPC`
-- `InfoCenter` 只提供节点事实，不代理任务
-- `Gateway` 不代理任务
+1. 高频任务链路仍然走 `NodeControl gRPC`
+2. `InfoCenter` 只提供节点事实，不代理任务
+3. `Gateway` 不代理任务
 
 ## 顶层 Python API
 
@@ -103,15 +122,15 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 ### 3. 服务模式
 
 ```python
-from pycloud_parallel import DeployedService, pycloud_export
+from pycloud_parallel import DeployedService
 
 blob = (
     b"def pycloud_export(fn):\n"
     b"    fn.__pycloud_export__ = True\n"
     b"    return fn\n\n"
     b"@pycloud_export\n"
-    b"def square(payload):\n"
-    b"    x = int(payload.get('x', 0))\n"
+    b"def square(x=0, **_kwargs):\n"
+    b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
@@ -120,6 +139,7 @@ group = DeployedService.deploy_from_infocenter(
     service_name="square-service",
     blob=blob,
     filename="square_service.py",
+    runtime="py3",
     entry_module="square_service",
     export_mode="decorator",
     node_count=1,
@@ -129,14 +149,30 @@ print(group.square.sync(x=7))
 # group.join() 适合 owner 长驻
 ```
 
+如果你的代码依赖节点上未预装的包，可以显式给白名单：
+
+```python
+group = DeployedService.deploy_from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    service_name="dep-service",
+    artifact_path="./service_src",
+    runtime="py3",
+    entry_module="viewer",
+    dependency_allowlist=[
+        "./third_party/my_local_pkg",
+        "orjson==3.10.18",
+    ],
+)
+```
+
 ### 4. 任务模式
 
 ```python
 from pycloud_parallel import TaskSubmitter
 
 blob = (
-    b"def run(payload):\n"
-    b"    value = int(payload.get('value', 0))\n"
+    b"def run(value=0, **_kwargs):\n"
+    b"    value = int(value)\n"
     b"    return {'value': value, 'square': value * value}\n"
 )
 
@@ -144,12 +180,16 @@ with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="task_demo.py",
+    runtime="py3",
     entry_module="task_demo",
 ) as task:
     results = task.run(value=7, runtime_key="demo-runtime")
     for item in results:
         print(item.task_id, item.status, item.result)
 ```
+
+如果上传校验报 `ModuleNotFoundError`，默认会严格失败。
+只有显式传了 `dependency_allowlist`，节点才会尝试在当前 `code_version` 的隔离目录里补装依赖。
 
 ### 5. Gateway 调用
 
@@ -195,6 +235,40 @@ print(client.square.sync(x=9))
 2. `InfoCenter.select_task_nodes(...)` 支持 `preferred_runtime_key`
 3. `TaskBatchClient.from_infocenter(...)` 默认会优先选择热 node
 
+## Python Runtime 约束
+
+`runtime` 当前表示 Python 版本约束，不是任意标签。
+
+支持的写法：
+
+1. `py3`
+2. `py3.11`
+3. `>=py3.11`
+4. `<=py3.11`
+5. `>py3.11`
+6. `<py3.11`
+
+当前行为：
+
+1. `InfoCenter` 会暴露节点 `python_version`
+2. 服务部署和任务选点会先按 `runtime` 过滤节点
+3. 节点侧在上传代码和创建服务时会再做一次本地校验
+
+建议：
+
+1. 通用示例默认使用 `runtime="py3"`
+2. 只有明确依赖某个次版本时，再使用精确版本或比较表达式
+
+## 依赖补装策略
+
+当前策略刻意保持保守：
+
+1. 默认不自动安装任何缺失模块
+2. 只有调用方显式传 `dependency_allowlist` 才允许节点补装
+3. 节点不会猜测 `import 名 -> pip 包名`
+4. 白名单会安装到 `code_cache/<sha>_deps`
+5. 同一个 `code_version` 如果使用不同的 `dependency_allowlist`，会直接拒绝，避免缓存语义混乱
+
 ## 运维接口
 
 当前 `ControlPlane` 端口同时提供：
@@ -223,3 +297,4 @@ print(client.square.sync(x=9))
 4. [ServiceModuleGroup](docs/SERVICE_MODULE_GROUP.md)
 5. [Gateway 客户端指南](docs/GATEWAY_CLIENT_GUIDE.md)
 6. [InfoCenter HTTP](docs/INFOCENTER_HTTP.md)
+7. [Runtime 参数说明](docs/RUNTIME_PARAMETER_ANALYSIS.md)

@@ -26,6 +26,9 @@ def main() -> None:
     run_job_id = f"job-run-{int(time.time())}"
     cancel_job_id = f"job-cancel-{int(time.time())}"
     runtime_key = "demo-runtime-v1"
+    # 如果任务代码依赖节点未预装的包，可显式填写白名单。
+    # 例如: ["./third_party/my_local_pkg", "/abs/path/to/pkg.whl", "orjson==3.10.18"]
+    dependency_allowlist = []
 
     blob = (
         b"def run(payload):\n"
@@ -52,9 +55,10 @@ def main() -> None:
         job_id=run_job_id,
         blob=blob,
         filename="task_demo.py",
-        runtime="py3.11",
+        runtime="py3",
         entry_module="task_demo",
         entry_callable="run",
+        dependency_allowlist=dependency_allowlist,
         tags=["compute"],
         node_count=2,
         node_limit=50,

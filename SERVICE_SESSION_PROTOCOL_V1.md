@@ -74,12 +74,41 @@
 5. 生成 `code_version=sha256:<digest>`。
 6. 对归档文件解压到独立目录。
 
+`runtime` 当前表示 Python 版本约束，而不是任意标签。
+
+支持的轻量表达式：
+
+1. `py3`
+2. `py3.11`
+3. `>=py3.11`
+4. `<=py3.11`
+
+行为：
+
+1. owner 侧部署前会按 `InfoCenter` 返回的节点 `python_version` 先过滤
+2. NodeControl 创建服务时还会再做一次本地校验
+
 ### 4.3 导入污染防护
 
 对于包导入：
 
 1. 导入前会清理 `entry_module` 及其父包缓存。
 2. 避免重复部署同名包时命中旧路径。
+
+### 4.4 缺依赖时的补装策略
+
+`CreateServiceMeta` 当前支持可选字段：
+
+1. `dependency_allowlist`
+
+语义：
+
+1. 默认严格模式，缺依赖直接失败
+2. 只有白名单非空时，NodeControl 才允许尝试补装
+3. 不做 `import 名 -> pip 包名` 猜测
+4. 当前实现会把整批白名单安装到 `code_cache/<sha>_deps`
+5. 安装成功后，会用该依赖目录重试一次模块校验
+6. 同一个 `code_version` 若收到不同的 `dependency_allowlist`，会拒绝请求
 
 ## 5. 方法导出
 
@@ -184,8 +213,9 @@ Python 客户端当前会在本地缓存：
    - `healthy=false`
    - `schedulable=false`
    - `drain=true`
-3. 按 `service_worker_available` 排序。
-4. 选出 `node_ids` 或 `node_count` / `min_success_nodes` 决定的节点数。
+3. 如果指定了 `runtime`，先按节点 `python_version` 过滤
+4. 按 `service_worker_available` 排序。
+5. 选出 `node_ids` 或 `node_count` / `min_success_nodes` 决定的节点数。
 
 这版默认是“按需选点”，不是“默认部署到所有节点”。
 
@@ -197,3 +227,14 @@ Python 客户端当前会在本地缓存：
 4. 开启 keepalive
 5. 通过 HTTP 或 gRPC 调方法
 6. 完成后 `EndService`
+
+如果创建时收到类似：
+
+1. `artifact validation failed while loading`
+2. `ModuleNotFoundError`
+
+优先处理顺序建议：
+
+1. 先修正代码或打包内容
+2. 确认确实只是缺外部依赖
+3. 再显式补 `dependency_allowlist`
