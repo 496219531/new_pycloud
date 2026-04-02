@@ -98,19 +98,11 @@ def main():
                 group.acall_balanced("square", {"x": i}, timeout_sec=10)
                 for i in range(100)
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            success = 0
-            failed = 0
-            for result in results:
-                if isinstance(result, Exception):
-                    failed += 1
-                    print(f"    [FAIL] {result}")
-                else:
-                    success += 1
+            results = await asyncio.gather(*tasks)
 
             elapsed = time.time() - start
-            print(f"    成功: {success}, 失败: {failed}")
+            success = len(results)
+            print(f"    成功: {success}, 失败: 0")
             print(f"    总耗时: {elapsed:.3f}s")
             print(f"    QPS: {success / elapsed:.1f}")
             return results
@@ -136,9 +128,8 @@ def main():
 
             for node_id, resp, exc in results:
                 if exc:
-                    print(f"    {node_id}: FAILED - {exc}")
-                else:
-                    print(f"    {node_id}: {resp['data']}")
+                    raise RuntimeError(f"broadcast to node {node_id} failed: {exc}")
+                print(f"    {node_id}: {resp['data']}")
             print(f"    总耗时: {elapsed:.3f}s")
             return results
 
@@ -155,27 +146,18 @@ def main():
         async def demo_high_concurrency():
             start = time.time()
 
-            async def one_call(i):
-                try:
-                    node_id, resp = await group.acall_balanced("square", {"x": i}, timeout_sec=30)
-                    return (node_id, resp['data'], None)
-                except Exception as e:
-                    return (None, None, str(e))
-
             # 分批执行，每批 100 个
             batch_size = 100
             total = 1000
             success = 0
-            failed = 0
 
             for batch_num in range(total // batch_size):
-                tasks = [one_call(batch_num * batch_size + i) for i in range(batch_size)]
+                tasks = [
+                    group.acall_balanced("square", {"x": batch_num * batch_size + i}, timeout_sec=30)
+                    for i in range(batch_size)
+                ]
                 results = await asyncio.gather(*tasks)
-                for node_id, data, err in results:
-                    if err:
-                        failed += 1
-                    else:
-                        success += 1
+                success += len(results)
 
                 if (batch_num + 1) % 5 == 0:
                     elapsed = time.time() - start
@@ -183,7 +165,7 @@ def main():
                           f"QPS: {success / elapsed:.1f}")
 
             elapsed = time.time() - start
-            print(f"    成功: {success}, 失败: {failed}")
+            print(f"    成功: {success}, 失败: 0")
             print(f"    总耗时: {elapsed:.3f}s")
             print(f"    平均 QPS: {total / elapsed:.1f}")
 

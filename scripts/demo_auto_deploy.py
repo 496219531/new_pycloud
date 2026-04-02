@@ -58,11 +58,6 @@ def demo_deployed_service_with_function():
         print(f"✓ 调用结果: {result}")
         print()
 
-    except Exception as e:
-        print(f"✗ 部署或调用失败: {e}")
-        import traceback
-        traceback.print_exc()
-
     finally:
         print("[3] 清理服务")
         print("-" * 70)
@@ -124,11 +119,6 @@ def demo_task_submitter_with_function():
             if result.status == "TASK_STATUS_SUCCEEDED":
                 print(f"  {result.task_id}: {result.result}")
         print()
-
-    except Exception as e:
-        print(f"✗ 创建或提交失败: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         print("[4] 清理")
@@ -202,40 +192,34 @@ def main():
     print("╚" + "=" * 68 + "╝")
     print()
 
-    try:
-        # 演示对比
-        demo_comparison()
+    # 演示对比
+    demo_comparison()
 
-        # 演示 DeployedService
-        # demo_deployed_service_with_function()
+    # 演示 DeployedService
+    # demo_deployed_service_with_function()
 
-        # 演示 TaskSubmitter
-        # demo_task_submitter_with_function()
+    # 演示 TaskSubmitter
+    # demo_task_submitter_with_function()
 
-        print("=" * 70)
-        print("  所有演示完成!")
-        print("=" * 70)
-        print()
-        print("✅ 新功能:")
-        print("  1. ✅ DeployedService.deploy_from_infocenter(func=...)")
-        print("  2. ✅ TaskSubmitter.from_infocenter(func=...)")
-        print("  3. ✅ 自动打包本地源码依赖")
-        print("  4. ✅ 自动推断 entry_module 和 entry_callable")
-        print()
-        print("📋 使用方式:")
-        print("  - 之前：需要手动打包代码或创建 blob")
-        print("  - 现在：直接传函数对象，自动处理本地源码打包")
-        print()
-        print("💡 提示:")
-        print("  - 函数会被自动打包成 tar.gz")
-        print("  - 本地源码依赖和 package 资源会自动包含")
-        print("  - 如果远端缺第三方包，可显式传 dependency_allowlist")
-        print()
-
-    except Exception as e:
-        print(f"❌ 演示失败: {e}")
-        import traceback
-        traceback.print_exc()
+    print("=" * 70)
+    print("  所有演示完成!")
+    print("=" * 70)
+    print()
+    print("✅ 新功能:")
+    print("  1. ✅ DeployedService.deploy_from_infocenter(func=...)")
+    print("  2. ✅ TaskSubmitter.from_infocenter(func=...)")
+    print("  3. ✅ 自动打包本地源码依赖")
+    print("  4. ✅ 自动推断 entry_module 和 entry_callable")
+    print()
+    print("📋 使用方式:")
+    print("  - 之前：需要手动打包代码或创建 blob")
+    print("  - 现在：直接传函数对象，自动处理本地源码打包")
+    print()
+    print("💡 提示:")
+    print("  - 函数会被自动打包成 tar.gz")
+    print("  - 本地源码依赖和 package 资源会自动包含")
+    print("  - 如果远端缺第三方包，可显式传 dependency_allowlist")
+    print()
 
 
 if __name__ == "__main__":

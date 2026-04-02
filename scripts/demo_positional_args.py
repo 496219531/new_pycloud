@@ -44,33 +44,26 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    try:
-        group = DeployedService.deploy_from_infocenter(
-            infocenter_target=gateway_target,
-            service_name=service_name,
-            blob=blob,
-            filename="args_demo.py",
-            runtime="py3",
-            entry_module="args_demo",
-            export_mode="decorator",
-            export_decorator="pycloud_export",
-            worker_count=2,
-            tags=["demo"],
-            min_success_nodes=1,
-        )
-        print(f"✓ 服务部署成功")
-        print(f"  服务名: {group.service_name}")
-        print(f"  节点: {list(group.sessions.keys())}")
-        print()
+    group = DeployedService.deploy_from_infocenter(
+        infocenter_target=gateway_target,
+        service_name=service_name,
+        blob=blob,
+        filename="args_demo.py",
+        runtime="py3",
+        entry_module="args_demo",
+        export_mode="decorator",
+        export_decorator="pycloud_export",
+        worker_count=2,
+        tags=["demo"],
+        min_success_nodes=1,
+    )
+    print(f"✓ 服务部署成功")
+    print(f"  服务名: {group.service_name}")
+    print(f"  节点: {list(group.sessions.keys())}")
+    print()
 
-        import time
-        time.sleep(3)  # 等待服务启动
-
-    except Exception as e:
-        print(f"✗ 部署失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+    import time
+    time.sleep(3)  # 等待服务启动
 
     try:
         # 步骤 2: 测试不同参数传递方式
@@ -151,11 +144,6 @@ def main():
 
         asyncio.run(batch_test())
         print()
-
-    except Exception as e:
-        print(f"✗ 调用失败: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         # 步骤 3: 清理

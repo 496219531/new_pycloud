@@ -39,31 +39,26 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    try:
-        group = DeployedService.deploy_from_infocenter(
-            infocenter_target=gateway_target,
-            service_name=service_name,
-            blob=blob,
-            filename="compat_demo.py",
-            runtime="py3",
-            entry_module="compat_demo",
-            export_mode="decorator",
-            export_decorator="pycloud_export",
-            dependency_allowlist=dependency_allowlist,
-            worker_count=2,
-            tags=["demo"],
-            min_success_nodes=1,
-        )
-        print(f"✓ 服务部署成功")
-        print(f"  服务名: {group.service_name}")
-        print()
+    group = DeployedService.deploy_from_infocenter(
+        infocenter_target=gateway_target,
+        service_name=service_name,
+        blob=blob,
+        filename="compat_demo.py",
+        runtime="py3",
+        entry_module="compat_demo",
+        export_mode="decorator",
+        export_decorator="pycloud_export",
+        dependency_allowlist=dependency_allowlist,
+        worker_count=2,
+        tags=["demo"],
+        min_success_nodes=1,
+    )
+    print(f"✓ 服务部署成功")
+    print(f"  服务名: {group.service_name}")
+    print()
 
-        import time
-        time.sleep(3)  # 等待服务启动
-
-    except Exception as e:
-        print(f"✗ 部署失败: {e}")
-        return
+    import time
+    time.sleep(3)  # 等待服务启动
 
     try:
         print("[2] 测试不同的调用风格")
@@ -158,11 +153,6 @@ def main():
 
         asyncio.run(batch_test())
         print()
-
-    except Exception as e:
-        print(f"✗ 调用失败: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         # 清理
