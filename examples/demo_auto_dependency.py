@@ -12,7 +12,7 @@ import os
 # 添加项目路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.pycloud_parallel.controlplane.dependency import (
+from pycloud_parallel.controlplane.dependency import (
     DependencyAnalyzer,
     DependencyPackager,
     auto_deploy_function,

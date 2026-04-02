@@ -147,11 +147,11 @@ replace_existing_if_code_changed=False
 ### 5.3 典型 demo
 
 ```bash
-python scripts/grpc_register_service_client_demo.py
-python scripts/demo_service_module_group.py
-python scripts/demo_simple_deploy.py
-python scripts/demo_deploy_from_files.py
-python scripts/grpc_existing_service_client_demo.py
+python examples/grpc_register_service_client_demo.py
+python examples/demo_service_module_group.py
+python examples/demo_simple_deploy.py
+python examples/demo_deploy_from_files.py
+python examples/grpc_existing_service_client_demo.py
 ```
 
 ## 6. 当前不做的复杂功能

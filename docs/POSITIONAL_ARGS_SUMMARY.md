@@ -138,7 +138,7 @@ def __call__(self, *args, **kwargs) -> Sequence[pb2.TaskResult]:
 ### 4. 演示脚本
 
 #### 4.1 Service Session 模式演示
-**文件**: `scripts/demo_positional_args.py`
+**文件**: `examples/demo_positional_args.py`
 
 展示功能：
 - 单参数函数（位置/命名）
@@ -150,7 +150,7 @@ def __call__(self, *args, **kwargs) -> Sequence[pb2.TaskResult]:
 - 批量并发调用
 
 #### 4.2 Task 模式演示
-**文件**: `scripts/demo_task_positional_args.py`
+**文件**: `examples/demo_task_positional_args.py`
 
 展示功能：
 - 位置参数提交
@@ -232,8 +232,8 @@ result = await group.square(7)
 ✅ 所有文件语法检查通过：
 - `src/pycloud_parallel/controlplane/state.py`
 - `src/pycloud_parallel/controlplane/client.py`
-- `scripts/demo_positional_args.py`
-- `scripts/demo_task_positional_args.py`
+- `examples/demo_positional_args.py`
+- `examples/demo_task_positional_args.py`
 
 ## 修改的文件清单
 
@@ -242,8 +242,8 @@ result = await group.square(7)
    - `src/pycloud_parallel/controlplane/client.py` - 客户端参数打包
 
 2. **演示脚本**
-   - `scripts/demo_positional_args.py` - Service Session 位置参数演示
-   - `scripts/demo_task_positional_args.py` - Task 位置参数演示
+   - `examples/demo_positional_args.py` - Service Session 位置参数演示
+   - `examples/demo_task_positional_args.py` - Task 位置参数演示
 
 3. **文档**
    - `docs/POSITIONAL_ARGS_SUPPORT.md` - 功能说明文档

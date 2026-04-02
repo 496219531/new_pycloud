@@ -12,7 +12,6 @@ import tempfile
 import shutil
 
 # 添加项目路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pycloud_parallel import DeployedService, TaskSubmitter
 

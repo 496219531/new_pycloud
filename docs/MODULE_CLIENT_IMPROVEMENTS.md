@@ -132,10 +132,10 @@ from pycloud_parallel import (
 
 ### 新增的文件
 
-4. **[scripts/demo_task_module_client.py](scripts/demo_task_module_client.py)**
+4. **[examples/demo_task_module_client.py](../examples/demo_task_module_client.py)**
    - TaskModuleClient 演示脚本
 
-5. **[scripts/demo_top_level_import.py](scripts/demo_top_level_import.py)**
+5. **[examples/demo_top_level_import.py](../examples/demo_top_level_import.py)**
    - 顶层导入演示脚本
 
 6. **[docs/TASK_MODULE_CLIENT.md](docs/TASK_MODULE_CLIENT.md)**
@@ -203,16 +203,16 @@ result = client.square.sync(x=7)
 python -c "from pycloud_parallel import foreach; print(foreach(lambda x: x*x, range(10)))"
 
 # Service Session
-python scripts/demo_gateway_complete.py
+python examples/demo_gateway_complete.py
 
 # Task 模式
-python scripts/demo_task_module_client.py
+python examples/demo_task_module_client.py
 
 # Gateway 调用
-python scripts/demo_gateway_client.py
+python examples/demo_gateway_client.py
 
 # 顶层导入
-python scripts/demo_top_level_import.py
+python examples/demo_top_level_import.py
 ```
 
 ## 向后兼容性

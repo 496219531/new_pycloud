@@ -152,10 +152,10 @@ has_args_or_kwargs = "args" in payload or "kwargs" in payload
 
 ```bash
 # 测试位置参数
-python scripts/demo_positional_args.py
+python examples/demo_positional_args.py
 
 # 测试 HTTP 兼容性
-python scripts/demo_http_compat.py
+python examples/demo_http_compat.py
 ```
 
 ## 总结

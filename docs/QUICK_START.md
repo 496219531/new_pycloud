@@ -180,11 +180,11 @@ print(client.square.sync(x=11))
 ## 8. 常用脚本
 
 ```bash
-python scripts/grpc_task_client_demo.py
-python scripts/grpc_register_service_client_demo.py
-python scripts/demo_gateway_client.py
-python scripts/demo_gateway_module_client.py
-python scripts/demo_service_module_group.py
+python examples/grpc_task_client_demo.py
+python examples/grpc_register_service_client_demo.py
+python examples/demo_gateway_client.py
+python examples/demo_gateway_module_client.py
+python examples/demo_service_module_group.py
 ```
 
 ## 9. Runtime 约束速记

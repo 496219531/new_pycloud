@@ -62,7 +62,7 @@ def main() -> None:
     if not check_service_exists(gateway_target, service_name):
         raise RuntimeError(
             f"service {service_name!r} not found; deploy it first with "
-            "python scripts/demo_gateway_complete.py"
+            "python examples/demo_gateway_complete.py"
         )
 
     print("[GatewayServiceClient]")

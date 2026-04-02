@@ -54,9 +54,9 @@
 常用脚本：
 
 - [../scripts/start_services.sh](../scripts/start_services.sh)
-- [../scripts/grpc_task_client_demo.py](../scripts/grpc_task_client_demo.py)
-- [../scripts/grpc_register_service_client_demo.py](../scripts/grpc_register_service_client_demo.py)
-- [../scripts/demo_gateway_client.py](../scripts/demo_gateway_client.py)
-- [../scripts/demo_gateway_module_client.py](../scripts/demo_gateway_module_client.py)
-- [../scripts/demo_service_module_group.py](../scripts/demo_service_module_group.py)
-- [../scripts/demo_simple_deploy.py](../scripts/demo_simple_deploy.py)
+- [../examples/grpc_task_client_demo.py](../examples/grpc_task_client_demo.py)
+- [../examples/grpc_register_service_client_demo.py](../examples/grpc_register_service_client_demo.py)
+- [../examples/demo_gateway_client.py](../examples/demo_gateway_client.py)
+- [../examples/demo_gateway_module_client.py](../examples/demo_gateway_module_client.py)
+- [../examples/demo_service_module_group.py](../examples/demo_service_module_group.py)
+- [../examples/demo_simple_deploy.py](../examples/demo_simple_deploy.py)

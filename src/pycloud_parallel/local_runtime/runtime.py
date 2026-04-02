@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 import itertools
 import multiprocessing as mp
 import os
+import pickle
 import threading
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -53,11 +54,33 @@ def _ensure_global_pool() -> ProcessPoolExecutor:
         return _POOL
 
 
+def _serialize_callable(fn) -> Tuple[str, bytes]:
+    try:
+        return "pickle", pickle.dumps(fn)
+    except Exception as pickle_exc:
+        try:
+            return "cloudpickle", cloudpickle.dumps(fn)
+        except Exception as cloudpickle_exc:
+            raise RuntimeError(
+                "failed to serialize function for parallel execution: "
+                f"pickle={pickle_exc}; cloudpickle={cloudpickle_exc}"
+            ) from cloudpickle_exc
+
+
+def _deserialize_callable(payload: Tuple[str, bytes]):
+    serializer, serialized_fn = payload
+    if serializer == "pickle":
+        return pickle.loads(serialized_fn)
+    if serializer == "cloudpickle":
+        return cloudpickle.loads(serialized_fn)
+    raise RuntimeError(f"unsupported callable serializer: {serializer}")
+
+
 def _execute_item(
-    serialized_fn: bytes,
+    serialized_fn: Tuple[str, bytes],
     indexed_item: Tuple[int, object],
 ) -> Tuple[int, bool, object]:
-    fn = cloudpickle.loads(serialized_fn)
+    fn = _deserialize_callable(serialized_fn)
     index, item = indexed_item
     try:
         return index, True, fn(item)
@@ -76,10 +99,7 @@ def _run_with_pool(
     iterable: Union[Sequence[object], Iterable[object]],
     fn,
 ) -> ForeachResult:
-    try:
-        serialized_fn = cloudpickle.dumps(fn)
-    except Exception as exc:
-        raise RuntimeError(f"failed to serialize function for parallel execution: {exc}") from exc
+    serialized_fn = _serialize_callable(fn)
 
     values: List[object] = []
     errors: List[TaskError] = []

@@ -237,9 +237,9 @@ def square(payload):
 
 ## 示例脚本
 
-- `scripts/demo_positional_args.py` - Service Session 模式位置参数演示
-- `scripts/demo_task_positional_args.py` - Task 模式位置参数演示
-- `scripts/demo_http_compat.py` - HTTP 风格兼容性演示
+- `examples/demo_positional_args.py` - Service Session 模式位置参数演示
+- `examples/demo_task_positional_args.py` - Task 模式位置参数演示
+- `examples/demo_http_compat.py` - HTTP 风格兼容性演示
 
 ## 实现细节
 

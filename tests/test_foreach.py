@@ -3,6 +3,7 @@
 import time
 
 from pycloud_parallel import configure, foreach
+from pycloud_parallel.local_runtime.runtime import _deserialize_callable, _serialize_callable
 
 
 def _square_or_fail(x):
@@ -24,3 +25,19 @@ def test_foreach_skip_errors():
     )
     assert result.values == [0, 1, 4, 16, 25, 36, 64, 81]
     assert [e.index for e in result.errors] == [3, 7]
+
+
+def test_serialize_callable_prefers_pickle_for_top_level_function():
+    serializer, payload = _serialize_callable(_square_or_fail)
+    restored = _deserialize_callable((serializer, payload))
+
+    assert serializer == "pickle"
+    assert restored(2) == 4
+
+
+def test_serialize_callable_falls_back_to_cloudpickle_for_lambda():
+    serializer, payload = _serialize_callable(lambda x: x + 1)
+    restored = _deserialize_callable((serializer, payload))
+
+    assert serializer == "cloudpickle"
+    assert restored(2) == 3

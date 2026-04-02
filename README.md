@@ -105,9 +105,25 @@ from pycloud_parallel import (
 
 ### 1. 启动控制面和节点
 
+安装后的全局命令（推荐）：
+
+```bash
+pycloudctl start
+pycloudctl status
+```
+
+macOS / Linux:
+
 ```bash
 ./scripts/start_services.sh start
 ./scripts/start_services.sh status
+```
+
+Windows `cmd`:
+
+```bat
+scripts\start_services.bat start
+scripts\start_services.bat status
 ```
 
 默认端口：

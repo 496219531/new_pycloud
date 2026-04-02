@@ -324,7 +324,7 @@ result = process_data.remote(df)
 - [Cloudpickle vs 文件上传对比](./CLOUDPICKLE_VS_FILE_UPLOAD.md)
 - [本地源码自动打包系统设计](./AUTO_DEPENDENCY_DETECTION.md)
 - [实现代码](../src/pycloud_parallel/controlplane/dependency.py)
-- [演示脚本](../scripts/demo_auto_dependency.py)
+- [演示脚本](../examples/demo_auto_dependency.py)
 
 ---
 

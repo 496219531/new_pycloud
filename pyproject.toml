@@ -26,6 +26,7 @@ dev = ["pytest>=7.0", "pytest-cov>=4.0", "grpcio-tools>=1.78.0"]
 
 [project.scripts]
 pycloud-control = "pycloud_parallel.controlplane.server:main"
+pycloudctl = "pycloud_parallel.controlplane.ctl:main"
 
 [tool.setuptools]
 # 使用 src-layout，避免导入路径污染。

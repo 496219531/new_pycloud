@@ -158,8 +158,8 @@ def check_and_start_services():
     import time
     from pathlib import Path
 
-    script_dir = Path(__file__).parent
-    start_script = script_dir / "start_services.sh"
+    repo_root = Path(__file__).resolve().parents[1]
+    start_script = repo_root / "scripts" / "start_services.sh"
 
     if not start_script.exists():
         raise FileNotFoundError(f"start script not found: {start_script}")
