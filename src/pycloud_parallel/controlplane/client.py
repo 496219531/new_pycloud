@@ -113,6 +113,18 @@ def _default_entry_module_for_module(module: Any) -> str:
     return inferred or module_name or "user_module"
 
 
+def _normalize_entry_module_arg(entry_module: Any) -> str:
+    """Normalize entry_module to a dotted module name string.
+
+    Accepts either a module object or a string-like value. Module objects are
+    converted to ``module.__name__`` so callers do not have to extract the name
+    manually before invoking deploy/upload helpers.
+    """
+    if inspect.ismodule(entry_module):
+        return str(getattr(entry_module, "__name__", "") or "").strip()
+    return str(entry_module or "").strip()
+
+
 def _prepare_code_blob(
     func: Optional[Callable] = None,
     module: Optional[Any] = None,
@@ -417,6 +429,42 @@ def _package_format_from_filename(filename: str) -> str:
     if lower.endswith(".py"):
         return "py"
     return "bin"
+
+
+def _resolve_package_format(package_format: str, filename: str = "", *, default: str = "bin") -> str:
+    explicit = str(package_format or "").strip().lower()
+    if explicit:
+        return explicit
+    inferred = _package_format_from_filename(filename)
+    if inferred != "bin":
+        return inferred
+    fallback = str(default or "bin").strip().lower()
+    return fallback or "bin"
+
+
+def _default_artifact_filename(
+    *,
+    package_format: str,
+    entry_module: Any = "",
+    fallback_stem: str = "artifact",
+) -> str:
+    stem = _normalize_entry_module_arg(entry_module).split(".")[-1].strip()
+    if not stem:
+        stem = str(fallback_stem or "artifact").strip() or "artifact"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "artifact"
+
+    normalized_format = _resolve_package_format(package_format, default="py")
+    if normalized_format == "tar.gz":
+        suffix = ".tar.gz"
+    elif normalized_format == "zip":
+        suffix = ".zip"
+    elif normalized_format == "whl":
+        suffix = ".whl"
+    elif normalized_format == "py":
+        suffix = ".py"
+    else:
+        suffix = ".bin"
+    return f"{stem}{suffix}"
 
 
 def _build_export_spec(
@@ -1553,7 +1601,7 @@ class NodeControlClient:
         self,
         *,
         client_id: str,
-        filename: str,
+        filename: str = "",
         blob: bytes,
         runtime: str = "py3",
         entry_module: str = "",
@@ -1567,11 +1615,15 @@ class NodeControlClient:
     ) -> pb2.UploadCodeResponse:
         if not client_id:
             raise ValueError("client_id is required")
-        if not filename:
-            raise ValueError("filename is required")
-
-        effective_format = package_format or _package_format_from_filename(filename)
-        effective_module = entry_module or (Path(filename).stem if filename.endswith(".py") else "")
+        effective_format = _resolve_package_format(package_format, filename, default="py")
+        effective_filename = filename or _default_artifact_filename(
+            package_format=effective_format,
+            entry_module=entry_module,
+            fallback_stem="artifact",
+        )
+        effective_module = _normalize_entry_module_arg(entry_module) or (
+            Path(effective_filename).stem if effective_filename.endswith(".py") else ""
+        )
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
@@ -1583,7 +1635,7 @@ class NodeControlClient:
             yield pb2.UploadCodeRequest(
                 meta=pb2.UploadCodeMeta(
                     client_id=client_id,
-                    filename=filename,
+                    filename=effective_filename,
                     sha256=f"sha256:{digest}",
                     runtime=runtime,
                     entry_module=effective_module,
@@ -1618,8 +1670,10 @@ class NodeControlClient:
         chunk_size: int,
     ) -> pb2.UploadCodeResponse:
         effective_filename = filename or file_path.name
-        effective_module = entry_module or (Path(effective_filename).stem if effective_filename.endswith(".py") else "")
-        effective_format = package_format or _package_format_from_filename(effective_filename)
+        effective_module = _normalize_entry_module_arg(entry_module) or (
+            Path(effective_filename).stem if effective_filename.endswith(".py") else ""
+        )
+        effective_format = _resolve_package_format(package_format, effective_filename)
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
@@ -1881,7 +1935,7 @@ class NodeControlClient:
         chunk_size: int,
     ) -> ServiceSessionClient:
         effective_filename = filename or file_path.name
-        effective_module = entry_module
+        effective_module = _normalize_entry_module_arg(entry_module)
         if not effective_module and effective_filename.endswith(".py"):
             effective_module = Path(effective_filename).stem
         effective_format = package_format or _package_format_from_filename(effective_filename)
@@ -1932,7 +1986,7 @@ class NodeControlClient:
         *,
         owner_client_id: str,
         service_name: str,
-        filename: str,
+        filename: str = "",
         blob: bytes,
         runtime: str,
         entry_module: str,
@@ -1950,11 +2004,16 @@ class NodeControlClient:
     ) -> ServiceSessionClient:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
-        if not filename:
-            raise ValueError("filename is required")
-
         digest = hashlib.sha256(blob).hexdigest()
-        effective_format = package_format or _package_format_from_filename(filename)
+        effective_format = _resolve_package_format(package_format, filename, default="py")
+        effective_filename = filename or _default_artifact_filename(
+            package_format=effective_format,
+            entry_module=entry_module,
+            fallback_stem="service_artifact",
+        )
+        effective_module = _normalize_entry_module_arg(entry_module) or (
+            Path(effective_filename).stem if effective_filename.endswith(".py") else ""
+        )
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
@@ -1966,10 +2025,10 @@ class NodeControlClient:
                 meta=pb2.CreateServiceMeta(
                     owner_client_id=owner_client_id,
                     service_name=service_name,
-                    filename=filename,
+                    filename=effective_filename,
                     sha256=f"sha256:{digest}",
                     runtime=runtime,
-                    entry_module=entry_module,
+                    entry_module=effective_module,
                     entry_callable=entry_callable or "run",
                     worker_count=max(1, int(worker_count)),
                     heartbeat_timeout_sec=max(1, int(heartbeat_timeout_sec)),
@@ -2418,6 +2477,7 @@ class TaskBatchClient:
         preferred_runtime_key: str = "",
         timeout_sec: float = 10.0,
     ) -> "TaskBatchClient":
+        entry_module = _normalize_entry_module_arg(entry_module)
         # 自动本地源码打包：处理模块对象和函数对象
         if module is not None:
             effective_blob, effective_filename = _prepare_code_blob(
@@ -2456,6 +2516,18 @@ class TaskBatchClient:
             )
             effective_filename = effective_filename or filename
             effective_package_format = package_format
+
+        effective_package_format = _resolve_package_format(
+            effective_package_format,
+            effective_filename,
+            default="py",
+        )
+        if effective_blob is not None and not effective_filename:
+            effective_filename = _default_artifact_filename(
+                package_format=effective_package_format,
+                entry_module=entry_module,
+                fallback_stem="artifact",
+            )
 
         # 自动生成 client_id（如果未提供）
         effective_client_id = client_id
@@ -2529,8 +2601,6 @@ class TaskBatchClient:
             else:
                 uploaded_versions: Dict[str, str] = {}
                 if effective_blob is not None:
-                    if not effective_filename:
-                        raise ValueError("filename is required when blob is provided")
                     for node_id, client in clients.items():
                         upload = client.upload_code_from_bytes(
                             client_id=effective_client_id,
@@ -3036,6 +3106,7 @@ class ServiceGroup:
         Returns:
             ServiceGroup: 部署的服务组
         """
+        entry_module = _normalize_entry_module_arg(entry_module)
         # 自动本地源码打包：处理模块对象和函数对象
         if module is not None:
             effective_blob, effective_filename = _prepare_code_blob(
@@ -3074,6 +3145,18 @@ class ServiceGroup:
             )
             effective_filename = effective_filename or filename
             effective_package_format = package_format
+
+        effective_package_format = _resolve_package_format(
+            effective_package_format,
+            effective_filename,
+            default="py",
+        )
+        if effective_blob is not None and not effective_filename:
+            effective_filename = _default_artifact_filename(
+                package_format=effective_package_format,
+                entry_module=entry_module,
+                fallback_stem="service_artifact",
+            )
 
         # 生成默认的 owner_client_id 和 service_name
         local_ip = _get_local_ip()
@@ -3417,6 +3500,296 @@ class ServiceGroup:
         group._persist_session_cache()
         group._start_keepalive()
         return group
+
+    @classmethod
+    def deploy_from_module(
+        cls,
+        *,
+        infocenter_target: str,
+        module: Any,
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        runtime: str = "py3",
+        entry_callable: str = "run",
+        export_mode: str = "decorator",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        worker_count: int = 10,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        expose_http: bool = True,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        allow_partial: bool = True,
+        min_success_nodes: int = 1,
+        timeout_sec: float = 10.0,
+        ensure_unique_service_name: bool = True,
+        reuse_existing_same_code: bool = True,
+        replace_existing_if_code_changed: bool = False,
+        session_cache_dir: str = "",
+        breaker_enabled: bool = True,
+        breaker_failure_threshold: int = 3,
+        breaker_cooldown_sec: float = 15.0,
+        breaker_max_cooldown_sec: float = 120.0,
+    ) -> "ServiceGroup":
+        return cls.deploy_from_infocenter(
+            infocenter_target=infocenter_target,
+            owner_client_id=owner_client_id,
+            service_name=service_name,
+            module=module,
+            runtime=runtime,
+            entry_callable=entry_callable,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            expose_http=expose_http,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            allow_partial=allow_partial,
+            min_success_nodes=min_success_nodes,
+            timeout_sec=timeout_sec,
+            ensure_unique_service_name=ensure_unique_service_name,
+            reuse_existing_same_code=reuse_existing_same_code,
+            replace_existing_if_code_changed=replace_existing_if_code_changed,
+            session_cache_dir=session_cache_dir,
+            breaker_enabled=breaker_enabled,
+            breaker_failure_threshold=breaker_failure_threshold,
+            breaker_cooldown_sec=breaker_cooldown_sec,
+            breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+        )
+
+    @classmethod
+    def deploy_from_func(
+        cls,
+        *,
+        infocenter_target: str,
+        func: Callable,
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        export_mode: str = "decorator",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        worker_count: int = 10,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        expose_http: bool = True,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        allow_partial: bool = True,
+        min_success_nodes: int = 1,
+        timeout_sec: float = 10.0,
+        ensure_unique_service_name: bool = True,
+        reuse_existing_same_code: bool = True,
+        replace_existing_if_code_changed: bool = False,
+        session_cache_dir: str = "",
+        breaker_enabled: bool = True,
+        breaker_failure_threshold: int = 3,
+        breaker_cooldown_sec: float = 15.0,
+        breaker_max_cooldown_sec: float = 120.0,
+    ) -> "ServiceGroup":
+        return cls.deploy_from_infocenter(
+            infocenter_target=infocenter_target,
+            owner_client_id=owner_client_id,
+            service_name=service_name,
+            func=func,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            expose_http=expose_http,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            allow_partial=allow_partial,
+            min_success_nodes=min_success_nodes,
+            timeout_sec=timeout_sec,
+            ensure_unique_service_name=ensure_unique_service_name,
+            reuse_existing_same_code=reuse_existing_same_code,
+            replace_existing_if_code_changed=replace_existing_if_code_changed,
+            session_cache_dir=session_cache_dir,
+            breaker_enabled=breaker_enabled,
+            breaker_failure_threshold=breaker_failure_threshold,
+            breaker_cooldown_sec=breaker_cooldown_sec,
+            breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+        )
+
+    @classmethod
+    def deploy_from_file(
+        cls,
+        *,
+        infocenter_target: str,
+        artifact_path: str,
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        export_mode: str = "decorator",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        worker_count: int = 10,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        expose_http: bool = True,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        allow_partial: bool = True,
+        min_success_nodes: int = 1,
+        timeout_sec: float = 10.0,
+        ensure_unique_service_name: bool = True,
+        reuse_existing_same_code: bool = True,
+        replace_existing_if_code_changed: bool = False,
+        session_cache_dir: str = "",
+        breaker_enabled: bool = True,
+        breaker_failure_threshold: int = 3,
+        breaker_cooldown_sec: float = 15.0,
+        breaker_max_cooldown_sec: float = 120.0,
+    ) -> "ServiceGroup":
+        return cls.deploy_from_infocenter(
+            infocenter_target=infocenter_target,
+            owner_client_id=owner_client_id,
+            service_name=service_name,
+            artifact_path=artifact_path,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            expose_http=expose_http,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            allow_partial=allow_partial,
+            min_success_nodes=min_success_nodes,
+            timeout_sec=timeout_sec,
+            ensure_unique_service_name=ensure_unique_service_name,
+            reuse_existing_same_code=reuse_existing_same_code,
+            replace_existing_if_code_changed=replace_existing_if_code_changed,
+            session_cache_dir=session_cache_dir,
+            breaker_enabled=breaker_enabled,
+            breaker_failure_threshold=breaker_failure_threshold,
+            breaker_cooldown_sec=breaker_cooldown_sec,
+            breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+        )
+
+    @classmethod
+    def deploy_from_bytes(
+        cls,
+        *,
+        infocenter_target: str,
+        blob: bytes,
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        runtime: str = "py3",
+        package_format: str = "py",
+        export_mode: str = "decorator",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        worker_count: int = 10,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        expose_http: bool = True,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        allow_partial: bool = True,
+        min_success_nodes: int = 1,
+        timeout_sec: float = 10.0,
+        ensure_unique_service_name: bool = True,
+        reuse_existing_same_code: bool = True,
+        replace_existing_if_code_changed: bool = False,
+        session_cache_dir: str = "",
+        breaker_enabled: bool = True,
+        breaker_failure_threshold: int = 3,
+        breaker_cooldown_sec: float = 15.0,
+        breaker_max_cooldown_sec: float = 120.0,
+    ) -> "ServiceGroup":
+        return cls.deploy_from_infocenter(
+            infocenter_target=infocenter_target,
+            owner_client_id=owner_client_id,
+            service_name=service_name,
+            blob=blob,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            expose_http=expose_http,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            allow_partial=allow_partial,
+            min_success_nodes=min_success_nodes,
+            timeout_sec=timeout_sec,
+            ensure_unique_service_name=ensure_unique_service_name,
+            reuse_existing_same_code=reuse_existing_same_code,
+            replace_existing_if_code_changed=replace_existing_if_code_changed,
+            session_cache_dir=session_cache_dir,
+            breaker_enabled=breaker_enabled,
+            breaker_failure_threshold=breaker_failure_threshold,
+            breaker_cooldown_sec=breaker_cooldown_sec,
+            breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+        )
 
     @staticmethod
     def _select_active_routes(routes: Sequence[InfoCenterServiceRoute]) -> List[InfoCenterServiceRoute]:
