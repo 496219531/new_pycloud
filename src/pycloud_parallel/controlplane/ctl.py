@@ -221,16 +221,8 @@ def _query_loaded_services(infocenter_port: int) -> List[str]:
         with InfoCenterClient(target, timeout_sec=3) as client:
             with contextlib.redirect_stdout(io.StringIO()):
                 nodes = list(client.list_nodes(healthy_only=False, limit=500))
-                routes = list(client.list_service_routes(healthy_only=False, limit=5000))
     except Exception as exc:
         return [f"  (query failed: {exc})"]
-
-    by_node: Dict[str, List[str]] = {}
-    for route in routes:
-        node_id = str(getattr(route, "node_id", "") or "").strip()
-        service_name = str(getattr(route, "service_name", "") or "").strip()
-        if node_id and service_name:
-            by_node.setdefault(node_id, []).append(service_name)
 
     if not nodes:
         return ["  (no nodes)"]
@@ -238,9 +230,16 @@ def _query_loaded_services(infocenter_port: int) -> List[str]:
     for node in sorted(nodes, key=lambda x: getattr(x, "node_id", "")):
         node_id = getattr(node, "node_id", "")
         pyver = (getattr(node, "python_version", "") or "").strip() or "unknown"
-        names = sorted(set(by_node.get(node_id, [])))
-        if names:
-            lines.append(f"  - {node_id} [{pyver}]: {', '.join(names)}")
+        services = sorted(
+            getattr(node, "services", ()),
+            key=lambda item: (getattr(item, "service_name", ""), getattr(item, "service_id", "")),
+        )
+        if services:
+            rendered = ", ".join(
+                f"{getattr(svc, 'service_name', '?')}[{getattr(svc, 'alive_workers', 0)}/{getattr(svc, 'worker_count', 0)}]"
+                for svc in services
+            )
+            lines.append(f"  - {node_id} [{pyver}]: {rendered}")
         else:
             lines.append(f"  - {node_id} [{pyver}]: (none)")
     return lines

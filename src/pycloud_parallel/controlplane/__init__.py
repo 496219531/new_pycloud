@@ -10,23 +10,17 @@ from typing import Any
 
 _CLIENT_EXPORTS = {
     "pycloud_export",
-    # 新命名（推荐）
     "DeployedService",
     "DirectConnect",
     "GatewayConnect",
     "TaskSubmitter",
-    # 旧命名（向后兼容）
-    "DiscoveryModuleClient",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
-    "GatewayModuleClient",
     "InfoCenterClient",
     "InfoCenterNode",
     "InfoCenterServiceRoute",
     "ServiceGroup",
-    "ServiceModuleGroup",
     "TaskBatchClient",
-    "TaskModuleClient",
 }
 
 _CONTROLPLANE_DEP_HINT = (
@@ -60,21 +54,15 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "pycloud_export",
-    # 新命名（推荐）
     "DeployedService",
     "DirectConnect",
     "GatewayConnect",
     "TaskSubmitter",
-    # 旧命名（向后兼容）
-    "DiscoveryModuleClient",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
-    "GatewayModuleClient",
     "InfoCenterClient",
     "InfoCenterNode",
     "InfoCenterServiceRoute",
     "ServiceGroup",
-    "ServiceModuleGroup",
     "TaskBatchClient",
-    "TaskModuleClient",
 ]

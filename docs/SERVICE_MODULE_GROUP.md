@@ -1,6 +1,4 @@
-# ServiceModuleGroup / DeployedService
-
-`DeployedService` 是 `ServiceModuleGroup` 的推荐别名。
+# DeployedService
 
 它面向 owner 侧，职责是：
 

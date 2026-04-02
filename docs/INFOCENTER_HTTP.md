@@ -72,12 +72,25 @@
 5. `queued`
 6. `inflight`
 7. `loaded_services`
-8. `python_version`
-9. `active_runtimes`
-10. `active_runtime_count`
-11. `service_worker_capacity`
-12. `service_worker_used`
-13. `service_worker_available`
+8. `services`
+9. `python_version`
+10. `active_runtimes`
+11. `active_runtime_count`
+12. `service_worker_capacity`
+13. `service_worker_used`
+14. `service_worker_available`
+
+其中 `services` 会展开每个服务实例的：
+
+1. `service_name`
+2. `service_id`
+3. `status`
+4. `status_text`
+5. `worker_count`
+6. `alive_workers`
+7. `in_flight`
+8. `lease_expire_at`
+9. `http_base_url`
 
 ### 2.4 `GET /services/routes`
 
@@ -117,8 +130,10 @@ http://127.0.0.1:50051/ops
 2. `schedulable / drain`
 3. `python_version`
 4. `service_worker` 容量与占用
-5. 当前已加载的服务名
-6. 当前 `active_runtimes`
+5. 每个节点当前服务数量
+6. 每个服务的 `alive_workers / worker_count / in_flight`
+7. 单独的服务实例明细表
+8. 当前 `active_runtimes`
 
 ### 2.6 运维动作
 

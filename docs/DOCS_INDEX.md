@@ -23,18 +23,18 @@
 - [TASK_MODE.md](TASK_MODE.md)
   - 任务流、`runtime_key`、热点路由、runtime slot
 - [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
-  - `TaskSubmitter` / `TaskModuleClient` 的模块化调用体验
+  - `TaskSubmitter` 的模块化调用体验
 - [ID_SYSTEM_DESIGN.md](ID_SYSTEM_DESIGN.md)
   - `client_id / job_id / task_id / service_id` 设计说明
 
 ## 服务模式
 
 - [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-  - `DeployedService` / `ServiceModuleGroup` 的 owner 侧用法
+  - `DeployedService` 的 owner 侧用法
 - [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-  - `GatewayConnect` / `GatewayModuleClient` / `GatewayServiceClient`
+  - `GatewayConnect` / `GatewayServiceClient`
 - [CLASS_RENAMING.md](CLASS_RENAMING.md)
-  - 新旧类名映射
+  - 当前统一命名说明
 
 ## 控制面与运维
 

@@ -1,34 +1,7 @@
-# 脚本类名更新完成
+# 示例脚本更新总结
 
-## 更新内容
+当前示例脚本统一使用顶层 API：
 
-已将所有 scripts 文件中的旧类名更新为新类名，并且改为直接从 `pycloud_parallel` 顶层导入。
-
-## 更新的文件
-
-| 文件 | 更新内容 |
-|------|---------|
-| `demo_gateway_client.py` | `GatewayModuleClient` → `GatewayConnect` |
-| `demo_gateway_complete.py` | `ServiceModuleGroup` → `DeployedService`, `GatewayModuleClient` → `GatewayConnect` |
-| `demo_gateway_module_client.py` | `GatewayModuleClient` → `GatewayConnect` |
-| `demo_service_module_group.py` | `ServiceModuleGroup` → `DeployedService` |
-| `demo_simple_deploy.py` | `ServiceModuleGroup` → `DeployedService` |
-| `demo_task_module_client.py` | `TaskModuleClient` → `TaskSubmitter` |
-| `demo_top_level_import.py` | 所有旧类名 → 新类名 |
-
-## 导入方式变更
-
-**之前：**
-```python
-from pycloud_parallel.controlplane.client import (
-    ServiceModuleGroup,
-    TaskModuleClient,
-    GatewayModuleClient,
-    DiscoveryModuleClient,
-)
-```
-
-**现在：**
 ```python
 from pycloud_parallel import (
     DeployedService,
@@ -38,20 +11,26 @@ from pycloud_parallel import (
 )
 ```
 
-## 验证
+## 覆盖的示例
 
-✅ 所有脚本语法检查通过
-✅ 旧类名已全部替换
-✅ 新类名正确使用
-✅ 直接从顶层导入
+1. `demo_gateway_client.py`
+2. `demo_gateway_complete.py`
+3. `demo_gateway_module_client.py`
+4. `demo_service_module_group.py`
+5. `demo_simple_deploy.py`
+6. `demo_task_module_client.py`
+7. `demo_top_level_import.py`
 
-## 类名对照
+## 当前约定
 
-| 旧类名 | 新类名 | 用途 |
-|--------|--------|------|
-| `ServiceModuleGroup` | `DeployedService` | 部署服务 |
-| `TaskModuleClient` | `TaskSubmitter` | 提交任务 |
-| `GatewayModuleClient` | `GatewayConnect` | 网关连接 |
-| `DiscoveryModuleClient` | `DirectConnect` | 直连实例 |
+1. owner 侧服务部署示例统一使用 `DeployedService`
+2. 任务模式示例统一使用 `TaskSubmitter`
+3. Gateway 调用示例统一使用 `GatewayConnect`
+4. 直连发现示例统一使用 `DirectConnect`
+5. 示例优先从 `pycloud_parallel` 顶层导入，不再绕到旧导出层
 
-所有脚本文件已成功更新！
+## 验证点
+
+1. 示例里不再依赖兼容别名
+2. 文档代码片段与示例脚本保持一致
+3. IDE 跳转会直接落到真实类定义

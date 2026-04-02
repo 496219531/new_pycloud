@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, utc_now
+from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -49,8 +50,34 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
     return out
 
 
+def _service_status_text(status: int) -> str:
+    mapping = {
+        int(pb2.SERVICE_STATUS_UNSPECIFIED): "UNSPECIFIED",
+        int(pb2.SERVICE_STATUS_STARTING): "STARTING",
+        int(pb2.SERVICE_STATUS_RUNNING): "RUNNING",
+        int(pb2.SERVICE_STATUS_DRAINING): "DRAINING",
+        int(pb2.SERVICE_STATUS_STOPPED): "STOPPED",
+    }
+    return mapping.get(int(status or 0), f"UNKNOWN({int(status or 0)})")
+
+
+def _serialize_service(service: NodeServiceState) -> Dict[str, object]:
+    return {
+        "service_name": str(service.service_name),
+        "service_id": str(service.service_id),
+        "status": int(service.status),
+        "status_text": _service_status_text(service.status),
+        "worker_count": int(service.worker_count),
+        "alive_workers": int(service.alive_workers),
+        "in_flight": int(service.in_flight),
+        "lease_expire_at": _dt_text(service.lease_expire_at),
+        "http_base_url": str(service.http_base_url or ""),
+    }
+
+
 def _serialize_node(state) -> Dict[str, object]:
-    loaded_services = sorted({svc.service_name for svc in state.services.values()})
+    services = [_serialize_service(svc) for svc in sorted(state.services.values(), key=lambda item: (item.service_name, item.service_id))]
+    loaded_services = sorted({svc["service_name"] for svc in services})
     return {
         "node_id": state.node_id,
         "control_addr": state.control_addr,
@@ -76,17 +103,25 @@ def _serialize_node(state) -> Dict[str, object]:
         "service_worker_capacity": int(state.service_worker_capacity),
         "service_worker_used": int(state.service_worker_used),
         "service_worker_available": int(state.service_worker_available()),
+        "service_count": int(len(services)),
         "loaded_services": loaded_services,
+        "services": services,
     }
 
 
 def _render_ops_page(state: InfoCenterState) -> str:
     nodes = state.list_nodes(healthy_only=False, tags=(), limit=10000)
-    rows: List[str] = []
+    node_rows: List[str] = []
+    service_rows: List[str] = []
     for node in nodes:
-        loaded = ", ".join(sorted({svc.service_name for svc in node.services.values()})) or "-"
+        services = sorted(node.services.values(), key=lambda item: (item.service_name, item.service_id))
+        loaded = "<br>".join(
+            f"{html.escape(svc.service_name)} "
+            f"<span class='muted'>[{svc.alive_workers}/{svc.worker_count} alive, in-flight {svc.in_flight}]</span>"
+            for svc in services
+        ) or "-"
         active_runtimes = ", ".join(node.active_runtimes[:10]) or "-"
-        rows.append(
+        node_rows.append(
             "<tr>"
             f"<td>{html.escape(node.node_id)}</td>"
             f"<td>{html.escape(node.control_addr)}</td>"
@@ -98,7 +133,8 @@ def _render_ops_page(state: InfoCenterState) -> str:
             f"<td>{node.service_worker_capacity}</td>"
             f"<td>{node.service_worker_used}</td>"
             f"<td>{node.service_worker_available()}</td>"
-            f"<td>{html.escape(loaded)}</td>"
+            f"<td>{len(services)}</td>"
+            f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
             "<td>"
             f"<form method='post' action='/ops/nodes/{html.escape(node.node_id)}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
@@ -108,18 +144,41 @@ def _render_ops_page(state: InfoCenterState) -> str:
             "</td>"
             "</tr>"
         )
-    body = "\n".join(rows) or "<tr><td colspan='13'>no nodes</td></tr>"
+        for svc in services:
+            service_rows.append(
+                "<tr>"
+                f"<td>{html.escape(node.node_id)}</td>"
+                f"<td>{html.escape(svc.service_name)}</td>"
+                f"<td>{html.escape(svc.service_id)}</td>"
+                f"<td>{html.escape(_service_status_text(svc.status))}</td>"
+                f"<td>{svc.worker_count}</td>"
+                f"<td>{svc.alive_workers}</td>"
+                f"<td>{svc.in_flight}</td>"
+                f"<td>{html.escape(_dt_text(svc.lease_expire_at))}</td>"
+                f"<td>{html.escape(svc.http_base_url or '-')}</td>"
+                "</tr>"
+            )
+    node_body = "\n".join(node_rows) or "<tr><td colspan='14'>no nodes</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='9'>no services</td></tr>"
     return (
         "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
-        "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;}th{background:#f5f5f5;text-align:left;}</style>"
+        "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;}th{background:#f5f5f5;text-align:left;}"
+        "h2{margin-top:28px;} .muted{color:#666;} .section-note{color:#555;font-size:12px;margin:6px 0 10px;}</style>"
         "</head><body>"
         "<h1>InfoCenter Ops</h1>"
+        "<div class='section-note'>Node table shows task-mode pressure and service capacity. Service table below shows each deployed service instance and its worker process counts.</div>"
         "<table><thead><tr>"
         "<th>node_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th>"
-        "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>loaded services</th><th>reason</th><th>actions</th>"
+        "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
         "</tr></thead><tbody>"
-        f"{body}"
+        f"{node_body}"
+        "</tbody></table>"
+        "<h2>Service Instances</h2>"
+        "<table><thead><tr>"
+        "<th>node_id</th><th>service_name</th><th>service_id</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>lease_expire_at</th><th>http_base_url</th>"
+        "</tr></thead><tbody>"
+        f"{service_body}"
         "</tbody></table></body></html>"
     )
 

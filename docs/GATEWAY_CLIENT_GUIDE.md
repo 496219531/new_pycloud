@@ -37,7 +37,7 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 2. 想直接拿 HTTP 层返回
 3. 脚本或系统集成场景
 
-### 2.2 `GatewayModuleClient` / `GatewayConnect`
+### 2.2 `GatewayConnect`
 
 这是模块化调用体验。
 

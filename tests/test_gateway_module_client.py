@@ -1,4 +1,4 @@
-"""Tests for GatewayModuleClient."""
+"""Tests for GatewayConnect."""
 
 import asyncio
 from unittest.mock import patch
@@ -6,11 +6,11 @@ from unittest.mock import patch
 import pytest
 
 
-class TestGatewayModuleClient:
+class TestGatewayConnect:
     def test_getattr_creates_proxy(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient, _CallProxy
+        from pycloud_parallel.controlplane.client import GatewayConnect, _CallProxy
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo")
         client._discovered_methods = ["square", "fibonacci"]
 
         proxy = client.square
@@ -19,18 +19,18 @@ class TestGatewayModuleClient:
         assert proxy._method == "square"
 
     def test_unknown_method_raises(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient
+        from pycloud_parallel.controlplane.client import GatewayConnect
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo")
         client._discovered_methods = ["square"]
 
         with pytest.raises(AttributeError, match="has no method 'unknown'"):
             _ = client.unknown
 
     def test_methods_property_uses_gateway_list_methods(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient
+        from pycloud_parallel.controlplane.client import GatewayConnect
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo")
         with patch(
             "pycloud_parallel.controlplane.client.GatewayServiceClient.list_methods",
             return_value=[
@@ -43,9 +43,9 @@ class TestGatewayModuleClient:
             mocked.assert_called_once_with(service_name="svc-demo", include_docs=True)
 
     def test_call_sync(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient
+        from pycloud_parallel.controlplane.client import GatewayConnect
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0)
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0)
         with patch(
             "pycloud_parallel.controlplane.client.GatewayServiceClient.call",
             return_value={"ok": True, "data": {"y": 49}},
@@ -61,9 +61,9 @@ class TestGatewayModuleClient:
         )
 
     def test_async_proxy_call(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient
+        from pycloud_parallel.controlplane.client import GatewayConnect
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0)
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0)
         client._discovered_methods = ["square"]
         with patch(
             "pycloud_parallel.controlplane.client.GatewayServiceClient.call",
@@ -83,9 +83,9 @@ class TestGatewayModuleClient:
         )
 
     def test_status(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient
+        from pycloud_parallel.controlplane.client import GatewayConnect
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo")
         with patch(
             "pycloud_parallel.controlplane.client.GatewayServiceClient.get_status",
             return_value={"ok": True, "route_count": 1},
@@ -96,9 +96,9 @@ class TestGatewayModuleClient:
         mocked.assert_called_once_with(service_name="svc-demo")
 
     def test_broadcast_is_not_supported(self):
-        from pycloud_parallel.controlplane.client import GatewayModuleClient
+        from pycloud_parallel.controlplane.client import GatewayConnect
 
-        client = GatewayModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = GatewayConnect("127.0.0.1:50051", service_name="svc-demo")
         client._discovered_methods = ["square"]
 
         async def _run():

@@ -557,6 +557,18 @@ def _load_service_session_cache(
 
 
 @dataclass(frozen=True)
+class InfoCenterNodeService:
+    service_name: str
+    service_id: str
+    status: int
+    status_text: str = ""
+    worker_count: int = 0
+    alive_workers: int = 0
+    in_flight: int = 0
+    http_base_url: str = ""
+
+
+@dataclass(frozen=True)
 class InfoCenterNode:
     node_id: str
     control_addr: str
@@ -575,6 +587,8 @@ class InfoCenterNode:
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
+    loaded_services: Tuple[str, ...] = ()
+    services: Tuple[InfoCenterNodeService, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -747,6 +761,20 @@ class InfoCenterClient:
         )
         out = []
         for item in resp.get("nodes", []):
+            services = []
+            for svc in item.get("services", []) or []:
+                services.append(
+                    InfoCenterNodeService(
+                        service_name=str(svc.get("service_name", "") or ""),
+                        service_id=str(svc.get("service_id", "") or ""),
+                        status=int(svc.get("status", 0) or 0),
+                        status_text=str(svc.get("status_text", "") or ""),
+                        worker_count=int(svc.get("worker_count", 0) or 0),
+                        alive_workers=int(svc.get("alive_workers", 0) or 0),
+                        in_flight=int(svc.get("in_flight", 0) or 0),
+                        http_base_url=str(svc.get("http_base_url", "") or ""),
+                    )
+                )
             out.append(
                 InfoCenterNode(
                     node_id=str(item.get("node_id", "")),
@@ -766,6 +794,8 @@ class InfoCenterClient:
                     schedulable=bool(item.get("schedulable", True)),
                     drain=bool(item.get("drain", False)),
                     reason=str(item.get("reason", "") or ""),
+                    loaded_services=tuple(item.get("loaded_services") or ()),
+                    services=tuple(services),
                 )
             )
         return out
@@ -4251,7 +4281,7 @@ class _BroadcastProxy:
         return self().__await__()
 
 
-class ServiceModuleGroup(ServiceGroup):
+class DeployedService(ServiceGroup):
     """模块化的服务组，像使用 Python 模块一样调用远程服务。
 
     支持多种调用方式：
@@ -4261,7 +4291,7 @@ class ServiceModuleGroup(ServiceGroup):
     - group.list_methods()           # 列出所有可用方法
 
     Example:
-        >>> group = ServiceModuleGroup.deploy_from_infocenter(...)
+        >>> group = DeployedService.deploy_from_infocenter(...)
         >>>
         >>> # 异步调用
         >>> result = await group.square(x=7)
@@ -4401,13 +4431,13 @@ class ServiceModuleGroup(ServiceGroup):
         node_ids = list(self.sessions.keys()) if self.sessions else []
         methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
         return (
-            f"<ServiceModuleGroup "
+            f"<DeployedService "
             f"service={self.service_name!r} "
             f"nodes={len(node_ids)} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )
 
-class GatewayModuleClient(GatewayServiceClient):
+class GatewayConnect(GatewayServiceClient):
     """Module-like caller on top of ControlPlane Gateway.
 
     只负责 caller 侧体验：
@@ -4539,18 +4569,18 @@ class GatewayModuleClient(GatewayServiceClient):
         max_concurrency: int = 100,
     ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
         del method, payload, timeout_sec, max_concurrency
-        raise NotImplementedError("GatewayModuleClient does not support broadcast; use Gateway for single-route calls")
+        raise NotImplementedError("GatewayConnect does not support broadcast; use Gateway for single-route calls")
 
     def __repr__(self) -> str:
         methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
         return (
-            f"<GatewayModuleClient "
+            f"<GatewayConnect "
             f"service={self.service_name!r} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )
 
 
-class DiscoveryModuleClient(DiscoveryServiceClient):
+class DirectConnect(DiscoveryServiceClient):
     """Module-like caller built on InfoCenter discovery + direct instance calls."""
 
     def __init__(
@@ -4714,12 +4744,12 @@ class DiscoveryModuleClient(DiscoveryServiceClient):
         max_concurrency: int = 100,
     ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
         del method, payload, timeout_sec, max_concurrency
-        raise NotImplementedError("DiscoveryModuleClient does not support broadcast; use direct discovery for single-route calls")
+        raise NotImplementedError("DirectConnect does not support broadcast; use direct discovery for single-route calls")
 
     def __repr__(self) -> str:
         methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
         return (
-            f"<DiscoveryModuleClient "
+            f"<DirectConnect "
             f"service={self.service_name!r} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )
@@ -4889,7 +4919,7 @@ class _TaskCallProxy:
         return self.submit_and_wait()
 
 
-class TaskModuleClient:
+class TaskSubmitter:
     """任务模式的模块化客户端。
 
     提供类似 Python 模块的调用方式来提交任务。
@@ -4901,10 +4931,10 @@ class TaskModuleClient:
     - 简化 TaskBatchClient 的使用
 
     Example:
-        >>> from pycloud_parallel.controlplane.client import TaskModuleClient
+        >>> from pycloud_parallel.controlplane.client import TaskSubmitter
         >>>
         >>> # 创建任务客户端
-        >>> task = TaskModuleClient.from_infocenter(
+        >>> task = TaskSubmitter.from_infocenter(
         ...     infocenter_target="127.0.0.1:50051",
         ...     blob=blob,
         ...     filename="task.py",
@@ -4923,7 +4953,7 @@ class TaskModuleClient:
     _batch: TaskBatchClient
 
     def __init__(self, batch: TaskBatchClient) -> None:
-        """初始化 TaskModuleClient。
+        """初始化 TaskSubmitter。
 
         Args:
             batch: 底层的 TaskBatchClient 实例
@@ -4958,13 +4988,13 @@ class TaskModuleClient:
         require_credit: bool = True,
         preferred_runtime_key: str = "",
         timeout_sec: float = 10.0,
-    ) -> "TaskModuleClient":
-        """从 InfoCenter 创建 TaskModuleClient。
+    ) -> "TaskSubmitter":
+        """从 InfoCenter 创建 TaskSubmitter。
 
         参数与 TaskBatchClient.from_infocenter 相同。
 
         Returns:
-            TaskModuleClient: 任务模块客户端
+            TaskSubmitter: 任务模块客户端
         """
         batch = TaskBatchClient.from_infocenter(
             infocenter_target=infocenter_target,
@@ -5170,7 +5200,7 @@ class TaskModuleClient:
         """关闭客户端。"""
         self._batch.close()
 
-    def __enter__(self) -> "TaskModuleClient":
+    def __enter__(self) -> "TaskSubmitter":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -5178,25 +5208,8 @@ class TaskModuleClient:
 
     def __repr__(self) -> str:
         return (
-            f"<TaskModuleClient "
+            f"<TaskSubmitter "
             f"client_id={self.client_id!r} "
             f"job_id={self.job_id!r} "
             f"nodes={len(self.node_ids)}>"
         )
-
-
-# ============================================================================
-# 类别名（新命名，推荐使用）
-# ============================================================================
-
-# 新命名：DeployedService（部署并拥有服务）
-DeployedService = ServiceModuleGroup
-
-# 新命名：TaskSubmitter（提交任务）
-TaskSubmitter = TaskModuleClient
-
-# 新命名：GatewayConnect（通过网关连接）
-GatewayConnect = GatewayModuleClient
-
-# 新命名：DirectConnect（直接连接实例）
-DirectConnect = DiscoveryModuleClient

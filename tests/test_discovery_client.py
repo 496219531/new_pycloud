@@ -11,7 +11,7 @@ import grpc
 import pytest
 
 from pycloud_parallel.controlplane.client import (
-    DiscoveryModuleClient,
+    DirectConnect,
     DiscoveryServiceClient,
     InfoCenterClient,
     InfoCenterServiceRoute,
@@ -119,9 +119,9 @@ def _demo_route(service_name: str = "svc-demo") -> InfoCenterServiceRoute:
     )
 
 
-class TestDiscoveryModuleClient:
+class TestDirectConnect:
     def test_getattr_creates_proxy(self):
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
         try:
             client._discovered_methods = ["square", "fibonacci"]
             proxy = client.square
@@ -131,7 +131,7 @@ class TestDiscoveryModuleClient:
             client.close()
 
     def test_unknown_method_raises(self):
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
         try:
             client._discovered_methods = ["square"]
             with pytest.raises(AttributeError, match="has no method 'unknown'"):
@@ -140,10 +140,10 @@ class TestDiscoveryModuleClient:
             client.close()
 
     def test_methods_property_uses_discovery_list_methods(self):
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
         try:
             with patch.object(
-                DiscoveryModuleClient,
+                DirectConnect,
                 "list_methods",
                 return_value=[{"method": "square"}, {"method": "fibonacci"}],
             ) as mocked:
@@ -155,7 +155,7 @@ class TestDiscoveryModuleClient:
 
     def test_call_sync(self):
         route = _demo_route()
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0)
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0)
         try:
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
                 "pycloud_parallel.controlplane.client._call_route_http",
@@ -169,7 +169,7 @@ class TestDiscoveryModuleClient:
 
     def test_async_proxy_call(self):
         route = _demo_route()
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0)
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0)
         try:
             client._discovered_methods = ["square"]
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
@@ -185,7 +185,7 @@ class TestDiscoveryModuleClient:
             client.close()
 
     def test_status(self):
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
         try:
             with patch.object(
                 DiscoveryServiceClient,
@@ -199,7 +199,7 @@ class TestDiscoveryModuleClient:
             client.close()
 
     def test_broadcast_is_not_supported(self):
-        client = DiscoveryModuleClient("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
         try:
             client._discovered_methods = ["square"]
 
@@ -248,7 +248,7 @@ def test_discovery_client_direct_call_roundtrip(tmp_path):
             assert status["route_count"] == 1
             assert status["routes"][0]["service_id"] == service_id
 
-        module_client = DiscoveryModuleClient(controlplane.base_url, service_name="svc_discovery", timeout_sec=5.0)
+        module_client = DirectConnect(controlplane.base_url, service_name="svc_discovery", timeout_sec=5.0)
         try:
             assert module_client.methods == ["add", "mul"]
             assert module_client.call_sync("add", value=10) == {"value": 10, "plus_one": 11}

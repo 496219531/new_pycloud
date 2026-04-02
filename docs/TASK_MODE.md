@@ -32,7 +32,7 @@
 
 当前推荐优先级：
 
-1. `TaskSubmitter` / `TaskModuleClient`
+1. `TaskSubmitter`
 2. `TaskBatchClient`
 3. `NodeControlClient.open_task_stream(...)`
 

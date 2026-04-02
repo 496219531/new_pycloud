@@ -1,6 +1,4 @@
-# TaskModuleClient / TaskSubmitter
-
-`TaskSubmitter` 是 `TaskModuleClient` 的推荐别名。
+# TaskSubmitter
 
 它的目标是：
 
@@ -12,9 +10,8 @@
 
 关系很简单：
 
-1. `TaskSubmitter = TaskModuleClient`
-2. `TaskModuleClient` 是对 `TaskBatchClient` 的薄封装
-3. 底层选点、上传代码、任务流、结果等待仍然由 `TaskBatchClient` 承担
+1. `TaskSubmitter` 是对 `TaskBatchClient` 的薄封装
+2. 底层选点、上传代码、任务流、结果等待仍然由 `TaskBatchClient` 承担
 
 ## 2. 创建方式
 

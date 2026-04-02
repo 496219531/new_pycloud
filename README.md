@@ -88,16 +88,12 @@ from pycloud_parallel import (
 
 1. `DeployedService`
    - owner 侧部署并持有服务
-   - 是 `ServiceModuleGroup` 的推荐别名
 2. `TaskSubmitter`
    - 任务模式的模块化客户端
-   - 是 `TaskModuleClient` 的推荐别名
 3. `GatewayConnect`
    - 通过 Gateway 按 `service_name` 调用服务
-   - 是 `GatewayModuleClient` 的推荐别名
 4. `DirectConnect`
    - 客户端本地查路由后直连实例
-   - 是 `DiscoveryModuleClient` 的推荐别名
 
 如果你需要更底层的控制面类，请从 `pycloud_parallel.controlplane` 导入。
 
@@ -318,7 +314,7 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 1. [快速开始](docs/QUICK_START.md)
 2. [架构总览](docs/ARCHITECTURE_OVERVIEW.md)
 3. [任务模式](docs/TASK_MODE.md)
-4. [ServiceModuleGroup](docs/SERVICE_MODULE_GROUP.md)
+4. [DeployedService](docs/SERVICE_MODULE_GROUP.md)
 5. [Gateway 客户端指南](docs/GATEWAY_CLIENT_GUIDE.md)
 6. [InfoCenter HTTP](docs/INFOCENTER_HTTP.md)
 7. [Runtime 参数说明](docs/RUNTIME_PARAMETER_ANALYSIS.md)

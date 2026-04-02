@@ -11,12 +11,44 @@ description = "Cluster-first task/service orchestration with gRPC control plane,
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "pycloud" }]
+keywords = [
+  "cluster",
+  "distributed-computing",
+  "gateway",
+  "grpc",
+  "orchestration",
+  "parallel",
+  "rpc",
+  "task-scheduler",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Distributed Computing",
+]
 dependencies = [
   "cloudpickle>=2.2.0",
   "grpcio>=1.78.0",
   "protobuf>=6.31.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/496219531/new_pycloud"
+Repository = "https://github.com/496219531/new_pycloud"
+Issues = "https://github.com/496219531/new_pycloud/issues"
+Documentation = "https://github.com/496219531/new_pycloud/tree/main/docs"
 
 [project.optional-dependencies]
 # 可选依赖：按功能分组，减少基础安装体积。
@@ -34,6 +66,19 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/pycloud_parallel/docs" = ["docs/*.md"]
+"share/pycloud_parallel/examples" = ["examples/*.py"]
+"share/pycloud_parallel/tests" = ["tests/*.py"]
+"share/pycloud_parallel/specs" = [
+  "API_CONTRACT_V1.md",
+  "ARCHITECTURE_V1.md",
+  "GRPC_CONTRACT_V1.md",
+  "SERVICE_SESSION_PROTOCOL_V1.md",
+  "openapi_v1.yaml",
+  "pycloud.yaml",
+]
 
 [tool.pytest.ini_options]
 # 测试入口统一配置。

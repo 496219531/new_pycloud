@@ -51,9 +51,9 @@ service-{本机IP}-{时间戳}
 ### 3.1 使用本地文件
 
 ```python
-from pycloud_parallel.controlplane.client import ServiceModuleGroup
+from pycloud_parallel.controlplane.client import DeployedService
 
-group = ServiceModuleGroup.deploy_from_infocenter(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     artifact_path="service.py",
 )
@@ -62,7 +62,7 @@ group = ServiceModuleGroup.deploy_from_infocenter(
 ### 3.2 使用 blob
 
 ```python
-group = ServiceModuleGroup.deploy_from_infocenter(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="service.py",
@@ -88,7 +88,7 @@ group = ServiceModuleGroup.deploy_from_infocenter(
 ### 4.1 显式指定节点
 
 ```python
-group = ServiceModuleGroup.deploy_from_infocenter(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="service.py",
@@ -99,7 +99,7 @@ group = ServiceModuleGroup.deploy_from_infocenter(
 ### 4.2 指定节点数
 
 ```python
-group = ServiceModuleGroup.deploy_from_infocenter(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="service.py",
@@ -144,7 +144,7 @@ replace_existing_if_code_changed=True
 ## 7. 一个更贴近当前实现的示例
 
 ```python
-group = ServiceModuleGroup.deploy_from_infocenter(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     filename="square_service.py",

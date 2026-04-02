@@ -1,0 +1,15 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include API_CONTRACT_V1.md
+include ARCHITECTURE_V1.md
+include GRPC_CONTRACT_V1.md
+include SERVICE_SESSION_PROTOCOL_V1.md
+include openapi_v1.yaml
+include pycloud.yaml
+graft docs
+graft examples
+graft tests
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

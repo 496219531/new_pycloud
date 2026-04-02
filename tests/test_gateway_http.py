@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 import grpc
 
-from pycloud_parallel.controlplane.client import GatewayModuleClient, GatewayServiceClient, InfoCenterClient, NodeControlClient
+from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, NodeControlClient
 from pycloud_parallel.controlplane.server import build_controlplane_server, build_gateway_server, build_infocenter_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
@@ -164,7 +164,7 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
             body = gateway.call(service_name="svc_gateway_controlplane", method="mul", payload={"value": 6}, timeout_sec=5.0)
             assert body["data"]["square"] == 36
 
-        module_client = GatewayModuleClient(
+        module_client = GatewayConnect(
             controlplane.base_url,
             service_name="svc_gateway_controlplane",
             timeout_sec=5.0,

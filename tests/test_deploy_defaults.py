@@ -1,7 +1,7 @@
 """测试 deploy_from_infocenter 的默认值功能。"""
 
 import pytest
-from pycloud_parallel.controlplane.client import ServiceModuleGroup, _get_local_ip
+from pycloud_parallel.controlplane.client import DeployedService, _get_local_ip
 
 
 class TestDefaultValues:
@@ -65,12 +65,12 @@ class TestParameterValidation:
         """测试 infocenter_target 是必须的。"""
         with pytest.raises(TypeError):
             # 缺少必须的位置参数
-            ServiceModuleGroup.deploy_from_infocenter()
+            DeployedService.deploy_from_infocenter()
 
     def test_artifact_content_required(self):
         """测试必须提供代码内容之一。"""
         with pytest.raises(ValueError, match="artifact_path or artifact_paths or blob must be provided"):
-            ServiceModuleGroup.deploy_from_infocenter(
+            DeployedService.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 # 不提供任何代码内容
             )

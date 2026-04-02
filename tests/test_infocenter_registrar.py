@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from urllib.request import urlopen
 
 from pycloud_parallel.controlplane.client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
@@ -82,6 +83,21 @@ def test_node_registrar_syncs_service_routes(tmp_path):
                 return any(r.service_id == session.service_id and r.status == pb2.SERVICE_STATUS_RUNNING for r in routes)
 
             assert _wait_until(_route_ready, timeout_sec=6.0)
+
+            nodes = infocenter.list_nodes(healthy_only=True, tags=["compute"], limit=20)
+            assert len(nodes) == 1
+            node = nodes[0]
+            assert node.loaded_services == ("svc-reg-sync",)
+            assert len(node.services) == 1
+            assert node.services[0].service_name == "svc-reg-sync"
+            assert node.services[0].worker_count == 2
+            assert node.services[0].alive_workers == 2
+
+            with urlopen(f"{info_target}/ops", timeout=5.0) as resp:
+                raw = resp.read().decode("utf-8")
+            assert "Service Instances" in raw
+            assert "svc-reg-sync" in raw
+            assert ">2</td><td>2</td>" in raw
 
             node_state.end_service(
                 owner_client_id="owner-reg",
