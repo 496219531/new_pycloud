@@ -6,6 +6,10 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,8 +24,8 @@ NODE1_HTTP=${NODE1_HTTP:-18081}
 NODE2_PORT=${NODE2_PORT:-50062}
 NODE2_HTTP=${NODE2_HTTP:-18082}
 
-LOG_DIR="./logs"
-PID_DIR="./pids"
+LOG_DIR="$REPO_ROOT/logs"
+PID_DIR="$REPO_ROOT/pids"
 
 # 模块路径
 MODULE="pycloud_parallel.controlplane.server"

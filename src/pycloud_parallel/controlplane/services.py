@@ -7,9 +7,9 @@ import hashlib
 import os
 import queue
 import tempfile
-import threading
 import time
-from typing import Iterable, List, Optional
+import threading
+from typing import Callable, Iterable, List, Optional
 
 import grpc
 
@@ -74,8 +74,17 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         _state: NodeControl 状态管理器
     """
 
-    def __init__(self, state: NodeControlState) -> None:
+    def __init__(self, state: NodeControlState, *, on_service_routes_changed: Optional[Callable[[], None]] = None) -> None:
         self._state = state
+        self._on_service_routes_changed = on_service_routes_changed
+
+    def _notify_service_routes_changed(self) -> None:
+        if self._on_service_routes_changed is None:
+            return
+        try:
+            self._on_service_routes_changed()
+        except Exception:
+            logger.exception("[NodeControl] service route sync callback failed")
 
     def UploadCode(self, request_iterator: Iterable[pb2.UploadCodeRequest], context: grpc.ServicerContext) -> pb2.UploadCodeResponse:
         meta = None
@@ -705,6 +714,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 except FileNotFoundError:
                     pass
 
+        self._notify_service_routes_changed()
         return pb2.CreateServiceResponse(
             ok=True,
             service_id=session.service_id,
@@ -948,6 +958,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)),
             )
 
+        self._notify_service_routes_changed()
         return pb2.EndServiceResponse(ok=True, accepted=True, status=session.status)
 
     def GetServiceStatus(

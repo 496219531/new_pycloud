@@ -83,6 +83,7 @@ def build_nodecontrol_server(
     service_http_base_url: str = "",
     service_default_worker_count: int = 10,
     service_default_heartbeat_timeout_sec: int = 30,
+    on_service_routes_changed: Optional[Callable[[], None]] = None,
 ) -> Tuple[grpc.Server, NodeControlState]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max(1, max_workers)))
     state = NodeControlState(
@@ -94,7 +95,10 @@ def build_nodecontrol_server(
         service_default_worker_count=service_default_worker_count,
         service_default_heartbeat_timeout_sec=service_default_heartbeat_timeout_sec,
     )
-    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    pb2_grpc.add_NodeControlServiceServicer_to_server(
+        NodeControlService(state, on_service_routes_changed=on_service_routes_changed),
+        server,
+    )
     server.add_insecure_port(bind)
     return server, state
 
@@ -215,6 +219,16 @@ def main() -> None:
         args.advertise_addr or args.bind,
         level_name,
     )
+    advertise_addr = (args.advertise_addr or args.bind).strip()
+    node_tags = [x.strip() for x in args.node_tags.split(",") if x.strip()]
+
+    registrar_holder: dict[str, Optional[NodeInfoCenterRegistrar]] = {"value": None}
+
+    def _sync_routes_now() -> None:
+        registrar = registrar_holder["value"]
+        if registrar is not None:
+            registrar.sync_now()
+
     server, state = build_nodecontrol_server(
         args.bind,
         node_id=args.node_id,
@@ -225,9 +239,8 @@ def main() -> None:
         service_http_base_url=args.service_http_base_url,
         service_default_worker_count=args.service_default_workers,
         service_default_heartbeat_timeout_sec=args.service_heartbeat_timeout_sec,
+        on_service_routes_changed=_sync_routes_now,
     )
-    advertise_addr = (args.advertise_addr or args.bind).strip()
-    node_tags = [x.strip() for x in args.node_tags.split(",") if x.strip()]
 
     registrar: Optional[NodeInfoCenterRegistrar] = None
     if args.infocenter_addr:
@@ -242,6 +255,7 @@ def main() -> None:
             version=args.node_version,
             metadata={"role": "compute-node"},
         )
+        registrar_holder["value"] = registrar
 
     def _on_start() -> None:
         if registrar is not None:

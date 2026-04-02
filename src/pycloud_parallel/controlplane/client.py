@@ -3,6 +3,7 @@ from __future__ import annotations
 """Client helpers for InfoCenter/NodeControl service-session workflow."""
 
 import asyncio
+import errno
 import hashlib
 import importlib
 import inspect
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Any, Callable, ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -334,6 +335,55 @@ def _http_json_request(
     if data.get("ok", False) is False:
         raise RuntimeError(str(data.get("error", "request failed")))
     return data
+
+
+def _is_transient_infocenter_error(exc: Exception) -> bool:
+    candidate: object = exc
+    if isinstance(candidate, URLError):
+        candidate = candidate.reason
+    if isinstance(candidate, socket.timeout):
+        return True
+    if isinstance(candidate, TimeoutError):
+        return True
+    if isinstance(candidate, OSError):
+        return getattr(candidate, "errno", None) in {
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.ETIMEDOUT,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+        }
+    if isinstance(candidate, str):
+        lowered = candidate.lower()
+        return (
+            "connection refused" in lowered
+            or "connection reset" in lowered
+            or "timed out" in lowered
+            or "temporarily unavailable" in lowered
+        )
+    return False
+
+
+def _retry_infocenter_request(
+    fn: Callable[[], Any],
+    *,
+    timeout_sec: float,
+    target: str,
+    action: str,
+    retry_interval_sec: float = 0.25,
+) -> Any:
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while True:
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_transient_infocenter_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"InfoCenter {target} not ready for {action} after {float(timeout_sec):.1f}s: {exc}"
+                ) from exc
+            time.sleep(min(retry_interval_sec, max(0.05, deadline - time.monotonic())))
 
 
 def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -2417,19 +2467,27 @@ class TaskBatchClient:
 
             desired_runtime_key = str(preferred_runtime_key or effective_code_version).strip() or effective_code_version
 
-            with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
-                selected_nodes = list(
-                    infocenter.select_task_nodes(
-                        healthy_only=healthy_only,
-                        tags=tags,
-                        node_ids=node_ids,
-                        node_count=node_count,
-                        limit=node_limit,
-                        require_credit=require_credit,
-                        preferred_runtime_key=desired_runtime_key,
-                        runtime=runtime,
+            def _select_nodes_from_infocenter() -> List[InfoCenterNode]:
+                with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                    return list(
+                        infocenter.select_task_nodes(
+                            healthy_only=healthy_only,
+                            tags=tags,
+                            node_ids=node_ids,
+                            node_count=node_count,
+                            limit=node_limit,
+                            require_credit=require_credit,
+                            preferred_runtime_key=desired_runtime_key,
+                            runtime=runtime,
+                        )
                     )
-                )
+
+            selected_nodes = _retry_infocenter_request(
+                _select_nodes_from_infocenter,
+                timeout_sec=timeout_sec,
+                target=infocenter_target,
+                action="task node discovery",
+            )
 
             clients = {
                 node.node_id: NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
@@ -3117,19 +3175,28 @@ class ServiceGroup:
             desired_node_count or required_success_nodes,
         )
 
-        with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
-            existing_routes: Sequence[InfoCenterServiceRoute] = ()
-            if ensure_unique_service_name:
-                existing_routes = infocenter.list_service_routes(
-                    service_name=effective_service_name,
-                    healthy_only=True,
-                    limit=max(100, discovery_limit * 10),
+        def _discover_from_infocenter() -> Tuple[Sequence[InfoCenterServiceRoute], Sequence[InfoCenterNode]]:
+            with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                existing_routes: Sequence[InfoCenterServiceRoute] = ()
+                if ensure_unique_service_name:
+                    existing_routes = infocenter.list_service_routes(
+                        service_name=effective_service_name,
+                        healthy_only=True,
+                        limit=max(100, discovery_limit * 10),
+                    )
+                discovered_nodes = infocenter.list_nodes(
+                    healthy_only=healthy_only,
+                    tags=tags,
+                    limit=discovery_limit,
                 )
-            discovered_nodes = infocenter.list_nodes(
-                healthy_only=healthy_only,
-                tags=tags,
-                limit=discovery_limit,
-            )
+                return existing_routes, discovered_nodes
+
+        existing_routes, discovered_nodes = _retry_infocenter_request(
+            _discover_from_infocenter,
+            timeout_sec=timeout_sec,
+            target=infocenter_target,
+            action="service deployment discovery",
+        )
 
         if not discovered_nodes:
             raise RuntimeError("no available nodes from InfoCenter")

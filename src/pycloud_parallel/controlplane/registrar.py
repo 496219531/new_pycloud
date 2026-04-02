@@ -43,6 +43,7 @@ class NodeInfoCenterRegistrar:
         self._thread: Optional[threading.Thread] = None
         self._registered = False
         self._next_hb_sec = self.fallback_heartbeat_sec
+        self._sync_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -57,6 +58,16 @@ class NodeInfoCenterRegistrar:
             self._thread.join(timeout=2.0)
             self._thread = None
         self._client.close()
+
+    def sync_now(self) -> bool:
+        with self._sync_lock:
+            try:
+                if not self._registered:
+                    return self._register_once()
+                return self._heartbeat_once()
+            except Exception:
+                self._registered = False
+                return False
 
     def _register_once(self) -> bool:
         resp = self._client.register_node(
@@ -104,13 +115,7 @@ class NodeInfoCenterRegistrar:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            try:
-                if not self._registered:
-                    self._register_once()
-                else:
-                    self._heartbeat_once()
-            except Exception:
-                self._registered = False
+            self.sync_now()
 
             wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
             self._stop_event.wait(max(1, int(wait_sec)))

@@ -108,6 +108,8 @@ class GatewayRouteCache:
             snapshot = self._snapshots.get(name)
         if snapshot is None:
             return list(self.refresh(name, force=True))
+        if not snapshot.routes:
+            return list(self.refresh(name, force=True))
         return list(snapshot.routes)
 
     def snapshot_info(self, service_name: str) -> Dict[str, object]:
