@@ -162,58 +162,46 @@ def check_and_start_services():
     start_script = script_dir / "start_services.sh"
 
     if not start_script.exists():
-        print("⚠️  未找到启动脚本")
-        print(f"   请确保 {start_script} 存在")
-        return False
+        raise FileNotFoundError(f"start script not found: {start_script}")
 
     print("检查 PyCloud 服务状态...")
 
     # 检查是否有进程在运行
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "pycloud_parallel.controlplane.server"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            print("✓ PyCloud 服务已运行")
-            return True
-    except Exception:
-        pass
+    result = subprocess.run(
+        ["pgrep", "-f", "pycloud_parallel.controlplane.server"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode == 0:
+        print("✓ PyCloud 服务已运行")
+        return True
 
     # 启动服务
     print("正在启动 PyCloud 服务...")
-    try:
-        proc = subprocess.Popen(
-            [str(start_script), "start"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+    proc = subprocess.Popen(
+        [str(start_script), "start"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
 
-        # 等待启动
-        time.sleep(3)
+    # 等待启动
+    time.sleep(3)
 
-        # 检查是否成功启动
-        result = subprocess.run(
-            ["pgrep", "-f", "pycloud_parallel.controlplane.server"],
-            capture_output=True,
-            text=True
-        )
+    # 检查是否成功启动
+    result = subprocess.run(
+        ["pgrep", "-f", "pycloud_parallel.controlplane.server"],
+        capture_output=True,
+        text=True
+    )
 
-        if result.returncode == 0:
-            print("✓ PyCloud 服务启动成功")
-            return True
-        else:
-            print("✗ 服务启动失败")
-            stdout, stderr = proc.communicate()
-            if stderr:
-                print(f"  错误: {stderr}")
-            return False
+    if result.returncode == 0:
+        print("✓ PyCloud 服务启动成功")
+        return True
 
-    except Exception as exc:
-        print(f"✗ 启动服务失败: {exc}")
-        return False
+    stdout, stderr = proc.communicate()
+    detail = (stderr or stdout or "").strip()
+    raise RuntimeError(f"failed to start PyCloud services: {detail or 'process did not come up'}")
 
 
 def main():
@@ -261,45 +249,36 @@ def main():
         print("-" * 60)
         print()
 
-        try:
-            group = ServiceGroup.deploy_from_infocenter(
-                infocenter_target="127.0.0.1:50051",
-                owner_client_id=owner_client_id,
-                service_name=service_name,
+        group = ServiceGroup.deploy_from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            owner_client_id=owner_client_id,
+            service_name=service_name,
 
-                # 使用 artifact_paths 部署多个文件/文件夹
-                artifact_paths=[
-                    str(service_dir),
-                ],
+            # 使用 artifact_paths 部署多个文件/文件夹
+            artifact_paths=[
+                str(service_dir),
+            ],
 
-                # 入口配置
-                entry_module="compute_service.main",  # zip 内路径：compute_service/main.py
-                entry_callable="process",             # 默认函数
+            # 入口配置
+            entry_module="compute_service.main",  # zip 内路径：compute_service/main.py
+            entry_callable="process",             # 默认函数
 
-                # 导出配置
-                export_mode="decorator",
-                export_decorator="pycloud_export",
+            # 导出配置
+            export_mode="decorator",
+            export_decorator="pycloud_export",
 
-                # 运行时配置
-                runtime="py3",
-                worker_count=4,
-                heartbeat_timeout_sec=30,
+            # 运行时配置
+            runtime="py3",
+            worker_count=4,
+            heartbeat_timeout_sec=30,
 
-                # 部署配置
-                expose_http=True,
-                healthy_only=True,
-                tags=["compute"],  # 只使用 "compute" 标签
-                min_success_nodes=1,
-                allow_partial=True,
-            )
-        except RuntimeError as exc:
-            if "no available nodes from InfoCenter" in str(exc):
-                print("✗ 部署失败：没有可用的节点")
-                print()
-                print("  请先启动 PyCloud 服务：")
-                print("    ./scripts/start_services.sh start")
-                return
-            raise
+            # 部署配置
+            expose_http=True,
+            healthy_only=True,
+            tags=["compute"],  # 只使用 "compute" 标签
+            min_success_nodes=1,
+            allow_partial=True,
+        )
 
         print(f"✓ 服务部署成功！")
         print(f"  服务名: {group.service_name}")
@@ -332,20 +311,16 @@ def main():
         ]
 
         for test in test_cases:
-            try:
-                node_id, resp = group.call_balanced(
-                    test["method"],
-                    test["payload"],
-                    timeout_sec=10
-                )
-                print(f"✓ {test['desc']}")
-                print(f"  方法: {test['method']}")
-                print(f"  节点: {node_id}")
-                print(f"  结果: {resp.get('data')}")
-                print()
-            except Exception as exc:
-                print(f"✗ {test['desc']}: {exc}")
-                print()
+            node_id, resp = group.call_balanced(
+                test["method"],
+                test["payload"],
+                timeout_sec=10
+            )
+            print(f"✓ {test['desc']}")
+            print(f"  方法: {test['method']}")
+            print(f"  节点: {node_id}")
+            print(f"  结果: {resp.get('data')}")
+            print()
 
         print("=" * 60)
         print("  示例完成")
@@ -361,11 +336,8 @@ def main():
 
     finally:
         # 清理
-        try:
-            shutil.rmtree(temp_dir)
-            print(f"\n✓ 清理临时文件: {temp_dir}")
-        except Exception as exc:
-            print(f"\n✗ 清理失败: {exc}")
+        shutil.rmtree(temp_dir)
+        print(f"\n✓ 清理临时文件: {temp_dir}")
 
         if group is not None:
             group.close(

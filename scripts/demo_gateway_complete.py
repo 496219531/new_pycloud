@@ -47,32 +47,27 @@ def main():
         b"    return {'x': x, 'y': x * x * x}\n"
     )
 
-    try:
-        group = DeployedService.deploy_from_infocenter(
-            infocenter_target=gateway_target,
-            service_name=service_name,
-            blob=blob,
-            filename="square_service.py",
-            runtime="py3",
-            entry_module="square_service",
-            export_mode="decorator",
-            export_decorator="pycloud_export",
-            dependency_allowlist=dependency_allowlist,
-            worker_count=4,
-            tags=["compute"],
-            min_success_nodes=1,
-        )
-        print(f"✓ 服务部署成功")
-        print(f"  服务名: {group.service_name}")
-        print(f"  节点: {list(group.sessions.keys())}")
-        print()
+    group = DeployedService.deploy_from_infocenter(
+        infocenter_target=gateway_target,
+        service_name=service_name,
+        blob=blob,
+        filename="square_service.py",
+        runtime="py3",
+        entry_module="square_service",
+        export_mode="decorator",
+        export_decorator="pycloud_export",
+        dependency_allowlist=dependency_allowlist,
+        worker_count=4,
+        tags=["compute"],
+        min_success_nodes=1,
+    )
+    print(f"✓ 服务部署成功")
+    print(f"  服务名: {group.service_name}")
+    print(f"  节点: {list(group.sessions.keys())}")
+    print()
 
-        # 启动心跳
-        time.sleep(5)  # 等待服务启动
-
-    except Exception as e:
-        print(f"✗ 部署失败: {e}")
-        return
+    # 启动心跳
+    time.sleep(5)  # 等待服务启动
 
     try:
         # 步骤 2: 使用 GatewayServiceClient 调用
@@ -159,11 +154,6 @@ def main():
 
         asyncio.run(async_calls())
         print()
-
-    except Exception as e:
-        print(f"✗ Gateway 调用失败: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         # 步骤 4: 清理服务

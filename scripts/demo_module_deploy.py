@@ -22,6 +22,7 @@ def demo_create_test_module():
     # 创建临时目录
     temp_dir = tempfile.mkdtemp(prefix="pycloud_module_test_")
     sys.path.insert(0, temp_dir)
+    created = False
 
     try:
         # 创建测试模块
@@ -66,12 +67,12 @@ class Processor:
 
         # 导入模块
         import my_processor
+        created = True
         return my_processor, temp_dir
-    except Exception as e:
-        # 清理
-        sys.path.remove(temp_dir)
-        shutil.rmtree(temp_dir)
-        raise
+    finally:
+        if not created:
+            sys.path.remove(temp_dir)
+            shutil.rmtree(temp_dir)
 
 
 def demo_task_submitter_with_module():
@@ -125,11 +126,6 @@ def demo_task_submitter_with_module():
         result = submitter.cube(x=3)
         print(f"✓ cube(3): {result}")
         print()
-
-    except Exception as e:
-        print(f"✗ 创建或调用失败: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         # 清理
@@ -202,40 +198,34 @@ def main():
     print("╚" + "=" * 68 + "╝")
     print()
 
-    try:
-        # 对比三种方式
-        demo_comparison()
+    # 对比三种方式
+    demo_comparison()
 
-        # 实际部署模块（需要服务运行）
-        # demo_task_submitter_with_module()
+    # 实际部署模块（需要服务运行）
+    # demo_task_submitter_with_module()
 
-        print("=" * 70)
-        print("  演示完成!")
-        print("=" * 70)
-        print()
-        print("✅ 新功能:")
-        print("  1. ✅ DeployedService.deploy_from_infocenter(module=...)")
-        print("  2. ✅ TaskSubmitter.from_infocenter(module=...)")
-        print("  3. ✅ 自动打包整个本地模块 / package")
-        print("  4. ✅ 可以调用模块中的任何导出函数")
-        print()
-        print("📋 优势:")
-        print("  - 一次性部署整个模块")
-        print("  - 可以调用模块中的多个函数")
-        print("  - 自动带上本地源码依赖和资源文件")
-        print("  - entry_module 自动推断为模块名")
-        print()
-        print("💡 使用场景:")
-        print("  - 模块包含多个相关函数")
-        print("  - 需要共享代码和依赖")
-        print("  - 模块级别的代码组织")
-        print("  - 第三方包缺失时，再显式传 dependency_allowlist")
-        print()
-
-    except Exception as e:
-        print(f"❌ 演示失败: {e}")
-        import traceback
-        traceback.print_exc()
+    print("=" * 70)
+    print("  演示完成!")
+    print("=" * 70)
+    print()
+    print("✅ 新功能:")
+    print("  1. ✅ DeployedService.deploy_from_infocenter(module=...)")
+    print("  2. ✅ TaskSubmitter.from_infocenter(module=...)")
+    print("  3. ✅ 自动打包整个本地模块 / package")
+    print("  4. ✅ 可以调用模块中的任何导出函数")
+    print()
+    print("📋 优势:")
+    print("  - 一次性部署整个模块")
+    print("  - 可以调用模块中的多个函数")
+    print("  - 自动带上本地源码依赖和资源文件")
+    print("  - entry_module 自动推断为模块名")
+    print()
+    print("💡 使用场景:")
+    print("  - 模块包含多个相关函数")
+    print("  - 需要共享代码和依赖")
+    print("  - 模块级别的代码组织")
+    print("  - 第三方包缺失时，再显式传 dependency_allowlist")
+    print()
 
 
 if __name__ == "__main__":

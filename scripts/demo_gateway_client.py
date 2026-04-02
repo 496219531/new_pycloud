@@ -36,19 +36,14 @@ group = DeployedService.deploy_from_infocenter(
 """
 
 import asyncio
-import sys
-
 from pycloud_parallel import GatewayConnect
 
 
 def check_service_exists(gateway_target: str, service_name: str) -> bool:
     """检查服务是否存在。"""
-    try:
-        with GatewayConnect(gateway_target, timeout_sec=5.0) as client:
-            status = client.get_status(service_name=service_name)
-            return status.get("route_count", 0) > 0
-    except Exception:
-        return False
+    with GatewayConnect(gateway_target, timeout_sec=5.0) as client:
+        status = client.get_status(service_name=service_name)
+        return status.get("route_count", 0) > 0
 
 
 def main() -> None:
@@ -65,13 +60,10 @@ def main() -> None:
 
     # 检查服务是否存在
     if not check_service_exists(gateway_target, service_name):
-        print(f"✗ 服务 '{service_name}' 不存在")
-        print()
-        print("请先部署服务：")
-        print("  方式 1: 运行 python scripts/demo_gateway_complete.py")
-        print("  方式 2: 手动部署服务（参考脚本注释）")
-        print()
-        sys.exit(1)
+        raise RuntimeError(
+            f"service {service_name!r} not found; deploy it first with "
+            "python scripts/demo_gateway_complete.py"
+        )
 
     print("[GatewayServiceClient]")
     print("-" * 60)

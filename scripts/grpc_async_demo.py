@@ -62,9 +62,8 @@ async def main():
         )
         for node_id, resp, exc in results:
             if exc:
-                print(f"节点 {node_id} 失败: {exc}")
-            else:
-                print(f"节点 {node_id} 成功: {resp['data']}")
+                raise RuntimeError(f"call to node {node_id} failed: {exc}")
+            print(f"节点 {node_id} 成功: {resp['data']}")
 
         # ✅ 高并发场景：批量异步调用
         async def batch_call():
@@ -72,15 +71,12 @@ async def main():
                 group.acall_balanced("cube", {"x": i}, timeout_sec=10)
                 for i in range(1000)
             ]
-            return await asyncio.gather(*tasks, return_exceptions=True)
+            return await asyncio.gather(*tasks)
 
         results = await batch_call()
         for result in results:
-            if isinstance(result, Exception):
-                print(f"失败: {result}")
-            else:
-                node_id, resp = result
-                print(f"节点 {node_id}: {resp['data']}")
+            node_id, resp = result
+            print(f"节点 {node_id}: {resp['data']}")
 
         print("服务已进入长驻模式，按 Ctrl+C 会自动结束远端服务。")
         group.join(

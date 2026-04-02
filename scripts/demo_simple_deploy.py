@@ -98,10 +98,7 @@ def main():
     finally:
         # 清理：结束服务，确保脚本可重复运行。
         for group in groups:
-            try:
-                group.close(end_services=True)
-            except Exception:
-                pass
+            group.close(end_services=True)
 
     print("=" * 60)
     print("  完成！")

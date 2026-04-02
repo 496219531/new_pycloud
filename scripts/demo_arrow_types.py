@@ -56,36 +56,29 @@ def main():
         b"    }\n"
     )
 
-    try:
-        print("[1] 部署服务...")
-        print("-" * 60)
+    print("[1] 部署服务...")
+    print("-" * 60)
 
-        group = DeployedService.deploy_from_infocenter(
-            infocenter_target=gateway_target,
-            service_name=service_name,
-            blob=blob,
-            filename="arrow_service.py",
-            runtime="py3",
-            entry_module="arrow_service",
-            export_mode="decorator",
-            export_decorator="pycloud_export",
-            dependency_allowlist=dependency_allowlist,
-            worker_count=2,
-            tags=["compute"],  # 修改为 compute 标签
-            min_success_nodes=1,
-        )
-        print(f"✓ 服务部署成功")
-        print(f"  服务名: {group.service_name}")
-        print()
+    group = DeployedService.deploy_from_infocenter(
+        infocenter_target=gateway_target,
+        service_name=service_name,
+        blob=blob,
+        filename="arrow_service.py",
+        runtime="py3",
+        entry_module="arrow_service",
+        export_mode="decorator",
+        export_decorator="pycloud_export",
+        dependency_allowlist=dependency_allowlist,
+        worker_count=2,
+        tags=["compute"],  # 修改为 compute 标签
+        min_success_nodes=1,
+    )
+    print(f"✓ 服务部署成功")
+    print(f"  服务名: {group.service_name}")
+    print()
 
-        import time
-        time.sleep(3)
-
-    except Exception as e:
-        print(f"✗ 部署失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+    import time
+    time.sleep(3)
 
     try:
         # 测试 DataFrame
@@ -167,11 +160,6 @@ def main():
         print(f"✓ DataFrame 结果: {results['df_result']}")
         print(f"✓ Array 结果: {results['arr_result']}")
         print()
-
-    except Exception as e:
-        print(f"✗ 调用失败: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         print("[6] 清理服务")

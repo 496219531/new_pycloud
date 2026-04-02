@@ -157,25 +157,13 @@ def main():
     print()
 
     # 方式 1：所有 ID 自动生成
-    try:
-        demo_auto_ids()
-    except Exception as e:
-        print(f"✗ 方式 1 失败: {e}")
-        print()
+    demo_auto_ids()
 
     # 方式 2：手动指定 ID
-    try:
-        demo_manual_ids()
-    except Exception as e:
-        print(f"✗ 方式 2 失败: {e}")
-        print()
+    demo_manual_ids()
 
     # 方式 3：演示唯一性
-    try:
-        demo_uniqueness()
-    except Exception as e:
-        print(f"✗ 方式 3 失败: {e}")
-        print()
+    demo_uniqueness()
 
     print("=" * 60)
     print("  完成")
