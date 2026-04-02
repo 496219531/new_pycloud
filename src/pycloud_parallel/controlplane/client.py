@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Awaitable, Any, Callable, ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -2256,15 +2256,42 @@ class TaskBatchClient:
     code_version: str
     _cursors_by_node: Dict[str, str] = field(default_factory=dict, repr=False)
     _submit_seq: int = field(default=0, repr=False)
+    _submit_seq_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _submitted_task_ids_by_job: Dict[str, List[str]] = field(default_factory=dict, repr=False)
     _seen_result_task_ids_by_job: Dict[str, Set[str]] = field(default_factory=dict, repr=False)
     _task_node_by_job: Dict[str, Dict[str, str]] = field(default_factory=dict, repr=False)
     _runtime_node_hint: Dict[str, str] = field(default_factory=dict, repr=False)
     _latest_credit_by_node: Dict[str, int] = field(default_factory=dict, repr=False)
 
-    # 类级别的序列号计数器，确保同一毫秒内生成的ID也是唯一的
-    _class_client_seq: int = 0
-    _class_job_seq: int = 0
+    # 类级别序列号，配合锁用于并发安全的自动 ID 生成。
+    _class_id_lock: ClassVar[threading.Lock] = threading.Lock()
+    _class_client_seq: ClassVar[int] = 0
+    _class_job_seq: ClassVar[int] = 0
+
+    @classmethod
+    def _next_class_seq(cls, *, id_type: str) -> int:
+        with cls._class_id_lock:
+            if id_type == "client":
+                cls._class_client_seq += 1
+                return cls._class_client_seq
+            if id_type == "job":
+                cls._class_job_seq += 1
+                return cls._class_job_seq
+        raise ValueError(f"unknown id_type: {id_type}")
+
+    @classmethod
+    def _build_auto_id(cls, *, prefix: str) -> str:
+        local_ip = _get_local_ip()
+        timestamp_ms = int(time.time() * 1000)
+        pid = os.getpid()
+        seq = cls._next_class_seq(id_type=prefix)
+        entropy = uuid.uuid4().hex[:6]
+        return f"{prefix}-{local_ip}-{timestamp_ms}-{pid}-{seq:04d}-{entropy}"
+
+    def _next_submit_seq(self) -> int:
+        with self._submit_seq_lock:
+            self._submit_seq += 1
+            return self._submit_seq
 
     @classmethod
     def from_infocenter(
@@ -2339,18 +2366,12 @@ class TaskBatchClient:
         # 自动生成 client_id（如果未提供）
         effective_client_id = client_id
         if not effective_client_id:
-            local_ip = _get_local_ip()
-            timestamp_ms = int(time.time() * 1000)
-            cls._class_client_seq += 1
-            effective_client_id = f"client-{local_ip}-{timestamp_ms}-{cls._class_client_seq:04d}"
+            effective_client_id = cls._build_auto_id(prefix="client")
 
         # 自动生成 job_id（如果未提供）
         effective_job_id = job_id
         if not effective_job_id:
-            local_ip = _get_local_ip()
-            timestamp_ms = int(time.time() * 1000)
-            cls._class_job_seq += 1
-            effective_job_id = f"job-{local_ip}-{timestamp_ms}-{cls._class_job_seq:04d}"
+            effective_job_id = cls._build_auto_id(prefix="job")
 
         if not effective_client_id:
             raise ValueError("client_id is required")
@@ -2612,10 +2633,10 @@ class TaskBatchClient:
         prefix = str(task_id_prefix or f"{effective_job_id}-task").strip()
         items: List[pb2.TaskSubmitItem] = []
         for payload in payloads:
-            self._submit_seq += 1
+            next_seq = self._next_submit_seq()
             items.append(
                 pb2.TaskSubmitItem(
-                    task_id=f"{prefix}-{self._submit_seq:04d}",
+                    task_id=f"{prefix}-{next_seq:04d}",
                     payload=dict_to_struct(_serialize_arrow_compatible(payload or {})),
                     timeout_hint_sec=max(0, int(timeout_hint_sec)),
                     priority=max(1, int(priority)),
