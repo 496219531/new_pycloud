@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
+from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -343,7 +344,7 @@ class InfoCenterHttpServer:
                 return payload
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
-                raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))

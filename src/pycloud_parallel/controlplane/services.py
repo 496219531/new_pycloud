@@ -14,7 +14,7 @@ from typing import Callable, Iterable, List, Optional
 import grpc
 
 from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict
-from pycloud_parallel.controlplane.serialization import validate_inline_payload_structs
+from pycloud_parallel.controlplane.serialization import dict_to_struct, validate_inline_payload_structs
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -1024,7 +1024,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             ok=True,
             service_id=request.service_id,
             method=request.method,
-            data=body.get("data", {}),
+            data=dict_to_struct(body.get("data", {})),
         )
 
     def HeartbeatService(

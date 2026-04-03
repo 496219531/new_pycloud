@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Any, Callable, ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -42,6 +42,7 @@ from pycloud_parallel.controlplane.object_ref import (
 )
 from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import (
+    convert_dict_to_arrow,
     dict_to_struct,
     serialize_arrow_compatible,
     serialize_inline_payload,
@@ -351,6 +352,34 @@ def _materialize_downloaded_result(path: Path, *, result_ref: ResultRef):
     raise ValueError(f"unsupported result materialize_as: {result_ref.materialize_as!r}")
 
 
+def _inject_result_ref_control_addr(value: object, *, control_addr: str) -> object:
+    if isinstance(value, ResultRef) and control_addr and not value.control_addr:
+        return replace(value, control_addr=control_addr)
+    return value
+
+
+def _normalize_http_response_body(body: object, *, control_addr: str = "") -> Dict[str, object]:
+    if not isinstance(body, dict):
+        raise RuntimeError("invalid json response")
+    converted = convert_dict_to_arrow(body)
+    if not isinstance(converted, dict):
+        raise RuntimeError("invalid json response")
+    if "data" in converted:
+        converted = dict(converted)
+        converted["data"] = _inject_result_ref_control_addr(converted.get("data"), control_addr=control_addr)
+    return converted
+
+
+def _extract_result_ref(value: object) -> Optional[ResultRef]:
+    if isinstance(value, ResultRef):
+        return value
+    if isinstance(value, dict):
+        data = value.get("data")
+        if isinstance(data, ResultRef):
+            return data
+    return None
+
+
 def _get_local_ip() -> str:
     """获取本机 IP 地址。
 
@@ -437,15 +466,13 @@ def _http_json_request(
     )
     try:
         with urlopen(req, timeout=max(0.1, float(timeout_sec))) as resp:
-            data = json.loads(resp.read().decode("utf-8") or "{}")
+            data = _normalize_http_response_body(json.loads(resp.read().decode("utf-8") or "{}"))
     except HTTPError as exc:
         try:
-            body = json.loads((exc.read() or b"{}").decode("utf-8"))
+            body = _normalize_http_response_body(json.loads((exc.read() or b"{}").decode("utf-8") or "{}"))
         except Exception:
             body = {"ok": False, "error": exc.reason}
         raise RuntimeError(str(body.get("error", exc.reason))) from exc
-    if not isinstance(data, dict):
-        raise RuntimeError("invalid json response")
     if data.get("ok", False) is False:
         raise RuntimeError(str(data.get("error", "request failed")))
     return data
@@ -1246,6 +1273,26 @@ class GatewayServiceClient:
             timeout_sec=self.timeout_sec,
         )
 
+    def download_result_to_file(self, response_or_data: object, *, target_path: str) -> Path:
+        ref = _extract_result_ref(response_or_data)
+        if ref is None:
+            raise ValueError("service result is inline data; no download needed")
+        if not ref.control_addr:
+            raise RuntimeError("service result is missing control_addr for download")
+        with NodeControlClient(ref.control_addr, timeout_sec=self.timeout_sec) as client:
+            return client.download_result_to_file(ref, target_path=target_path)
+
+    def fetch_result_data(self, response_or_data: object, *, target_path: str = ""):
+        ref = _extract_result_ref(response_or_data)
+        if ref is None:
+            if isinstance(response_or_data, dict) and "data" in response_or_data:
+                return response_or_data["data"]
+            return response_or_data
+        if not ref.control_addr:
+            raise RuntimeError("service result is missing control_addr for download")
+        with NodeControlClient(ref.control_addr, timeout_sec=self.timeout_sec) as client:
+            return client.fetch_result_ref_data(ref, target_path=target_path)
+
 
 @dataclass
 class DiscoveryCallError(Exception):
@@ -1456,17 +1503,18 @@ def _call_route_http(
     )
     try:
         with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-            data = json.loads(resp.read().decode("utf-8") or "{}")
+            data = _normalize_http_response_body(
+                json.loads(resp.read().decode("utf-8") or "{}"),
+                control_addr=route.control_addr,
+            )
     except HTTPError as exc:
         try:
-            data = json.loads((exc.read() or b"{}").decode("utf-8"))
+            data = _normalize_http_response_body(json.loads((exc.read() or b"{}").decode("utf-8") or "{}"))
         except Exception:
             data = {"ok": False, "error": exc.reason}
         raise DiscoveryCallError(status_code=exc.code, data=data) from exc
     except Exception as exc:
         raise DiscoveryCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
-    if not isinstance(data, dict):
-        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
     if not data.get("ok", False):
         raise DiscoveryCallError(status_code=502, data=data)
     return data
@@ -1537,6 +1585,26 @@ class DiscoveryServiceClient:
             "route_count": int(info["route_count"]),
             "routes": [_serialize_route(route) for route in routes],
         }
+
+    def download_result_to_file(self, response_or_data: object, *, target_path: str) -> Path:
+        ref = _extract_result_ref(response_or_data)
+        if ref is None:
+            raise ValueError("service result is inline data; no download needed")
+        if not ref.control_addr:
+            raise RuntimeError("service result is missing control_addr for download")
+        with NodeControlClient(ref.control_addr, timeout_sec=self.timeout_sec) as client:
+            return client.download_result_to_file(ref, target_path=target_path)
+
+    def fetch_result_data(self, response_or_data: object, *, target_path: str = ""):
+        ref = _extract_result_ref(response_or_data)
+        if ref is None:
+            if isinstance(response_or_data, dict) and "data" in response_or_data:
+                return response_or_data["data"]
+            return response_or_data
+        if not ref.control_addr:
+            raise RuntimeError("service result is missing control_addr for download")
+        with NodeControlClient(ref.control_addr, timeout_sec=self.timeout_sec) as client:
+            return client.fetch_result_ref_data(ref, target_path=target_path)
 
     def list_methods(
         self,
@@ -1726,16 +1794,31 @@ class ServiceSessionClient:
         )
         try:
             with urlopen(req, timeout=max(2.0, float(timeout_sec) + 1.0)) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                body = _normalize_http_response_body(
+                    json.loads(resp.read().decode("utf-8") or "{}"),
+                    control_addr=self._client.target,
+                )
         except HTTPError as exc:
             raw = exc.read().decode("utf-8") if hasattr(exc, "read") else ""
             msg = raw or str(exc)
             raise RuntimeError(f"call failed: {msg}") from exc
-        if not isinstance(body, dict):
-            raise RuntimeError("call failed: invalid response body")
         if not body.get("ok", False):
             raise RuntimeError(f"call failed: {body.get('error', 'unknown error')}")
         return body
+
+    def download_result_to_file(self, response_or_data: object, *, target_path: str) -> Path:
+        ref = _extract_result_ref(response_or_data)
+        if ref is None:
+            raise ValueError("service result is inline data; no download needed")
+        return self._client.download_result_to_file(ref, target_path=target_path)
+
+    def fetch_result_data(self, response_or_data: object, *, target_path: str = ""):
+        ref = _extract_result_ref(response_or_data)
+        if ref is None:
+            if isinstance(response_or_data, dict) and "data" in response_or_data:
+                return response_or_data["data"]
+            return response_or_data
+        return self._client.fetch_result_ref_data(ref, target_path=target_path)
 
     def _keepalive_loop(self) -> None:
         while not self._hb_stop.wait(max(0.5, self._hb_interval_sec)):
@@ -2060,18 +2143,27 @@ class NodeControlClient:
     def download_result_to_file(self, result_ref: ResultRef, *, target_path: str) -> Path:
         return self.download_object_to_file(object_id=result_ref.object_id, target_path=target_path)
 
+    def fetch_result_ref_data(self, result_ref: ResultRef, *, target_path: str = ""):
+        if target_path:
+            return self.download_result_to_file(result_ref, target_path=target_path)
+        suffix = Path(f"result{('.' + result_ref.format) if result_ref.format else ''}")
+        tmp = tempfile.NamedTemporaryFile(prefix="pycloud-result-", suffix=suffix.suffix, delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        self.download_result_to_file(result_ref, target_path=str(tmp_path))
+        return _materialize_downloaded_result(tmp_path, result_ref=result_ref)
+
     def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
         data = struct_to_dict(task_result.result)
         if not isinstance(data, ResultRef):
             return data
-        if target_path:
-            return self.download_result_to_file(data, target_path=target_path)
-        suffix = Path(f"result{('.' + data.format) if data.format else ''}")
-        tmp = tempfile.NamedTemporaryFile(prefix="pycloud-result-", suffix=suffix.suffix, delete=False)
-        tmp_path = Path(tmp.name)
-        tmp.close()
-        self.download_result_to_file(data, target_path=str(tmp_path))
-        return _materialize_downloaded_result(tmp_path, result_ref=data)
+        return self.fetch_result_ref_data(data, target_path=target_path)
+
+    def fetch_service_result_data(self, call_response: pb2.CallServiceResponse, *, target_path: str = ""):
+        data = struct_to_dict(call_response.data)
+        if not isinstance(data, ResultRef):
+            return data
+        return self.fetch_result_ref_data(data, target_path=target_path)
 
     def cancel_tasks(
         self,

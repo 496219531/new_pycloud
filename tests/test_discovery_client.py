@@ -18,6 +18,7 @@ from pycloud_parallel.controlplane.client import (
     NodeControlClient,
     _CallProxy,
 )
+from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
@@ -322,6 +323,77 @@ def test_discovery_client_retries_second_route_when_first_route_is_broken(tmp_pa
             route_map = {item["service_id"]: item for item in status["routes"]}
             assert service_id in route_map
             assert "svc-discovery-bad" in route_map
+    finally:
+        node_server.stop(grace=0)
+        node_state.close()
+        controlplane.stop()
+
+
+def test_discovery_client_fetches_large_dataframe_result(tmp_path):
+    pytest.importorskip("pyarrow")
+    pd = pytest.importorskip("pandas")
+
+    controlplane = build_controlplane_server("127.0.0.1:0")
+    controlplane.start()
+    node_server, node_target, node_state = _start_nodecontrol_server("node-discovery-large-01", str(tmp_path / "node_discovery_large_01"))
+
+    try:
+        blob = (
+            b"import pandas as pd\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
+            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}, {'x': value + 2}])\n"
+        )
+        with NodeControlClient(node_target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-svc-discovery-large",
+                service_name="svc_discovery_large_result",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_discovery_large_result",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            assert session.service_id
+        _register_node_with_services(
+            controlplane.base_url,
+            node_id="node-discovery-large-01",
+            control_addr=node_target,
+            state=node_state,
+        )
+
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(controlplane.base_url, timeout_sec=5.0).list_service_routes(
+                    service_name="svc_discovery_large_result",
+                    healthy_only=True,
+                    limit=20,
+                )
+            )
+            == 1
+        )
+
+        with DiscoveryServiceClient(controlplane.base_url, timeout_sec=5.0) as client:
+            body = client.call(
+                service_name="svc_discovery_large_result",
+                method="run",
+                payload={"value": 4},
+                timeout_sec=5.0,
+            )
+            assert body["ok"] is True
+            assert isinstance(body["data"], ResultRef)
+            assert body["data"].node_id == "node-discovery-large-01"
+            assert body["data"].control_addr == node_target
+            frame = client.fetch_result_data(body)
+            assert isinstance(frame, pd.DataFrame)
+            assert list(frame["x"]) == [4, 5, 6]
     finally:
         node_server.stop(grace=0)
         node_state.close()

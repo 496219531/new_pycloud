@@ -72,6 +72,16 @@ class StoredResultArtifact:
     materialize_as: str
 
 
+def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) -> ResultRef:
+    return ResultRef(
+        object_id=result.object_id,
+        node_id=node_id,
+        format=result.format,
+        size_bytes=result.size_bytes,
+        materialize_as=result.materialize_as,
+    )
+
+
 def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -2132,6 +2142,8 @@ class NodeControlState:
                 session.in_flight = max(0, session.in_flight - 1)
 
         if status_text == "SUCCEEDED":
+            if isinstance(result, StoredResultArtifact):
+                result = _stored_result_to_result_ref(result, node_id=self.node_id)
             return 200, {"ok": True, "method": requested_method, "data": result or {}}
         if status_text == "FAILED_USER":
             return 400, {
@@ -2732,13 +2744,7 @@ class NodeControlState:
                 else:
                     task.status = pb2.TASK_STATUS_SUCCEEDED
                     if isinstance(result, StoredResultArtifact):
-                        task.result = ResultRef(
-                            object_id=result.object_id,
-                            node_id=self.node_id,
-                            format=result.format,
-                            size_bytes=result.size_bytes,
-                            materialize_as=result.materialize_as,
-                        )
+                        task.result = _stored_result_to_result_ref(result, node_id=self.node_id)
                     else:
                         task.result = result or {}
                     task.error_type = ""

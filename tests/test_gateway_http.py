@@ -7,8 +7,10 @@ from typing import Tuple
 from urllib.request import Request, urlopen
 
 import grpc
+import pytest
 
 from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, NodeControlClient
+from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.server import build_controlplane_server, build_gateway_server, build_infocenter_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
@@ -231,6 +233,79 @@ def test_standalone_gateway_reads_routes_from_infocenter(tmp_path):
         node_state.close()
         gateway.stop()
         infocenter.stop()
+
+
+def test_gateway_service_client_fetches_large_dataframe_result(tmp_path):
+    pytest.importorskip("pyarrow")
+    pd = pytest.importorskip("pandas")
+
+    controlplane = build_controlplane_server("127.0.0.1:0")
+    controlplane.start()
+    node_server, node_target, node_state = _start_nodecontrol_server("node-gw-large-01", str(tmp_path / "node_gw_large_01"))
+
+    try:
+        blob = (
+            b"import pandas as pd\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
+            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}])\n"
+        )
+        with NodeControlClient(node_target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-svc-gateway-large",
+                service_name="svc_gateway_large_result",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_gateway_large_result",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            service_id = session.service_id
+        _register_node_with_services(
+            controlplane.base_url,
+            node_id="node-gw-large-01",
+            control_addr=node_target,
+            state=node_state,
+        )
+
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(controlplane.base_url, timeout_sec=5.0).list_service_routes(
+                    service_name="svc_gateway_large_result",
+                    healthy_only=True,
+                    limit=20,
+                )
+            )
+            == 1
+        )
+
+        with GatewayServiceClient(controlplane.base_url, timeout_sec=5.0) as gateway:
+            body = gateway.call(
+                service_name="svc_gateway_large_result",
+                method="run",
+                payload={"value": 11},
+                timeout_sec=5.0,
+            )
+            assert body["ok"] is True
+            assert isinstance(body["data"], ResultRef)
+            assert body["data"].node_id == "node-gw-large-01"
+            assert body["data"].control_addr == node_target
+            frame = gateway.fetch_result_data(body)
+            assert isinstance(frame, pd.DataFrame)
+            assert list(frame["x"]) == [11, 12]
+
+        assert service_id
+    finally:
+        node_server.stop(grace=0)
+        node_state.close()
+        controlplane.stop()
 
 
 def test_gateway_retries_second_route_when_first_route_is_broken(tmp_path):

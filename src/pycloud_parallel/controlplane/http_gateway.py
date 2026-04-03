@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from pycloud_parallel.controlplane.serialization import serialize_inline_payload
+from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible, serialize_inline_payload
 
 
 InvokeHandler = Callable[[str, str, dict, str, float], Tuple[int, Dict[str, object]]]
@@ -105,7 +105,7 @@ class ServiceHttpGateway:
                 return ""
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
-                raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))

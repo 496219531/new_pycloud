@@ -13,7 +13,8 @@ from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.client import InfoCenterServiceRoute, NodeControlClient
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
-from pycloud_parallel.controlplane.serialization import serialize_inline_payload
+from pycloud_parallel.controlplane.result_ref import ResultRef
+from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow, serialize_arrow_compatible, serialize_inline_payload
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -215,7 +216,7 @@ class GatewayHttpApp:
             raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
         if not data.get("ok", False):
             raise GatewayCallError(status_code=502, data=data)
-        return data
+        return _attach_result_ref_control_addr(convert_dict_to_arrow(data), control_addr=route.control_addr)
 
     def _extract_token(self, headers) -> str:
         x_token = str(headers.get("X-Service-Token", "") or "").strip()
@@ -273,7 +274,7 @@ class GatewayHttpServer:
                 return
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
-                raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
@@ -302,3 +303,20 @@ class GatewayHttpServer:
             self._thread.join(timeout=1.0)
             self._thread = None
         self.app.stop()
+
+
+def _attach_result_ref_control_addr(data: Dict[str, object], *, control_addr: str) -> Dict[str, object]:
+    if not isinstance(data, dict):
+        return data
+    result = data.get("data")
+    if isinstance(result, ResultRef) and control_addr and not result.control_addr:
+        data = dict(data)
+        data["data"] = ResultRef(
+            object_id=result.object_id,
+            node_id=result.node_id,
+            control_addr=control_addr,
+            format=result.format,
+            size_bytes=result.size_bytes,
+            materialize_as=result.materialize_as,
+        )
+    return data
