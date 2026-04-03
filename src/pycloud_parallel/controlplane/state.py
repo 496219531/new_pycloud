@@ -1585,6 +1585,59 @@ class NodeControlState:
     def object_dir(self) -> Path:
         return self._object_dir
 
+    def _executor_host_required(self) -> bool:
+        return bool(self.enable_internal_executor or self.enable_service_session)
+
+    def _executor_host_alive_locked(self) -> bool:
+        return self._executor_host is not None and self._executor_host.is_alive()
+
+    def _ensure_executor_host_alive_locked(self, *, now: Optional[datetime] = None) -> None:
+        if not self._executor_host_required():
+            return
+        if self._executor_host_alive_locked():
+            return
+
+        current_time = now or utc_now()
+        old_host = self._executor_host
+        self._executor_host = ExecutorHostClient()
+
+        for session in self._services.values():
+            if session.status != pb2.SERVICE_STATUS_RUNNING or not session.executor_ready:
+                continue
+            try:
+                self._executor_host.create_service(
+                    service_id=session.service_id,
+                    worker_count=session.worker_count,
+                )
+                session.alive_workers = session.worker_count
+            except Exception:
+                session.executor_ready = False
+                session.alive_workers = 0
+                session.status = pb2.SERVICE_STATUS_STOPPED
+                session.stop_reason = "executor host restart failed"
+                session.lease_expire_at = current_time
+
+        for runtime_key, slot in list(self._runtime_slots.items()):
+            if slot.current_task_id:
+                task = self._tasks.get(slot.current_task_id)
+                task_attempt = slot.current_attempt
+                self._reset_runtime_slot_locked(runtime_key, now=current_time, ensure_host=False)
+                if task is not None and task.attempt == task_attempt and task.status == pb2.TASK_STATUS_RUNNING:
+                    self._handle_infra_failure_locked(
+                        task,
+                        reason="executor host restarted during task execution",
+                        now=current_time,
+                    )
+                continue
+            slot.executor = None
+            slot.executor_ready = False
+
+        if old_host is not None:
+            try:
+                old_host.close()
+            except Exception:
+                pass
+
     def get_object_artifact(self, object_id: str) -> ObjectArtifact:
         normalized = normalize_object_id(object_id)
         with self._lock:
@@ -2005,6 +2058,7 @@ class NodeControlState:
         token = secrets.token_urlsafe(24)
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
 
+        self._ensure_executor_host_alive_locked(now=now)
         if self._executor_host is None:
             raise RuntimeError("executor host unavailable")
         self._executor_host.create_service(service_id=service_id, worker_count=actual_workers)
@@ -2126,6 +2180,7 @@ class NodeControlState:
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
+            self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
             session.in_flight += 1
@@ -2557,10 +2612,19 @@ class NodeControlState:
         result = task.as_result()
         self._result_hook.push(task.client_id, result)
 
-    def _reset_runtime_slot_locked(self, runtime_key: str, *, now: datetime, drop_queued: bool = False) -> None:
+    def _reset_runtime_slot_locked(
+        self,
+        runtime_key: str,
+        *,
+        now: datetime,
+        drop_queued: bool = False,
+        ensure_host: bool = True,
+    ) -> None:
         slot = self._runtime_slots.get(runtime_key)
         if slot is None:
             return
+        if ensure_host:
+            self._ensure_executor_host_alive_locked(now=now)
         if self._executor_host is not None and slot.executor_ready:
             try:
                 self._executor_host.stop_runtime_slot(runtime_key=runtime_key)
@@ -2608,6 +2672,7 @@ class NodeControlState:
     def _start_runtime_slot_locked(self, slot: RuntimeSlotState) -> None:
         if slot.executor_ready:
             return
+        self._ensure_executor_host_alive_locked()
         if self._executor_host is None:
             raise RuntimeError("executor host unavailable")
         self._executor_host.start_runtime_slot(runtime_key=slot.runtime_key)
@@ -2737,6 +2802,7 @@ class NodeControlState:
             task.last_heartbeat_at = now
 
     def _drain_executor_events(self) -> None:
+        self._ensure_executor_host_alive_locked()
         if self._executor_host is None:
             return
         for item in self._executor_host.drain_events():
@@ -2794,6 +2860,7 @@ class NodeControlState:
         while not self._stop_event.is_set():
             self._drain_executor_events()
             with self._cv:
+                self._ensure_executor_host_alive_locked()
                 self._touch_internal_heartbeats_locked()
                 self._reclaim_idle_runtime_slots_locked()
                 self._dispatch_runtime_slots_locked()

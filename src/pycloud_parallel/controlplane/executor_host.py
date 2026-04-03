@@ -228,6 +228,9 @@ class ExecutorHostClient:
         self._reader = threading.Thread(target=self._reader_loop, name="executor-host-reader", daemon=True)
         self._reader.start()
 
+    def is_alive(self) -> bool:
+        return (not self._closed) and self._process.is_alive()
+
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
             try:
@@ -249,10 +252,11 @@ class ExecutorHostClient:
         if self._closed:
             return
         self._closed = True
-        try:
-            self._request("shutdown", timeout_sec=30.0)
-        except Exception:
-            pass
+        if self._process.is_alive():
+            try:
+                self._request("shutdown", timeout_sec=30.0)
+            except Exception:
+                pass
         self._reader_stop.set()
         if self._reader.is_alive():
             self._reader.join(timeout=1.0)

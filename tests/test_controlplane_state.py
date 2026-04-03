@@ -605,6 +605,61 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
         state.close()
 
 
+def test_service_call_recovers_after_executor_host_restart(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-host-restart-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    v = int(value)\n"
+            b"    return {'v': v, 'square': v * v}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-host-restart",
+            service_name="svc-host-restart",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_host_restart",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        assert state._executor_host is not None  # noqa: SLF001
+        state._executor_host._process.terminate()  # noqa: SLF001
+        state._executor_host._process.join(timeout=5.0)  # noqa: SLF001
+
+        code, body = state.call_service(
+            service_id=session.service_id,
+            method="run",
+            payload={"value": 8},
+            service_token=session.service_token,
+            timeout_sec=5.0,
+        )
+        assert code == 200
+        assert body["ok"] is True
+        assert body["data"] == {"v": 8, "square": 64}
+    finally:
+        state.close()
+
+
 def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
     state = NodeControlState(
         node_id="node-svc-03",
@@ -656,5 +711,89 @@ def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
         assert session.status == pb2.SERVICE_STATUS_RUNNING
         assert "compute_service" not in sys.modules
         assert "compute_service.main" not in sys.modules
+    finally:
+        state.close()
+
+
+def test_internal_executor_recovers_after_executor_host_restart(tmp_path):
+    state = NodeControlState(
+        node_id="node-runtime-host-restart-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        runtime_slot_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_runtime_host_restart"),
+        heartbeat_timeout_sec=30,
+        max_retries=2,
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+        monitor_interval_sec=60,
+    )
+    try:
+        blob = (
+            b"import time\n"
+            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
+            b"    sleep_ms = int(sleep_ms)\n"
+            b"    if sleep_ms > 0:\n"
+            b"        time.sleep(sleep_ms / 1000.0)\n"
+            b"    value = int(value)\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _ = state.put_code(
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="runtime_host_restart_demo",
+            entry_callable="run",
+            package_format="py",
+            chunks=[blob],
+        )
+        accepted, rejected, _ = state.submit_tasks(
+            pb2.SubmitTasksRequest(
+                client_id="client-host-restart",
+                code_version=artifact.code_version,
+                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+                tasks=[
+                    pb2.TaskSubmitItem(
+                        task_id="restart-task-1",
+                        payload={"value": 7, "sleep_ms": 5000},
+                        priority=1,
+                        runtime_key="rt-host-restart",
+                    ),
+                ],
+            )
+        )
+        assert len(accepted) == 1
+        assert not rejected
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with state._lock:  # noqa: SLF001
+                task = state._tasks["restart-task-1"]  # noqa: SLF001
+                slot = state._runtime_slots["rt-host-restart"]  # noqa: SLF001
+                if task.status == pb2.TASK_STATUS_RUNNING and slot.current_task_id == "restart-task-1":
+                    task.payload["sleep_ms"] = 0
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("task never entered running state")
+
+        assert state._executor_host is not None  # noqa: SLF001
+        state._executor_host._process.terminate()  # noqa: SLF001
+        state._executor_host._process.join(timeout=5.0)  # noqa: SLF001
+
+        deadline = time.time() + 15
+        results = []
+        cursor = ""
+        while time.time() < deadline and not results:
+            batch, cursor = state.pull_results(
+                pb2.PullResultsRequest(client_id="client-host-restart", limit=10, wait_ms=200, cursor=cursor)
+            )
+            results.extend(batch)
+
+        assert len(results) == 1
+        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
+        assert results[0].attempt == 2
+        assert dict(results[0].result) == {"value": 7, "square": 49}
     finally:
         state.close()
