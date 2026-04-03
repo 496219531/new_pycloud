@@ -13,6 +13,7 @@ from typing import Any, Deque, Dict, Optional
 
 def _executor_host_main(request_q, event_q) -> None:
     service_executors: Dict[str, ProcessPoolExecutor] = {}
+    service_workers: Dict[str, int] = {}
     runtime_executors: Dict[str, ProcessPoolExecutor] = {}
     inflight: Dict[object, Dict[str, Any]] = {}
     shutdown_request_id = ""
@@ -63,6 +64,17 @@ def _executor_host_main(request_q, event_q) -> None:
             args["payload"],
         )
 
+    def _rebuild_service_executor(service_id: str) -> Optional[ProcessPoolExecutor]:
+        worker_count = max(1, int(service_workers.get(service_id, 1) or 1))
+        existing = service_executors.pop(service_id, None)
+        _shutdown_executor(existing, wait=True)
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=_ensure_mp_context(),
+        )
+        service_executors[service_id] = executor
+        return executor
+
     def _handle_request(message: Dict[str, Any]) -> bool:
         request_id = str(message.get("request_id", "") or "")
         action = str(message.get("action", "") or "")
@@ -76,18 +88,15 @@ def _executor_host_main(request_q, event_q) -> None:
             if action == "create_service":
                 service_id = str(payload.get("service_id", "") or "")
                 worker_count = max(1, int(payload.get("worker_count", 1) or 1))
-                existing = service_executors.pop(service_id, None)
-                _shutdown_executor(existing, wait=True)
-                service_executors[service_id] = ProcessPoolExecutor(
-                    max_workers=worker_count,
-                    mp_context=_ensure_mp_context(),
-                )
+                service_workers[service_id] = worker_count
+                service_executors[service_id] = _rebuild_service_executor(service_id)
                 _send_response(request_id, ok=True)
                 return True
 
             if action == "stop_service":
                 service_id = str(payload.get("service_id", "") or "")
                 executor = service_executors.pop(service_id, None)
+                service_workers.pop(service_id, None)
                 _shutdown_executor(executor, wait=True)
                 _send_response(request_id, ok=True)
                 return True
@@ -95,6 +104,8 @@ def _executor_host_main(request_q, event_q) -> None:
             if action == "call_service":
                 service_id = str(payload.get("service_id", "") or "")
                 executor = service_executors.get(service_id)
+                if executor is None and service_id in service_workers:
+                    executor = _rebuild_service_executor(service_id)
                 if executor is None:
                     _send_response(request_id, ok=False, error="service executor missing")
                     return True
@@ -102,6 +113,7 @@ def _executor_host_main(request_q, event_q) -> None:
                 try:
                     status_text, result, err_type, err_message = future.result(timeout=max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)))
                 except FutureTimeout:
+                    _rebuild_service_executor(service_id)
                     _send_response(request_id, ok=False, timeout=True, error="invoke timeout")
                     return True
                 except Exception as exc:

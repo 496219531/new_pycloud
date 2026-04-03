@@ -472,6 +472,60 @@ def test_nodecontrol_call_service_dataframe_result_returns_result_ref_and_fetche
         state.close()
 
 
+def test_service_session_call_timeout_recycles_executor_and_next_call_succeeds(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-session-timeout-recycle-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_session_timeout_recycle"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"import time\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
+            b"    time.sleep(max(0, int(sleep_ms)) / 1000.0)\n"
+            b"    value = int(value)\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-session-timeout-recycle",
+                service_name="svc-session-timeout-recycle",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_session_timeout_recycle",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+
+            with pytest.raises(RuntimeError, match="invoke timeout"):
+                session.call("run", {"value": 3, "sleep_ms": 3000}, timeout_sec=0.2)
+
+            resp = session.call("run", {"value": 5, "sleep_ms": 0}, timeout_sec=5.0)
+            assert resp["ok"] is True
+            assert resp["data"] == {"value": 5, "square": 25}
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
 def test_nodecontrol_client_task_helpers_roundtrip(tmp_path):
     state = NodeControlState(
         node_id="node-client-task-01",

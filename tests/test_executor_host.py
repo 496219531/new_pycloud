@@ -144,3 +144,50 @@ def test_executor_host_close_cleans_active_runtime_worker(tmp_path):
         assert host._process.is_alive() is False  # noqa: SLF001
     finally:
         state.close()
+
+
+def test_executor_host_recycles_service_executor_after_timeout(tmp_path):
+    state, artifact = _seed_artifact(
+        tmp_path,
+        blob=(
+            b"import time\n"
+            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
+            b"    time.sleep(max(0, int(sleep_ms)) / 1000.0)\n"
+            b"    value = int(value)\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        ),
+        entry_module="executor_host_service_timeout_recycle",
+    )
+    host = ExecutorHostClient()
+    try:
+        host.create_service(service_id="svc-host-timeout", worker_count=1)
+        resp = host.call_service(
+            service_id="svc-host-timeout",
+            timeout_sec=0.2,
+            execute_spec=_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={"value": 2, "sleep_ms": 3000},
+            ),
+        )
+        assert resp["ok"] is False
+        assert resp["timeout"] is True
+
+        resp = host.call_service(
+            service_id="svc-host-timeout",
+            timeout_sec=5.0,
+            execute_spec=_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={"value": 4, "sleep_ms": 0},
+            ),
+        )
+        assert resp["ok"] is True
+        assert resp["status_text"] == "SUCCEEDED"
+        assert resp["result"] == {"value": 4, "square": 16}
+        host.stop_service(service_id="svc-host-timeout")
+    finally:
+        host.close()
+        state.close()
