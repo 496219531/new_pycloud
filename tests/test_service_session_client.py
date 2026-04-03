@@ -410,6 +410,68 @@ def test_service_session_call_dataframe_result_returns_result_ref_and_fetches(tm
         state.close()
 
 
+def test_nodecontrol_call_service_dataframe_result_returns_result_ref_and_fetches(tmp_path):
+    pytest.importorskip("pyarrow")
+    pd = pytest.importorskip("pandas")
+
+    state = NodeControlState(
+        node_id="node-client-call-service-result-ref-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_call_service_result_ref"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"import pandas as pd\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
+            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}])\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-call-service-result-ref",
+                service_name="svc-call-service-result-ref",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_call_service_result_ref",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            resp = client.call_service(
+                service_id=session.service_id,
+                method="run",
+                payload={"value": 5},
+                timeout_sec=10.0,
+                service_token=session.service_token,
+            )
+            result_value = struct_to_dict(resp.data)
+            assert isinstance(result_value, ResultRef)
+            assert result_value.node_id == "node-client-call-service-result-ref-01"
+            frame = client.fetch_service_result_data(resp)
+            assert isinstance(frame, pd.DataFrame)
+            assert list(frame["x"]) == [5, 6]
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
 def test_nodecontrol_client_task_helpers_roundtrip(tmp_path):
     state = NodeControlState(
         node_id="node-client-task-01",

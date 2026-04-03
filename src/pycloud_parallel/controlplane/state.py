@@ -7,7 +7,6 @@ import importlib
 import importlib.util
 import inspect
 import json
-import multiprocessing as mp
 import os
 import queue
 import subprocess
@@ -19,7 +18,7 @@ import tempfile
 import threading
 import uuid
 import zipfile
-from concurrent.futures import Future, ProcessPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import TimeoutError as FutureTimeout
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -30,6 +29,7 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 from google.protobuf import struct_pb2
 from google.protobuf import timestamp_pb2
 
+from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
 from pycloud_parallel.controlplane.object_ref import (
@@ -70,6 +70,9 @@ class StoredResultArtifact:
     format: str
     size_bytes: int
     materialize_as: str
+
+
+_EXECUTOR_ACTIVE = object()
 
 
 def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) -> ResultRef:
@@ -217,6 +220,28 @@ def _normalize_user_return(ret: Any, *, object_dir: str) -> Tuple[str, Optional[
         return status_text, result, err_type, err_message
 
     return "SUCCEEDED", _normalize_result_value(ret, object_dir=object_dir), "", ""
+
+
+def _build_execute_spec(
+    artifact: "CodeArtifact",
+    *,
+    object_dir: Path,
+    method_name: str,
+    payload: dict,
+) -> Dict[str, Any]:
+    return {
+        "artifact_path": artifact.path,
+        "entry_module": artifact.entry_module,
+        "package_format": artifact.package_format,
+        "dependency_path": artifact.dependency_path,
+        "object_dir": str(object_dir),
+        "export_mode": artifact.export_mode,
+        "export_methods": list(artifact.export_methods),
+        "export_decorator": artifact.export_decorator,
+        "method_name": method_name,
+        "entry_callable": artifact.entry_callable,
+        "payload": payload or {},
+    }
 
 
 def _serialize_result_for_json(obj: Any) -> Any:
@@ -1423,7 +1448,7 @@ class ServiceSession:
     created_at: datetime
     last_heartbeat_at: datetime
     lease_expire_at: datetime
-    executor: Optional[ProcessPoolExecutor] = None
+    executor_ready: bool = False
     in_flight: int = 0
     queued: int = 0
     alive_workers: int = 0
@@ -1436,8 +1461,8 @@ class RuntimeSlotState:
     runtime_key: str
     code_version: str
     task_ids: Deque[str] = field(default_factory=deque)
-    executor: Optional[ProcessPoolExecutor] = None
-    future: Optional[Future] = None
+    executor: Optional[object] = None
+    executor_ready: bool = False
     current_task_id: str = ""
     current_attempt: int = 0
     last_used_at: datetime = field(default_factory=utc_now)
@@ -1519,8 +1544,7 @@ class NodeControlState:
         self._stop_event = threading.Event()
         self._monitor = threading.Thread(target=self._monitor_loop, name="nodecontrol-monitor", daemon=True)
         self._monitor.start()
-        self._done_queue: "queue.Queue[Future]" = queue.Queue()
-        self._inflight_futures: Dict[Future, Tuple[str, str, int]] = {}
+        self._executor_host = ExecutorHostClient() if (self.enable_internal_executor or self.enable_service_session) else None
         self._dispatcher: Optional[threading.Thread] = None
         self._service_http_gateway: Optional[ServiceHttpGateway] = None
 
@@ -1547,14 +1571,11 @@ class NodeControlState:
         self._monitor.join(timeout=1.0)
         if self._dispatcher is not None:
             self._dispatcher.join(timeout=1.0)
-        for slot in list(self._runtime_slots.values()):
-            if slot.executor is not None:
-                slot.executor.shutdown(wait=True, cancel_futures=True)
-                slot.executor = None
-                slot.future = None
         if self._service_http_gateway is not None:
             self._service_http_gateway.stop()
         self._shutdown_all_services()
+        if self._executor_host is not None:
+            self._executor_host.close()
 
     @property
     def artifact_dir(self) -> Path:
@@ -1984,8 +2005,9 @@ class NodeControlState:
         token = secrets.token_urlsafe(24)
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
 
-        mp_ctx = mp.get_context("spawn")
-        executor = ProcessPoolExecutor(max_workers=actual_workers, mp_context=mp_ctx)
+        if self._executor_host is None:
+            raise RuntimeError("executor host unavailable")
+        self._executor_host.create_service(service_id=service_id, worker_count=actual_workers)
         session = ServiceSession(
             service_id=service_id,
             owner_client_id=owner_client_id,
@@ -2001,7 +2023,7 @@ class NodeControlState:
             created_at=now,
             last_heartbeat_at=now,
             lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
-            executor=executor,
+            executor_ready=True,
             alive_workers=actual_workers,
             methods=method_info,
         )
@@ -2050,14 +2072,16 @@ class NodeControlState:
         if session.status == pb2.SERVICE_STATUS_STOPPED:
             return
         session.status = pb2.SERVICE_STATUS_DRAINING
-        executor = session.executor
-        session.executor = None
+        session.executor_ready = False
         session.stop_reason = reason
         session.alive_workers = 0
         session.status = pb2.SERVICE_STATUS_STOPPED
         session.lease_expire_at = utc_now()
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+        if self._executor_host is not None:
+            try:
+                self._executor_host.stop_service(service_id=session.service_id)
+            except Exception:
+                pass
 
     def _shutdown_all_services(self) -> None:
         with self._lock:
@@ -2102,27 +2126,29 @@ class NodeControlState:
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
-            executor = session.executor
-            if executor is None:
+            if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
             session.in_flight += 1
 
         try:
-            future = executor.submit(
-                _execute_payload_in_subprocess,
-                artifact.path,
-                artifact.entry_module,
-                artifact.package_format,
-                artifact.dependency_path,
-                str(self._object_dir),
-                artifact.export_mode,
-                artifact.export_methods,
-                artifact.export_decorator,
-                requested_method,
-                artifact.entry_callable,
-                payload or {},
+            resp = self._executor_host.call_service(
+                service_id=service_id,
+                timeout_sec=max(0.1, timeout_sec),
+                execute_spec=_build_execute_spec(
+                    artifact,
+                    object_dir=self._object_dir,
+                    method_name=requested_method,
+                    payload=payload or {},
+                ),
             )
-            status_text, result, err_type, err_message = future.result(timeout=max(0.1, timeout_sec))
+            if not resp.get("ok", False):
+                if resp.get("timeout", False):
+                    raise FutureTimeout()
+                raise RuntimeError(str(resp.get("error", "service invoke failed")))
+            status_text = str(resp.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
+            result = resp.get("result")
+            err_type = str(resp.get("err_type", "") or "")
+            err_message = str(resp.get("err_message", "") or "")
         except FutureTimeout:
             with self._lock:
                 session = self._services.get(service_id)
@@ -2288,7 +2314,7 @@ class NodeControlState:
                         self._runtime_slots[runtime_key] = slot
                     slot.task_ids.append(item.task_id)
                     slot.last_used_at = utc_now()
-                    if slot.executor is None and not slot.waiting and self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
+                    if not slot.executor_ready and not slot.waiting and self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
                         slot.waiting = True
                         self._runtime_waiting.append(runtime_key)
                 else:
@@ -2500,7 +2526,7 @@ class NodeControlState:
             rows: List[Tuple[int, int, float, str]] = []
             for runtime_key, slot in self._runtime_slots.items():
                 queued = len(slot.task_ids)
-                hot = 1 if slot.executor is not None else 0
+                hot = 1 if slot.executor_ready else 0
                 last_used = slot.last_used_at.timestamp() if slot.last_used_at else 0.0
                 rows.append((hot, queued, last_used, runtime_key))
             rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
@@ -2519,7 +2545,7 @@ class NodeControlState:
         return max(0, self.queue_capacity - (self._queued_count_locked() + self._inflight_count_locked()))
 
     def _active_runtime_slot_count_locked(self) -> int:
-        return sum(1 for slot in self._runtime_slots.values() if slot.executor is not None)
+        return sum(1 for slot in self._runtime_slots.values() if slot.executor_ready)
 
     def _queued_count_locked(self) -> int:
         return sum(1 for task in self._tasks.values() if task.status == pb2.TASK_STATUS_QUEUED)
@@ -2549,7 +2575,7 @@ class NodeControlState:
                     self._runtime_slots[task.runtime_key] = slot
                 slot.task_ids.append(task.task_id)
                 slot.last_used_at = now
-                if slot.executor is None and not slot.waiting and self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
+                if not slot.executor_ready and not slot.waiting and self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
                     slot.waiting = True
                     self._runtime_waiting.append(task.runtime_key)
             else:
@@ -2562,15 +2588,14 @@ class NodeControlState:
         task.error_message = reason
         self._publish_result_locked(task)
 
-    def _on_future_done(self, future: Future) -> None:
-        self._done_queue.put(future)
-
     def _start_runtime_slot_locked(self, slot: RuntimeSlotState) -> None:
-        if slot.executor is not None:
+        if slot.executor_ready:
             return
-        mp_ctx = mp.get_context("spawn")
-        slot.executor = ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx)
-        slot.future = None
+        if self._executor_host is None:
+            raise RuntimeError("executor host unavailable")
+        self._executor_host.start_runtime_slot(runtime_key=slot.runtime_key)
+        slot.executor = _EXECUTOR_ACTIVE
+        slot.executor_ready = True
         slot.current_task_id = ""
         slot.current_attempt = 0
         slot.last_used_at = utc_now()
@@ -2583,7 +2608,7 @@ class NodeControlState:
             if slot is None:
                 continue
             slot.waiting = False
-            if slot.executor is not None:
+            if slot.executor_ready:
                 continue
             if not slot.task_ids:
                 continue
@@ -2592,18 +2617,22 @@ class NodeControlState:
     def _reclaim_idle_runtime_slots_locked(self) -> None:
         now = utc_now()
         for runtime_key, slot in list(self._runtime_slots.items()):
-            if slot.executor is None:
+            if not slot.executor_ready:
                 if not slot.task_ids and not slot.waiting:
                     self._runtime_slots.pop(runtime_key, None)
                 continue
-            if slot.future is not None or slot.task_ids:
+            if slot.current_task_id or slot.task_ids:
                 continue
             idle_sec = (now - slot.last_used_at).total_seconds()
             if idle_sec < self.runtime_slot_idle_ttl_sec:
                 continue
-            slot.executor.shutdown(wait=False, cancel_futures=True)
+            if self._executor_host is not None:
+                try:
+                    self._executor_host.stop_runtime_slot(runtime_key=runtime_key)
+                except Exception:
+                    pass
             slot.executor = None
-            slot.future = None
+            slot.executor_ready = False
             slot.current_task_id = ""
             slot.current_attempt = 0
             slot.last_used_at = now
@@ -2616,11 +2645,11 @@ class NodeControlState:
             for slot in self._runtime_slots.values():
                 if self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
                     break
-                if slot.executor is None and slot.task_ids and not slot.waiting:
+                if not slot.executor_ready and slot.task_ids and not slot.waiting:
                     self._start_runtime_slot_locked(slot)
 
         for slot in self._runtime_slots.values():
-            if slot.executor is None or slot.future is not None:
+            if not slot.executor_ready or slot.current_task_id:
                 continue
             while slot.task_ids:
                 task_id = slot.task_ids[0]
@@ -2651,71 +2680,65 @@ class NodeControlState:
                 task.lease_id = str(uuid.uuid4())
                 task.started_at = now
                 task.last_heartbeat_at = now
-                future = slot.executor.submit(
-                    _execute_payload_in_subprocess,
-                    artifact.path,
-                    artifact.entry_module,
-                    artifact.package_format,
-                    artifact.dependency_path,
-                    str(self._object_dir),
-                    artifact.export_mode,
-                    artifact.export_methods,
-                    artifact.export_decorator,
-                    artifact.entry_callable,
-                    artifact.entry_callable,
-                    task.payload,
-                )
-                slot.future = future
+                try:
+                    if self._executor_host is None:
+                        raise RuntimeError("executor host unavailable")
+                    self._executor_host.submit_runtime_task(
+                        runtime_key=slot.runtime_key,
+                        task_id=task.task_id,
+                        attempt=task.attempt,
+                        execute_spec=_build_execute_spec(
+                            artifact,
+                            object_dir=self._object_dir,
+                            method_name=artifact.entry_callable,
+                            payload=task.payload,
+                        ),
+                    )
+                except Exception as exc:
+                    self._handle_infra_failure_locked(task, reason=repr(exc), now=now)
+                    slot.current_task_id = ""
+                    slot.current_attempt = 0
+                    slot.last_used_at = now
+                    continue
                 slot.current_task_id = task.task_id
                 slot.current_attempt = task.attempt
                 slot.last_used_at = now
-                self._inflight_futures[future] = (slot.runtime_key, task.task_id, task.attempt)
-                future.add_done_callback(self._on_future_done)
                 break
 
     def _touch_internal_heartbeats_locked(self) -> None:
         now = utc_now()
-        for _runtime_key, task_id, attempt in self._inflight_futures.values():
-            task = self._tasks.get(task_id)
+        for slot in self._runtime_slots.values():
+            if not slot.current_task_id:
+                continue
+            task = self._tasks.get(slot.current_task_id)
             if task is None:
                 continue
-            if task.attempt != attempt:
+            if task.attempt != slot.current_attempt:
                 continue
             if task.status != pb2.TASK_STATUS_RUNNING:
                 continue
             task.last_heartbeat_at = now
 
-    def _drain_completed_futures(self) -> None:
-        while True:
-            try:
-                future = self._done_queue.get_nowait()
-            except queue.Empty:
-                return
-
-            with self._cv:
-                meta = self._inflight_futures.pop(future, None)
-            if meta is None:
+    def _drain_executor_events(self) -> None:
+        if self._executor_host is None:
+            return
+        for item in self._executor_host.drain_events():
+            if str(item.get("kind", "") or "") != "runtime_task_done":
                 continue
-            runtime_key, task_id, attempt = meta
-            slot = None
-            with self._cv:
-                slot = self._runtime_slots.get(runtime_key)
-                if slot is not None and slot.future is future:
-                    slot.future = None
-                    slot.current_task_id = ""
-                    slot.current_attempt = 0
-                    slot.last_used_at = utc_now()
-
-            try:
-                status_text, result, err_type, err_message = future.result()
-            except Exception as exc:
-                status_text = "FAILED_INFRA"
-                result = None
-                err_type = "InfraException"
-                err_message = repr(exc)
-
+            runtime_key = str(item.get("runtime_key", "") or "")
+            task_id = str(item.get("task_id", "") or "")
+            attempt = int(item.get("attempt", 0) or 0)
+            status_text = str(item.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
+            result = item.get("result")
+            err_type = str(item.get("err_type", "") or "")
+            err_message = str(item.get("err_message", "") or "")
             now = utc_now()
             with self._cv:
+                slot = self._runtime_slots.get(runtime_key)
+                if slot is not None and slot.current_task_id == task_id and slot.current_attempt == attempt:
+                    slot.current_task_id = ""
+                    slot.current_attempt = 0
+                    slot.last_used_at = now
                 task = self._tasks.get(task_id)
                 if task is None:
                     continue
@@ -2723,10 +2746,8 @@ class NodeControlState:
                     continue
                 if task.status not in (pb2.TASK_STATUS_RUNNING, pb2.TASK_STATUS_CANCELLED):
                     continue
-
                 task.finished_at = now
                 task.last_heartbeat_at = now
-
                 if task.cancel_requested:
                     task.status = pb2.TASK_STATUS_CANCELLED
                     task.error_type = "Cancelled"
@@ -2754,12 +2775,12 @@ class NodeControlState:
 
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
-            self._drain_completed_futures()
+            self._drain_executor_events()
             with self._cv:
                 self._touch_internal_heartbeats_locked()
                 self._reclaim_idle_runtime_slots_locked()
                 self._dispatch_runtime_slots_locked()
-            self._drain_completed_futures()
+            self._drain_executor_events()
             self._stop_event.wait(self.executor_poll_interval_sec)
 
     def _monitor_loop(self) -> None:
