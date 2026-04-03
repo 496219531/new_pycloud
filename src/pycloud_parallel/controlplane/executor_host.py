@@ -24,12 +24,18 @@ def _executor_host_main(request_q, event_q) -> None:
         if executor is None:
             return
         processes = list(getattr(executor, "_processes", {}).values())
-        executor.shutdown(wait=wait, cancel_futures=True)
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         for proc in processes:
             try:
                 if proc.is_alive():
                     proc.terminate()
-                proc.join(timeout=1.0)
+                proc.join(timeout=2.0 if wait else 0.2)
+                if proc.is_alive() and hasattr(proc, "kill"):
+                    proc.kill()
+                    proc.join(timeout=1.0)
             except Exception:
                 continue
 

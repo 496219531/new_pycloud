@@ -275,6 +275,95 @@ def test_internal_executor_runtime_slots_queue_and_reclaim(tmp_path):
         state.close()
 
 
+def test_internal_executor_timeout_recycles_runtime_slot_and_allows_retry(tmp_path):
+    state = NodeControlState(
+        node_id="node-test-runtime-timeout-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        runtime_slot_capacity=1,
+        heartbeat_timeout_sec=1,
+        max_retries=2,
+        monitor_interval_sec=60,
+        artifact_dir=str(tmp_path / "code_cache_runtime_timeout"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        blob = (
+            b"import time\n"
+            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
+            b"    sleep_ms = int(sleep_ms)\n"
+            b"    if sleep_ms > 0:\n"
+            b"        time.sleep(sleep_ms / 1000.0)\n"
+            b"    value = int(value)\n"
+            b"    return {'value': value, 'square': value * value}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _ = state.put_code(
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="runtime_timeout_demo",
+            entry_callable="run",
+            package_format="py",
+            chunks=[blob],
+        )
+        accepted, rejected, _ = state.submit_tasks(
+            pb2.SubmitTasksRequest(
+                client_id="client-timeout",
+                code_version=artifact.code_version,
+                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+                tasks=[
+                    pb2.TaskSubmitItem(
+                        task_id="timeout-task-1",
+                        payload={"value": 6, "sleep_ms": 5000},
+                        priority=1,
+                        runtime_key="rt-timeout",
+                    ),
+                ],
+            )
+        )
+        assert len(accepted) == 1
+        assert not rejected
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with state._lock:  # noqa: SLF001
+                task = state._tasks["timeout-task-1"]  # noqa: SLF001
+                slot = state._runtime_slots["rt-timeout"]  # noqa: SLF001
+                if task.status == pb2.TASK_STATUS_RUNNING and slot.current_task_id == "timeout-task-1":
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("task never entered running state")
+
+        with state._lock:  # noqa: SLF001
+            task = state._tasks["timeout-task-1"]  # noqa: SLF001
+            task.payload["sleep_ms"] = 0
+            task.last_heartbeat_at = utc_now() - timedelta(seconds=5)
+
+        state._handle_timeouts()  # noqa: SLF001
+
+        deadline = time.time() + 10
+        results = []
+        cursor = ""
+        while time.time() < deadline and not results:
+            batch, cursor = state.pull_results(
+                pb2.PullResultsRequest(client_id="client-timeout", limit=10, wait_ms=200, cursor=cursor)
+            )
+            results.extend(batch)
+
+        assert len(results) == 1
+        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
+        assert results[0].attempt == 2
+        assert dict(results[0].result) == {"value": 6, "square": 36}
+        with state._lock:  # noqa: SLF001
+            slot = state._runtime_slots["rt-timeout"]  # noqa: SLF001
+            assert slot.current_task_id == ""
+    finally:
+        state.close()
+
+
 def test_cancel_job_marks_matching_tasks(tmp_path):
     state = NodeControlState(
         node_id="node-test-cancel-job",

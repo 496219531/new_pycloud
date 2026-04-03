@@ -2557,6 +2557,23 @@ class NodeControlState:
         result = task.as_result()
         self._result_hook.push(task.client_id, result)
 
+    def _reset_runtime_slot_locked(self, runtime_key: str, *, now: datetime, drop_queued: bool = False) -> None:
+        slot = self._runtime_slots.get(runtime_key)
+        if slot is None:
+            return
+        if self._executor_host is not None and slot.executor_ready:
+            try:
+                self._executor_host.stop_runtime_slot(runtime_key=runtime_key)
+            except Exception:
+                pass
+        slot.executor = None
+        slot.executor_ready = False
+        slot.current_task_id = ""
+        slot.current_attempt = 0
+        slot.last_used_at = now
+        if drop_queued:
+            slot.task_ids.clear()
+
     def _handle_infra_failure_locked(self, task: TaskState, *, reason: str, now: datetime) -> None:
         if task.attempt < self.max_retries:
             task.attempt += 1
@@ -2800,6 +2817,8 @@ class NodeControlState:
                 diff = (now - task.last_heartbeat_at).total_seconds()
                 if diff <= self.heartbeat_timeout_sec:
                     continue
+                if self.enable_internal_executor:
+                    self._reset_runtime_slot_locked(task.runtime_key, now=now)
                 self._handle_infra_failure_locked(task, reason="heartbeat timeout", now=now)
                 mutated = True
 
