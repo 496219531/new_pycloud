@@ -10,6 +10,7 @@ from typing import Any
 
 _CLIENT_EXPORTS = {
     "ObjectRef",
+    "ResultRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",
@@ -55,6 +56,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "ObjectRef",
+    "ResultRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",

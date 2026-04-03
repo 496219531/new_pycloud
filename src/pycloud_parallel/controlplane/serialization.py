@@ -13,10 +13,18 @@ from pycloud_parallel.controlplane.object_ref import (
     object_ref_from_payload,
     object_ref_to_payload,
 )
+from pycloud_parallel.controlplane.result_ref import (
+    ResultRef,
+    is_result_ref_payload,
+    result_ref_from_payload,
+    result_ref_to_payload,
+)
 
 INLINE_PAYLOAD_SOFT_LIMIT_BYTES = 256 * 1024
 INLINE_PAYLOAD_HARD_LIMIT_BYTES = 1024 * 1024
 INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = 4 * 1024 * 1024
+INLINE_RESULT_SOFT_LIMIT_BYTES = 256 * 1024
+INLINE_RESULT_HARD_LIMIT_BYTES = 1024 * 1024
 
 
 def _format_payload_bytes(size_bytes: int) -> str:
@@ -64,6 +72,42 @@ def validate_inline_request_size(size_bytes: int, *, limit_bytes: int = INLINE_P
         limit_bytes=limit_bytes,
         context=context,
     )
+
+
+def inline_result_limit_error(size_bytes: int, *, limit_bytes: int, context: str) -> ValueError:
+    return ValueError(
+        f"{context} serialized to {_format_payload_bytes(size_bytes)}, "
+        f"which exceeds the inline result limit {_format_payload_bytes(limit_bytes)}. "
+        "For large results, write to a node-local file or stream chunks and return a lightweight handle instead."
+    )
+
+
+def validate_inline_result_size(size_bytes: int, *, limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES, context: str = "result") -> int:
+    normalized = max(0, int(size_bytes or 0))
+    if normalized > max(1, int(limit_bytes)):
+        raise inline_result_limit_error(normalized, limit_bytes=max(1, int(limit_bytes)), context=context)
+    return normalized
+
+
+def validate_inline_result_struct(data: struct_pb2.Struct, *, limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES, context: str = "result") -> int:
+    return validate_inline_result_size(
+        int(data.ByteSize()),
+        limit_bytes=limit_bytes,
+        context=context,
+    )
+
+
+def serialize_inline_result(
+    data: Optional[dict],
+    *,
+    context: str = "result",
+    limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES,
+) -> tuple[dict, struct_pb2.Struct, int]:
+    serialized = serialize_arrow_compatible(data or {})
+    out = struct_pb2.Struct()
+    out.update(serialized)
+    size_bytes = validate_inline_result_struct(out, limit_bytes=limit_bytes, context=context)
+    return serialized, out, size_bytes
 
 
 def validate_inline_payload_structs(
@@ -121,6 +165,8 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
         return obj
     if isinstance(obj, ObjectRef):
         return object_ref_to_payload(obj)
+    if isinstance(obj, ResultRef):
+        return result_ref_to_payload(obj)
 
     try:
         import numpy as np
@@ -219,6 +265,8 @@ def convert_dict_to_arrow(data: Any) -> Any:
     if isinstance(data, dict):
         if is_object_ref_payload(data):
             return object_ref_from_payload(data)
+        if is_result_ref_payload(data):
+            return result_ref_from_payload(data)
         obj_type = data.get("__type__")
         if obj_type == "DataFrame":
             try:

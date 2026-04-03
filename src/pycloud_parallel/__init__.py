@@ -10,6 +10,7 @@ from .local_runtime.types import ForeachResult, TaskError
 
 _CONTROLPLANE_EXPORTS = {
     "ObjectRef",
+    "ResultRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",
@@ -60,6 +61,7 @@ __all__ = [
     "parallel_for",
     # ControlPlane Module Clients（新命名）
     "ObjectRef",
+    "ResultRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",

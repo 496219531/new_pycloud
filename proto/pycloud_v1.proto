@@ -178,6 +178,7 @@ message ListServiceRoutesResponse {
 service NodeControlService {
   rpc UploadCode(stream UploadCodeRequest) returns (UploadCodeResponse);
   rpc UploadObject(stream UploadObjectRequest) returns (UploadObjectResponse);
+  rpc DownloadObject(DownloadObjectRequest) returns (stream DownloadObjectChunk);
   rpc TaskStream(stream TaskStreamRequest) returns (stream TaskStreamResponse);
   rpc SubmitTasks(SubmitTasksRequest) returns (SubmitTasksResponse);
   rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
@@ -245,6 +246,17 @@ message UploadObjectResponse {
   int64 size_bytes = 5;
   google.protobuf.Timestamp created_at = 6;
   Error error = 7;
+}
+
+message DownloadObjectRequest {
+  string object_id = 1;
+}
+
+message DownloadObjectChunk {
+  string object_id = 1;
+  string format = 2;
+  int64 size_bytes = 3;
+  bytes chunk = 4;
 }
 
 message TaskSubmitItem {

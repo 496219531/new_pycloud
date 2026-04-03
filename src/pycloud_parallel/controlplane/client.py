@@ -40,10 +40,12 @@ from pycloud_parallel.controlplane.object_ref import (
     normalize_object_format,
     object_id_from_sha256_hex,
 )
+from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import (
     dict_to_struct,
     serialize_arrow_compatible,
     serialize_inline_payload,
+    struct_to_dict,
     validate_inline_payload_structs,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -328,6 +330,25 @@ def _validate_task_submit_items(tasks: Sequence[pb2.TaskSubmitItem], *, request_
         item_context="task payload",
         request_context=request_context,
     )
+
+
+def _materialize_downloaded_result(path: Path, *, result_ref: ResultRef):
+    materialized = normalize_materialize_as(result_ref.materialize_as, default="path")
+    if materialized == "path":
+        return path
+    if materialized == "bytes":
+        return path.read_bytes()
+    if materialized == "json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    if materialized == "ndarray":
+        import numpy as np
+
+        return np.load(path, allow_pickle=False)
+    if materialized == "dataframe":
+        import pandas as pd
+
+        return pd.read_parquet(path)
+    raise ValueError(f"unsupported result materialize_as: {result_ref.materialize_as!r}")
 
 
 def _get_local_ip() -> str:
@@ -2007,6 +2028,51 @@ class NodeControlClient:
             raise RuntimeError(_err_msg(resp.error, "pull results failed"))
         return resp
 
+    def download_object_to_file(
+        self,
+        *,
+        object_id: str,
+        target_path: str,
+    ) -> Path:
+        path = Path(target_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as fh:
+            stream = self.stub.DownloadObject(
+                pb2.DownloadObjectRequest(object_id=str(object_id or "").strip()),
+                timeout=self.timeout_sec,
+            )
+            for chunk in stream:
+                if chunk.chunk:
+                    fh.write(chunk.chunk)
+        return path
+
+    def download_object_bytes(self, *, object_id: str) -> bytes:
+        out = bytearray()
+        stream = self.stub.DownloadObject(
+            pb2.DownloadObjectRequest(object_id=str(object_id or "").strip()),
+            timeout=self.timeout_sec,
+        )
+        for chunk in stream:
+            if chunk.chunk:
+                out.extend(chunk.chunk)
+        return bytes(out)
+
+    def download_result_to_file(self, result_ref: ResultRef, *, target_path: str) -> Path:
+        return self.download_object_to_file(object_id=result_ref.object_id, target_path=target_path)
+
+    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
+        data = struct_to_dict(task_result.result)
+        if not isinstance(data, ResultRef):
+            return data
+        if target_path:
+            return self.download_result_to_file(data, target_path=target_path)
+        suffix = Path(f"result{('.' + data.format) if data.format else ''}")
+        tmp = tempfile.NamedTemporaryFile(prefix="pycloud-result-", suffix=suffix.suffix, delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        self.download_result_to_file(data, target_path=str(tmp_path))
+        return _materialize_downloaded_result(tmp_path, result_ref=data)
+
     def cancel_tasks(
         self,
         *,
@@ -3482,6 +3548,26 @@ class TaskBatchClient:
 
     def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
         return self.put_data(value, format="json", chunk_size=chunk_size)
+
+    def download_result_to_file(self, task_result: pb2.TaskResult, *, target_path: str) -> Path:
+        data = struct_to_dict(task_result.result)
+        if not isinstance(data, ResultRef):
+            raise ValueError("task result is inline data; no download needed")
+        client = self._clients.get(data.node_id)
+        if client is None:
+            raise RuntimeError(f"no node client available for result node_id={data.node_id!r}")
+        return client.download_result_to_file(data, target_path=target_path)
+
+    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
+        data = struct_to_dict(task_result.result)
+        if not isinstance(data, ResultRef):
+            return data
+        client = self._clients.get(data.node_id)
+        if client is None:
+            raise RuntimeError(f"no node client available for result node_id={data.node_id!r}")
+        if target_path:
+            return client.download_result_to_file(data, target_path=target_path)
+        return client.fetch_result_data(task_result)
 
     @property
     def node_ids(self) -> Sequence[str]:

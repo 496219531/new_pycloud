@@ -12,9 +12,10 @@ import pytest
 
 from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient, TaskBatchClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
+from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMIT_BYTES, dict_to_struct
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
+from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState, struct_to_dict
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -1280,3 +1281,133 @@ def test_service_http_gateway_rejects_oversized_inline_payload_server_side(tmp_p
     finally:
         server.stop(grace=0)
         state.close()
+
+
+def test_task_batch_dataframe_result_returns_result_ref_and_fetches(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-result-ref-df-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_result_ref_df"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-result-ref-df-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"import pandas as pd\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
+            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}, {'x': value + 2}])\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="result-ref-df-client",
+            job_id="job-result-ref-df",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_result_ref_df",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            submit = batch.submit_payloads([{"value": 7}])
+            assert len(submit.accepted) == 1
+
+            pulled = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled.results) == 1
+            assert pulled.results[0].status == pb2.TASK_STATUS_SUCCEEDED
+            result_value = struct_to_dict(pulled.results[0].result)
+            assert isinstance(result_value, ResultRef)
+            assert result_value.node_id == "node-client-result-ref-df-01"
+            frame = batch.fetch_result_data(pulled.results[0])
+            assert list(frame["x"]) == [7, 8, 9]
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_batch_large_inline_result_fails_with_file_guidance(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-result-inline-fail-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_result_inline_fail"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-result-inline-fail-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"def run(**_kwargs):\n"
+            b"    return {'blob': 'x' * (1024 * 1024 + 1024)}\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="result-inline-fail-client",
+            job_id="job-result-inline-fail",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_result_inline_fail",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            submit = batch.submit_payloads([{}])
+            assert len(submit.accepted) == 1
+
+            pulled = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled.results) == 1
+            assert pulled.results[0].status == pb2.TASK_STATUS_FAILED_USER
+            assert "node-local file" in pulled.results[0].error.message
+            assert "stream chunks" in pulled.results[0].error.message
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()

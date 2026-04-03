@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import json
 import multiprocessing as mp
 import os
 import queue
@@ -35,12 +36,14 @@ from pycloud_parallel.controlplane.object_ref import (
     ObjectRef,
     is_object_ref_payload,
     normalize_materialize_as,
+    object_format_suffix,
     normalize_object_format,
     normalize_object_id,
     object_id_from_sha256_hex,
     object_ref_from_payload,
     object_storage_path,
 )
+from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.runtime_spec import (
     matches_python_runtime,
     normalize_python_runtime_spec,
@@ -51,12 +54,137 @@ from pycloud_parallel.controlplane.serialization import (
     dict_to_struct,
     is_arrow_compatible,
     serialize_arrow_compatible,
+    serialize_inline_result,
     struct_to_dict,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
-def _normalize_user_return(ret: Any) -> Tuple[str, Optional[dict], str, str]:
+class LargeResultError(ValueError):
+    """Raised when a task result is too large for safe inline return."""
+
+
+@dataclass(frozen=True)
+class StoredResultArtifact:
+    object_id: str
+    format: str
+    size_bytes: int
+    materialize_as: str
+
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(max(1, int(chunk_size)))
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_bytes: int, materialize_as: str) -> StoredResultArtifact:
+    root = Path(str(object_dir or "")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    digest = _sha256_file(source_path)
+    object_id = object_id_from_sha256_hex(digest)
+    normalized_format = normalize_object_format(fmt, source_name=source_path.name, default="bin")
+    final_path = object_storage_path(root, object_id=object_id, fmt=normalized_format)
+    if not final_path.exists():
+        os.replace(str(source_path), str(final_path))
+    else:
+        source_path.unlink(missing_ok=True)
+    return StoredResultArtifact(
+        object_id=object_id,
+        format=normalized_format,
+        size_bytes=max(0, int(size_bytes or final_path.stat().st_size)),
+        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+    )
+
+
+def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
+    if not path.exists() or not path.is_file():
+        raise LargeResultError(f"returned path is not a readable file: {path}")
+    suffix = object_format_suffix(normalize_object_format("", source_name=path.name, default="bin")) or ".bin"
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=suffix, dir=str(Path(object_dir).resolve()))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    shutil.copyfile(str(path), str(tmp_path))
+    return _commit_result_file(
+        tmp_path,
+        object_dir=object_dir,
+        fmt=normalize_object_format("", source_name=path.name, default="bin"),
+        size_bytes=path.stat().st_size,
+        materialize_as="path",
+    )
+
+
+def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtifact:
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".parquet", dir=str(Path(object_dir).resolve()))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        frame.to_parquet(tmp_path)
+        return _commit_result_file(
+            tmp_path,
+            object_dir=object_dir,
+            fmt="parquet",
+            size_bytes=tmp_path.stat().st_size,
+            materialize_as="dataframe",
+        )
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifact:
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".npy", dir=str(Path(object_dir).resolve()))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        import numpy as np
+
+        with tmp_path.open("wb") as fh:
+            np.save(fh, array, allow_pickle=False)
+        return _commit_result_file(
+            tmp_path,
+            object_dir=object_dir,
+            fmt="npy",
+            size_bytes=tmp_path.stat().st_size,
+            materialize_as="ndarray",
+        )
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
+    if isinstance(ret, Path):
+        return _store_result_path(ret, object_dir=object_dir)
+
+    try:
+        import pandas as pd
+
+        if isinstance(ret, pd.DataFrame):
+            return _store_result_dataframe(ret, object_dir=object_dir)
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+
+        if isinstance(ret, np.ndarray):
+            return _store_result_ndarray(ret, object_dir=object_dir)
+    except ImportError:
+        pass
+
+    serialized = serialize_arrow_compatible(ret)
+    wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
+    serialize_inline_result(wrapped, context="task result")
+    return wrapped
+
+
+def _normalize_user_return(ret: Any, *, object_dir: str) -> Tuple[str, Optional[Any], str, str]:
     def _normalize_status(v: Any) -> str:
         s = str(v or "SUCCEEDED").strip().upper()
         if s in ("SUCCESS", "OK"):
@@ -67,8 +195,7 @@ def _normalize_user_return(ret: Any) -> Tuple[str, Optional[dict], str, str]:
 
     if isinstance(ret, tuple) and len(ret) == 4:
         status_text, result, err_type, err_message = ret
-        # 序列化返回值中的 Arrow 对象
-        result = _serialize_result_for_json(result)
+        result = _normalize_result_value(result, object_dir=object_dir) if result is not None else None
         return _normalize_status(status_text), result, str(err_type), str(err_message)
 
     if isinstance(ret, dict) and "status" in ret:
@@ -76,17 +203,10 @@ def _normalize_user_return(ret: Any) -> Tuple[str, Optional[dict], str, str]:
         result = ret.get("result")
         err_type = str(ret.get("error_type", ""))
         err_message = str(ret.get("error_message", ""))
-        # 序列化返回值中的 Arrow 对象
-        result = _serialize_result_for_json(result)
+        result = _normalize_result_value(result, object_dir=object_dir) if result is not None else None
         return status_text, result, err_type, err_message
 
-    if isinstance(ret, dict):
-        # 序列化返回值中的 Arrow 对象
-        ret = _serialize_result_for_json(ret)
-        return "SUCCEEDED", ret, "", ""
-    # 序列化返回值中的 Arrow 对象
-    ret = _serialize_result_for_json(ret)
-    return "SUCCEEDED", {"value": ret}, "", ""
+    return "SUCCEEDED", _normalize_result_value(ret, object_dir=object_dir), "", ""
 
 
 def _serialize_result_for_json(obj: Any) -> Any:
@@ -805,7 +925,9 @@ def _execute_payload_in_subprocess(
             raise RuntimeError(f"method `{method}` not exported")
         resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
         ret = _invoke_user_callable(fn, resolved_payload)
-        return _normalize_user_return(ret)
+        return _normalize_user_return(ret, object_dir=object_dir)
+    except LargeResultError as exc:
+        return ("FAILED_USER", None, exc.__class__.__name__, str(exc))
     except ObjectResolutionError as exc:
         return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc))
     except Exception as exc:
@@ -1252,7 +1374,7 @@ class TaskState:
     finished_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
     cancel_requested: bool = False
-    result: Optional[dict] = None
+    result: Optional[Any] = None
     error_type: str = ""
     error_message: str = ""
 
@@ -1431,6 +1553,34 @@ class NodeControlState:
     @property
     def object_dir(self) -> Path:
         return self._object_dir
+
+    def get_object_artifact(self, object_id: str) -> ObjectArtifact:
+        normalized = normalize_object_id(object_id)
+        with self._lock:
+            artifact = self._objects.get(normalized)
+            if artifact is not None and Path(artifact.path).exists():
+                return artifact
+        candidate = object_storage_path(self._object_dir, object_id=normalized, fmt="bin")
+        digest = normalized.replace("sha256:", "", 1)
+        fallback = sorted(self._object_dir.glob(f"{digest}*"))
+        if candidate.exists():
+            return ObjectArtifact(
+                object_id=normalized,
+                path=str(candidate),
+                format=normalize_object_format(candidate.suffix, source_name=candidate.name, default="bin"),
+                size_bytes=candidate.stat().st_size,
+                created_at=utc_now(),
+            )
+        if fallback:
+            path = fallback[0]
+            return ObjectArtifact(
+                object_id=normalized,
+                path=str(path),
+                format=normalize_object_format("", source_name=path.name, default="bin"),
+                size_bytes=path.stat().st_size,
+                created_at=utc_now(),
+            )
+        raise KeyError("object not found")
 
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
         digest = str(code_version or "").replace("sha256:", "").strip().lower()
@@ -2581,7 +2731,16 @@ class NodeControlState:
                     self._publish_result_locked(task)
                 else:
                     task.status = pb2.TASK_STATUS_SUCCEEDED
-                    task.result = result or {}
+                    if isinstance(result, StoredResultArtifact):
+                        task.result = ResultRef(
+                            object_id=result.object_id,
+                            node_id=self.node_id,
+                            format=result.format,
+                            size_bytes=result.size_bytes,
+                            materialize_as=result.materialize_as,
+                        )
+                    else:
+                        task.result = result or {}
                     task.error_type = ""
                     task.error_message = ""
                     self._publish_result_locked(task)

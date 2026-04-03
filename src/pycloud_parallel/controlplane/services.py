@@ -318,6 +318,40 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             created_at=dt_to_ts(artifact.created_at),
         )
 
+    def DownloadObject(
+        self,
+        request: pb2.DownloadObjectRequest,
+        context: grpc.ServicerContext,
+    ) -> Iterable[pb2.DownloadObjectChunk]:
+        object_id = str(request.object_id or "").strip()
+        if not object_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("object_id is required")
+            return
+        try:
+            artifact = self._state.get_object_artifact(object_id)
+        except KeyError:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details("object not found")
+            return
+
+        try:
+            with open(artifact.path, "rb") as fp:
+                while True:
+                    part = fp.read(256 * 1024)
+                    if not part:
+                        break
+                    yield pb2.DownloadObjectChunk(
+                        object_id=artifact.object_id,
+                        format=artifact.format,
+                        size_bytes=artifact.size_bytes,
+                        chunk=part,
+                    )
+        except FileNotFoundError:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details("object file missing")
+            return
+
     def SubmitTasks(self, request: pb2.SubmitTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
         logger.info(
             "[NodeControl] SubmitTasks peer=%s client_id=%s job_id=%s code_version=%s tasks=%d",
