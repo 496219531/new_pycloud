@@ -31,8 +31,8 @@ def process_data(x):
 group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="my_service.py",
     runtime="py3.11",
+    entry_module="my_service",
 )
 ```
 
@@ -83,8 +83,8 @@ def square(x):
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="my_task.py",
     runtime="py3.11",
+    entry_module="my_task",
 )
 ```
 

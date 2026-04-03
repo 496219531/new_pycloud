@@ -43,7 +43,6 @@ def main():
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,
-        filename="compat_demo.py",
         runtime="py3",
         entry_module="compat_demo",
         export_mode="decorator",

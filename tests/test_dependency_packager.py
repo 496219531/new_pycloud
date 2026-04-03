@@ -116,8 +116,8 @@ def test_auto_deploy_function_uses_task_submitter_from_infocenter(tmp_path, monk
         assert captured["entry_module"] == "demo_mod"
         assert captured["entry_callable"] == "work"
         assert captured["package_format"] == "tar.gz"
-        assert captured["filename"].endswith(".tar.gz")
         assert isinstance(captured["blob"], bytes) and captured["blob"]
+        assert "filename" not in captured
     finally:
         sys.path.remove(str(tmp_path))
         sys.modules.pop("demo_mod", None)
@@ -148,3 +148,4 @@ def test_auto_deploy_function_infers_main_entry_module(monkeypatch):
     assert result == "ok"
     assert captured["entry_module"] == "test_dependency_packager"
     assert captured["entry_callable"] == "local_func"
+    assert "filename" not in captured

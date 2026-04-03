@@ -30,7 +30,6 @@ $ tar -czf my_service.tar.gz my_service.py utils/__init__.py utils/helpers.py
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     artifact_path="./my_service.tar.gz",  # ← 手动创建的 tar.gz
-    filename="my_service.tar.gz",
     runtime="py3.11",
     entry_module="my_service",
     entry_callable="process_data",
@@ -44,7 +43,7 @@ submitter = TaskSubmitter.from_infocenter(
 )
 
 # 问题：
-# ❌ 参数太多（14 个参数）
+# ❌ 参数太多（13 个参数）
 # ❌ 需要手动创建 tar.gz
 # ❌ 需要手动包含依赖文件
 # ❌ 容易出错
@@ -66,7 +65,7 @@ submitter = TaskSubmitter.from_infocenter(
     tags=["compute"],
 )
 
-# 参数：14 → 6 个（减少了 8 个）
+# 参数：13 → 6 个（减少了 7 个）
 
 # 问题：
 # ❌ 还是需要手动指定 entry_module 和 entry_callable
@@ -144,12 +143,12 @@ result2 = submitter.another_function(...)
 
 | 方式 | 必需参数 | 总参数 | 减少 |
 |------|---------|--------|------|
-| 第一代（手动 tar.gz） | 8 | 14 | - |
-| 第二代（文件路径） | 6 | 6 | ↓ 57% |
-| 第三代（函数对象） | 3 | 3 | ↓ 79% |
-| 第四代（模块对象） | 3 | 3 | ↓ 79% |
+| 第一代（手动 tar.gz） | 8 | 13 | - |
+| 第二代（文件路径） | 6 | 6 | ↓ 54% |
+| 第三代（函数对象） | 3 | 3 | ↓ 77% |
+| 第四代（模块对象） | 3 | 3 | ↓ 77% |
 
-**从 14 个参数减少到 3 个参数，减少了 79%！**
+**从 13 个参数减少到 3 个参数，减少了 77%！**
 
 ---
 
@@ -161,7 +160,6 @@ result2 = submitter.another_function(...)
 # 之前需要手动指定：
 submitter = TaskSubmitter.from_infocenter(
     artifact_path="./my_service.py",
-    filename="my_service.py",              # ← 自动推断
     entry_module="my_service",            # ← 自动推断
     entry_callable="process_data",        # ← 自动推断
     package_format="tar.gz",              # ← 自动推断
@@ -189,7 +187,7 @@ submitter = TaskSubmitter.from_infocenter(
 # 从函数对象自动推断：
 func.__module__     # → entry_module
 func.__name__       # → entry_callable
-func.__code__.co_filename  # → filename
+"内部自动生成 artifact 名"  # → 文件名
 "tar.gz"            # → package_format（固定）
 "single"            # → export_mode（固定）
 ```
@@ -256,7 +254,6 @@ with PyCloud(infocenter="...", runtime="py3.11"):
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="...",
     artifact_path="...",      # 什么是 artifact？
-    filename="...",            # 为什么要指定两次？
     entry_module="...",        # 这是什么？
     entry_callable="...",      # 这又是什么？
     package_format="...",      # tar.gz vs zip vs py？
@@ -321,7 +318,7 @@ submitter = TaskSubmitter.from_infocenter(
 
 ```python
 # 约定：
-# - filename 从 func.__code__.co_filename 推断
+# - artifact 文件名由系统内部自动生成
 # - entry_module 从 func.__module__ 推断
 # - entry_callable 从 func.__name__ 推断
 # - package_format 默认为 "tar.gz"
@@ -334,7 +331,7 @@ submitter = TaskSubmitter.from_infocenter(
 ### 渐进式简化
 
 ```
-第一代：手动一切（14 个参数）
+第一代：手动一切（13 个参数）
    ↓
 第二代：简化文件路径（6 个参数）
    ↓
@@ -371,7 +368,6 @@ with tarfile.open("my_service.tar.gz", "w:gz") as tar:
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     artifact_path="./my_service.tar.gz",
-    filename="my_service.tar.gz",
     runtime="py3.11",
     entry_module="my_service",
     entry_callable="process_data",

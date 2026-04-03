@@ -128,7 +128,6 @@ DeployedService.deploy_from_infocenter(..., runtime="py3.11")
 with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task_demo.py",
     runtime=">=py3.11",
     entry_module="task_demo",
 ) as task:

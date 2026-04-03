@@ -73,7 +73,6 @@ def _create_exported_service(target: str, service_name: str) -> str:
         session = client.create_service_from_bytes(
             owner_client_id=f"owner-{service_name}",
             service_name=service_name,
-            filename=f"{service_name}.py",
             blob=blob,
             runtime="py3",
             entry_module=service_name,

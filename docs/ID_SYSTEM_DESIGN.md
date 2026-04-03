@@ -19,26 +19,23 @@
 - ✅ 时间戳秒级（跨时间唯一）
 - ✅ 模块名语义（易于识别）
 
-### Task Batch 模式（需要改进）
+### Task Batch 模式（已优化）
 
 **参数：**
-- `client_id`: 必填（有简单默认值）
-  - 当前默认值：`"task-client-{timestamp_sec}"`
-  - 示例：`"task-client-1746445200"`
-  - **问题**：秒级精度，同一秒内多次调用会冲突
-- `job_id`: 必填（有简单默认值）
-  - 当前默认值：`"job-{timestamp_sec}"`
-  - 示例：`"job-1746445200"`
-  - **问题**：秒级精度，同一秒内多次调用会冲突
+- `client_id`: 可选（默认自动生成）
+  - 默认格式：`"client-{IP}-{timestamp_ms}-{pid}-{seq}-{entropy}"`
+  - 示例：`"client-192.168.1.100-1746445200123-12345-0001-a1b2c3"`
+- `job_id`: 可选（默认自动生成）
+  - 默认格式：`"job-{IP}-{timestamp_ms}-{pid}-{seq}-{entropy}"`
+  - 示例：`"job-192.168.1.100-1746445200123-12345-0001-a1b2c3"`
 - `task_id`: 客户端生成（submit_payloads）
   - 格式：`"{job_id}-task-{seq:04d}"`
   - 示例：`"job-1746445200-task-0001"`
-  - **问题**：依赖 job_id，如果 job_id 冲突，task_id 也冲突
 
-**唯一性问题：**
-- ❌ 缺少 IP 地址维度（多机器部署可能冲突）
-- ❌ 时间戳秒级精度不够（同一秒内多次调用会生成相同 ID）
-- ❌ 用户需要手动保证 client_id 和 job_id 唯一性
+**当前保证：**
+- ✅ 包含 IP 地址维度（跨机器唯一）
+- ✅ 毫秒级时间戳 + PID + 序列号 + 随机熵
+- ✅ 默认自动生成 `client_id` 和 `job_id`，用户通常不需要手动保证唯一性
 
 ## 改进目标
 
@@ -182,7 +179,7 @@ group = ModuleLikeServiceGroup.deploy_from_infocenter(
 with TaskBatchClient.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task.py",
+    entry_module="task",
 ) as batch:
     # 自动生成：
     # - client_id: "client-192.168.1.100-1746445200123-0001"
@@ -211,29 +208,21 @@ with TaskBatchClient.from_infocenter(
     client_id="etl-worker-01",
     job_id="data-load-20260330",
     blob=blob,
-    filename="task.py",
+    entry_module="task",
 ) as batch:
     result = batch.submit_payloads([{"x": 1}, {"x": 2}])
 ```
 
-## 向后兼容性
+## 公开接口变化
 
-✅ **完全向后兼容**：
-- 所有参数仍可手动指定
-- 默认值生成逻辑仅在参数���空时触发
-- 现有代码无需修改
+高层公开入口已经移除了 `filename`：
 
-```python
-# 旧代码仍然正常工作
-with TaskBatchClient.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    client_id="my-client",    # 手动指定，优先级高
-    job_id="my-job",          # 手动指定，优先级高
-    blob=blob,
-    filename="task.py",
-) as batch:
-    ...
-```
+1. `TaskBatchClient.from_infocenter(...)`
+2. `TaskSubmitter.from_infocenter(...)`
+3. `DeployedService.deploy_from_infocenter(...)`
+
+如果是 `blob` 直传场景，需要稳定模块名时请显式传 `entry_module`。
+低层上传接口现在也统一改为依赖 `package_format + entry_module`，不再显式传 `filename`。
 
 ## 测试覆盖
 
@@ -276,11 +265,11 @@ def test_task_id_generation():
 
 | 改进点 | Service 模式 | Task 模式 |
 |--------|-------------|----------|
-| client_id 自动生成 | ✅ 已实现 | 🔧 需要改进 |
-| service_name/job_id 自动生成 | ✅ 已实现 | 🔧 需要改进 |
+| client_id 自动生成 | ✅ 已实现 | ✅ 已实现 |
+| service_name/job_id 自动生成 | ✅ 已实现 | ✅ 已实现 |
 | task_id 自动生成 | N/A | ✅ 已实现 |
-| IP 地址维度 | ✅ 已实现 | 🔧 需要添加 |
-| 时间戳精度 | 秒级（够用） | 🔧 毫秒级（更安全） |
-| 序列号维度 | ❌ 缺少 | 🔧 需要添加 |
+| IP 地址维度 | ✅ 已实现 | ✅ 已实现 |
+| 时间戳精度 | 秒级（够用） | ✅ 毫秒级 |
+| 序列号维度 | ❌ 缺少 | ✅ 已实现 |
 
-改进后，Task 模式将拥有与 Service 模式一致的智能默认值，用户无需关心 ID 唯一性。
+现在，Task 模式已经具备与 Service 模式一致的智能默认值，用户通常无需关心 ID 唯一性。

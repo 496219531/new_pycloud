@@ -52,7 +52,6 @@ def main():
         owner_client_id=f"module-demo-{int(time.time())}",
         service_name=f"compute-service-{int(time.time())}",
         blob=blob,
-        filename="compute.py",
         runtime="py3",
         entry_module="compute",
         entry_callable="square",

@@ -92,7 +92,7 @@ def _artifact_module_name(artifact_path: str) -> str:
     return f"_pycloud_user_{hashlib.sha1(artifact_path.encode('utf-8')).hexdigest()}"
 
 
-def _normalize_package_format(package_format: str, filename: str) -> str:
+def _normalize_package_format(package_format: str, artifact_path: str = "") -> str:
     raw = str(package_format or "").strip().lower().replace("_", "").replace(".", "")
     if raw in ("py", "python"):
         return "py"
@@ -103,7 +103,7 @@ def _normalize_package_format(package_format: str, filename: str) -> str:
     if raw == "whl":
         return "whl"
 
-    lower_name = str(filename or "").strip().lower()
+    lower_name = str(artifact_path or "").strip().lower()
     if lower_name.endswith(".tar.gz") or lower_name.endswith(".tgz"):
         return "tar.gz"
     if lower_name.endswith(".zip"):
@@ -113,6 +113,19 @@ def _normalize_package_format(package_format: str, filename: str) -> str:
     if lower_name.endswith(".py"):
         return "py"
     return "bin"
+
+
+def _package_suffix(package_format: str) -> str:
+    normalized = _normalize_package_format(package_format)
+    if normalized == "tar.gz":
+        return ".tar.gz"
+    if normalized == "zip":
+        return ".zip"
+    if normalized == "whl":
+        return ".whl"
+    if normalized == "py":
+        return ".py"
+    return ".bin"
 
 
 def _normalize_export_spec(
@@ -1457,7 +1470,6 @@ class NodeControlState:
         self,
         *,
         sha256: str,
-        filename: str,
         runtime: str,
         entry_module: str,
         entry_callable: str,
@@ -1490,7 +1502,7 @@ class NodeControlState:
                     )
                 return existing, True
 
-        normalized_format = _normalize_package_format(package_format, filename)
+        normalized_format = _normalize_package_format(package_format, uploaded_path)
         normalized_runtime = _validate_python_runtime_or_raise(
             node_python_version=self.python_version,
             runtime=runtime,
@@ -1498,7 +1510,7 @@ class NodeControlState:
         normalized_callable = str(entry_callable or "").strip() or "run"
         normalized_module = str(entry_module or "").strip()
         if not normalized_module and normalized_format == "py":
-            normalized_module = Path(filename).stem
+            normalized_module = "artifact"
         if normalized_format in ("tar.gz", "zip", "whl") and not normalized_module:
             raise ValueError(f"entry_module is required for {normalized_format} artifact")
         if normalized_format == "bin":
@@ -1569,7 +1581,6 @@ class NodeControlState:
         self,
         *,
         sha256: str,
-        filename: str,
         runtime: str,
         entry_module: str,
         entry_callable: str,
@@ -1583,7 +1594,7 @@ class NodeControlState:
     ) -> Tuple[CodeArtifact, bool]:
         h = hashlib.sha256()
         size = 0
-        suffix = ".tar.gz" if str(filename or "").lower().endswith(".tar.gz") else (Path(filename).suffix or ".bin")
+        suffix = _package_suffix(package_format)
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-upload-", suffix=suffix, dir=str(self._artifact_dir))
         os.close(fd)
         tmp_path = Path(tmp_name)
@@ -1597,7 +1608,6 @@ class NodeControlState:
                     size += len(part)
             return self.put_code_from_uploaded_file(
                 sha256=sha256,
-                filename=filename,
                 runtime=runtime,
                 entry_module=entry_module,
                 entry_callable=entry_callable,
@@ -1624,7 +1634,6 @@ class NodeControlState:
         *,
         owner_client_id: str,
         service_name: str,
-        filename: str,
         sha256: str,
         runtime: str,
         entry_module: str,
@@ -1645,7 +1654,6 @@ class NodeControlState:
 
         artifact, _cached = self.put_code(
             sha256=sha256,
-            filename=filename or "service_artifact.py",
             runtime=runtime,
             entry_module=entry_module,
             entry_callable=entry_callable,

@@ -41,10 +41,10 @@ service-{本机IP}-{时间戳}
 当前顺序：
 
 1. 显式传入的 `entry_module`
-2. `filename` 是 `.py` 时，从文件名推断
+2. `func` / `module` 场景下，从对象自动推断
 3. `artifact_path` 是 `.py` 时，从路径推断
-4. `artifact_paths[0]` 是 `.py` 时，从第一个路径推断
-5. 否则不自动推断，服务名回退到 `service-...`
+4. `artifact_path` 是路径列表且首个元素是 `.py` 时，从第一个路径推断
+5. `blob` 直传且未指定 `entry_module` 时，不再依赖外部 `filename`，服务名回退到 `service-...`
 
 ## 3. 当前最小部署示例
 
@@ -65,7 +65,7 @@ group = DeployedService.deploy_from_infocenter(
 group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="service.py",
+    entry_module="service",
 )
 ```
 
@@ -91,7 +91,7 @@ group = DeployedService.deploy_from_infocenter(
 group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="service.py",
+    entry_module="service",
     node_ids=["node-1", "node-3"],
 )
 ```
@@ -102,7 +102,7 @@ group = DeployedService.deploy_from_infocenter(
 group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="service.py",
+    entry_module="service",
     node_count=2,
 )
 ```
@@ -147,7 +147,6 @@ replace_existing_if_code_changed=True
 group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="square_service.py",
     entry_module="square_service",
     worker_count=1,
     node_count=1,

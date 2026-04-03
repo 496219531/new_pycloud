@@ -48,7 +48,6 @@ def main():
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,
-        filename="args_demo.py",
         runtime="py3",
         entry_module="args_demo",
         export_mode="decorator",

@@ -24,10 +24,10 @@ def _seed_code(state: NodeControlState) -> str:
     digest = hashlib.sha256(blob).hexdigest()
     artifact, _ = state.put_code(
         sha256=f"sha256:{digest}",
-        filename="demo.py",
         runtime="py3",
         entry_module="demo",
         entry_callable="run",
+        package_format="py",
         chunks=[blob],
     )
     return artifact.code_version
@@ -226,10 +226,10 @@ def test_internal_executor_runtime_slots_queue_and_reclaim(tmp_path):
         digest = hashlib.sha256(blob).hexdigest()
         artifact, _ = state.put_code(
             sha256=f"sha256:{digest}",
-            filename="runtime_slot_demo.py",
             runtime="py3",
             entry_module="runtime_slot_demo",
             entry_callable="run",
+            package_format="py",
             chunks=[blob],
         )
         code_version = artifact.code_version
@@ -376,11 +376,11 @@ def test_service_session_http_call_and_end(tmp_path):
         session = state.create_service(
             owner_client_id="owner-a",
             service_name="svc-a",
-            filename="svc_entry.py",
             sha256=f"sha256:{digest}",
             runtime="py3",
             entry_module="svc_entry",
             entry_callable="run",
+            package_format="py",
             worker_count=2,
             heartbeat_timeout_sec=30,
             idle_ttl_sec=0,
@@ -435,11 +435,11 @@ def test_service_session_management_requires_token(tmp_path):
         session = state.create_service(
             owner_client_id="owner-auth",
             service_name="svc-auth",
-            filename="svc_auth.py",
             sha256=f"sha256:{digest}",
             runtime="py3",
             entry_module="svc_auth",
             entry_callable="run",
+            package_format="py",
             worker_count=1,
             heartbeat_timeout_sec=30,
             idle_ttl_sec=0,
@@ -495,11 +495,11 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
         session = state.create_service(
             owner_client_id="owner-b",
             service_name="svc-b",
-            filename="svc_entry.py",
             sha256=f"sha256:{digest}",
             runtime="py3",
             entry_module="svc_entry",
             entry_callable="run",
+            package_format="py",
             worker_count=1,
             heartbeat_timeout_sec=1,
             idle_ttl_sec=0,
@@ -549,7 +549,6 @@ def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
         session = state.create_service(
             owner_client_id="owner-c",
             service_name="svc-c",
-            filename="compute_service.zip",
             sha256=f"sha256:{digest}",
             runtime="py3",
             entry_module="compute_service.main",

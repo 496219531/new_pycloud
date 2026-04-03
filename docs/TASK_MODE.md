@@ -181,7 +181,6 @@ from pycloud_parallel import TaskSubmitter
 with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task_demo.py",
     runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
@@ -201,7 +200,6 @@ from pycloud_parallel.controlplane.client import TaskBatchClient
 with TaskBatchClient.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task_demo.py",
     runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
@@ -222,7 +220,6 @@ from pycloud_parallel.controlplane.client import NodeControlClient
 with NodeControlClient("127.0.0.1:50061") as client:
     upload = client.upload_code_from_bytes(
         client_id="demo-client",
-        filename="task_demo.py",
         blob=blob,
         runtime="py3",
         entry_module="task_demo",

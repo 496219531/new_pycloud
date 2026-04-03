@@ -35,7 +35,6 @@ def main():
             infocenter_target="127.0.0.1:50051",
             # service_name 和 owner_client_id 会自动生成
             blob=blob,
-            filename="compute.py",
             runtime="py3",
             entry_module="compute",
             dependency_allowlist=dependency_allowlist,
@@ -53,7 +52,6 @@ def main():
             infocenter_target="127.0.0.1:50051",
             # entry_module 会用于生成 service_name
             blob=blob,
-            filename="my_service.py",
             entry_module="my_service",  # 指定 entry_module
             dependency_allowlist=dependency_allowlist,
             worker_count=1,
@@ -69,7 +67,6 @@ def main():
             infocenter_target="127.0.0.1:50051",
             owner_client_id="my-custom-client",  # 自定义 owner
             blob=blob,
-            filename="service.py",
             dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
@@ -87,7 +84,6 @@ def main():
             infocenter_target="127.0.0.1:50051",
             service_name=custom_name,  # 自定义 service_name
             blob=blob,
-            filename="service.py",
             dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )

@@ -157,8 +157,8 @@ def my_function(data):
 submitter = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="my_module.py",
     runtime="py3",
+    entry_module="my_module",
     dependency_allowlist=["./third_party/my_local_pkg"],  # 可选
 )
 """)

@@ -60,7 +60,6 @@ def test_upload_code_preflight_rejects_bad_import(tmp_path):
             with pytest.raises(grpc.RpcError) as excinfo:
                 client.upload_code_from_bytes(
                     client_id="upload-client",
-                    filename="bad_upload.py",
                     blob=blob,
                     runtime="py3",
                     entry_module="bad_upload",
@@ -103,7 +102,6 @@ def test_create_service_surfaces_user_import_error(tmp_path):
                 client.create_service_from_bytes(
                     owner_client_id="owner-client",
                     service_name="svc-bad",
-                    filename="svc_bad.py",
                     blob=blob,
                     runtime="py3",
                     entry_module="svc_bad",
@@ -146,7 +144,6 @@ def test_upload_code_allowlist_installs_missing_dep(tmp_path):
         with NodeControlClient(target, timeout_sec=30.0) as client:
             upload = client.upload_code_from_bytes(
                 client_id="upload-client",
-                filename="dep_upload.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="dep_upload",
@@ -205,7 +202,6 @@ def test_create_service_allowlist_installs_missing_dep(tmp_path):
             session = client.create_service_from_bytes(
                 owner_client_id="owner-client",
                 service_name="svc-dep",
-                filename="svc_dep.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="svc_dep",
@@ -251,7 +247,6 @@ def test_upload_code_cached_version_rejects_different_dependency_allowlist(tmp_p
         with NodeControlClient(target, timeout_sec=30.0) as client:
             first = client.upload_code_from_bytes(
                 client_id="upload-client",
-                filename="dep_upload_same.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="dep_upload_same",
@@ -263,7 +258,6 @@ def test_upload_code_cached_version_rejects_different_dependency_allowlist(tmp_p
             with pytest.raises(grpc.RpcError) as excinfo:
                 client.upload_code_from_bytes(
                     client_id="upload-client",
-                    filename="dep_upload_same.py",
                     blob=blob,
                     runtime="py3",
                     entry_module="dep_upload_same",
@@ -308,7 +302,6 @@ def test_service_session_client_roundtrip(tmp_path):
             session = client.create_service_from_bytes(
                 owner_client_id="owner-client",
                 service_name="svc-demo",
-                filename="svc_demo.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="svc_demo",
@@ -375,7 +368,6 @@ def test_nodecontrol_client_task_helpers_roundtrip(tmp_path):
         with NodeControlClient(target, timeout_sec=10.0) as client:
             upload = client.upload_code_from_bytes(
                 client_id="task-client",
-                filename="task_demo.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="task_demo",
@@ -445,7 +437,6 @@ def test_nodecontrol_client_task_stream_roundtrip(tmp_path):
         with NodeControlClient(target, timeout_sec=10.0) as client:
             upload = client.upload_code_from_bytes(
                 client_id="task-stream-client",
-                filename="task_stream_demo.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="task_stream_demo",
@@ -550,7 +541,6 @@ def test_task_batch_client_from_infocenter_roundtrip(tmp_path):
             client_id="task-batch-client",
             job_id="job-batch",
             blob=blob,
-            filename="task_batch_demo.py",
             runtime="py3",
             entry_module="task_batch_demo",
             entry_callable="run",
@@ -643,7 +633,6 @@ def test_service_session_http_supports_nested_dataframe_series_ndarray(tmp_path)
             session = client.create_service_from_bytes(
                 owner_client_id="owner-http-client",
                 service_name="svc-http-nested",
-                filename="svc_http_nested.py",
                 blob=blob,
                 runtime="py3",
                 entry_module="svc_http_nested",
@@ -720,7 +709,6 @@ def test_task_batch_grpc_supports_nested_dataframe_series_ndarray(tmp_path):
             client_id="grpc-serialize-client",
             job_id="job-grpc-serialize",
             blob=blob,
-            filename="task_grpc_nested.py",
             runtime="py3",
             entry_module="task_grpc_nested",
             entry_callable="run",

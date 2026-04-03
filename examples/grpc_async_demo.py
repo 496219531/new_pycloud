@@ -27,7 +27,6 @@ async def main():
         owner_client_id=f"client-owner-{suffix}",
         service_name=f"square-service-{suffix}",
         blob=blob,
-        filename="square_service.py",
         runtime="py3",
         entry_module="square_service",
         entry_callable="square",

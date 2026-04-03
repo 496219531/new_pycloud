@@ -199,14 +199,13 @@ message ModuleExportSpec {
 
 message UploadCodeMeta {
   string client_id = 1;
-  string filename = 2;
-  string sha256 = 3;
-  string runtime = 4;
-  string entry_module = 5;
-  string entry_callable = 6; // legacy single-function field
-  string package_format = 7; // py | tar.gz | zip | whl
-  ModuleExportSpec export_spec = 8;
-  repeated string dependency_allowlist = 9;
+  string sha256 = 2;
+  string runtime = 3;
+  string entry_module = 4;
+  string entry_callable = 5; // legacy single-function field
+  string package_format = 6; // py | tar.gz | zip | whl
+  ModuleExportSpec export_spec = 7;
+  repeated string dependency_allowlist = 8;
 }
 
 message UploadCodeRequest {
@@ -422,18 +421,17 @@ message GetMetricsResponse {
 message CreateServiceMeta {
   string owner_client_id = 1;
   string service_name = 2;
-  string filename = 3;
-  string sha256 = 4;
-  string runtime = 5;
-  string entry_module = 6;
-  string entry_callable = 7; // legacy single-function field
-  int32 worker_count = 8;
-  int32 heartbeat_timeout_sec = 9;
-  int32 idle_ttl_sec = 10;
-  bool expose_http = 11;
-  string package_format = 12; // py | tar.gz | zip | whl
-  ModuleExportSpec export_spec = 13;
-  repeated string dependency_allowlist = 14;
+  string sha256 = 3;
+  string runtime = 4;
+  string entry_module = 5;
+  string entry_callable = 6; // legacy single-function field
+  int32 worker_count = 7;
+  int32 heartbeat_timeout_sec = 8;
+  int32 idle_ttl_sec = 9;
+  bool expose_http = 10;
+  string package_format = 11; // py | tar.gz | zip | whl
+  ModuleExportSpec export_spec = 12;
+  repeated string dependency_allowlist = 13;
 }
 
 message CreateServiceRequest {

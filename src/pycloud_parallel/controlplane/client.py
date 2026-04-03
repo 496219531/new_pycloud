@@ -125,20 +125,36 @@ def _normalize_entry_module_arg(entry_module: Any) -> str:
     return str(entry_module or "").strip()
 
 
+def _infer_entry_module_from_artifact_path(
+    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
+) -> str:
+    if not artifact_path:
+        return ""
+    if isinstance(artifact_path, (list, tuple)):
+        first_path = next((Path(str(p)) for p in artifact_path if str(p)), None)
+        if first_path is not None and first_path.suffix == ".py":
+            return first_path.stem
+        return ""
+    path = Path(artifact_path)
+    if path.suffix == ".py":
+        return path.stem
+    return ""
+
+
 def _prepare_code_blob(
     func: Optional[Callable] = None,
     module: Optional[Any] = None,
-    artifact_path: str = "",
+    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
     blob: Optional[bytes] = None,
 ) -> Tuple[Optional[bytes], str]:
     """准备代码 blob 和文件名。
 
-    智能处理模块对象、函数对象、文件路径、直接 blob 四种情况。
+    智能处理模块对象、函数对象、文件路径/路径列表、直接 blob 四种情况。
 
     Args:
         func: 函数对象（自动打包依赖）
         module: 模块对象（自动打包整个模块）
-        artifact_path: 文件路径
+        artifact_path: 文件路径、文件夹路径或路径列表
         blob: 直接提供的 blob
 
     Returns:
@@ -197,8 +213,49 @@ def _prepare_code_blob(
     if blob is not None:
         return blob, ""
 
-    # 优先级 4: 文件路径
+    # 优先级 4: 文件路径 / 路径列表
     if artifact_path:
+        if isinstance(artifact_path, (list, tuple)):
+            import zipfile
+
+            paths = [Path(str(p)) for p in artifact_path if str(p)]
+            if not paths:
+                raise ValueError("artifact_path list is empty")
+
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip:
+                tmp_zip_path = tmp_zip.name
+
+            try:
+                with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for path in paths:
+                        if not path.exists():
+                            raise FileNotFoundError(f"Path not found: {path}")
+                        if path.is_file():
+                            zf.write(path, path.name)
+                        elif path.is_dir():
+                            dirs_to_check = {path}
+                            for child in path.rglob("*"):
+                                if child.is_dir():
+                                    dirs_to_check.add(child)
+
+                            for d in sorted(dirs_to_check, key=lambda x: str(x)):
+                                if not (d / "__init__.py").exists():
+                                    init_arcname = path.name / d.relative_to(path) / "__init__.py"
+                                    zf.writestr(str(init_arcname), "")
+
+                            for file_path in path.rglob("*"):
+                                if file_path.is_file():
+                                    arcname = path.name / file_path.relative_to(path)
+                                    zf.write(file_path, str(arcname))
+
+                with open(tmp_zip_path, "rb") as f:
+                    return f.read(), "artifact_bundle.zip"
+            finally:
+                try:
+                    os.unlink(tmp_zip_path)
+                except Exception:
+                    pass
+
         path = Path(artifact_path)
         if not path.exists():
             raise FileNotFoundError(f"Artifact path not found: {artifact_path}")
@@ -465,6 +522,26 @@ def _default_artifact_filename(
     else:
         suffix = ".bin"
     return f"{stem}{suffix}"
+
+
+def _default_entry_module_for_package(
+    *,
+    package_format: str,
+    entry_module: Any = "",
+    fallback_stem: str = "artifact",
+) -> str:
+    normalized_module = _normalize_entry_module_arg(entry_module).strip()
+    if normalized_module:
+        return normalized_module
+    if _resolve_package_format(package_format, default="py") != "py":
+        return ""
+    return Path(
+        _default_artifact_filename(
+            package_format=package_format,
+            entry_module="",
+            fallback_stem=fallback_stem,
+        )
+    ).stem
 
 
 def _build_export_spec(
@@ -1553,7 +1630,6 @@ class NodeControlClient:
         *,
         client_id: str,
         artifact_path: str,
-        filename: str = "",
         runtime: str = "py3",
         entry_module: str = "",
         entry_callable: str = "run",
@@ -1570,19 +1646,16 @@ class NodeControlClient:
 
         tmp_pkg: Optional[Path] = None
         upload_file = path
-        effective_filename = filename or path.name
-        inferred_format = package_format
+        inferred_format = _resolve_package_format(package_format, path.name)
         if path.is_dir():
             tmp_pkg = _package_directory_to_targz(path)
             upload_file = tmp_pkg
-            effective_filename = filename or f"{path.name}.tar.gz"
             inferred_format = package_format or "tar.gz"
 
         try:
             return self._upload_code_from_local_file(
                 client_id=client_id,
                 file_path=upload_file,
-                filename=effective_filename,
                 runtime=runtime,
                 entry_module=entry_module,
                 entry_callable=entry_callable,
@@ -1601,7 +1674,6 @@ class NodeControlClient:
         self,
         *,
         client_id: str,
-        filename: str = "",
         blob: bytes,
         runtime: str = "py3",
         entry_module: str = "",
@@ -1615,14 +1687,11 @@ class NodeControlClient:
     ) -> pb2.UploadCodeResponse:
         if not client_id:
             raise ValueError("client_id is required")
-        effective_format = _resolve_package_format(package_format, filename, default="py")
-        effective_filename = filename or _default_artifact_filename(
+        effective_format = _resolve_package_format(package_format, default="py")
+        effective_module = _default_entry_module_for_package(
             package_format=effective_format,
             entry_module=entry_module,
             fallback_stem="artifact",
-        )
-        effective_module = _normalize_entry_module_arg(entry_module) or (
-            Path(effective_filename).stem if effective_filename.endswith(".py") else ""
         )
         export_spec = _build_export_spec(
             export_mode=export_mode,
@@ -1635,7 +1704,6 @@ class NodeControlClient:
             yield pb2.UploadCodeRequest(
                 meta=pb2.UploadCodeMeta(
                     client_id=client_id,
-                    filename=effective_filename,
                     sha256=f"sha256:{digest}",
                     runtime=runtime,
                     entry_module=effective_module,
@@ -1658,7 +1726,6 @@ class NodeControlClient:
         *,
         client_id: str,
         file_path: Path,
-        filename: str,
         runtime: str,
         entry_module: str,
         entry_callable: str,
@@ -1669,11 +1736,10 @@ class NodeControlClient:
         dependency_allowlist: Optional[Sequence[str]],
         chunk_size: int,
     ) -> pb2.UploadCodeResponse:
-        effective_filename = filename or file_path.name
+        effective_format = _resolve_package_format(package_format, file_path.name)
         effective_module = _normalize_entry_module_arg(entry_module) or (
-            Path(effective_filename).stem if effective_filename.endswith(".py") else ""
+            file_path.stem if effective_format == "py" else ""
         )
-        effective_format = _resolve_package_format(package_format, effective_filename)
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
@@ -1685,7 +1751,6 @@ class NodeControlClient:
             yield pb2.UploadCodeRequest(
                 meta=pb2.UploadCodeMeta(
                     client_id=client_id,
-                    filename=effective_filename,
                     sha256=f"sha256:{digest}",
                     runtime=runtime,
                     entry_module=effective_module,
@@ -1815,7 +1880,6 @@ class NodeControlClient:
         owner_client_id: str,
         artifact_path: str,
         service_name: str = "",
-        filename: str = "",
         runtime: str = "py3",
         entry_module: str = "",
         entry_callable: str = "run",
@@ -1836,12 +1900,10 @@ class NodeControlClient:
 
         tmp_pkg: Optional[Path] = None
         upload_file = path
-        effective_filename = filename or path.name
-        inferred_format = package_format
+        inferred_format = _resolve_package_format(package_format, path.name)
         if path.is_dir():
             tmp_pkg = _package_directory_to_targz(path)
             upload_file = tmp_pkg
-            effective_filename = filename or f"{path.name}.tar.gz"
             inferred_format = package_format or "tar.gz"
 
         try:
@@ -1849,7 +1911,6 @@ class NodeControlClient:
                 owner_client_id=owner_client_id,
                 service_name=service_name,
                 file_path=upload_file,
-                filename=effective_filename,
                 runtime=runtime,
                 entry_module=entry_module,
                 entry_callable=entry_callable,
@@ -1875,7 +1936,6 @@ class NodeControlClient:
         root_dir: str,
         paths: Sequence[str],
         service_name: str = "",
-        filename: str = "service_bundle.tar.gz",
         runtime: str = "py3",
         entry_module: str = "",
         entry_callable: str = "run",
@@ -1895,7 +1955,6 @@ class NodeControlClient:
                 owner_client_id=owner_client_id,
                 service_name=service_name,
                 file_path=tar_path,
-                filename=filename or "service_bundle.tar.gz",
                 runtime=runtime,
                 entry_module=entry_module,
                 entry_callable=entry_callable,
@@ -1919,7 +1978,6 @@ class NodeControlClient:
         owner_client_id: str,
         service_name: str,
         file_path: Path,
-        filename: str,
         runtime: str,
         entry_module: str,
         entry_callable: str,
@@ -1934,11 +1992,10 @@ class NodeControlClient:
         expose_http: bool,
         chunk_size: int,
     ) -> ServiceSessionClient:
-        effective_filename = filename or file_path.name
         effective_module = _normalize_entry_module_arg(entry_module)
-        if not effective_module and effective_filename.endswith(".py"):
-            effective_module = Path(effective_filename).stem
-        effective_format = package_format or _package_format_from_filename(effective_filename)
+        effective_format = _resolve_package_format(package_format, file_path.name)
+        if not effective_module and effective_format == "py":
+            effective_module = file_path.stem
         digest = _sha256_file(file_path)
         export_spec = _build_export_spec(
             export_mode=export_mode,
@@ -1951,7 +2008,6 @@ class NodeControlClient:
                 meta=pb2.CreateServiceMeta(
                     owner_client_id=owner_client_id,
                     service_name=service_name,
-                    filename=effective_filename,
                     sha256=f"sha256:{digest}",
                     runtime=runtime,
                     entry_module=effective_module,
@@ -1986,7 +2042,6 @@ class NodeControlClient:
         *,
         owner_client_id: str,
         service_name: str,
-        filename: str = "",
         blob: bytes,
         runtime: str,
         entry_module: str,
@@ -2005,14 +2060,11 @@ class NodeControlClient:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         digest = hashlib.sha256(blob).hexdigest()
-        effective_format = _resolve_package_format(package_format, filename, default="py")
-        effective_filename = filename or _default_artifact_filename(
+        effective_format = _resolve_package_format(package_format, default="py")
+        effective_module = _default_entry_module_for_package(
             package_format=effective_format,
             entry_module=entry_module,
             fallback_stem="service_artifact",
-        )
-        effective_module = _normalize_entry_module_arg(entry_module) or (
-            Path(effective_filename).stem if effective_filename.endswith(".py") else ""
         )
         export_spec = _build_export_spec(
             export_mode=export_mode,
@@ -2025,7 +2077,6 @@ class NodeControlClient:
                 meta=pb2.CreateServiceMeta(
                     owner_client_id=owner_client_id,
                     service_name=service_name,
-                    filename=effective_filename,
                     sha256=f"sha256:{digest}",
                     runtime=runtime,
                     entry_module=effective_module,
@@ -2456,9 +2507,8 @@ class TaskBatchClient:
         func: Optional[Callable] = None,
         module: Optional[Any] = None,
         code_version: str = "",
-        artifact_path: str = "",
+        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
-        filename: str = "",
         runtime: str = "py3",
         entry_module: str = "",
         entry_callable: str = "run",
@@ -2486,7 +2536,6 @@ class TaskBatchClient:
                 artifact_path="",
                 blob=blob,
             )
-            effective_filename = effective_filename or filename
             effective_package_format = "tar.gz"
 
             # 自动推断 entry_module
@@ -2499,7 +2548,6 @@ class TaskBatchClient:
                 artifact_path="",
                 blob=blob,
             )
-            effective_filename = effective_filename or filename
             effective_package_format = "tar.gz"
 
             # 自动推断 entry_module 和 entry_callable
@@ -2514,8 +2562,9 @@ class TaskBatchClient:
                 artifact_path=artifact_path,
                 blob=blob,
             )
-            effective_filename = effective_filename or filename
             effective_package_format = package_format
+            if not entry_module:
+                entry_module = _infer_entry_module_from_artifact_path(artifact_path)
 
         effective_package_format = _resolve_package_format(
             effective_package_format,
@@ -2604,7 +2653,6 @@ class TaskBatchClient:
                     for node_id, client in clients.items():
                         upload = client.upload_code_from_bytes(
                             client_id=effective_client_id,
-                            filename=effective_filename,
                             blob=effective_blob,
                             runtime=runtime,
                             entry_module=entry_module,
@@ -2622,7 +2670,6 @@ class TaskBatchClient:
                         upload = client.upload_code_from_file(
                             client_id=effective_client_id,
                             artifact_path=artifact_path,
-                            filename=effective_filename,
                             runtime=runtime,
                             entry_module=entry_module,
                             entry_callable=entry_callable,
@@ -2667,6 +2714,200 @@ class TaskBatchClient:
             for client in clients.values():
                 client.close()
             raise
+
+    @classmethod
+    def from_module(
+        cls,
+        *,
+        infocenter_target: str,
+        module: Any,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_callable: str = "run",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskBatchClient":
+        return cls.from_infocenter(
+            infocenter_target=infocenter_target,
+            client_id=client_id,
+            job_id=job_id,
+            module=module,
+            runtime=runtime,
+            entry_callable=entry_callable,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+
+    @classmethod
+    def from_func(
+        cls,
+        *,
+        infocenter_target: str,
+        func: Callable,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskBatchClient":
+        return cls.from_infocenter(
+            infocenter_target=infocenter_target,
+            client_id=client_id,
+            job_id=job_id,
+            func=func,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+
+    @classmethod
+    def from_file(
+        cls,
+        *,
+        infocenter_target: str,
+        artifact_path: str,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskBatchClient":
+        return cls.from_infocenter(
+            infocenter_target=infocenter_target,
+            client_id=client_id,
+            job_id=job_id,
+            artifact_path=artifact_path,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls,
+        *,
+        infocenter_target: str,
+        blob: bytes,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        package_format: str = "py",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskBatchClient":
+        return cls.from_infocenter(
+            infocenter_target=infocenter_target,
+            client_id=client_id,
+            job_id=job_id,
+            blob=blob,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
 
     def close(self) -> None:
         for stream in self._streams.values():
@@ -3029,10 +3270,8 @@ class ServiceGroup:
         service_name: Optional[str] = None,
         func: Optional[Callable] = None,
         module: Optional[Any] = None,
-        artifact_path: str = "",
-        artifact_paths: Optional[Sequence[str]] = None,
+        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
-        filename: str = "",
         runtime: str = "py3",
         entry_module: str = "",
         entry_callable: str = "run",
@@ -3070,10 +3309,8 @@ class ServiceGroup:
             owner_client_id: 所有者客户端 ID
             service_name: 服务名称
             func: 函数对象（自动打包依赖，优先级最高）
-            artifact_path: 单个文件路径
-            artifact_paths: 文件/文件夹路径列表，会自动打包成 zip
+            artifact_path: 单个文件、单个文件夹或文件/文件夹路径列表
             blob: 直接提供代码内容
-            filename: 文件名
             runtime: 运行时版本
             entry_module: 入口模块名
             entry_callable: 入口函数名
@@ -3115,7 +3352,6 @@ class ServiceGroup:
                 artifact_path="",
                 blob=blob,
             )
-            effective_filename = effective_filename or filename
             effective_package_format = "tar.gz"
 
             # 自动推断 entry_module
@@ -3128,7 +3364,6 @@ class ServiceGroup:
                 artifact_path="",
                 blob=blob,
             )
-            effective_filename = effective_filename or filename
             effective_package_format = "tar.gz"
 
             # 自动推断 entry_module 和 entry_callable
@@ -3143,7 +3378,6 @@ class ServiceGroup:
                 artifact_path=artifact_path,
                 blob=blob,
             )
-            effective_filename = effective_filename or filename
             effective_package_format = package_format
 
         effective_package_format = _resolve_package_format(
@@ -3167,23 +3401,12 @@ class ServiceGroup:
             effective_owner_client_id = f"client-{local_ip}"
 
         # 先确定 entry_module（用于生成 service_name）
-        effective_entry_module = entry_module
+        effective_entry_module = entry_module or _infer_entry_module_from_artifact_path(artifact_path)
         if not effective_entry_module:
             if effective_filename:
-                # 优先使用 filename
+                # 优先使用推导出的 artifact 文件名
                 if effective_filename.endswith(".py"):
                     effective_entry_module = Path(effective_filename).stem
-            else:
-                # 尝试从 artifact_path 推断
-                if artifact_path:
-                    path = Path(artifact_path)
-                    if path.suffix == ".py":
-                        effective_entry_module = path.stem
-                # 尝试从 artifact_paths 推断
-                elif artifact_paths and len(artifact_paths) > 0:
-                    first_path = Path(artifact_paths[0])
-                    if first_path.suffix == ".py":
-                        effective_entry_module = first_path.stem
 
         # 如果 service_name 为空，使用 entry_module + 本机 IP + 时间戳（精确到秒）
         # 添加时间戳确保唯一性，避免服务名冲突
@@ -3203,61 +3426,9 @@ class ServiceGroup:
         if not effective_service_name:
             raise ValueError("service_name is required")
 
-        # 优先级: func > blob > artifact_path > artifact_paths
-        # 如果 func 参数已处理，effective_blob 已经设置，跳过后续处理
-        if effective_blob is None and artifact_paths:
-            # artifact_paths 列表：打包成 zip
-            import zipfile
-            import tempfile
-
-            paths = [str(p) for p in artifact_paths if p]
-            if not paths:
-                raise ValueError("artifact_paths list is empty")
-
-            # 创建临时 zip 文件
-            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip:
-                tmp_zip_path = tmp_zip.name
-
-            with zipfile.ZipFile(tmp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for path_str in paths:
-                    p = Path(path_str)
-                    if not p.exists():
-                        raise FileNotFoundError(f"Path not found: {p}")
-                    if p.is_file():
-                        # 单个文件：直接添加，保持原名
-                        zf.write(p, p.name)
-                    elif p.is_dir():
-                        # 收集所有需要写入 zip 的目录（用于自动补全 __init__.py）
-                        dirs_to_check = {p}  # 顶级目录本身
-                        for child in p.rglob('*'):
-                            if child.is_dir():
-                                dirs_to_check.add(child)
-
-                        # 为缺少 __init__.py 的目录写入空文件
-                        for d in sorted(dirs_to_check, key=lambda x: str(x)):
-                            if not (d / "__init__.py").exists():
-                                init_arcname = p.name / d.relative_to(p) / "__init__.py"
-                                zf.writestr(str(init_arcname), "")
-
-                        # 文件夹：将文件夹本身作为 zip 内的一层目录，写入所有文件
-                        for file_path in p.rglob('*'):
-                            if file_path.is_file():
-                                arcname = p.name / file_path.relative_to(p)
-                                zf.write(file_path, str(arcname))
-            if not effective_filename:
-                effective_filename = Path(tmp_zip_path).name
-            effective_blob = Path(tmp_zip_path).read_bytes()
-            effective_package_format = "zip"
-
-            # 清理临时文件
-            try:
-                os.unlink(tmp_zip_path)
-            except Exception:
-                pass
-
         if effective_blob is None:
             if not artifact_path:
-                raise ValueError("artifact_path or artifact_paths or blob must be provided")
+                raise ValueError("artifact_path or blob must be provided")
             path = Path(artifact_path)
             if not path.exists():
                 raise FileNotFoundError(f"artifact_path not found: {path}")
@@ -3448,7 +3619,6 @@ class ServiceGroup:
                 session = client.create_service_from_bytes(
                     owner_client_id=effective_owner_client_id,
                     service_name=effective_service_name,
-                    filename=effective_filename,
                     blob=effective_blob,
                     runtime=runtime,
                     entry_module=effective_entry_module,
@@ -5310,7 +5480,7 @@ class TaskSubmitter:
         >>> task = TaskSubmitter.from_infocenter(
         ...     infocenter_target="127.0.0.1:50051",
         ...     blob=blob,
-        ...     filename="task.py",
+        ...     entry_module="task",
         ... )
         >>>
         >>> # 提交任务并等待结果
@@ -5340,10 +5510,11 @@ class TaskSubmitter:
         infocenter_target: str,
         client_id: Optional[str] = None,
         job_id: Optional[str] = None,
+        func: Optional[Callable] = None,
+        module: Optional[Any] = None,
         code_version: str = "",
-        artifact_path: str = "",
+        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
-        filename: str = "",
         runtime: str = "py3",
         entry_module: str = "",
         entry_callable: str = "run",
@@ -5373,10 +5544,209 @@ class TaskSubmitter:
             infocenter_target=infocenter_target,
             client_id=client_id,
             job_id=job_id,
+            func=func,
+            module=module,
             code_version=code_version,
             artifact_path=artifact_path,
             blob=blob,
-            filename=filename,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+        return cls(batch)
+
+    @classmethod
+    def from_module(
+        cls,
+        *,
+        infocenter_target: str,
+        module: Any,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_callable: str = "run",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskSubmitter":
+        batch = TaskBatchClient.from_module(
+            infocenter_target=infocenter_target,
+            module=module,
+            client_id=client_id,
+            job_id=job_id,
+            runtime=runtime,
+            entry_callable=entry_callable,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+        return cls(batch)
+
+    @classmethod
+    def from_func(
+        cls,
+        *,
+        infocenter_target: str,
+        func: Callable,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskSubmitter":
+        batch = TaskBatchClient.from_func(
+            infocenter_target=infocenter_target,
+            func=func,
+            client_id=client_id,
+            job_id=job_id,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+        return cls(batch)
+
+    @classmethod
+    def from_file(
+        cls,
+        *,
+        infocenter_target: str,
+        artifact_path: str,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskSubmitter":
+        batch = TaskBatchClient.from_file(
+            infocenter_target=infocenter_target,
+            artifact_path=artifact_path,
+            client_id=client_id,
+            job_id=job_id,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=export_decorator,
+            dependency_allowlist=dependency_allowlist,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            require_credit=require_credit,
+            preferred_runtime_key=preferred_runtime_key,
+            timeout_sec=timeout_sec,
+        )
+        return cls(batch)
+
+    @classmethod
+    def from_bytes(
+        cls,
+        *,
+        infocenter_target: str,
+        blob: bytes,
+        client_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: str = "run",
+        package_format: str = "py",
+        export_mode: str = "single",
+        export_methods: Optional[Sequence[str]] = None,
+        export_decorator: str = "pycloud_export",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        require_credit: bool = True,
+        preferred_runtime_key: str = "",
+        timeout_sec: float = 10.0,
+    ) -> "TaskSubmitter":
+        batch = TaskBatchClient.from_bytes(
+            infocenter_target=infocenter_target,
+            blob=blob,
+            client_id=client_id,
+            job_id=job_id,
             runtime=runtime,
             entry_module=entry_module,
             entry_callable=entry_callable,

@@ -29,7 +29,6 @@ group = DeployedService.deploy_from_infocenter(
     owner_client_id="demo-owner",
     service_name="square-service",
     blob=blob,
-    filename="square_service.py",
     runtime="py3",
     entry_module="square_service",
     export_mode="decorator",

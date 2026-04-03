@@ -559,7 +559,6 @@ def auto_deploy_function(
     return TaskSubmitter.from_infocenter(
         infocenter_target=infocenter_target,
         blob=blob,
-        filename=Path(package_path).name,
         runtime=runtime,
         entry_module=entry_module,
         entry_callable=entry_callable,

@@ -51,7 +51,6 @@ def main():
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,
-        filename="square_service.py",
         runtime="py3",
         entry_module="square_service",
         export_mode="decorator",

@@ -43,7 +43,6 @@ def main():
         owner_client_id=f"async-demo-{suffix}",
         service_name=f"compute-service-{suffix}",
         blob=blob,
-        filename="compute.py",
         runtime="py3",
         entry_module="compute",
         entry_callable="square",

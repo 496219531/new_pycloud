@@ -27,7 +27,6 @@ blob = (
 with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task_demo.py",
     runtime="py3",
     entry_module="task_demo",
     preferred_runtime_key="demo-runtime",
@@ -100,7 +99,6 @@ resp = task.run.submit(value=8, runtime_key="factor-alpha")
 with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task_demo.py",
     runtime=">=py3.11",
     entry_module="task_demo",
 ) as task:

@@ -34,13 +34,12 @@
 
 `UploadCodeMeta` / `CreateServiceMeta` 的关键字段：
 
-1. `filename`
-2. `sha256`
-3. `runtime`
-4. `entry_module`
-5. `entry_callable`
-6. `package_format`
-7. `export_spec`
+1. `sha256`
+2. `runtime`
+3. `entry_module`
+4. `entry_callable`
+5. `package_format`
+6. `export_spec`
 
 支持的包格式：
 

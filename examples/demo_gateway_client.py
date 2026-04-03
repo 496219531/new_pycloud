@@ -29,7 +29,7 @@ group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
-    filename="square_service.py",
+    entry_module="square_service",
     dependency_allowlist=["./third_party/my_local_pkg"],  # 可选
 )
 ```

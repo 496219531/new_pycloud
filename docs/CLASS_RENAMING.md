@@ -59,7 +59,7 @@ from pycloud_parallel import TaskSubmitter
 task = TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task.py",
+    entry_module="task",
 )
 
 results = task.run(value=7)

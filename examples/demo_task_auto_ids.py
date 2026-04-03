@@ -28,7 +28,6 @@ def demo_auto_ids():
     with TaskBatchClient.from_infocenter(
         infocenter_target="127.0.0.1:50051",
         blob=blob,
-        filename="task_demo.py",
         runtime="py3",
         entry_module="task_demo",
         entry_callable="run",
@@ -83,7 +82,6 @@ def demo_manual_ids():
         client_id="etl-worker-01",        # 手动指定
         job_id="data-load-20260330",      # 手动指定
         blob=blob,
-        filename="task_demo.py",
         runtime="py3",
         entry_module="task_demo",
         entry_callable="run",
@@ -121,7 +119,6 @@ def demo_uniqueness():
         batch = TaskBatchClient.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             blob=blob,
-            filename="task_demo.py",
             runtime="py3",
             entry_module="task_demo",
             entry_callable="run",

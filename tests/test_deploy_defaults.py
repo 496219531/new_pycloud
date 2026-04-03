@@ -10,6 +10,8 @@ from pycloud_parallel.controlplane.client import (
     InfoCenterNode,
     NodeControlClient,
     ServiceGroup,
+    TaskBatchClient,
+    TaskSubmitter,
     _get_local_ip,
     _normalize_entry_module_arg,
 )
@@ -81,18 +83,18 @@ class TestParameterValidation:
 
     def test_artifact_content_required(self):
         """测试必须提供代码内容之一。"""
-        with pytest.raises(ValueError, match="artifact_path or artifact_paths or blob must be provided"):
+        with pytest.raises(ValueError, match="artifact_path or blob must be provided"):
             DeployedService.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 # 不提供任何代码内容
             )
 
-    def test_blob_requires_filename(self):
-        """测试使用 blob 时必须提供 filename。"""
-        # 注意：这个测试会尝试实际连接服务器
-        # 所以我们只测试参数校验逻辑，不进行实际部署
-        # filename 的校验在代码后面，会由服务器端进行验证
-        pass
+    def test_public_entrypoints_hide_filename(self):
+        """测试高层公开入口不再暴露 filename。"""
+        assert "filename" not in inspect.signature(DeployedService.deploy_from_infocenter).parameters
+        assert "filename" not in inspect.signature(TaskBatchClient.from_infocenter).parameters
+        assert "filename" not in inspect.signature(TaskSubmitter.from_infocenter).parameters
+        assert "artifact_paths" not in inspect.signature(DeployedService.deploy_from_infocenter).parameters
 
 
 class TestEntryModuleNormalization:
@@ -108,7 +110,7 @@ class TestEntryModuleNormalization:
             def CreateService(self, request_iter, timeout=None):
                 first = next(request_iter)
                 captured["entry_module"] = first.meta.entry_module
-                captured["filename"] = first.meta.filename
+                captured["package_format"] = first.meta.package_format
                 return pb2.CreateServiceResponse(
                     ok=True,
                     service_id="svc-test",
@@ -138,7 +140,7 @@ class TestEntryModuleNormalization:
             client.close()
 
         assert captured["entry_module"] == "math"
-        assert captured["filename"] == "math.py"
+        assert captured["package_format"] == "py"
         assert session.service_id == "svc-test"
 
     def test_deploy_service_uses_module_name_for_default_service_name(self, monkeypatch):
@@ -216,7 +218,84 @@ class TestEntryModuleNormalization:
 
         assert group.service_name == "math-127.0.0.1-20260402123456"
         assert captured["entry_module"] == "math"
-        assert captured["filename"] == "math.py"
+
+    def test_deploy_service_accepts_artifact_path_list(self, monkeypatch, tmp_path):
+        captured = {}
+
+        source = tmp_path / "demo_task.py"
+        source.write_text("def run():\n    return {'ok': True}\n", encoding="utf-8")
+
+        class FakeInfoCenterClient:
+            def __init__(self, target, timeout_sec=0):
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def list_service_routes(self, **kwargs):
+                return []
+
+            def list_nodes(self, **kwargs):
+                return [
+                    InfoCenterNode(
+                        node_id="node-1",
+                        control_addr="127.0.0.1:50061",
+                        healthy=True,
+                        capacity=4,
+                        queue_capacity=100,
+                        queued=0,
+                        inflight=0,
+                        credit=4,
+                        service_worker_capacity=4,
+                        service_worker_used=0,
+                        service_worker_available=4,
+                    )
+                ]
+
+        class FakeSession:
+            service_id = "svc-test"
+            service_token = "token-test"
+            http_base_url = "http://127.0.0.1:18080"
+            heartbeat_timeout_sec = 30
+            worker_count = 1
+
+            def _start_keepalive(self, interval_sec=None):
+                return None
+
+        class FakeNodeControlClient:
+            def __init__(self, target, timeout_sec=0):
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                captured.update(kwargs)
+                return FakeSession()
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(client_mod, "InfoCenterClient", FakeInfoCenterClient)
+        monkeypatch.setattr(client_mod, "NodeControlClient", FakeNodeControlClient)
+        monkeypatch.setattr(client_mod, "_get_local_ip", lambda: "127.0.0.1")
+        monkeypatch.setattr(client_mod.time, "strftime", lambda fmt: "20260402123456")
+        monkeypatch.setattr(ServiceGroup, "_persist_session_cache", lambda self: None)
+        monkeypatch.setattr(ServiceGroup, "_start_keepalive", lambda self, interval_sec=None: None)
+
+        group = ServiceGroup.deploy_from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            artifact_path=[str(source)],
+            runtime="py3",
+            min_success_nodes=1,
+            node_limit=1,
+        )
+
+        assert group.service_name == "demo_task-127.0.0.1-20260402123456"
+        assert captured["entry_module"] == "demo_task"
+        assert captured["package_format"] == "zip"
 
     def test_layered_service_entrypoints_hide_filename(self, monkeypatch):
         captured = {}
@@ -241,6 +320,155 @@ class TestEntryModuleNormalization:
         assert result == "ok"
         assert captured["blob"] == b"def run():\n    return {'ok': True}\n"
         assert captured["entry_module"] == "svc_demo"
+        assert captured["package_format"] == "py"
+        assert "filename" not in captured
+
+    def test_layered_task_batch_entrypoints_hide_filename(self, monkeypatch):
+        captured = {}
+
+        def fake_from_infocenter(cls, **kwargs):
+            captured.update(kwargs)
+            return "batch-ok"
+
+        monkeypatch.setattr(TaskBatchClient, "from_infocenter", classmethod(fake_from_infocenter))
+
+        assert "filename" not in inspect.signature(TaskBatchClient.from_module).parameters
+        assert "filename" not in inspect.signature(TaskBatchClient.from_func).parameters
+        assert "filename" not in inspect.signature(TaskBatchClient.from_file).parameters
+        assert "filename" not in inspect.signature(TaskBatchClient.from_bytes).parameters
+
+        result = TaskBatchClient.from_bytes(
+            infocenter_target="127.0.0.1:50051",
+            blob=b"def run(payload):\n    return payload\n",
+            entry_module="task_demo",
+        )
+
+        assert result == "batch-ok"
+        assert captured["blob"] == b"def run(payload):\n    return payload\n"
+        assert captured["entry_module"] == "task_demo"
+        assert captured["package_format"] == "py"
+        assert "filename" not in captured
+
+    def test_task_batch_accepts_artifact_path_list(self, monkeypatch, tmp_path):
+        captured = {}
+
+        source = tmp_path / "demo_task.py"
+        source.write_text("def run(value=0, **_kwargs):\n    return {'value': value}\n", encoding="utf-8")
+
+        class FakeInfoCenterClient:
+            def __init__(self, target, timeout_sec=0):
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def select_task_nodes(self, **kwargs):
+                return [
+                    InfoCenterNode(
+                        node_id="node-1",
+                        control_addr="127.0.0.1:50061",
+                        healthy=True,
+                        capacity=4,
+                        queue_capacity=100,
+                        queued=0,
+                        inflight=0,
+                        credit=4,
+                        service_worker_capacity=4,
+                        service_worker_used=0,
+                        service_worker_available=4,
+                    )
+                ]
+
+        class FakeStream:
+            node_credit = 4
+
+            def close(self):
+                return None
+
+        class FakeUpload:
+            code_version = "sha256:test"
+
+        class FakeNodeControlClient:
+            def __init__(self, target, timeout_sec=0):
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def upload_code_from_bytes(self, **kwargs):
+                captured.update(kwargs)
+                return FakeUpload()
+
+            def open_task_stream(self, **kwargs):
+                return FakeStream()
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(client_mod, "InfoCenterClient", FakeInfoCenterClient)
+        monkeypatch.setattr(client_mod, "NodeControlClient", FakeNodeControlClient)
+
+        batch = TaskBatchClient.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            artifact_path=[str(source)],
+            runtime="py3",
+        )
+        try:
+            assert captured["entry_module"] == "demo_task"
+            assert captured["package_format"] == "zip"
+        finally:
+            batch.close()
+
+    def test_task_submitter_from_infocenter_accepts_func_and_module(self, monkeypatch):
+        captured = {}
+        batch = object()
+
+        def fake_from_infocenter(cls, **kwargs):
+            captured.update(kwargs)
+            return batch
+
+        monkeypatch.setattr(TaskBatchClient, "from_infocenter", classmethod(fake_from_infocenter))
+
+        submitter = TaskSubmitter.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            func=math.sqrt,
+            runtime="py3",
+        )
+
+        assert isinstance(submitter, TaskSubmitter)
+        assert submitter._batch is batch
+        assert "func" in inspect.signature(TaskSubmitter.from_infocenter).parameters
+        assert "module" in inspect.signature(TaskSubmitter.from_infocenter).parameters
+        assert captured["func"] is math.sqrt
+        assert captured["runtime"] == "py3"
+
+    def test_layered_task_submitter_entrypoints_hide_filename(self, monkeypatch):
+        captured = {}
+        batch = object()
+
+        def fake_from_bytes(cls, **kwargs):
+            captured.update(kwargs)
+            return batch
+
+        monkeypatch.setattr(TaskBatchClient, "from_bytes", classmethod(fake_from_bytes))
+
+        assert "filename" not in inspect.signature(TaskSubmitter.from_module).parameters
+        assert "filename" not in inspect.signature(TaskSubmitter.from_func).parameters
+        assert "filename" not in inspect.signature(TaskSubmitter.from_file).parameters
+        assert "filename" not in inspect.signature(TaskSubmitter.from_bytes).parameters
+
+        submitter = TaskSubmitter.from_bytes(
+            infocenter_target="127.0.0.1:50051",
+            blob=b"def run(payload):\n    return payload\n",
+            entry_module="task_demo",
+        )
+
+        assert isinstance(submitter, TaskSubmitter)
+        assert submitter._batch is batch
+        assert captured["blob"] == b"def run(payload):\n    return payload\n"
+        assert captured["entry_module"] == "task_demo"
         assert captured["package_format"] == "py"
         assert "filename" not in captured
 

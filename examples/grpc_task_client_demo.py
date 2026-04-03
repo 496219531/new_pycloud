@@ -54,7 +54,6 @@ def main() -> None:
         client_id=client_id,
         job_id=run_job_id,
         blob=blob,
-        filename="task_demo.py",
         runtime="py3",
         entry_module="task_demo",
         entry_callable="run",

@@ -66,11 +66,11 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             session = node_state.create_service(
                 owner_client_id="owner-reg",
                 service_name="svc-reg-sync",
-                filename="svc_reg.py",
                 sha256=f"sha256:{digest}",
                 runtime="py3",
                 entry_module="svc_reg",
                 entry_callable="run",
+                package_format="py",
                 worker_count=2,
                 heartbeat_timeout_sec=30,
                 idle_ttl_sec=0,
@@ -383,10 +383,10 @@ def test_node_registrar_syncs_active_runtimes(tmp_path):
         digest = hashlib.sha256(blob).hexdigest()
         artifact, _ = node_state.put_code(
             sha256=f"sha256:{digest}",
-            filename="runtime_registrar_demo.py",
             runtime="py3",
             entry_module="runtime_registrar_demo",
             entry_callable="run",
+            package_format="py",
             chunks=[blob],
         )
         node_state.submit_tasks(

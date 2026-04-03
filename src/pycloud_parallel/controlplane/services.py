@@ -24,6 +24,19 @@ def _err(code: int, message: str, request_id: str = "") -> pb2.Error:
     return pb2.Error(code=code, message=message, request_id=request_id)
 
 
+def _tempfile_suffix_for_package_format(package_format: str) -> str:
+    normalized = str(package_format or "").strip().lower()
+    if normalized == "tar.gz":
+        return ".tar.gz"
+    if normalized == "zip":
+        return ".zip"
+    if normalized == "whl":
+        return ".whl"
+    if normalized == "py":
+        return ".py"
+    return ".bin"
+
+
 def _service_info_to_pb(info: dict) -> pb2.ServiceStatusInfo:
     return pb2.ServiceStatusInfo(
         service_id=str(info.get("service_id", "")),
@@ -113,11 +126,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                         error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame must come before chunk frames"),
                     )
                 if tmp_file is None:
-                    suffix = ".tar.gz" if str(meta.filename or "").lower().endswith(".tar.gz") else ""
                     tmp_file = tempfile.NamedTemporaryFile(
                         mode="wb",
                         prefix="pycloud-upload-",
-                        suffix=suffix or ".bin",
+                        suffix=_tempfile_suffix_for_package_format(meta.package_format),
                         delete=False,
                         dir=str(self._state.artifact_dir),
                     )
@@ -130,10 +142,11 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                     chunk_count += 1
 
         logger.info(
-            "[NodeControl] UploadCode peer=%s client_id=%s filename=%s chunks=%d",
+            "[NodeControl] UploadCode peer=%s client_id=%s package_format=%s entry_module=%s chunks=%d",
             _peer(context),
             (meta.client_id if meta is not None else ""),
-            (meta.filename if meta is not None else ""),
+            (meta.package_format if meta is not None else ""),
+            (meta.entry_module if meta is not None else ""),
             chunk_count,
         )
 
@@ -161,7 +174,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             export_spec = meta.export_spec
             artifact, cached = self._state.put_code_from_uploaded_file(
                 sha256=meta.sha256,
-                filename=meta.filename or "artifact.bin",
                 runtime=meta.runtime,
                 entry_module=meta.entry_module,
                 entry_callable=meta.entry_callable,
@@ -616,11 +628,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                         error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame must come before chunk frames"),
                     )
                 if tmp_file is None:
-                    suffix = ".tar.gz" if str(meta.filename or "").lower().endswith(".tar.gz") else ""
                     tmp_file = tempfile.NamedTemporaryFile(
                         mode="wb",
                         prefix="pycloud-service-",
-                        suffix=suffix or ".bin",
+                        suffix=_tempfile_suffix_for_package_format(meta.package_format),
                         delete=False,
                         dir=str(self._state.artifact_dir),
                     )
@@ -673,7 +684,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             session = self._state.create_service(
                 owner_client_id=meta.owner_client_id,
                 service_name=meta.service_name,
-                filename=meta.filename or "service_artifact.py",
                 sha256=meta.sha256,
                 runtime=meta.runtime,
                 entry_module=meta.entry_module,

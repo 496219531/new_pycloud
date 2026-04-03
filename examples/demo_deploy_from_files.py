@@ -222,9 +222,9 @@ def main():
     service_name = f"compute-service-{service_suffix}"
     owner_client_id = f"demo-compute-{service_suffix}"
 
-    # 方式 1: 使用 artifact_paths 部署
+    # 方式 1: 使用 artifact_path 列表部署
     print("-" * 60)
-    print("  方式 1: 使用 artifact_paths（推荐）")
+    print("  方式 1: 使用 artifact_path 列表（推荐）")
     print("-" * 60)
     print()
 
@@ -254,8 +254,8 @@ def main():
             owner_client_id=owner_client_id,
             service_name=service_name,
 
-            # 使用 artifact_paths 部署多个文件/文件夹
-            artifact_paths=[
+            # 使用 artifact_path 列表部署多个文件/文件夹
+            artifact_path=[
                 str(service_dir),
             ],
 

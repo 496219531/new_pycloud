@@ -52,7 +52,7 @@ submitter = TaskSubmitter.from_infocenter(
 │  4. 上传到 NodeControl                 │
 │     client.upload_code_from_bytes(     │
 │         blob=blob,                     │
-│         filename="my_module.py",       │
+│         entry_module="my_module",      │
 │         ...                             │
 │     )                                  │
 └─────────────────────────────────────────┘
@@ -124,7 +124,7 @@ submitter = TaskSubmitter.from_infocenter(
 │  6. 上传到 NodeControl                 │
 │     client.upload_code_from_bytes(     │
 │         blob=blob,                     │
-│         filename="...tar.gz",         │
+│         package_format="tar.gz",      │
 │         ...                             │
 │     )                                  │
 └─────────────────────────────────────────┘
@@ -239,7 +239,7 @@ submitter = TaskSubmitter.from_infocenter(
 │  6. 上传到 NodeControl                 │
 │     client.upload_code_from_bytes(     │
 │         blob=blob,                     │
-│         filename="my_module.tar.gz",  │
+│         package_format="tar.gz",      │
 │         ...                             │
 │     )                                  │
 └─────────────────────────────────────────┘
@@ -373,7 +373,6 @@ blob = tar.gz 文件的字节内容
 # 上传到服务端
 client.upload_code_from_bytes(
     blob=blob,           # ← 都是 tar.gz
-    filename="...",
     package_format="tar.gz",  # ← 都是 tar.gz
     ...
 )

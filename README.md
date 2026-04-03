@@ -149,7 +149,6 @@ group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
-    filename="square_service.py",
     runtime="py3",
     entry_module="square_service",
     export_mode="decorator",
@@ -190,7 +189,6 @@ blob = (
 with TaskSubmitter.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
-    filename="task_demo.py",
     runtime="py3",
     entry_module="task_demo",
 ) as task:
