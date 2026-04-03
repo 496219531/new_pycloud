@@ -34,6 +34,7 @@ from pycloud_parallel.controlplane.hooks import InMemoryResultHook
 from pycloud_parallel.controlplane.object_ref import (
     ObjectRef,
     is_object_ref_payload,
+    normalize_materialize_as,
     normalize_object_format,
     normalize_object_id,
     object_id_from_sha256_hex,
@@ -708,13 +709,38 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
 
     def _resolve(value: Any) -> Any:
         if isinstance(value, ObjectRef):
+            materialized = normalize_materialize_as(value.materialize_as, default="path")
+
+            def _materialize_path(candidate: Path) -> Any:
+                if materialized == "path":
+                    return candidate
+                if materialized == "bytes":
+                    return candidate.read_bytes()
+                if materialized == "json":
+                    import json
+
+                    return json.loads(candidate.read_text(encoding="utf-8"))
+                if materialized == "ndarray":
+                    try:
+                        import numpy as np
+                    except ImportError as exc:
+                        raise ObjectResolutionError("numpy not available on node, cannot materialize ndarray") from exc
+                    return np.load(candidate, allow_pickle=False)
+                if materialized == "dataframe":
+                    try:
+                        import pandas as pd
+                    except ImportError as exc:
+                        raise ObjectResolutionError("pandas not available on node, cannot materialize dataframe") from exc
+                    return pd.read_parquet(candidate)
+                raise ObjectResolutionError(f"unsupported materialize_as: {value.materialize_as}")
+
             candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
             if candidate.exists():
-                return candidate
+                return _materialize_path(candidate)
             digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
             fallback = sorted(root.glob(f"{digest}*"))
             if fallback:
-                return fallback[0]
+                return _materialize_path(fallback[0])
             raise ObjectResolutionError(f"object not found on node: {value.object_id}")
         if isinstance(value, dict):
             if is_object_ref_payload(value):

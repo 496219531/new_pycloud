@@ -36,6 +36,7 @@ from pycloud_parallel.controlplane.runtime_spec import (
 )
 from pycloud_parallel.controlplane.object_ref import (
     ObjectRef,
+    normalize_materialize_as,
     normalize_object_format,
     object_id_from_sha256_hex,
 )
@@ -594,6 +595,99 @@ def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
             rel = p.relative_to(root)
             tf.add(p, arcname=str(rel))
     return out
+
+
+def _serialize_data_for_object_ref(
+    data: Any,
+    *,
+    format: str = "",
+    materialize_as: str = "auto",
+) -> Tuple[str, str, bytes]:
+    if isinstance(data, ObjectRef):
+        raise ValueError("ObjectRef is already uploaded; no need to serialize again")
+
+    if isinstance(data, os.PathLike):
+        path = Path(data).expanduser()
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"path not found or not a file: {path}")
+        return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+
+    if isinstance(data, str):
+        path = Path(data).expanduser()
+        if path.exists() and path.is_file():
+            return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+        raise TypeError("plain string is not supported by put_data; pass it inline in payload or use an existing file path")
+
+    try:
+        import pandas as pd
+
+        if isinstance(data, pd.DataFrame):
+            import io
+
+            buf = io.BytesIO()
+            data.to_parquet(buf, index=False)
+            return "dataframe", normalize_object_format(format or "parquet", default="parquet"), buf.getvalue()
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+
+        if isinstance(data, np.ndarray):
+            import io
+
+            buf = io.BytesIO()
+            np.save(buf, data, allow_pickle=False)
+            return "ndarray", normalize_object_format(format or "npy", default="npy"), buf.getvalue()
+    except ImportError:
+        pass
+
+    if isinstance(data, (dict, list)):
+        return "json", normalize_object_format(format or "json", default="json"), json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return "bytes", normalize_object_format(format or "bin", default="bin"), bytes(data)
+
+    raise TypeError(
+        f"put_data does not support type {type(data).__name__}; "
+        "supported inputs are file paths, pandas.DataFrame, numpy.ndarray, dict/list, bytes, and ObjectRef"
+    )
+
+
+def _put_data_via_clients(
+    clients: Sequence["NodeControlClient"],
+    data: Any,
+    *,
+    format: str = "",
+    chunk_size: int = 256 * 1024,
+) -> ObjectRef:
+    if isinstance(data, ObjectRef):
+        return data
+    materialize_as, effective_format, blob = _serialize_data_for_object_ref(
+        data,
+        format=format,
+    )
+    refs = [
+        client.upload_object_from_bytes(
+            blob=blob,
+            format=effective_format,
+            chunk_size=chunk_size,
+        )
+        for client in clients
+    ]
+    if not refs:
+        raise RuntimeError("no node clients available for object upload")
+    object_ids = {ref.object_id for ref in refs}
+    formats = {ref.format for ref in refs}
+    if len(object_ids) != 1 or len(formats) != 1:
+        raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
+    first = refs[0]
+    return ObjectRef(
+        object_id=first.object_id,
+        format=first.format,
+        size_bytes=first.size_bytes,
+        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+    )
 
 
 _SERVICE_SESSION_SCHEMA_VERSION = 1
@@ -3343,6 +3437,29 @@ class TaskBatchClient:
             raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
         return refs[0]
 
+    def put_data(
+        self,
+        data: Any,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        return _put_data_via_clients(
+            list(self._clients.values()),
+            data,
+            format=format,
+            chunk_size=chunk_size,
+        )
+
+    def put_dataframe(self, dataframe: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
+
+    def put_ndarray(self, array: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self.put_data(array, format="npy", chunk_size=chunk_size)
+
+    def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self.put_data(value, format="json", chunk_size=chunk_size)
+
     @property
     def node_ids(self) -> Sequence[str]:
         return list(self.nodes.keys())
@@ -4471,6 +4588,29 @@ class ServiceGroup:
         if len(object_ids) != 1 or len(formats) != 1:
             raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
         return refs[0]
+
+    def put_data(
+        self,
+        data: Any,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        return _put_data_via_clients(
+            list(self._clients.values()),
+            data,
+            format=format,
+            chunk_size=chunk_size,
+        )
+
+    def put_dataframe(self, dataframe: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
+
+    def put_ndarray(self, array: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self.put_data(array, format="npy", chunk_size=chunk_size)
+
+    def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self.put_data(value, format="json", chunk_size=chunk_size)
 
     def __enter__(self) -> "ServiceGroup":
         return self
@@ -6013,6 +6153,28 @@ class TaskSubmitter:
             format=format,
             chunk_size=chunk_size,
         )
+
+    def put_data(
+        self,
+        data: Any,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        return self._batch.put_data(
+            data,
+            format=format,
+            chunk_size=chunk_size,
+        )
+
+    def put_dataframe(self, dataframe: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self._batch.put_dataframe(dataframe, chunk_size=chunk_size)
+
+    def put_ndarray(self, array: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self._batch.put_ndarray(array, chunk_size=chunk_size)
+
+    def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+        return self._batch.put_json(value, chunk_size=chunk_size)
 
     def submit_payloads(
         self,

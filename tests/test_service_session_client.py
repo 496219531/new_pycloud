@@ -872,3 +872,144 @@ def test_task_batch_auto_resolves_object_ref_to_local_path(tmp_path):
         server.stop(grace=0)
         state.close()
         info_server.stop()
+
+
+def test_task_batch_put_data_json_auto_resolves_to_dict(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-grpc-object-json-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_grpc_object_json"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-grpc-object-json-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"def run(config=None, **_kwargs):\n"
+            b"    return {\n"
+            b"        'cls': config.__class__.__name__,\n"
+            b"        'count': int(config['count']),\n"
+            b"        'name': str(config['name']),\n"
+            b"    }\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="grpc-object-json-client",
+            job_id="job-grpc-object-json",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_grpc_object_json",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            ref = batch.put_data({"count": 3, "name": "demo"})
+            submit = batch.submit_payloads([{"config": ref}])
+            assert len(submit.accepted) == 1
+
+            pulled = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled.results) == 1
+            assert pulled.results[0].status == pb2.TASK_STATUS_SUCCEEDED
+            assert dict(pulled.results[0].result) == {
+                "cls": "dict",
+                "count": 3,
+                "name": "demo",
+            }
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_batch_put_dataframe_auto_resolves_to_dataframe(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-grpc-object-df-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_grpc_object_df"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-grpc-object-df-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"def run(dataset=None, **_kwargs):\n"
+            b"    return {\n"
+            b"        'cls': dataset.__class__.__name__,\n"
+            b"        'rows': int(dataset.shape[0]),\n"
+            b"        'cols': int(dataset.shape[1]),\n"
+            b"    }\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="grpc-object-df-client",
+            job_id="job-grpc-object-df",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_grpc_object_df",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            ref = batch.put_data(pd.DataFrame([{"x": 1}, {"x": 2}, {"x": 3}]))
+            submit = batch.submit_payloads([{"dataset": ref}])
+            assert len(submit.accepted) == 1
+
+            pulled = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled.results) == 1
+            assert pulled.results[0].status == pb2.TASK_STATUS_SUCCEEDED
+            assert dict(pulled.results[0].result) == {
+                "cls": "DataFrame",
+                "rows": 3,
+                "cols": 1,
+            }
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()

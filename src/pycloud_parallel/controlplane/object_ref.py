@@ -10,6 +10,7 @@ from typing import Any, Dict
 OBJECT_REF_SENTINEL = "__pycloud_object_ref__"
 _OBJECT_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OBJECT_FORMAT_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_MATERIALIZE_AS = {"path", "dataframe", "ndarray", "json", "bytes"}
 
 
 def normalize_object_id(object_id: str) -> str:
@@ -49,16 +50,27 @@ def object_storage_path(base_dir: Path, *, object_id: str, fmt: str) -> Path:
     return Path(base_dir) / f"{digest}{suffix}"
 
 
+def normalize_materialize_as(value: str = "", *, default: str = "path") -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        text = str(default or "path").strip().lower() or "path"
+    if text not in _MATERIALIZE_AS:
+        raise ValueError(f"unsupported materialize_as: {value!r}")
+    return text
+
+
 @dataclass(frozen=True)
 class ObjectRef:
     object_id: str
     format: str = "bin"
     size_bytes: int = 0
+    materialize_as: str = "path"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "object_id", normalize_object_id(self.object_id))
         object.__setattr__(self, "format", normalize_object_format(self.format, default="bin"))
         object.__setattr__(self, "size_bytes", max(0, int(self.size_bytes or 0)))
+        object.__setattr__(self, "materialize_as", normalize_materialize_as(self.materialize_as, default="path"))
 
     def to_payload(self) -> Dict[str, Dict[str, object]]:
         return {
@@ -66,6 +78,7 @@ class ObjectRef:
                 "object_id": self.object_id,
                 "format": self.format,
                 "size_bytes": self.size_bytes,
+                "materialize_as": self.materialize_as,
             }
         }
 
@@ -86,6 +99,7 @@ def object_ref_from_payload(data: Dict[str, object]) -> ObjectRef:
         object_id=str(payload.get("object_id", "") or ""),
         format=str(payload.get("format", "") or ""),
         size_bytes=int(payload.get("size_bytes", 0) or 0),
+        materialize_as=str(payload.get("materialize_as", "") or "path"),
     )
 
 
