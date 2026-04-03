@@ -15,6 +15,7 @@ def _executor_host_main(request_q, event_q) -> None:
     service_executors: Dict[str, ProcessPoolExecutor] = {}
     runtime_executors: Dict[str, ProcessPoolExecutor] = {}
     inflight: Dict[object, Dict[str, Any]] = {}
+    shutdown_request_id = ""
 
     def _send_response(request_id: str, **payload: object) -> None:
         event_q.put({"kind": "response", "request_id": request_id, **payload})
@@ -22,7 +23,15 @@ def _executor_host_main(request_q, event_q) -> None:
     def _shutdown_executor(executor: Optional[ProcessPoolExecutor], *, wait: bool = False) -> None:
         if executor is None:
             return
+        processes = list(getattr(executor, "_processes", {}).values())
         executor.shutdown(wait=wait, cancel_futures=True)
+        for proc in processes:
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                proc.join(timeout=1.0)
+            except Exception:
+                continue
 
     def _ensure_mp_context():
         try:
@@ -53,7 +62,8 @@ def _executor_host_main(request_q, event_q) -> None:
         action = str(message.get("action", "") or "")
         payload = dict(message.get("payload") or {})
         if action == "shutdown":
-            _send_response(request_id, ok=True)
+            nonlocal shutdown_request_id
+            shutdown_request_id = request_id
             return False
 
         try:
@@ -61,7 +71,7 @@ def _executor_host_main(request_q, event_q) -> None:
                 service_id = str(payload.get("service_id", "") or "")
                 worker_count = max(1, int(payload.get("worker_count", 1) or 1))
                 existing = service_executors.pop(service_id, None)
-                _shutdown_executor(existing, wait=False)
+                _shutdown_executor(existing, wait=True)
                 service_executors[service_id] = ProcessPoolExecutor(
                     max_workers=worker_count,
                     mp_context=_ensure_mp_context(),
@@ -72,7 +82,7 @@ def _executor_host_main(request_q, event_q) -> None:
             if action == "stop_service":
                 service_id = str(payload.get("service_id", "") or "")
                 executor = service_executors.pop(service_id, None)
-                _shutdown_executor(executor, wait=False)
+                _shutdown_executor(executor, wait=True)
                 _send_response(request_id, ok=True)
                 return True
 
@@ -115,7 +125,7 @@ def _executor_host_main(request_q, event_q) -> None:
             if action == "stop_runtime_slot":
                 runtime_key = str(payload.get("runtime_key", "") or "")
                 executor = runtime_executors.pop(runtime_key, None)
-                _shutdown_executor(executor, wait=False)
+                _shutdown_executor(executor, wait=True)
                 _send_response(request_id, ok=True)
                 return True
 
@@ -176,6 +186,8 @@ def _executor_host_main(request_q, event_q) -> None:
         _shutdown_executor(executor, wait=True)
     for executor in list(runtime_executors.values()):
         _shutdown_executor(executor, wait=True)
+    if shutdown_request_id:
+        _send_response(shutdown_request_id, ok=True)
 
 
 class ExecutorHostClient:
@@ -220,7 +232,7 @@ class ExecutorHostClient:
             return
         self._closed = True
         try:
-            self._request("shutdown", timeout_sec=2.0)
+            self._request("shutdown", timeout_sec=30.0)
         except Exception:
             pass
         self._reader_stop.set()
