@@ -660,6 +660,66 @@ def test_service_session_http_supports_nested_dataframe_series_ndarray(tmp_path)
         state.close()
 
 
+def test_service_session_call_auto_resolves_object_ref_to_local_path(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-http-object-ref-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_http_object_ref"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    data_file = tmp_path / "shared.txt"
+    data_file.write_text("hello-object-ref\n", encoding="utf-8")
+
+    try:
+        blob = (
+            b"from pathlib import Path\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(dataset=None, **_kwargs):\n"
+            b"    return {\n"
+            b"        'cls': dataset.__class__.__name__,\n"
+            b"        'exists': bool(dataset.exists()),\n"
+            b"        'name': dataset.name,\n"
+            b"        'content': dataset.read_text(encoding='utf-8').strip(),\n"
+            b"    }\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            ref = client.upload_object_from_file(file_path=str(data_file), format="txt")
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-object-ref",
+                service_name="svc-object-ref",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_object_ref",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            resp = session.call("run", {"dataset": ref}, timeout_sec=10.0)
+        assert resp["ok"] is True
+        assert resp["data"]["cls"] == "PosixPath"
+        assert resp["data"]["exists"] is True
+        assert resp["data"]["name"].endswith(".txt")
+        assert resp["data"]["content"] == "hello-object-ref"
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
 def test_task_batch_grpc_supports_nested_dataframe_series_ndarray(tmp_path):
     pd = pytest.importorskip("pandas")
     np = pytest.importorskip("numpy")
@@ -735,6 +795,79 @@ def test_task_batch_grpc_supports_nested_dataframe_series_ndarray(tmp_path):
                 "series_name": "alpha",
                 "arr_sum": 12,
             }
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_batch_auto_resolves_object_ref_to_local_path(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-grpc-object-ref-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_grpc_object_ref"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    data_file = tmp_path / "shared-task.txt"
+    data_file.write_text("hello-task-object-ref\n", encoding="utf-8")
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-grpc-object-ref-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"def run(dataset=None, **_kwargs):\n"
+            b"    return {\n"
+            b"        'cls': dataset.__class__.__name__,\n"
+            b"        'exists': bool(dataset.exists()),\n"
+            b"        'name': dataset.name,\n"
+            b"        'content': dataset.read_text(encoding='utf-8').strip(),\n"
+            b"    }\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="grpc-object-ref-client",
+            job_id="job-grpc-object-ref",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_grpc_object_ref",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            ref = batch.put_object_from_file(str(data_file), format="txt")
+            submit = batch.submit_payloads([{"dataset": ref}])
+            assert len(submit.accepted) == 1
+
+            pulled = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled.results) == 1
+            assert pulled.results[0].status == pb2.TASK_STATUS_SUCCEEDED
+            result = dict(pulled.results[0].result)
+            assert result["cls"] == "PosixPath"
+            assert result["exists"] is True
+            assert result["name"].endswith(".txt")
+            assert result["content"] == "hello-task-object-ref"
     finally:
         server.stop(grace=0)
         state.close()

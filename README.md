@@ -175,6 +175,27 @@ group = DeployedService.deploy_from_infocenter(
 )
 ```
 
+如果你有一份**共享静态数据文件**要跟模块一起部署，当前可直接走 `module` / package 打包模式：
+
+```python
+import my_job.main
+from pycloud_parallel import DeployedService
+
+group = DeployedService.deploy_from_module(
+    infocenter_target="127.0.0.1:50051",
+    module=my_job.main,
+    runtime="py3",
+)
+```
+
+要求：
+
+1. 数据文件放在模块 / package 目录树内
+2. 代码里用 `Path(__file__)` 的相对路径读取
+3. 不要指望单文件 `.py` 模块自动带上旁边的兄弟数据文件
+
+完整说明见 [MODULE_DEPLOY_GUIDE.md](/Users/hankangkang/Documents/new_pycloud/docs/MODULE_DEPLOY_GUIDE.md)。
+
 ### 3. 任务模式
 
 ```python

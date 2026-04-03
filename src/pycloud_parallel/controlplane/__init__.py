@@ -9,6 +9,7 @@ import importlib
 from typing import Any
 
 _CLIENT_EXPORTS = {
+    "ObjectRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",
@@ -53,6 +54,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "ObjectRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",

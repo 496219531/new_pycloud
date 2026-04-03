@@ -5,7 +5,7 @@ import warnings
 
 from . import pycloud_v1_pb2 as pycloud__v1__pb2
 
-GRPC_GENERATED_VERSION = '1.78.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -42,6 +42,11 @@ class NodeControlServiceStub(object):
                 '/pycloud.v1.NodeControlService/UploadCode',
                 request_serializer=pycloud__v1__pb2.UploadCodeRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.UploadCodeResponse.FromString,
+                _registered_method=True)
+        self.UploadObject = channel.stream_unary(
+                '/pycloud.v1.NodeControlService/UploadObject',
+                request_serializer=pycloud__v1__pb2.UploadObjectRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.UploadObjectResponse.FromString,
                 _registered_method=True)
         self.TaskStream = channel.stream_stream(
                 '/pycloud.v1.NodeControlService/TaskStream',
@@ -113,6 +118,12 @@ class NodeControlServiceServicer(object):
     """
 
     def UploadCode(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UploadObject(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -197,6 +208,11 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     servicer.UploadCode,
                     request_deserializer=pycloud__v1__pb2.UploadCodeRequest.FromString,
                     response_serializer=pycloud__v1__pb2.UploadCodeResponse.SerializeToString,
+            ),
+            'UploadObject': grpc.stream_unary_rpc_method_handler(
+                    servicer.UploadObject,
+                    request_deserializer=pycloud__v1__pb2.UploadObjectRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.UploadObjectResponse.SerializeToString,
             ),
             'TaskStream': grpc.stream_stream_rpc_method_handler(
                     servicer.TaskStream,
@@ -290,6 +306,33 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/UploadCode',
             pycloud__v1__pb2.UploadCodeRequest.SerializeToString,
             pycloud__v1__pb2.UploadCodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UploadObject(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/pycloud.v1.NodeControlService/UploadObject',
+            pycloud__v1__pb2.UploadObjectRequest.SerializeToString,
+            pycloud__v1__pb2.UploadObjectResponse.FromString,
             options,
             channel_credentials,
             insecure,

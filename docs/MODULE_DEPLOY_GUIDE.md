@@ -93,6 +93,61 @@ result3 = submitter.cube(x=3)
 print(result3)  # {"value": 27}
 ```
 
+### 3. 共享静态数据文件（当前可行）
+
+如果有一份**共享的大数据文件**需要随模块一起部署，当前推荐做法是：
+
+1. 把数据文件放进模块 / package 目录树内部
+2. 通过 `module=...` 方式部署整个模块
+3. 在代码里通过 `__file__` 的相对路径访问数据文件
+
+推荐目录结构：
+
+```text
+my_job/
+  __init__.py
+  main.py
+  resources/
+    lookup.parquet
+```
+
+`main.py`：
+
+```python
+from pathlib import Path
+
+DATA_PATH = Path(__file__).resolve().parent / "resources" / "lookup.parquet"
+
+
+def run(key: str):
+    # 这里继续按本地相对路径习惯读取
+    data_bytes = DATA_PATH.read_bytes()
+    return {"key": key, "size": len(data_bytes)}
+```
+
+部署：
+
+```python
+import my_job.main
+from pycloud_parallel import DeployedService
+
+group = DeployedService.deploy_from_module(
+    infocenter_target="127.0.0.1:50051",
+    module=my_job.main,
+    runtime="py3.11",
+)
+```
+
+这个模式当前可以走通，因为 `module` 自动打包会把模块 / package 树里的**资源文件一起带上**，不只打包 `.py` 源码。相关回归测试见 [test_dependency_packager.py](/Users/hankangkang/Documents/new_pycloud/tests/test_dependency_packager.py#L33)。
+
+**边界：**
+
+- 适合“共享、静态、相对稳定”的数据文件
+- 数据文件必须放在模块 / package 树内
+- 推荐使用 `Path(__file__).resolve().parent / ...` 这种相对路径写法
+- 如果你传的是**单个 `.py` 文件模块**，不会自动把旁边的兄弟数据文件带上
+- 如果数据已经大到“每次部署都重新上传很慢”，后续应考虑独立数据引用 / 对象存储方案
+
 ---
 
 ## 🔄 三种部署方式对比

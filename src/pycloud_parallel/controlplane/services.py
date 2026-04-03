@@ -217,6 +217,106 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             created_at=dt_to_ts(artifact.created_at),
         )
 
+    def UploadObject(self, request_iterator: Iterable[pb2.UploadObjectRequest], context: grpc.ServicerContext) -> pb2.UploadObjectResponse:
+        meta = None
+        chunk_count = 0
+        size_bytes = 0
+        h = hashlib.sha256()
+        tmp_file = None
+        tmp_path = ""
+        for req in request_iterator:
+            kind = req.WhichOneof("body")
+            if kind == "meta":
+                if meta is not None:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("meta frame can only appear once")
+                    return pb2.UploadObjectResponse(
+                        ok=False,
+                        error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame can only appear once"),
+                    )
+                meta = req.meta
+            elif kind == "chunk":
+                if meta is None:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("meta frame must come before chunk frames")
+                    return pb2.UploadObjectResponse(
+                        ok=False,
+                        error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame must come before chunk frames"),
+                    )
+                if tmp_file is None:
+                    tmp_file = tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        prefix="pycloud-object-",
+                        suffix=_tempfile_suffix_for_package_format(meta.format or "bin"),
+                        delete=False,
+                        dir=str(self._state.object_dir),
+                    )
+                    tmp_path = tmp_file.name
+                part = req.chunk or b""
+                if part:
+                    tmp_file.write(part)
+                    h.update(part)
+                    size_bytes += len(part)
+                    chunk_count += 1
+
+        logger.info(
+            "[NodeControl] UploadObject peer=%s object_id=%s format=%s chunks=%d",
+            _peer(context),
+            (meta.object_id if meta is not None else ""),
+            (meta.format if meta is not None else ""),
+            chunk_count,
+        )
+
+        if meta is None:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("missing object metadata frame")
+            return pb2.UploadObjectResponse(
+                ok=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "missing object metadata frame"),
+            )
+
+        if tmp_file is None:
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix="pycloud-object-",
+                suffix=".bin",
+                delete=False,
+                dir=str(self._state.object_dir),
+            )
+            tmp_path = tmp_file.name
+
+        try:
+            tmp_file.close()
+            artifact, cached = self._state.put_object_from_uploaded_file(
+                object_id=meta.object_id,
+                format=meta.format,
+                uploaded_path=tmp_path,
+                actual_sha256=h.hexdigest(),
+                size_bytes=size_bytes,
+            )
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.UploadObjectResponse(
+                ok=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+
+        return pb2.UploadObjectResponse(
+            ok=True,
+            object_id=artifact.object_id,
+            format=artifact.format,
+            cached=cached,
+            size_bytes=artifact.size_bytes,
+            created_at=dt_to_ts(artifact.created_at),
+        )
+
     def SubmitTasks(self, request: pb2.SubmitTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
         logger.info(
             "[NodeControl] SubmitTasks peer=%s client_id=%s job_id=%s code_version=%s tasks=%d",

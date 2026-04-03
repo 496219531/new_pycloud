@@ -31,6 +31,15 @@ from google.protobuf import timestamp_pb2
 
 from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
+from pycloud_parallel.controlplane.object_ref import (
+    ObjectRef,
+    is_object_ref_payload,
+    normalize_object_format,
+    normalize_object_id,
+    object_id_from_sha256_hex,
+    object_ref_from_payload,
+    object_storage_path,
+)
 from pycloud_parallel.controlplane.runtime_spec import (
     matches_python_runtime,
     normalize_python_runtime_spec,
@@ -690,11 +699,42 @@ def _invoke_user_callable(fn, payload: dict):
     return fn(payload)
 
 
+class ObjectResolutionError(RuntimeError):
+    """Raised when an ObjectRef cannot be materialized on the node."""
+
+
+def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
+    root = Path(str(object_dir or "")).resolve()
+
+    def _resolve(value: Any) -> Any:
+        if isinstance(value, ObjectRef):
+            candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
+            if candidate.exists():
+                return candidate
+            digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
+            fallback = sorted(root.glob(f"{digest}*"))
+            if fallback:
+                return fallback[0]
+            raise ObjectResolutionError(f"object not found on node: {value.object_id}")
+        if isinstance(value, dict):
+            if is_object_ref_payload(value):
+                return _resolve(object_ref_from_payload(value))
+            return {key: _resolve(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_resolve(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_resolve(item) for item in value)
+        return value
+
+    return _resolve(payload)
+
+
 def _execute_payload_in_subprocess(
     artifact_path: str,
     entry_module: str,
     package_format: str,
     dependency_path: str,
+    object_dir: str,
     export_mode: str,
     export_methods: Sequence[str],
     export_decorator: str,
@@ -737,8 +777,11 @@ def _execute_payload_in_subprocess(
         fn = router.get(method)
         if fn is None:
             raise RuntimeError(f"method `{method}` not exported")
-        ret = _invoke_user_callable(fn, payload)
+        resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
+        ret = _invoke_user_callable(fn, resolved_payload)
         return _normalize_user_return(ret)
+    except ObjectResolutionError as exc:
+        return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc))
     except Exception as exc:
         return ("FAILED_USER", None, exc.__class__.__name__, repr(exc))
 
@@ -1134,6 +1177,15 @@ class CodeArtifact:
 
 
 @dataclass
+class ObjectArtifact:
+    object_id: str
+    path: str
+    format: str
+    size_bytes: int
+    created_at: datetime
+
+
+@dataclass
 class TaskState:
     """任务状态。
 
@@ -1292,6 +1344,7 @@ class NodeControlState:
         self._pending: Deque[str] = deque()
         self._tasks: Dict[str, TaskState] = {}
         self._codes: Dict[str, CodeArtifact] = {}
+        self._objects: Dict[str, ObjectArtifact] = {}
         self._runtime_slots: Dict[str, RuntimeSlotState] = {}
         self._runtime_waiting: Deque[str] = deque()
         self._services: Dict[str, ServiceSession] = {}
@@ -1302,6 +1355,8 @@ class NodeControlState:
 
         self._artifact_dir = Path(artifact_dir)
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._object_dir = self._artifact_dir / "_objects"
+        self._object_dir.mkdir(parents=True, exist_ok=True)
 
         self._stop_event = threading.Event()
         self._monitor = threading.Thread(target=self._monitor_loop, name="nodecontrol-monitor", daemon=True)
@@ -1346,6 +1401,10 @@ class NodeControlState:
     @property
     def artifact_dir(self) -> Path:
         return self._artifact_dir
+
+    @property
+    def object_dir(self) -> Path:
+        return self._object_dir
 
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
         digest = str(code_version or "").replace("sha256:", "").strip().lower()
@@ -1575,6 +1634,63 @@ class NodeControlState:
                 raise
         with self._lock:
             self._codes[code_version] = artifact
+        return artifact, False
+
+    def put_object_from_uploaded_file(
+        self,
+        *,
+        object_id: str,
+        format: str = "",
+        uploaded_path: str,
+        actual_sha256: str,
+        size_bytes: int,
+    ) -> Tuple[ObjectArtifact, bool]:
+        expected = normalize_object_id(object_id)
+        digest = str(actual_sha256 or "").strip().lower()
+        if not digest:
+            raise ValueError("empty uploaded object")
+        actual_object_id = object_id_from_sha256_hex(digest)
+        if expected and expected != actual_object_id:
+            raise ValueError(f"sha256 mismatch: expected={expected}, actual={actual_object_id}")
+
+        tmp_path = Path(uploaded_path)
+        if not tmp_path.exists():
+            raise ValueError(f"uploaded object missing: {uploaded_path}")
+
+        normalized_format = normalize_object_format(format, source_name=uploaded_path, default="bin")
+        with self._lock:
+            existing = self._objects.get(actual_object_id)
+            if existing is not None and Path(existing.path).exists():
+                return existing, True
+
+        now = utc_now()
+        final_path = object_storage_path(self._object_dir, object_id=actual_object_id, fmt=normalized_format)
+        if final_path.exists():
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            artifact = ObjectArtifact(
+                object_id=actual_object_id,
+                path=str(final_path),
+                format=normalized_format,
+                size_bytes=max(0, int(size_bytes)),
+                created_at=now,
+            )
+            with self._lock:
+                self._objects[actual_object_id] = artifact
+            return artifact, True
+
+        os.replace(str(tmp_path), str(final_path))
+        artifact = ObjectArtifact(
+            object_id=actual_object_id,
+            path=str(final_path),
+            format=normalized_format,
+            size_bytes=max(0, int(size_bytes)),
+            created_at=now,
+        )
+        with self._lock:
+            self._objects[actual_object_id] = artifact
         return artifact, False
 
     def put_code(
@@ -1812,6 +1928,7 @@ class NodeControlState:
                 artifact.entry_module,
                 artifact.package_format,
                 artifact.dependency_path,
+                str(self._object_dir),
                 artifact.export_mode,
                 artifact.export_methods,
                 artifact.export_decorator,
@@ -2352,6 +2469,7 @@ class NodeControlState:
                     artifact.entry_module,
                     artifact.package_format,
                     artifact.dependency_path,
+                    str(self._object_dir),
                     artifact.export_mode,
                     artifact.export_methods,
                     artifact.export_decorator,

@@ -7,6 +7,13 @@ from typing import Any, Optional
 from google.protobuf import json_format
 from google.protobuf import struct_pb2
 
+from pycloud_parallel.controlplane.object_ref import (
+    ObjectRef,
+    is_object_ref_payload,
+    object_ref_from_payload,
+    object_ref_to_payload,
+)
+
 
 def serialize_arrow_compatible(obj: Any) -> Any:
     """Recursively convert Arrow-compatible objects into JSON/Struct-safe data."""
@@ -23,6 +30,8 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
     """Internal recursive serializer with better error locations."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
+    if isinstance(obj, ObjectRef):
+        return object_ref_to_payload(obj)
 
     try:
         import numpy as np
@@ -83,7 +92,7 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
     raise TypeError(
         f"{path} has unsupported type {type(obj).__name__}; "
         "supported values are JSON scalars, list/tuple, dict, "
-        "pandas.DataFrame, pandas.Series, and numpy.ndarray"
+        "pandas.DataFrame, pandas.Series, numpy.ndarray, and ObjectRef"
     )
 
 
@@ -119,6 +128,8 @@ def convert_arrow_to_dict(obj: Any) -> dict:
 def convert_dict_to_arrow(data: Any) -> Any:
     """Restore tagged dict/list payloads back into pandas/numpy objects."""
     if isinstance(data, dict):
+        if is_object_ref_payload(data):
+            return object_ref_from_payload(data)
         obj_type = data.get("__type__")
         if obj_type == "DataFrame":
             try:

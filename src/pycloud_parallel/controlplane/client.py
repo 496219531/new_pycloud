@@ -34,6 +34,11 @@ from pycloud_parallel.controlplane.runtime_spec import (
     matches_python_runtime,
     normalize_python_runtime_spec,
 )
+from pycloud_parallel.controlplane.object_ref import (
+    ObjectRef,
+    normalize_object_format,
+    object_id_from_sha256_hex,
+)
 from pycloud_parallel.controlplane.serialization import dict_to_struct, serialize_arrow_compatible
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
@@ -1721,6 +1726,83 @@ class NodeControlClient:
             raise RuntimeError(_err_msg(resp.error, "upload code failed"))
         return resp
 
+    def upload_object_from_file(
+        self,
+        *,
+        file_path: str,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"file_path not found: {file_path}")
+        if not path.is_file():
+            raise ValueError(f"file_path must be a file: {file_path}")
+        return self._upload_object_from_local_file(
+            file_path=path,
+            format=normalize_object_format(format, source_name=path.name),
+            chunk_size=chunk_size,
+        )
+
+    def upload_object_from_bytes(
+        self,
+        *,
+        blob: bytes,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        digest = hashlib.sha256(blob).hexdigest()
+        object_id = object_id_from_sha256_hex(digest)
+        effective_format = normalize_object_format(format, default="bin")
+
+        def _iter() -> Iterator[pb2.UploadObjectRequest]:
+            yield pb2.UploadObjectRequest(
+                meta=pb2.UploadObjectMeta(
+                    object_id=object_id,
+                    format=effective_format,
+                )
+            )
+            for i in range(0, len(blob), max(1, int(chunk_size))):
+                yield pb2.UploadObjectRequest(chunk=blob[i : i + chunk_size])
+
+        resp = self.stub.UploadObject(_iter(), timeout=self.timeout_sec)
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
+        return ObjectRef(
+            object_id=resp.object_id or object_id,
+            format=resp.format or effective_format,
+            size_bytes=int(resp.size_bytes or len(blob)),
+        )
+
+    def _upload_object_from_local_file(
+        self,
+        *,
+        file_path: Path,
+        format: str,
+        chunk_size: int,
+    ) -> ObjectRef:
+        effective_format = normalize_object_format(format, source_name=file_path.name)
+        digest = _sha256_file(file_path)
+        object_id = object_id_from_sha256_hex(digest)
+
+        def _iter() -> Iterator[pb2.UploadObjectRequest]:
+            yield pb2.UploadObjectRequest(
+                meta=pb2.UploadObjectMeta(
+                    object_id=object_id,
+                    format=effective_format,
+                )
+            )
+            yield from (pb2.UploadObjectRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
+
+        resp = self.stub.UploadObject(_iter(), timeout=self.timeout_sec)
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
+        return ObjectRef(
+            object_id=resp.object_id or object_id,
+            format=resp.format or effective_format,
+            size_bytes=int(resp.size_bytes or file_path.stat().st_size),
+        )
+
     def _upload_code_from_local_file(
         self,
         *,
@@ -3215,6 +3297,52 @@ class TaskBatchClient:
             for node_id, client in self._clients.items()
         }
 
+    def put_object_from_file(
+        self,
+        file_path: str,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        refs = [
+            client.upload_object_from_file(
+                file_path=file_path,
+                format=format,
+                chunk_size=chunk_size,
+            )
+            for client in self._clients.values()
+        ]
+        if not refs:
+            raise RuntimeError("no node clients available for object upload")
+        object_ids = {ref.object_id for ref in refs}
+        formats = {ref.format for ref in refs}
+        if len(object_ids) != 1 or len(formats) != 1:
+            raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
+        return refs[0]
+
+    def put_object_from_bytes(
+        self,
+        blob: bytes,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        refs = [
+            client.upload_object_from_bytes(
+                blob=blob,
+                format=format,
+                chunk_size=chunk_size,
+            )
+            for client in self._clients.values()
+        ]
+        if not refs:
+            raise RuntimeError("no node clients available for object upload")
+        object_ids = {ref.object_id for ref in refs}
+        formats = {ref.format for ref in refs}
+        if len(object_ids) != 1 or len(formats) != 1:
+            raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
+        return refs[0]
+
     @property
     def node_ids(self) -> Sequence[str]:
         return list(self.nodes.keys())
@@ -4297,6 +4425,52 @@ class ServiceGroup:
                     "last_error": state.last_error,
                 }
         return out
+
+    def put_object_from_file(
+        self,
+        file_path: str,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        refs = [
+            client.upload_object_from_file(
+                file_path=file_path,
+                format=format,
+                chunk_size=chunk_size,
+            )
+            for client in self._clients.values()
+        ]
+        if not refs:
+            raise RuntimeError("no node clients available for object upload")
+        object_ids = {ref.object_id for ref in refs}
+        formats = {ref.format for ref in refs}
+        if len(object_ids) != 1 or len(formats) != 1:
+            raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
+        return refs[0]
+
+    def put_object_from_bytes(
+        self,
+        blob: bytes,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        refs = [
+            client.upload_object_from_bytes(
+                blob=blob,
+                format=format,
+                chunk_size=chunk_size,
+            )
+            for client in self._clients.values()
+        ]
+        if not refs:
+            raise RuntimeError("no node clients available for object upload")
+        object_ids = {ref.object_id for ref in refs}
+        formats = {ref.format for ref in refs}
+        if len(object_ids) != 1 or len(formats) != 1:
+            raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
+        return refs[0]
 
     def __enter__(self) -> "ServiceGroup":
         return self
@@ -5813,6 +5987,32 @@ class TaskSubmitter:
     def node_ids(self) -> Sequence[str]:
         """返回节点 ID 列表。"""
         return self._batch.node_ids
+
+    def put_object_from_file(
+        self,
+        file_path: str,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        return self._batch.put_object_from_file(
+            file_path,
+            format=format,
+            chunk_size=chunk_size,
+        )
+
+    def put_object_from_bytes(
+        self,
+        blob: bytes,
+        *,
+        format: str = "",
+        chunk_size: int = 256 * 1024,
+    ) -> ObjectRef:
+        return self._batch.put_object_from_bytes(
+            blob,
+            format=format,
+            chunk_size=chunk_size,
+        )
 
     def submit_payloads(
         self,
