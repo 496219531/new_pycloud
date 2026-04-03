@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.client import InfoCenterServiceRoute, NodeControlClient
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
+from pycloud_parallel.controlplane.serialization import serialize_inline_payload
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -56,6 +57,10 @@ class GatewayHttpApp:
             return 400, {"ok": False, "error": "invalid json body"}
         if not isinstance(payload, dict):
             return 400, {"ok": False, "error": "json body must be object"}
+        try:
+            payload, _, _ = serialize_inline_payload(payload, context="service call payload")
+        except ValueError as exc:
+            return 400, {"ok": False, "error": str(exc)}
 
         qs = parse_qs(parsed.query)
         timeout_sec = self.timeout_sec

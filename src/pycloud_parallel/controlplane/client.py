@@ -40,7 +40,12 @@ from pycloud_parallel.controlplane.object_ref import (
     normalize_object_format,
     object_id_from_sha256_hex,
 )
-from pycloud_parallel.controlplane.serialization import dict_to_struct, serialize_arrow_compatible
+from pycloud_parallel.controlplane.serialization import (
+    dict_to_struct,
+    serialize_arrow_compatible,
+    serialize_inline_payload,
+    validate_inline_payload_structs,
+)
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -310,6 +315,19 @@ def _serialize_arrow_compatible(obj: Any) -> Any:
         Any: 可 JSON 序列化的对象
     """
     return serialize_arrow_compatible(obj)
+
+
+def _serialize_http_call_payload(payload: Optional[Dict[str, object]], *, context: str) -> Dict[str, object]:
+    serialized_payload, _, _ = serialize_inline_payload(payload or {}, context=context)
+    return serialized_payload
+
+
+def _validate_task_submit_items(tasks: Sequence[pb2.TaskSubmitItem], *, request_context: str) -> None:
+    validate_inline_payload_structs(
+        [item.payload for item in tasks],
+        item_context="task payload",
+        request_context=request_context,
+    )
 
 
 def _get_local_ip() -> str:
@@ -1170,12 +1188,13 @@ class GatewayServiceClient:
         if token:
             headers["X-Service-Token"] = token
         params = urlencode({"timeout_sec": f"{max(0.1, float(timeout_sec)):.3f}"})
+        serialized_payload = _serialize_http_call_payload(payload, context="service call payload")
         return _http_json_request(
             base_url=self.base_url,
             path=f"/svc/{quote(name, safe='')}/call/{quote(method_name, safe='')}?{params}",
             method="POST",
             timeout_sec=max(self.timeout_sec, max(0.1, float(timeout_sec)) + 1.0),
-            payload=payload or {},
+            payload=serialized_payload,
             headers=headers,
         )
 
@@ -1407,7 +1426,7 @@ def _call_route_http(
     headers = {"Content-Type": "application/json"}
     if service_token:
         headers["X-Service-Token"] = service_token
-    serialized_payload = _serialize_arrow_compatible(payload or {})
+    serialized_payload = _serialize_http_call_payload(payload, context="service call payload")
     req = Request(
         url=url,
         method="POST",
@@ -1677,7 +1696,7 @@ class ServiceSessionClient:
         auth_token = self.service_token if token is None else token
         if auth_token:
             headers["X-Service-Token"] = auth_token
-        serialized_payload = _serialize_arrow_compatible(payload or {})
+        serialized_payload = _serialize_http_call_payload(payload, context="service call payload")
         req = Request(
             url=url,
             method="POST",
@@ -1952,6 +1971,7 @@ class NodeControlClient:
         execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
         job_id: str = "",
     ) -> pb2.SubmitTasksResponse:
+        _validate_task_submit_items(tasks, request_context="submit tasks request")
         resp = self.stub.SubmitTasks(
             pb2.SubmitTasksRequest(
                 client_id=client_id,
@@ -2304,11 +2324,12 @@ class NodeControlClient:
         timeout_sec: float = 60.0,
         service_token: str = "",
     ) -> pb2.CallServiceResponse:
+        _, payload_struct, _ = serialize_inline_payload(payload or {}, context="service call payload")
         resp = self.stub.CallService(
             pb2.CallServiceRequest(
                 service_id=service_id,
                 method=method,
-                payload=dict_to_struct(_serialize_arrow_compatible(payload or {})),
+                payload=payload_struct,
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=service_token or "",
             ),
@@ -2506,6 +2527,7 @@ class TaskStreamSession:
         timeout_sec: float = 0.0,
     ) -> pb2.SubmitTasksResponse:
         self._raise_if_failed()
+        _validate_task_submit_items(tasks, request_context="task stream submit request")
         request_id = uuid.uuid4().hex
         waiter: "queue.Queue[pb2.TaskStreamSubmitAck]" = queue.Queue(maxsize=1)
         with self._lock:
@@ -3224,10 +3246,11 @@ class TaskBatchClient:
         items: List[pb2.TaskSubmitItem] = []
         for payload in payloads:
             next_seq = self._next_submit_seq()
+            _, payload_struct, _ = serialize_inline_payload(payload or {}, context="task payload")
             items.append(
                 pb2.TaskSubmitItem(
                     task_id=f"{prefix}-{next_seq:04d}",
-                    payload=dict_to_struct(_serialize_arrow_compatible(payload or {})),
+                    payload=payload_struct,
                     timeout_hint_sec=max(0, int(timeout_hint_sec)),
                     priority=max(1, int(priority)),
                     runtime_key=normalized_runtime_key,

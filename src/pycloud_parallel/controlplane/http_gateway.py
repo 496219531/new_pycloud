@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from pycloud_parallel.controlplane.serialization import serialize_inline_payload
+
 
 InvokeHandler = Callable[[str, str, dict, str, float], Tuple[int, Dict[str, object]]]
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
@@ -62,6 +64,14 @@ class ServiceHttpGateway:
                         payload = json.loads(body.decode("utf-8") if body else "{}")
                     except Exception:
                         self._send_json(400, {"ok": False, "error": "invalid json body"})
+                        return
+                    if not isinstance(payload, dict):
+                        self._send_json(400, {"ok": False, "error": "json body must be object"})
+                        return
+                    try:
+                        payload, _, _ = serialize_inline_payload(payload, context="service call payload")
+                    except ValueError as exc:
+                        self._send_json(400, {"ok": False, "error": str(exc)})
                         return
                     token = self._extract_token()
                     code, resp = invoke_handler(service_id, method, payload, token, timeout_sec)

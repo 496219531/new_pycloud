@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Shared helpers for Arrow-compatible payload/result serialization."""
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from google.protobuf import json_format
 from google.protobuf import struct_pb2
@@ -13,6 +13,95 @@ from pycloud_parallel.controlplane.object_ref import (
     object_ref_from_payload,
     object_ref_to_payload,
 )
+
+INLINE_PAYLOAD_SOFT_LIMIT_BYTES = 256 * 1024
+INLINE_PAYLOAD_HARD_LIMIT_BYTES = 1024 * 1024
+INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = 4 * 1024 * 1024
+
+
+def _format_payload_bytes(size_bytes: int) -> str:
+    size = max(0, int(size_bytes or 0))
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.2f} MiB"
+    if size >= 1024:
+        return f"{size / 1024:.2f} KiB"
+    return f"{size} B"
+
+
+def _inline_payload_limit_hint() -> str:
+    return (
+        "Use put_data()/put_dataframe()/put_ndarray()/put_json()/"
+        "put_object_from_file()/put_object_from_bytes() and pass ObjectRef instead."
+    )
+
+
+def inline_payload_limit_error(size_bytes: int, *, limit_bytes: int, context: str) -> ValueError:
+    return ValueError(
+        f"{context} serialized to {_format_payload_bytes(size_bytes)}, "
+        f"which exceeds the inline limit {_format_payload_bytes(limit_bytes)}. "
+        f"{_inline_payload_limit_hint()}"
+    )
+
+
+def validate_inline_payload_size(size_bytes: int, *, limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES, context: str = "payload") -> int:
+    normalized = max(0, int(size_bytes or 0))
+    if normalized > max(1, int(limit_bytes)):
+        raise inline_payload_limit_error(normalized, limit_bytes=max(1, int(limit_bytes)), context=context)
+    return normalized
+
+
+def validate_inline_payload_struct(data: struct_pb2.Struct, *, limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES, context: str = "payload") -> int:
+    return validate_inline_payload_size(
+        int(data.ByteSize()),
+        limit_bytes=limit_bytes,
+        context=context,
+    )
+
+
+def validate_inline_request_size(size_bytes: int, *, limit_bytes: int = INLINE_PAYLOAD_REQUEST_LIMIT_BYTES, context: str = "payload request") -> int:
+    return validate_inline_payload_size(
+        size_bytes,
+        limit_bytes=limit_bytes,
+        context=context,
+    )
+
+
+def validate_inline_payload_structs(
+    payloads: Sequence[struct_pb2.Struct],
+    *,
+    item_context: str = "payload",
+    item_limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    request_context: str = "payload request",
+    request_limit_bytes: int = INLINE_PAYLOAD_REQUEST_LIMIT_BYTES,
+) -> int:
+    total_size = 0
+    total_count = len(payloads)
+    for index, payload in enumerate(payloads):
+        context = item_context if total_count == 1 else f"{item_context}[{index}]"
+        size_bytes = validate_inline_payload_struct(
+            payload,
+            limit_bytes=item_limit_bytes,
+            context=context,
+        )
+        total_size += size_bytes
+    return validate_inline_request_size(
+        total_size,
+        limit_bytes=request_limit_bytes,
+        context=request_context,
+    )
+
+
+def serialize_inline_payload(
+    data: Optional[dict],
+    *,
+    context: str = "payload",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> tuple[dict, struct_pb2.Struct, int]:
+    serialized = serialize_arrow_compatible(data or {})
+    out = struct_pb2.Struct()
+    out.update(serialized)
+    size_bytes = validate_inline_payload_struct(out, limit_bytes=limit_bytes, context=context)
+    return serialized, out, size_bytes
 
 
 def serialize_arrow_compatible(obj: Any) -> Any:

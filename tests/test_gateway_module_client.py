@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMIT_BYTES
+
 
 class TestGatewayConnect:
     def test_getattr_creates_proxy(self):
@@ -106,3 +108,14 @@ class TestGatewayConnect:
 
         with pytest.raises(NotImplementedError, match="does not support broadcast"):
             asyncio.run(_run())
+
+
+def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
+    from pycloud_parallel.controlplane.client import GatewayServiceClient
+
+    payload = {"blob": "x" * (INLINE_PAYLOAD_HARD_LIMIT_BYTES + 1024)}
+    client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
+    with patch("pycloud_parallel.controlplane.client._http_json_request") as mocked:
+        with pytest.raises(ValueError, match="ObjectRef"):
+            client.call(service_name="svc-demo", method="run", payload=payload, timeout_sec=5.0)
+    mocked.assert_not_called()

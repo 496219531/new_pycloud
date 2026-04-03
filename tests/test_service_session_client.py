@@ -2,13 +2,17 @@
 
 from concurrent import futures
 import hashlib
+import json
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import grpc
 import pytest
 
 from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient, TaskBatchClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
+from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMIT_BYTES, dict_to_struct
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -30,6 +34,10 @@ def _make_local_dependency_package(base_dir: Path, *, folder_name: str = "dep_pk
         encoding="utf-8",
     )
     return pkg_root
+
+
+def _oversized_inline_payload() -> dict:
+    return {"blob": "x" * (INLINE_PAYLOAD_HARD_LIMIT_BYTES + 1024)}
 
 
 def test_upload_code_preflight_rejects_bad_import(tmp_path):
@@ -1013,3 +1021,262 @@ def test_task_batch_put_dataframe_auto_resolves_to_dataframe(tmp_path):
         server.stop(grace=0)
         state.close()
         info_server.stop()
+
+
+def test_task_batch_submit_payloads_rejects_oversized_inline_payload(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-inline-limit-task-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_inline_limit_task"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-inline-limit-task-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"def run(blob=None, **_kwargs):\n"
+            b"    return {'size': len(str(blob or ''))}\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="inline-limit-task-client",
+            job_id="job-inline-limit-task",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_inline_limit",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as batch:
+            with pytest.raises(ValueError, match="ObjectRef"):
+                batch.submit_payloads([_oversized_inline_payload()])
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_submit_tasks_grpc_rejects_oversized_inline_payload_server_side(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-inline-limit-submit-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_inline_limit_submit"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            with pytest.raises(grpc.RpcError) as excinfo:
+                client.stub.SubmitTasks(
+                    pb2.SubmitTasksRequest(
+                        client_id="inline-limit-submit-client",
+                        code_version="sha256:test-inline-limit",
+                        tasks=[
+                            pb2.TaskSubmitItem(
+                                task_id="task-inline-limit-0001",
+                                payload=dict_to_struct(_oversized_inline_payload()),
+                            )
+                        ],
+                    ),
+                    timeout=5.0,
+                )
+        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "task payload" in excinfo.value.details()
+        assert "ObjectRef" in excinfo.value.details()
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_service_session_call_rejects_oversized_inline_payload_before_http(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-inline-limit-service-http-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_inline_limit_service_http"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(blob=None, **_kwargs):\n"
+            b"    return {'size': len(str(blob or ''))}\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-inline-limit-http",
+                service_name="svc-inline-limit-http",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_inline_limit_http",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            with pytest.raises(ValueError, match="ObjectRef"):
+                session.call("run", _oversized_inline_payload(), timeout_sec=10.0)
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_call_service_grpc_rejects_oversized_inline_payload_server_side(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-inline-limit-call-grpc-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_inline_limit_call_grpc"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(blob=None, **_kwargs):\n"
+            b"    return {'size': len(str(blob or ''))}\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-inline-limit-grpc",
+                service_name="svc-inline-limit-grpc",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_inline_limit_grpc",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            with pytest.raises(grpc.RpcError) as excinfo:
+                client.stub.CallService(
+                    pb2.CallServiceRequest(
+                        service_id=session.service_id,
+                        method="run",
+                        payload=dict_to_struct(_oversized_inline_payload()),
+                        timeout_sec=5.0,
+                        service_token=session.service_token,
+                    ),
+                    timeout=5.0,
+                )
+        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "service call payload" in excinfo.value.details()
+        assert "ObjectRef" in excinfo.value.details()
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_service_http_gateway_rejects_oversized_inline_payload_server_side(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-inline-limit-call-http-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_inline_limit_call_http"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(blob=None, **_kwargs):\n"
+            b"    return {'size': len(str(blob or ''))}\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-inline-limit-http-server",
+                service_name="svc-inline-limit-http-server",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_inline_limit_http_server",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+
+            req = Request(
+                f"{session.http_base_url}/call/run",
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Service-Token": session.service_token,
+                },
+                data=json.dumps(_oversized_inline_payload()).encode("utf-8"),
+            )
+            with pytest.raises(HTTPError) as excinfo:
+                urlopen(req, timeout=5.0)
+        assert excinfo.value.code == 400
+        body = json.loads(excinfo.value.read().decode("utf-8") or "{}")
+        assert body["ok"] is False
+        assert "ObjectRef" in body["error"]
+    finally:
+        server.stop(grace=0)
+        state.close()

@@ -40,7 +40,7 @@ classifiers = [
 ]
 dependencies = [
   "cloudpickle>=2.2.0",
-  "grpcio>=1.78.0",
+  "grpcio>=1.80.0",
   "protobuf>=6.31.1",
 ]
 
@@ -54,7 +54,7 @@ Documentation = "https://github.com/496219531/new_pycloud/tree/main/docs"
 # 可选依赖：按功能分组，减少基础安装体积。
 yaml = ["PyYAML>=6.0"]
 ray = ["ray>=2.9.0"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "grpcio-tools>=1.78.0"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "grpcio-tools>=1.80.0"]
 
 [project.scripts]
 pycloud-control = "pycloud_parallel.controlplane.server:main"

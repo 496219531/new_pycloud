@@ -14,6 +14,7 @@ from typing import Callable, Iterable, List, Optional
 import grpc
 
 from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict
+from pycloud_parallel.controlplane.serialization import validate_inline_payload_structs
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -341,6 +342,19 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 ok=False,
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "tasks cannot be empty"),
             )
+        try:
+            validate_inline_payload_structs(
+                [item.payload for item in request.tasks],
+                item_context="task payload",
+                request_context="submit tasks request",
+            )
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.SubmitTasksResponse(
+                ok=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
         accepted, rejected, credit = self._state.submit_tasks(request)
         logger.info(
             "[NodeControl] SubmitTasks result peer=%s accepted=%d rejected=%d credit=%d",
@@ -434,6 +448,24 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                                         job_id=submit.job_id,
                                         node_credit=int(self._state.metrics()["credit"]),
                                         error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "tasks cannot be empty"),
+                                    )
+                                )
+                            )
+                            continue
+                        try:
+                            validate_inline_payload_structs(
+                                [item.payload for item in submit.tasks],
+                                item_context="task payload",
+                                request_context="task stream submit request",
+                            )
+                        except ValueError as exc:
+                            _push(
+                                pb2.TaskStreamResponse(
+                                    submit_ack=pb2.TaskStreamSubmitAck(
+                                        request_id=submit.request_id,
+                                        job_id=submit.job_id,
+                                        node_credit=int(self._state.metrics()["credit"]),
+                                        error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
                                     )
                                 )
                             )
@@ -890,6 +922,21 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 service_id=request.service_id,
                 method=request.method,
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "service_id and method are required"),
+            )
+        try:
+            validate_inline_payload_structs(
+                [request.payload],
+                item_context="service call payload",
+                request_context="call service request",
+            )
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.CallServiceResponse(
+                ok=False,
+                service_id=request.service_id,
+                method=request.method,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
             )
 
         code, body = self._state.call_service(
