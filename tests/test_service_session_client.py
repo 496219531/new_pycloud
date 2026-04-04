@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 import grpc
 import pytest
 
-from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient, TaskBatchClient
+from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient, TaskBatchClient, TaskSubmitter
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMIT_BYTES, dict_to_struct
@@ -20,21 +20,34 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 
-def _make_local_dependency_package(base_dir: Path, *, folder_name: str = "dep_pkg") -> Path:
+def _make_dependency_package(
+    base_dir: Path,
+    *,
+    folder_name: str,
+    distribution_name: str,
+    module_name: str,
+    module_body: str,
+) -> Path:
     pkg_root = base_dir / folder_name
-    module_dir = pkg_root / "pycloud_local_dep"
+    module_dir = pkg_root / module_name
     module_dir.mkdir(parents=True, exist_ok=True)
     (pkg_root / "setup.py").write_text(
         "from setuptools import setup\n"
-        "setup(name='pycloud-local-dep', version='0.0.1', packages=['pycloud_local_dep'])\n",
+        f"setup(name={distribution_name!r}, version='0.0.1', packages={[module_name]!r})\n",
         encoding="utf-8",
     )
-    (module_dir / "__init__.py").write_text(
-        "def multiply(value):\n"
-        "    return int(value) * 10\n",
-        encoding="utf-8",
-    )
+    (module_dir / "__init__.py").write_text(module_body, encoding="utf-8")
     return pkg_root
+
+
+def _make_local_dependency_package(base_dir: Path, *, folder_name: str = "dep_pkg") -> Path:
+    return _make_dependency_package(
+        base_dir,
+        folder_name=folder_name,
+        distribution_name="pycloud-local-dep",
+        module_name="pycloud_local_dep",
+        module_body="def multiply(value):\n    return int(value) * 10\n",
+    )
 
 
 def _oversized_inline_payload() -> dict:
@@ -229,7 +242,117 @@ def test_create_service_allowlist_installs_missing_dep(tmp_path):
         state.close()
 
 
-def test_upload_code_cached_version_rejects_different_dependency_allowlist(tmp_path):
+def test_service_call_surfaces_runtime_missing_dependency_hint(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-service-runtime-dep-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    blob = (
+        b"def pycloud_export(fn):\n"
+        b"    fn.__pycloud_export__ = True\n"
+        b"    return fn\n\n"
+        b"@pycloud_export\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    from pycloud_missing_runtime_dep import times_two\n"
+        b"    return {'value': times_two(value)}\n"
+    )
+    try:
+        with NodeControlClient(target, timeout_sec=30.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-client",
+                service_name="svc-runtime-dep",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_runtime_dep",
+                entry_callable="run",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            with pytest.raises(RuntimeError, match=r"dependency_allowlist"):
+                session.call("run", {"value": 9}, timeout_sec=10.0)
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_service_call_dependency_allowlist_repairs_runtime_missing_dep(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-service-runtime-dep-allow-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    dep_pkg = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_runtime_call")
+    runtime_pkg_dir = dep_pkg / "pycloud_missing_runtime_dep"
+    runtime_pkg_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_pkg_dir / "__init__.py").write_text(
+        "def times_two(value):\n"
+        "    return int(value) * 2\n",
+        encoding="utf-8",
+    )
+    (dep_pkg / "setup.py").write_text(
+        "from setuptools import setup\n"
+        "setup(name='pycloud-runtime-dep', version='0.0.1', packages=['pycloud_local_dep', 'pycloud_missing_runtime_dep'])\n",
+        encoding="utf-8",
+    )
+
+    blob = (
+        b"def pycloud_export(fn):\n"
+        b"    fn.__pycloud_export__ = True\n"
+        b"    return fn\n\n"
+        b"@pycloud_export\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    from pycloud_missing_runtime_dep import times_two\n"
+        b"    return {'value': times_two(value)}\n"
+    )
+    try:
+        with NodeControlClient(target, timeout_sec=30.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-client",
+                service_name="svc-runtime-dep-fixed",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_runtime_dep_fixed",
+                entry_callable="run",
+                dependency_allowlist=[str(dep_pkg)],
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            resp = session.call("run", {"value": 9}, timeout_sec=10.0)
+            assert resp["ok"] is True
+            assert resp["data"]["value"] == 18
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_upload_code_cached_version_allows_dependency_allowlist_expansion(tmp_path):
     state = NodeControlState(
         node_id="node-client-upload-dep-mismatch-01",
         queue_capacity=16,
@@ -246,11 +369,21 @@ def test_upload_code_cached_version_rejects_different_dependency_allowlist(tmp_p
     target = f"127.0.0.1:{port}"
 
     dep_pkg_a = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_first")
-    dep_pkg_b = _make_local_dependency_package(tmp_path, folder_name="dep_pkg_second")
+    dep_pkg_b = _make_dependency_package(
+        tmp_path,
+        folder_name="dep_pkg_second",
+        distribution_name="pycloud-extra-dep",
+        module_name="pycloud_extra_dep",
+        module_body="def plus_five(value):\n    return int(value) + 5\n",
+    )
     blob = (
         b"from pycloud_local_dep import multiply\n\n"
-        b"def run(value=0, **_kwargs):\n"
-        b"    return {'value': multiply(value)}\n"
+        b"def run(value=0, use_extra=False, **_kwargs):\n"
+        b"    base = multiply(value)\n"
+        b"    if use_extra:\n"
+        b"        from pycloud_extra_dep import plus_five\n"
+        b"        return {'value': plus_five(base)}\n"
+        b"    return {'value': base}\n"
     )
     try:
         with NodeControlClient(target, timeout_sec=30.0) as client:
@@ -264,17 +397,18 @@ def test_upload_code_cached_version_rejects_different_dependency_allowlist(tmp_p
             )
             assert first.ok is True
 
-            with pytest.raises(grpc.RpcError) as excinfo:
-                client.upload_code_from_bytes(
-                    client_id="upload-client",
-                    blob=blob,
-                    runtime="py3",
-                    entry_module="dep_upload_same",
-                    entry_callable="run",
-                    dependency_allowlist=[str(dep_pkg_b)],
-                )
-        assert excinfo.value.code() == grpc.StatusCode.INVALID_ARGUMENT
-        assert "different dependency_allowlist" in excinfo.value.details()
+            second = client.upload_code_from_bytes(
+                client_id="upload-client",
+                blob=blob,
+                runtime="py3",
+                entry_module="dep_upload_same",
+                entry_callable="run",
+                dependency_allowlist=[str(dep_pkg_a), str(dep_pkg_b)],
+            )
+            assert second.ok is True
+            artifact = state._codes[first.code_version]
+            assert artifact.dependency_allowlist == (str(dep_pkg_a), str(dep_pkg_b))
+            assert (Path(artifact.dependency_path) / "pycloud_extra_dep").exists()
     finally:
         server.stop(grace=0)
         state.close()
@@ -521,6 +655,126 @@ def test_service_session_call_timeout_recycles_executor_and_next_call_succeeds(t
             resp = session.call("run", {"value": 5, "sleep_ms": 0}, timeout_sec=5.0)
             assert resp["ok"] is True
             assert resp["data"] == {"value": 5, "square": 25}
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_service_session_update_globals_applies_latest_digest_across_workers(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-session-managed-globals-01",
+        queue_capacity=16,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "code_cache_session_managed_globals"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"STATE = 'old'\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    import os\n"
+            b"    return {'pid': os.getpid(), 'state': STATE}\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-session-managed-globals",
+                service_name="svc-session-managed-globals",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_session_managed_globals",
+                entry_callable="run",
+                managed_global_names=["STATE"],
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            initial = session.call("run", {}, timeout_sec=5.0)
+            assert initial["ok"] is True
+            assert initial["data"]["state"] == "old"
+
+            update = session.update_globals({"STATE": "new"})
+            assert update.ok is True
+            assert update.globals_digest.startswith("sha256:")
+            assert list(update.updated_names) == ["STATE"]
+
+            with futures.ThreadPoolExecutor(max_workers=4) as pool:
+                responses = list(pool.map(lambda _: session.call("run", {}, timeout_sec=5.0), range(8)))
+
+            assert responses
+            assert all(item["ok"] is True for item in responses)
+            assert all(item["data"]["state"] == "new" for item in responses)
+            assert {item["data"]["pid"] for item in responses}
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_service_session_update_globals_large_json_auto_uploads_object_ref(tmp_path):
+    state = NodeControlState(
+        node_id="node-client-session-managed-globals-large-json-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_session_managed_globals_large_json"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        blob = (
+            b"CONFIG = {}\n\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    return {\n"
+            b"        'count': len(CONFIG.get('items', [])),\n"
+            b"        'first': CONFIG.get('items', [None])[0],\n"
+            b"        'last': CONFIG.get('items', [None])[-1],\n"
+            b"    }\n"
+        )
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-session-managed-globals-large-json",
+                service_name="svc-session-managed-globals-large-json",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_session_managed_globals_large_json",
+                entry_callable="run",
+                managed_global_names=["CONFIG"],
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+            )
+            values = {"items": list(range(100000))}
+            update = session.update_globals({"CONFIG": values})
+            assert update.ok is True
+
+            resp = session.call("run", {}, timeout_sec=5.0)
+            assert resp["ok"] is True
+            assert resp["data"] == {"count": 100000, "first": 0, "last": 99999}
     finally:
         server.stop(grace=0)
         state.close()
@@ -1520,6 +1774,343 @@ def test_task_batch_dataframe_result_returns_result_ref_and_fetches(tmp_path):
             assert result_value.node_id == "node-client-result-ref-df-01"
             frame = batch.fetch_result_data(pulled.results[0])
             assert list(frame["x"]) == [7, 8, 9]
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_submitter_call_dataframe_result_auto_fetches(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-submitter-result-ref-df-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_submitter_result_ref_df"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-submitter-result-ref-df-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"import pandas as pd\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
+            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}, {'x': value + 2}])\n"
+        )
+        with TaskSubmitter.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="submitter-result-ref-df-client",
+            job_id="job-submitter-result-ref-df",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_submitter_result_ref_df",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as task:
+            results = task.run(value=7)
+            assert len(results) == 1
+            frame = results[0]
+            assert isinstance(frame, pd.DataFrame)
+            assert list(frame["x"]) == [7, 8, 9]
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_submitter_wait_for_results_inlines_result_ref(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-submitter-inline-result-ref-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_submitter_inline_result_ref"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-submitter-inline-result-ref-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"import pandas as pd\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    value = int(value)\n"
+            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}])\n"
+        )
+        with TaskSubmitter.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="submitter-inline-result-ref-client",
+            job_id="job-submitter-inline-result-ref",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_submitter_inline_result_ref",
+            entry_callable="run",
+            timeout_sec=10.0,
+        ) as task:
+            submit = task.run.submit(value=5)
+            assert len(submit.accepted) == 1
+
+            results = task.wait_for_results(expected_count=1, timeout_sec=10.0, wait_ms=3000)
+            assert len(results) == 1
+            data = struct_to_dict(results[0].result)
+            assert isinstance(data, pd.DataFrame)
+            assert list(data["x"]) == [5, 6]
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_batch_update_globals_uses_digest_and_runtime_scope(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-task-managed-globals-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_task_managed_globals"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-task-managed-globals-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"STATE = 'old'\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'state': STATE}\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="task-managed-globals-client",
+            job_id="job-task-managed-globals",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_managed_globals",
+            entry_callable="run",
+            managed_global_names=["STATE"],
+            timeout_sec=10.0,
+        ) as batch:
+            first = batch.submit_payloads([{}], runtime_key="managed-rt")
+            assert len(first.accepted) == 1
+            first_results = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(first_results.results) == 1
+            assert struct_to_dict(first_results.results[0].result) == {"state": "old"}
+
+            globals_digest = batch.update_globals({"STATE": "new"}, runtime_key="managed-rt")
+            assert globals_digest.startswith("sha256:")
+
+            second = batch.submit_payloads([{}], runtime_key="managed-rt")
+            assert len(second.accepted) == 1
+            second_results = batch.pull_results(limit=10, wait_ms=3000)
+            assert len(second_results.results) == 1
+            assert struct_to_dict(second_results.results[0].result) == {"state": "new"}
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_batch_update_globals_isolated_by_client_id(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-task-managed-globals-isolated-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_task_managed_globals_isolated"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-task-managed-globals-isolated-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"STATE = 'old'\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'state': STATE}\n"
+        )
+        with TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="task-managed-globals-client-a",
+            job_id="job-task-managed-globals-a",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_managed_globals_client_a",
+            entry_callable="run",
+            managed_global_names=["STATE"],
+            timeout_sec=10.0,
+        ) as batch_a, TaskBatchClient.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="task-managed-globals-client-b",
+            job_id="job-task-managed-globals-b",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_managed_globals_client_b",
+            entry_callable="run",
+            managed_global_names=["STATE"],
+            timeout_sec=10.0,
+        ) as batch_b:
+            digest_a = batch_a.update_globals({"STATE": "client-a"}, runtime_key="shared-rt")
+            digest_b = batch_b.update_globals({"STATE": "client-b"}, runtime_key="shared-rt")
+            assert digest_a.startswith("sha256:")
+            assert digest_b.startswith("sha256:")
+
+            resp_a = batch_a.submit_payloads([{}], runtime_key="shared-rt")
+            assert len(resp_a.accepted) == 1
+            pulled_a = batch_a.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled_a.results) == 1
+            assert struct_to_dict(pulled_a.results[0].result) == {"state": "client-a"}
+
+            resp_b = batch_b.submit_payloads([{}], runtime_key="shared-rt")
+            assert len(resp_b.accepted) == 1
+            pulled_b = batch_b.pull_results(limit=10, wait_ms=3000)
+            assert len(pulled_b.results) == 1
+            assert struct_to_dict(pulled_b.results[0].result) == {"state": "client-b"}
+    finally:
+        server.stop(grace=0)
+        state.close()
+        info_server.stop()
+
+
+def test_task_submitter_call_treats_runtime_key_as_control_param(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    state = NodeControlState(
+        node_id="node-client-task-submitter-runtime-key-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_task_submitter_runtime_key"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    target = f"127.0.0.1:{port}"
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="node-client-task-submitter-runtime-key-01",
+                control_addr=target,
+                capacity=8,
+                queue_capacity=16,
+                tags=["compute"],
+                services=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+            )
+
+        blob = (
+            b"STATE = 'old'\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'state': STATE}\n"
+        )
+        with TaskSubmitter.from_infocenter(
+            infocenter_target=info_server.base_url,
+            client_id="task-submitter-runtime-key-client",
+            job_id="job-task-submitter-runtime-key",
+            blob=blob,
+            runtime="py3",
+            entry_module="task_submitter_runtime_key",
+            entry_callable="run",
+            managed_global_names=["STATE"],
+            timeout_sec=10.0,
+        ) as task:
+            task.update_globals({"STATE": "new"}, runtime_key="call-rt")
+            result = task.run(runtime_key="call-rt")
+            assert result == [{"state": "new"}]
     finally:
         server.stop(grace=0)
         state.close()

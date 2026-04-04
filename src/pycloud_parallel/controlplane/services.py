@@ -9,11 +9,12 @@ import queue
 import tempfile
 import time
 import threading
+from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
 import grpc
 
-from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict
+from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict, touch_object_last_at
 from pycloud_parallel.controlplane.serialization import dict_to_struct, validate_inline_payload_structs
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
@@ -174,6 +175,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             tmp_file.close()
             export_spec = meta.export_spec
             artifact, cached = self._state.put_code_from_uploaded_file(
+                client_id=meta.client_id,
                 sha256=meta.sha256,
                 runtime=meta.runtime,
                 entry_module=meta.entry_module,
@@ -183,10 +185,16 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 export_methods=list(export_spec.methods),
                 export_decorator=export_spec.decorator,
                 dependency_allowlist=list(meta.dependency_allowlist),
+                managed_global_names=list(meta.managed_global_names),
+                code_token=meta.code_token,
                 uploaded_path=tmp_path,
                 actual_sha256=h.hexdigest(),
                 size_bytes=size_bytes,
                 validate_load=True,
+            )
+            effective_code_token = self._state.get_client_code_token(
+                client_id=meta.client_id,
+                code_version=artifact.code_version,
             )
         except ValueError as exc:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
@@ -216,6 +224,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             cached=cached,
             size_bytes=artifact.size_bytes,
             created_at=dt_to_ts(artifact.created_at),
+            code_token=effective_code_token,
         )
 
     def UploadObject(self, request_iterator: Iterable[pb2.UploadObjectRequest], context: grpc.ServicerContext) -> pb2.UploadObjectResponse:
@@ -336,6 +345,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             return
 
         try:
+            touch_object_last_at(self._state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.path))
             with open(artifact.path, "rb") as fp:
                 while True:
                     part = fp.read(256 * 1024)
@@ -649,6 +659,61 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             )
         )
 
+    def UpdateRuntimeGlobals(
+        self,
+        request: pb2.UpdateRuntimeGlobalsRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.UpdateRuntimeGlobalsResponse:
+        logger.info(
+            "[NodeControl] UpdateRuntimeGlobals peer=%s client_id=%s code_version=%s runtime_key=%s",
+            _peer(context),
+            request.client_id,
+            request.code_version,
+            request.runtime_key,
+        )
+        try:
+            globals_digest, updated_names = self._state.update_runtime_globals(
+                client_id=request.client_id,
+                code_version=request.code_version,
+                runtime_key=request.runtime_key,
+                code_token=request.code_token,
+                values=struct_to_dict(request.values),
+            )
+            return pb2.UpdateRuntimeGlobalsResponse(
+                ok=True,
+                code_version=request.code_version,
+                runtime_key=request.runtime_key or request.code_version,
+                globals_digest=globals_digest,
+                updated_names=updated_names,
+            )
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.UpdateRuntimeGlobalsResponse(
+                ok=False,
+                code_version=request.code_version,
+                runtime_key=request.runtime_key or request.code_version,
+                error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)),
+            )
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.UpdateRuntimeGlobalsResponse(
+                ok=False,
+                code_version=request.code_version,
+                runtime_key=request.runtime_key or request.code_version,
+                error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)),
+            )
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.UpdateRuntimeGlobalsResponse(
+                ok=False,
+                code_version=request.code_version,
+                runtime_key=request.runtime_key or request.code_version,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
+
     def PullResults(self, request: pb2.PullResultsRequest, context: grpc.ServicerContext) -> pb2.PullResultsResponse:
         logger.info(
             "[NodeControl] PullResults peer=%s client_id=%s limit=%d wait_ms=%d",
@@ -859,6 +924,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 export_methods=list(export_spec.methods),
                 export_decorator=export_spec.decorator,
                 dependency_allowlist=list(meta.dependency_allowlist),
+                managed_global_names=list(meta.managed_global_names),
                 worker_count=meta.worker_count,
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
                 idle_ttl_sec=meta.idle_ttl_sec,
@@ -1026,6 +1092,55 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             method=request.method,
             data=dict_to_struct(body.get("data", {})),
         )
+
+    def UpdateServiceGlobals(
+        self,
+        request: pb2.UpdateServiceGlobalsRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        logger.info(
+            "[NodeControl] UpdateServiceGlobals peer=%s service_id=%s owner_client_id=%s",
+            _peer(context),
+            request.service_id,
+            request.owner_client_id,
+        )
+        try:
+            globals_digest, updated_names = self._state.update_service_globals(
+                owner_client_id=request.owner_client_id,
+                service_id=request.service_id,
+                service_token=request.service_token,
+                values=struct_to_dict(request.values),
+            )
+            return pb2.UpdateServiceGlobalsResponse(
+                ok=True,
+                service_id=request.service_id,
+                globals_digest=globals_digest,
+                updated_names=updated_names,
+            )
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.UpdateServiceGlobalsResponse(
+                ok=False,
+                service_id=request.service_id,
+                error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)),
+            )
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.UpdateServiceGlobalsResponse(
+                ok=False,
+                service_id=request.service_id,
+                error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)),
+            )
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.UpdateServiceGlobalsResponse(
+                ok=False,
+                service_id=request.service_id,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
 
     def HeartbeatService(
         self,

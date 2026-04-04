@@ -179,6 +179,7 @@ service NodeControlService {
   rpc UploadCode(stream UploadCodeRequest) returns (UploadCodeResponse);
   rpc UploadObject(stream UploadObjectRequest) returns (UploadObjectResponse);
   rpc DownloadObject(DownloadObjectRequest) returns (stream DownloadObjectChunk);
+  rpc UpdateRuntimeGlobals(UpdateRuntimeGlobalsRequest) returns (UpdateRuntimeGlobalsResponse);
   rpc TaskStream(stream TaskStreamRequest) returns (stream TaskStreamResponse);
   rpc SubmitTasks(SubmitTasksRequest) returns (SubmitTasksResponse);
   rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
@@ -188,6 +189,7 @@ service NodeControlService {
   rpc CreateService(stream CreateServiceRequest) returns (CreateServiceResponse);
   rpc ListServiceMethods(ListServiceMethodsRequest) returns (ListServiceMethodsResponse);
   rpc CallService(CallServiceRequest) returns (CallServiceResponse);
+  rpc UpdateServiceGlobals(UpdateServiceGlobalsRequest) returns (UpdateServiceGlobalsResponse);
   rpc HeartbeatService(HeartbeatServiceRequest) returns (HeartbeatServiceResponse);
   rpc EndService(EndServiceRequest) returns (EndServiceResponse);
   rpc GetServiceStatus(GetServiceStatusRequest) returns (GetServiceStatusResponse);
@@ -208,6 +210,8 @@ message UploadCodeMeta {
   string package_format = 6; // py | tar.gz | zip | whl
   ModuleExportSpec export_spec = 7;
   repeated string dependency_allowlist = 8;
+  repeated string managed_global_names = 9;
+  string code_token = 10;
 }
 
 message UploadCodeRequest {
@@ -224,6 +228,7 @@ message UploadCodeResponse {
   int64 size_bytes = 4;
   google.protobuf.Timestamp created_at = 5;
   Error error = 6;
+  string code_token = 7;
 }
 
 message UploadObjectMeta {
@@ -257,6 +262,23 @@ message DownloadObjectChunk {
   string format = 2;
   int64 size_bytes = 3;
   bytes chunk = 4;
+}
+
+message UpdateRuntimeGlobalsRequest {
+  string client_id = 1;
+  string code_version = 2;
+  string runtime_key = 3;
+  string code_token = 4;
+  google.protobuf.Struct values = 5;
+}
+
+message UpdateRuntimeGlobalsResponse {
+  bool ok = 1;
+  string code_version = 2;
+  string runtime_key = 3;
+  string globals_digest = 4;
+  repeated string updated_names = 5;
+  Error error = 6;
 }
 
 message TaskSubmitItem {
@@ -467,6 +489,7 @@ message CreateServiceMeta {
   string package_format = 11; // py | tar.gz | zip | whl
   ModuleExportSpec export_spec = 12;
   repeated string dependency_allowlist = 13;
+  repeated string managed_global_names = 14;
 }
 
 message CreateServiceRequest {
@@ -522,6 +545,21 @@ message CallServiceResponse {
   google.protobuf.Struct data = 4;
   TaskError task_error = 5;
   Error error = 6;
+}
+
+message UpdateServiceGlobalsRequest {
+  string owner_client_id = 1;
+  string service_id = 2;
+  string service_token = 3;
+  google.protobuf.Struct values = 4;
+}
+
+message UpdateServiceGlobalsResponse {
+  bool ok = 1;
+  string service_id = 2;
+  string globals_digest = 3;
+  repeated string updated_names = 4;
+  Error error = 5;
 }
 
 message HeartbeatServiceRequest {

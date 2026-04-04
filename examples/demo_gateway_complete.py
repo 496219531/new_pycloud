@@ -14,6 +14,7 @@ from pycloud_parallel.controlplane.client import GatewayServiceClient
 from pycloud_parallel import (
     DeployedService,
     GatewayConnect,
+    pycloud_export,
 )
 
 
@@ -35,9 +36,7 @@ def main():
     print("-" * 60)
 
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
         b"def square(x):\n"
         b"    return {'x': x, 'y': x * x}\n"
@@ -54,7 +53,6 @@ def main():
         runtime="py3",
         entry_module="square_service",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
         tags=["compute"],

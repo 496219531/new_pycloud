@@ -138,7 +138,7 @@ group = DeployedService.deploy_from_module(
 )
 ```
 
-这个模式当前可以走通，因为 `module` 自动打包会把模块 / package 树里的**资源文件一起带上**，不只打包 `.py` 源码。相关回归测试见 [test_dependency_packager.py](/Users/hankangkang/Documents/new_pycloud/tests/test_dependency_packager.py#L33)。
+这个模式当前可以走通，因为 `module` 自动打包会把模块 / package 树里的**资源文件一起带上**，不只打包 `.py` 源码。相关回归测试见 [test_dependency_packager.py](../tests/test_dependency_packager.py#L33)。
 
 **边界：**
 

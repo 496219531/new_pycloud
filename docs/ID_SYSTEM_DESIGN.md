@@ -227,7 +227,7 @@ with TaskBatchClient.from_infocenter(
 ## 测试覆盖
 
 ```python
-# tests/test_id_generation.py
+# tests/test_task_id_generation.py
 
 def test_client_id_auto_generation():
     """测试 client_id 自动生成"""

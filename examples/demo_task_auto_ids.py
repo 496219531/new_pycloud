@@ -71,8 +71,8 @@ def demo_manual_ids():
     print()
 
     blob = (
-        b"def run(payload):\n"
-        b"    value = int(payload.get('value', 0))\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    value = int(value)\n"
         b"    return {'value': value, 'square': value * value}\n"
     )
 
@@ -109,8 +109,8 @@ def demo_uniqueness():
     print()
 
     blob = (
-        b"def run(payload):\n"
-        b"    return {'value': payload.get('value', 0)}\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': value}\n"
     )
 
     # 创建多个实例，每个实例的 ID 都不同

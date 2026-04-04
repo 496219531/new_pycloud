@@ -36,7 +36,6 @@ submitter = TaskSubmitter.from_infocenter(
     package_format="tar.gz",
     export_mode="single",
     export_methods=None,
-    export_decorator="",
     chunk_size=256*1024,
     healthy_only=True,
     tags=["compute"],
@@ -165,7 +164,6 @@ submitter = TaskSubmitter.from_infocenter(
     package_format="tar.gz",              # ← 自动推断
     export_mode="single",                 # ← 自动推断
     export_methods=None,                  # ← 自动推断
-    export_decorator="",                  # ← 自动推断
     chunk_size=256*1024,                  # ← 使用默认值
     healthy_only=True,                    # ← 使用默认值
     ...

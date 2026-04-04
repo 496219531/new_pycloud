@@ -5,6 +5,8 @@ TaskSubmitter 位置参数演示
 展示如何使用位置参数、命名参数或混合方式提交任务。
 """
 
+import time
+
 from pycloud_parallel import TaskSubmitter
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -17,18 +19,7 @@ def main():
 
     # 任务代码
     blob = (
-        b"def run(payload):\n"
-        b"    if isinstance(payload, dict):\n"
-        b"        if 'args' in payload or 'kwargs' in payload:\n"
-        b"            args = payload.get('args', [])\n"
-        b"            kwargs = payload.get('kwargs', {})\n"
-        b"            return compute(*args, **kwargs)\n"
-        b"        else:\n"
-        b"            x = payload.get('x', 0)\n"
-        b"            y = payload.get('y', 0)\n"
-        b"            return compute(x, y)\n"
-        b"    return compute(0, 0)\n\n"
-        b"def compute(x, y=1):\n"
+        b"def run(x=0, y=1, **_kwargs):\n"
         b"    return {'x': x, 'y': y, 'product': x * y}\n"
     )
 
@@ -43,6 +34,7 @@ def main():
         entry_callable="run",
         tags=["compute"],
         node_count=2,
+        job_id=f"task-positional-{int(time.time())}",
     )
 
     print(f"✓ 客户端创建成功")
@@ -56,12 +48,8 @@ def main():
     print("-" * 60)
     results = task.run(7)
     print(f"task.run(7):")
-    for result in results:
-        status_name = pb2.TaskStatus.Name(result.status)
-        if result.result:
-            from google.protobuf import json_format
-            data = json_format.MessageToDict(result.result, preserving_proto_field_name=True)
-            print(f"  task_id={result.task_id} status={status_name} result={data}")
+    for i, result in enumerate(results, 1):
+        print(f"  [{i}] {result}")
     print()
 
     # 测试 2: 命名参数
@@ -69,12 +57,8 @@ def main():
     print("-" * 60)
     results = task.run(x=5, y=3)
     print(f"task.run(x=5, y=3):")
-    for result in results:
-        status_name = pb2.TaskStatus.Name(result.status)
-        if result.result:
-            from google.protobuf import json_format
-            data = json_format.MessageToDict(result.result, preserving_proto_field_name=True)
-            print(f"  task_id={result.task_id} status={status_name} result={data}")
+    for i, result in enumerate(results, 1):
+        print(f"  [{i}] {result}")
     print()
 
     # 测试 3: 混合参数
@@ -82,12 +66,8 @@ def main():
     print("-" * 60)
     results = task.run(10, y=2)
     print(f"task.run(10, y=2):")
-    for result in results:
-        status_name = pb2.TaskStatus.Name(result.status)
-        if result.result:
-            from google.protobuf import json_format
-            data = json_format.MessageToDict(result.result, preserving_proto_field_name=True)
-            print(f"  task_id={result.task_id} status={status_name} result={data}")
+    for i, result in enumerate(results, 1):
+        print(f"  [{i}] {result}")
     print()
 
     # 测试 4: 批量提交

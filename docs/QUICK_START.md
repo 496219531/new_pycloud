@@ -1,5 +1,20 @@
 # 快速开始
 
+## 0. 模式定位
+
+建议先把三层角色区分开：
+
+1. `Task Mode`
+   - 重计算执行层
+   - 更适合 CPU 密集型任务、批处理、高吞吐执行
+2. `Service Mode`
+   - 常驻函数服务层
+   - 更适合作为内部 RPC / 内部函数服务层
+   - 当前不是标准 ASGI/WSGI 网络服务运行时
+3. `External Web Layer`
+   - 真正对外的轻网络入口层
+   - 如果需要标准 Web 服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
+
 ## 1. 启动服务
 
 ```bash
@@ -38,11 +53,11 @@ from pycloud_parallel import (
 含义：
 
 1. `DeployedService`
-   - owner 侧部署服务
+   - owner 侧部署内部函数服务
 2. `TaskSubmitter`
    - 任务模式模块化客户端
 3. `GatewayConnect`
-   - 通过 Gateway 调用服务
+   - 通过 Gateway 调用内部函数服务
 4. `DirectConnect`
    - 客户端发现后直连实例
 
@@ -56,6 +71,8 @@ print(parallel_for(range(5), lambda i: i + 10, max_workers=2))
 ```
 
 ## 4. 服务模式
+
+当前更建议把这里理解成“常驻函数服务层”，而不是直接对外的 Web 服务层。
 
 ```python
 from pycloud_parallel import DeployedService
@@ -155,6 +172,8 @@ with TaskBatchClient.from_infocenter(
 
 ## 6. Gateway 调用
 
+`Gateway` 当前服务的是内部函数服务 caller，不承担任务模式，也不等同于标准 Web 应用入口。
+
 ```python
 from pycloud_parallel import GatewayConnect
 
@@ -179,7 +198,7 @@ print(client.square.sync(x=11))
 ```bash
 python examples/grpc_task_client_demo.py
 python examples/grpc_register_service_client_demo.py
-python examples/demo_gateway_client.py
+python examples/demo_gateway_client.py --service-name square-service
 python examples/demo_gateway_module_client.py
 python examples/demo_service_module_group.py
 ```
@@ -210,5 +229,5 @@ python examples/demo_service_module_group.py
 1. 默认严格校验，缺依赖直接报错
 2. 显式传 `dependency_allowlist` 后，节点才会尝试补装
 3. 支持本地路径、wheel 路径、普通 pip requirement 字符串
-4. 安装目录位于节点 `code_cache/<sha>_deps`
+4. 安装目录位于节点 `code_cache/codes/<sha>/deps`
 5. 同一 `code_version` 不允许混用不同白名单

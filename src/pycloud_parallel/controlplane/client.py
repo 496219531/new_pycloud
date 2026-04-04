@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import socket
 import sys
 import tarfile
@@ -42,6 +43,7 @@ from pycloud_parallel.controlplane.object_ref import (
 )
 from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import (
+    INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     convert_dict_to_arrow,
     dict_to_struct,
     serialize_arrow_compatible,
@@ -56,6 +58,9 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 def pycloud_export(fn):
     fn.__pycloud_export__ = True
     return fn
+
+
+_DEFAULT_EXPORT_DECORATOR = "pycloud_export"
 
 
 def _auto_package_function(func: Callable) -> bytes:
@@ -380,6 +385,87 @@ def _extract_result_ref(value: object) -> Optional[ResultRef]:
     return None
 
 
+def _resolve_high_level_service_data(group: object, *, node_id: str, response: Dict[str, object]):
+    if not isinstance(response, dict) or "data" not in response:
+        return response
+    result_ref = _extract_result_ref(response)
+    if result_ref is None:
+        return response.get("data", response)
+
+    sessions = getattr(group, "sessions", None)
+    if isinstance(sessions, dict) and node_id in sessions:
+        return sessions[node_id].fetch_result_data(response)
+
+    fetcher = getattr(group, "fetch_result_data", None)
+    if callable(fetcher):
+        return fetcher(response)
+
+    return response.get("data", response)
+
+
+def _resolve_high_level_service_results(
+    group: object,
+    *,
+    results: Sequence[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]],
+) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:
+    resolved: List[Tuple[Optional[str], Optional[object], Optional[Exception]]] = []
+    for node_id, response, error in results:
+        if error is not None or node_id is None or response is None:
+            resolved.append((node_id, response, error))
+            continue
+        resolved.append(
+            (
+                node_id,
+                _resolve_high_level_service_data(group, node_id=node_id, response=response),
+                error,
+            )
+        )
+    return resolved
+
+
+def _resolve_task_results_data(batch: "TaskBatchClient", results: Sequence[pb2.TaskResult]) -> List[Any]:
+    return [batch.fetch_result_data(item) for item in results]
+
+
+def _inline_task_result_data(task_result: pb2.TaskResult, *, data: Any) -> pb2.TaskResult:
+    serialized = serialize_arrow_compatible(data)
+    wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
+    resolved = pb2.TaskResult()
+    resolved.CopyFrom(task_result)
+    resolved.result.Clear()
+    resolved.result.update(wrapped)
+    return resolved
+
+
+def _resolve_high_level_task_result(batch: "TaskBatchClient", task_result: pb2.TaskResult) -> pb2.TaskResult:
+    if int(task_result.status) != int(pb2.TASK_STATUS_SUCCEEDED):
+        return task_result
+    data = struct_to_dict(task_result.result)
+    if not isinstance(data, ResultRef):
+        return task_result
+    resolved_data = batch.fetch_result_data(task_result)
+    try:
+        return _inline_task_result_data(task_result, data=resolved_data)
+    except TypeError:
+        # Bytes/path-like values cannot be represented by protobuf Struct; keep the raw ResultRef envelope.
+        return task_result
+
+
+def _resolve_high_level_task_results(batch: "TaskBatchClient", results: Sequence[pb2.TaskResult]) -> List[pb2.TaskResult]:
+    return [_resolve_high_level_task_result(batch, item) for item in results]
+
+
+def _resolve_high_level_pull_results_response(
+    batch: "TaskBatchClient",
+    response: pb2.PullResultsResponse,
+) -> pb2.PullResultsResponse:
+    resolved = pb2.PullResultsResponse()
+    resolved.CopyFrom(response)
+    resolved.ClearField("results")
+    resolved.results.extend(_resolve_high_level_task_results(batch, response.results))
+    return resolved
+
+
 def _get_local_ip() -> str:
     """获取本机 IP 地址。
 
@@ -620,12 +706,11 @@ def _build_export_spec(
     *,
     export_mode: str,
     export_methods: Optional[Sequence[str]],
-    export_decorator: str,
 ) -> pb2.ModuleExportSpec:
     return pb2.ModuleExportSpec(
         mode=str(export_mode or "").strip(),
         methods=[x.strip() for x in (export_methods or []) if str(x).strip()],
-        decorator=str(export_decorator or "").strip(),
+        decorator=_DEFAULT_EXPORT_DECORATOR,
     )
 
 
@@ -754,6 +839,60 @@ def _put_data_via_clients(
         size_bytes=first.size_bytes,
         materialize_as=normalize_materialize_as(materialize_as, default="path"),
     )
+
+
+def _estimate_managed_global_inline_size(value: Any) -> int:
+    serialized = serialize_arrow_compatible(value)
+    return len(json.dumps(serialized, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _prepare_managed_global_value_for_upload(
+    clients: Sequence["NodeControlClient"],
+    value: Any,
+    *,
+    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+) -> Any:
+    if isinstance(value, ObjectRef):
+        return value
+    if isinstance(value, os.PathLike):
+        return _put_data_via_clients(clients, value)
+    if isinstance(value, str):
+        path = Path(value).expanduser()
+        if path.exists() and path.is_file():
+            return _put_data_via_clients(clients, path)
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _put_data_via_clients(clients, bytes(value), format="bin")
+
+    try:
+        inline_size = _estimate_managed_global_inline_size(value)
+    except Exception:
+        return value
+    if inline_size <= max(1, int(object_threshold_bytes)):
+        return value
+
+    try:
+        if isinstance(value, (dict, list)):
+            return _put_data_via_clients(clients, value, format="json")
+        return _put_data_via_clients(clients, value)
+    except Exception:
+        return value
+
+
+def _prepare_managed_globals_values_for_upload(
+    clients: Sequence["NodeControlClient"],
+    values: Dict[str, object],
+    *,
+    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+) -> Dict[str, object]:
+    return {
+        str(name): _prepare_managed_global_value_for_upload(
+            clients,
+            value,
+            object_threshold_bytes=object_threshold_bytes,
+        )
+        for name, value in (values or {}).items()
+    }
 
 
 _SERVICE_SESSION_SCHEMA_VERSION = 1
@@ -1820,6 +1959,14 @@ class ServiceSessionClient:
             return response_or_data
         return self._client.fetch_result_ref_data(ref, target_path=target_path)
 
+    def update_globals(self, values: Dict[str, object]) -> pb2.UpdateServiceGlobalsResponse:
+        return self._client.update_service_globals(
+            owner_client_id=self.owner_client_id,
+            service_id=self.service_id,
+            service_token=self.service_token,
+            values=values,
+        )
+
     def _keepalive_loop(self) -> None:
         while not self._hb_stop.wait(max(0.5, self._hb_interval_sec)):
             try:
@@ -1858,8 +2005,9 @@ class NodeControlClient:
         package_format: str = "",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        code_token: str = "",
         chunk_size: int = 256 * 1024,
     ) -> pb2.UploadCodeResponse:
         path = Path(artifact_path)
@@ -1884,8 +2032,9 @@ class NodeControlClient:
                 package_format=inferred_format,
                 export_mode=export_mode,
                 export_methods=export_methods,
-                export_decorator=export_decorator,
                 dependency_allowlist=dependency_allowlist,
+                managed_global_names=managed_global_names,
+                code_token=code_token,
                 chunk_size=chunk_size,
             )
         finally:
@@ -1903,8 +2052,9 @@ class NodeControlClient:
         package_format: str = "",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        code_token: str = "",
         chunk_size: int = 256 * 1024,
     ) -> pb2.UploadCodeResponse:
         if not client_id:
@@ -1918,7 +2068,6 @@ class NodeControlClient:
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
         )
         digest = hashlib.sha256(blob).hexdigest()
 
@@ -1933,6 +2082,8 @@ class NodeControlClient:
                     package_format=effective_format,
                     export_spec=export_spec,
                     dependency_allowlist=list(dependency_allowlist or ()),
+                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
+                    code_token=str(code_token or "").strip(),
                 )
             )
             for i in range(0, len(blob), max(1, int(chunk_size))):
@@ -2031,8 +2182,9 @@ class NodeControlClient:
         package_format: str,
         export_mode: str,
         export_methods: Optional[Sequence[str]],
-        export_decorator: str,
         dependency_allowlist: Optional[Sequence[str]],
+        managed_global_names: Optional[Sequence[str]],
+        code_token: str,
         chunk_size: int,
     ) -> pb2.UploadCodeResponse:
         effective_format = _resolve_package_format(package_format, file_path.name)
@@ -2042,7 +2194,6 @@ class NodeControlClient:
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
         )
         digest = _sha256_file(file_path)
 
@@ -2057,6 +2208,8 @@ class NodeControlClient:
                     package_format=effective_format,
                     export_spec=export_spec,
                     dependency_allowlist=list(dependency_allowlist or ()),
+                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
+                    code_token=str(code_token or "").strip(),
                 )
             )
             yield from (pb2.UploadCodeRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
@@ -2228,6 +2381,30 @@ class NodeControlClient:
             result_wait_ms=result_wait_ms,
         )
 
+    def update_runtime_globals(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str,
+        code_token: str,
+        values: Dict[str, object],
+    ) -> pb2.UpdateRuntimeGlobalsResponse:
+        prepared_values = _prepare_managed_globals_values_for_upload([self], values)
+        resp = self.stub.UpdateRuntimeGlobals(
+            pb2.UpdateRuntimeGlobalsRequest(
+                client_id=str(client_id or "").strip(),
+                code_version=str(code_version or "").strip(),
+                runtime_key=str(runtime_key or "").strip(),
+                code_token=str(code_token or "").strip(),
+                values=dict_to_struct(prepared_values),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "update runtime globals failed"))
+        return resp
+
     def create_service_from_file(
         self,
         *,
@@ -2240,8 +2417,8 @@ class NodeControlClient:
         package_format: str = "",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2271,8 +2448,8 @@ class NodeControlClient:
                 package_format=inferred_format,
                 export_mode=export_mode,
                 export_methods=export_methods,
-                export_decorator=export_decorator,
                 dependency_allowlist=dependency_allowlist,
+                managed_global_names=managed_global_names,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -2295,8 +2472,8 @@ class NodeControlClient:
         entry_callable: str = "run",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2315,8 +2492,8 @@ class NodeControlClient:
                 package_format="tar.gz",
                 export_mode=export_mode,
                 export_methods=export_methods,
-                export_decorator=export_decorator,
                 dependency_allowlist=dependency_allowlist,
+                managed_global_names=managed_global_names,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -2338,8 +2515,8 @@ class NodeControlClient:
         package_format: str,
         export_mode: str,
         export_methods: Optional[Sequence[str]],
-        export_decorator: str,
         dependency_allowlist: Optional[Sequence[str]],
+        managed_global_names: Optional[Sequence[str]],
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -2354,7 +2531,6 @@ class NodeControlClient:
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
         )
 
         def _iter() -> Iterator[pb2.CreateServiceRequest]:
@@ -2373,6 +2549,7 @@ class NodeControlClient:
                     package_format=effective_format,
                     export_spec=export_spec,
                     dependency_allowlist=list(dependency_allowlist or ()),
+                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
                 )
             )
             yield from (pb2.CreateServiceRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
@@ -2403,8 +2580,8 @@ class NodeControlClient:
         package_format: str = "",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2423,7 +2600,6 @@ class NodeControlClient:
         export_spec = _build_export_spec(
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
         )
 
         def _iter() -> Iterator[pb2.CreateServiceRequest]:
@@ -2442,6 +2618,7 @@ class NodeControlClient:
                     package_format=effective_format,
                     export_spec=export_spec,
                     dependency_allowlist=list(dependency_allowlist or ()),
+                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
                 )
             )
             for i in range(0, len(blob), max(1, int(chunk_size))):
@@ -2496,6 +2673,28 @@ class NodeControlClient:
         if not resp.ok:
             reason = resp.task_error.message if resp.task_error and resp.task_error.message else _err_msg(resp.error, "call service failed")
             raise RuntimeError(reason)
+        return resp
+
+    def update_service_globals(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        values: Dict[str, object],
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        prepared_values = _prepare_managed_globals_values_for_upload([self], values)
+        resp = self.stub.UpdateServiceGlobals(
+            pb2.UpdateServiceGlobalsRequest(
+                owner_client_id=str(owner_client_id or "").strip(),
+                service_id=str(service_id or "").strip(),
+                service_token=str(service_token or "").strip(),
+                values=dict_to_struct(prepared_values),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "update service globals failed"))
         return resp
 
     def heartbeat_service(
@@ -2800,6 +2999,7 @@ class TaskBatchClient:
     job_id: str
     nodes: Dict[str, InfoCenterNode]
     code_version: str
+    code_token: str = ""
     _cursors_by_node: Dict[str, str] = field(default_factory=dict, repr=False)
     _submit_seq: int = field(default=0, repr=False)
     _submit_seq_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -2871,8 +3071,8 @@ class TaskBatchClient:
         package_format: str = "",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -3003,8 +3203,11 @@ class TaskBatchClient:
 
             if code_version:
                 effective_code_version = str(code_version).strip()
+                effective_code_token = ""
             else:
                 uploaded_versions: Dict[str, str] = {}
+                uploaded_tokens: Dict[str, str] = {}
+                requested_code_token = secrets.token_urlsafe(24)
                 if effective_blob is not None:
                     for node_id, client in clients.items():
                         upload = client.upload_code_from_bytes(
@@ -3016,11 +3219,13 @@ class TaskBatchClient:
                             package_format=effective_package_format,
                             export_mode=export_mode,
                             export_methods=export_methods,
-                            export_decorator=export_decorator,
                             dependency_allowlist=dependency_allowlist,
+                            managed_global_names=managed_global_names,
+                            code_token=requested_code_token,
                             chunk_size=chunk_size,
                         )
                         uploaded_versions[node_id] = upload.code_version
+                        uploaded_tokens[node_id] = upload.code_token
                 elif artifact_path:
                     for node_id, client in clients.items():
                         upload = client.upload_code_from_file(
@@ -3032,11 +3237,13 @@ class TaskBatchClient:
                             package_format=effective_package_format,
                             export_mode=export_mode,
                             export_methods=export_methods,
-                            export_decorator=export_decorator,
                             dependency_allowlist=dependency_allowlist,
+                            managed_global_names=managed_global_names,
+                            code_token=requested_code_token,
                             chunk_size=chunk_size,
                         )
                         uploaded_versions[node_id] = upload.code_version
+                        uploaded_tokens[node_id] = upload.code_token
                 else:
                     raise ValueError("code_version or artifact_path or blob must be provided")
 
@@ -3044,6 +3251,10 @@ class TaskBatchClient:
                 if len(unique_versions) != 1:
                     raise RuntimeError(f"inconsistent code_version across nodes: {uploaded_versions}")
                 effective_code_version = next(iter(unique_versions))
+                unique_tokens = {token for token in uploaded_tokens.values() if str(token).strip()}
+                if len(unique_tokens) > 1:
+                    raise RuntimeError(f"inconsistent code_token across nodes: {uploaded_tokens}")
+                effective_code_token = next(iter(unique_tokens), "")
 
             for node_id, client in clients.items():
                 streams[node_id] = client.open_task_stream(
@@ -3060,6 +3271,7 @@ class TaskBatchClient:
                 job_id=effective_job_id,
                 nodes={node.node_id: node for node in selected_nodes},
                 code_version=effective_code_version,
+                code_token=effective_code_token,
                 _cursors_by_node={node.node_id: "" for node in selected_nodes},
                 _latest_credit_by_node={node.node_id: int(node.credit) for node in selected_nodes},
                 _runtime_node_hint={desired_runtime_key: selected_nodes[0].node_id} if selected_nodes else {},
@@ -3083,8 +3295,8 @@ class TaskBatchClient:
         entry_callable: str = "run",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -3104,8 +3316,8 @@ class TaskBatchClient:
             entry_callable=entry_callable,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -3130,8 +3342,8 @@ class TaskBatchClient:
         entry_callable: str = "run",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -3152,8 +3364,8 @@ class TaskBatchClient:
             entry_callable=entry_callable,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -3179,8 +3391,8 @@ class TaskBatchClient:
         package_format: str = "",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -3202,8 +3414,8 @@ class TaskBatchClient:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -3229,8 +3441,8 @@ class TaskBatchClient:
         package_format: str = "py",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -3252,8 +3464,8 @@ class TaskBatchClient:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -3641,6 +3853,30 @@ class TaskBatchClient:
     def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
         return self.put_data(value, format="json", chunk_size=chunk_size)
 
+    def update_globals(
+        self,
+        values: Dict[str, object],
+        *,
+        runtime_key: str = "",
+    ) -> str:
+        if not self.code_token:
+            raise RuntimeError("update_globals requires code uploaded by this client; code_token is unavailable")
+        normalized_runtime_key = str(runtime_key or self.code_version).strip() or self.code_version
+        digests: Dict[str, str] = {}
+        for node_id, client in self._clients.items():
+            resp = client.update_runtime_globals(
+                client_id=self.client_id,
+                code_version=self.code_version,
+                runtime_key=normalized_runtime_key,
+                code_token=self.code_token,
+                values=values,
+            )
+            digests[node_id] = resp.globals_digest
+        unique = {digest for digest in digests.values() if str(digest).strip()}
+        if len(unique) != 1:
+            raise RuntimeError(f"inconsistent managed globals digest across nodes: {digests}")
+        return next(iter(unique), "")
+
     def download_result_to_file(self, task_result: pb2.TaskResult, *, target_path: str) -> Path:
         data = struct_to_dict(task_result.result)
         if not isinstance(data, ResultRef):
@@ -3724,8 +3960,8 @@ class ServiceGroup:
         package_format: str = "",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -3763,7 +3999,6 @@ class ServiceGroup:
             package_format: 包格式 ("py", "zip", "tar.gz")
             export_mode: 导出模式 ("decorator", "explicit", "all", "single")
             export_methods: 显式导出的方法列表
-            export_decorator: 装饰器名称
             worker_count: 工作进程数
             heartbeat_timeout_sec: 心跳超时
             idle_ttl_sec: 空闲 TTL
@@ -4072,8 +4307,8 @@ class ServiceGroup:
                     package_format=effective_package_format,
                     export_mode=export_mode,
                     export_methods=export_methods,
-                    export_decorator=export_decorator,
                     dependency_allowlist=dependency_allowlist,
+                    managed_global_names=managed_global_names,
                     worker_count=worker_count,
                     heartbeat_timeout_sec=heartbeat_timeout_sec,
                     idle_ttl_sec=idle_ttl_sec,
@@ -4129,8 +4364,8 @@ class ServiceGroup:
         entry_callable: str = "run",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -4162,8 +4397,8 @@ class ServiceGroup:
             entry_callable=entry_callable,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -4200,8 +4435,8 @@ class ServiceGroup:
         entry_callable: str = "run",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -4234,8 +4469,8 @@ class ServiceGroup:
             entry_callable=entry_callable,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -4273,8 +4508,8 @@ class ServiceGroup:
         package_format: str = "",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -4308,8 +4543,8 @@ class ServiceGroup:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -4347,8 +4582,8 @@ class ServiceGroup:
         package_format: str = "py",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -4382,8 +4617,8 @@ class ServiceGroup:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -4813,6 +5048,16 @@ class ServiceGroup:
     def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
         return self.put_data(value, format="json", chunk_size=chunk_size)
 
+    def update_globals(self, values: Dict[str, object]) -> str:
+        digests: Dict[str, str] = {}
+        for node_id, session in self.sessions.items():
+            resp = session.update_globals(values)
+            digests[node_id] = resp.globals_digest
+        unique = {digest for digest in digests.values() if str(digest).strip()}
+        if len(unique) != 1:
+            raise RuntimeError(f"inconsistent managed globals digest across nodes: {digests}")
+        return next(iter(unique), "")
+
     def __enter__(self) -> "ServiceGroup":
         return self
 
@@ -5161,14 +5406,14 @@ class _CallProxy:
         # 序列化 Arrow 兼容对象（DataFrame, Series, ndarray）
         serialized_payload = _serialize_arrow_compatible(final_payload)
 
-        _, resp = await self._group.acall_balanced(
+        node_id, resp = await self._group.acall_balanced(
             self._method,
             serialized_payload,
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
         )
-        return resp.get("data", resp)
+        return _resolve_high_level_service_data(self._group, node_id=node_id, response=resp)
 
     def __await__(self):
         """支持 await proxy() 语法。"""
@@ -5279,14 +5524,14 @@ class _SyncCallProxy:
         # 序列化 Arrow 兼容对象（DataFrame, Series, ndarray）
         serialized_payload = _serialize_arrow_compatible(final_payload)
 
-        _, resp = self._group.call_balanced(
+        node_id, resp = self._group.call_balanced(
             self._method,
             serialized_payload,
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
         )
-        return resp.get("data", resp)
+        return _resolve_high_level_service_data(self._group, node_id=node_id, response=resp)
 
 
 class _BroadcastProxy:
@@ -5311,7 +5556,7 @@ class _BroadcastProxy:
     async def __call__(
         self,
         **kwargs,
-    ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
+    ) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:
         """异步广播调用所有节点。
 
         Args:
@@ -5328,12 +5573,13 @@ class _BroadcastProxy:
             ...     else:
             ...         print(f"{node_id}: {result}")
         """
-        return await self._group.acall_all(
+        results = await self._group.acall_all(
             self._method,
             kwargs,
             timeout_sec=self._timeout_sec,
             max_concurrency=self._max_concurrency,
         )
+        return _resolve_high_level_service_results(self._group, results=results)
 
     def __await__(self):
         return self().__await__()
@@ -5453,8 +5699,8 @@ class DeployedService(ServiceGroup):
         Returns:
             Dict[str, object]: 服务的返回值
         """
-        _, resp = await self.acall_balanced(method, kwargs)
-        return resp.get("data", resp)
+        node_id, resp = await self.acall_balanced(method, kwargs)
+        return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
         """通用同步调用接口。
@@ -5466,14 +5712,14 @@ class DeployedService(ServiceGroup):
         Returns:
             Dict[str, object]: 服务的返回值
         """
-        _, resp = self.call_balanced(method, kwargs)
-        return resp.get("data", resp)
+        node_id, resp = self.call_balanced(method, kwargs)
+        return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
     async def call_all(
         self,
         method: str,
         **kwargs,
-    ) -> List[Tuple[Optional[str], Optional[Dict[str, object]], Optional[Exception]]]:
+    ) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:
         """异步调用所有节点。
 
         Args:
@@ -5483,7 +5729,8 @@ class DeployedService(ServiceGroup):
         Returns:
             List[Tuple[节点ID, 结果, 异常]]: 所有节点的结果
         """
-        return await self.acall_all(method, kwargs)
+        results = await self.acall_all(method, kwargs)
+        return _resolve_high_level_service_results(self, results=results)
 
     def __repr__(self) -> str:
         node_ids = list(self.sessions.keys()) if self.sessions else []
@@ -5518,12 +5765,35 @@ class GatewayConnect(GatewayServiceClient):
         service_name: str,
         timeout_sec: float = 10.0,
         service_token: str = "",
+        validate_on_init: bool = True,
     ) -> None:
         super().__init__(target, timeout_sec=timeout_sec, service_token=service_token)
         self.service_name = str(service_name or "").strip()
         if not self.service_name:
             raise ValueError("service_name is required")
         self._discovered_methods: Optional[List[str]] = None
+        self._last_status: Optional[Dict[str, object]] = None
+        if validate_on_init:
+            self._validate_service_ready()
+
+    def _validate_service_ready(self) -> Dict[str, object]:
+        try:
+            status = self.get_status(service_name=self.service_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to query gateway status for service_name={self.service_name!r} via {self.target}: {exc}"
+            ) from exc
+        if not isinstance(status, dict):
+            raise RuntimeError(
+                f"invalid gateway status for service_name={self.service_name!r} via {self.target}: {status!r}"
+            )
+        self._last_status = status
+        route_count = int(status.get("route_count", 0) or 0)
+        if route_count <= 0:
+            raise RuntimeError(
+                f"no available route for service_name={self.service_name!r} via gateway {self.target}"
+            )
+        return status
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -5548,9 +5818,18 @@ class GatewayConnect(GatewayServiceClient):
             return
         try:
             methods = self.list_methods(include_docs=True)
-            self._discovered_methods = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
-        except Exception:
-            self._discovered_methods = []
+        except Exception as exc:
+            self._validate_service_ready()
+            raise RuntimeError(
+                f"failed to list methods for service_name={self.service_name!r} via gateway {self.target}: {exc}"
+            ) from exc
+        discovered = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
+        if not discovered:
+            self._validate_service_ready()
+            raise RuntimeError(
+                f"service_name={self.service_name!r} has active gateway routes via {self.target} but no exported methods"
+            )
+        self._discovered_methods = discovered
 
     def refresh_methods(self) -> List[str]:
         self._discovered_methods = None
@@ -5566,7 +5845,10 @@ class GatewayConnect(GatewayServiceClient):
         return list(self._discovered_methods or [])
 
     def status(self) -> Dict[str, object]:
-        return self.get_status(service_name=self.service_name)
+        status = self.get_status(service_name=self.service_name)
+        if isinstance(status, dict):
+            self._last_status = status
+        return status
 
     def call_balanced(
         self,
@@ -5611,12 +5893,12 @@ class GatewayConnect(GatewayServiceClient):
         )
 
     async def call(self, method: str, **kwargs) -> Dict[str, object]:
-        _, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
-        return resp.get("data", resp)
+        node_id, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
-        _, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
-        return resp.get("data", resp)
+        node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
     async def acall_all(
         self,
@@ -5652,6 +5934,7 @@ class DirectConnect(DiscoveryServiceClient):
         failure_threshold: int = 3,
         open_sec: float = 5.0,
         route_limit: int = 500,
+        validate_on_init: bool = True,
     ) -> None:
         super().__init__(
             infocenter_target,
@@ -5666,6 +5949,29 @@ class DirectConnect(DiscoveryServiceClient):
         if not self.service_name:
             raise ValueError("service_name is required")
         self._discovered_methods: Optional[List[str]] = None
+        self._last_status: Optional[Dict[str, object]] = None
+        if validate_on_init:
+            self._validate_service_ready()
+
+    def _validate_service_ready(self) -> Dict[str, object]:
+        try:
+            self.refresh_routes(service_name=self.service_name, force=True)
+            status = self.get_status(service_name=self.service_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to query discovery status for service_name={self.service_name!r} via {self.infocenter_target}: {exc}"
+            ) from exc
+        if not isinstance(status, dict):
+            raise RuntimeError(
+                f"invalid discovery status for service_name={self.service_name!r} via {self.infocenter_target}: {status!r}"
+            )
+        self._last_status = status
+        route_count = int(status.get("route_count", 0) or 0)
+        if route_count <= 0:
+            raise RuntimeError(
+                f"no available route for service_name={self.service_name!r} via infocenter {self.infocenter_target}"
+            )
+        return status
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -5690,9 +5996,18 @@ class DirectConnect(DiscoveryServiceClient):
             return
         try:
             methods = self.list_methods(include_docs=True)
-            self._discovered_methods = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
-        except Exception:
-            self._discovered_methods = []
+        except Exception as exc:
+            self._validate_service_ready()
+            raise RuntimeError(
+                f"failed to list methods for service_name={self.service_name!r} via discovery {self.infocenter_target}: {exc}"
+            ) from exc
+        discovered = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
+        if not discovered:
+            self._validate_service_ready()
+            raise RuntimeError(
+                f"service_name={self.service_name!r} has active discovery routes via {self.infocenter_target} but no exported methods"
+            )
+        self._discovered_methods = discovered
 
     def refresh_methods(self) -> List[str]:
         self._discovered_methods = None
@@ -5714,7 +6029,10 @@ class DirectConnect(DiscoveryServiceClient):
         return list(self._discovered_methods or [])
 
     def status(self) -> Dict[str, object]:
-        return self.get_status(service_name=self.service_name)
+        status = self.get_status(service_name=self.service_name)
+        if isinstance(status, dict):
+            self._last_status = status
+        return status
 
     def call_balanced(
         self,
@@ -5786,12 +6104,12 @@ class DirectConnect(DiscoveryServiceClient):
         )
 
     async def call(self, method: str, **kwargs) -> Dict[str, object]:
-        _, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
-        return resp.get("data", resp)
+        node_id, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
-        _, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
-        return resp.get("data", resp)
+        node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
     async def acall_all(
         self,
@@ -5907,7 +6225,7 @@ class _TaskCallProxy:
         wait_ms: int = 500,
         _payload=None,
         **kwargs,
-    ) -> Sequence[pb2.TaskResult]:
+    ) -> Sequence[Any]:
         """提交任务并等待结果。
 
         Args:
@@ -5917,7 +6235,7 @@ class _TaskCallProxy:
             **kwargs: 额外的提交参数
 
         Returns:
-            Sequence[pb2.TaskResult]: 结果列表
+            Sequence[Any]: 反序列化后的结果列表
         """
         if _payload is not None:
             # 直接提交指定的 payload
@@ -5939,9 +6257,9 @@ class _TaskCallProxy:
             timeout_sec=timeout_sec,
             wait_ms=wait_ms,
         )
-        return results
+        return _resolve_task_results_data(self._batch, results)
 
-    def __call__(self, *args, **kwargs) -> Sequence[pb2.TaskResult]:
+    def __call__(self, *args, **kwargs) -> Sequence[Any]:
         """直接调用：提交任务并等待结果（简写）。
 
         Args:
@@ -5949,7 +6267,7 @@ class _TaskCallProxy:
             **kwargs: 任务参数��会合并到 payload 中）
 
         Returns:
-            Sequence[pb2.TaskResult]: 结果列表
+            Sequence[Any]: 反序列化后的结果列表
 
         Example:
             >>> # 命名参数
@@ -5957,6 +6275,10 @@ class _TaskCallProxy:
             >>> # 位置参数
             >>> results = task.run(7)
         """
+        timeout_hint = kwargs.pop("timeout_hint_sec", self._timeout_hint_sec)
+        prio = kwargs.pop("priority", self._priority)
+        rt_key = kwargs.pop("runtime_key", self._runtime_key)
+
         # 只有 kwargs 时保持旧格式；存在 args 时使用 args/kwargs 格式。
         if args or kwargs:
             payload = dict(self._payload)
@@ -5968,13 +6290,17 @@ class _TaskCallProxy:
                 payload.update(kwargs)
             serialized_payload = _serialize_arrow_compatible(payload)
             return self.submit_and_wait(
-                timeout_hint_sec=self._timeout_hint_sec,
-                priority=self._priority,
-                runtime_key=self._runtime_key,
+                timeout_hint_sec=timeout_hint,
+                priority=prio,
+                runtime_key=rt_key,
                 _payload=serialized_payload,  # 使用内部参数名避免冲突
             )
 
-        return self.submit_and_wait()
+        return self.submit_and_wait(
+            timeout_hint_sec=timeout_hint,
+            priority=prio,
+            runtime_key=rt_key,
+        )
 
 
 class TaskSubmitter:
@@ -6036,8 +6362,8 @@ class TaskSubmitter:
         package_format: str = "",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -6070,8 +6396,8 @@ class TaskSubmitter:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -6096,8 +6422,8 @@ class TaskSubmitter:
         entry_callable: str = "run",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -6117,8 +6443,8 @@ class TaskSubmitter:
             entry_callable=entry_callable,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -6144,8 +6470,8 @@ class TaskSubmitter:
         entry_callable: str = "run",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -6166,8 +6492,8 @@ class TaskSubmitter:
             entry_callable=entry_callable,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -6194,8 +6520,8 @@ class TaskSubmitter:
         package_format: str = "",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -6217,8 +6543,8 @@ class TaskSubmitter:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -6245,8 +6571,8 @@ class TaskSubmitter:
         package_format: str = "py",
         export_mode: str = "single",
         export_methods: Optional[Sequence[str]] = None,
-        export_decorator: str = "pycloud_export",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
         chunk_size: int = 256 * 1024,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
@@ -6268,8 +6594,8 @@ class TaskSubmitter:
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunk_size=chunk_size,
             healthy_only=healthy_only,
             tags=tags,
@@ -6318,6 +6644,11 @@ class TaskSubmitter:
     def code_version(self) -> str:
         """返回 code_version。"""
         return self._batch.code_version
+
+    @property
+    def code_token(self) -> str:
+        """返回 code_token。"""
+        return self._batch.code_token
 
     @property
     def nodes(self) -> Dict[str, InfoCenterNode]:
@@ -6377,6 +6708,9 @@ class TaskSubmitter:
     def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
         return self._batch.put_json(value, chunk_size=chunk_size)
 
+    def update_globals(self, values: Dict[str, object], *, runtime_key: str = "") -> str:
+        return self._batch.update_globals(values, runtime_key=runtime_key)
+
     def submit_payloads(
         self,
         payloads: Sequence[Dict[str, object]],
@@ -6429,7 +6763,8 @@ class TaskSubmitter:
         Returns:
             pb2.PullResultsResponse: 拉取响应
         """
-        return self._batch.pull_results(limit=limit, wait_ms=wait_ms, cursor=cursor)
+        response = self._batch.pull_results(limit=limit, wait_ms=wait_ms, cursor=cursor)
+        return _resolve_high_level_pull_results_response(self._batch, response)
 
     def wait_for_results(
         self,
@@ -6452,13 +6787,14 @@ class TaskSubmitter:
         Returns:
             Sequence[pb2.TaskResult]: 结果列表
         """
-        return self._batch.wait_for_results(
+        results = self._batch.wait_for_results(
             expected_count=expected_count,
             timeout_sec=timeout_sec,
             wait_ms=wait_ms,
             limit=limit,
             job_id=job_id,
         )
+        return _resolve_high_level_task_results(self._batch, results)
 
     def cancel_tasks(
         self,

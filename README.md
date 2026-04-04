@@ -5,6 +5,20 @@
 1. 主功能：多节点/跨集群任务与服务调度（ControlPlane + NodeControl）
 2. 辅功能：本地多进程并行 API（轻量兜底）
 
+更细一点的边界建议这样理解：
+
+1. `Task Mode`
+   - 面向重计算、批处理、高吞吐任务执行
+   - 更适合 CPU 密集型工作、批量任务分发、长耗时数据处理
+2. `Service Mode`
+   - 面向可寻址、常驻的函数服务实例
+   - 更适合内部 RPC、轻量状态服务、稳定路由的函数调用
+   - 当前本质仍是“函数执行服务”，不是标准 ASGI/WSGI 网络服务运行时
+3. `External Web Layer`
+   - 如果需要真正的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
+   - 该层负责 HTTP API、鉴权、参数校验、编排与聚合
+   - 重计算下沉到 `Task Mode`，内部函数调用下沉到 `Service Mode`
+
 ## 安装
 
 默认安装即包含集群控制面所需依赖：
@@ -20,6 +34,15 @@ pip install pycloud-parallel
 1. `ControlPlane = InfoCenter + Gateway`，对外 `HTTP + JSON`
 2. `NodeControl`，对外 `gRPC`
 3. 服务实例数据面，节点内 `HTTP + JSON`
+
+可以把这三层关系理解成：
+
+1. `uvicorn/gunicorn`
+   - 对外轻网络入口层
+2. `Service Mode`
+   - 内部常驻函数服务层
+3. `Task Mode`
+   - 重计算执行层
 
 ## Payload 序列化边界
 
@@ -38,6 +61,72 @@ pip install pycloud-parallel
 5. `numpy.ndarray` 只接受简单 `dtype`：数值 / bool / 字符串
 
 如果业务参数里有更复杂的 Python 对象，当前建议用户自己先转成普通 JSON 结构，或落到外部存储后只传引用。
+
+## 大文件与缓存
+
+当前 node 侧缓存目录已经按代码与对象分开：
+
+```text
+artifact_dir/
+  codes/
+    <code_sha>/
+      artifact.py | pkg/
+      deps/
+      scopes/
+        service/<scope_hash>/
+        runtime/<scope_hash>/
+      meta.json
+  objects/
+    <object_sha>.<fmt>
+    meta/<object_sha>.json
+```
+
+说明：
+
+1. `codes/<code_sha>/`
+   - 一套代码的作用域目录
+   - 包含代码本体、补装依赖、managed globals scope 状态与 `meta.json`
+2. `objects/`
+   - 大对象与大结果缓存
+   - `meta/<object_sha>.json` 里记录 `created_at` 与 `last_at`
+
+### 结果返回机制
+
+任务模式与服务模式的结果返回当前是自动分流的：
+
+1. 小结果
+   - 直接 inline 回传
+2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
+   - 落到 node 本地 `objects/`
+   - 返回 `ResultRef`
+
+高层 Python API 会自动帮你下载并还原 `ResultRef` 指向的大结果。
+
+如果你明确知道结果会很大，建议业务侧主动返回“小摘要 + 对象引用”，不要依赖超大 inline 返回。
+
+### GC 约定
+
+当前推荐使用离线命令做 GC，而不是把 GC 挂进常驻服务进程：
+
+```bash
+pycloudctl gc --dry-run
+pycloudctl gc --scope codes --older-than-hours 168
+pycloudctl gc --scope objects --older-than-hours 168
+pycloudctl gc --scope all --older-than-hours 168
+```
+
+当前规则：
+
+1. `codes`
+   - 按 `codes/<code_sha>/meta.json` 的 `last_at`
+   - 超过阈值就删整个 code scope
+2. `objects`
+   - 被“当前 globals 版本”引用的对象保留
+   - 其他对象按 `last_at` 超时删除
+3. `all`
+   - 先回收 `codes`
+   - 再基于剩余 code scope 扫描当前 globals 引用
+   - 最后回收 `objects`
 
 职责划分：
 
@@ -194,7 +283,7 @@ group = DeployedService.deploy_from_module(
 2. 代码里用 `Path(__file__)` 的相对路径读取
 3. 不要指望单文件 `.py` 模块自动带上旁边的兄弟数据文件
 
-完整说明见 [MODULE_DEPLOY_GUIDE.md](/Users/hankangkang/Documents/new_pycloud/docs/MODULE_DEPLOY_GUIDE.md)。
+完整说明见 [MODULE_DEPLOY_GUIDE.md](docs/MODULE_DEPLOY_GUIDE.md)。
 
 ### 3. 任务模式
 
@@ -305,7 +394,7 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 1. 默认不自动安装任何缺失模块
 2. 只有调用方显式传 `dependency_allowlist` 才允许节点补装
 3. 节点不会猜测 `import 名 -> pip 包名`
-4. 白名单会安装到 `code_cache/<sha>_deps`
+4. 白名单会安装到 `code_cache/codes/<sha>/deps`
 5. 同一个 `code_version` 如果使用不同的 `dependency_allowlist`，会直接拒绝，避免缓存语义混乱
 
 ## 运维接口

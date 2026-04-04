@@ -8,6 +8,26 @@
 2. `NodeControl 管理面与任务面 = gRPC`
 3. `NodeControl 服务实例数据面 = HTTP + JSON`
 
+从角色定位上，当前更推荐这样理解：
+
+1. `Task Mode`
+   - 重计算执行层
+   - 面向 CPU 密集型任务、批处理、高吞吐执行
+2. `Service Mode`
+   - 常驻函数服务层
+   - 面向内部 RPC、轻量状态服务、稳定路由的函数调用
+   - 当前不是标准 ASGI/WSGI 网络服务运行时
+3. `External Web Layer`
+   - 真正对外的轻网络入口层
+   - 建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
+   - 负责 HTTP API、鉴权、参数校验、编排与聚合
+
+一句话概括：
+
+1. `Task Mode = 重计算执行层`
+2. `Service Mode = 常驻函数服务层`
+3. `FastAPI/uvicorn = 对外轻网络入口层`
+
 默认部署建议：
 
 1. 一个 `controlplane` 进程
@@ -71,6 +91,12 @@
 1. `POST /svc/{service_name}/call/{method}`
 2. `GET /svc/{service_name}/methods`
 3. `GET /svc/{service_name}/status`
+
+边界上需要特别注意：
+
+1. 当前 `Service Mode` 虽然带 HTTP 数据面，但本质仍然是“HTTP/RPC 入口 + 进程池中执行 Python 函数”
+2. 它更适合作为内部 service fabric / 内部函数服务层
+3. 如果你需要真正的 Web 应用生命周期、中间件、流式响应、ASGI 能力，建议放到外部 Web 层处理
 
 ## 4. 任务模式
 

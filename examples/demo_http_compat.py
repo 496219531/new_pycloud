@@ -8,11 +8,54 @@ HTTP 风格兼容性演示
 """
 
 import asyncio
-from pycloud_parallel import DeployedService
+import sys
+from pathlib import Path
+from urllib.error import URLError
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
+try:
+    from pycloud_parallel import DeployedService
+except ModuleNotFoundError as exc:
+    missing = str(getattr(exc, "name", "") or "")
+    message = str(exc)
+    if (
+        missing in {"pycloud_parallel", "grpc", "cloudpickle", "google", "protobuf"}
+        or missing.startswith("google.")
+        or "Control-plane dependencies are missing." in message
+        or "Local runtime dependencies are missing." in message
+    ):
+        raise SystemExit(
+            "无法导入 pycloud_parallel 依赖。\n"
+            f"当前解释器: {sys.executable}\n"
+            "请使用已安装项目依赖的解释器运行，或先安装依赖后再执行。\n"
+            "例如在这台机器上可优先尝试: python examples/demo_http_compat.py"
+        ) from exc
+    raise
+
+
+def _exit_infocenter_unavailable(gateway_target: str, exc: BaseException) -> "NoReturn":
+    raise SystemExit(
+        "无法连接到 controlplane / InfoCenter。\n"
+        f"目标地址: http://{gateway_target}\n"
+        f"当前解释器: {sys.executable}\n"
+        f"原始错误: {exc}\n"
+        "请先启动本示例专用端口的本地服务:\n"
+        "  ./scripts/start_services.sh "
+        "--controlplane-port 51051 "
+        "--node1-port 51061 "
+        "--node1-http 18181 "
+        "--node2-port 51062 "
+        "--node2-http 18182 "
+        "start\n"
+        "再重新运行该示例。"
+    ) from exc
 
 
 def main():
-    gateway_target = "127.0.0.1:50051"
+    gateway_target = "127.0.0.1:51051"
     service_name = "compat-demo"
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
@@ -24,9 +67,7 @@ def main():
 
     # 服务端代码：最自然的 Python 函数
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
         b"def add(a, b):\n"
         b"    return {'a': a, 'b': b, 'sum': a + b}\n\n"
@@ -39,19 +80,21 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    group = DeployedService.deploy_from_infocenter(
-        infocenter_target=gateway_target,
-        service_name=service_name,
-        blob=blob,
-        runtime="py3",
-        entry_module="compat_demo",
-        export_mode="decorator",
-        export_decorator="pycloud_export",
-        dependency_allowlist=dependency_allowlist,
-        worker_count=2,
-        tags=["demo"],
-        min_success_nodes=1,
-    )
+    try:
+        group = DeployedService.deploy_from_infocenter(
+            infocenter_target=gateway_target,
+            service_name=service_name,
+            blob=blob,
+            runtime="py3",
+            entry_module="compat_demo",
+            export_mode="decorator",
+            dependency_allowlist=dependency_allowlist,
+            worker_count=2,
+            tags=["demo"],
+            min_success_nodes=1,
+        )
+    except (URLError, ConnectionError, OSError) as exc:
+        _exit_infocenter_unavailable(gateway_target, exc)
     print(f"✓ 服务部署成功")
     print(f"  服务名: {group.service_name}")
     print()

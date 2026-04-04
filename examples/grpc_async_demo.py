@@ -1,6 +1,6 @@
-from pycloud_parallel.controlplane.client import ServiceGroup
 import asyncio
 import time
+from pycloud_parallel.controlplane.client import ServiceGroup
 
 
 async def main():
@@ -8,16 +8,14 @@ async def main():
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
-        b"def square(payload):\n"
-        b"    x = int(payload.get('x', 0))\n"
+        b"def square(x=0, **_kwargs):\n"
+        b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x}\n"
         b"@pycloud_export\n"
-        b"def cube(payload):\n"
-        b"    x = int(payload.get('x', 0))\n"
+        b"def cube(x=0, **_kwargs):\n"
+        b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x * x}\n"
     )
 
@@ -31,7 +29,6 @@ async def main():
         entry_module="square_service",
         entry_callable="square",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,

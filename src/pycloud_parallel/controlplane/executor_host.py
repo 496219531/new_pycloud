@@ -56,6 +56,8 @@ def _executor_host_main(request_q, event_q) -> None:
             args["package_format"],
             args["dependency_path"],
             args["object_dir"],
+            args.get("managed_globals_scope_dir", ""),
+            args.get("managed_globals_digest", ""),
             args["export_mode"],
             args["export_methods"],
             args["export_decorator"],

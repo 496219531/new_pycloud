@@ -13,15 +13,13 @@ PyCloud Gateway 调用示例
 
 或者手动部署：
 ```python
-from pycloud_parallel import DeployedService
+from pycloud_parallel import DeployedService, pycloud_export
 
 blob = (
-    b"def pycloud_export(fn):\n"
-    b"    fn.__pycloud_export__ = True\n"
-    b"    return fn\n\n"
+    b"from pycloud_parallel import pycloud_export\n\n"
     b"@pycloud_export\n"
-    b"def square(payload):\n"
-    b"    x = int(payload.get('x', 0))\n"
+    b"def square(x=0, **_kwargs):\n"
+    b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
@@ -37,18 +35,18 @@ group = DeployedService.deploy_from_infocenter(
 
 import asyncio
 from pycloud_parallel import GatewayConnect
-
+from pycloud_parallel.controlplane.client import GatewayServiceClient
 
 def check_service_exists(gateway_target: str, service_name: str) -> bool:
     """检查服务是否存在。"""
-    with GatewayConnect(gateway_target, timeout_sec=5.0) as client:
+    with GatewayServiceClient(gateway_target, timeout_sec=5.0) as client:
         status = client.get_status(service_name=service_name)
         return status.get("route_count", 0) > 0
 
 
 def main() -> None:
     gateway_target = "127.0.0.1:50051"
-    service_name = "square-service"
+    service_name = "compute-service"
 
     print("=" * 60)
     print("  PyCloud Gateway Client Demo")
@@ -68,7 +66,7 @@ def main() -> None:
     print("[GatewayServiceClient]")
     print("-" * 60)
 
-    with GatewayConnect(gateway_target, timeout_sec=10.0) as client:
+    with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
         methods = client.list_methods(service_name=service_name, include_docs=False)
         print("可用方法:")
         for item in methods:

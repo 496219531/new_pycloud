@@ -9,6 +9,13 @@
 3. 高频任务链路直接走 `client -> NodeControl gRPC`
 4. 结果当前只存在节点内存里
 
+更推荐把它理解为：
+
+1. 重计算执行层
+2. CPU 密集型任务、批处理、高吞吐执行入口
+3. 面向作业 / 任务提交与结果回收
+4. 不是对外 HTTP 服务层
+
 ## 2. 当前接口
 
 ### 2.1 低层 gRPC
@@ -143,6 +150,32 @@
 3. 节点重启后结果丢失
 4. 当前没有内建结果持久化
 
+### 7.0 大结果返回
+
+任务结果不是永远 inline 回传。
+
+当前返回逻辑：
+
+1. 小结果
+   - 直接放进 `TaskResult.result`
+2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
+   - 落到 node 本地 `objects/`
+   - 返回 `ResultRef`
+
+高层 API：
+
+1. `TaskBatchClient.fetch_result_data(...)`
+2. `TaskSubmitter.run(...)`
+
+会自动把 `ResultRef` 下载并还原。
+
+如果你明确知道结果会很大，建议业务侧主动返回：
+
+1. 小摘要
+2. `ObjectRef / ResultRef`
+
+而不是依赖超大 inline 结果。
+
 ## 7.1 参数序列化边界
 
 任务模式当前只额外支持这 3 种 Python 类型：
@@ -170,6 +203,79 @@
 1. 任务参数尽量保持为基础 JSON 结构
 2. 只有确实需要时，再传 `DataFrame / Series / ndarray`
 3. 更复杂对象由业务侧自己转普通结构或外部落地
+
+## 7.2 managed globals
+
+任务模式现在支持声明可动态更新的全局变量：
+
+```python
+with TaskSubmitter.from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    blob=blob,
+    entry_module="task_demo",
+    managed_global_names=["STATE", "MODEL_REF"],
+) as task:
+    task.update_globals({"STATE": "v2"}, runtime_key="demo-runtime")
+```
+
+规则：
+
+1. 只有上传代码的一侧才有 `code_token`，因此才有权限更新
+2. 当前版本是按 scope 定义的，不是按整套 `code_version` 只算一个
+3. task scope 当前定义为：
+   - `client_id + code_version + runtime_key`
+4. 同一套代码的不同客户端、不同 `runtime_key` 可以有不同 globals
+
+### 7.3 节点文件布局
+
+当前 node 文件布局：
+
+```text
+artifact_dir/
+  codes/
+    <code_sha>/
+      artifact.py | pkg/
+      deps/
+      scopes/
+        runtime/<scope_hash>/
+      meta.json
+  objects/
+    <object_sha>.<fmt>
+    meta/<object_sha>.json
+```
+
+说明：
+
+1. `codes/<code_sha>/`
+   - 一套代码作用域
+2. `deps/`
+   - 这套代码的依赖补装目录
+3. `scopes/runtime/...`
+   - 这套代码下各 runtime scope 的 managed globals
+4. `objects/`
+   - 大对象与大结果缓存
+
+### 7.4 GC
+
+任务模式相关文件 GC 当前推荐走离线命令：
+
+```bash
+pycloudctl gc --scope codes --dry-run
+pycloudctl gc --scope objects --older-than-hours 168
+pycloudctl gc --scope all --older-than-hours 168
+```
+
+当前规则：
+
+1. `codes`
+   - 按 `codes/<code_sha>/meta.json` 的 `last_at`
+   - 超过阈值删除整个 code scope
+2. `objects`
+   - 被当前 globals 引用的对象保留
+   - 非当前 globals 引用对象，按 `last_at` 超时删除
+3. `all`
+   - 先回收 `codes`
+   - 再回收 `objects`
 
 ## 8. 推荐用法
 

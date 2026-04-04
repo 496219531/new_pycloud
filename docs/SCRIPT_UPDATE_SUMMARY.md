@@ -14,6 +14,7 @@ from pycloud_parallel import (
 ## 覆盖的示例
 
 1. `demo_gateway_client.py`
+   - 网关 smoke test，可直测现有服务，也可用 `--deploy-demo-service` 自举测试服务
 2. `demo_gateway_complete.py`
 3. `demo_gateway_module_client.py`
 4. `demo_service_module_group.py`
@@ -25,7 +26,7 @@ from pycloud_parallel import (
 
 1. owner 侧服务部署示例统一使用 `DeployedService`
 2. 任务模式示例统一使用 `TaskSubmitter`
-3. Gateway 调用示例统一使用 `GatewayConnect`
+3. Gateway 调用示例优先展示 `GatewayConnect`，必要时同时展示 `GatewayServiceClient`
 4. 直连发现示例统一使用 `DirectConnect`
 5. 示例优先从 `pycloud_parallel` 顶层导入，不再绕到旧导出层
 

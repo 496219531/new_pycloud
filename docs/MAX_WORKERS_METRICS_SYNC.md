@@ -64,7 +64,7 @@
 
 ## 6. 参考
 
-1. [README.md](/Users/hkk/Documents/new_pycloud/README.md)
-2. [ARCHITECTURE_OVERVIEW.md](/Users/hkk/Documents/new_pycloud/docs/ARCHITECTURE_OVERVIEW.md)
-3. [api.py](/Users/hkk/Documents/new_pycloud/src/pycloud_parallel/local_runtime/api.py)
-4. [runtime.py](/Users/hkk/Documents/new_pycloud/src/pycloud_parallel/local_runtime/runtime.py)
+1. [README.md](../README.md)
+2. [ARCHITECTURE_OVERVIEW.md](./ARCHITECTURE_OVERVIEW.md)
+3. [api.py](../src/pycloud_parallel/local_runtime/api.py)
+4. [runtime.py](../src/pycloud_parallel/local_runtime/runtime.py)

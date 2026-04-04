@@ -4,6 +4,8 @@ TaskSubmitter 演示
 
 展示如何使用 TaskSubmitter 以模块化方式提交任务。
 """
+import time
+
 from pycloud_parallel import TaskSubmitter
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -12,6 +14,7 @@ def main():
     # 任务代码
     # 如果任务代码依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
+    job_suffix = int(time.time())
     blob = (
         b"def run(value, sleep_ms=0, should_fail=False):\n"
         b"    if sleep_ms > 0:\n"
@@ -40,6 +43,7 @@ def main():
         dependency_allowlist=dependency_allowlist,
         tags=["compute"],
         node_count=2,
+        job_id=f"task-demo-{job_suffix}",
     )
 
     print(f"✓ 客户端创建成功")
@@ -56,14 +60,8 @@ def main():
     # task.run(value=7) 自动提交并等待结果
     results = task.run(7)
     print(f"✓ 提交并等待完成:")
-    for result in results:
-        status_name = pb2.TaskStatus.Name(result.status)
-        if result.result:
-            from google.protobuf import json_format
-            data = json_format.MessageToDict(result.result, preserving_proto_field_name=True)
-            print(f"  task_id={result.task_id} status={status_name} result={data}")
-        elif result.error:
-            print(f"  task_id={result.task_id} status={status_name} error={result.error.message}")
+    for i, result in enumerate(results, 1):
+        print(f"  [{i}] {result}")
     print()
 
     # 方式 2: 先提交，稍后获取结果

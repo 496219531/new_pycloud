@@ -23,9 +23,7 @@ def main():
 
     # 服务代码：直接使用 Arrow 类型
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
         b"def process_dataframe(df):\n"
         b"    import pandas as pd\n"
@@ -66,7 +64,6 @@ def main():
         runtime="py3",
         entry_module="arrow_service",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         dependency_allowlist=dependency_allowlist,
         worker_count=2,
         tags=["compute"],  # 修改为 compute 标签

@@ -13,9 +13,7 @@ def main():
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
         b"def square(x):\n"
         b"    return {'x': x, 'y': x * x}\n"

@@ -104,7 +104,6 @@ owner 推荐用法：
 worker_count=1
 node_count=1
 export_mode="decorator"
-export_decorator="pycloud_export"
 reuse_existing_same_code=True
 replace_existing_if_code_changed=False
 ```

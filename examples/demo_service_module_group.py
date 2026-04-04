@@ -14,16 +14,12 @@ def main():
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
-        b"def square(**payload):\n"
-        b"    x = payload.get('x', 0)\n"
+        b"def square(x=0, **_kwargs):\n"
         b"    return {'x': x, 'y': x * x}\n\n"
         b"@pycloud_export\n"
-        b"def fibonacci(**payload):\n"
-        b"    n = payload.get('n', 0)\n"
+        b"def fibonacci(n=0, **_kwargs):\n"
         b"    if n <= 1:\n"
         b"        return n\n"
         b"    a, b = 0, 1\n"
@@ -31,9 +27,7 @@ def main():
         b"        a, b = b, a + b\n"
         b"    return {'n': n, 'result': b}\n\n"
         b"@pycloud_export\n"
-        b"def slow_add(**payload):\n"
-        b"    a = payload.get('a', 0)\n"
-        b"    b = payload.get('b', 0)\n"
+        b"def slow_add(a=0, b=0, **_kwargs):\n"
         b"    import time\n"
         b"    time.sleep(0.1)\n"
         b"    return {'a': a, 'b': b, 'result': a + b}\n"
@@ -50,13 +44,12 @@ def main():
     group = DeployedService.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"module-demo-{int(time.time())}",
-        service_name=f"compute-service-{int(time.time())}",
+        service_name=f"compute-service-1",
         blob=blob,
         runtime="py3",
         entry_module="compute",
         entry_callable="square",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,

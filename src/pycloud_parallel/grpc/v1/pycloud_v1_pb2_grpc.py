@@ -53,6 +53,11 @@ class NodeControlServiceStub(object):
                 request_serializer=pycloud__v1__pb2.DownloadObjectRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.DownloadObjectChunk.FromString,
                 _registered_method=True)
+        self.UpdateRuntimeGlobals = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/UpdateRuntimeGlobals',
+                request_serializer=pycloud__v1__pb2.UpdateRuntimeGlobalsRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.UpdateRuntimeGlobalsResponse.FromString,
+                _registered_method=True)
         self.TaskStream = channel.stream_stream(
                 '/pycloud.v1.NodeControlService/TaskStream',
                 request_serializer=pycloud__v1__pb2.TaskStreamRequest.SerializeToString,
@@ -98,6 +103,11 @@ class NodeControlServiceStub(object):
                 request_serializer=pycloud__v1__pb2.CallServiceRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.CallServiceResponse.FromString,
                 _registered_method=True)
+        self.UpdateServiceGlobals = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/UpdateServiceGlobals',
+                request_serializer=pycloud__v1__pb2.UpdateServiceGlobalsRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.UpdateServiceGlobalsResponse.FromString,
+                _registered_method=True)
         self.HeartbeatService = channel.unary_unary(
                 '/pycloud.v1.NodeControlService/HeartbeatService',
                 request_serializer=pycloud__v1__pb2.HeartbeatServiceRequest.SerializeToString,
@@ -135,6 +145,12 @@ class NodeControlServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def DownloadObject(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateRuntimeGlobals(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -194,6 +210,12 @@ class NodeControlServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def UpdateServiceGlobals(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def HeartbeatService(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -229,6 +251,11 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     servicer.DownloadObject,
                     request_deserializer=pycloud__v1__pb2.DownloadObjectRequest.FromString,
                     response_serializer=pycloud__v1__pb2.DownloadObjectChunk.SerializeToString,
+            ),
+            'UpdateRuntimeGlobals': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateRuntimeGlobals,
+                    request_deserializer=pycloud__v1__pb2.UpdateRuntimeGlobalsRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.UpdateRuntimeGlobalsResponse.SerializeToString,
             ),
             'TaskStream': grpc.stream_stream_rpc_method_handler(
                     servicer.TaskStream,
@@ -274,6 +301,11 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     servicer.CallService,
                     request_deserializer=pycloud__v1__pb2.CallServiceRequest.FromString,
                     response_serializer=pycloud__v1__pb2.CallServiceResponse.SerializeToString,
+            ),
+            'UpdateServiceGlobals': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateServiceGlobals,
+                    request_deserializer=pycloud__v1__pb2.UpdateServiceGlobalsRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.UpdateServiceGlobalsResponse.SerializeToString,
             ),
             'HeartbeatService': grpc.unary_unary_rpc_method_handler(
                     servicer.HeartbeatService,
@@ -376,6 +408,33 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/DownloadObject',
             pycloud__v1__pb2.DownloadObjectRequest.SerializeToString,
             pycloud__v1__pb2.DownloadObjectChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateRuntimeGlobals(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/UpdateRuntimeGlobals',
+            pycloud__v1__pb2.UpdateRuntimeGlobalsRequest.SerializeToString,
+            pycloud__v1__pb2.UpdateRuntimeGlobalsResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -619,6 +678,33 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/CallService',
             pycloud__v1__pb2.CallServiceRequest.SerializeToString,
             pycloud__v1__pb2.CallServiceResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateServiceGlobals(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/UpdateServiceGlobals',
+            pycloud__v1__pb2.UpdateServiceGlobalsRequest.SerializeToString,
+            pycloud__v1__pb2.UpdateServiceGlobalsResponse.FromString,
             options,
             channel_credentials,
             insecure,

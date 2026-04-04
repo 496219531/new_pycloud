@@ -1,5 +1,15 @@
 # DeployedService
 
+`DeployedService` 当前更适合被理解为“owner 侧部署内部常驻函数服务”的入口。
+
+它的定位是：
+
+1. 内部 RPC / 内部函数服务层
+2. 稳定可寻址的常驻服务实例
+3. 不是标准 ASGI/WSGI Web 服务运行时
+
+如果你需要真正对外的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`，再在业务层调用这里的服务实例。
+
 它面向 owner 侧，职责是：
 
 1. 部署服务
@@ -32,7 +42,6 @@ group = DeployedService.deploy_from_infocenter(
     runtime="py3",
     entry_module="square_service",
     export_mode="decorator",
-    export_decorator="pycloud_export",
     worker_count=1,
     node_count=1,
 )
@@ -148,6 +157,28 @@ result = group.call_sync("square", x=7)
 2. 更复杂的对象数组、业务自定义类实例等，不做自动兼容
 3. 报错会尽量带字段路径，方便定位是哪一段 payload 不被支持
 
+### 4.2 大结果与 `ResultRef`
+
+服务返回值当前也支持“大结果自动转引用”：
+
+1. 小结果
+   - 直接 inline 返回
+2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
+   - 落到 node 本地 `objects/`
+   - 返回 `ResultRef`
+
+高层 API：
+
+1. `group.square.sync(...)`
+2. `group.call_sync(...)`
+
+会自动把 `ResultRef` 下载并还原。
+
+如果你明确知道返回值很大，建议服务函数返回：
+
+1. 小摘要
+2. 文件引用 / 对象引用
+
 ## 5. 常用部署参数
 
 ```python
@@ -182,6 +213,75 @@ group = DeployedService.deploy_from_infocenter(
 3. 节点把依赖安装到当前 `code_version` 的隔离目录
 4. 运行时调用服务方法时，也会把该依赖目录加入 `sys.path`
 5. 同一个 `code_version` 不允许混用不同 `dependency_allowlist`
+
+## 5.2 managed globals
+
+服务模式现在支持声明可动态更新的全局变量：
+
+```python
+group = DeployedService.deploy_from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    service_name="square-service",
+    blob=blob,
+    entry_module="square_service",
+    managed_global_names=["STATE", "MODEL_REF"],
+)
+
+group.update_globals({"STATE": "v2"})
+```
+
+规则：
+
+1. 只有 owner 持有 `service_token`，所以只有 owner 能更新
+2. 当前版本是按 `service_id` 定义的
+3. 同一套代码的不同服务实例可以有不同 globals
+
+## 5.3 节点目录布局
+
+当前 node 目录布局：
+
+```text
+artifact_dir/
+  codes/
+    <code_sha>/
+      artifact.py | pkg/
+      deps/
+      scopes/
+        service/<scope_hash>/
+      meta.json
+  objects/
+    <object_sha>.<fmt>
+    meta/<object_sha>.json
+```
+
+说明：
+
+1. `codes/<code_sha>/`
+   - 一套代码作用域目录
+2. `scopes/service/...`
+   - 这套代码下的服务级 managed globals
+3. `objects/`
+   - 大对象与大结果缓存
+
+## 5.4 GC
+
+服务模式文件回收当前推荐走离线命令：
+
+```bash
+pycloudctl gc --scope codes --older-than-hours 168 --dry-run
+pycloudctl gc --scope all --older-than-hours 168
+```
+
+当前规则：
+
+1. `codes`
+   - 超过阈值删除整个 `codes/<code_sha>/`
+2. `objects`
+   - 被当前 globals 引用对象保留
+   - 其余对象按 `last_at` 超时删除
+3. `all`
+   - 先删 `codes`
+   - 再删 `objects`
 
 ## 6. 节点选择
 

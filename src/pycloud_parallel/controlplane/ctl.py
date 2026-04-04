@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from typing import Dict, Iterable, List, Tuple
 from urllib.request import urlopen
+
+from pycloud_parallel.controlplane.object_ref import normalize_object_id
 
 
 def _runtime_root(explicit: str = "") -> Path:
@@ -313,6 +317,157 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return status_code
 
 
+def _default_artifact_dir(root: Path) -> Path:
+    return root / "code_cache"
+
+
+def _object_meta_dir(object_dir: Path) -> Path:
+    return object_dir / "meta"
+
+
+def _load_json(path: Path) -> Dict[str, object]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+
+
+def _collect_current_globals_object_ids(artifact_dir: Path) -> set[str]:
+    live: set[str] = set()
+    codes_dir = artifact_dir / "codes"
+    if not codes_dir.exists():
+        return live
+    for current_path in codes_dir.glob("*/scopes/*/*/current.json"):
+        current = _load_json(current_path)
+        globals_digest = str(current.get("globals_digest", "") or "").strip()
+        if not globals_digest:
+            continue
+        scope_dir = current_path.parent
+        digest = globals_digest.replace("sha256:", "", 1).strip().lower()
+        manifest_path = scope_dir / "manifests" / f"{digest}.json"
+        manifest = _load_json(manifest_path)
+        values = dict(manifest.get("values") or {})
+        for item in values.values():
+            if not isinstance(item, dict):
+                continue
+            value_digest = str(item.get("sha256", "") or "").strip()
+            if not value_digest:
+                continue
+            value_path = scope_dir / "values" / f"{value_digest.replace('sha256:', '', 1).strip().lower()}.json"
+            value_payload = _load_json(value_path)
+
+            def _walk(value):
+                if isinstance(value, dict):
+                    if set(value.keys()) == {"__pycloud_object_ref__"} and isinstance(value.get("__pycloud_object_ref__"), dict):
+                        ref = value["__pycloud_object_ref__"]
+                        object_id = normalize_object_id(str(ref.get("object_id", "") or ""))
+                        if object_id:
+                            live.add(object_id)
+                        return
+                    for child in value.values():
+                        _walk(child)
+                    return
+                if isinstance(value, list):
+                    for child in value:
+                        _walk(child)
+
+            _walk(value_payload)
+    return live
+
+
+def _cmd_gc(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    artifact_dir = Path(args.artifact_dir).expanduser().resolve() if args.artifact_dir else _default_artifact_dir(root)
+    object_dir = artifact_dir / "objects"
+    meta_dir = _object_meta_dir(object_dir)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(args.older_than_hours)))
+    deleted_objects: List[Dict[str, object]] = []
+    kept_objects: List[Dict[str, object]] = []
+    deleted_codes: List[Dict[str, object]] = []
+    kept_codes: List[Dict[str, object]] = []
+
+    if args.scope in ("codes", "all"):
+        codes_dir = artifact_dir / "codes"
+        if codes_dir.exists():
+            for code_dir in sorted(path for path in codes_dir.iterdir() if path.is_dir()):
+                meta_path = code_dir / "meta.json"
+                meta = _load_json(meta_path)
+                last_at_raw = str(meta.get("last_at", "") or "").strip()
+                try:
+                    last_at = datetime.fromisoformat(last_at_raw)
+                    if last_at.tzinfo is None:
+                        last_at = last_at.replace(tzinfo=timezone.utc)
+                except Exception:
+                    last_at = datetime.fromtimestamp(code_dir.stat().st_mtime, tz=timezone.utc)
+                row = {
+                    "code_sha": code_dir.name,
+                    "path": str(code_dir),
+                    "last_at": last_at.astimezone(timezone.utc).isoformat(),
+                }
+                if last_at >= cutoff:
+                    row["reason"] = "recently_used"
+                    kept_codes.append(row)
+                    continue
+                deleted_codes.append(row)
+                if not args.dry_run:
+                    shutil.rmtree(code_dir, ignore_errors=True)
+
+    if args.scope in ("objects", "all") and object_dir.exists():
+        live_object_ids = _collect_current_globals_object_ids(artifact_dir)
+        for object_path in sorted(path for path in object_dir.iterdir() if path.is_file()):
+            object_id = ""
+            try:
+                stem = object_path.name.split(".", 1)[0]
+                object_id = normalize_object_id(f"sha256:{stem}")
+            except Exception:
+                continue
+
+            meta_path = meta_dir / f"{object_path.name.split('.', 1)[0]}.json"
+            meta = _load_json(meta_path)
+            last_at_raw = str(meta.get("last_at", "") or "").strip()
+            try:
+                last_at = datetime.fromisoformat(last_at_raw)
+                if last_at.tzinfo is None:
+                    last_at = last_at.replace(tzinfo=timezone.utc)
+            except Exception:
+                last_at = datetime.fromtimestamp(object_path.stat().st_mtime, tz=timezone.utc)
+
+            row = {
+                "object_id": object_id,
+                "path": str(object_path),
+                "size_bytes": int(object_path.stat().st_size),
+                "last_at": last_at.astimezone(timezone.utc).isoformat(),
+            }
+            if object_id in live_object_ids:
+                row["reason"] = "referenced_by_current_globals"
+                kept_objects.append(row)
+                continue
+            if last_at >= cutoff:
+                row["reason"] = "recently_used"
+                kept_objects.append(row)
+                continue
+            deleted_objects.append(row)
+            if not args.dry_run:
+                with contextlib.suppress(FileNotFoundError):
+                    object_path.unlink()
+                with contextlib.suppress(FileNotFoundError):
+                    meta_path.unlink()
+
+    payload = {
+        "ok": True,
+        "artifact_dir": str(artifact_dir),
+        "dry_run": bool(args.dry_run),
+        "scope": args.scope,
+        "older_than_hours": int(args.older_than_hours),
+        "deleted_objects": deleted_objects,
+        "kept_objects": kept_objects,
+        "deleted_codes": deleted_codes,
+        "kept_codes": kept_codes,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PyCloud local service manager")
     parser.add_argument("--runtime-root", default="", help="base directory for logs and pid files (default: cwd or PYCLOUD_HOME)")
@@ -328,6 +483,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stop", help="stop local services started by pycloudctl")
     subparsers.add_parser("restart", help="restart local services")
     subparsers.add_parser("status", help="show local service status")
+    gc_parser = subparsers.add_parser("gc", help="garbage collect cached object files")
+    gc_parser.add_argument("--artifact-dir", default="", help="artifact/code cache directory (default: <runtime-root>/code_cache)")
+    gc_parser.add_argument("--scope", choices=["codes", "objects", "all"], default="all")
+    gc_parser.add_argument("--older-than-hours", type=int, default=24 * 7)
+    gc_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -342,6 +502,8 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_restart(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "gc":
+        return _cmd_gc(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

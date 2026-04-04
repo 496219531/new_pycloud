@@ -121,7 +121,7 @@ def _demo_route(service_name: str = "svc-demo") -> InfoCenterServiceRoute:
 
 class TestDirectConnect:
     def test_getattr_creates_proxy(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             client._discovered_methods = ["square", "fibonacci"]
             proxy = client.square
@@ -131,7 +131,7 @@ class TestDirectConnect:
             client.close()
 
     def test_unknown_method_raises(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
             with pytest.raises(AttributeError, match="has no method 'unknown'"):
@@ -140,7 +140,7 @@ class TestDirectConnect:
             client.close()
 
     def test_methods_property_uses_discovery_list_methods(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             with patch.object(
                 DirectConnect,
@@ -155,7 +155,7 @@ class TestDirectConnect:
 
     def test_call_sync(self):
         route = _demo_route()
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0)
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0, validate_on_init=False)
         try:
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
                 "pycloud_parallel.controlplane.client._call_route_http",
@@ -169,7 +169,7 @@ class TestDirectConnect:
 
     def test_async_proxy_call(self):
         route = _demo_route()
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0)
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
@@ -185,7 +185,7 @@ class TestDirectConnect:
             client.close()
 
     def test_status(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             with patch.object(
                 DiscoveryServiceClient,
@@ -199,7 +199,7 @@ class TestDirectConnect:
             client.close()
 
     def test_broadcast_is_not_supported(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
 
@@ -208,6 +208,38 @@ class TestDirectConnect:
 
             with pytest.raises(NotImplementedError, match="does not support broadcast"):
                 asyncio.run(_run())
+        finally:
+            client.close()
+
+    def test_init_raises_when_no_available_route(self):
+        with patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[]), patch.object(
+            DiscoveryServiceClient,
+            "get_status",
+            return_value={"ok": True, "route_count": 0},
+        ):
+            with pytest.raises(RuntimeError, match="no available route"):
+                DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+
+    def test_methods_raise_clear_error_when_service_has_no_exported_methods(self):
+        with patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[object()]), patch.object(
+            DiscoveryServiceClient,
+            "get_status",
+            return_value={"ok": True, "route_count": 1},
+        ):
+            client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+        try:
+            with patch.object(
+                DirectConnect,
+                "list_methods",
+                return_value=[],
+            ):
+                with patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[object()]), patch.object(
+                    DiscoveryServiceClient,
+                    "get_status",
+                    return_value={"ok": True, "route_count": 1},
+                ):
+                    with pytest.raises(RuntimeError, match="no exported methods"):
+                        _ = client.methods
         finally:
             client.close()
 

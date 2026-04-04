@@ -154,8 +154,7 @@ class TestBroadcastProxy:
         async def test():
             results = await proxy(x=7)
             assert len(results) == 2
-            # acall_all 返回的是完整响应，不是 data 部分
-            assert results[0][1] == {"data": {"result": 49}}
+            assert results[0][1] == {"result": 49}
 
         asyncio.run(test())
 
@@ -353,6 +352,7 @@ class TestDeployedService:
         async def test():
             results = await group.call_all("square", x=7)
             assert len(results) == 1
+            assert results[0][1] == {"result": 49}
 
         asyncio.run(test())
 
@@ -457,7 +457,7 @@ class TestIntegration:
             assert len(results) == 2
             for node_id, result, error in results:
                 assert error is None
-                assert result == {"data": {"x": 7, "y": 49}}
+                assert result == {"x": 7, "y": 49}
 
         asyncio.run(run_test())
 

@@ -6,12 +6,13 @@
 """
 
 import asyncio
+import time
 from pycloud_parallel import DeployedService
 
 
 def main():
     gateway_target = "127.0.0.1:50051"
-    service_name = "args-demo-service"
+    service_name = f"args-demo-service-{int(time.time())}"
 
     print("=" * 60)
     print("  位置参数演示")
@@ -20,9 +21,7 @@ def main():
 
     # 定义服务代码，展示不同参数风格的函数
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
         b"def square(x):\n"
         b"    return {'x': x, 'square': x * x}\n\n"
@@ -51,9 +50,8 @@ def main():
         runtime="py3",
         entry_module="args_demo",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         worker_count=2,
-        tags=["demo"],
+        tags=["compute"],
         min_success_nodes=1,
     )
     print(f"✓ 服务部署成功")
@@ -61,7 +59,6 @@ def main():
     print(f"  节点: {list(group.sessions.keys())}")
     print()
 
-    import time
     time.sleep(3)  # 等待服务启动
 
     try:
@@ -136,7 +133,7 @@ def main():
                 group.square(1),
                 group.square(2),
                 group.square(3),
-                group.add.sync(10, 20),
+                group.add(10, 20),
             )
             for i, r in enumerate(results, 1):
                 print(f"   [{i}] {r}")

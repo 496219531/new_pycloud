@@ -1,5 +1,14 @@
 # 文档索引
 
+建议先把当前三层角色区分开：
+
+1. `Task Mode`
+   - 重计算执行层
+2. `Service Mode`
+   - 常驻函数服务层
+3. `External Web Layer`
+   - 真正对外的轻网络入口层，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
+
 ## 建议阅读顺序
 
 1. [QUICK_START.md](QUICK_START.md)
@@ -14,14 +23,14 @@
 ## 入口文档
 
 - [QUICK_START.md](QUICK_START.md)
-  - 顶层 API、启动方式、最短示例
+  - 顶层 API、启动方式、三层定位、最短示例
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
-  - 当前控制面、节点、任务模式、服务模式的边界
+  - 当前控制面、节点、任务模式、服务模式与外部 Web 层的边界
 
 ## 任务模式
 
 - [TASK_MODE.md](TASK_MODE.md)
-  - 任务流、`runtime_key`、热点路由、runtime slot
+  - 重计算执行层、任务流、`runtime_key`、热点路由、runtime slot
 - [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
   - `TaskSubmitter` 的模块化调用体验
 - [ID_SYSTEM_DESIGN.md](ID_SYSTEM_DESIGN.md)
@@ -30,9 +39,9 @@
 ## 服务模式
 
 - [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-  - `DeployedService` 的 owner 侧用法
+  - `DeployedService` 的 owner 侧用法与常驻函数服务定位
 - [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-  - `GatewayConnect` / `GatewayServiceClient`
+  - `GatewayConnect` / `GatewayServiceClient`，面向内部函数服务 caller
 - [CLASS_RENAMING.md](CLASS_RENAMING.md)
   - 当前统一命名说明
 

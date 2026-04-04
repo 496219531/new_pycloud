@@ -11,6 +11,12 @@ Gateway 只服务于服务模式 caller：
 
 任务模式不经过 Gateway。
 
+边界上要注意：
+
+1. 这里的 `Gateway` 面向的是内部函数服务调用
+2. 它不是标准 Web 应用入口层
+3. 如果你需要真正对外的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
+
 ## 2. 两层 Python 客户端
 
 ### 2.1 `GatewayServiceClient`

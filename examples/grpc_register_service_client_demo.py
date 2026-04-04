@@ -1,14 +1,12 @@
-from pycloud_parallel.controlplane.client import ServiceGroup
 import time
+from pycloud_parallel.controlplane.client import ServiceGroup
 
 def main():
     # 你的业务代码（也可以用 artifact_path 指向本地 .py 文件）
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
         b"def square(x):\n"
         b"    return {'x': x, 'y': x * x}\n"
@@ -24,7 +22,6 @@ def main():
         entry_module="square_service",
         entry_callable="square",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,

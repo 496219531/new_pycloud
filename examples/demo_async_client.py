@@ -15,16 +15,14 @@ def main():
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
     blob = (
-        b"def pycloud_export(fn):\n"
-        b"    fn.__pycloud_export__ = True\n"
-        b"    return fn\n\n"
+        b"from pycloud_parallel import pycloud_export\n\n"
         b"@pycloud_export\n"
-        b"def square(payload):\n"
-        b"    x = int(payload.get('x', 0))\n"
+        b"def square(x=0, **_kwargs):\n"
+        b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x}\n\n"
         b"@pycloud_export\n"
-        b"def fibonacci(payload):\n"
-        b"    n = int(payload.get('n', 0))\n"
+        b"def fibonacci(n=0, **_kwargs):\n"
+        b"    n = int(n)\n"
         b"    if n <= 1:\n"
         b"        return n\n"
         b"    a, b = 0, 1\n"
@@ -41,13 +39,12 @@ def main():
     group = ServiceGroup.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"async-demo-{suffix}",
-        service_name=f"compute-service-{suffix}",
+        service_name=f"compute-service",
         blob=blob,
         runtime="py3",
         entry_module="compute",
         entry_callable="square",
         export_mode="decorator",
-        export_decorator="pycloud_export",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,

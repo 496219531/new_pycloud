@@ -59,6 +59,8 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
+_DEFAULT_EXPORT_DECORATOR = "pycloud_export"
+
 
 class LargeResultError(ValueError):
     """Raised when a task result is too large for safe inline return."""
@@ -72,7 +74,309 @@ class StoredResultArtifact:
     materialize_as: str
 
 
+@dataclass
+class ManagedGlobalsState:
+    scope_kind: str
+    scope_key: str
+    scope_dir: str
+    allowed_names: Tuple[str, ...]
+    globals_digest: str
+
+
 _EXECUTOR_ACTIVE = object()
+_MANAGED_GLOBALS_CACHE_LOCK = threading.Lock()
+_MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
+
+
+def _stable_json_bytes(data: Any) -> bytes:
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _sha256_text(data: Any) -> str:
+    return f"sha256:{hashlib.sha256(_stable_json_bytes(data)).hexdigest()}"
+
+
+def _managed_globals_scope_dir(base_dir: Path, *, scope_kind: str, scope_key: str) -> Path:
+    digest = hashlib.sha1(f"{scope_kind}:{scope_key}".encode("utf-8")).hexdigest()
+    return Path(base_dir) / scope_kind / digest
+
+
+def _code_digest_from_code_version(code_version: str) -> str:
+    digest = str(code_version or "").replace("sha256:", "").strip().lower()
+    if not digest:
+        raise ValueError("invalid code_version")
+    return digest
+
+
+def _code_scope_dir(base_dir: Path, *, code_version: str) -> Path:
+    return Path(base_dir) / "codes" / _code_digest_from_code_version(code_version)
+
+
+def _code_dependency_dir(base_dir: Path, *, code_version: str) -> Path:
+    return _code_scope_dir(base_dir, code_version=code_version) / "deps"
+
+
+def _code_meta_path(base_dir: Path, *, code_version: str) -> Path:
+    return _code_scope_dir(base_dir, code_version=code_version) / "meta.json"
+
+
+def _code_archive_path(base_dir: Path, *, code_version: str, package_format: str) -> Path:
+    normalized = _normalize_package_format(package_format)
+    code_dir = _code_scope_dir(base_dir, code_version=code_version)
+    if normalized == "tar.gz":
+        return code_dir / "artifact.tar.gz"
+    if normalized == "zip":
+        return code_dir / "artifact.zip"
+    if normalized == "whl":
+        return code_dir / "artifact.whl"
+    raise ValueError(f"unsupported archive package_format: {package_format}")
+
+
+def _code_exec_path(base_dir: Path, *, code_version: str, package_format: str) -> Path:
+    normalized = _normalize_package_format(package_format)
+    code_dir = _code_scope_dir(base_dir, code_version=code_version)
+    if normalized == "py":
+        return code_dir / "artifact.py"
+    if normalized in ("tar.gz", "zip", "whl"):
+        return code_dir / "pkg"
+    raise ValueError(f"unsupported package_format for code exec path: {package_format}")
+
+
+def _objects_meta_dir(object_dir: Path) -> Path:
+    return Path(object_dir) / "meta"
+
+
+def _object_meta_path(object_dir: Path, *, object_id: str) -> Path:
+    digest = normalize_object_id(object_id).replace("sha256:", "", 1)
+    return _objects_meta_dir(object_dir) / f"{digest}.json"
+
+
+def _managed_globals_manifest_path(scope_dir: Path, globals_digest: str) -> Path:
+    normalized = str(globals_digest or "").replace("sha256:", "").strip().lower()
+    if not normalized:
+        raise ValueError("globals_digest is required")
+    return Path(scope_dir) / "manifests" / f"{normalized}.json"
+
+
+def _managed_globals_value_path(scope_dir: Path, *, value_digest: str) -> Path:
+    normalized = str(value_digest or "").replace("sha256:", "").strip().lower()
+    if not normalized:
+        raise ValueError("value_digest is required")
+    return Path(scope_dir) / "values" / f"{normalized}.json"
+
+
+def _managed_globals_current_path(scope_dir: Path) -> Path:
+    return Path(scope_dir) / "current.json"
+
+
+def _normalize_managed_global_names(names: Sequence[str]) -> Tuple[str, ...]:
+    normalized: List[str] = []
+    seen = set()
+    for item in names or ():
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return tuple(sorted(normalized))
+
+
+def _load_managed_globals_snapshot_serialized(state: ManagedGlobalsState) -> Dict[str, Any]:
+    if not state.globals_digest:
+        return {}
+    scope_dir = Path(state.scope_dir)
+    manifest_path = _managed_globals_manifest_path(scope_dir, state.globals_digest)
+    if not manifest_path.exists():
+        return {}
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
+    values_meta = dict(manifest.get("values") or {})
+    out: Dict[str, Any] = {}
+    for name in state.allowed_names:
+        item = values_meta.get(name)
+        if not isinstance(item, dict):
+            continue
+        value_digest = str(item.get("sha256", "") or "").strip()
+        if not value_digest:
+            continue
+        value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest)
+        if not value_path.exists():
+            continue
+        out[name] = json.loads(value_path.read_text(encoding="utf-8") or "null")
+    return out
+
+
+def _write_managed_globals_snapshot(
+    state: ManagedGlobalsState,
+    *,
+    values_serialized: Dict[str, Any],
+) -> str:
+    scope_dir = Path(state.scope_dir)
+    manifests_dir = scope_dir / "manifests"
+    values_dir = scope_dir / "values"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    values_dir.mkdir(parents=True, exist_ok=True)
+
+    values_meta: Dict[str, Dict[str, str]] = {}
+    for name in state.allowed_names:
+        if name not in values_serialized:
+            continue
+        payload = values_serialized[name]
+        value_digest = _sha256_text(payload)
+        value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest)
+        if not value_path.exists():
+            tmp_path = value_path.with_suffix(".tmp")
+            tmp_path.write_bytes(_stable_json_bytes(payload))
+            os.replace(str(tmp_path), str(value_path))
+        values_meta[name] = {"sha256": value_digest}
+
+    manifest = {
+        "scope_kind": state.scope_kind,
+        "scope_key": state.scope_key,
+        "allowed_names": list(state.allowed_names),
+        "values": values_meta,
+    }
+    globals_digest = _sha256_text(manifest)
+    manifest_path = _managed_globals_manifest_path(scope_dir, globals_digest)
+    if not manifest_path.exists():
+        tmp_path = manifest_path.with_suffix(".tmp")
+        tmp_path.write_bytes(_stable_json_bytes(manifest))
+        os.replace(str(tmp_path), str(manifest_path))
+    return globals_digest
+
+
+def _load_code_meta(base_dir: Path, *, code_version: str) -> Dict[str, Any]:
+    meta_path = _code_meta_path(base_dir, code_version=code_version)
+    if not meta_path.exists():
+        return {}
+    return json.loads(meta_path.read_text(encoding="utf-8") or "{}")
+
+
+def _write_code_meta(base_dir: Path, artifact: "CodeArtifact", *, last_at: Optional[datetime] = None) -> None:
+    meta_path = _code_meta_path(base_dir, code_version=artifact.code_version)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _load_code_meta(base_dir, code_version=artifact.code_version)
+    created_at = artifact.created_at.astimezone(timezone.utc).isoformat()
+    if existing.get("created_at"):
+        created_at = str(existing.get("created_at"))
+    effective_last_at = last_at.astimezone(timezone.utc).isoformat() if last_at is not None else str(existing.get("last_at", "") or created_at)
+    payload = {
+        "code_version": artifact.code_version,
+        "runtime": artifact.runtime,
+        "entry_module": artifact.entry_module,
+        "entry_callable": artifact.entry_callable,
+        "package_format": artifact.package_format,
+        "export_mode": artifact.export_mode,
+        "export_methods": list(artifact.export_methods),
+        "export_decorator": artifact.export_decorator,
+        "dependency_allowlist": list(artifact.dependency_allowlist),
+        "managed_global_names": list(artifact.managed_global_names),
+        "artifact_path": artifact.path,
+        "dependency_path": artifact.dependency_path,
+        "size_bytes": int(artifact.size_bytes),
+        "created_at": created_at,
+        "last_at": effective_last_at,
+    }
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_bytes(_stable_json_bytes(payload))
+    os.replace(str(tmp_path), str(meta_path))
+
+
+def touch_code_last_at(base_dir: Path, *, code_version: str) -> None:
+    meta = _load_code_meta(base_dir, code_version=code_version)
+    if not meta:
+        return
+    meta_path = _code_meta_path(base_dir, code_version=code_version)
+    meta["last_at"] = utc_now().astimezone(timezone.utc).isoformat()
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_bytes(_stable_json_bytes(meta))
+    os.replace(str(tmp_path), str(meta_path))
+
+
+def _write_object_meta(
+    object_dir: Path,
+    *,
+    object_id: str,
+    fmt: str,
+    size_bytes: int,
+    created_at: datetime,
+    last_at: Optional[datetime] = None,
+) -> None:
+    meta_dir = _objects_meta_dir(object_dir)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = _object_meta_path(object_dir, object_id=object_id)
+    timestamp = (last_at or created_at).astimezone(timezone.utc).isoformat()
+    payload = {
+        "object_id": normalize_object_id(object_id),
+        "format": normalize_object_format(fmt, default="bin"),
+        "size_bytes": max(0, int(size_bytes or 0)),
+        "created_at": created_at.astimezone(timezone.utc).isoformat(),
+        "last_at": timestamp,
+    }
+    tmp_path = meta_path.with_suffix(".tmp")
+    tmp_path.write_bytes(_stable_json_bytes(payload))
+    os.replace(str(tmp_path), str(meta_path))
+
+
+def _load_object_meta(object_dir: Path, *, object_id: str) -> Dict[str, Any]:
+    meta_path = _object_meta_path(object_dir, object_id=object_id)
+    if not meta_path.exists():
+        return {}
+    return json.loads(meta_path.read_text(encoding="utf-8") or "{}")
+
+
+def _touch_object_last_at(object_dir: Path, *, object_id: str, fallback_path: Optional[Path] = None) -> None:
+    object_root = Path(object_dir)
+    meta = _load_object_meta(object_root, object_id=object_id)
+    now = utc_now()
+    if meta:
+        created_at_raw = str(meta.get("created_at", "") or "").strip()
+        try:
+            created_at = datetime.fromisoformat(created_at_raw)
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            created_at = now
+        _write_object_meta(
+            object_root,
+            object_id=object_id,
+            fmt=str(meta.get("format", "") or "bin"),
+            size_bytes=int(meta.get("size_bytes", 0) or 0),
+            created_at=created_at,
+            last_at=now,
+        )
+        return
+    candidate = Path(fallback_path) if fallback_path is not None else None
+    if candidate is None or not candidate.exists():
+        return
+    _write_object_meta(
+        object_root,
+        object_id=object_id,
+        fmt=normalize_object_format("", source_name=candidate.name, default="bin"),
+        size_bytes=candidate.stat().st_size,
+        created_at=datetime.fromtimestamp(candidate.stat().st_ctime, tz=timezone.utc),
+        last_at=now,
+    )
+
+
+def touch_object_last_at(object_dir: Path, *, object_id: str, fallback_path: Optional[Path] = None) -> None:
+    _touch_object_last_at(object_dir, object_id=object_id, fallback_path=fallback_path)
+
+
+def _write_managed_globals_current(scope_dir: Path, *, globals_digest: str) -> None:
+    current_path = _managed_globals_current_path(scope_dir)
+    current_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "globals_digest": str(globals_digest or "").strip(),
+        "updated_at": utc_now().astimezone(timezone.utc).isoformat(),
+    }
+    tmp_path = current_path.with_suffix(".tmp")
+    tmp_path.write_bytes(_stable_json_bytes(payload))
+    os.replace(str(tmp_path), str(current_path))
 
 
 def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) -> ResultRef:
@@ -107,6 +411,15 @@ def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_by
         os.replace(str(source_path), str(final_path))
     else:
         source_path.unlink(missing_ok=True)
+    created_at = utc_now()
+    _write_object_meta(
+        root,
+        object_id=object_id,
+        fmt=normalized_format,
+        size_bytes=max(0, int(size_bytes or final_path.stat().st_size)),
+        created_at=created_at,
+        last_at=created_at,
+    )
     return StoredResultArtifact(
         object_id=object_id,
         format=normalized_format,
@@ -228,6 +541,8 @@ def _build_execute_spec(
     object_dir: Path,
     method_name: str,
     payload: dict,
+    managed_globals_scope_dir: str = "",
+    managed_globals_digest: str = "",
 ) -> Dict[str, Any]:
     return {
         "artifact_path": artifact.path,
@@ -241,6 +556,8 @@ def _build_execute_spec(
         "method_name": method_name,
         "entry_callable": artifact.entry_callable,
         "payload": payload or {},
+        "managed_globals_scope_dir": str(managed_globals_scope_dir or ""),
+        "managed_globals_digest": str(managed_globals_digest or ""),
     }
 
 
@@ -305,7 +622,7 @@ def _normalize_export_spec(
         normalized_mode = ""
 
     normalized_methods = tuple(sorted({x.strip() for x in methods if str(x).strip()}))
-    normalized_decorator = str(decorator or "").strip() or "pycloud_export"
+    normalized_decorator = _DEFAULT_EXPORT_DECORATOR
     fallback_callable = str(entry_callable or "").strip() or "run"
 
     if not normalized_mode:
@@ -399,6 +716,19 @@ def _describe_artifact_error(
     )
 
 
+def _describe_user_execution_error(exc: BaseException) -> str:
+    message = str(exc) or repr(exc)
+    detail = f"{exc.__class__.__name__}: {message}"
+    missing_import = _missing_import_name(exc)
+    repair_hint = (
+        f" Missing dependency `{missing_import}` detected during execution; "
+        "retry with dependency_allowlist if node-side install is allowed."
+        if missing_import
+        else ""
+    )
+    return f"user code execution failed: {detail}{repair_hint}"
+
+
 def _normalize_dependency_allowlist(requirements: Sequence[str]) -> Tuple[str, ...]:
     normalized: List[str] = []
     seen: set[str] = set()
@@ -445,8 +775,11 @@ def _install_dependency_allowlist(requirements: Sequence[str], *, target_dir: Pa
     normalized = _normalize_dependency_allowlist(requirements)
     if not normalized:
         return
-    shutil.rmtree(target_dir, ignore_errors=True)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(target_dir)
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = target_dir.with_name(f"{target_dir.name}.tmp-{uuid.uuid4().hex}")
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
         "-m",
@@ -456,7 +789,7 @@ def _install_dependency_allowlist(requirements: Sequence[str], *, target_dir: Pa
         "--no-input",
         "--disable-pip-version-check",
         "--target",
-        str(target_dir),
+        str(staging_dir),
         *normalized,
     ]
     completed = subprocess.run(
@@ -466,10 +799,23 @@ def _install_dependency_allowlist(requirements: Sequence[str], *, target_dir: Pa
         check=False,
     )
     if completed.returncode != 0:
+        shutil.rmtree(staging_dir, ignore_errors=True)
         stderr = str(completed.stderr or "").strip()
         stdout = str(completed.stdout or "").strip()
         detail = stderr or stdout or f"pip exited with code {completed.returncode}"
         raise RuntimeError(f"dependency install failed for {list(normalized)}: {detail}")
+    backup_dir = target_dir.with_name(f"{target_dir.name}.bak-{uuid.uuid4().hex}")
+    try:
+        if target_dir.exists():
+            os.replace(str(target_dir), str(backup_dir))
+        os.replace(str(staging_dir), str(target_dir))
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if backup_dir.exists() and not target_dir.exists():
+            os.replace(str(backup_dir), str(target_dir))
+        raise
+    finally:
+        shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def _purge_module_tree(module_name: str) -> None:
@@ -559,12 +905,12 @@ def _build_callable_router(
     decorator: str,
     entry_callable: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Tuple[str, str]]]:
-    marker = str(decorator or "").strip() or "pycloud_export"
+    marker = _DEFAULT_EXPORT_DECORATOR
     marker_candidates = {
         marker,
         f"__{marker}__",
-        "pycloud_export",
-        "__pycloud_export__",
+        _DEFAULT_EXPORT_DECORATOR,
+        f"__{_DEFAULT_EXPORT_DECORATOR}__",
     }
     exported_declared = set()
     declared = getattr(module, "__pycloud_exports__", None)
@@ -891,10 +1237,12 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
 
             candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
             if candidate.exists():
+                _touch_object_last_at(root, object_id=value.object_id, fallback_path=candidate)
                 return _materialize_path(candidate)
             digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
             fallback = sorted(root.glob(f"{digest}*"))
             if fallback:
+                _touch_object_last_at(root, object_id=value.object_id, fallback_path=fallback[0])
                 return _materialize_path(fallback[0])
             raise ObjectResolutionError(f"object not found on node: {value.object_id}")
         if isinstance(value, dict):
@@ -910,12 +1258,66 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
     return _resolve(payload)
 
 
+def _apply_managed_globals_to_router(
+    router: Dict[str, Any],
+    *,
+    scope_dir: str,
+    globals_digest: str,
+    object_dir: str,
+) -> None:
+    normalized_scope_dir = str(scope_dir or "").strip()
+    normalized_digest = str(globals_digest or "").strip()
+    if not normalized_scope_dir or not normalized_digest:
+        return
+
+    with _MANAGED_GLOBALS_CACHE_LOCK:
+        if _MANAGED_GLOBALS_CACHE.get(normalized_scope_dir) == normalized_digest:
+            return
+
+    manifest_path = _managed_globals_manifest_path(Path(normalized_scope_dir), normalized_digest)
+    if not manifest_path.exists():
+        raise RuntimeError(f"managed globals manifest missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
+    values_meta = dict(manifest.get("values") or {})
+
+    resolved_values: Dict[str, Any] = {}
+    for name, item in values_meta.items():
+        if not isinstance(item, dict):
+            continue
+        value_digest = str(item.get("sha256", "") or "").strip()
+        if not value_digest:
+            continue
+        value_path = _managed_globals_value_path(Path(normalized_scope_dir), value_digest=value_digest)
+        if not value_path.exists():
+            raise RuntimeError(f"managed globals value missing: {value_path}")
+        serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
+        resolved_value = convert_dict_to_arrow(serialized_value)
+        resolved_values[name] = _resolve_object_refs_in_payload(resolved_value, object_dir=object_dir)
+
+    seen_globals_ids = set()
+    for fn in router.values():
+        globals_dict = getattr(fn, "__globals__", None)
+        if not isinstance(globals_dict, dict):
+            continue
+        globals_id = id(globals_dict)
+        if globals_id in seen_globals_ids:
+            continue
+        seen_globals_ids.add(globals_id)
+        for name, value in resolved_values.items():
+            globals_dict[name] = value
+
+    with _MANAGED_GLOBALS_CACHE_LOCK:
+        _MANAGED_GLOBALS_CACHE[normalized_scope_dir] = normalized_digest
+
+
 def _execute_payload_in_subprocess(
     artifact_path: str,
     entry_module: str,
     package_format: str,
     dependency_path: str,
     object_dir: str,
+    managed_globals_scope_dir: str,
+    managed_globals_digest: str,
     export_mode: str,
     export_methods: Sequence[str],
     export_decorator: str,
@@ -954,18 +1356,27 @@ def _execute_payload_in_subprocess(
             )
         return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc))
     try:
-        method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
-        fn = router.get(method)
-        if fn is None:
-            raise RuntimeError(f"method `{method}` not exported")
-        resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
-        ret = _invoke_user_callable(fn, resolved_payload)
+        with _temporary_import_paths(dependency_path):
+            method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
+            fn = router.get(method)
+            if fn is None:
+                raise RuntimeError(f"method `{method}` not exported")
+            _apply_managed_globals_to_router(
+                router,
+                scope_dir=managed_globals_scope_dir,
+                globals_digest=managed_globals_digest,
+                object_dir=object_dir,
+            )
+            resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
+            ret = _invoke_user_callable(fn, resolved_payload)
         return _normalize_user_return(ret, object_dir=object_dir)
     except LargeResultError as exc:
         return ("FAILED_USER", None, exc.__class__.__name__, str(exc))
     except ObjectResolutionError as exc:
         return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc))
     except Exception as exc:
+        if isinstance(exc, (ImportError, ModuleNotFoundError)):
+            return ("FAILED_USER", None, exc.__class__.__name__, _describe_user_execution_error(exc))
         return ("FAILED_USER", None, exc.__class__.__name__, repr(exc))
 
 
@@ -1354,6 +1765,7 @@ class CodeArtifact:
     export_methods: Tuple[str, ...]
     export_decorator: str
     dependency_allowlist: Tuple[str, ...]
+    managed_global_names: Tuple[str, ...]
     dependency_path: str
     size_bytes: int
     created_at: datetime
@@ -1454,6 +1866,8 @@ class ServiceSession:
     alive_workers: int = 0
     stop_reason: str = ""
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    managed_globals_scope_dir: str = ""
+    managed_globals_digest: str = ""
 
 
 @dataclass
@@ -1538,8 +1952,12 @@ class NodeControlState:
 
         self._artifact_dir = Path(artifact_dir)
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
-        self._object_dir = self._artifact_dir / "_objects"
+        self._codes_dir = self._artifact_dir / "codes"
+        self._codes_dir.mkdir(parents=True, exist_ok=True)
+        self._object_dir = self._artifact_dir / "objects"
         self._object_dir.mkdir(parents=True, exist_ok=True)
+        self._runtime_managed_globals: Dict[Tuple[str, str, str], ManagedGlobalsState] = {}
+        self._client_code_tokens: Dict[Tuple[str, str], str] = {}
 
         self._stop_event = threading.Event()
         self._monitor = threading.Thread(target=self._monitor_loop, name="nodecontrol-monitor", daemon=True)
@@ -1584,6 +2002,131 @@ class NodeControlState:
     @property
     def object_dir(self) -> Path:
         return self._object_dir
+
+    @property
+    def codes_dir(self) -> Path:
+        return self._codes_dir
+
+    def _new_managed_globals_state(
+        self,
+        *,
+        code_version: str,
+        scope_kind: str,
+        scope_key: str,
+        allowed_names: Sequence[str],
+    ) -> ManagedGlobalsState:
+        code_dir = _code_scope_dir(self._artifact_dir, code_version=code_version)
+        scopes_dir = code_dir / "scopes"
+        state = ManagedGlobalsState(
+            scope_kind=str(scope_kind or "").strip(),
+            scope_key=str(scope_key or "").strip(),
+            scope_dir=str(_managed_globals_scope_dir(scopes_dir, scope_kind=scope_kind, scope_key=scope_key)),
+            allowed_names=_normalize_managed_global_names(allowed_names),
+            globals_digest="",
+        )
+        state.globals_digest = _write_managed_globals_snapshot(state, values_serialized={})
+        _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
+        return state
+
+    def _ensure_service_managed_globals_state_locked(
+        self,
+        session: ServiceSession,
+        *,
+        artifact: CodeArtifact,
+    ) -> Optional[ManagedGlobalsState]:
+        if not artifact.managed_global_names:
+            session.managed_globals_scope_dir = ""
+            session.managed_globals_digest = ""
+            return None
+        if not session.managed_globals_scope_dir:
+            state = self._new_managed_globals_state(
+                code_version=session.code_version,
+                scope_kind="service",
+                scope_key=session.service_id,
+                allowed_names=artifact.managed_global_names,
+            )
+            session.managed_globals_scope_dir = state.scope_dir
+            session.managed_globals_digest = state.globals_digest
+            return state
+        return ManagedGlobalsState(
+            scope_kind="service",
+            scope_key=session.service_id,
+            scope_dir=session.managed_globals_scope_dir,
+            allowed_names=_normalize_managed_global_names(artifact.managed_global_names),
+            globals_digest=session.managed_globals_digest,
+        )
+
+    def _ensure_runtime_managed_globals_state_locked(
+        self,
+        *,
+        client_id: str = "",
+        code_version: str,
+        runtime_key: str,
+        artifact: CodeArtifact,
+    ) -> Optional[ManagedGlobalsState]:
+        if not artifact.managed_global_names:
+            return None
+        normalized_key = (
+            str(client_id or "").strip(),
+            str(code_version or "").strip(),
+            str(runtime_key or "").strip(),
+        )
+        state = self._runtime_managed_globals.get(normalized_key)
+        if state is None:
+            state = self._new_managed_globals_state(
+                code_version=code_version,
+                scope_kind="runtime",
+                scope_key=f"{normalized_key[0]}|{normalized_key[1]}|{normalized_key[2]}",
+                allowed_names=artifact.managed_global_names,
+            )
+            self._runtime_managed_globals[normalized_key] = state
+        return state
+
+    def _update_managed_globals_state(
+        self,
+        state: ManagedGlobalsState,
+        *,
+        values: Dict[str, Any],
+    ) -> Tuple[str, List[str]]:
+        if not values:
+            raise ValueError("managed globals values cannot be empty")
+        unknown = [name for name in values if name not in set(state.allowed_names)]
+        if unknown:
+            raise ValueError(f"managed globals not declared in upload metadata: {unknown}")
+
+        current_values = _load_managed_globals_snapshot_serialized(state)
+        updated_names: List[str] = []
+        for name, value in values.items():
+            current_values[name] = serialize_arrow_compatible(value)
+            updated_names.append(name)
+        state.globals_digest = _write_managed_globals_snapshot(state, values_serialized=current_values)
+        _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
+        return state.globals_digest, sorted(updated_names)
+
+    def _register_client_code_token_locked(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        code_token: str,
+    ) -> str:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        normalized_code_token = str(code_token or "").strip()
+        if not normalized_client_id:
+            raise ValueError("client_id is required for code token registration")
+        if not normalized_code_version:
+            raise ValueError("code_version is required for code token registration")
+        if not normalized_code_token:
+            normalized_code_token = secrets.token_urlsafe(24)
+        self._client_code_tokens[(normalized_client_id, normalized_code_version)] = normalized_code_token
+        return normalized_code_token
+
+    def get_client_code_token(self, *, client_id: str, code_version: str) -> str:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        with self._lock:
+            return str(self._client_code_tokens.get((normalized_client_id, normalized_code_version), "") or "")
 
     def _executor_host_required(self) -> bool:
         return bool(self.enable_internal_executor or self.enable_service_session)
@@ -1646,7 +2189,11 @@ class NodeControlState:
                 return artifact
         candidate = object_storage_path(self._object_dir, object_id=normalized, fmt="bin")
         digest = normalized.replace("sha256:", "", 1)
-        fallback = sorted(self._object_dir.glob(f"{digest}*"))
+        fallback = sorted(
+            path
+            for path in self._object_dir.glob(f"{digest}*")
+            if path.is_file()
+        )
         if candidate.exists():
             return ObjectArtifact(
                 object_id=normalized,
@@ -1667,10 +2214,40 @@ class NodeControlState:
         raise KeyError("object not found")
 
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
-        digest = str(code_version or "").replace("sha256:", "").strip().lower()
-        if not digest:
-            raise ValueError("invalid code_version for dependency directory")
-        return self._artifact_dir / f"{digest}_deps"
+        return _code_dependency_dir(self._artifact_dir, code_version=code_version)
+
+    def _validate_managed_global_names(
+        self,
+        artifact: CodeArtifact,
+        *,
+        dependency_path: str,
+    ) -> None:
+        if not artifact.managed_global_names:
+            return
+        module = _load_user_module(
+            artifact.path,
+            entry_module=artifact.entry_module,
+            package_format=artifact.package_format,
+            dependency_path=dependency_path,
+        )
+        try:
+            missing = [name for name in artifact.managed_global_names if not hasattr(module, name)]
+            if missing:
+                raise ValueError(f"managed globals not found in entry module: {missing}")
+            invalid = []
+            for name in artifact.managed_global_names:
+                value = getattr(module, name)
+                if inspect.ismodule(value) or inspect.isfunction(value) or inspect.isclass(value) or callable(value):
+                    invalid.append(name)
+            if invalid:
+                raise ValueError(f"managed globals must be data values, not callables/modules/classes: {invalid}")
+        finally:
+            _purge_loaded_artifact_modules(
+                artifact.path,
+                entry_module=artifact.entry_module,
+                package_format=artifact.package_format,
+                dependency_path=dependency_path,
+            )
 
     def _validate_artifact_methods(
         self,
@@ -1678,7 +2255,7 @@ class NodeControlState:
         *,
         dependency_path: str,
     ) -> Dict[str, Tuple[str, str]]:
-        return _discover_callable_methods(
+        methods = _discover_callable_methods(
             artifact.path,
             entry_module=artifact.entry_module,
             package_format=artifact.package_format,
@@ -1688,6 +2265,8 @@ class NodeControlState:
             export_decorator=artifact.export_decorator,
             entry_callable=artifact.entry_callable,
         )
+        self._validate_managed_global_names(artifact, dependency_path=dependency_path)
+        return methods
 
     def _ensure_artifact_ready(
         self,
@@ -1697,16 +2276,36 @@ class NodeControlState:
     ) -> Dict[str, Tuple[str, str]]:
         normalized_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
         installed_dependency_path = str(artifact.dependency_path or "").strip()
-        if artifact.dependency_allowlist and normalized_allowlist and artifact.dependency_allowlist != normalized_allowlist:
-            raise ValueError(
-                "cached code_version exists with different dependency_allowlist: "
-                f"existing={list(artifact.dependency_allowlist)} incoming={list(normalized_allowlist)}"
-            )
+        effective_allowlist = _normalize_dependency_allowlist(
+            [*artifact.dependency_allowlist, *normalized_allowlist]
+        )
+
+        created_dir = False
+        candidate_dependency_path = installed_dependency_path
+        if effective_allowlist and (not candidate_dependency_path or effective_allowlist != artifact.dependency_allowlist):
+            target_dir = self._dependency_dir_for_code_version(artifact.code_version)
+            try:
+                _install_dependency_allowlist(effective_allowlist, target_dir=target_dir)
+            except Exception as install_exc:
+                if _is_user_artifact_error(install_exc):
+                    raise ValueError(
+                        _describe_artifact_error(
+                            install_exc,
+                            entry_module=artifact.entry_module,
+                            entry_callable=artifact.entry_callable,
+                            package_format=artifact.package_format,
+                        )
+                    ) from install_exc
+                raise
+            created_dir = True
+            candidate_dependency_path = str(target_dir)
 
         try:
-            return self._validate_artifact_methods(artifact, dependency_path=installed_dependency_path)
+            method_info = self._validate_artifact_methods(artifact, dependency_path=candidate_dependency_path)
         except Exception as exc:
-            if not normalized_allowlist or not _missing_import_name(exc):
+            if not effective_allowlist or not _missing_import_name(exc):
+                if created_dir:
+                    shutil.rmtree(candidate_dependency_path, ignore_errors=True)
                 if _is_user_artifact_error(exc):
                     raise ValueError(
                         _describe_artifact_error(
@@ -1719,13 +2318,11 @@ class NodeControlState:
                 raise
 
             target_dir = self._dependency_dir_for_code_version(artifact.code_version)
-            created_dir = False
             try:
-                _install_dependency_allowlist(normalized_allowlist, target_dir=target_dir)
-                created_dir = True
+                _install_dependency_allowlist(effective_allowlist, target_dir=target_dir)
                 method_info = self._validate_artifact_methods(artifact, dependency_path=str(target_dir))
             except Exception as repair_exc:
-                if created_dir:
+                if created_dir or target_dir.exists():
                     shutil.rmtree(target_dir, ignore_errors=True)
                 if _is_user_artifact_error(repair_exc):
                     raise ValueError(
@@ -1738,9 +2335,16 @@ class NodeControlState:
                     ) from repair_exc
                 raise
 
-            artifact.dependency_allowlist = normalized_allowlist
+            artifact.dependency_allowlist = effective_allowlist
             artifact.dependency_path = str(target_dir)
+            _write_code_meta(self._artifact_dir, artifact)
             return method_info
+
+        if effective_allowlist and candidate_dependency_path:
+            artifact.dependency_allowlist = effective_allowlist
+            artifact.dependency_path = candidate_dependency_path
+            _write_code_meta(self._artifact_dir, artifact)
+        return method_info
 
     def service_worker_used(self) -> int:
         with self._lock:
@@ -1788,6 +2392,7 @@ class NodeControlState:
     def put_code_from_uploaded_file(
         self,
         *,
+        client_id: str,
         sha256: str,
         runtime: str,
         entry_module: str,
@@ -1797,6 +2402,8 @@ class NodeControlState:
         export_methods: Sequence[str] = (),
         export_decorator: str = "",
         dependency_allowlist: Sequence[str] = (),
+        managed_global_names: Sequence[str] = (),
+        code_token: str = "",
         uploaded_path: str,
         actual_sha256: str,
         size_bytes: int,
@@ -1811,13 +2418,27 @@ class NodeControlState:
 
         code_version = f"sha256:{digest}"
         normalized_dependency_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
+        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
         with self._lock:
             existing = self._codes.get(code_version)
             if existing is not None:
+                if existing.managed_global_names != normalized_managed_global_names and (
+                    existing.managed_global_names or normalized_managed_global_names
+                ):
+                    raise ValueError(
+                        "cached code_version exists with different managed_global_names: "
+                        f"existing={list(existing.managed_global_names)} incoming={list(normalized_managed_global_names)}"
+                    )
                 if validate_load:
                     self._ensure_artifact_ready(
                         existing,
                         dependency_allowlist=normalized_dependency_allowlist,
+                    )
+                if str(client_id or "").strip():
+                    self._register_client_code_token_locked(
+                        client_id=client_id,
+                        code_version=code_version,
+                        code_token=code_token,
                     )
                 return existing, True
 
@@ -1847,20 +2468,19 @@ class NodeControlState:
             raise ValueError(f"uploaded file missing: {uploaded_path}")
 
         now = utc_now()
-        cleanup_paths: List[Path] = []
+        code_dir = _code_scope_dir(self._artifact_dir, code_version=code_version)
+        cleanup_paths: List[Path] = [code_dir]
+        code_dir.mkdir(parents=True, exist_ok=True)
         if normalized_format == "py":
-            final_path = self._artifact_dir / f"{digest}.py"
+            final_path = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
             os.replace(str(tmp_path), str(final_path))
             artifact_exec_path = str(final_path)
-            cleanup_paths.append(final_path)
         else:
-            ext = "tar.gz" if normalized_format == "tar.gz" else normalized_format
-            archive_path = self._artifact_dir / f"{digest}.{ext}"
+            archive_path = _code_archive_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
             os.replace(str(tmp_path), str(archive_path))
-            extract_dir = self._artifact_dir / f"{digest}_pkg"
+            extract_dir = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
             self._extract_archive(archive_path=archive_path, package_format=normalized_format, out_dir=extract_dir)
             artifact_exec_path = str(extract_dir)
-            cleanup_paths.extend((archive_path, extract_dir))
 
         artifact = CodeArtifact(
             code_version=code_version,
@@ -1873,6 +2493,7 @@ class NodeControlState:
             export_methods=normalized_export_methods,
             export_decorator=normalized_export_decorator,
             dependency_allowlist=normalized_dependency_allowlist,
+            managed_global_names=normalized_managed_global_names,
             dependency_path="",
             size_bytes=max(0, int(size_bytes)),
             created_at=now,
@@ -1894,6 +2515,13 @@ class NodeControlState:
                 raise
         with self._lock:
             self._codes[code_version] = artifact
+            if str(client_id or "").strip():
+                self._register_client_code_token_locked(
+                    client_id=client_id,
+                    code_version=code_version,
+                    code_token=code_token,
+                )
+        _write_code_meta(self._artifact_dir, artifact)
         return artifact, False
 
     def put_object_from_uploaded_file(
@@ -1930,6 +2558,14 @@ class NodeControlState:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            _write_object_meta(
+                self._object_dir,
+                object_id=actual_object_id,
+                fmt=normalized_format,
+                size_bytes=max(0, int(size_bytes)),
+                created_at=now,
+                last_at=now,
+            )
             artifact = ObjectArtifact(
                 object_id=actual_object_id,
                 path=str(final_path),
@@ -1942,6 +2578,14 @@ class NodeControlState:
             return artifact, True
 
         os.replace(str(tmp_path), str(final_path))
+        _write_object_meta(
+            self._object_dir,
+            object_id=actual_object_id,
+            fmt=normalized_format,
+            size_bytes=max(0, int(size_bytes)),
+            created_at=now,
+            last_at=now,
+        )
         artifact = ObjectArtifact(
             object_id=actual_object_id,
             path=str(final_path),
@@ -1956,6 +2600,7 @@ class NodeControlState:
     def put_code(
         self,
         *,
+        client_id: str = "",
         sha256: str,
         runtime: str,
         entry_module: str,
@@ -1965,6 +2610,8 @@ class NodeControlState:
         export_methods: Optional[Sequence[str]] = None,
         export_decorator: str = "",
         dependency_allowlist: Sequence[str] = (),
+        managed_global_names: Sequence[str] = (),
+        code_token: str = "",
         chunks: Iterable[bytes],
         validate_load: bool = False,
     ) -> Tuple[CodeArtifact, bool]:
@@ -1983,6 +2630,7 @@ class NodeControlState:
                     fp.write(part)
                     size += len(part)
             return self.put_code_from_uploaded_file(
+                client_id=client_id,
                 sha256=sha256,
                 runtime=runtime,
                 entry_module=entry_module,
@@ -1992,6 +2640,8 @@ class NodeControlState:
                 export_methods=list(export_methods or ()),
                 export_decorator=export_decorator,
                 dependency_allowlist=dependency_allowlist,
+                managed_global_names=managed_global_names,
+                code_token=code_token,
                 uploaded_path=str(tmp_path),
                 actual_sha256=h.hexdigest(),
                 size_bytes=size,
@@ -2019,6 +2669,7 @@ class NodeControlState:
         export_methods: Sequence[str] = (),
         export_decorator: str = "",
         dependency_allowlist: Sequence[str] = (),
+        managed_global_names: Sequence[str] = (),
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -2029,6 +2680,7 @@ class NodeControlState:
             raise ValueError("owner_client_id is required")
 
         artifact, _cached = self.put_code(
+            client_id=owner_client_id,
             sha256=sha256,
             runtime=runtime,
             entry_module=entry_module,
@@ -2038,6 +2690,7 @@ class NodeControlState:
             export_methods=export_methods,
             export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
             chunks=chunks,
             validate_load=True,
         )
@@ -2081,6 +2734,10 @@ class NodeControlState:
             alive_workers=actual_workers,
             methods=method_info,
         )
+        managed_state = self._ensure_service_managed_globals_state_locked(session, artifact=artifact)
+        if managed_state is not None:
+            session.managed_globals_scope_dir = managed_state.scope_dir
+            session.managed_globals_digest = managed_state.globals_digest
         with self._lock:
             self._services[service_id] = session
         return session
@@ -2180,6 +2837,7 @@ class NodeControlState:
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
+            touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
             self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
@@ -2194,6 +2852,8 @@ class NodeControlState:
                     object_dir=self._object_dir,
                     method_name=requested_method,
                     payload=payload or {},
+                    managed_globals_scope_dir=session.managed_globals_scope_dir,
+                    managed_globals_digest=session.managed_globals_digest,
                 ),
             )
             if not resp.get("ok", False):
@@ -2272,6 +2932,64 @@ class NodeControlState:
             service_token=service_token,
             timeout_sec=timeout_sec,
         )
+
+    def update_service_globals(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        values: Dict[str, Any],
+    ) -> Tuple[str, List[str]]:
+        with self._lock:
+            session = self._services.get(service_id)
+            if session is None:
+                raise KeyError("service not found")
+            if session.owner_client_id != owner_client_id:
+                raise PermissionError("owner_client_id mismatch")
+            if not service_token or session.service_token != service_token:
+                raise PermissionError("service_token mismatch")
+            artifact = self._codes.get(session.code_version)
+            if artifact is None:
+                raise RuntimeError("artifact missing")
+            state = self._ensure_service_managed_globals_state_locked(session, artifact=artifact)
+            if state is None:
+                raise ValueError("service artifact did not declare managed globals")
+            globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
+            session.managed_globals_scope_dir = state.scope_dir
+            session.managed_globals_digest = globals_digest
+            return globals_digest, updated_names
+
+    def update_runtime_globals(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str,
+        code_token: str,
+        values: Dict[str, Any],
+    ) -> Tuple[str, List[str]]:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        normalized_runtime_key = str(runtime_key or normalized_code_version).strip() or normalized_code_version
+        with self._lock:
+            artifact = self._codes.get(normalized_code_version)
+            if artifact is None:
+                raise KeyError("code artifact not found")
+            expected_code_token = self._client_code_tokens.get((normalized_client_id, normalized_code_version), "")
+            if not code_token or not expected_code_token or expected_code_token != code_token:
+                raise PermissionError("code_token mismatch")
+            state = self._ensure_runtime_managed_globals_state_locked(
+                client_id=normalized_client_id,
+                code_version=normalized_code_version,
+                runtime_key=normalized_runtime_key,
+                artifact=artifact,
+            )
+            if state is None:
+                raise ValueError("task artifact did not declare managed globals")
+            globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
+            self._runtime_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = state
+            return globals_digest, updated_names
 
     def _service_status_http(self, service_id: str) -> Tuple[int, Dict[str, object]]:
         try:
@@ -2765,6 +3483,13 @@ class NodeControlState:
                 try:
                     if self._executor_host is None:
                         raise RuntimeError("executor host unavailable")
+                    touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
+                    managed_state = self._ensure_runtime_managed_globals_state_locked(
+                        client_id=task.client_id,
+                        code_version=task.code_version,
+                        runtime_key=task.runtime_key,
+                        artifact=artifact,
+                    )
                     self._executor_host.submit_runtime_task(
                         runtime_key=slot.runtime_key,
                         task_id=task.task_id,
@@ -2774,6 +3499,8 @@ class NodeControlState:
                             object_dir=self._object_dir,
                             method_name=artifact.entry_callable,
                             payload=task.payload,
+                            managed_globals_scope_dir=(managed_state.scope_dir if managed_state is not None else ""),
+                            managed_globals_digest=(managed_state.globals_digest if managed_state is not None else ""),
                         ),
                     )
                 except Exception as exc:

@@ -31,13 +31,13 @@ def main() -> None:
     dependency_allowlist = []
 
     blob = (
-        b"def run(payload):\n"
-        b"    value = int(payload.get('value', 0))\n"
-        b"    sleep_ms = int(payload.get('sleep_ms', 0))\n"
+        b"def run(value=0, sleep_ms=0, should_fail=False, **_kwargs):\n"
+        b"    value = int(value)\n"
+        b"    sleep_ms = int(sleep_ms)\n"
         b"    if sleep_ms > 0:\n"
         b"        import time\n"
         b"        time.sleep(sleep_ms / 1000.0)\n"
-        b"    if payload.get('should_fail'):\n"
+        b"    if should_fail:\n"
         b"        raise ValueError(f'intentional failure value={value}')\n"
         b"    return {'value': value, 'square': value * value}\n"
     )

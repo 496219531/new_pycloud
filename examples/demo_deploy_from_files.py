@@ -17,32 +17,27 @@ def demo_service_code():
         "compute_service/__init__.py": '"""计算服务模块"""',
 
         "compute_service/main.py": '''
-# 定义导出装饰器
-def pycloud_export(fn):
-    fn.__pycloud_export__ = True
-    return fn
+from pycloud_parallel import pycloud_export
 
 from .algorithms import sort, search
 
 @pycloud_export
-def quick_sort(payload):
+def quick_sort(data=None, **_kwargs):
     """快速排序"""
-    data = payload.get("data", [])
+    data = list(data or [])
     return {"result": sort.quick_sort(data), "algorithm": "quick_sort"}
 
 @pycloud_export
-def binary_search(payload):
+def binary_search(data=None, target=0, **_kwargs):
     """二分查找"""
-    data = payload.get("data", [])
-    target = payload.get("target", 0)
+    data = list(data or [])
     idx = search.binary_search(data, target)
     return {"result": idx, "target": target, "found": idx >= 0}
 
 @pycloud_export
-def process(payload):
+def process(action="", data=None, **_kwargs):
     """通用处理函数"""
-    action = payload.get("action", "")
-    data = payload.get("data", [])
+    data = list(data or [])
     if action == "sort":
         return {"result": sorted(data)}
     elif action == "reverse":
@@ -265,7 +260,6 @@ def main():
 
             # 导出配置
             export_mode="decorator",
-            export_decorator="pycloud_export",
 
             # 运行时配置
             runtime="py3",
