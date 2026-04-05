@@ -6,7 +6,7 @@ Imports are intentionally lazy to avoid side effects on module startup.
 from __future__ import annotations
 
 import importlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 _CLIENT_EXPORTS = {
     "ObjectRef",
@@ -40,6 +40,75 @@ def _import_client_module() -> Any:
         if missing == "grpc" or missing == "google" or missing.startswith("google."):
             raise ModuleNotFoundError(_CONTROLPLANE_DEP_HINT) from exc
         raise
+
+
+if TYPE_CHECKING:
+    from .client import (
+        DedicatedTaskServiceSession,
+        DeployedService,
+        DirectConnect,
+        DiscoveryServiceClient,
+        GatewayConnect,
+        GatewayServiceClient,
+        InfoCenterClient,
+        InfoCenterNode,
+        InfoCenterServiceRoute,
+        JobQueueClient,
+        ObjectRef,
+        ResultRef,
+        ServiceGroup,
+        TaskPoolSession,
+        pycloud_export,
+    )
+
+
+def _try_bind_client_exports() -> None:
+    try:
+        from .client import (
+            DedicatedTaskServiceSession,
+            DeployedService,
+            DirectConnect,
+            DiscoveryServiceClient,
+            GatewayConnect,
+            GatewayServiceClient,
+            InfoCenterClient,
+            InfoCenterNode,
+            InfoCenterServiceRoute,
+            JobQueueClient,
+            ObjectRef,
+            ResultRef,
+            ServiceGroup,
+            TaskPoolSession,
+            pycloud_export,
+        )
+    except ModuleNotFoundError as exc:
+        missing = str(getattr(exc, "name", "") or "")
+        if missing == "grpc" or missing == "google" or missing.startswith("google."):
+            return
+        raise
+
+    globals().update(
+        {
+            "ObjectRef": ObjectRef,
+            "ResultRef": ResultRef,
+            "pycloud_export": pycloud_export,
+            "DeployedService": DeployedService,
+            "DirectConnect": DirectConnect,
+            "GatewayConnect": GatewayConnect,
+            "DedicatedTaskServiceSession": DedicatedTaskServiceSession,
+            "JobQueueClient": JobQueueClient,
+            "TaskPoolSession": TaskPoolSession,
+            "DiscoveryServiceClient": DiscoveryServiceClient,
+            "GatewayServiceClient": GatewayServiceClient,
+            "InfoCenterClient": InfoCenterClient,
+            "InfoCenterNode": InfoCenterNode,
+            "InfoCenterServiceRoute": InfoCenterServiceRoute,
+            "ServiceGroup": ServiceGroup,
+        }
+    )
+
+
+_try_bind_client_exports()
 
 
 def __getattr__(name: str):

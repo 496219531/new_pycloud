@@ -49,6 +49,12 @@
 
 - [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
   - `/nodes`、`/services/routes`、`/ops`、节点事实字段
+- [HTTP_SERVICE_DEBUG_FLOW.md](HTTP_SERVICE_DEBUG_FLOW.md)
+  - HTTP 服务调用从 caller 到节点执行再到返回的关键函数链路
+- [TASKPOOL_DEBUG_FLOW.md](TASKPOOL_DEBUG_FLOW.md)
+  - TaskPool 从创建、提交、执行到结果返回的关键函数链路
+- [PAYLOAD_FLOW_DEBUGGING.md](PAYLOAD_FLOW_DEBUGGING.md)
+  - 如何通过 `pycloud_parallel.payload_flow` 判断 payload 走的是哪条路径
 - [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
   - `runtime` 作为 Python 版本约束的当前语义
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)

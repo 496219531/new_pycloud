@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Shared helpers for Arrow-compatible payload/result serialization."""
 
+from datetime import date, datetime, time, timedelta
+import logging
 from typing import Any, Optional, Sequence
 
 from google.protobuf import json_format
@@ -26,6 +28,8 @@ INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = 4 * 1024 * 1024
 INLINE_RESULT_SOFT_LIMIT_BYTES = 256 * 1024
 INLINE_RESULT_HARD_LIMIT_BYTES = 1024 * 1024
 
+payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
+
 
 def _format_payload_bytes(size_bytes: int) -> str:
     size = max(0, int(size_bytes or 0))
@@ -34,6 +38,79 @@ def _format_payload_bytes(size_bytes: int) -> str:
     if size >= 1024:
         return f"{size / 1024:.2f} KiB"
     return f"{size} B"
+
+
+def summarize_payload_flow_value(value: Any) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, ObjectRef):
+        return (
+            f"ObjectRef(format={value.format}, size_bytes={value.size_bytes}, "
+            f"materialize_as={value.materialize_as})"
+        )
+    if isinstance(value, ResultRef):
+        return (
+            f"ResultRef(format={value.format}, size_bytes={value.size_bytes}, "
+            f"materialize_as={value.materialize_as}, node_id={value.node_id})"
+        )
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        preview = keys[:5]
+        suffix = "..." if len(keys) > 5 else ""
+        return f"dict(len={len(value)}, keys={preview}{suffix})"
+    if isinstance(value, (list, tuple)):
+        return f"{type(value).__name__}(len={len(value)})"
+    if isinstance(value, datetime):
+        return f"datetime({value.isoformat()})"
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return f"date({value.isoformat()})"
+    if isinstance(value, time):
+        return f"time({value.isoformat()})"
+    if isinstance(value, timedelta):
+        return f"timedelta(seconds={value.total_seconds()})"
+
+    try:
+        import pandas as pd
+
+        if isinstance(value, pd.DataFrame):
+            return (
+                f"DataFrame(shape={value.shape}, "
+                f"index={type(value.index).__name__}, columns={type(value.columns).__name__})"
+            )
+        if isinstance(value, pd.Series):
+            return (
+                f"Series(len={len(value)}, index={type(value.index).__name__}, "
+                f"name={value.name!r})"
+            )
+        if isinstance(value, pd.Index):
+            return f"{type(value).__name__}(len={len(value)}, name={value.name!r})"
+        if isinstance(value, pd.Timestamp):
+            return f"Timestamp({value.isoformat()})"
+        if isinstance(value, pd.Timedelta):
+            return f"Timedelta({value.isoformat()})"
+    except ImportError:
+        pass
+
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return f"ndarray(shape={value.shape}, dtype={value.dtype})"
+    except ImportError:
+        pass
+
+    if isinstance(value, (str, int, float, bool)):
+        return f"{type(value).__name__}({value!r})"
+    return type(value).__name__
+
+
+def log_payload_flow(event: str, /, **fields: Any) -> None:
+    if not payload_flow_logger.isEnabledFor(logging.DEBUG):
+        return
+    pieces = [f"event={event}"]
+    for key, value in fields.items():
+        pieces.append(f"{key}={value}")
+    payload_flow_logger.debug(" ".join(pieces))
 
 
 def _inline_payload_limit_hint() -> str:
@@ -107,6 +184,12 @@ def serialize_inline_result(
     out = struct_pb2.Struct()
     out.update(serialized)
     size_bytes = validate_inline_result_struct(out, limit_bytes=limit_bytes, context=context)
+    log_payload_flow(
+        "inline_result_encode",
+        context=context,
+        size_bytes=size_bytes,
+        summary=summarize_payload_flow_value(data or {}),
+    )
     return serialized, out, size_bytes
 
 
@@ -145,6 +228,12 @@ def serialize_inline_payload(
     out = struct_pb2.Struct()
     out.update(serialized)
     size_bytes = validate_inline_payload_struct(out, limit_bytes=limit_bytes, context=context)
+    log_payload_flow(
+        "inline_payload_encode",
+        context=context,
+        size_bytes=size_bytes,
+        summary=summarize_payload_flow_value(data or {}),
+    )
     return serialized, out, size_bytes
 
 
@@ -178,10 +267,115 @@ def _normalize_mapping_key(key: Any, *, path: str, existing_keys: set[str]) -> s
     return normalized
 
 
+def _serialize_pandas_label(value: Any, *, path: str) -> Any:
+    if value is None:
+        return {"__type__": "pd.label", "kind": "none"}
+    if isinstance(value, str):
+        return {"__type__": "pd.label", "kind": "str", "value": value}
+    if isinstance(value, bool):
+        return {"__type__": "pd.label", "kind": "bool", "value": value}
+    if isinstance(value, int):
+        return {"__type__": "pd.label", "kind": "int", "value": str(value)}
+    if isinstance(value, float):
+        return {"__type__": "pd.label", "kind": "float", "value": repr(value)}
+    if isinstance(value, tuple):
+        return {
+            "__type__": "pd.label",
+            "kind": "tuple",
+            "items": [_serialize_pandas_label(item, path=_child_path(path, idx)) for idx, item in enumerate(value)],
+        }
+
+    serialized = _serialize_arrow_compatible(value, path=path)
+    return {"__type__": "pd.label", "kind": "object", "value": serialized}
+
+
+def _deserialize_pandas_label(value: Any) -> Any:
+    if not isinstance(value, dict) or value.get("__type__") != "pd.label":
+        return convert_dict_to_arrow(value)
+
+    kind = str(value.get("kind", "") or "").strip().lower()
+    if kind == "none":
+        return None
+    if kind == "str":
+        return str(value.get("value", ""))
+    if kind == "bool":
+        return bool(value.get("value"))
+    if kind == "int":
+        return int(str(value.get("value", "0")))
+    if kind == "float":
+        return float(str(value.get("value", "0.0")))
+    if kind == "tuple":
+        return tuple(_deserialize_pandas_label(item) for item in value.get("items", []))
+    if kind == "object":
+        return convert_dict_to_arrow(value.get("value"))
+    raise TypeError(f"unsupported pandas label kind: {kind!r}")
+
+
+def _serialize_pandas_index(index: Any, *, path: str) -> dict[str, Any]:
+    import pandas as pd
+
+    if isinstance(index, pd.MultiIndex):
+        tuples = [list(item) for item in index.tolist()]
+        return {
+            "kind": "multi",
+            "values": [
+                [_serialize_pandas_label(item, path=_child_path(f"{path}.values[{row_idx}]", col_idx)) for col_idx, item in enumerate(row)]
+                for row_idx, row in enumerate(tuples)
+            ],
+            "names": [_serialize_pandas_label(name, path=_child_path(f"{path}.names", idx)) for idx, name in enumerate(index.names)],
+        }
+    if isinstance(index, pd.RangeIndex):
+        return {
+            "kind": "range",
+            "start": int(index.start),
+            "stop": int(index.stop),
+            "step": int(index.step),
+            "name": _serialize_pandas_label(index.name, path=f"{path}.name"),
+        }
+    return {
+        "kind": "index",
+        "values": [_serialize_pandas_label(item, path=_child_path(f"{path}.values", idx)) for idx, item in enumerate(index.tolist())],
+        "name": _serialize_pandas_label(index.name, path=f"{path}.name"),
+    }
+
+
+def _deserialize_pandas_index(spec: Any):
+    import pandas as pd
+
+    if not isinstance(spec, dict):
+        return pd.Index(convert_dict_to_arrow(spec))
+
+    kind = str(spec.get("kind", "index") or "index").strip().lower()
+    if kind == "multi":
+        values = [[_deserialize_pandas_label(item) for item in row] for row in spec.get("values", [])]
+        names = [_deserialize_pandas_label(item) for item in spec.get("names", [])]
+        tuples = [tuple(item) for item in values]
+        return pd.MultiIndex.from_tuples(tuples, names=list(names) if names is not None else None)
+    if kind == "range":
+        return pd.RangeIndex(
+            start=int(spec.get("start", 0) or 0),
+            stop=int(spec.get("stop", 0) or 0),
+            step=int(spec.get("step", 1) or 1),
+            name=_deserialize_pandas_label(spec.get("name")),
+        )
+    return pd.Index(
+        [_deserialize_pandas_label(item) for item in spec.get("values", [])],
+        name=_deserialize_pandas_label(spec.get("name")),
+    )
+
+
 def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
     """Internal recursive serializer with better error locations."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
+    if isinstance(obj, datetime):
+        return {"__type__": "datetime", "value": obj.isoformat()}
+    if isinstance(obj, date):
+        return {"__type__": "date", "value": obj.isoformat()}
+    if isinstance(obj, time):
+        return {"__type__": "time", "value": obj.isoformat()}
+    if isinstance(obj, timedelta):
+        return {"__type__": "timedelta", "seconds": obj.total_seconds()}
     if isinstance(obj, ObjectRef):
         return object_ref_to_payload(obj)
     if isinstance(obj, ResultRef):
@@ -198,17 +392,23 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
     try:
         import pandas as pd
 
+        if isinstance(obj, pd.Timestamp):
+            return {"__type__": "pd.Timestamp", "value": obj.isoformat()}
+        if isinstance(obj, pd.Timedelta):
+            return {"__type__": "pd.Timedelta", "value": obj.isoformat()}
         if isinstance(obj, pd.DataFrame):
             return {
                 "__type__": "DataFrame",
-                "data": _serialize_arrow_compatible(obj.to_dict(orient="records"), path=f"{path}.data"),
+                "data": _serialize_arrow_compatible(obj.to_numpy(dtype=object).tolist(), path=f"{path}.data"),
+                "index": _serialize_pandas_index(obj.index, path=f"{path}.index"),
+                "columns": _serialize_pandas_index(obj.columns, path=f"{path}.columns"),
             }
         if isinstance(obj, pd.Series):
             return {
                 "__type__": "Series",
                 "data": _serialize_arrow_compatible(obj.tolist(), path=f"{path}.data"),
-                "index": _serialize_arrow_compatible(list(obj.index), path=f"{path}.index"),
-                "name": obj.name,
+                "index": _serialize_pandas_index(obj.index, path=f"{path}.index"),
+                "name": _serialize_arrow_compatible(obj.name, path=f"{path}.name"),
             }
     except ImportError:
         pass
@@ -244,7 +444,7 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
     raise TypeError(
         f"{path} has unsupported type {type(obj).__name__}; "
         "supported values are JSON scalars, list/tuple, dict, "
-        "pandas.DataFrame, pandas.Series, numpy.ndarray, and ObjectRef"
+        "datetime/date/time/timedelta, pandas.DataFrame, pandas.Series, numpy.ndarray, and ObjectRef"
     )
 
 
@@ -285,18 +485,47 @@ def convert_dict_to_arrow(data: Any) -> Any:
         if is_result_ref_payload(data):
             return result_ref_from_payload(data)
         obj_type = data.get("__type__")
+        if obj_type == "datetime":
+            return datetime.fromisoformat(str(data["value"]))
+        if obj_type == "date":
+            return date.fromisoformat(str(data["value"]))
+        if obj_type == "time":
+            return time.fromisoformat(str(data["value"]))
+        if obj_type == "timedelta":
+            return timedelta(seconds=float(data["seconds"]))
+        if obj_type == "pd.Timestamp":
+            try:
+                import pandas as pd
+
+                return pd.Timestamp(data["value"])
+            except ImportError as exc:
+                raise RuntimeError("pandas not available, cannot deserialize Timestamp") from exc
+        if obj_type == "pd.Timedelta":
+            try:
+                import pandas as pd
+
+                return pd.Timedelta(data["value"])
+            except ImportError as exc:
+                raise RuntimeError("pandas not available, cannot deserialize Timedelta") from exc
         if obj_type == "DataFrame":
             try:
                 import pandas as pd
 
-                return pd.DataFrame(data["data"])
+                frame = pd.DataFrame(convert_dict_to_arrow(data["data"]))
+                frame.index = _deserialize_pandas_index(data.get("index"))
+                frame.columns = _deserialize_pandas_index(data.get("columns"))
+                return frame
             except ImportError as exc:
                 raise RuntimeError("pandas not available, cannot deserialize DataFrame") from exc
         if obj_type == "Series":
             try:
                 import pandas as pd
 
-                return pd.Series(data["data"], index=data.get("index"), name=data.get("name"))
+                return pd.Series(
+                    convert_dict_to_arrow(data["data"]),
+                    index=_deserialize_pandas_index(data.get("index")),
+                    name=convert_dict_to_arrow(data.get("name")),
+                )
             except ImportError as exc:
                 raise RuntimeError("pandas not available, cannot deserialize Series") from exc
         if obj_type == "ndarray":

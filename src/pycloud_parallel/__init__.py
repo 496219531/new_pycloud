@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 _LOCAL_RUNTIME_EXPORTS = {
     "configure",
@@ -35,6 +35,8 @@ _LOCAL_RUNTIME_DEP_HINT = (
     'Reinstall with `pip install pycloud-parallel` (or avoid `--no-deps`).'
 )
 
+__version__ = "0.1.1"
+
 
 def pycloud_export(fn):
     fn.__pycloud_export__ = True
@@ -60,6 +62,78 @@ def _import_controlplane() -> Any:
         if missing == "grpc" or missing == "google" or missing.startswith("google."):
             raise ModuleNotFoundError(_CONTROLPLANE_DEP_HINT) from exc
         raise
+
+
+if TYPE_CHECKING:
+    from .controlplane import (
+        DedicatedTaskServiceSession,
+        DeployedService,
+        DirectConnect,
+        GatewayConnect,
+        JobQueueClient,
+        ObjectRef,
+        ResultRef,
+        TaskPoolSession,
+    )
+    from .local_runtime.api import configure, foreach, parallel_for
+    from .local_runtime.types import ForeachResult, TaskError
+
+
+def _try_bind_local_runtime_exports() -> None:
+    try:
+        from .local_runtime.api import configure, foreach, parallel_for
+        from .local_runtime.types import ForeachResult, TaskError
+    except ModuleNotFoundError as exc:
+        missing = str(getattr(exc, "name", "") or "")
+        if missing == "cloudpickle":
+            return
+        raise
+
+    globals().update(
+        {
+            "configure": configure,
+            "foreach": foreach,
+            "parallel_for": parallel_for,
+            "ForeachResult": ForeachResult,
+            "TaskError": TaskError,
+        }
+    )
+
+
+def _try_bind_controlplane_exports() -> None:
+    try:
+        from .controlplane import (
+            DedicatedTaskServiceSession,
+            DeployedService,
+            DirectConnect,
+            GatewayConnect,
+            JobQueueClient,
+            ObjectRef,
+            ResultRef,
+            TaskPoolSession,
+        )
+    except ModuleNotFoundError as exc:
+        missing = str(getattr(exc, "name", "") or "")
+        if missing == "grpc" or missing == "google" or missing.startswith("google."):
+            return
+        raise
+
+    globals().update(
+        {
+            "ObjectRef": ObjectRef,
+            "ResultRef": ResultRef,
+            "DeployedService": DeployedService,
+            "DedicatedTaskServiceSession": DedicatedTaskServiceSession,
+            "DirectConnect": DirectConnect,
+            "GatewayConnect": GatewayConnect,
+            "JobQueueClient": JobQueueClient,
+            "TaskPoolSession": TaskPoolSession,
+        }
+    )
+
+
+_try_bind_local_runtime_exports()
+_try_bind_controlplane_exports()
 
 
 def __getattr__(name: str):

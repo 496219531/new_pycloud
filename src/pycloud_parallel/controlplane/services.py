@@ -15,7 +15,7 @@ from typing import Callable, Iterable, List, Optional
 import grpc
 
 from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict, touch_object_last_at
-from pycloud_parallel.controlplane.serialization import dict_to_struct, validate_inline_payload_structs
+from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, validate_inline_payload_structs
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -951,12 +951,26 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         )
 
     def SubmitPoolTasks(self, request: pb2.SubmitPoolTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
+        log_payload_flow(
+            "taskpool_submit_rpc",
+            peer=_peer(context),
+            pool_id=request.pool_id,
+            task_count=len(request.tasks),
+            job_id=(request.job_id or ""),
+        )
         try:
             accepted, rejected = self._state.submit_pool_tasks(
                 pool_id=request.pool_id,
                 pool_token=request.pool_token,
                 tasks=list(request.tasks),
                 job_id=request.job_id,
+            )
+            log_payload_flow(
+                "taskpool_submit_rpc_result",
+                peer=_peer(context),
+                pool_id=request.pool_id,
+                accepted=len(accepted),
+                rejected=len(rejected),
             )
             return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
         except KeyError as exc:
@@ -998,6 +1012,14 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             return pb2.HeartbeatTaskPoolResponse(ok=False, accepted=False, error=_err(pb2.ERROR_CODE_INTERNAL_ERROR, str(exc)))
 
     def PullPoolResults(self, request: pb2.PullPoolResultsRequest, context: grpc.ServicerContext) -> pb2.PullResultsResponse:
+        log_payload_flow(
+            "taskpool_pull_results_rpc",
+            peer=_peer(context),
+            pool_id=request.pool_id,
+            limit=max(1, int(request.limit or 100)),
+            wait_ms=max(0, int(request.wait_ms or 0)),
+            cursor=(request.cursor or ""),
+        )
         try:
             results, next_cursor = self._state.pull_pool_results(
                 pool_id=request.pool_id,
@@ -1005,6 +1027,13 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 limit=request.limit,
                 wait_ms=request.wait_ms,
                 cursor=request.cursor,
+            )
+            log_payload_flow(
+                "taskpool_pull_results_rpc_result",
+                peer=_peer(context),
+                pool_id=request.pool_id,
+                result_count=len(results),
+                next_cursor=next_cursor,
             )
             return pb2.PullResultsResponse(ok=True, results=results, next_cursor=next_cursor)
         except KeyError as exc:

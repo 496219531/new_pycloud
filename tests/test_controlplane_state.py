@@ -1,10 +1,11 @@
 """中文说明：验证 gRPC 控制面的核心状态流转（内存后端）。"""
 
 import hashlib
+import io
 import json
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 
 import pytest
@@ -106,6 +107,24 @@ def test_nested_arrow_payload_roundtrip():
     assert restored["plain"] == [1, True, None]
 
 
+def test_dataframe_round_trips_int_columns_and_multiindex():
+    pd = pytest.importorskip("pandas")
+
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2024-01-02"), "stock"),
+            (pd.Timestamp("2024-01-03"), "bond"),
+        ],
+        names=["trade_date", "asset_type"],
+    )
+    columns = pd.Index([10006, 10007], name="fund_id")
+    frame = pd.DataFrame([[0.1, 0.2], [0.3, 0.4]], index=index, columns=columns)
+
+    restored = struct_to_dict(dict_to_struct({"frame": frame}))
+
+    pd.testing.assert_frame_equal(restored["frame"], frame)
+
+
 def test_dict_to_struct_rejects_unsupported_object_with_clear_path():
     class DemoObject:
         pass
@@ -142,6 +161,45 @@ def test_dict_to_struct_stringifies_scalar_dict_keys():
 def test_dict_to_struct_rejects_colliding_normalized_dict_keys():
     with pytest.raises(TypeError, match=r"normalize to '1'"):
         dict_to_struct({"payload": {1: "int-key", "1": "string-key"}})
+
+
+def test_dict_to_struct_round_trips_temporal_scalars_and_series_index():
+    pd = pytest.importorskip("pandas")
+
+    ts = pd.Timestamp("2024-01-02T03:04:05+08:00")
+    payload = {
+        "when": datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+        "series": pd.Series([10, 20], index=[ts, ts + pd.Timedelta(days=1)], name="nav"),
+    }
+
+    restored = struct_to_dict(dict_to_struct(payload))
+
+    assert restored["when"] == payload["when"]
+    assert restored["series"].name == "nav"
+    assert list(restored["series"]) == [10, 20]
+    assert restored["series"].index[0] == ts
+    assert restored["series"].index[1] == ts + pd.Timedelta(days=1)
+
+
+def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+
+    index = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
+        names=["trade_date", "bucket"],
+    )
+    frame = pd.DataFrame([[1, 2], [3, 4]], index=index, columns=[10006, 10007])
+
+    kind, fmt, blob = _serialize_data_for_object_ref(frame, format="parquet")
+
+    restored = pd.read_parquet(io.BytesIO(blob))
+
+    assert kind == "dataframe"
+    assert fmt == "parquet"
+    pd.testing.assert_frame_equal(restored, frame)
 
 
 def test_infra_timeout_requeue_then_retry(tmp_path):

@@ -10,6 +10,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import logging
 import os
 import queue
 import re
@@ -48,13 +49,17 @@ from pycloud_parallel.controlplane.serialization import (
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     convert_dict_to_arrow,
     dict_to_struct,
+    log_payload_flow,
     serialize_arrow_compatible,
     serialize_inline_payload,
+    summarize_payload_flow_value,
     struct_to_dict,
     validate_inline_payload_structs,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+
+logger = logging.getLogger(__name__)
 
 
 def pycloud_export(fn):
@@ -342,6 +347,12 @@ def _validate_task_submit_items(tasks: Sequence[pb2.TaskSubmitItem], *, request_
 
 def _materialize_downloaded_result(path: Path, *, result_ref: ResultRef):
     materialized = normalize_materialize_as(result_ref.materialize_as, default="path")
+    log_payload_flow(
+        "result_materialize",
+        materialize_as=materialized,
+        format=result_ref.format,
+        path=str(path),
+    )
     if materialized == "path":
         return path
     if materialized == "bytes":
@@ -539,12 +550,14 @@ def _http_json_request(
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request_headers["Content-Type"] = "application/json; charset=utf-8"
 
-    # 打印 HTTP 请求信息
     url = f"{base_url.rstrip('/')}{path}"
-    print(f"[HTTP {method.upper()}] {url}")
-    if payload is not None:
-        print(f"[Payload] {json.dumps(payload, ensure_ascii=False)}")
-    print(f"[Headers] {request_headers}")
+    logger.debug(
+        "http request method=%s url=%s payload=%s headers=%s",
+        method.upper(),
+        url,
+        payload if payload is not None else None,
+        request_headers,
+    )
 
     req = Request(
         url,
@@ -756,6 +769,12 @@ def _serialize_data_for_object_ref(
     format: str = "",
     materialize_as: str = "auto",
 ) -> Tuple[str, str, bytes]:
+    log_payload_flow(
+        "object_ref_upload_prepare",
+        format=(format or "auto"),
+        materialize_as=materialize_as,
+        summary=summarize_payload_flow_value(data),
+    )
     if isinstance(data, ObjectRef):
         raise ValueError("ObjectRef is already uploaded; no need to serialize again")
 
@@ -763,11 +782,13 @@ def _serialize_data_for_object_ref(
         path = Path(data).expanduser()
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"path not found or not a file: {path}")
+        log_payload_flow("object_ref_upload", path_type="file", format=normalize_object_format(format, source_name=path.name))
         return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
 
     if isinstance(data, str):
         path = Path(data).expanduser()
         if path.exists() and path.is_file():
+            log_payload_flow("object_ref_upload", path_type="string-file", format=normalize_object_format(format, source_name=path.name))
             return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
         raise TypeError("plain string is not supported by put_data; pass it inline in payload or use an existing file path")
 
@@ -778,7 +799,8 @@ def _serialize_data_for_object_ref(
             import io
 
             buf = io.BytesIO()
-            data.to_parquet(buf, index=False)
+            data.to_parquet(buf, index=True)
+            log_payload_flow("object_ref_upload", path_type="dataframe", format=(format or "parquet"), summary=summarize_payload_flow_value(data))
             return "dataframe", normalize_object_format(format or "parquet", default="parquet"), buf.getvalue()
     except ImportError:
         pass
@@ -791,14 +813,17 @@ def _serialize_data_for_object_ref(
 
             buf = io.BytesIO()
             np.save(buf, data, allow_pickle=False)
+            log_payload_flow("object_ref_upload", path_type="ndarray", format=(format or "npy"), summary=summarize_payload_flow_value(data))
             return "ndarray", normalize_object_format(format or "npy", default="npy"), buf.getvalue()
     except ImportError:
         pass
 
     if isinstance(data, (dict, list)):
+        log_payload_flow("object_ref_upload", path_type="json", format=(format or "json"), summary=summarize_payload_flow_value(data))
         return "json", normalize_object_format(format or "json", default="json"), json.dumps(data, ensure_ascii=False).encode("utf-8")
 
     if isinstance(data, (bytes, bytearray, memoryview)):
+        log_payload_flow("object_ref_upload", path_type="bytes", format=(format or "bin"), summary=summarize_payload_flow_value(data))
         return "bytes", normalize_object_format(format or "bin", default="bin"), bytes(data)
 
     raise TypeError(
@@ -3265,6 +3290,13 @@ class NodeControlClient:
         return self.download_object_to_file(object_id=result_ref.object_id, target_path=target_path)
 
     def fetch_result_ref_data(self, result_ref: ResultRef, *, target_path: str = ""):
+        log_payload_flow(
+            "result_ref_fetch",
+            format=result_ref.format,
+            materialize_as=result_ref.materialize_as,
+            target_path=(target_path or "<temp>"),
+            summary=summarize_payload_flow_value(result_ref),
+        )
         if target_path:
             return self.download_result_to_file(result_ref, target_path=target_path)
         suffix = Path(f"result{('.' + result_ref.format) if result_ref.format else ''}")
@@ -3578,6 +3610,16 @@ class NodeControlClient:
             entry_module=entry_module,
             fallback_stem="task_pool_artifact",
         )
+        log_payload_flow(
+            "taskpool_create_grpc",
+            owner_client_id=owner_client_id,
+            pool_name=(pool_name or ""),
+            runtime=runtime,
+            entry_module=effective_module,
+            entry_callable=(entry_callable or "run"),
+            worker_count=max(1, int(worker_count)),
+            blob_size=len(blob),
+        )
 
         def _iter() -> Iterator[pb2.CreateTaskPoolRequest]:
             yield pb2.CreateTaskPoolRequest(
@@ -3602,6 +3644,12 @@ class NodeControlClient:
         resp = self.stub.CreateTaskPool(_iter(), timeout=self.timeout_sec)
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "create task pool failed"))
+        log_payload_flow(
+            "taskpool_create_grpc_result",
+            pool_id=resp.pool_id,
+            code_version=resp.code_version,
+            worker_count=resp.worker_count,
+        )
         return NativeTaskPoolClient(
             _client=self,
             owner_client_id=owner_client_id,
@@ -3620,6 +3668,12 @@ class NodeControlClient:
         tasks: Sequence[pb2.TaskSubmitItem],
         job_id: str = "",
     ) -> pb2.SubmitTasksResponse:
+        log_payload_flow(
+            "taskpool_submit_grpc",
+            pool_id=str(pool_id or "").strip(),
+            task_count=len(tasks),
+            job_id=str(job_id or "").strip(),
+        )
         resp = self.stub.SubmitPoolTasks(
             pb2.SubmitPoolTasksRequest(
                 pool_id=str(pool_id or "").strip(),
@@ -3631,6 +3685,12 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "submit pool tasks failed"))
+        log_payload_flow(
+            "taskpool_submit_grpc_result",
+            pool_id=str(pool_id or "").strip(),
+            accepted=len(resp.accepted),
+            rejected=len(resp.rejected),
+        )
         return resp
 
     def pull_pool_results(
@@ -3642,6 +3702,13 @@ class NodeControlClient:
         wait_ms: int = 0,
         cursor: str = "",
     ) -> pb2.PullResultsResponse:
+        log_payload_flow(
+            "taskpool_pull_results_grpc",
+            pool_id=str(pool_id or "").strip(),
+            limit=max(1, int(limit or 100)),
+            wait_ms=max(0, int(wait_ms or 0)),
+            cursor=str(cursor or "").strip(),
+        )
         resp = self.stub.PullPoolResults(
             pb2.PullPoolResultsRequest(
                 pool_id=str(pool_id or "").strip(),
@@ -3654,6 +3721,12 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "pull pool results failed"))
+        log_payload_flow(
+            "taskpool_pull_results_grpc_result",
+            pool_id=str(pool_id or "").strip(),
+            result_count=len(resp.results),
+            next_cursor=resp.next_cursor,
+        )
         return resp
 
     def close_task_pool(

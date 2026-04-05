@@ -53,8 +53,10 @@ from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
     dict_to_struct,
     is_arrow_compatible,
+    log_payload_flow,
     serialize_arrow_compatible,
     serialize_inline_result,
+    summarize_payload_flow_value,
     struct_to_dict,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -486,12 +488,14 @@ def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifac
 
 def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
     if isinstance(ret, Path):
+        log_payload_flow("result_ref_store", path_type="path", summary=summarize_payload_flow_value(ret))
         return _store_result_path(ret, object_dir=object_dir)
 
     try:
         import pandas as pd
 
         if isinstance(ret, pd.DataFrame):
+            log_payload_flow("result_ref_store", path_type="dataframe", summary=summarize_payload_flow_value(ret))
             return _store_result_dataframe(ret, object_dir=object_dir)
     except ImportError:
         pass
@@ -500,6 +504,7 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
         import numpy as np
 
         if isinstance(ret, np.ndarray):
+            log_payload_flow("result_ref_store", path_type="ndarray", summary=summarize_payload_flow_value(ret))
             return _store_result_ndarray(ret, object_dir=object_dir)
     except ImportError:
         pass
@@ -507,6 +512,7 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
     serialized = serialize_arrow_compatible(ret)
     wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
     serialize_inline_result(wrapped, context="task result")
+    log_payload_flow("inline_result_ready", context="task result", summary=summarize_payload_flow_value(ret))
     return wrapped
 
 
@@ -1151,8 +1157,8 @@ def _invoke_user_callable(fn, payload: dict):
     4. {"key": value, ...} - HTTP 风格，直接作为 kwargs
 
     Arrow 兼容类型自动转换：
-    - DataFrame → dict (JSON records)
-    - Series → dict
+    - DataFrame → 保留 index/columns 的结构化数据
+    - Series → 保留 index 的结构化数据
     - ndarray → list
     """
     try:
@@ -1188,6 +1194,12 @@ def _invoke_user_callable(fn, payload: dict):
             # 确保 kwargs 是字典类型
             if not isinstance(kwargs, dict):
                 kwargs = {}
+            log_payload_flow(
+                "user_invoke",
+                mode="args_kwargs",
+                args_summary=summarize_payload_flow_value(args),
+                kwargs_summary=summarize_payload_flow_value(kwargs),
+            )
             return fn(*args, **kwargs)
 
     # HTTP 风格：整个 payload 作为 kwargs
@@ -1195,9 +1207,19 @@ def _invoke_user_callable(fn, payload: dict):
     if isinstance(payload, dict):
         # 反序列化 Arrow 对象
         deserialized = convert_dict_to_arrow(payload)
+        log_payload_flow(
+            "user_invoke",
+            mode="http_kwargs",
+            kwargs_summary=summarize_payload_flow_value(deserialized),
+        )
         return fn(**deserialized)
 
     # 其他情况：直接传递 payload
+    log_payload_flow(
+        "user_invoke",
+        mode="direct_payload",
+        payload_summary=summarize_payload_flow_value(payload),
+    )
     return fn(payload)
 
 
@@ -1211,6 +1233,11 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
     def _resolve(value: Any) -> Any:
         if isinstance(value, ObjectRef):
             materialized = normalize_materialize_as(value.materialize_as, default="path")
+            log_payload_flow(
+                "object_ref_resolve",
+                materialize_as=materialized,
+                summary=summarize_payload_flow_value(value),
+            )
 
             def _materialize_path(candidate: Path) -> Any:
                 if materialized == "path":
@@ -1238,12 +1265,24 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
             candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
             if candidate.exists():
                 _touch_object_last_at(root, object_id=value.object_id, fallback_path=candidate)
-                return _materialize_path(candidate)
+                resolved = _materialize_path(candidate)
+                log_payload_flow(
+                    "object_ref_resolved",
+                    materialize_as=materialized,
+                    summary=summarize_payload_flow_value(resolved),
+                )
+                return resolved
             digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
             fallback = sorted(root.glob(f"{digest}*"))
             if fallback:
                 _touch_object_last_at(root, object_id=value.object_id, fallback_path=fallback[0])
-                return _materialize_path(fallback[0])
+                resolved = _materialize_path(fallback[0])
+                log_payload_flow(
+                    "object_ref_resolved",
+                    materialize_as=materialized,
+                    summary=summarize_payload_flow_value(resolved),
+                )
+                return resolved
             raise ObjectResolutionError(f"object not found on node: {value.object_id}")
         if isinstance(value, dict):
             if is_object_ref_payload(value):
@@ -2861,6 +2900,12 @@ class NodeControlState:
     ) -> Tuple[List[pb2.TaskAccepted], List[pb2.TaskRejected]]:
         accepted: List[pb2.TaskAccepted] = []
         rejected: List[pb2.TaskRejected] = []
+        log_payload_flow(
+            "taskpool_submit_state",
+            pool_id=str(pool_id or "").strip(),
+            task_count=len(tasks),
+            job_id=str(job_id or "").strip(),
+        )
         now = utc_now()
         with self._cv:
             pool = self._task_pools.get(str(pool_id or "").strip())
@@ -2916,6 +2961,12 @@ class NodeControlState:
                 )
                 pool.task_count += 1
                 accepted.append(pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED))
+        log_payload_flow(
+            "taskpool_submit_state_result",
+            pool_id=str(pool_id or "").strip(),
+            accepted=len(accepted),
+            rejected=len(rejected),
+        )
         return accepted, rejected
 
     def pull_pool_results(
@@ -2930,7 +2981,19 @@ class NodeControlState:
         pool = self.task_pool(pool_id)
         if pool.pool_token != str(pool_token or "").strip():
             raise PermissionError("pool_token mismatch")
-        return self._pool_result_hook.pull(pool.pool_id, limit=max(1, int(limit or 100)), wait_ms=max(0, int(wait_ms or 0)), cursor=cursor)
+        results, next_cursor = self._pool_result_hook.pull(
+            pool.pool_id,
+            limit=max(1, int(limit or 100)),
+            wait_ms=max(0, int(wait_ms or 0)),
+            cursor=cursor,
+        )
+        log_payload_flow(
+            "taskpool_pull_results_state",
+            pool_id=str(pool_id or "").strip(),
+            result_count=len(results),
+            next_cursor=next_cursor,
+        )
+        return results, next_cursor
 
     def close_task_pool(
         self,
@@ -3432,11 +3495,24 @@ class NodeControlState:
                 task.result = struct_to_dict(request.result)
                 task.error_type = ""
                 task.error_message = ""
+                log_payload_flow(
+                    "task_result_report",
+                    task_id=request.task_id,
+                    status="SUCCEEDED",
+                    result_summary=summarize_payload_flow_value(task.result),
+                )
             elif request.status == pb2.TASK_STATUS_FAILED_USER:
                 task.status = pb2.TASK_STATUS_FAILED_USER
                 task.result = None
                 task.error_type = request.error.type
                 task.error_message = request.error.message
+                log_payload_flow(
+                    "task_result_report",
+                    task_id=request.task_id,
+                    status="FAILED_USER",
+                    error_type=request.error.type,
+                    error_message=request.error.message,
+                )
             else:
                 self._handle_infra_failure_locked(
                     task,
@@ -3444,6 +3520,13 @@ class NodeControlState:
                     now=task.finished_at,
                 )
                 should_publish = task.status == pb2.TASK_STATUS_FAILED_INFRA
+                log_payload_flow(
+                    "task_result_report",
+                    task_id=request.task_id,
+                    status="FAILED_INFRA",
+                    error_type=request.error.type,
+                    error_message=request.error.message,
+                )
 
             if should_publish:
                 self._publish_result_locked(task)
