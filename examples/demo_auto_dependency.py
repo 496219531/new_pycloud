@@ -291,7 +291,7 @@ def main():
     print("  5. ✅ 支持 __init__.py 等相关文件")
     print()
     print("📋 下一步:")
-    print("  - 集成到 TaskSubmitter.deploy_from_function()")
+    print("  - 集成到 TaskPoolSession / JobQueueClient 的自动打包入口")
     print("  - 添加 auto_deploy_function() 便捷 API")
     print("  - 优化依赖查找算法（处理复杂情况）")
     print()

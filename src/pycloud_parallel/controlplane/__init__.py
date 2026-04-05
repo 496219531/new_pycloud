@@ -15,14 +15,15 @@ _CLIENT_EXPORTS = {
     "DeployedService",
     "DirectConnect",
     "GatewayConnect",
-    "TaskSubmitter",
+    "DedicatedTaskServiceSession",
+    "JobQueueClient",
+    "TaskPoolSession",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
     "InfoCenterServiceRoute",
     "ServiceGroup",
-    "TaskBatchClient",
 }
 
 _CONTROLPLANE_DEP_HINT = (
@@ -61,12 +62,13 @@ __all__ = [
     "DeployedService",
     "DirectConnect",
     "GatewayConnect",
-    "TaskSubmitter",
+    "DedicatedTaskServiceSession",
+    "JobQueueClient",
+    "TaskPoolSession",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
     "InfoCenterServiceRoute",
     "ServiceGroup",
-    "TaskBatchClient",
 ]

@@ -105,7 +105,7 @@ worker_count=1
 node_count=1
 export_mode="decorator"
 reuse_existing_same_code=True
-replace_existing_if_code_changed=False
+replace_existing_if_code_changed=True
 ```
 
 这样更接近“本地轻量服务”的预期，也更不容易把节点 service capacity 一次吃满。

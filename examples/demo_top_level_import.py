@@ -6,10 +6,10 @@
 """
 
 # 方式 1: 从 pycloud_parallel 直接导入（推荐）
-from pycloud_parallel import GatewayConnect, DeployedService, TaskSubmitter
+from pycloud_parallel import GatewayConnect, DeployedService, JobQueueClient, TaskPoolSession
 
 # 方式 2: 从子模块导入（仍然可用）
-# from pycloud_parallel.controlplane import GatewayConnect, DeployedService, TaskSubmitter
+# from pycloud_parallel.controlplane import GatewayConnect, DeployedService, JobQueueClient, TaskPoolSession
 
 
 def main():
@@ -21,7 +21,8 @@ def main():
     print("✓ 成功从 pycloud_parallel 导入模块化客户端:")
     print(f"  - GatewayConnect: {GatewayConnect}")
     print(f"  - DeployedService: {DeployedService}")
-    print(f"  - TaskSubmitter: {TaskSubmitter}")
+    print(f"  - JobQueueClient: {JobQueueClient}")
+    print(f"  - TaskPoolSession: {TaskPoolSession}")
     print()
 
     print("使用示例:")
@@ -31,10 +32,15 @@ def main():
     print("  group = DeployedService.deploy_from_infocenter(...)")
     print("  result = await group.square(x=7)")
     print()
-    print("  # Task 模式")
-    print("  from pycloud_parallel import TaskSubmitter")
-    print("  task = TaskSubmitter.from_infocenter(...)")
-    print("  results = task.run(value=7)")
+    print("  # JobQueue 模式")
+    print("  from pycloud_parallel import JobQueueClient")
+    print("  client = JobQueueClient(...)")
+    print("  client.submit_job_from_bytes(...)")
+    print()
+    print("  # TaskPool 模式")
+    print("  from pycloud_parallel import TaskPoolSession")
+    print("  pool = TaskPoolSession.from_infocenter(...)")
+    print("  results = pool.wait_for_data(...)")
     print()
     print("  # Gateway 调用")
     print("  from pycloud_parallel import GatewayConnect")

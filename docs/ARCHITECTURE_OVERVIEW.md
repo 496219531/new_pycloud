@@ -2,36 +2,23 @@
 
 ## 1. 当前边界
 
-当前实现收敛为三条链路：
+当前实现已经收敛为四层：
 
-1. `ControlPlane(InfoCenter + Gateway) = HTTP + JSON`
-2. `NodeControl 管理面与任务面 = gRPC`
-3. `NodeControl 服务实例数据面 = HTTP + JSON`
-
-从角色定位上，当前更推荐这样理解：
-
-1. `Task Mode`
-   - 重计算执行层
-   - 面向 CPU 密集型任务、批处理、高吞吐执行
-2. `Service Mode`
-   - 常驻函数服务层
-   - 面向内部 RPC、轻量状态服务、稳定路由的函数调用
-   - 当前不是标准 ASGI/WSGI 网络服务运行时
-3. `External Web Layer`
+1. `External Web Layer`
    - 真正对外的轻网络入口层
-   - 建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
-   - 负责 HTTP API、鉴权、参数校验、编排与聚合
+   - 推荐独立使用 `FastAPI/Flask + uvicorn/gunicorn`
+2. `Service Mode`
+   - 内部常驻函数服务层
+3. `JobQueue Mode`
+   - 大任务排队与单活调度层
+4. `TaskPool Mode`
+   - 子任务执行层
 
 一句话概括：
 
-1. `Task Mode = 重计算执行层`
-2. `Service Mode = 常驻函数服务层`
-3. `FastAPI/uvicorn = 对外轻网络入口层`
-
-默认部署建议：
-
-1. 一个 `controlplane` 进程
-2. 多个 `nodecontrol` 进程
+1. `Service Mode = 常驻函数服务层`
+2. `JobQueue Mode = 大任务排队与单活调度层`
+3. `TaskPool Mode = 专属子任务执行层`
 
 ## 2. 角色
 
@@ -39,52 +26,60 @@
 
 负责：
 
-1. 上传代码并创建服务
+1. 部署并持有内部函数服务
 2. 持有 `service_token`
-3. 长驻并维持心跳
-4. 正常退出时 `EndService`
+3. 维持服务 keepalive
 
-推荐入口：`DeployedService.deploy_from_infocenter(...)`
+推荐入口：
+
+1. `DeployedService.deploy_from_infocenter(...)`
 
 ### 2.2 caller client
 
 负责：
 
-1. 按 `service_name` 调用已有服务
-2. 不拥有服务生命周期
-3. 不持有 owner token
+1. 按 `service_name` 调已有服务
+2. 不管理服务生命周期
 
 推荐入口：
 
 1. `GatewayConnect`
 2. `GatewayServiceClient`
-3. `DirectConnect`（调试或旁路直连）
+3. `DirectConnect`
 
-### 2.3 task client
+### 2.3 job client
 
 负责：
 
-1. 上传任务代码
-2. 从 `InfoCenter` 取节点事实
-3. 向目标 `NodeControl` 建立任务流
-4. 提交任务并接收结果
+1. 提交大任务
+2. 进入队列等待调度
+3. 查询 job 状态与结果
 
 推荐入口：
 
-1. `TaskSubmitter`
-2. `TaskBatchClient`
-3. 低层：`NodeControlClient.open_task_stream(...)`
+1. `JobQueueClient`
 
-## 3. 服务模式
+### 2.4 task pool client
 
-服务模式当前是“模块 + 多函数导出”模型：
+负责：
+
+1. 创建原生专属 pool
+2. 往 pool 提交 subtasks
+3. 拉结果、取消 job、关闭 pool
+
+推荐入口：
+
+1. `TaskPoolSession`
+2. `DedicatedTaskServiceSession`（兼容实现）
+
+## 3. Service Mode
+
+服务模式当前仍然是“模块 + 多函数导出”模型：
 
 1. 上传支持 `py / tar.gz / zip / whl`
 2. 注册时指定 `entry_module + export_spec`
-3. 导出模式：`decorator / explicit / all / single`
-4. 默认推荐 `decorator + pycloud_export`
-5. 调用路由为 `service_name -> route -> service_id -> method`
-6. 依赖缺失时默认严格失败，只有显式 `dependency_allowlist` 才允许节点补装
+3. 导出模式支持 `decorator / explicit / all / single`
+4. 当前更适合作为内部函数服务层，而不是对外 Web 应用层
 
 对外推荐入口：
 
@@ -92,105 +87,42 @@
 2. `GET /svc/{service_name}/methods`
 3. `GET /svc/{service_name}/status`
 
-边界上需要特别注意：
+## 4. JobQueue Mode
 
-1. 当前 `Service Mode` 虽然带 HTTP 数据面，但本质仍然是“HTTP/RPC 入口 + 进程池中执行 Python 函数”
-2. 它更适合作为内部 service fabric / 内部函数服务层
-3. 如果你需要真正的 Web 应用生命周期、中间件、流式响应、ASGI 能力，建议放到外部 Web 层处理
+`JobQueue Mode` 负责：
 
-## 4. 任务模式
+1. 大任务先入队
+2. 同一时刻只放行一个大任务进入 `RUNNING`
+3. 放行后再创建 `TaskPoolSession`
+4. 由 driver 生成 subtasks，交给 pool 执行
 
-### 4.1 通信模型
+当前推荐入口：
 
-任务模式当前已经从“批量提交 + 轮询”收敛为“流式入口 + 高层 helper”：
+1. `JobQueueClient`
 
-1. gRPC 协议包含 `TaskStream`
-2. `TaskBatchClient` / `TaskSubmitter` 内部已经走任务流
-3. 低层 `SubmitTasks / PullResults / CancelJob` 仍保留
+## 5. TaskPool Mode
 
-### 4.2 节点内执行模型
+`TaskPool Mode` 当前已经是原生 pool 协议：
 
-节点内部不是简单共享池，而是 runtime slot 模型：
+1. `CreateTaskPool`
+2. `HeartbeatTaskPool`
+3. `SubmitPoolTasks`
+4. `PullPoolResults`
+5. `CancelPoolJob`
+6. `GetTaskPoolStatus`
+7. `CloseTaskPool`
 
-1. 任务可带 `runtime_key`
-2. `runtime_key` 绑定到节点内 runtime slot
-3. 每个 slot 复用单进程 worker
-4. 同一 slot 内尽量少切代码
-5. 节点只保留前 `K` 个活跃 slot
-6. 空闲 slot 超过 `idle TTL` 自动回收
+特点：
 
-### 4.3 热点路由
+1. 每个 pool 是独立资源会话
+2. pool 自己 heartbeat 保活
+3. subtasks 不走旧共享任务池
+4. 更适合作为 `JobQueue Mode` 的执行层
 
-任务选点目标不是单纯均衡 credit，而是：
+## 6. 已移除
 
-1. 尽量少切代码
-2. 尽量让热代码持续热
-3. 同时避免把某个 node 撑爆
+以下旧共享任务池能力已经移除：
 
-因此：
-
-1. 节点会向 `InfoCenter` 心跳上报 `active_runtimes`
-2. `InfoCenter.select_task_nodes(...)` 支持 `preferred_runtime_key`
-3. `TaskBatchClient.from_infocenter(...)` 会优先选择热点 node
-
-### 4.4 结果与生命周期
-
-1. 结果当前保存在节点内存中
-2. 不做持久化
-3. `job_id` 是分组键，不是 heartbeat session
-4. 任务模式没有 Gateway
-5. 任务 client 不需要服务模式那种长驻 keepalive
-
-### 4.5 `runtime` 约束
-
-`runtime` 当前统一表示 Python 版本约束：
-
-1. `py3`
-2. `py3.11`
-3. `>=py3.11`
-4. `<=py3.11`
-
-当前链路：
-
-1. 节点向 `InfoCenter` 暴露 `python_version`
-2. 服务部署和任务选点会先按 `runtime` 过滤节点
-3. 节点侧上传代码 / 建服务时再做一次本地校验
-
-注意：
-
-1. 精确 `py3.11` 只匹配 Python 3.11
-2. 如果你想表达“3.11 及以上”，要显式写 `>=py3.11`
-
-### 4.6 依赖补装
-
-当前实现保持保守：
-
-1. 不做盲目自动安装
-2. 只有调用方显式提供 `dependency_allowlist` 才允许节点补装
-3. 依赖安装目录跟随 `code_version`
-4. 这样能保持缓存语义简单、排障路径清晰
-
-## 5. ControlPlane
-
-`ControlPlane` 默认是 `InfoCenter + Gateway` 同进程：
-
-1. `InfoCenter` 维护节点与服务事实
-2. `Gateway` 维护 route cache
-3. 同进程时不需要本机网络回环
-4. 也支持单独起 `infocenter` 和 `gateway`
-
-## 6. 设计取向
-
-当前优先级是：
-
-1. 简单
-2. 稳定
-3. 可预测
-4. 易排障
-
-因此当前刻意不做：
-
-1. `InfoCenter` 内建复杂调度器
-2. `InfoCenter` 代理任务执行
-3. 任务结果持久化系统
-4. 复杂鉴权中心
+1. 旧共享任务池客户端
+2. 旧共享任务池流式入口
+3. 旧共享任务结果拉取与取消链路

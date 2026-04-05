@@ -3,6 +3,8 @@ from __future__ import annotations
 """Client helpers for InfoCenter/NodeControl service-session workflow."""
 
 import asyncio
+import base64
+import contextlib
 import errno
 import hashlib
 import importlib
@@ -18,8 +20,8 @@ import tarfile
 import tempfile
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -423,7 +425,7 @@ def _resolve_high_level_service_results(
     return resolved
 
 
-def _resolve_task_results_data(batch: "TaskBatchClient", results: Sequence[pb2.TaskResult]) -> List[Any]:
+def _resolve_task_results_data(batch: Any, results: Sequence[pb2.TaskResult]) -> List[Any]:
     return [batch.fetch_result_data(item) for item in results]
 
 
@@ -437,7 +439,7 @@ def _inline_task_result_data(task_result: pb2.TaskResult, *, data: Any) -> pb2.T
     return resolved
 
 
-def _resolve_high_level_task_result(batch: "TaskBatchClient", task_result: pb2.TaskResult) -> pb2.TaskResult:
+def _resolve_high_level_task_result(batch: Any, task_result: pb2.TaskResult) -> pb2.TaskResult:
     if int(task_result.status) != int(pb2.TASK_STATUS_SUCCEEDED):
         return task_result
     data = struct_to_dict(task_result.result)
@@ -451,12 +453,12 @@ def _resolve_high_level_task_result(batch: "TaskBatchClient", task_result: pb2.T
         return task_result
 
 
-def _resolve_high_level_task_results(batch: "TaskBatchClient", results: Sequence[pb2.TaskResult]) -> List[pb2.TaskResult]:
+def _resolve_high_level_task_results(batch: Any, results: Sequence[pb2.TaskResult]) -> List[pb2.TaskResult]:
     return [_resolve_high_level_task_result(batch, item) for item in results]
 
 
 def _resolve_high_level_pull_results_response(
-    batch: "TaskBatchClient",
+    batch: Any,
     response: pb2.PullResultsResponse,
 ) -> pb2.PullResultsResponse:
     resolved = pb2.PullResultsResponse()
@@ -1433,6 +1435,1017 @@ class GatewayServiceClient:
             return client.fetch_result_ref_data(ref, target_path=target_path)
 
 
+class JobQueueClient:
+    """Thin HTTP client for controlplane job queue endpoints."""
+
+    def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+        self.target = target
+        self.base_url = _target_to_base_url(target)
+        self.timeout_sec = max(0.1, float(timeout_sec))
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "JobQueueClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return _http_json_request(
+            base_url=self.base_url,
+            path="/jobs/submit",
+            method="POST",
+            timeout_sec=self.timeout_sec,
+            payload=payload,
+        )
+
+    def get_job_status(self, job_id: str) -> Dict[str, object]:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            raise ValueError("job_id is required")
+        return _http_json_request(
+            base_url=self.base_url,
+            path=f"/jobs/{quote(normalized, safe='')}",
+            method="GET",
+            timeout_sec=self.timeout_sec,
+        )
+
+    def cancel_job(self, job_id: str) -> Dict[str, object]:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            raise ValueError("job_id is required")
+        return _http_json_request(
+            base_url=self.base_url,
+            path=f"/jobs/{quote(normalized, safe='')}/cancel",
+            method="POST",
+            timeout_sec=self.timeout_sec,
+            payload={},
+        )
+
+    def submit_job_from_bytes(
+        self,
+        *,
+        blob: bytes,
+        driver_entry_module: str,
+        driver_entry_callable: str = "run",
+        driver_payload: Optional[Dict[str, object]] = None,
+        driver_package_format: str = "py",
+        priority: int = 0,
+        client_id: str = "",
+        runtime: str = "py3",
+        task_blob: Optional[bytes] = None,
+        task_entry_module: str = "",
+        task_entry_callable: str = "run",
+        task_package_format: str = "py",
+        tags: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        pool_name: str = "",
+        pool_worker_count: int = 1,
+        pool_node_count: int = 1,
+        pool_heartbeat_timeout_sec: int = 30,
+        pool_idle_ttl_sec: int = 0,
+        pool_allow_partial: bool = True,
+        pool_min_success_nodes: int = 1,
+        wait_timeout_sec: float = 3600.0,
+        task_priority: int = 1,
+        dependency_allowlist: Optional[Sequence[str]] = None,
+    ) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "client_id": str(client_id or "").strip(),
+            "priority": max(0, int(priority)),
+            "runtime": str(runtime or "py3"),
+            "blob_b64": base64.b64encode((task_blob if task_blob is not None else blob)).decode("utf-8"),
+            "entry_module": str(task_entry_module or "").strip(),
+            "entry_callable": str(task_entry_callable or "run").strip() or "run",
+            "package_format": str(task_package_format or "py").strip() or "py",
+            "tags": list(tags or ()),
+            "node_count": int(node_count or 0),
+            "wait_timeout_sec": float(wait_timeout_sec or 3600.0),
+            "task_priority": max(1, int(task_priority or 1)),
+            "dependency_allowlist": list(dependency_allowlist or ()),
+            "pool_name": str(pool_name or "").strip(),
+            "pool_worker_count": max(1, int(pool_worker_count or 1)),
+            "pool_node_count": max(1, int(pool_node_count or 1)),
+            "pool_heartbeat_timeout_sec": max(5, int(pool_heartbeat_timeout_sec or 30)),
+            "pool_idle_ttl_sec": max(0, int(pool_idle_ttl_sec or 0)),
+            "pool_allow_partial": bool(pool_allow_partial),
+            "pool_min_success_nodes": max(1, int(pool_min_success_nodes or 1)),
+            "driver_blob_b64": base64.b64encode(blob).decode("utf-8"),
+            "driver_entry_module": str(driver_entry_module or "").strip(),
+            "driver_entry_callable": str(driver_entry_callable or "run").strip() or "run",
+            "driver_payload": dict(driver_payload or {}),
+            "driver_package_format": str(driver_package_format or "py").strip() or "py",
+        }
+        return self.submit_job(payload)
+
+    def submit_job_from_func(
+        self,
+        *,
+        func: Callable,
+        driver_entry_callable: Optional[str] = None,
+        driver_payload: Optional[Dict[str, object]] = None,
+        priority: int = 0,
+        client_id: str = "",
+        runtime: str = "py3",
+        task_func: Optional[Callable] = None,
+        task_entry_callable: str = "run",
+        tags: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        pool_name: str = "",
+        pool_worker_count: int = 1,
+        pool_node_count: int = 1,
+        pool_heartbeat_timeout_sec: int = 30,
+        pool_idle_ttl_sec: int = 0,
+        pool_allow_partial: bool = True,
+        pool_min_success_nodes: int = 1,
+        wait_timeout_sec: float = 3600.0,
+        task_priority: int = 1,
+        dependency_allowlist: Optional[Sequence[str]] = None,
+    ) -> Dict[str, object]:
+        driver_blob, _ = _prepare_code_blob(func=func)
+        driver_module = _default_entry_module_for_func(func)
+        actual_driver_callable = str(driver_entry_callable or func.__name__).strip() or func.__name__
+        effective_task_func = task_func or func
+        task_blob, _ = _prepare_code_blob(func=effective_task_func)
+        task_module = _default_entry_module_for_func(effective_task_func)
+        actual_task_callable = str(task_entry_callable or effective_task_func.__name__).strip() or effective_task_func.__name__
+        return self.submit_job_from_bytes(
+            blob=driver_blob or b"",
+            driver_entry_module=driver_module,
+            driver_entry_callable=actual_driver_callable,
+            driver_payload=driver_payload,
+            priority=priority,
+            client_id=client_id,
+            runtime=runtime,
+            task_blob=task_blob,
+            task_entry_module=task_module,
+            task_entry_callable=actual_task_callable,
+            tags=tags,
+            node_count=node_count,
+            pool_name=pool_name,
+            pool_worker_count=pool_worker_count,
+            pool_node_count=pool_node_count,
+            pool_heartbeat_timeout_sec=pool_heartbeat_timeout_sec,
+            pool_idle_ttl_sec=pool_idle_ttl_sec,
+            pool_allow_partial=pool_allow_partial,
+            pool_min_success_nodes=pool_min_success_nodes,
+            wait_timeout_sec=wait_timeout_sec,
+            task_priority=task_priority,
+            dependency_allowlist=dependency_allowlist,
+        )
+
+    def submit_job_from_module(
+        self,
+        *,
+        module: Any,
+        driver_entry_callable: str = "run",
+        driver_payload: Optional[Dict[str, object]] = None,
+        priority: int = 0,
+        client_id: str = "",
+        runtime: str = "py3",
+        task_module: Optional[Any] = None,
+        task_entry_callable: str = "run",
+        tags: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        pool_name: str = "",
+        pool_worker_count: int = 1,
+        pool_node_count: int = 1,
+        pool_heartbeat_timeout_sec: int = 30,
+        pool_idle_ttl_sec: int = 0,
+        pool_allow_partial: bool = True,
+        pool_min_success_nodes: int = 1,
+        wait_timeout_sec: float = 3600.0,
+        task_priority: int = 1,
+        dependency_allowlist: Optional[Sequence[str]] = None,
+    ) -> Dict[str, object]:
+        driver_blob, _ = _prepare_code_blob(module=module)
+        driver_module_name = _default_entry_module_for_module(module)
+        effective_task_module = task_module or module
+        task_blob, _ = _prepare_code_blob(module=effective_task_module)
+        task_module_name = _default_entry_module_for_module(effective_task_module)
+        return self.submit_job_from_bytes(
+            blob=driver_blob or b"",
+            driver_entry_module=driver_module_name,
+            driver_entry_callable=driver_entry_callable,
+            driver_payload=driver_payload,
+            priority=priority,
+            client_id=client_id,
+            runtime=runtime,
+            task_blob=task_blob,
+            task_entry_module=task_module_name,
+            task_entry_callable=task_entry_callable,
+            tags=tags,
+            node_count=node_count,
+            pool_name=pool_name,
+            pool_worker_count=pool_worker_count,
+            pool_node_count=pool_node_count,
+            pool_heartbeat_timeout_sec=pool_heartbeat_timeout_sec,
+            pool_idle_ttl_sec=pool_idle_ttl_sec,
+            pool_allow_partial=pool_allow_partial,
+            pool_min_success_nodes=pool_min_success_nodes,
+            wait_timeout_sec=wait_timeout_sec,
+            task_priority=task_priority,
+            dependency_allowlist=dependency_allowlist,
+        )
+
+    def wait_for_terminal(
+        self,
+        job_id: str,
+        *,
+        timeout_sec: float = 30.0,
+        poll_interval_sec: float = 0.5,
+    ) -> Dict[str, object]:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            raise ValueError("job_id is required")
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        while time.time() < deadline:
+            payload = self.get_job_status(normalized)
+            job = dict(payload.get("job") or {})
+            status = str(job.get("status", "") or "")
+            if status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                return payload
+            time.sleep(max(0.05, float(poll_interval_sec)))
+        raise TimeoutError(f"job did not reach terminal state before timeout: {normalized}")
+
+
+@dataclass
+class NativeTaskPoolClient:
+    _client: "NodeControlClient" = field(repr=False)
+    owner_client_id: str
+    pool_id: str
+    pool_token: str
+    code_version: str
+    worker_count: int
+    heartbeat_timeout_sec: int = 30
+
+    def submit_tasks(
+        self,
+        tasks: Sequence[pb2.TaskSubmitItem],
+        *,
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        return self._client.submit_pool_tasks(
+            pool_id=self.pool_id,
+            pool_token=self.pool_token,
+            tasks=tasks,
+            job_id=job_id,
+        )
+
+    def pull_results(
+        self,
+        *,
+        limit: int = 100,
+        wait_ms: int = 0,
+        cursor: str = "",
+    ) -> pb2.PullResultsResponse:
+        return self._client.pull_pool_results(
+            pool_id=self.pool_id,
+            pool_token=self.pool_token,
+            limit=limit,
+            wait_ms=wait_ms,
+            cursor=cursor,
+        )
+
+    def close(self, *, reason: str = "") -> pb2.CloseTaskPoolResponse:
+        return self._client.close_task_pool(
+            owner_client_id=self.owner_client_id,
+            pool_id=self.pool_id,
+            pool_token=self.pool_token,
+            reason=reason,
+        )
+
+    def heartbeat(self, *, seq: int = 0) -> pb2.HeartbeatTaskPoolResponse:
+        return self._client.heartbeat_task_pool(
+            owner_client_id=self.owner_client_id,
+            pool_id=self.pool_id,
+            pool_token=self.pool_token,
+            seq=seq,
+        )
+
+    def cancel_job(self, *, job_id: str, reason: str = "") -> pb2.CancelJobResponse:
+        return self._client.cancel_pool_job(
+            pool_id=self.pool_id,
+            pool_token=self.pool_token,
+            job_id=job_id,
+            reason=reason,
+        )
+
+    def get_status(self) -> pb2.TaskPoolStatusInfo:
+        return self._client.get_task_pool_status(pool_id=self.pool_id, pool_token=self.pool_token)
+
+
+@dataclass
+class _TaskPoolCallProxy:
+    session: Any
+    method_name: str
+
+    def submit(self, *args, **kwargs) -> pb2.SubmitTasksResponse:
+        payload: Dict[str, object] = {}
+        if args:
+            payload["args"] = list(args)
+            if kwargs:
+                payload["kwargs"] = kwargs
+        elif kwargs:
+            payload.update(kwargs)
+        return self.session.submit_payloads([payload], task_method=self.method_name)
+
+    def __call__(self, *args, **kwargs) -> Sequence[Any]:
+        resp = self.submit(*args, **kwargs)
+        return self.session.wait_for_data(expected_count=len(resp.accepted), timeout_sec=30.0)
+
+    def sync(self, *args, **kwargs):
+        results = self(*args, **kwargs)
+        if len(results) == 1:
+            return results[0]
+        return results
+
+
+class DedicatedTaskServiceSession:
+    """Dedicated temporary task pool backed by a hidden ServiceGroup."""
+
+    def __init__(
+        self,
+        *,
+        group: "ServiceGroup",
+        task_method: str,
+        job_id: str = "",
+        max_submit_workers: int = 0,
+    ) -> None:
+        self._group = group
+        self._task_method = str(task_method or "run").strip() or "run"
+        self._job_id = str(job_id or f"pool-{self._group.service_name}").strip() or f"pool-{self._group.service_name}"
+        self._closed = False
+        self._submit_seq = 0
+        self._submit_lock = threading.Lock()
+        self._results: "queue.Queue[pb2.TaskResult]" = queue.Queue()
+        self._futures: Dict[str, Future] = {}
+        self._future_lock = threading.Lock()
+        submit_workers = max(1, int(max_submit_workers or sum(int(session.worker_count or 1) for session in group.sessions.values()) or 1))
+        self._executor = ThreadPoolExecutor(max_workers=submit_workers, thread_name_prefix="task-pool-submit")
+
+    @property
+    def client_id(self) -> str:
+        return str(self._group.owner_client_id)
+
+    @property
+    def job_id(self) -> str:
+        return self._job_id
+
+    @property
+    def code_version(self) -> str:
+        return str(self._group._artifact_code_version or "")  # noqa: SLF001
+
+    @property
+    def node_ids(self) -> Sequence[str]:
+        return list(self._group.sessions.keys())
+
+    @property
+    def methods(self) -> List[str]:
+        return [self._task_method]
+
+    def _ensure_method(self, method_name: str) -> str:
+        normalized = str(method_name or "").strip()
+        if not normalized:
+            raise ValueError("method is required")
+        if normalized != self._task_method:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no method '{normalized}'. Available methods: {self.methods}"
+            )
+        return normalized
+
+    def _next_task_id(self) -> str:
+        with self._submit_lock:
+            self._submit_seq += 1
+            return f"{self.job_id}-task-{self._submit_seq:04d}"
+
+    def _submit_one(self, *, task_id: str, payload: Dict[str, object], method_name: str, timeout_sec: float) -> None:
+        started_at = _now_timestamp()
+        try:
+            _, resp = self._group.call_balanced(method_name, payload, timeout_sec=timeout_sec)
+            result = pb2.TaskResult(
+                task_id=task_id,
+                job_id=self.job_id,
+                status=pb2.TASK_STATUS_SUCCEEDED,
+                attempt=1,
+                started_at=started_at,
+                finished_at=_now_timestamp(),
+                result=dict_to_struct(resp.get("data") if isinstance(resp, dict) and "data" in resp else resp or {}),
+            )
+        except Exception as exc:
+            result = pb2.TaskResult(
+                task_id=task_id,
+                job_id=self.job_id,
+                status=pb2.TASK_STATUS_FAILED_INFRA,
+                attempt=1,
+                started_at=started_at,
+                finished_at=_now_timestamp(),
+                error=pb2.TaskError(type="TaskPoolError", message=str(exc)),
+            )
+        self._results.put(result)
+
+    def submit_payloads(
+        self,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        task_method: str = "",
+        timeout_sec: float = 60.0,
+        job_id: str = "",
+        task_id_prefix: str = "",
+        timeout_hint_sec: int = 0,
+        priority: int = 1,
+        runtime_key: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        del job_id, timeout_hint_sec, priority, runtime_key
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        method_name = str(task_method or self._task_method).strip() or self._task_method
+        accepted: List[pb2.TaskAccepted] = []
+        prefix = str(task_id_prefix or f"{self.job_id}-task").strip()
+        with self._future_lock:
+            for payload in payloads:
+                task_id = self._next_task_id()
+                if prefix:
+                    task_id = f"{prefix}-{task_id.rsplit('-', 1)[-1]}"
+                future = self._executor.submit(
+                    self._submit_one,
+                    task_id=task_id,
+                    payload=dict(payload or {}),
+                    method_name=method_name,
+                    timeout_sec=timeout_sec,
+                )
+                self._futures[task_id] = future
+                accepted.append(pb2.TaskAccepted(task_id=task_id, status=pb2.TASK_STATUS_QUEUED))
+        return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=[], node_credit=0)
+
+    def wait_for_results(
+        self,
+        *,
+        expected_count: int = 0,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+    ) -> Sequence[pb2.TaskResult]:
+        del wait_ms, limit, job_id
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        results: List[pb2.TaskResult] = []
+        target = max(0, int(expected_count or 0))
+        while time.time() < deadline and (target <= 0 or len(results) < target):
+            remaining = max(0.01, deadline - time.time())
+            try:
+                item = self._results.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                if target <= 0:
+                    break
+                continue
+            results.append(item)
+        return results
+
+    def wait_for_data(
+        self,
+        *,
+        expected_count: int = 0,
+        timeout_sec: float = 30.0,
+    ) -> Sequence[Any]:
+        results = self.wait_for_results(expected_count=expected_count, timeout_sec=timeout_sec)
+        return _resolve_task_results_data(_PoolResultAdapter(self), results)
+
+    def submit_values(
+        self,
+        values: Sequence[Any],
+        *,
+        arg_name: str = "value",
+        task_method: str = "",
+        **shared_kwargs,
+    ) -> pb2.SubmitTasksResponse:
+        normalized_arg = str(arg_name or "value").strip() or "value"
+        payloads = [{normalized_arg: value, **dict(shared_kwargs)} for value in values]
+        return self.submit_payloads(payloads, task_method=task_method)
+
+    def map(
+        self,
+        values: Sequence[Any],
+        *,
+        arg_name: str = "value",
+        task_method: str = "",
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> Sequence[Any]:
+        resp = self.submit_values(values, arg_name=arg_name, task_method=task_method, **shared_kwargs)
+        return self.wait_for_data(expected_count=len(resp.accepted), timeout_sec=timeout_sec)
+
+    def cancel_job(
+        self,
+        *,
+        reason: str = "",
+        job_id: str = "",
+    ) -> pb2.CancelJobResponse:
+        del reason, job_id
+        cancelled = 0
+        with self._future_lock:
+            for task_id, future in list(self._futures.items()):
+                if future.cancel():
+                    cancelled += 1
+                    self._results.put(
+                        pb2.TaskResult(
+                            task_id=task_id,
+                            job_id=self.job_id,
+                            status=pb2.TASK_STATUS_CANCELLED,
+                            attempt=1,
+                            started_at=_now_timestamp(),
+                            finished_at=_now_timestamp(),
+                            error=pb2.TaskError(type="Cancelled", message="cancelled before dispatch"),
+                        )
+                    )
+        return pb2.CancelJobResponse(
+            ok=True,
+            queued_cancelled=cancelled,
+            running_marked=0,
+            already_done=0,
+            not_found=0,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._group.close(end_services=True, reason="task pool session close")
+
+    def __enter__(self) -> "DedicatedTaskServiceSession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        return _TaskPoolCallProxy(session=self, method_name=self._ensure_method(name))
+
+    def call_sync(self, method: str, **kwargs) -> Any:
+        normalized = self._ensure_method(method)
+        return getattr(self, normalized).sync(**kwargs)
+
+    async def call(self, method: str, **kwargs) -> Any:
+        normalized = self._ensure_method(method)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: getattr(self, normalized).sync(**kwargs))
+
+    def __repr__(self) -> str:
+        return f"<DedicatedTaskServiceSession methods={self.methods} nodes={len(self.node_ids)}>"
+
+    @classmethod
+    def from_infocenter(
+        cls,
+        *,
+        infocenter_target: str,
+        job_id: str = "",
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        func: Optional[Callable] = None,
+        module: Optional[Any] = None,
+        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
+        blob: Optional[bytes] = None,
+        runtime: str = "py3",
+        entry_module: str = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        worker_count: int = 10,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        allow_partial: bool = True,
+        min_success_nodes: int = 1,
+        timeout_sec: float = 10.0,
+        session_cache_dir: str = "",
+    ) -> "DedicatedTaskServiceSession":
+        effective_service_name = str(service_name or "").strip() or f"task-pool-{uuid.uuid4().hex[:12]}"
+        group = ServiceGroup.deploy_from_infocenter(
+            infocenter_target=infocenter_target,
+            owner_client_id=owner_client_id,
+            service_name=effective_service_name,
+            func=func,
+            module=module,
+            artifact_path=artifact_path,
+            blob=blob,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode="single",
+            export_methods=[entry_callable],
+            dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            expose_http=True,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            allow_partial=allow_partial,
+            min_success_nodes=min_success_nodes,
+            timeout_sec=timeout_sec,
+            ensure_unique_service_name=True,
+            reuse_existing_same_code=False,
+            replace_existing_if_code_changed=True,
+            session_cache_dir=session_cache_dir,
+        )
+        return cls(group=group, task_method=entry_callable, job_id=job_id)
+
+
+class _PoolResultAdapter:
+    def __init__(self, session: DedicatedTaskServiceSession) -> None:
+        self._session = session
+
+    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
+        del target_path
+        if task_result.result:
+            return struct_to_dict(task_result.result)
+        raise RuntimeError(task_result.error.message or "task failed")
+
+
+class TaskPoolSession:
+    """Native dedicated task pool session backed by NodeControl task pool RPCs."""
+
+    def __init__(
+        self,
+        *,
+        pools: Dict[str, NativeTaskPoolClient],
+        nodes: Dict[str, InfoCenterNode],
+        task_method: str,
+        job_id: str = "",
+    ) -> None:
+        self._pools = pools
+        self.nodes = nodes
+        self._task_method = str(task_method or "run").strip() or "run"
+        self._job_id = str(job_id or f"pool-{uuid.uuid4().hex[:12]}").strip()
+        self._closed = False
+        self._submit_seq = 0
+        self._submit_lock = threading.Lock()
+        self._pool_cycle = 0
+        self._hb_stop = threading.Event()
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_lock = threading.Lock()
+
+    @property
+    def client_id(self) -> str:
+        first = next(iter(self._pools.values()))
+        return first.owner_client_id
+
+    @property
+    def job_id(self) -> str:
+        return self._job_id
+
+    @property
+    def code_version(self) -> str:
+        first = next(iter(self._pools.values()))
+        return first.code_version
+
+    @property
+    def node_ids(self) -> Sequence[str]:
+        return list(self._pools.keys())
+
+    @property
+    def methods(self) -> List[str]:
+        return [self._task_method]
+
+    def _ensure_method(self, method_name: str) -> str:
+        normalized = str(method_name or "").strip()
+        if not normalized:
+            raise ValueError("method is required")
+        if normalized != self._task_method:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no method '{normalized}'. Available methods: {self.methods}"
+            )
+        return normalized
+
+    def _next_task_id(self) -> str:
+        with self._submit_lock:
+            self._submit_seq += 1
+            return f"{self.job_id}-task-{self._submit_seq:04d}"
+
+    def _select_pool_node(self) -> str:
+        node_ids = list(self._pools.keys())
+        if not node_ids:
+            raise RuntimeError("task pool has no node pools")
+        idx = self._pool_cycle % len(node_ids)
+        self._pool_cycle += 1
+        return node_ids[idx]
+
+    def submit_payloads(
+        self,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        task_method: str = "",
+        timeout_sec: float = 60.0,
+        job_id: str = "",
+        task_id_prefix: str = "",
+        timeout_hint_sec: int = 0,
+        priority: int = 1,
+        runtime_key: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        del task_method, timeout_sec, job_id, runtime_key
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        accepted: List[pb2.TaskAccepted] = []
+        rejected: List[pb2.TaskRejected] = []
+        prefix = str(task_id_prefix or f"{self.job_id}-task").strip()
+        grouped: Dict[str, List[pb2.TaskSubmitItem]] = {}
+        for payload in payloads:
+            task_id = self._next_task_id()
+            if prefix:
+                task_id = f"{prefix}-{task_id.rsplit('-', 1)[-1]}"
+            _, payload_struct, _ = serialize_inline_payload(payload or {}, context="task pool payload")
+            target_node_id = self._select_pool_node()
+            grouped.setdefault(target_node_id, []).append(
+                pb2.TaskSubmitItem(
+                    task_id=task_id,
+                    payload=payload_struct,
+                    timeout_hint_sec=max(0, int(timeout_hint_sec)),
+                    priority=max(1, int(priority)),
+                )
+            )
+        for node_id, items in grouped.items():
+            resp = self._pools[node_id].submit_tasks(items, job_id=self.job_id)
+            accepted.extend(resp.accepted)
+            rejected.extend(resp.rejected)
+        return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
+
+    def wait_for_results(
+        self,
+        *,
+        expected_count: int = 0,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+    ) -> Sequence[pb2.TaskResult]:
+        del job_id
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        results: List[pb2.TaskResult] = []
+        seen: set[str] = set()
+        while time.time() < deadline and (expected_count <= 0 or len(results) < expected_count):
+            for pool in self._pools.values():
+                resp = pool.pull_results(limit=limit, wait_ms=0, cursor="")
+                for item in resp.results:
+                    if item.task_id in seen:
+                        continue
+                    seen.add(item.task_id)
+                    results.append(item)
+            if expected_count > 0 and len(results) >= expected_count:
+                break
+            time.sleep(max(0.01, min(0.1, wait_ms / 1000.0 if wait_ms > 0 else 0.02)))
+        return results
+
+    def wait_for_data(
+        self,
+        *,
+        expected_count: int = 0,
+        timeout_sec: float = 30.0,
+    ) -> Sequence[Any]:
+        results = self.wait_for_results(expected_count=expected_count, timeout_sec=timeout_sec)
+        return _resolve_task_results_data(_NativePoolResultAdapter(), results)
+
+    def submit_values(
+        self,
+        values: Sequence[Any],
+        *,
+        arg_name: str = "value",
+        task_method: str = "",
+        **shared_kwargs,
+    ) -> pb2.SubmitTasksResponse:
+        normalized_arg = str(arg_name or "value").strip() or "value"
+        payloads = [{normalized_arg: value, **dict(shared_kwargs)} for value in values]
+        return self.submit_payloads(payloads, task_method=task_method)
+
+    def map(
+        self,
+        values: Sequence[Any],
+        *,
+        arg_name: str = "value",
+        task_method: str = "",
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> Sequence[Any]:
+        resp = self.submit_values(values, arg_name=arg_name, task_method=task_method, **shared_kwargs)
+        return self.wait_for_data(expected_count=len(resp.accepted), timeout_sec=timeout_sec)
+
+    def cancel_job(
+        self,
+        *,
+        reason: str = "",
+        job_id: str = "",
+    ) -> pb2.CancelJobResponse:
+        effective_job_id = str(job_id or self.job_id).strip()
+        queued_cancelled = 0
+        running_marked = 0
+        already_done = 0
+        not_found = 0
+        for pool in self._pools.values():
+            resp = pool.cancel_job(job_id=effective_job_id, reason=reason)
+            queued_cancelled += int(resp.queued_cancelled or 0)
+            running_marked += int(resp.running_marked or 0)
+            already_done += int(resp.already_done or 0)
+            not_found += int(resp.not_found or 0)
+        return pb2.CancelJobResponse(
+            ok=True,
+            queued_cancelled=queued_cancelled,
+            running_marked=running_marked,
+            already_done=already_done,
+            not_found=not_found,
+        )
+
+    def status_map(self) -> Dict[str, pb2.TaskPoolStatusInfo]:
+        return {node_id: pool.get_status() for node_id, pool in self._pools.items()}
+
+    def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
+        with self._hb_lock:
+            if self._hb_thread is not None and self._hb_thread.is_alive():
+                return
+            default_interval = min(
+                max(1.0, float(min(pool.heartbeat_timeout_sec for pool in self._pools.values())) / 2.0),
+                30.0,
+            )
+            wait_sec = max(0.5, float(interval_sec or default_interval))
+            self._hb_stop.clear()
+            self._hb_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(wait_sec,),
+                name=f"task-pool-hb-{self.job_id}",
+                daemon=True,
+            )
+            self._hb_thread.start()
+
+    def _stop_keepalive(self) -> None:
+        with self._hb_lock:
+            self._hb_stop.set()
+            thread = self._hb_thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+        with self._hb_lock:
+            self._hb_thread = None
+
+    def _heartbeat_loop(self, interval_sec: float) -> None:
+        seq = 0
+        while not self._hb_stop.wait(interval_sec):
+            seq += 1
+            for pool in self._pools.values():
+                try:
+                    pool.heartbeat(seq=seq)
+                except Exception:
+                    self._hb_stop.set()
+                    break
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_keepalive()
+        for pool in self._pools.values():
+            with contextlib.suppress(Exception):
+                pool.close(reason="task pool session close")
+            with contextlib.suppress(Exception):
+                pool._client.close()  # noqa: SLF001
+
+    def __enter__(self) -> "TaskPoolSession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        return _TaskPoolCallProxy(session=self, method_name=self._ensure_method(name))
+
+    def call_sync(self, method: str, **kwargs) -> Any:
+        normalized = self._ensure_method(method)
+        return getattr(self, normalized).sync(**kwargs)
+
+    async def call(self, method: str, **kwargs) -> Any:
+        normalized = self._ensure_method(method)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: getattr(self, normalized).sync(**kwargs))
+
+    def __repr__(self) -> str:
+        return f"<TaskPoolSession methods={self.methods} nodes={len(self.node_ids)}>"
+
+    @classmethod
+    def from_infocenter(
+        cls,
+        *,
+        infocenter_target: str,
+        job_id: str = "",
+        owner_client_id: Optional[str] = None,
+        pool_name: Optional[str] = None,
+        func: Optional[Callable] = None,
+        module: Optional[Any] = None,
+        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
+        blob: Optional[bytes] = None,
+        runtime: str = "py3",
+        entry_module: str = "",
+        entry_callable: str = "run",
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        worker_count: int = 1,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        chunk_size: int = 256 * 1024,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_count: int = 1,
+        node_limit: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> "TaskPoolSession":
+        entry_module = _normalize_entry_module_arg(entry_module)
+        effective_blob, effective_filename = _prepare_code_blob(
+            func=func,
+            module=module,
+            artifact_path=artifact_path,
+            blob=blob,
+        )
+        if effective_blob is None:
+            raise ValueError("blob, func, module or artifact_path is required")
+        effective_package_format = _resolve_package_format(package_format, effective_filename, default="py")
+        if not entry_module:
+            if module is not None:
+                entry_module = _default_entry_module_for_module(module)
+            elif func is not None:
+                entry_module = _default_entry_module_for_func(func)
+            elif artifact_path:
+                entry_module = _infer_entry_module_from_artifact_path(artifact_path)
+        if not entry_module and effective_package_format == "py":
+            entry_module = _default_entry_module_for_package(package_format=effective_package_format, entry_module=entry_module, fallback_stem="task_pool_artifact")
+
+        effective_owner = str(owner_client_id or f"client-{_get_local_ip()}").strip()
+        desired_count = max(1, int(node_count or 1))
+        with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+            selected_nodes = list(
+                infocenter.select_task_nodes(
+                    healthy_only=healthy_only,
+                    tags=tags,
+                    node_ids=node_ids,
+                    node_count=desired_count,
+                    limit=node_limit,
+                    require_credit=False,
+                    preferred_runtime_key="",
+                    runtime=runtime,
+                )
+            )
+        if not selected_nodes:
+            raise RuntimeError("no task pool nodes selected from InfoCenter")
+
+        pools: Dict[str, NativeTaskPoolClient] = {}
+        nodes: Dict[str, InfoCenterNode] = {}
+        for node in selected_nodes[:desired_count]:
+            client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id=effective_owner,
+                pool_name=str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}"),
+                blob=effective_blob,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=effective_package_format,
+                dependency_allowlist=dependency_allowlist,
+                managed_global_names=managed_global_names,
+                worker_count=worker_count,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                chunk_size=chunk_size,
+            )
+            pools[node.node_id] = pool
+            nodes[node.node_id] = node
+        session = cls(pools=pools, nodes=nodes, task_method=entry_callable, job_id=job_id)
+        session._start_keepalive()
+        return session
+
+
+class _NativePoolResultAdapter:
+    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
+        del target_path
+        if task_result.result:
+            return struct_to_dict(task_result.result)
+        raise RuntimeError(task_result.error.message or "task failed")
+
+
 @dataclass
 class DiscoveryCallError(Exception):
     status_code: int
@@ -2219,51 +3232,6 @@ class NodeControlClient:
             raise RuntimeError(_err_msg(resp.error, "upload code failed"))
         return resp
 
-    def submit_tasks(
-        self,
-        *,
-        client_id: str,
-        code_version: str,
-        tasks: Sequence[pb2.TaskSubmitItem],
-        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
-        job_id: str = "",
-    ) -> pb2.SubmitTasksResponse:
-        _validate_task_submit_items(tasks, request_context="submit tasks request")
-        resp = self.stub.SubmitTasks(
-            pb2.SubmitTasksRequest(
-                client_id=client_id,
-                code_version=code_version,
-                execution_mode=execution_mode,
-                tasks=list(tasks),
-                job_id=job_id,
-            ),
-            timeout=self.timeout_sec,
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "submit tasks failed"))
-        return resp
-
-    def pull_results(
-        self,
-        *,
-        client_id: str,
-        limit: int = 100,
-        wait_ms: int = 0,
-        cursor: str = "",
-    ) -> pb2.PullResultsResponse:
-        resp = self.stub.PullResults(
-            pb2.PullResultsRequest(
-                client_id=client_id,
-                limit=max(1, int(limit)),
-                wait_ms=max(0, int(wait_ms)),
-                cursor=cursor,
-            ),
-            timeout=max(self.timeout_sec, max(0.1, float(wait_ms) / 1000.0) + 1.0),
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "pull results failed"))
-        return resp
-
     def download_object_to_file(
         self,
         *,
@@ -2318,44 +3286,6 @@ class NodeControlClient:
             return data
         return self.fetch_result_ref_data(data, target_path=target_path)
 
-    def cancel_tasks(
-        self,
-        *,
-        client_id: str,
-        task_ids: Sequence[str],
-        reason: str = "",
-    ) -> pb2.CancelTasksResponse:
-        resp = self.stub.CancelTasks(
-            pb2.CancelTasksRequest(
-                client_id=client_id,
-                task_ids=[str(task_id) for task_id in task_ids],
-                reason=reason,
-            ),
-            timeout=self.timeout_sec,
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "cancel tasks failed"))
-        return resp
-
-    def cancel_job(
-        self,
-        *,
-        client_id: str,
-        job_id: str,
-        reason: str = "",
-    ) -> pb2.CancelJobResponse:
-        resp = self.stub.CancelJob(
-            pb2.CancelJobRequest(
-                client_id=client_id,
-                job_id=job_id,
-                reason=reason,
-            ),
-            timeout=self.timeout_sec,
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "cancel job failed"))
-        return resp
-
     def get_metrics(self) -> pb2.GetMetricsResponse:
         resp = self.stub.GetMetrics(
             pb2.GetMetricsRequest(),
@@ -2364,22 +3294,6 @@ class NodeControlClient:
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "get metrics failed"))
         return resp
-
-    def open_task_stream(
-        self,
-        *,
-        client_id: str,
-        code_version: str,
-        result_limit: int = 100,
-        result_wait_ms: int = 200,
-    ) -> "TaskStreamSession":
-        return TaskStreamSession(
-            _client=self,
-            client_id=client_id,
-            code_version=code_version,
-            result_limit=result_limit,
-            result_wait_ms=result_wait_ms,
-        )
 
     def update_runtime_globals(
         self,
@@ -2638,6 +3552,191 @@ class NodeControlClient:
             status=resp.status,
         )
 
+    def create_task_pool_from_bytes(
+        self,
+        *,
+        owner_client_id: str,
+        pool_name: str = "",
+        blob: bytes,
+        runtime: str,
+        entry_module: str,
+        entry_callable: str,
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        worker_count: int = 1,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        chunk_size: int = 256 * 1024,
+    ) -> NativeTaskPoolClient:
+        if not owner_client_id:
+            raise ValueError("owner_client_id is required")
+        digest = hashlib.sha256(blob).hexdigest()
+        effective_format = _resolve_package_format(package_format, default="py")
+        effective_module = _default_entry_module_for_package(
+            package_format=effective_format,
+            entry_module=entry_module,
+            fallback_stem="task_pool_artifact",
+        )
+
+        def _iter() -> Iterator[pb2.CreateTaskPoolRequest]:
+            yield pb2.CreateTaskPoolRequest(
+                meta=pb2.CreateTaskPoolMeta(
+                    owner_client_id=owner_client_id,
+                    pool_name=pool_name,
+                    sha256=f"sha256:{digest}",
+                    runtime=runtime,
+                    entry_module=effective_module,
+                    entry_callable=entry_callable or "run",
+                    worker_count=max(1, int(worker_count)),
+                    heartbeat_timeout_sec=max(1, int(heartbeat_timeout_sec)),
+                    idle_ttl_sec=max(0, int(idle_ttl_sec)),
+                    package_format=effective_format,
+                    dependency_allowlist=list(dependency_allowlist or ()),
+                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
+                )
+            )
+            for i in range(0, len(blob), max(1, int(chunk_size))):
+                yield pb2.CreateTaskPoolRequest(chunk=blob[i : i + chunk_size])
+
+        resp = self.stub.CreateTaskPool(_iter(), timeout=self.timeout_sec)
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "create task pool failed"))
+        return NativeTaskPoolClient(
+            _client=self,
+            owner_client_id=owner_client_id,
+            pool_id=resp.pool_id,
+            pool_token=resp.pool_token,
+            code_version=resp.code_version,
+            worker_count=resp.worker_count,
+            heartbeat_timeout_sec=resp.heartbeat_timeout_sec,
+        )
+
+    def submit_pool_tasks(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        tasks: Sequence[pb2.TaskSubmitItem],
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        resp = self.stub.SubmitPoolTasks(
+            pb2.SubmitPoolTasksRequest(
+                pool_id=str(pool_id or "").strip(),
+                pool_token=str(pool_token or "").strip(),
+                tasks=list(tasks),
+                job_id=str(job_id or "").strip(),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "submit pool tasks failed"))
+        return resp
+
+    def pull_pool_results(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        limit: int = 100,
+        wait_ms: int = 0,
+        cursor: str = "",
+    ) -> pb2.PullResultsResponse:
+        resp = self.stub.PullPoolResults(
+            pb2.PullPoolResultsRequest(
+                pool_id=str(pool_id or "").strip(),
+                pool_token=str(pool_token or "").strip(),
+                limit=max(1, int(limit or 100)),
+                wait_ms=max(0, int(wait_ms or 0)),
+                cursor=str(cursor or "").strip(),
+            ),
+            timeout=max(self.timeout_sec, max(0.1, float(wait_ms) / 1000.0) + 1.0),
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "pull pool results failed"))
+        return resp
+
+    def close_task_pool(
+        self,
+        *,
+        owner_client_id: str,
+        pool_id: str,
+        pool_token: str,
+        reason: str = "",
+    ) -> pb2.CloseTaskPoolResponse:
+        resp = self.stub.CloseTaskPool(
+            pb2.CloseTaskPoolRequest(
+                owner_client_id=str(owner_client_id or "").strip(),
+                pool_id=str(pool_id or "").strip(),
+                pool_token=str(pool_token or "").strip(),
+                reason=str(reason or ""),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok or not resp.accepted:
+            raise RuntimeError(_err_msg(resp.error, "close task pool failed"))
+        return resp
+
+    def heartbeat_task_pool(
+        self,
+        *,
+        owner_client_id: str,
+        pool_id: str,
+        pool_token: str,
+        seq: int = 0,
+    ) -> pb2.HeartbeatTaskPoolResponse:
+        resp = self.stub.HeartbeatTaskPool(
+            pb2.HeartbeatTaskPoolRequest(
+                owner_client_id=str(owner_client_id or "").strip(),
+                pool_id=str(pool_id or "").strip(),
+                seq=int(seq),
+                timestamp=_now_timestamp(),
+                pool_token=str(pool_token or "").strip(),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok or not resp.accepted:
+            raise RuntimeError(_err_msg(resp.error, "heartbeat task pool failed"))
+        return resp
+
+    def cancel_pool_job(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        job_id: str,
+        reason: str = "",
+    ) -> pb2.CancelJobResponse:
+        resp = self.stub.CancelPoolJob(
+            pb2.CancelPoolJobRequest(
+                pool_id=str(pool_id or "").strip(),
+                pool_token=str(pool_token or "").strip(),
+                job_id=str(job_id or "").strip(),
+                reason=str(reason or ""),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "cancel pool job failed"))
+        return resp
+
+    def get_task_pool_status(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+    ) -> pb2.TaskPoolStatusInfo:
+        resp = self.stub.GetTaskPoolStatus(
+            pb2.GetTaskPoolStatusRequest(
+                pool_id=str(pool_id or "").strip(),
+                pool_token=str(pool_token or "").strip(),
+            ),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "get task pool status failed"))
+        return resp.pool
+
     def list_service_methods(self, *, service_id: str, include_docs: bool = False) -> Sequence[pb2.ServiceMethodInfo]:
         resp = self.stub.ListServiceMethods(
             pb2.ListServiceMethodsRequest(
@@ -2749,1180 +3848,6 @@ class NodeControlClient:
             raise RuntimeError(_err_msg(resp.error, "get service status failed"))
         return resp.service
 
-
-@dataclass
-class TaskStreamSession:
-    _client: NodeControlClient = field(repr=False)
-    client_id: str
-    code_version: str
-    result_limit: int = 100
-    result_wait_ms: int = 200
-    _request_queue: "queue.Queue[Optional[pb2.TaskStreamRequest]]" = field(default_factory=queue.Queue, init=False, repr=False)
-    _result_queue: "queue.Queue[pb2.TaskResult]" = field(default_factory=queue.Queue, init=False, repr=False)
-    _submit_waiters: Dict[str, "queue.Queue[pb2.TaskStreamSubmitAck]"] = field(default_factory=dict, init=False, repr=False)
-    _cancel_waiters: Dict[str, "queue.Queue[pb2.TaskStreamCancelJobAck]"] = field(default_factory=dict, init=False, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
-    _opened: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _closed: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _response_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
-    _fatal_error: Optional[BaseException] = field(default=None, init=False, repr=False)
-    _close_sent: bool = field(default=False, init=False, repr=False)
-    _node_credit: int = field(default=0, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.client_id = str(self.client_id or "").strip()
-        self.code_version = str(self.code_version or "").strip()
-        if not self.client_id:
-            raise ValueError("client_id is required")
-        if not self.code_version:
-            raise ValueError("code_version is required")
-
-        self._response_thread = threading.Thread(
-            target=self._run_stream,
-            name=f"task-stream-{self.client_id}",
-            daemon=True,
-        )
-        self._response_thread.start()
-        self._request_queue.put(
-            pb2.TaskStreamRequest(
-                open=pb2.TaskStreamOpen(
-                    client_id=self.client_id,
-                    code_version=self.code_version,
-                    result_limit=max(1, int(self.result_limit)),
-                    result_wait_ms=max(0, int(self.result_wait_ms)),
-                )
-            )
-        )
-        if not self._opened.wait(timeout=max(1.0, float(self._client.timeout_sec))):
-            self.close()
-            raise TimeoutError("task stream open timed out")
-        self._raise_if_failed()
-
-    def _request_iter(self) -> Iterator[pb2.TaskStreamRequest]:
-        while True:
-            item = self._request_queue.get()
-            if item is None:
-                return
-            yield item
-
-    def _set_fatal_error(self, exc: BaseException) -> None:
-        with self._lock:
-            if self._fatal_error is None:
-                self._fatal_error = exc
-        self._opened.set()
-        self._closed.set()
-
-    def _run_stream(self) -> None:
-        try:
-            responses = self._client.stub.TaskStream(self._request_iter())
-            for resp in responses:
-                kind = resp.WhichOneof("body")
-                if kind == "open_ack":
-                    self._node_credit = int(resp.open_ack.node_credit)
-                    self._opened.set()
-                    continue
-                if kind == "submit_ack":
-                    self._node_credit = int(resp.submit_ack.node_credit)
-                    with self._lock:
-                        waiter = self._submit_waiters.pop(resp.submit_ack.request_id, None)
-                    if waiter is not None:
-                        waiter.put(resp.submit_ack)
-                    continue
-                if kind == "cancel_job_ack":
-                    with self._lock:
-                        waiter = self._cancel_waiters.pop(resp.cancel_job_ack.request_id, None)
-                    if waiter is not None:
-                        waiter.put(resp.cancel_job_ack)
-                    continue
-                if kind == "result_batch":
-                    self._node_credit = int(resp.result_batch.node_credit)
-                    for item in resp.result_batch.results:
-                        self._result_queue.put(item)
-                    continue
-                if kind == "credit_update":
-                    self._node_credit = int(resp.credit_update.node_credit)
-                    continue
-                if kind == "error":
-                    self._set_fatal_error(RuntimeError(resp.error.message or "task stream failed"))
-                    break
-                if kind == "closed":
-                    self._node_credit = int(resp.closed.node_credit)
-                    self._opened.set()
-                    self._closed.set()
-                    break
-        except Exception as exc:
-            self._set_fatal_error(exc)
-        finally:
-            self._opened.set()
-            self._closed.set()
-
-    def _raise_if_failed(self) -> None:
-        if self._fatal_error is not None:
-            raise RuntimeError(str(self._fatal_error))
-
-    def _await_waiter(self, waiter: queue.Queue, *, timeout_sec: float, what: str):
-        deadline = time.time() + max(0.1, float(timeout_sec))
-        while time.time() < deadline:
-            self._raise_if_failed()
-            try:
-                return waiter.get(timeout=min(0.1, max(0.01, deadline - time.time())))
-            except queue.Empty:
-                continue
-        self._raise_if_failed()
-        raise TimeoutError(f"{what} timed out")
-
-    @property
-    def node_credit(self) -> int:
-        return int(self._node_credit)
-
-    def submit_tasks(
-        self,
-        tasks: Sequence[pb2.TaskSubmitItem],
-        *,
-        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
-        job_id: str = "",
-        timeout_sec: float = 0.0,
-    ) -> pb2.SubmitTasksResponse:
-        self._raise_if_failed()
-        _validate_task_submit_items(tasks, request_context="task stream submit request")
-        request_id = uuid.uuid4().hex
-        waiter: "queue.Queue[pb2.TaskStreamSubmitAck]" = queue.Queue(maxsize=1)
-        with self._lock:
-            self._submit_waiters[request_id] = waiter
-        self._request_queue.put(
-            pb2.TaskStreamRequest(
-                submit=pb2.TaskStreamSubmit(
-                    request_id=request_id,
-                    job_id=str(job_id or "").strip(),
-                    execution_mode=execution_mode,
-                    tasks=list(tasks),
-                )
-            )
-        )
-        ack = self._await_waiter(
-            waiter,
-            timeout_sec=float(timeout_sec or self._client.timeout_sec or 10.0),
-            what="task stream submit",
-        )
-        if ack.error and ack.error.message:
-            raise RuntimeError(_err_msg(ack.error, "task stream submit failed"))
-        return pb2.SubmitTasksResponse(
-            ok=True,
-            accepted=ack.accepted,
-            rejected=ack.rejected,
-            node_credit=ack.node_credit,
-        )
-
-    def cancel_job(
-        self,
-        *,
-        job_id: str,
-        reason: str = "",
-        timeout_sec: float = 0.0,
-    ) -> pb2.CancelJobResponse:
-        self._raise_if_failed()
-        request_id = uuid.uuid4().hex
-        waiter: "queue.Queue[pb2.TaskStreamCancelJobAck]" = queue.Queue(maxsize=1)
-        with self._lock:
-            self._cancel_waiters[request_id] = waiter
-        self._request_queue.put(
-            pb2.TaskStreamRequest(
-                cancel_job=pb2.TaskStreamCancelJob(
-                    request_id=request_id,
-                    job_id=str(job_id or "").strip(),
-                    reason=reason,
-                )
-            )
-        )
-        ack = self._await_waiter(
-            waiter,
-            timeout_sec=float(timeout_sec or self._client.timeout_sec or 10.0),
-            what="task stream cancel job",
-        )
-        if ack.error and ack.error.message:
-            raise RuntimeError(_err_msg(ack.error, "task stream cancel job failed"))
-        return pb2.CancelJobResponse(
-            ok=True,
-            queued_cancelled=ack.queued_cancelled,
-            running_marked=ack.running_marked,
-            already_done=ack.already_done,
-            not_found=ack.not_found,
-        )
-
-    def pull_results(
-        self,
-        *,
-        limit: int = 100,
-        wait_ms: int = 0,
-    ) -> pb2.PullResultsResponse:
-        self._raise_if_failed()
-        max_items = max(1, int(limit or 100))
-        results: List[pb2.TaskResult] = []
-
-        if wait_ms > 0 and self._result_queue.empty():
-            try:
-                first = self._result_queue.get(timeout=max(0.001, float(wait_ms) / 1000.0))
-                results.append(first)
-            except queue.Empty:
-                return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
-
-        while len(results) < max_items:
-            try:
-                results.append(self._result_queue.get_nowait())
-            except queue.Empty:
-                break
-        return pb2.PullResultsResponse(ok=True, results=results, next_cursor="")
-
-    def close(self, *, drain: bool = False) -> None:
-        if self._close_sent:
-            return
-        self._close_sent = True
-        self._request_queue.put(pb2.TaskStreamRequest(close=pb2.TaskStreamClose(drain=bool(drain))))
-        self._request_queue.put(None)
-        if self._response_thread is not None:
-            self._response_thread.join(timeout=2.0)
-
-    def __enter__(self) -> "TaskStreamSession":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-
-@dataclass
-class TaskBatchClient:
-    """Multi-node task-mode helper bound to a selected set of NodeControl nodes."""
-
-    _clients: Dict[str, NodeControlClient] = field(repr=False)
-    _streams: Dict[str, TaskStreamSession] = field(repr=False)
-    client_id: str
-    job_id: str
-    nodes: Dict[str, InfoCenterNode]
-    code_version: str
-    code_token: str = ""
-    _cursors_by_node: Dict[str, str] = field(default_factory=dict, repr=False)
-    _submit_seq: int = field(default=0, repr=False)
-    _submit_seq_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _submitted_task_ids_by_job: Dict[str, List[str]] = field(default_factory=dict, repr=False)
-    _seen_result_task_ids_by_job: Dict[str, Set[str]] = field(default_factory=dict, repr=False)
-    _task_node_by_job: Dict[str, Dict[str, str]] = field(default_factory=dict, repr=False)
-    _runtime_node_hint: Dict[str, str] = field(default_factory=dict, repr=False)
-    _latest_credit_by_node: Dict[str, int] = field(default_factory=dict, repr=False)
-
-    # 类级别序列号，配合锁用于并发安全的自动 ID 生成。
-    _class_id_lock: ClassVar[threading.Lock] = threading.Lock()
-    _class_default_client_id_lock: ClassVar[threading.Lock] = threading.Lock()
-    _class_client_seq: ClassVar[int] = 0
-    _class_job_seq: ClassVar[int] = 0
-    _class_default_client_id: ClassVar[str] = ""
-
-    @classmethod
-    def _next_class_seq(cls, *, id_type: str) -> int:
-        with cls._class_id_lock:
-            if id_type == "client":
-                cls._class_client_seq += 1
-                return cls._class_client_seq
-            if id_type == "job":
-                cls._class_job_seq += 1
-                return cls._class_job_seq
-        raise ValueError(f"unknown id_type: {id_type}")
-
-    @classmethod
-    def _build_auto_id(cls, *, prefix: str) -> str:
-        local_ip = _get_local_ip()
-        timestamp_ms = int(time.time() * 1000)
-        pid = os.getpid()
-        seq = cls._next_class_seq(id_type=prefix)
-        entropy = uuid.uuid4().hex[:6]
-        return f"{prefix}-{local_ip}-{timestamp_ms}-{pid}-{seq:04d}-{entropy}"
-
-    @classmethod
-    def _default_client_id(cls) -> str:
-        cached = str(cls._class_default_client_id or "").strip()
-        if cached:
-            return cached
-        with cls._class_default_client_id_lock:
-            cached = str(cls._class_default_client_id or "").strip()
-            if not cached:
-                cached = cls._build_auto_id(prefix="client")
-                cls._class_default_client_id = cached
-            return cached
-
-    def _next_submit_seq(self) -> int:
-        with self._submit_seq_lock:
-            self._submit_seq += 1
-            return self._submit_seq
-
-    @classmethod
-    def from_infocenter(
-        cls,
-        *,
-        infocenter_target: str,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        func: Optional[Callable] = None,
-        module: Optional[Any] = None,
-        code_version: str = "",
-        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-        blob: Optional[bytes] = None,
-        runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskBatchClient":
-        entry_module = _normalize_entry_module_arg(entry_module)
-        # 自动本地源码打包：处理模块对象和函数对象
-        if module is not None:
-            effective_blob, effective_filename = _prepare_code_blob(
-                func=None,
-                module=module,
-                artifact_path="",
-                blob=blob,
-            )
-            effective_package_format = "tar.gz"
-
-            # 自动推断 entry_module
-            if not entry_module:
-                entry_module = _default_entry_module_for_module(module)
-        elif func is not None:
-            effective_blob, effective_filename = _prepare_code_blob(
-                func=func,
-                module=None,
-                artifact_path="",
-                blob=blob,
-            )
-            effective_package_format = "tar.gz"
-
-            # 自动推断 entry_module 和 entry_callable
-            if not entry_module:
-                entry_module = _default_entry_module_for_func(func)
-            if not entry_callable or entry_callable == "run":
-                entry_callable = func.__name__
-        else:
-            effective_blob, effective_filename = _prepare_code_blob(
-                func=None,
-                module=None,
-                artifact_path=artifact_path,
-                blob=blob,
-            )
-            effective_package_format = package_format
-            if not entry_module:
-                entry_module = _infer_entry_module_from_artifact_path(artifact_path)
-
-        effective_package_format = _resolve_package_format(
-            effective_package_format,
-            effective_filename,
-            default="py",
-        )
-        if effective_blob is not None and not effective_filename:
-            effective_filename = _default_artifact_filename(
-                package_format=effective_package_format,
-                entry_module=entry_module,
-                fallback_stem="artifact",
-            )
-
-        # 自动生成 client_id（如果未提供）
-        effective_client_id = client_id
-        if not effective_client_id:
-            # 默认复用进程级 client_id，便于追踪同一客户端。
-            effective_client_id = cls._default_client_id()
-
-        # 自动生成 job_id（如果未提供）
-        effective_job_id = job_id
-        if not effective_job_id:
-            effective_job_id = cls._build_auto_id(prefix="job")
-
-        if not effective_client_id:
-            raise ValueError("client_id is required")
-        if not effective_job_id:
-            raise ValueError("job_id is required")
-
-        clients: Dict[str, NodeControlClient] = {}
-        streams: Dict[str, TaskStreamSession] = {}
-        try:
-            effective_code_version = str(code_version or "").strip()
-            if not effective_code_version:
-                if effective_blob is not None:
-                    effective_code_version = f"sha256:{hashlib.sha256(effective_blob).hexdigest()}"
-                elif artifact_path:
-                    upload_path = Path(artifact_path)
-                    upload_file = upload_path
-                    tmp_pkg: Optional[Path] = None
-                    try:
-                        if upload_path.is_dir():
-                            tmp_pkg = _package_directory_to_targz(upload_path)
-                            upload_file = tmp_pkg
-                        effective_code_version = f"sha256:{_sha256_file(upload_file)}"
-                    finally:
-                        if tmp_pkg is not None:
-                            tmp_pkg.unlink(missing_ok=True)
-                else:
-                    raise ValueError("code_version or artifact_path or blob or func must be provided")
-
-            desired_runtime_key = str(preferred_runtime_key or effective_code_version).strip() or effective_code_version
-
-            def _select_nodes_from_infocenter() -> List[InfoCenterNode]:
-                with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
-                    return list(
-                        infocenter.select_task_nodes(
-                            healthy_only=healthy_only,
-                            tags=tags,
-                            node_ids=node_ids,
-                            node_count=node_count,
-                            limit=node_limit,
-                            require_credit=require_credit,
-                            preferred_runtime_key=desired_runtime_key,
-                            runtime=runtime,
-                        )
-                    )
-
-            selected_nodes = _retry_infocenter_request(
-                _select_nodes_from_infocenter,
-                timeout_sec=timeout_sec,
-                target=infocenter_target,
-                action="task node discovery",
-            )
-
-            clients = {
-                node.node_id: NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
-                for node in selected_nodes
-            }
-
-            if code_version:
-                effective_code_version = str(code_version).strip()
-                effective_code_token = ""
-            else:
-                uploaded_versions: Dict[str, str] = {}
-                uploaded_tokens: Dict[str, str] = {}
-                requested_code_token = secrets.token_urlsafe(24)
-                if effective_blob is not None:
-                    for node_id, client in clients.items():
-                        upload = client.upload_code_from_bytes(
-                            client_id=effective_client_id,
-                            blob=effective_blob,
-                            runtime=runtime,
-                            entry_module=entry_module,
-                            entry_callable=entry_callable,
-                            package_format=effective_package_format,
-                            export_mode=export_mode,
-                            export_methods=export_methods,
-                            dependency_allowlist=dependency_allowlist,
-                            managed_global_names=managed_global_names,
-                            code_token=requested_code_token,
-                            chunk_size=chunk_size,
-                        )
-                        uploaded_versions[node_id] = upload.code_version
-                        uploaded_tokens[node_id] = upload.code_token
-                elif artifact_path:
-                    for node_id, client in clients.items():
-                        upload = client.upload_code_from_file(
-                            client_id=effective_client_id,
-                            artifact_path=artifact_path,
-                            runtime=runtime,
-                            entry_module=entry_module,
-                            entry_callable=entry_callable,
-                            package_format=effective_package_format,
-                            export_mode=export_mode,
-                            export_methods=export_methods,
-                            dependency_allowlist=dependency_allowlist,
-                            managed_global_names=managed_global_names,
-                            code_token=requested_code_token,
-                            chunk_size=chunk_size,
-                        )
-                        uploaded_versions[node_id] = upload.code_version
-                        uploaded_tokens[node_id] = upload.code_token
-                else:
-                    raise ValueError("code_version or artifact_path or blob must be provided")
-
-                unique_versions = {version for version in uploaded_versions.values() if str(version).strip()}
-                if len(unique_versions) != 1:
-                    raise RuntimeError(f"inconsistent code_version across nodes: {uploaded_versions}")
-                effective_code_version = next(iter(unique_versions))
-                unique_tokens = {token for token in uploaded_tokens.values() if str(token).strip()}
-                if len(unique_tokens) > 1:
-                    raise RuntimeError(f"inconsistent code_token across nodes: {uploaded_tokens}")
-                effective_code_token = next(iter(unique_tokens), "")
-
-            for node_id, client in clients.items():
-                streams[node_id] = client.open_task_stream(
-                    client_id=effective_client_id,
-                    code_version=effective_code_version,
-                    result_limit=100,
-                    result_wait_ms=200,
-                )
-
-            return cls(
-                _clients=clients,
-                _streams=streams,
-                client_id=effective_client_id,
-                job_id=effective_job_id,
-                nodes={node.node_id: node for node in selected_nodes},
-                code_version=effective_code_version,
-                code_token=effective_code_token,
-                _cursors_by_node={node.node_id: "" for node in selected_nodes},
-                _latest_credit_by_node={node.node_id: int(node.credit) for node in selected_nodes},
-                _runtime_node_hint={desired_runtime_key: selected_nodes[0].node_id} if selected_nodes else {},
-            )
-        except Exception:
-            for stream in streams.values():
-                stream.close()
-            for client in clients.values():
-                client.close()
-            raise
-
-    @classmethod
-    def from_module(
-        cls,
-        *,
-        infocenter_target: str,
-        module: Any,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_callable: str = "run",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskBatchClient":
-        return cls.from_infocenter(
-            infocenter_target=infocenter_target,
-            client_id=client_id,
-            job_id=job_id,
-            module=module,
-            runtime=runtime,
-            entry_callable=entry_callable,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-
-    @classmethod
-    def from_func(
-        cls,
-        *,
-        infocenter_target: str,
-        func: Callable,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_module: Any = "",
-        entry_callable: str = "run",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskBatchClient":
-        return cls.from_infocenter(
-            infocenter_target=infocenter_target,
-            client_id=client_id,
-            job_id=job_id,
-            func=func,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-
-    @classmethod
-    def from_file(
-        cls,
-        *,
-        infocenter_target: str,
-        artifact_path: str,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_module: Any = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskBatchClient":
-        return cls.from_infocenter(
-            infocenter_target=infocenter_target,
-            client_id=client_id,
-            job_id=job_id,
-            artifact_path=artifact_path,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-
-    @classmethod
-    def from_bytes(
-        cls,
-        *,
-        infocenter_target: str,
-        blob: bytes,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_module: Any = "",
-        entry_callable: str = "run",
-        package_format: str = "py",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskBatchClient":
-        return cls.from_infocenter(
-            infocenter_target=infocenter_target,
-            client_id=client_id,
-            job_id=job_id,
-            blob=blob,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-
-    def close(self) -> None:
-        for stream in self._streams.values():
-            stream.close()
-        for client in self._clients.values():
-            client.close()
-
-    def __enter__(self) -> "TaskBatchClient":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def submit_tasks(
-        self,
-        tasks: Sequence[pb2.TaskSubmitItem],
-        *,
-        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
-        job_id: str = "",
-    ) -> pb2.SubmitTasksResponse:
-        effective_job_id = str(job_id or self.job_id)
-        if not tasks:
-            return pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[], node_credit=0)
-
-        task_by_id = {item.task_id: item for item in tasks}
-        task_positions = {item.task_id: idx for idx, item in enumerate(tasks)}
-        task_attempted_nodes: Dict[str, Set[str]] = {item.task_id: set() for item in tasks}
-        accepted_by_task_id: Dict[str, pb2.TaskAccepted] = {}
-        rejected_by_task_id: Dict[str, pb2.TaskRejected] = {}
-        latest_credit_by_node: Dict[str, int] = dict(self._latest_credit_by_node or {})
-
-        pending_task_ids = [item.task_id for item in tasks]
-        while pending_task_ids:
-            batches: Dict[str, List[pb2.TaskSubmitItem]] = {}
-            for task_id in pending_task_ids:
-                item = task_by_id[task_id]
-                runtime_key = str(item.runtime_key or self.code_version).strip() or self.code_version
-                node_order = self._node_order(latest_credit_by_node, runtime_key=runtime_key)
-                target_node_id = next((node_id for node_id in node_order if node_id not in task_attempted_nodes[task_id]), "")
-                if not target_node_id:
-                    rejected_by_task_id[task_id] = pb2.TaskRejected(
-                        task_id=task_id,
-                        code=pb2.ERROR_CODE_NO_CREDIT,
-                        message="no available task node accepted this task",
-                    )
-                    continue
-                task_attempted_nodes[task_id].add(target_node_id)
-                batches.setdefault(target_node_id, []).append(task_by_id[task_id])
-
-            retriable_task_ids: List[str] = []
-            for node_id, node_tasks in batches.items():
-                stream = self._streams[node_id]
-                node_task_ids = {item.task_id for item in node_tasks}
-                try:
-                    resp = stream.submit_tasks(
-                        tasks=node_tasks,
-                        execution_mode=execution_mode,
-                        job_id=effective_job_id,
-                    )
-                    latest_credit_by_node[node_id] = int(stream.node_credit or resp.node_credit)
-                    self._latest_credit_by_node[node_id] = latest_credit_by_node[node_id]
-                except Exception as exc:
-                    latest_credit_by_node[node_id] = 0
-                    self._latest_credit_by_node[node_id] = 0
-                    for task_id in node_task_ids:
-                        if len(task_attempted_nodes[task_id]) < len(self._clients):
-                            retriable_task_ids.append(task_id)
-                        else:
-                            rejected_by_task_id[task_id] = pb2.TaskRejected(
-                                task_id=task_id,
-                                code=pb2.ERROR_CODE_INTERNAL_ERROR,
-                                message=f"submit to node {node_id} failed: {exc}",
-                            )
-                    continue
-
-                accepted_ids = {item.task_id for item in resp.accepted}
-                submitted = self._submitted_task_ids_by_job.setdefault(effective_job_id, [])
-                task_node_map = self._task_node_by_job.setdefault(effective_job_id, {})
-                for item in resp.accepted:
-                    accepted_by_task_id[item.task_id] = item
-                    task_node_map[item.task_id] = node_id
-                    runtime_key = str(task_by_id[item.task_id].runtime_key or self.code_version).strip() or self.code_version
-                    self._runtime_node_hint[runtime_key] = node_id
-                    if item.task_id not in submitted:
-                        submitted.append(item.task_id)
-
-                for item in resp.rejected:
-                    if (
-                        item.code in (pb2.ERROR_CODE_NO_CREDIT, pb2.ERROR_CODE_QUEUE_FULL)
-                        and len(task_attempted_nodes[item.task_id]) < len(self._clients)
-                    ):
-                        retriable_task_ids.append(item.task_id)
-                    else:
-                        rejected_by_task_id[item.task_id] = item
-
-                unresolved_ids = node_task_ids - accepted_ids - {item.task_id for item in resp.rejected}
-                for task_id in unresolved_ids:
-                    if len(task_attempted_nodes[task_id]) < len(self._clients):
-                        retriable_task_ids.append(task_id)
-                    else:
-                        rejected_by_task_id[task_id] = pb2.TaskRejected(
-                            task_id=task_id,
-                            code=pb2.ERROR_CODE_INTERNAL_ERROR,
-                            message=f"node {node_id} returned no final status for task",
-                        )
-
-            pending_task_ids = []
-            seen_retry: Set[str] = set()
-            for task_id in retriable_task_ids:
-                if task_id in accepted_by_task_id or task_id in rejected_by_task_id or task_id in seen_retry:
-                    continue
-                seen_retry.add(task_id)
-                pending_task_ids.append(task_id)
-
-        accepted = sorted(accepted_by_task_id.values(), key=lambda item: task_positions.get(item.task_id, 0))
-        rejected = sorted(rejected_by_task_id.values(), key=lambda item: task_positions.get(item.task_id, 0))
-        return pb2.SubmitTasksResponse(
-            ok=True,
-            accepted=accepted,
-            rejected=rejected,
-            node_credit=sum(max(0, int(value)) for value in latest_credit_by_node.values()),
-        )
-
-    def submit_payloads(
-        self,
-        payloads: Sequence[Dict[str, object]],
-        *,
-        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
-        job_id: str = "",
-        task_id_prefix: str = "",
-        timeout_hint_sec: int = 0,
-        priority: int = 1,
-        runtime_key: str = "",
-    ) -> pb2.SubmitTasksResponse:
-        effective_job_id = str(job_id or self.job_id)
-        normalized_runtime_key = str(runtime_key or self.code_version).strip() or self.code_version
-        prefix = str(task_id_prefix or f"{effective_job_id}-task").strip()
-        items: List[pb2.TaskSubmitItem] = []
-        for payload in payloads:
-            next_seq = self._next_submit_seq()
-            _, payload_struct, _ = serialize_inline_payload(payload or {}, context="task payload")
-            items.append(
-                pb2.TaskSubmitItem(
-                    task_id=f"{prefix}-{next_seq:04d}",
-                    payload=payload_struct,
-                    timeout_hint_sec=max(0, int(timeout_hint_sec)),
-                    priority=max(1, int(priority)),
-                    runtime_key=normalized_runtime_key,
-                )
-            )
-        return self.submit_tasks(items, execution_mode=execution_mode, job_id=effective_job_id)
-
-    def pull_results(
-        self,
-        *,
-        limit: int = 100,
-        wait_ms: int = 0,
-        cursor: str = "",
-    ) -> pb2.PullResultsResponse:
-        del cursor
-        max_items = max(1, int(limit or 100))
-        results: List[pb2.TaskResult] = []
-        deadline = time.time() + max(0.0, float(wait_ms) / 1000.0)
-
-        while True:
-            for node_id, stream in self._streams.items():
-                if len(results) >= max_items:
-                    break
-                resp = stream.pull_results(limit=max_items - len(results), wait_ms=0)
-                results.extend(resp.results)
-                self._latest_credit_by_node[node_id] = int(stream.node_credit)
-            if results or wait_ms <= 0 or time.time() >= deadline:
-                break
-            time.sleep(0.02)
-
-        results.sort(key=lambda item: (str(item.job_id or ""), item.task_id))
-        return pb2.PullResultsResponse(ok=True, results=results, next_cursor="")
-
-    def pull_new_results(
-        self,
-        *,
-        limit: int = 100,
-        wait_ms: int = 0,
-        job_id: str = "",
-    ) -> Sequence[pb2.TaskResult]:
-        resp = self.pull_results(limit=limit, wait_ms=wait_ms, cursor="")
-        out = list(resp.results)
-        for item in out:
-            seen = self._seen_result_task_ids_by_job.setdefault(str(item.job_id or ""), set())
-            seen.add(item.task_id)
-        effective_job_id = str(job_id or "")
-        if not effective_job_id:
-            return out
-        return [item for item in out if str(item.job_id or "") == effective_job_id]
-
-    def wait_for_results(
-        self,
-        *,
-        expected_count: int = 0,
-        timeout_sec: float = 30.0,
-        wait_ms: int = 500,
-        limit: int = 100,
-        job_id: str = "",
-    ) -> Sequence[pb2.TaskResult]:
-        effective_job_id = str(job_id or self.job_id)
-        remaining = int(expected_count or 0)
-        if remaining <= 0:
-            submitted = self._submitted_task_ids_by_job.get(effective_job_id, [])
-            seen = self._seen_result_task_ids_by_job.get(effective_job_id, set())
-            remaining = max(0, len(submitted) - len(seen))
-
-        deadline = time.time() + max(0.1, float(timeout_sec))
-        results: List[pb2.TaskResult] = []
-        while time.time() < deadline and len(results) < remaining:
-            batch = list(self.pull_new_results(limit=limit, wait_ms=wait_ms, job_id=effective_job_id))
-            if batch:
-                results.extend(batch)
-                continue
-            if remaining <= 0:
-                break
-        return results
-
-    def submitted_task_ids(self, *, job_id: str = "") -> Sequence[str]:
-        effective_job_id = str(job_id or self.job_id)
-        return list(self._submitted_task_ids_by_job.get(effective_job_id, ()))
-
-    def cancel_tasks(
-        self,
-        task_ids: Sequence[str],
-        *,
-        reason: str = "",
-    ) -> pb2.CancelTasksResponse:
-        task_ids = [str(task_id) for task_id in task_ids if str(task_id).strip()]
-        status_by_task_id: Dict[str, str] = {task_id: "not_found" for task_id in task_ids}
-        grouped: Dict[str, List[str]] = {}
-        unknown: List[str] = []
-        for task_id in task_ids:
-            node_id = self._lookup_task_node(task_id)
-            if node_id:
-                grouped.setdefault(node_id, []).append(task_id)
-            else:
-                unknown.append(task_id)
-
-        for node_id, ids in grouped.items():
-            resp = self._clients[node_id].cancel_tasks(
-                client_id=self.client_id,
-                task_ids=ids,
-                reason=reason,
-            )
-            for task_id in resp.cancelled:
-                status_by_task_id[task_id] = "cancelled"
-            for task_id in resp.already_done:
-                if status_by_task_id.get(task_id) != "cancelled":
-                    status_by_task_id[task_id] = "already_done"
-
-        if unknown:
-            for node_id, client in self._clients.items():
-                resp = client.cancel_tasks(
-                    client_id=self.client_id,
-                    task_ids=unknown,
-                    reason=reason,
-                )
-                for task_id in resp.cancelled:
-                    status_by_task_id[task_id] = "cancelled"
-                for task_id in resp.already_done:
-                    if status_by_task_id.get(task_id) != "cancelled":
-                        status_by_task_id[task_id] = "already_done"
-
-        cancelled = [task_id for task_id in task_ids if status_by_task_id.get(task_id) == "cancelled"]
-        already_done = [task_id for task_id in task_ids if status_by_task_id.get(task_id) == "already_done"]
-        not_found = [task_id for task_id in task_ids if status_by_task_id.get(task_id) == "not_found"]
-        return pb2.CancelTasksResponse(
-            ok=True,
-            cancelled=cancelled,
-            already_done=already_done,
-            not_found=not_found,
-        )
-
-    def cancel_job(self, *, reason: str = "", job_id: str = "") -> pb2.CancelJobResponse:
-        effective_job_id = str(job_id or self.job_id)
-        queued_cancelled = 0
-        running_marked = 0
-        already_done = 0
-        matched = 0
-        for stream in self._streams.values():
-            resp = stream.cancel_job(
-                job_id=effective_job_id,
-                reason=reason,
-            )
-            queued_cancelled += int(resp.queued_cancelled)
-            running_marked += int(resp.running_marked)
-            already_done += int(resp.already_done)
-            if int(resp.not_found or 0) == 0:
-                matched += 1
-        return pb2.CancelJobResponse(
-            ok=True,
-            queued_cancelled=queued_cancelled,
-            running_marked=running_marked,
-            already_done=already_done,
-            not_found=0 if matched or queued_cancelled or running_marked or already_done else 1,
-        )
-
-    def get_metrics(self) -> Dict[str, pb2.GetMetricsResponse]:
-        return {
-            node_id: client.get_metrics()
-            for node_id, client in self._clients.items()
-        }
-
-    def put_object_from_file(
-        self,
-        file_path: str,
-        *,
-        format: str = "",
-        chunk_size: int = 256 * 1024,
-    ) -> ObjectRef:
-        refs = [
-            client.upload_object_from_file(
-                file_path=file_path,
-                format=format,
-                chunk_size=chunk_size,
-            )
-            for client in self._clients.values()
-        ]
-        if not refs:
-            raise RuntimeError("no node clients available for object upload")
-        object_ids = {ref.object_id for ref in refs}
-        formats = {ref.format for ref in refs}
-        if len(object_ids) != 1 or len(formats) != 1:
-            raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
-        return refs[0]
-
-    def put_object_from_bytes(
-        self,
-        blob: bytes,
-        *,
-        format: str = "",
-        chunk_size: int = 256 * 1024,
-    ) -> ObjectRef:
-        refs = [
-            client.upload_object_from_bytes(
-                blob=blob,
-                format=format,
-                chunk_size=chunk_size,
-            )
-            for client in self._clients.values()
-        ]
-        if not refs:
-            raise RuntimeError("no node clients available for object upload")
-        object_ids = {ref.object_id for ref in refs}
-        formats = {ref.format for ref in refs}
-        if len(object_ids) != 1 or len(formats) != 1:
-            raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
-        return refs[0]
-
-    def put_data(
-        self,
-        data: Any,
-        *,
-        format: str = "",
-        chunk_size: int = 256 * 1024,
-    ) -> ObjectRef:
-        return _put_data_via_clients(
-            list(self._clients.values()),
-            data,
-            format=format,
-            chunk_size=chunk_size,
-        )
-
-    def put_dataframe(self, dataframe: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
-        return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
-
-    def put_ndarray(self, array: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
-        return self.put_data(array, format="npy", chunk_size=chunk_size)
-
-    def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
-        return self.put_data(value, format="json", chunk_size=chunk_size)
-
-    def update_globals(
-        self,
-        values: Dict[str, object],
-        *,
-        runtime_key: str = "",
-    ) -> str:
-        if not self.code_token:
-            raise RuntimeError("update_globals requires code uploaded by this client; code_token is unavailable")
-        normalized_runtime_key = str(runtime_key or self.code_version).strip() or self.code_version
-        digests: Dict[str, str] = {}
-        for node_id, client in self._clients.items():
-            resp = client.update_runtime_globals(
-                client_id=self.client_id,
-                code_version=self.code_version,
-                runtime_key=normalized_runtime_key,
-                code_token=self.code_token,
-                values=values,
-            )
-            digests[node_id] = resp.globals_digest
-        unique = {digest for digest in digests.values() if str(digest).strip()}
-        if len(unique) != 1:
-            raise RuntimeError(f"inconsistent managed globals digest across nodes: {digests}")
-        return next(iter(unique), "")
-
-    def download_result_to_file(self, task_result: pb2.TaskResult, *, target_path: str) -> Path:
-        data = struct_to_dict(task_result.result)
-        if not isinstance(data, ResultRef):
-            raise ValueError("task result is inline data; no download needed")
-        client = self._clients.get(data.node_id)
-        if client is None:
-            raise RuntimeError(f"no node client available for result node_id={data.node_id!r}")
-        return client.download_result_to_file(data, target_path=target_path)
-
-    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
-        data = struct_to_dict(task_result.result)
-        if not isinstance(data, ResultRef):
-            return data
-        client = self._clients.get(data.node_id)
-        if client is None:
-            raise RuntimeError(f"no node client available for result node_id={data.node_id!r}")
-        if target_path:
-            return client.download_result_to_file(data, target_path=target_path)
-        return client.fetch_result_data(task_result)
-
-    @property
-    def node_ids(self) -> Sequence[str]:
-        return list(self.nodes.keys())
-
-    def _lookup_task_node(self, task_id: str) -> str:
-        for task_map in self._task_node_by_job.values():
-            node_id = task_map.get(task_id, "")
-            if node_id:
-                return node_id
-        return ""
-
-    def _node_order(self, latest_credit_by_node: Dict[str, int], *, runtime_key: str = "") -> List[str]:
-        ordered_nodes = list(self.nodes.values())
-        sticky_node_id = str(self._runtime_node_hint.get(str(runtime_key or "").strip(), "")).strip()
-        ordered_nodes.sort(
-            key=lambda node: (
-                0 if sticky_node_id and node.node_id == sticky_node_id else 1,
-                -int(latest_credit_by_node.get(node.node_id, node.credit)),
-                int(node.queued),
-                int(node.inflight),
-                node.node_id,
-            )
-        )
-        return [node.node_id for node in ordered_nodes]
-
-
 @dataclass
 class ServiceGroup:
     """A deployed service group spread across multiple NodeControl nodes."""
@@ -3977,7 +3902,7 @@ class ServiceGroup:
         timeout_sec: float = 10.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
-        replace_existing_if_code_changed: bool = False,
+        replace_existing_if_code_changed: bool = True,
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
@@ -4014,7 +3939,7 @@ class ServiceGroup:
             timeout_sec: 超时时间
             ensure_unique_service_name: 是否确保服务名唯一
             reuse_existing_same_code: 同 owner + 同代码时是否直接复用已存在服务
-            replace_existing_if_code_changed: 同 owner + 同服务名但代码变化时是否替换
+            replace_existing_if_code_changed: 同 owner + 同服务名但代码变化时是否替换（默认自动替换）
             session_cache_dir: 本地 service session token 缓存目录
             breaker_enabled: 是否启用熔断器
             breaker_failure_threshold: 熔断失败阈值
@@ -4267,9 +4192,8 @@ class ServiceGroup:
 
                 if not replace_existing_if_code_changed:
                     raise RuntimeError(
-                        f"service_name already exists with different code_version: {effective_service_name}; "
-                        f"existing={existing_code_version}; incoming={effective_code_version}; "
-                        "set replace_existing_if_code_changed=True to replace"
+                        f"service_name already exists with different code_version and replacement is disabled: "
+                        f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}"
                     )
                 if cached_session is None:
                     raise RuntimeError(
@@ -4381,7 +4305,7 @@ class ServiceGroup:
         timeout_sec: float = 10.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
-        replace_existing_if_code_changed: bool = False,
+        replace_existing_if_code_changed: bool = True,
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
@@ -4452,7 +4376,7 @@ class ServiceGroup:
         timeout_sec: float = 10.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
-        replace_existing_if_code_changed: bool = False,
+        replace_existing_if_code_changed: bool = True,
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
@@ -4525,7 +4449,7 @@ class ServiceGroup:
         timeout_sec: float = 10.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
-        replace_existing_if_code_changed: bool = False,
+        replace_existing_if_code_changed: bool = True,
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
@@ -4599,7 +4523,7 @@ class ServiceGroup:
         timeout_sec: float = 10.0,
         ensure_unique_service_name: bool = True,
         reuse_existing_same_code: bool = True,
-        replace_existing_if_code_changed: bool = False,
+        replace_existing_if_code_changed: bool = True,
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
@@ -6128,730 +6052,4 @@ class DirectConnect(DiscoveryServiceClient):
             f"<DirectConnect "
             f"service={self.service_name!r} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
-        )
-
-
-class _TaskCallProxy:
-    """任务方法调用代理。
-
-    提供类似函数调用的方式提交任务并获取结果。
-    """
-
-    def __init__(
-        self,
-        payload: Dict[str, object],
-        batch: TaskBatchClient,
-        *,
-        timeout_hint_sec: int = 0,
-        priority: int = 1,
-        runtime_key: str = "",
-    ) -> None:
-        self._payload = payload
-        self._batch = batch
-        self._timeout_hint_sec = timeout_hint_sec
-        self._priority = priority
-        self._runtime_key = runtime_key
-
-    def __repr__(self) -> str:
-        return f"<_TaskCallProxy payload={self._payload!r}>"
-
-    @property
-    def payload(self) -> Dict[str, object]:
-        """返回任务的 payload。"""
-        return self._payload
-
-    def submit(
-        self,
-        *args,
-        timeout_hint_sec: Optional[float] = None,
-        priority: Optional[int] = None,
-        runtime_key: Optional[str] = None,
-        **kwargs,
-    ) -> pb2.SubmitTasksResponse:
-        """提交任务，不等待结果。
-
-        Args:
-            *args: 任务的位置参数
-            timeout_hint_sec: 超时提示（框架控制参数，不传给任务函数）
-            priority: 优先级（框架控制参数，不传给任务函数）
-            runtime_key: 运行时键（框架控制参数，不传给任务函数）
-            **kwargs: 任务的命名参数
-
-        Returns:
-            pb2.SubmitTasksResponse: 提交响应
-
-        Example:
-            >>> # 位置参数
-            >>> resp = task.submit(7)
-            >>> # 命名参数
-            >>> resp = task.submit(value=7)
-            >>> # 混合参数
-            >>> resp = task.submit(7, sleep_ms=100)
-            >>> # 带控制参数
-            >>> resp = task.submit(7, timeout_hint_sec=60, priority=1)
-        """
-        # 使用传入的控制参数，或回退到默认值
-        timeout_hint = timeout_hint_sec if timeout_hint_sec is not None else self._timeout_hint_sec
-        prio = priority if priority is not None else self._priority
-        rt_key = runtime_key if runtime_key is not None else self._runtime_key
-
-        # 构造 payload（只包含业务参数）
-        payload = dict(self._payload)
-
-        # 只有 kwargs 时保持旧格式；存在 args 时使用 args/kwargs 格式。
-        if args:
-            payload["args"] = list(args)
-            if kwargs:
-                payload["kwargs"] = kwargs
-        elif kwargs:
-            payload.update(kwargs)
-
-        serialized_payload = _serialize_arrow_compatible(payload)
-
-        # 打印任务提交信息
-        print(f"[gRPC SubmitTasks] payload={json.dumps(serialized_payload, ensure_ascii=False)}")
-
-        return self._batch.submit_payloads(
-            [serialized_payload],
-            timeout_hint_sec=timeout_hint,
-            priority=prio,
-            runtime_key=rt_key,
-        )
-
-    def submit_and_wait(
-        self,
-        *,
-        timeout_sec: float = 30.0,
-        wait_ms: int = 500,
-        _payload=None,
-        **kwargs,
-    ) -> Sequence[Any]:
-        """提交任务并等待结果。
-
-        Args:
-            timeout_sec: 总超时时间
-            wait_ms: 每次轮询等待时间
-            _payload: 内部使用，自定义 payload
-            **kwargs: 额外的提交参数
-
-        Returns:
-            Sequence[Any]: 反序列化后的结果列表
-        """
-        if _payload is not None:
-            # 直接提交指定的 payload
-            resp = self._batch.submit_payloads(
-                [_payload],
-                timeout_hint_sec=kwargs.pop('timeout_hint_sec', self._timeout_hint_sec),
-                priority=kwargs.pop('priority', self._priority),
-                runtime_key=kwargs.pop('runtime_key', self._runtime_key),
-            )
-        else:
-            resp = self.submit(**kwargs)
-
-        if not resp.accepted:
-            raise RuntimeError(f"task rejected: {resp.rejected}")
-
-        expected_count = len(resp.accepted)
-        results = self._batch.wait_for_results(
-            expected_count=expected_count,
-            timeout_sec=timeout_sec,
-            wait_ms=wait_ms,
-        )
-        return _resolve_task_results_data(self._batch, results)
-
-    def __call__(self, *args, **kwargs) -> Sequence[Any]:
-        """直接调用：提交任务并等待结果（简写）。
-
-        Args:
-            *args: 位置参数
-            **kwargs: 任务参数��会合并到 payload 中）
-
-        Returns:
-            Sequence[Any]: 反序列化后的结果列表
-
-        Example:
-            >>> # 命名参数
-            >>> results = task.run(value=7)
-            >>> # 位置参数
-            >>> results = task.run(7)
-        """
-        timeout_hint = kwargs.pop("timeout_hint_sec", self._timeout_hint_sec)
-        prio = kwargs.pop("priority", self._priority)
-        rt_key = kwargs.pop("runtime_key", self._runtime_key)
-
-        # 只有 kwargs 时保持旧格式；存在 args 时使用 args/kwargs 格式。
-        if args or kwargs:
-            payload = dict(self._payload)
-            if args:
-                payload["args"] = list(args)
-                if kwargs:
-                    payload["kwargs"] = kwargs
-            else:
-                payload.update(kwargs)
-            serialized_payload = _serialize_arrow_compatible(payload)
-            return self.submit_and_wait(
-                timeout_hint_sec=timeout_hint,
-                priority=prio,
-                runtime_key=rt_key,
-                _payload=serialized_payload,  # 使用内部参数名避免冲突
-            )
-
-        return self.submit_and_wait(
-            timeout_hint_sec=timeout_hint,
-            priority=prio,
-            runtime_key=rt_key,
-        )
-
-
-class TaskSubmitter:
-    """任务模式的模块化客户端。
-
-    提供类似 Python 模块的调用方式来提交任务。
-
-    特点：
-    - 像 function 一样提交任务
-    - 自动处理 payload 序列化
-    - 支持提交后等待或异步获取结果
-    - 简化 TaskBatchClient 的使用
-
-    Example:
-        >>> from pycloud_parallel.controlplane.client import TaskSubmitter
-        >>>
-        >>> # 创建任务客户端
-        >>> task = TaskSubmitter.from_infocenter(
-        ...     infocenter_target="127.0.0.1:50051",
-        ...     blob=blob,
-        ...     entry_module="task",
-        ... )
-        >>>
-        >>> # 提交任务并等待结果
-        >>> results = task.run(x=1, y=2)
-        >>> for result in results:
-        ...     print(result.status, result.result)
-        >>>
-        >>> # 或者只提交，稍后获取结果
-        >>> resp = task.run.submit(x=1, y=2)
-        >>> results = task.wait_for_results(expected_count=1)
-    """
-
-    _batch: TaskBatchClient
-
-    def __init__(self, batch: TaskBatchClient) -> None:
-        """初始化 TaskSubmitter。
-
-        Args:
-            batch: 底层的 TaskBatchClient 实例
-        """
-        self._batch = batch
-
-    @classmethod
-    def from_infocenter(
-        cls,
-        *,
-        infocenter_target: str,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        func: Optional[Callable] = None,
-        module: Optional[Any] = None,
-        code_version: str = "",
-        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-        blob: Optional[bytes] = None,
-        runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskSubmitter":
-        """从 InfoCenter 创建 TaskSubmitter。
-
-        参数与 TaskBatchClient.from_infocenter 相同。
-
-        Returns:
-            TaskSubmitter: 任务模块客户端
-        """
-        batch = TaskBatchClient.from_infocenter(
-            infocenter_target=infocenter_target,
-            client_id=client_id,
-            job_id=job_id,
-            func=func,
-            module=module,
-            code_version=code_version,
-            artifact_path=artifact_path,
-            blob=blob,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-        return cls(batch)
-
-    @classmethod
-    def from_module(
-        cls,
-        *,
-        infocenter_target: str,
-        module: Any,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_callable: str = "run",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskSubmitter":
-        batch = TaskBatchClient.from_module(
-            infocenter_target=infocenter_target,
-            module=module,
-            client_id=client_id,
-            job_id=job_id,
-            runtime=runtime,
-            entry_callable=entry_callable,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-        return cls(batch)
-
-    @classmethod
-    def from_func(
-        cls,
-        *,
-        infocenter_target: str,
-        func: Callable,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_module: Any = "",
-        entry_callable: str = "run",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskSubmitter":
-        batch = TaskBatchClient.from_func(
-            infocenter_target=infocenter_target,
-            func=func,
-            client_id=client_id,
-            job_id=job_id,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-        return cls(batch)
-
-    @classmethod
-    def from_file(
-        cls,
-        *,
-        infocenter_target: str,
-        artifact_path: str,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_module: Any = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskSubmitter":
-        batch = TaskBatchClient.from_file(
-            infocenter_target=infocenter_target,
-            artifact_path=artifact_path,
-            client_id=client_id,
-            job_id=job_id,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-        return cls(batch)
-
-    @classmethod
-    def from_bytes(
-        cls,
-        *,
-        infocenter_target: str,
-        blob: bytes,
-        client_id: Optional[str] = None,
-        job_id: Optional[str] = None,
-        runtime: str = "py3",
-        entry_module: Any = "",
-        entry_callable: str = "run",
-        package_format: str = "py",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        chunk_size: int = 256 * 1024,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        require_credit: bool = True,
-        preferred_runtime_key: str = "",
-        timeout_sec: float = 10.0,
-    ) -> "TaskSubmitter":
-        batch = TaskBatchClient.from_bytes(
-            infocenter_target=infocenter_target,
-            blob=blob,
-            client_id=client_id,
-            job_id=job_id,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            require_credit=require_credit,
-            preferred_runtime_key=preferred_runtime_key,
-            timeout_sec=timeout_sec,
-        )
-        return cls(batch)
-
-    def __getattr__(self, name: str):
-        """动态创建任务调用代理。
-
-        Args:
-            name: 任务方法名（实际上会作为 entry_callable）
-
-        Returns:
-            _TaskCallProxy: 任务调用代理
-        """
-        # 避免无限递归
-        if name.startswith("_"):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-        # 创建并返回任务调用代理
-        return _TaskCallProxy(
-            payload={},  # 初始 payload 为空，调用时提供
-            batch=self._batch,
-            timeout_hint_sec=0,
-            priority=1,
-            runtime_key="",
-        )
-
-    @property
-    def client_id(self) -> str:
-        """返回 client_id。"""
-        return self._batch.client_id
-
-    @property
-    def job_id(self) -> str:
-        """返回 job_id。"""
-        return self._batch.job_id
-
-    @property
-    def code_version(self) -> str:
-        """返回 code_version。"""
-        return self._batch.code_version
-
-    @property
-    def code_token(self) -> str:
-        """返回 code_token。"""
-        return self._batch.code_token
-
-    @property
-    def nodes(self) -> Dict[str, InfoCenterNode]:
-        """返回节点列表。"""
-        return self._batch.nodes
-
-    @property
-    def node_ids(self) -> Sequence[str]:
-        """返回节点 ID 列表。"""
-        return self._batch.node_ids
-
-    def put_object_from_file(
-        self,
-        file_path: str,
-        *,
-        format: str = "",
-        chunk_size: int = 256 * 1024,
-    ) -> ObjectRef:
-        return self._batch.put_object_from_file(
-            file_path,
-            format=format,
-            chunk_size=chunk_size,
-        )
-
-    def put_object_from_bytes(
-        self,
-        blob: bytes,
-        *,
-        format: str = "",
-        chunk_size: int = 256 * 1024,
-    ) -> ObjectRef:
-        return self._batch.put_object_from_bytes(
-            blob,
-            format=format,
-            chunk_size=chunk_size,
-        )
-
-    def put_data(
-        self,
-        data: Any,
-        *,
-        format: str = "",
-        chunk_size: int = 256 * 1024,
-    ) -> ObjectRef:
-        return self._batch.put_data(
-            data,
-            format=format,
-            chunk_size=chunk_size,
-        )
-
-    def put_dataframe(self, dataframe: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
-        return self._batch.put_dataframe(dataframe, chunk_size=chunk_size)
-
-    def put_ndarray(self, array: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
-        return self._batch.put_ndarray(array, chunk_size=chunk_size)
-
-    def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
-        return self._batch.put_json(value, chunk_size=chunk_size)
-
-    def update_globals(self, values: Dict[str, object], *, runtime_key: str = "") -> str:
-        return self._batch.update_globals(values, runtime_key=runtime_key)
-
-    def submit_payloads(
-        self,
-        payloads: Sequence[Dict[str, object]],
-        *,
-        execution_mode: int = pb2.EXECUTION_MODE_PERSISTENT,
-        job_id: str = "",
-        task_id_prefix: str = "",
-        timeout_hint_sec: int = 0,
-        priority: int = 1,
-        runtime_key: str = "",
-    ) -> pb2.SubmitTasksResponse:
-        """批量提交任务。
-
-        Args:
-            payloads: payload 列表
-            execution_mode: 执行模式
-            job_id: 作业 ID
-            task_id_prefix: task_id 前缀
-            timeout_hint_sec: 超时提示
-            priority: 优先级
-            runtime_key: 运行时键
-
-        Returns:
-            pb2.SubmitTasksResponse: 提交响应
-        """
-        return self._batch.submit_payloads(
-            payloads,
-            execution_mode=execution_mode,
-            job_id=job_id,
-            task_id_prefix=task_id_prefix,
-            timeout_hint_sec=timeout_hint_sec,
-            priority=priority,
-            runtime_key=runtime_key,
-        )
-
-    def pull_results(
-        self,
-        *,
-        limit: int = 100,
-        wait_ms: int = 0,
-        cursor: str = "",
-    ) -> pb2.PullResultsResponse:
-        """拉取结果。
-
-        Args:
-            limit: 最大结果数
-            wait_ms: 等待时间（毫秒）
-            cursor: 游标
-
-        Returns:
-            pb2.PullResultsResponse: 拉取响应
-        """
-        response = self._batch.pull_results(limit=limit, wait_ms=wait_ms, cursor=cursor)
-        return _resolve_high_level_pull_results_response(self._batch, response)
-
-    def wait_for_results(
-        self,
-        *,
-        expected_count: int = 0,
-        timeout_sec: float = 30.0,
-        wait_ms: int = 500,
-        limit: int = 100,
-        job_id: str = "",
-    ) -> Sequence[pb2.TaskResult]:
-        """等待结果。
-
-        Args:
-            expected_count: 期望结果数
-            timeout_sec: 超时时间
-            wait_ms: 等待间隔
-            limit: 每次拉取限制
-            job_id: 作业 ID
-
-        Returns:
-            Sequence[pb2.TaskResult]: 结果列表
-        """
-        results = self._batch.wait_for_results(
-            expected_count=expected_count,
-            timeout_sec=timeout_sec,
-            wait_ms=wait_ms,
-            limit=limit,
-            job_id=job_id,
-        )
-        return _resolve_high_level_task_results(self._batch, results)
-
-    def cancel_tasks(
-        self,
-        task_ids: Sequence[str],
-        *,
-        reason: str = "",
-    ) -> pb2.CancelTasksResponse:
-        """取消任务。
-
-        Args:
-            task_ids: 任务 ID 列表
-            reason: 取消原因
-
-        Returns:
-            pb2.CancelTasksResponse: 取消响应
-        """
-        return self._batch.cancel_tasks(task_ids, reason=reason)
-
-    def cancel_job(
-        self,
-        *,
-        reason: str = "",
-        job_id: str = "",
-    ) -> pb2.CancelJobResponse:
-        """取消作业。
-
-        Args:
-            reason: 取消原因
-            job_id: 作业 ID
-
-        Returns:
-            pb2.CancelJobResponse: 取消响应
-        """
-        return self._batch.cancel_job(reason=reason, job_id=job_id)
-
-    def get_metrics(self) -> Dict[str, pb2.GetMetricsResponse]:
-        """获取节点指标。
-
-        Returns:
-            Dict[str, pb2.GetMetricsResponse]: 节点指标
-        """
-        return self._batch.get_metrics()
-
-    def close(self) -> None:
-        """关闭客户端。"""
-        self._batch.close()
-
-    def __enter__(self) -> "TaskSubmitter":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def __repr__(self) -> str:
-        return (
-            f"<TaskSubmitter "
-            f"client_id={self.client_id!r} "
-            f"job_id={self.job_id!r} "
-            f"nodes={len(self.node_ids)}>"
         )

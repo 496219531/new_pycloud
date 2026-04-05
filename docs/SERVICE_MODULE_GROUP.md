@@ -193,15 +193,15 @@ group = DeployedService.deploy_from_infocenter(
     worker_count=2,
     node_count=2,
     reuse_existing_same_code=True,
-    replace_existing_if_code_changed=False,
+    replace_existing_if_code_changed=True,
 )
 ```
 
 语义：
 
 1. 同 `owner_client_id + service_name + code_version` 时可复用
-2. 同名但代码变化时默认不覆盖
-3. 显式 `replace_existing_if_code_changed=True` 才会替换
+2. 同名但代码变化时默认会自动替换
+3. 显式 `replace_existing_if_code_changed=False` 才会拒绝
 4. 客户端会本地缓存 `service_id/service_token`，便于重启后复用
 
 ## 5.1 依赖补装语义

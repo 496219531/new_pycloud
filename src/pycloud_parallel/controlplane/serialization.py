@@ -159,6 +159,25 @@ def _child_path(path: str, key: Any) -> str:
     return f"{path}.{key}"
 
 
+def _normalize_mapping_key(key: Any, *, path: str, existing_keys: set[str]) -> str:
+    if isinstance(key, str):
+        normalized = key
+    elif key is None or isinstance(key, (int, float, bool)):
+        normalized = str(key)
+    else:
+        raise TypeError(
+            f"{path} contains dict key {key!r} of type {type(key).__name__}; "
+            "only string keys or scalar keys convertible to strings are supported"
+        )
+
+    if normalized in existing_keys:
+        raise TypeError(
+            f"{path} contains multiple dict keys that normalize to {normalized!r}; "
+            "please use unique string keys"
+        )
+    return normalized
+
+
 def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
     """Internal recursive serializer with better error locations."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
@@ -213,13 +232,11 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
 
     if isinstance(obj, dict):
         out = {}
+        seen_keys: set[str] = set()
         for key, value in obj.items():
-            if not isinstance(key, str):
-                raise TypeError(
-                    f"{path} contains dict key {key!r} of type {type(key).__name__}; "
-                    "only string keys are supported"
-                )
-            out[key] = _serialize_arrow_compatible(value, path=_child_path(path, key))
+            normalized_key = _normalize_mapping_key(key, path=path, existing_keys=seen_keys)
+            seen_keys.add(normalized_key)
+            out[normalized_key] = _serialize_arrow_compatible(value, path=_child_path(path, key))
         return out
     if isinstance(obj, (list, tuple)):
         return [_serialize_arrow_compatible(item, path=_child_path(path, idx)) for idx, item in enumerate(obj)]

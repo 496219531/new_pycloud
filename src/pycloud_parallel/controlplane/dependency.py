@@ -528,9 +528,9 @@ def auto_deploy_function(
         **kwargs: 其他部署参数
 
     Returns:
-        TaskSubmitter 或 DeployedService 实例
+        TaskPoolSession 或 DeployedService 实例
     """
-    from pycloud_parallel import TaskSubmitter
+    from pycloud_parallel import TaskPoolSession
 
     # 打包函数和依赖
     packager = DependencyPackager()
@@ -556,13 +556,13 @@ def auto_deploy_function(
         blob = f.read()
 
     # 上传并部署
-    return TaskSubmitter.from_infocenter(
+    return TaskPoolSession.from_infocenter(
         infocenter_target=infocenter_target,
+        job_id=f"auto-{func.__name__}",
         blob=blob,
         runtime=runtime,
         entry_module=entry_module,
         entry_callable=entry_callable,
         package_format="tar.gz",
-        export_mode="single",
         **kwargs,
     )

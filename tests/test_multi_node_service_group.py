@@ -401,7 +401,7 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
         n2_state.close()
 
 
-def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
+def test_multi_node_group_replace_existing_changed_code_replaces_by_default(tmp_path):
     info_server, info_target, _info_state = _start_infocenter_server()
     n1_server, n1_target, n1_state = _start_nodecontrol_server("node-replace-01", str(tmp_path / "replace_n1_code"))
     n2_server, n2_target, n2_state = _start_nodecontrol_server("node-replace-02", str(tmp_path / "replace_n2_code"))
@@ -454,11 +454,13 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
                 min_success_nodes=2,
                 allow_partial=False,
                 timeout_sec=10.0,
+                replace_existing_if_code_changed=False,
                 session_cache_dir=str(cache_dir),
             )
-            assert False, "expected code-changed deploy to require replace flag"
+            assert False, "expected explicit replace disable to reject changed code"
         except RuntimeError as exc:
             assert "different code_version" in str(exc)
+            assert "replacement is disabled" in str(exc)
 
         group2 = ServiceGroup.deploy_from_infocenter(
             infocenter_target=info_target,
@@ -475,7 +477,6 @@ def test_multi_node_group_replace_existing_changed_code_requires_flag(tmp_path):
             min_success_nodes=2,
             allow_partial=False,
             timeout_sec=10.0,
-            replace_existing_if_code_changed=True,
             session_cache_dir=str(cache_dir),
         )
 

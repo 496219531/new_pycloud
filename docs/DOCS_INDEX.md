@@ -3,10 +3,12 @@
 建议先把当前三层角色区分开：
 
 1. `Task Mode`
-   - 重计算执行层
-2. `Service Mode`
+   - 子任务执行层
+2. `JobQueue Mode`
+   - 大任务排队与单活调度层
+3. `Service Mode`
    - 常驻函数服务层
-3. `External Web Layer`
+4. `External Web Layer`
    - 真正对外的轻网络入口层，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
 
 ## 建议阅读顺序
@@ -30,11 +32,9 @@
 ## 任务模式
 
 - [TASK_MODE.md](TASK_MODE.md)
-  - 重计算执行层、任务流、`runtime_key`、热点路由、runtime slot
-- [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
-  - `TaskSubmitter` 的模块化调用体验
-- [ID_SYSTEM_DESIGN.md](ID_SYSTEM_DESIGN.md)
-  - `client_id / job_id / task_id / service_id` 设计说明
+  - 子任务执行层、任务流、`runtime_key`、热点路由、原生 task pool
+- [QUICK_START.md](QUICK_START.md)
+  - `TaskPoolSession` / `DedicatedTaskServiceSession` / `JobQueueClient` 最小入口
 
 ## 服务模式
 
@@ -63,8 +63,8 @@
 常用脚本：
 
 - [../scripts/start_services.sh](../scripts/start_services.sh)
-- [../examples/grpc_task_client_demo.py](../examples/grpc_task_client_demo.py)
-- [../examples/grpc_register_service_client_demo.py](../examples/grpc_register_service_client_demo.py)
+- [../examples/demo_task_pool_session.py](../examples/demo_task_pool_session.py)
+- [../examples/demo_job_queue.py](../examples/demo_job_queue.py)
 - [../examples/demo_gateway_client.py](../examples/demo_gateway_client.py)
 - [../examples/demo_gateway_module_client.py](../examples/demo_gateway_module_client.py)
 - [../examples/demo_service_module_group.py](../examples/demo_service_module_group.py)

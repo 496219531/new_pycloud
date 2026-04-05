@@ -186,6 +186,13 @@ service NodeControlService {
   rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
   rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+  rpc CreateTaskPool(stream CreateTaskPoolRequest) returns (CreateTaskPoolResponse);
+  rpc HeartbeatTaskPool(HeartbeatTaskPoolRequest) returns (HeartbeatTaskPoolResponse);
+  rpc SubmitPoolTasks(SubmitPoolTasksRequest) returns (SubmitTasksResponse);
+  rpc PullPoolResults(PullPoolResultsRequest) returns (PullResultsResponse);
+  rpc CancelPoolJob(CancelPoolJobRequest) returns (CancelJobResponse);
+  rpc GetTaskPoolStatus(GetTaskPoolStatusRequest) returns (GetTaskPoolStatusResponse);
+  rpc CloseTaskPool(CloseTaskPoolRequest) returns (CloseTaskPoolResponse);
   rpc CreateService(stream CreateServiceRequest) returns (CreateServiceResponse);
   rpc ListServiceMethods(ListServiceMethodsRequest) returns (ListServiceMethodsResponse);
   rpc CallService(CallServiceRequest) returns (CallServiceResponse);
@@ -473,6 +480,114 @@ message GetMetricsResponse {
   double mem_percent = 10;
   int64 uptime_sec = 11;
   Error error = 12;
+}
+
+message CreateTaskPoolMeta {
+  string owner_client_id = 1;
+  string pool_name = 2;
+  string sha256 = 3;
+  string runtime = 4;
+  string entry_module = 5;
+  string entry_callable = 6;
+  int32 worker_count = 7;
+  int32 heartbeat_timeout_sec = 8;
+  int32 idle_ttl_sec = 9;
+  string package_format = 10;
+  repeated string dependency_allowlist = 11;
+  repeated string managed_global_names = 12;
+}
+
+message CreateTaskPoolRequest {
+  oneof body {
+    CreateTaskPoolMeta meta = 1;
+    bytes chunk = 2;
+  }
+}
+
+message CreateTaskPoolResponse {
+  bool ok = 1;
+  string pool_id = 2;
+  string code_version = 3;
+  int32 worker_count = 4;
+  int32 heartbeat_timeout_sec = 5;
+  string owner_client_id = 6;
+  string pool_token = 7;
+  Error error = 8;
+}
+
+message SubmitPoolTasksRequest {
+  string pool_id = 1;
+  string pool_token = 2;
+  repeated TaskSubmitItem tasks = 3;
+  string job_id = 4;
+}
+
+message PullPoolResultsRequest {
+  string pool_id = 1;
+  string pool_token = 2;
+  int32 limit = 3;
+  int32 wait_ms = 4;
+  string cursor = 5;
+}
+
+message HeartbeatTaskPoolRequest {
+  string owner_client_id = 1;
+  string pool_id = 2;
+  int64 seq = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  string pool_token = 5;
+}
+
+message HeartbeatTaskPoolResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  int32 next_heartbeat_in_sec = 3;
+  Error error = 4;
+}
+
+message CancelPoolJobRequest {
+  string pool_id = 1;
+  string pool_token = 2;
+  string job_id = 3;
+  string reason = 4;
+}
+
+message GetTaskPoolStatusRequest {
+  string pool_id = 1;
+  string pool_token = 2;
+}
+
+message TaskPoolStatusInfo {
+  string pool_id = 1;
+  string owner_client_id = 2;
+  string pool_name = 3;
+  string code_version = 4;
+  int32 worker_count = 5;
+  int32 heartbeat_timeout_sec = 6;
+  string status = 7;
+  int32 task_count = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp last_heartbeat_at = 10;
+  google.protobuf.Timestamp lease_expire_at = 11;
+}
+
+message GetTaskPoolStatusResponse {
+  bool ok = 1;
+  TaskPoolStatusInfo pool = 2;
+  Error error = 3;
+}
+
+message CloseTaskPoolRequest {
+  string owner_client_id = 1;
+  string pool_id = 2;
+  string pool_token = 3;
+  string reason = 4;
+}
+
+message CloseTaskPoolResponse {
+  bool ok = 1;
+  bool accepted = 2;
+  Error error = 3;
 }
 
 message CreateServiceMeta {

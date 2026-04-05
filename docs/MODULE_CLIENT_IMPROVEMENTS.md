@@ -1,91 +1,32 @@
-# PyCloud 模块化客户端说明
+# 模块化客户端说明
 
-模块化调用当前统一收口为 4 个入口：
+当前推荐保留的模块化入口有 5 个：
 
 1. `DeployedService`
-2. `TaskSubmitter`
-3. `GatewayConnect`
-4. `DirectConnect`
+2. `TaskPoolSession`
+3. `DedicatedTaskServiceSession`
+4. `JobQueueClient`
+5. `GatewayConnect`
 
-## 为什么需要它们
+说明：
 
-相比底层 `TaskBatchClient`、`GatewayServiceClient`、`DiscoveryServiceClient`，这些模块化入口更接近直接写 Python 调用：
+1. 旧共享任务池模式已经移除
+2. 任务执行现在优先走原生 `TaskPoolSession`
+3. 大任务排队入口优先走 `JobQueueClient`
 
-```python
-result = client.square.sync(x=7)
-results = task.run(value=7)
-```
+分工：
 
-而不是手工拼：
+| 类 | 模式 | 用途 |
+|---|---|---|
+| `DeployedService` | Service | 部署并拥有内部函数服务 |
+| `TaskPoolSession` | TaskPool | 创建原生专属任务池并执行 subtasks |
+| `DedicatedTaskServiceSession` | Compat TaskPool | 兼容专属池实现 |
+| `JobQueueClient` | JobQueue | 提交大任务、排队、单活调度 |
+| `GatewayConnect` | Gateway | 按服务名调用内部函数服务 |
 
-```python
-client.call(service_name="demo", method="square", payload={"x": 7})
-batch.submit_payloads([{"value": 7}])
-```
+推荐资料：
 
-## 四类入口的分工
-
-| 类 | 模式 | 用途 | 生命周期 |
-|----|------|------|----------|
-| `DeployedService` | Service | 部署并拥有服务 | owner 管理 |
-| `TaskSubmitter` | Task | 提交任务并收结果 | owner 管理 |
-| `GatewayConnect` | Gateway | 按服务名调用 | caller 使用 |
-| `DirectConnect` | Discovery | 先发现再直连 | caller 使用 |
-
-## 示例
-
-### TaskSubmitter
-
-```python
-from pycloud_parallel import TaskSubmitter
-
-task = TaskSubmitter.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    blob=blob,
-    entry_module="task",
-)
-
-results = task.run(value=7)
-```
-
-### DeployedService
-
-```python
-from pycloud_parallel import DeployedService
-
-service = DeployedService.deploy_from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    artifact_path="service.py",
-)
-
-result = await service.square(x=7)
-```
-
-### GatewayConnect
-
-```python
-from pycloud_parallel import GatewayConnect
-
-client = GatewayConnect("127.0.0.1:50051", service_name="square-service")
-print(client.square.sync(x=7))
-```
-
-## 顶层导入
-
-当前推荐直接从顶层包导入：
-
-```python
-from pycloud_parallel import (
-    DeployedService,
-    TaskSubmitter,
-    GatewayConnect,
-    DirectConnect,
-)
-```
-
-## 相关资料
-
+- [QUICK_START.md](QUICK_START.md)
 - [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
 - [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
 - [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-- [QUICK_START.md](QUICK_START.md)

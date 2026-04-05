@@ -18,9 +18,11 @@ _CONTROLPLANE_EXPORTS = {
     "ResultRef",
     "pycloud_export",
     "DeployedService",
+    "DedicatedTaskServiceSession",
     "DirectConnect",
     "GatewayConnect",
-    "TaskSubmitter",
+    "JobQueueClient",
+    "TaskPoolSession",
 }
 
 _CONTROLPLANE_DEP_HINT = (
@@ -90,7 +92,9 @@ __all__ = [
     "ResultRef",
     "pycloud_export",
     "DeployedService",
+    "DedicatedTaskServiceSession",
     "DirectConnect",
     "GatewayConnect",
-    "TaskSubmitter",
+    "JobQueueClient",
+    "TaskPoolSession",
 ]

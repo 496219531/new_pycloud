@@ -88,6 +88,41 @@ class NodeControlServiceStub(object):
                 request_serializer=pycloud__v1__pb2.GetMetricsRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.GetMetricsResponse.FromString,
                 _registered_method=True)
+        self.CreateTaskPool = channel.stream_unary(
+                '/pycloud.v1.NodeControlService/CreateTaskPool',
+                request_serializer=pycloud__v1__pb2.CreateTaskPoolRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.CreateTaskPoolResponse.FromString,
+                _registered_method=True)
+        self.HeartbeatTaskPool = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/HeartbeatTaskPool',
+                request_serializer=pycloud__v1__pb2.HeartbeatTaskPoolRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.HeartbeatTaskPoolResponse.FromString,
+                _registered_method=True)
+        self.SubmitPoolTasks = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/SubmitPoolTasks',
+                request_serializer=pycloud__v1__pb2.SubmitPoolTasksRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.SubmitTasksResponse.FromString,
+                _registered_method=True)
+        self.PullPoolResults = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/PullPoolResults',
+                request_serializer=pycloud__v1__pb2.PullPoolResultsRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.PullResultsResponse.FromString,
+                _registered_method=True)
+        self.CancelPoolJob = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/CancelPoolJob',
+                request_serializer=pycloud__v1__pb2.CancelPoolJobRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.CancelJobResponse.FromString,
+                _registered_method=True)
+        self.GetTaskPoolStatus = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/GetTaskPoolStatus',
+                request_serializer=pycloud__v1__pb2.GetTaskPoolStatusRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.GetTaskPoolStatusResponse.FromString,
+                _registered_method=True)
+        self.CloseTaskPool = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/CloseTaskPool',
+                request_serializer=pycloud__v1__pb2.CloseTaskPoolRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.CloseTaskPoolResponse.FromString,
+                _registered_method=True)
         self.CreateService = channel.stream_unary(
                 '/pycloud.v1.NodeControlService/CreateService',
                 request_serializer=pycloud__v1__pb2.CreateServiceRequest.SerializeToString,
@@ -192,6 +227,48 @@ class NodeControlServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CreateTaskPool(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HeartbeatTaskPool(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SubmitPoolTasks(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PullPoolResults(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CancelPoolJob(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetTaskPoolStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CloseTaskPool(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CreateService(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -286,6 +363,41 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     servicer.GetMetrics,
                     request_deserializer=pycloud__v1__pb2.GetMetricsRequest.FromString,
                     response_serializer=pycloud__v1__pb2.GetMetricsResponse.SerializeToString,
+            ),
+            'CreateTaskPool': grpc.stream_unary_rpc_method_handler(
+                    servicer.CreateTaskPool,
+                    request_deserializer=pycloud__v1__pb2.CreateTaskPoolRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.CreateTaskPoolResponse.SerializeToString,
+            ),
+            'HeartbeatTaskPool': grpc.unary_unary_rpc_method_handler(
+                    servicer.HeartbeatTaskPool,
+                    request_deserializer=pycloud__v1__pb2.HeartbeatTaskPoolRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.HeartbeatTaskPoolResponse.SerializeToString,
+            ),
+            'SubmitPoolTasks': grpc.unary_unary_rpc_method_handler(
+                    servicer.SubmitPoolTasks,
+                    request_deserializer=pycloud__v1__pb2.SubmitPoolTasksRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.SubmitTasksResponse.SerializeToString,
+            ),
+            'PullPoolResults': grpc.unary_unary_rpc_method_handler(
+                    servicer.PullPoolResults,
+                    request_deserializer=pycloud__v1__pb2.PullPoolResultsRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.PullResultsResponse.SerializeToString,
+            ),
+            'CancelPoolJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelPoolJob,
+                    request_deserializer=pycloud__v1__pb2.CancelPoolJobRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.CancelJobResponse.SerializeToString,
+            ),
+            'GetTaskPoolStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTaskPoolStatus,
+                    request_deserializer=pycloud__v1__pb2.GetTaskPoolStatusRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.GetTaskPoolStatusResponse.SerializeToString,
+            ),
+            'CloseTaskPool': grpc.unary_unary_rpc_method_handler(
+                    servicer.CloseTaskPool,
+                    request_deserializer=pycloud__v1__pb2.CloseTaskPoolRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.CloseTaskPoolResponse.SerializeToString,
             ),
             'CreateService': grpc.stream_unary_rpc_method_handler(
                     servicer.CreateService,
@@ -597,6 +709,195 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/GetMetrics',
             pycloud__v1__pb2.GetMetricsRequest.SerializeToString,
             pycloud__v1__pb2.GetMetricsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateTaskPool(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/pycloud.v1.NodeControlService/CreateTaskPool',
+            pycloud__v1__pb2.CreateTaskPoolRequest.SerializeToString,
+            pycloud__v1__pb2.CreateTaskPoolResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HeartbeatTaskPool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/HeartbeatTaskPool',
+            pycloud__v1__pb2.HeartbeatTaskPoolRequest.SerializeToString,
+            pycloud__v1__pb2.HeartbeatTaskPoolResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SubmitPoolTasks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/SubmitPoolTasks',
+            pycloud__v1__pb2.SubmitPoolTasksRequest.SerializeToString,
+            pycloud__v1__pb2.SubmitTasksResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PullPoolResults(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/PullPoolResults',
+            pycloud__v1__pb2.PullPoolResultsRequest.SerializeToString,
+            pycloud__v1__pb2.PullResultsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelPoolJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/CancelPoolJob',
+            pycloud__v1__pb2.CancelPoolJobRequest.SerializeToString,
+            pycloud__v1__pb2.CancelJobResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTaskPoolStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/GetTaskPoolStatus',
+            pycloud__v1__pb2.GetTaskPoolStatusRequest.SerializeToString,
+            pycloud__v1__pb2.GetTaskPoolStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CloseTaskPool(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/CloseTaskPool',
+            pycloud__v1__pb2.CloseTaskPoolRequest.SerializeToString,
+            pycloud__v1__pb2.CloseTaskPoolResponse.FromString,
             options,
             channel_credentials,
             insecure,

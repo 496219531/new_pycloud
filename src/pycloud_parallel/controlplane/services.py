@@ -101,6 +101,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         except Exception:
             logger.exception("[NodeControl] service route sync callback failed")
 
+    @staticmethod
+    def _shared_task_mode_removed_message() -> str:
+        return "shared task mode has been removed; use native TaskPoolSession or JobQueueMode"
+
     def UploadCode(self, request_iterator: Iterable[pb2.UploadCodeRequest], context: grpc.ServicerContext) -> pb2.UploadCodeResponse:
         meta = None
         chunk_count = 0
@@ -363,6 +367,12 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             return
 
     def SubmitTasks(self, request: pb2.SubmitTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
+        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+        context.set_details(self._shared_task_mode_removed_message())
+        return pb2.SubmitTasksResponse(
+            ok=False,
+            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
+        )
         logger.info(
             "[NodeControl] SubmitTasks peer=%s client_id=%s job_id=%s code_version=%s tasks=%d",
             _peer(context),
@@ -414,6 +424,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         request_iterator: Iterable[pb2.TaskStreamRequest],
         context: grpc.ServicerContext,
     ) -> Iterable[pb2.TaskStreamResponse]:
+        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+        context.set_details(self._shared_task_mode_removed_message())
+        yield pb2.TaskStreamResponse(error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()))
+        return
         peer = _peer(context)
         sentinel = object()
         outbound: "queue.Queue[object]" = queue.Queue()
@@ -715,6 +729,12 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             )
 
     def PullResults(self, request: pb2.PullResultsRequest, context: grpc.ServicerContext) -> pb2.PullResultsResponse:
+        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+        context.set_details(self._shared_task_mode_removed_message())
+        return pb2.PullResultsResponse(
+            ok=False,
+            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
+        )
         logger.info(
             "[NodeControl] PullResults peer=%s client_id=%s limit=%d wait_ms=%d",
             _peer(context),
@@ -741,6 +761,12 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         return pb2.PullResultsResponse(ok=True, results=results, next_cursor=next_cursor)
 
     def CancelTasks(self, request: pb2.CancelTasksRequest, context: grpc.ServicerContext) -> pb2.CancelTasksResponse:
+        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+        context.set_details(self._shared_task_mode_removed_message())
+        return pb2.CancelTasksResponse(
+            ok=False,
+            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
+        )
         logger.info(
             "[NodeControl] CancelTasks peer=%s client_id=%s task_ids=%d",
             _peer(context),
@@ -771,6 +797,12 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         )
 
     def CancelJob(self, request: pb2.CancelJobRequest, context: grpc.ServicerContext) -> pb2.CancelJobResponse:
+        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+        context.set_details(self._shared_task_mode_removed_message())
+        return pb2.CancelJobResponse(
+            ok=False,
+            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
+        )
         logger.info(
             "[NodeControl] CancelJob peer=%s client_id=%s job_id=%s",
             _peer(context),
@@ -827,6 +859,239 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             mem_percent=0.0,
             uptime_sec=metrics["uptime_sec"],
         )
+
+    def CreateTaskPool(
+        self,
+        request_iterator: Iterable[pb2.CreateTaskPoolRequest],
+        context: grpc.ServicerContext,
+    ) -> pb2.CreateTaskPoolResponse:
+        meta = None
+        chunk_count = 0
+        tmp_file = None
+        tmp_path = ""
+        for req in request_iterator:
+            kind = req.WhichOneof("body")
+            if kind == "meta":
+                if meta is not None:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("meta frame can only appear once")
+                    return pb2.CreateTaskPoolResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame can only appear once"))
+                meta = req.meta
+            elif kind == "chunk":
+                if meta is None:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("meta frame must come before chunk frames")
+                    return pb2.CreateTaskPoolResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame must come before chunk frames"))
+                if tmp_file is None:
+                    tmp_file = tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        prefix="pycloud-task-pool-",
+                        suffix=_tempfile_suffix_for_package_format(meta.package_format),
+                        delete=False,
+                        dir=str(self._state.artifact_dir),
+                    )
+                    tmp_path = tmp_file.name
+                part = req.chunk or b""
+                if part:
+                    tmp_file.write(part)
+                    chunk_count += 1
+
+        if meta is None:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("missing task pool metadata frame")
+            return pb2.CreateTaskPoolResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "missing task pool metadata frame"))
+
+        if tmp_file is None:
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix="pycloud-task-pool-",
+                suffix=".bin",
+                delete=False,
+                dir=str(self._state.artifact_dir),
+            )
+            tmp_path = tmp_file.name
+
+        try:
+            tmp_file.close()
+            h = hashlib.sha256(Path(tmp_path).read_bytes()).hexdigest()
+            pool = self._state.create_task_pool(
+                owner_client_id=meta.owner_client_id,
+                pool_name=meta.pool_name,
+                sha256=meta.sha256,
+                runtime=meta.runtime,
+                entry_module=meta.entry_module,
+                entry_callable=meta.entry_callable,
+                package_format=meta.package_format,
+                dependency_allowlist=list(meta.dependency_allowlist),
+                managed_global_names=list(meta.managed_global_names),
+                worker_count=meta.worker_count,
+                heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
+                idle_ttl_sec=meta.idle_ttl_sec,
+                chunks=[Path(tmp_path).read_bytes()],
+            )
+        except Exception as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.CreateTaskPoolResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)))
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+
+        return pb2.CreateTaskPoolResponse(
+            ok=True,
+            pool_id=pool.pool_id,
+            code_version=pool.code_version,
+            worker_count=pool.worker_count,
+            heartbeat_timeout_sec=pool.heartbeat_timeout_sec,
+            owner_client_id=pool.owner_client_id,
+            pool_token=pool.pool_token,
+        )
+
+    def SubmitPoolTasks(self, request: pb2.SubmitPoolTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
+        try:
+            accepted, rejected = self._state.submit_pool_tasks(
+                pool_id=request.pool_id,
+                pool_token=request.pool_token,
+                tasks=list(request.tasks),
+                job_id=request.job_id,
+            )
+            return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.SubmitTasksResponse(ok=False, error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)))
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.SubmitTasksResponse(ok=False, error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)))
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.SubmitTasksResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)))
+
+    def HeartbeatTaskPool(self, request: pb2.HeartbeatTaskPoolRequest, context: grpc.ServicerContext) -> pb2.HeartbeatTaskPoolResponse:
+        try:
+            pool = self._state.heartbeat_task_pool(
+                owner_client_id=request.owner_client_id,
+                pool_id=request.pool_id,
+                pool_token=request.pool_token,
+            )
+            return pb2.HeartbeatTaskPoolResponse(
+                ok=True,
+                accepted=True,
+                next_heartbeat_in_sec=max(1, pool.heartbeat_timeout_sec // 2),
+            )
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.HeartbeatTaskPoolResponse(ok=False, accepted=False, error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)))
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.HeartbeatTaskPoolResponse(ok=False, accepted=False, error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)))
+        except RuntimeError as exc:
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details(str(exc))
+            return pb2.HeartbeatTaskPoolResponse(ok=False, accepted=False, error=_err(pb2.ERROR_CODE_INTERNAL_ERROR, str(exc)))
+
+    def PullPoolResults(self, request: pb2.PullPoolResultsRequest, context: grpc.ServicerContext) -> pb2.PullResultsResponse:
+        try:
+            results, next_cursor = self._state.pull_pool_results(
+                pool_id=request.pool_id,
+                pool_token=request.pool_token,
+                limit=request.limit,
+                wait_ms=request.wait_ms,
+                cursor=request.cursor,
+            )
+            return pb2.PullResultsResponse(ok=True, results=results, next_cursor=next_cursor)
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.PullResultsResponse(ok=False, error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)))
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.PullResultsResponse(ok=False, error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)))
+
+    def CancelPoolJob(self, request: pb2.CancelPoolJobRequest, context: grpc.ServicerContext) -> pb2.CancelJobResponse:
+        try:
+            queued_cancelled, running_marked, already_done, not_found = self._state.cancel_pool_job(
+                pool_id=request.pool_id,
+                pool_token=request.pool_token,
+                job_id=request.job_id,
+                reason=request.reason,
+            )
+            return pb2.CancelJobResponse(
+                ok=True,
+                queued_cancelled=queued_cancelled,
+                running_marked=running_marked,
+                already_done=already_done,
+                not_found=not_found,
+            )
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.CancelJobResponse(ok=False, error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)))
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.CancelJobResponse(ok=False, error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)))
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.CancelJobResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)))
+
+    def GetTaskPoolStatus(self, request: pb2.GetTaskPoolStatusRequest, context: grpc.ServicerContext) -> pb2.GetTaskPoolStatusResponse:
+        try:
+            info = self._state.task_pool_status_info(request.pool_id)
+            pool = self._state.task_pool(request.pool_id)
+            if pool.pool_token != str(request.pool_token or "").strip():
+                raise PermissionError("pool_token mismatch")
+            return pb2.GetTaskPoolStatusResponse(
+                ok=True,
+                pool=pb2.TaskPoolStatusInfo(
+                    pool_id=str(info.get("pool_id", "")),
+                    owner_client_id=str(info.get("owner_client_id", "")),
+                    pool_name=str(info.get("pool_name", "")),
+                    code_version=str(info.get("code_version", "")),
+                    worker_count=int(info.get("worker_count", 0) or 0),
+                    heartbeat_timeout_sec=int(info.get("heartbeat_timeout_sec", 0) or 0),
+                    status=str(info.get("status", "")),
+                    task_count=int(info.get("task_count", 0) or 0),
+                    created_at=dt_to_ts(info["created_at"]),
+                    last_heartbeat_at=dt_to_ts(info["last_heartbeat_at"]),
+                    lease_expire_at=dt_to_ts(info["lease_expire_at"]),
+                ),
+            )
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.GetTaskPoolStatusResponse(ok=False, error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)))
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.GetTaskPoolStatusResponse(ok=False, error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)))
+
+    def CloseTaskPool(self, request: pb2.CloseTaskPoolRequest, context: grpc.ServicerContext) -> pb2.CloseTaskPoolResponse:
+        try:
+            self._state.close_task_pool(
+                owner_client_id=request.owner_client_id,
+                pool_id=request.pool_id,
+                pool_token=request.pool_token,
+                reason=request.reason,
+            )
+            return pb2.CloseTaskPoolResponse(ok=True, accepted=True)
+        except KeyError as exc:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(exc))
+            return pb2.CloseTaskPoolResponse(ok=False, accepted=False, error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, str(exc)))
+        except PermissionError as exc:
+            context.set_code(grpc.StatusCode.PERMISSION_DENIED)
+            context.set_details(str(exc))
+            return pb2.CloseTaskPoolResponse(ok=False, accepted=False, error=_err(pb2.ERROR_CODE_UNAUTHORIZED, str(exc)))
 
     def CreateService(
         self,

@@ -11,12 +11,13 @@ import time
 from typing import Any, Deque, Dict, Optional
 
 
-def _executor_host_main(request_q, event_q) -> None:
+def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     service_executors: Dict[str, ProcessPoolExecutor] = {}
     service_workers: Dict[str, int] = {}
-    runtime_executors: Dict[str, ProcessPoolExecutor] = {}
+    pool_executors: Dict[str, ProcessPoolExecutor] = {}
+    pool_workers: Dict[str, int] = {}
+    task_executor: Optional[ProcessPoolExecutor] = None
     inflight: Dict[object, Dict[str, Any]] = {}
-    shutdown_request_id = ""
 
     def _send_response(request_id: str, **payload: object) -> None:
         event_q.put({"kind": "response", "request_id": request_id, **payload})
@@ -66,6 +67,15 @@ def _executor_host_main(request_q, event_q) -> None:
             args["payload"],
         )
 
+    def _ensure_task_executor() -> ProcessPoolExecutor:
+        nonlocal task_executor
+        if task_executor is None:
+            task_executor = ProcessPoolExecutor(
+                max_workers=max(1, int(task_worker_capacity or 1)),
+                mp_context=_ensure_mp_context(),
+            )
+        return task_executor
+
     def _rebuild_service_executor(service_id: str) -> Optional[ProcessPoolExecutor]:
         worker_count = max(1, int(service_workers.get(service_id, 1) or 1))
         existing = service_executors.pop(service_id, None)
@@ -77,13 +87,23 @@ def _executor_host_main(request_q, event_q) -> None:
         service_executors[service_id] = executor
         return executor
 
+    def _rebuild_pool_executor(pool_id: str) -> Optional[ProcessPoolExecutor]:
+        worker_count = max(1, int(pool_workers.get(pool_id, 1) or 1))
+        existing = pool_executors.pop(pool_id, None)
+        _shutdown_executor(existing, wait=True)
+        executor = ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=_ensure_mp_context(),
+        )
+        pool_executors[pool_id] = executor
+        return executor
+
     def _handle_request(message: Dict[str, Any]) -> bool:
         request_id = str(message.get("request_id", "") or "")
         action = str(message.get("action", "") or "")
         payload = dict(message.get("payload") or {})
         if action == "shutdown":
-            nonlocal shutdown_request_id
-            shutdown_request_id = request_id
+            _send_response(request_id, ok=True)
             return False
 
         try:
@@ -99,6 +119,22 @@ def _executor_host_main(request_q, event_q) -> None:
                 service_id = str(payload.get("service_id", "") or "")
                 executor = service_executors.pop(service_id, None)
                 service_workers.pop(service_id, None)
+                _shutdown_executor(executor, wait=True)
+                _send_response(request_id, ok=True)
+                return True
+
+            if action == "create_task_pool":
+                pool_id = str(payload.get("pool_id", "") or "")
+                worker_count = max(1, int(payload.get("worker_count", 1) or 1))
+                pool_workers[pool_id] = worker_count
+                pool_executors[pool_id] = _rebuild_pool_executor(pool_id)
+                _send_response(request_id, ok=True)
+                return True
+
+            if action == "stop_task_pool":
+                pool_id = str(payload.get("pool_id", "") or "")
+                executor = pool_executors.pop(pool_id, None)
+                pool_workers.pop(pool_id, None)
                 _shutdown_executor(executor, wait=True)
                 _send_response(request_id, ok=True)
                 return True
@@ -132,32 +168,38 @@ def _executor_host_main(request_q, event_q) -> None:
                 return True
 
             if action == "start_runtime_slot":
-                runtime_key = str(payload.get("runtime_key", "") or "")
-                existing = runtime_executors.get(runtime_key)
-                if existing is None:
-                    runtime_executors[runtime_key] = ProcessPoolExecutor(
-                        max_workers=1,
-                        mp_context=_ensure_mp_context(),
-                    )
+                _ensure_task_executor()
                 _send_response(request_id, ok=True)
                 return True
 
             if action == "stop_runtime_slot":
-                runtime_key = str(payload.get("runtime_key", "") or "")
-                executor = runtime_executors.pop(runtime_key, None)
-                _shutdown_executor(executor, wait=True)
                 _send_response(request_id, ok=True)
                 return True
 
             if action == "submit_runtime_task":
-                runtime_key = str(payload.get("runtime_key", "") or "")
-                executor = runtime_executors.get(runtime_key)
+                executor = _ensure_task_executor()
+                future = _submit_callable(executor, payload)
+                inflight[future] = {
+                    "kind": "runtime",
+                    "runtime_key": str(payload.get("runtime_key", "") or ""),
+                    "task_id": str(payload.get("task_id", "") or ""),
+                    "attempt": int(payload.get("attempt", 0) or 0),
+                }
+                _send_response(request_id, ok=True)
+                return True
+
+            if action == "submit_pool_task":
+                pool_id = str(payload.get("pool_id", "") or "")
+                executor = pool_executors.get(pool_id)
+                if executor is None and pool_id in pool_workers:
+                    executor = _rebuild_pool_executor(pool_id)
                 if executor is None:
-                    _send_response(request_id, ok=False, error="runtime slot missing")
+                    _send_response(request_id, ok=False, error="task pool missing")
                     return True
                 future = _submit_callable(executor, payload)
                 inflight[future] = {
-                    "runtime_key": runtime_key,
+                    "kind": "pool",
+                    "pool_id": pool_id,
                     "task_id": str(payload.get("task_id", "") or ""),
                     "attempt": int(payload.get("attempt", 0) or 0),
                 }
@@ -189,29 +231,42 @@ def _executor_host_main(request_q, event_q) -> None:
                 result = None
                 err_type = "InfraException"
                 err_message = repr(exc)
-            event_q.put(
-                {
-                    "kind": "runtime_task_done",
-                    "runtime_key": str(meta.get("runtime_key", "") or ""),
-                    "task_id": str(meta.get("task_id", "") or ""),
-                    "attempt": int(meta.get("attempt", 0) or 0),
-                    "status_text": status_text,
-                    "result": result,
-                    "err_type": err_type,
-                    "err_message": err_message,
-                }
-            )
+            if str(meta.get("kind", "") or "") == "pool":
+                event_q.put(
+                    {
+                        "kind": "pool_task_done",
+                        "pool_id": str(meta.get("pool_id", "") or ""),
+                        "task_id": str(meta.get("task_id", "") or ""),
+                        "attempt": int(meta.get("attempt", 0) or 0),
+                        "status_text": status_text,
+                        "result": result,
+                        "err_type": err_type,
+                        "err_message": err_message,
+                    }
+                )
+            else:
+                event_q.put(
+                    {
+                        "kind": "runtime_task_done",
+                        "runtime_key": str(meta.get("runtime_key", "") or ""),
+                        "task_id": str(meta.get("task_id", "") or ""),
+                        "attempt": int(meta.get("attempt", 0) or 0),
+                        "status_text": status_text,
+                        "result": result,
+                        "err_type": err_type,
+                        "err_message": err_message,
+                    }
+                )
 
     for executor in list(service_executors.values()):
         _shutdown_executor(executor, wait=True)
-    for executor in list(runtime_executors.values()):
+    for executor in list(pool_executors.values()):
         _shutdown_executor(executor, wait=True)
-    if shutdown_request_id:
-        _send_response(shutdown_request_id, ok=True)
+    _shutdown_executor(task_executor, wait=True)
 
 
 class ExecutorHostClient:
-    def __init__(self) -> None:
+    def __init__(self, *, task_worker_capacity: int = 1) -> None:
         self._ctx = mp.get_context("spawn")
         self._request_q = self._ctx.Queue()
         self._event_q = self._ctx.Queue()
@@ -223,7 +278,7 @@ class ExecutorHostClient:
         self._reader_stop = threading.Event()
         self._process = self._ctx.Process(
             target=_executor_host_main,
-            args=(self._request_q, self._event_q),
+            args=(self._request_q, self._event_q, max(1, int(task_worker_capacity or 1))),
             daemon=False,
         )
         self._process.start()
@@ -313,6 +368,19 @@ class ExecutorHostClient:
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "stop_service failed")))
 
+    def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
+        resp = self._request(
+            "create_task_pool",
+            payload={"pool_id": pool_id, "worker_count": int(worker_count)},
+        )
+        if not resp.get("ok", False):
+            raise RuntimeError(str(resp.get("error", "create_task_pool failed")))
+
+    def stop_task_pool(self, *, pool_id: str) -> None:
+        resp = self._request("stop_task_pool", payload={"pool_id": pool_id})
+        if not resp.get("ok", False):
+            raise RuntimeError(str(resp.get("error", "stop_task_pool failed")))
+
     def call_service(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]) -> Dict[str, Any]:
         resp = self._request(
             "call_service",
@@ -352,3 +420,23 @@ class ExecutorHostClient:
         )
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "submit_runtime_task failed")))
+
+    def submit_pool_task(
+        self,
+        *,
+        pool_id: str,
+        task_id: str,
+        attempt: int,
+        execute_spec: Dict[str, Any],
+    ) -> None:
+        resp = self._request(
+            "submit_pool_task",
+            payload={
+                "pool_id": pool_id,
+                "task_id": task_id,
+                "attempt": int(attempt),
+                **dict(execute_spec),
+            },
+        )
+        if not resp.get("ok", False):
+            raise RuntimeError(str(resp.get("error", "submit_pool_task failed")))

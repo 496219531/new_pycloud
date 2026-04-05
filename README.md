@@ -8,16 +8,19 @@
 更细一点的边界建议这样理解：
 
 1. `Task Mode`
-   - 面向重计算、批处理、高吞吐任务执行
-   - 更适合 CPU 密集型工作、批量任务分发、长耗时数据处理
-2. `Service Mode`
+   - 面向子任务执行层
+   - 更适合 CPU 密集型子任务、批量任务分发、长耗时数据处理
+2. `JobQueue Mode`
+   - 面向大任务排队与单活调度
+   - 大任务排到后，再展开成 subtasks 交给执行层
+3. `Service Mode`
    - 面向可寻址、常驻的函数服务实例
    - 更适合内部 RPC、轻量状态服务、稳定路由的函数调用
    - 当前本质仍是“函数执行服务”，不是标准 ASGI/WSGI 网络服务运行时
-3. `External Web Layer`
+4. `External Web Layer`
    - 如果需要真正的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
    - 该层负责 HTTP API、鉴权、参数校验、编排与聚合
-   - 重计算下沉到 `Task Mode`，内部函数调用下沉到 `Service Mode`
+   - 重计算下沉到 `JobQueue Mode + TaskPoolSession`，内部函数调用下沉到 `Service Mode`
 
 ## 安装
 
@@ -41,8 +44,10 @@ pip install pycloud-parallel
    - 对外轻网络入口层
 2. `Service Mode`
    - 内部常驻函数服务层
-3. `Task Mode`
-   - 重计算执行层
+3. `JobQueue Mode`
+   - 大任务排队与单活调度层
+4. `TaskPoolSession / Task Mode`
+   - 子任务执行层（原生专属 pool）
 
 ## Payload 序列化边界
 
@@ -92,7 +97,7 @@ artifact_dir/
 
 ### 结果返回机制
 
-任务模式与服务模式的结果返回当前是自动分流的：
+TaskPool / Service 两条执行链路的结果返回当前是自动分流的：
 
 1. 小结果
    - 直接 inline 回传
@@ -140,7 +145,7 @@ pycloudctl gc --scope all --older-than-hours 168
    - `service_name -> route` 缓存与失败切换
 3. `NodeControl`
    - 代码上传
-   - 任务模式执行
+   - task pool 执行
    - 服务模式生命周期管理
 
 ## 当前协议边界
@@ -167,7 +172,9 @@ from pycloud_parallel import (
     foreach,
     parallel_for,
     DeployedService,
-    TaskSubmitter,
+    DedicatedTaskServiceSession,
+    JobQueueClient,
+    TaskPoolSession,
     GatewayConnect,
     DirectConnect,
 )
@@ -177,11 +184,15 @@ from pycloud_parallel import (
 
 1. `DeployedService`
    - owner 侧部署并持有服务
-2. `TaskSubmitter`
-   - 任务模式的模块化客户端
-3. `GatewayConnect`
+2. `TaskPoolSession`
+   - 原生专属任务池会话
+3. `DedicatedTaskServiceSession`
+   - 复用 `ServiceGroup` 的兼容专属池实现
+4. `JobQueueClient`
+   - 大任务排队客户端
+5. `GatewayConnect`
    - 通过 Gateway 按 `service_name` 调用服务
-4. `DirectConnect`
+6. `DirectConnect`
    - 客户端本地查路由后直连实例
 
 如果你需要更底层的控制面类，请从 `pycloud_parallel.controlplane` 导入。
@@ -246,6 +257,7 @@ group = DeployedService.deploy_from_infocenter(
 
 print(group.square.sync(x=7))
 # group.join() 适合 owner 长驻
+# 重新部署同名服务且代码变化时，默认会自动替换旧版本
 ```
 
 如果你的代码依赖节点上未预装的包，可以显式给白名单：
@@ -288,7 +300,7 @@ group = DeployedService.deploy_from_module(
 ### 3. 任务模式
 
 ```python
-from pycloud_parallel import TaskSubmitter
+from pycloud_parallel import TaskPoolSession
 
 blob = (
     b"def run(value=0, **_kwargs):\n"
@@ -296,19 +308,26 @@ blob = (
     b"    return {'value': value, 'square': value * value}\n"
 )
 
-with TaskSubmitter.from_infocenter(
+with TaskPoolSession.from_infocenter(
     infocenter_target="127.0.0.1:50051",
+    job_id="demo-job",
     blob=blob,
     runtime="py3",
     entry_module="task_demo",
-) as task:
-    results = task.run(value=7, runtime_key="demo-runtime")
-    for item in results:
-        print(item.task_id, item.status, item.result)
+) as pool:
+    resp = pool.submit_payloads([{"value": 7}])
+    results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
+    print(results)
 ```
 
-如果上传校验报 `ModuleNotFoundError`，默认会严格失败。
-只有显式传了 `dependency_allowlist`，节点才会尝试在当前 `code_version` 的隔离目录里补装依赖。
+如果你希望先排队，再由调度器自动创建专属 pool，使用 `JobQueueClient`。
+
+常见高层 helper：
+
+1. `submit_job_from_bytes(...)`
+2. `submit_job_from_func(...)`
+3. `submit_job_from_module(...)`
+4. `wait_for_terminal(...)`
 
 ### 4. Gateway 调用
 
@@ -347,21 +366,14 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 
 ## 任务模式说明
 
-任务模式当前是“流式入口 + runtime slot 调度”：
+任务模式当前已经收敛为：
 
-1. 客户端上传代码后，和目标节点建立 `TaskStream`
-2. `TaskBatchClient` / `TaskSubmitter` 已经在内部使用任务流
-3. 任务可显式传 `runtime_key`
-4. 节点内部按 `runtime_key` 维护 runtime slot
-5. slot 内复用单进程 worker，尽量少切代码
-6. slot 空闲超过 `idle TTL` 后回收
-7. 结果当前仍保存在节点内存中，不做持久化
-
-热点与选点：
-
-1. 节点向 `InfoCenter` 心跳上报 `active_runtimes`
-2. `InfoCenter.select_task_nodes(...)` 支持 `preferred_runtime_key`
-3. `TaskBatchClient.from_infocenter(...)` 默认会优先选择热 node
+1. `TaskPoolSession`
+   - 原生专属任务池会话
+   - pool 自己保活、提交、拉结果、取消和关闭
+2. `JobQueueMode`
+   - 大任务排队与单活调度
+   - job 排到后，再自动创建 `TaskPoolSession`
 
 ## Python Runtime 约束
 

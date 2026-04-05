@@ -5,13 +5,16 @@
 建议先把三层角色区分开：
 
 1. `Task Mode`
-   - 重计算执行层
-   - 更适合 CPU 密集型任务、批处理、高吞吐执行
-2. `Service Mode`
+   - 子任务执行层
+   - 更适合 CPU 密集型子任务、批处理、高吞吐执行
+2. `JobQueue Mode`
+   - 大任务排队与单活调度层
+   - 大任务排到后，再展开成 subtasks 交给执行层
+3. `Service Mode`
    - 常驻函数服务层
    - 更适合作为内部 RPC / 内部函数服务层
    - 当前不是标准 ASGI/WSGI 网络服务运行时
-3. `External Web Layer`
+4. `External Web Layer`
    - 真正对外的轻网络入口层
    - 如果需要标准 Web 服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
 
@@ -44,7 +47,9 @@ from pycloud_parallel import (
     foreach,
     parallel_for,
     DeployedService,
-    TaskSubmitter,
+    DedicatedTaskServiceSession,
+    JobQueueClient,
+    TaskPoolSession,
     GatewayConnect,
     DirectConnect,
 )
@@ -54,11 +59,15 @@ from pycloud_parallel import (
 
 1. `DeployedService`
    - owner 侧部署内部函数服务
-2. `TaskSubmitter`
-   - 任务模式模块化客户端
-3. `GatewayConnect`
+2. `TaskPoolSession`
+   - 原生专属任务池会话
+3. `DedicatedTaskServiceSession`
+   - 复用 `ServiceGroup` 的兼容专属池实现
+4. `JobQueueClient`
+   - 大任务排队客户端
+5. `GatewayConnect`
    - 通过 Gateway 调用内部函数服务
-4. `DirectConnect`
+6. `DirectConnect`
    - 客户端发现后直连实例
 
 ## 3. 本地多进程
@@ -99,6 +108,7 @@ group = DeployedService.deploy_from_infocenter(
 
 print(group.square.sync(x=7))
 # owner 长驻时可调用 group.join()
+# 固定 service_name 重新部署时，如果代码变化会默认替换旧服务
 ```
 
 依赖缺失时可显式给补装白名单：
@@ -116,10 +126,19 @@ group = DeployedService.deploy_from_infocenter(
 
 ## 5. 任务模式
 
-### 5.1 低样板方式
+当前任务层已经可以分成三种入口：
+
+1. `TaskPoolSession`
+   - 原生专属 pool，会自动 heartbeat
+2. `DedicatedTaskServiceSession`
+   - 兼容专属池实现，底层复用 `ServiceGroup`
+3. `JobQueueClient`
+   - 先提交大任务到队列，排到后再自动创建 `TaskPoolSession`
+
+### 5.1 原生专属 pool
 
 ```python
-from pycloud_parallel import TaskSubmitter
+from pycloud_parallel import TaskPoolSession
 
 blob = (
     b"def run(value=0, **_kwargs):\n"
@@ -127,47 +146,66 @@ blob = (
     b"    return {'value': value, 'square': value * value}\n"
 )
 
-with TaskSubmitter.from_infocenter(
+with TaskPoolSession.from_infocenter(
     infocenter_target="127.0.0.1:50051",
+    job_id="demo-job",
     blob=blob,
     runtime="py3",
     entry_module="task_demo",
-) as task:
-    results = task.run(value=7, runtime_key="demo-runtime")
+) as pool:
+    resp = pool.submit_payloads([{"value": 7}])
+    results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
     print(results)
+
+    mapped = pool.map([8, 9, 10], timeout_sec=10.0)
+    print(mapped)
 ```
 
-如果任务代码 import 了节点上没有的包：
+如果你希望先排队，再由调度器自动创建专属 pool：
 
 ```python
-with TaskSubmitter.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    artifact_path="./task_src",
+from pycloud_parallel import JobQueueClient
+
+client = JobQueueClient("127.0.0.1:50051")
+client.submit_job_from_bytes(
+    blob=driver_blob,
+    driver_entry_module="job_driver_demo",
     runtime="py3",
-    entry_module="task_src.main",
-    dependency_allowlist=["./third_party/my_local_pkg"],
-) as task:
-    print(task.run(value=7))
+    task_entry_module="task_demo",
+    task_entry_callable="run",
+    pool_worker_count=2,
+    pool_node_count=2,
+)
 ```
 
-### 5.2 批量方式
+如果你已经有函数对象，也可以直接：
 
 ```python
-from pycloud_parallel.controlplane.client import TaskBatchClient
+client.submit_job_from_func(
+    func=build_subtasks,
+    task_func=run_subtask,
+    pool_worker_count=2,
+    pool_node_count=2,
+)
+```
 
-with TaskBatchClient.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    blob=blob,
-    runtime="py3",
-    entry_module="task_demo",
-    preferred_runtime_key="demo-runtime",
-) as batch:
-    batch.submit_payloads(
-        [{"value": 2}, {"value": 3}],
-        runtime_key="demo-runtime",
-    )
-    results = batch.wait_for_results(expected_count=2, timeout_sec=10.0)
-    print(results)
+如果你已有模块对象：
+
+```python
+client.submit_job_from_module(
+    module=job_driver_module,
+    task_module=task_module,
+    task_entry_callable="run",
+    pool_worker_count=2,
+    pool_node_count=2,
+)
+```
+
+等待 job 进入终态：
+
+```python
+final = client.wait_for_terminal(job_id, timeout_sec=30.0)
+print(final["job"]["status"])
 ```
 
 ## 6. Gateway 调用
@@ -196,7 +234,8 @@ print(client.square.sync(x=11))
 ## 8. 常用脚本
 
 ```bash
-python examples/grpc_task_client_demo.py
+python examples/demo_task_pool_session.py
+python examples/demo_job_queue.py
 python examples/grpc_register_service_client_demo.py
 python examples/demo_gateway_client.py --service-name square-service
 python examples/demo_gateway_module_client.py

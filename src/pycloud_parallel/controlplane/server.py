@@ -14,6 +14,7 @@ from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp, GatewayHttpServer
 from pycloud_parallel.controlplane.gateway_source import InProcessInfoCenterSource, RemoteInfoCenterSource
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
+from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
@@ -39,6 +40,7 @@ def build_controlplane_server(
     gateway_open_sec: float = 5.0,
 ) -> InfoCenterHttpServer:
     info_state = InfoCenterState(heartbeat_interval_sec=5)
+    job_queue = JobQueueManager()
     route_cache = GatewayRouteCache(
         source=InProcessInfoCenterSource(info_state),
         refresh_interval_sec=gateway_refresh_interval_sec,
@@ -50,6 +52,7 @@ def build_controlplane_server(
         bind=bind,
         state=info_state,
         gateway_app=gateway_app,
+        job_queue=job_queue,
     )
 
 

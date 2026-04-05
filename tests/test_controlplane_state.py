@@ -121,6 +121,29 @@ def test_dict_to_struct_rejects_complex_ndarray_dtype():
         dict_to_struct({"arr": np.array([{"x": 1}], dtype=object)})
 
 
+def test_dict_to_struct_stringifies_scalar_dict_keys():
+    restored = struct_to_dict(
+        dict_to_struct(
+            {
+                "payload": [
+                    {
+                        10006: {"value": 1},
+                        True: "flag",
+                    }
+                ]
+            }
+        )
+    )
+
+    assert restored["payload"][0]["10006"]["value"] == 1
+    assert restored["payload"][0]["True"] == "flag"
+
+
+def test_dict_to_struct_rejects_colliding_normalized_dict_keys():
+    with pytest.raises(TypeError, match=r"normalize to '1'"):
+        dict_to_struct({"payload": {1: "int-key", "1": "string-key"}})
+
+
 def test_infra_timeout_requeue_then_retry(tmp_path):
     state = NodeControlState(
         node_id="node-test-02",
@@ -250,10 +273,10 @@ def test_internal_executor_runtime_slots_queue_and_reclaim(tmp_path):
 
         time.sleep(0.1)
         with state._lock:  # noqa: SLF001
-            assert "rt-a" in state._runtime_slots  # noqa: SLF001
-            assert "rt-b" in state._runtime_slots  # noqa: SLF001
-            assert state._runtime_slots["rt-a"].executor is not None  # noqa: SLF001
-            assert state._runtime_slots["rt-b"].executor is None  # noqa: SLF001
+            running = [task.task_id for task in state._tasks.values() if task.status == pb2.TASK_STATUS_RUNNING]  # noqa: SLF001
+            queued = [task.task_id for task in state._tasks.values() if task.status == pb2.TASK_STATUS_QUEUED]  # noqa: SLF001
+            assert len(running) == 1
+            assert len(queued) == 2
 
         deadline = time.time() + 10
         cursor = ""
@@ -269,8 +292,8 @@ def test_internal_executor_runtime_slots_queue_and_reclaim(tmp_path):
 
         time.sleep(1.3)
         with state._lock:  # noqa: SLF001
-            active_slots = [slot for slot in state._runtime_slots.values() if slot.executor is not None]  # noqa: SLF001
-        assert active_slots == []
+            assert state._inflight_count_locked() == 0  # noqa: SLF001
+            assert state._queued_count_locked() == 0  # noqa: SLF001
     finally:
         state.close()
 
@@ -330,8 +353,7 @@ def test_internal_executor_timeout_recycles_runtime_slot_and_allows_retry(tmp_pa
         while time.time() < deadline:
             with state._lock:  # noqa: SLF001
                 task = state._tasks["timeout-task-1"]  # noqa: SLF001
-                slot = state._runtime_slots["rt-timeout"]  # noqa: SLF001
-                if task.status == pb2.TASK_STATUS_RUNNING and slot.current_task_id == "timeout-task-1":
+                if task.status == pb2.TASK_STATUS_RUNNING:
                     break
             time.sleep(0.05)
         else:
@@ -358,8 +380,9 @@ def test_internal_executor_timeout_recycles_runtime_slot_and_allows_retry(tmp_pa
         assert results[0].attempt == 2
         assert dict(results[0].result) == {"value": 6, "square": 36}
         with state._lock:  # noqa: SLF001
-            slot = state._runtime_slots["rt-timeout"]  # noqa: SLF001
-            assert slot.current_task_id == ""
+            task = state._tasks["timeout-task-1"]  # noqa: SLF001
+            assert task.status == pb2.TASK_STATUS_SUCCEEDED
+            assert state._inflight_count_locked() == 0  # noqa: SLF001
     finally:
         state.close()
 
@@ -770,8 +793,7 @@ def test_internal_executor_recovers_after_executor_host_restart(tmp_path):
         while time.time() < deadline:
             with state._lock:  # noqa: SLF001
                 task = state._tasks["restart-task-1"]  # noqa: SLF001
-                slot = state._runtime_slots["rt-host-restart"]  # noqa: SLF001
-                if task.status == pb2.TASK_STATUS_RUNNING and slot.current_task_id == "restart-task-1":
+                if task.status == pb2.TASK_STATUS_RUNNING:
                     task.payload["sleep_ms"] = 0
                     break
             time.sleep(0.05)

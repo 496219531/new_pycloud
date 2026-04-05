@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
+from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -191,10 +192,12 @@ class InfoCenterHttpServer:
         bind: str,
         state: Optional[InfoCenterState] = None,
         gateway_app: Optional[GatewayHttpApp] = None,
+        job_queue: Optional[JobQueueManager] = None,
     ) -> None:
         self._bind = bind
         self.state = state or InfoCenterState()
         self.gateway_app = gateway_app
+        self.job_queue = job_queue
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
@@ -259,6 +262,26 @@ class InfoCenterHttpServer:
                         return
                     self._send_json(200, {"ok": True, "accepted": True, "next_heartbeat_in_sec": state.heartbeat_interval_sec})
                     return
+                if parsed.path == "/jobs/submit":
+                    if self.server_ref.job_queue is None:
+                        self._send_json(503, {"ok": False, "error": "job queue unavailable"})
+                        return
+                    payload = self._read_json()
+                    if payload is None:
+                        return
+                    job = self.server_ref.job_queue.submit_job(payload)
+                    self._send_json(200, {"ok": True, "job": job.as_dict()})
+                    return
+                if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+                    if self.server_ref.job_queue is None:
+                        self._send_json(503, {"ok": False, "error": "job queue unavailable"})
+                        return
+                    state_obj = self.server_ref.job_queue.cancel_job(parts[1])
+                    if state_obj is None:
+                        self._send_json(404, {"ok": False, "error": "job not found"})
+                        return
+                    self._send_json(200, {"ok": True, "job": state_obj.as_dict()})
+                    return
                 if len(parts) == 4 and parts[:2] == ["ops", "nodes"]:
                     node_id = parts[2]
                     action = parts[3]
@@ -320,6 +343,17 @@ class InfoCenterHttpServer:
                     self.end_headers()
                     self.wfile.write(raw)
                     return
+                if len([x for x in parsed.path.split("/") if x]) == 2 and parsed.path.split("/")[1] == "jobs":
+                    parts = [x for x in parsed.path.split("/") if x]
+                    if self.server_ref.job_queue is None:
+                        self._send_json(503, {"ok": False, "error": "job queue unavailable"})
+                        return
+                    state_obj = self.server_ref.job_queue.get_job(parts[1])
+                    if state_obj is None:
+                        self._send_json(404, {"ok": False, "error": "job not found"})
+                        return
+                    self._send_json(200, {"ok": True, "job": state_obj.as_dict()})
+                    return
                 if gateway_app is not None:
                     handled = gateway_app.handle_get(path=self.path, headers=self.headers)
                     if handled is not None:
@@ -330,6 +364,10 @@ class InfoCenterHttpServer:
 
             def log_message(self, fmt, *args):  # noqa: A003
                 return
+
+            @property
+            def server_ref(self) -> "InfoCenterHttpServer":
+                return self.server.pycloud_owner  # type: ignore[attr-defined]
 
             def _read_json(self) -> Optional[dict]:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
@@ -352,11 +390,14 @@ class InfoCenterHttpServer:
                 self.wfile.write(raw)
 
         self._server = ThreadingHTTPServer((host, port), _Handler)
+        self._server.pycloud_owner = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, name="infocenter-http", daemon=True)
         self._thread.start()
         public_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
         actual_port = int(self._server.server_address[1])
         self.base_url = f"http://{public_host}:{actual_port}"
+        if self.job_queue is not None:
+            self.job_queue.start(controlplane_target=self.base_url)
 
     def wait_for_termination(self) -> None:
         thread = self._thread
@@ -365,6 +406,8 @@ class InfoCenterHttpServer:
 
     def stop(self, grace: int = 0) -> None:
         del grace
+        if self.job_queue is not None:
+            self.job_queue.close()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()

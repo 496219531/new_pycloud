@@ -129,17 +129,17 @@ group = DeployedService.deploy_from_infocenter(
 
 则客户端默认直接复用已有服务。
 
-### 6.2 默认不覆盖
+### 6.2 默认自动覆盖
 
-如果远端同名服务代码不同，默认会报错，不会自动替换。
+如果远端同名服务代码不同，默认会先结束旧服务，再创建新服务。
 
 只有显式传：
 
 ```python
-replace_existing_if_code_changed=True
+replace_existing_if_code_changed=False
 ```
 
-才会触发“先结束旧服务，再创建新服务”。
+才会拒绝这次部署。
 
 ## 7. 一个更贴近当前实现的示例
 
@@ -151,11 +151,11 @@ group = DeployedService.deploy_from_infocenter(
     worker_count=1,
     node_count=1,
     reuse_existing_same_code=True,
-    replace_existing_if_code_changed=False,
+    replace_existing_if_code_changed=True,
 )
 ```
 
-这更适合当前“本地轻量、简单稳定”的默认思路。
+这更符合固定 `service_name` 持续迭代代码的部署习惯。
 
 ## 8. owner 推荐长驻方式
 

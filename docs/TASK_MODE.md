@@ -2,397 +2,152 @@
 
 ## 1. 当前定位
 
-任务模式当前保持这几个边界：
+当前任务侧已经收敛为两层：
 
-1. 任务不经过 `Gateway`
-2. `InfoCenter` 只提供节点事实与热点提示
-3. 高频任务链路直接走 `client -> NodeControl gRPC`
-4. 结果当前只存在节点内存里
+1. `JobQueue Mode`
+   - 大任务排队与单活调度层
+   - 大任务排到后，再展开成 subtasks
+2. `TaskPool Mode`
+   - 子任务执行层
+   - 通过原生 `TaskPoolSession` 创建专属 pool 执行 subtasks
 
-更推荐把它理解为：
+`Gateway` 不参与任务模式。
 
-1. 重计算执行层
-2. CPU 密集型任务、批处理、高吞吐执行入口
-3. 面向作业 / 任务提交与结果回收
-4. 不是对外 HTTP 服务层
+## 2. 当前推荐入口
 
-## 2. 当前接口
+### 2.1 `TaskPoolSession`
 
-### 2.1 低层 gRPC
+适合：
 
-`NodeControlService` 相关任务接口：
+1. 直接申请一组专属 worker
+2. 立即执行一批 subtasks
+3. 执行结束后回收 pool
 
-1. `UploadCode`
-2. `TaskStream`
-3. `SubmitTasks`
-4. `PullResults`
-5. `CancelTasks`
-6. `CancelJob`
-7. `GetMetrics`
+最小示例：
 
-其中：
+```python
+from pycloud_parallel import TaskPoolSession
 
-1. `TaskStream` 是当前推荐的任务入口
-2. `SubmitTasks / PullResults` 仍保留，方便兼容和调试
+with TaskPoolSession.from_infocenter(
+    infocenter_target="127.0.0.1:50051",
+    job_id="demo-job",
+    blob=blob,
+    runtime="py3",
+    entry_module="task_demo",
+    entry_callable="run",
+    worker_count=2,
+    node_count=1,
+) as pool:
+    resp = pool.submit_payloads([{"value": 7}, {"value": 8}])
+    results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
+    print(results)
 
-### 2.2 Python helper
+    mapped = pool.map([9, 10, 11], timeout_sec=10.0)
+    print(mapped)
+```
 
-当前推荐优先级：
+### 2.2 `JobQueueClient`
 
-1. `TaskSubmitter`
-2. `TaskBatchClient`
-3. `NodeControlClient.open_task_stream(...)`
+适合：
 
-上传侧现在支持可选参数：
+1. 大任务先排队
+2. 同一时刻只允许一个大任务进入运行态
+3. job 排到后，再自动创建 `TaskPoolSession`
 
-1. `dependency_allowlist`
-2. 用于显式声明“节点允许补装哪些依赖”
+最小示例：
 
-## 3. 标识语义
+```python
+from pycloud_parallel import JobQueueClient
 
-### 3.1 `task_id`
+client = JobQueueClient("127.0.0.1:50051")
+client.submit_job_from_bytes(
+    blob=driver_blob,
+    driver_entry_module="job_driver_demo",
+    task_entry_module="task_demo",
+    task_entry_callable="run",
+    pool_worker_count=2,
+    pool_node_count=2,
+)
+```
 
-1. 单个任务唯一标识
-2. 也是节点侧去重键
+函数对象写法：
 
-### 3.2 `job_id`
+```python
+client.submit_job_from_func(
+    func=build_subtasks,
+    task_func=run_subtask,
+    pool_worker_count=2,
+    pool_node_count=2,
+)
+```
 
-1. 一批任务的分组键
-2. 可以跨多次提交复用
-3. 主要用于等待结果、调试和 `CancelJob`
-4. 不是 session，不需要 heartbeat
+模块对象写法：
 
-### 3.3 `runtime_key`
+```python
+client.submit_job_from_module(
+    module=job_driver_module,
+    task_module=task_module,
+    task_entry_callable="run",
+    pool_worker_count=2,
+    pool_node_count=2,
+)
+```
 
-1. 表示这批任务希望复用同一热 runtime
-2. 不传时通常退化为 `code_version`
-3. 是任务模式热点路由和 slot 复用的关键键
+等待 job 终态：
 
-### 3.4 `runtime`
+```python
+final = client.wait_for_terminal(job_id, timeout_sec=30.0)
+print(final["job"]["status"])
+```
 
-`runtime` 不是 `runtime_key`。
+## 3. TaskPoolSession 能力
 
-区别：
+当前原生 `TaskPoolSession` 已支持：
 
-1. `runtime`
-   - Python 版本约束
-   - 用于选点和节点侧校验
-2. `runtime_key`
-   - 热点粘性键
-   - 用于 runtime slot 复用和热路由
+1. 创建 pool
+2. pool heartbeat 保活
+3. 提交任务
+4. 拉取结果
+5. 取消 job
+6. 查询 pool 状态
+7. 关闭 pool
 
-常见写法：
+## 4. 结果语义
 
-1. `runtime="py3"`
-2. `runtime="py3.11"`
-3. `runtime=">=py3.11"`
+当前任务结果支持：
 
-## 4. 节点内执行模型
-
-当前 `NodeControlState` 里的任务执行已经不是“所有代码共享一个简单进程池”，而是：
-
-1. 按 `runtime_key` 维护 runtime slot
-2. 每个 slot 自己排队
-3. 每个 slot 复用一个单进程 worker
-4. 节点只保留前 `K` 个活跃 slot
-5. 冷 slot 等待激活
-6. slot 空闲超过 `idle TTL` 自动回收
-
-这样做的目标是：
-
-1. 尽量少切代码
-2. 尽量让热代码持续热
-3. 同时避免把单个 node 撑爆
-
-## 5. 热点路由
-
-任务模式当前支持轻量热点路由：
-
-1. 节点心跳会把 `active_runtimes` 同步到 `InfoCenter`
-2. `InfoCenterClient.select_task_nodes(...)` 支持 `preferred_runtime_key`
-3. `TaskBatchClient.from_infocenter(...)` 默认会把热点偏好带入选点
-4. 客户端本地还会继续维护 runtime 粘性提示，尽量把同 runtime 回打到热 node
-
-这是一种“轻量热点提示”机制，不是强一致调度锁。
-
-## 6. 当前生命周期
-
-### 6.1 推荐流程
-
-1. task client 从 `InfoCenter` 查 node
-2. 上传代码，得到 `code_version`
-3. 与目标节点建立 `TaskStream`
-4. 提交任务
-5. 接收结果
-6. 必要时 `CancelJob`
-
-### 6.2 取消语义
-
-`CancelJob` 当前语义：
-
-1. `QUEUED` 任务：直接取消并发布结果
-2. `RUNNING` 任务：打取消标记，等 worker 结束时转终态
-3. 已终态任务：保持不变
-
-返回统计：
-
-1. `queued_cancelled`
-2. `running_marked`
-3. `already_done`
-4. `not_found`
-
-## 7. 结果语义
-
-当前结果：
-
-1. 按 `client_id` 保存在节点内存队列
-2. 每个客户端结果队列有上限
-3. 节点重启后结果丢失
-4. 当前没有内建结果持久化
-
-### 7.0 大结果返回
-
-任务结果不是永远 inline 回传。
-
-当前返回逻辑：
-
-1. 小结果
-   - 直接放进 `TaskResult.result`
+1. 小结果 inline 返回
 2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
    - 落到 node 本地 `objects/`
    - 返回 `ResultRef`
 
-高层 API：
+高层接口：
 
-1. `TaskBatchClient.fetch_result_data(...)`
-2. `TaskSubmitter.run(...)`
+1. `TaskPoolSession.wait_for_data(...)`
+2. `JobQueueClient` 查询 job 结果
 
-会自动把 `ResultRef` 下载并还原。
+会自动按当前高层约定返回可直接消费的数据结构。
 
-如果你明确知道结果会很大，建议业务侧主动返回：
+## 5. 依赖补装
 
-1. 小摘要
-2. `ObjectRef / ResultRef`
+当前仍保持保守策略：
 
-而不是依赖超大 inline 结果。
+1. 默认严格校验
+2. 只有显式传 `dependency_allowlist` 才允许节点补装
+3. 安装目录位于节点 `code_cache/codes/<sha>/deps`
 
-## 7.1 参数序列化边界
+## 6. 兼容入口
 
-任务模式当前只额外支持这 3 种 Python 类型：
+`DedicatedTaskServiceSession`
 
-1. `pandas.DataFrame`
-2. `pandas.Series`
-3. `numpy.ndarray`
+1. 是兼容专属池实现
+2. 底层复用 `ServiceGroup`
+3. 适合过渡期使用
 
-行为约定：
+## 7. 已移除
 
-1. `client -> NodeControl gRPC` 会对这 3 种类型做显式包装
-2. node 内执行用户函数前会自动还原回 `DataFrame / Series / ndarray`
-3. 用户函数返回值里如果包含这 3 种类型，也会再包装后回传
-4. `numpy.ndarray` 只支持简单 `dtype`
-5. 其他复杂 Python 对象不支持，直接报错
+以下共享任务池能力已经移除：
 
-报错原则：
-
-1. 尽量在提交前或编码阶段就失败
-2. 错误信息会尽量带字段路径
-3. 例如会提示 `payload.bundle.bad has unsupported type ...`
-
-建议：
-
-1. 任务参数尽量保持为基础 JSON 结构
-2. 只有确实需要时，再传 `DataFrame / Series / ndarray`
-3. 更复杂对象由业务侧自己转普通结构或外部落地
-
-## 7.2 managed globals
-
-任务模式现在支持声明可动态更新的全局变量：
-
-```python
-with TaskSubmitter.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    blob=blob,
-    entry_module="task_demo",
-    managed_global_names=["STATE", "MODEL_REF"],
-) as task:
-    task.update_globals({"STATE": "v2"}, runtime_key="demo-runtime")
-```
-
-规则：
-
-1. 只有上传代码的一侧才有 `code_token`，因此才有权限更新
-2. 当前版本是按 scope 定义的，不是按整套 `code_version` 只算一个
-3. task scope 当前定义为：
-   - `client_id + code_version + runtime_key`
-4. 同一套代码的不同客户端、不同 `runtime_key` 可以有不同 globals
-
-### 7.3 节点文件布局
-
-当前 node 文件布局：
-
-```text
-artifact_dir/
-  codes/
-    <code_sha>/
-      artifact.py | pkg/
-      deps/
-      scopes/
-        runtime/<scope_hash>/
-      meta.json
-  objects/
-    <object_sha>.<fmt>
-    meta/<object_sha>.json
-```
-
-说明：
-
-1. `codes/<code_sha>/`
-   - 一套代码作用域
-2. `deps/`
-   - 这套代码的依赖补装目录
-3. `scopes/runtime/...`
-   - 这套代码下各 runtime scope 的 managed globals
-4. `objects/`
-   - 大对象与大结果缓存
-
-### 7.4 GC
-
-任务模式相关文件 GC 当前推荐走离线命令：
-
-```bash
-pycloudctl gc --scope codes --dry-run
-pycloudctl gc --scope objects --older-than-hours 168
-pycloudctl gc --scope all --older-than-hours 168
-```
-
-当前规则：
-
-1. `codes`
-   - 按 `codes/<code_sha>/meta.json` 的 `last_at`
-   - 超过阈值删除整个 code scope
-2. `objects`
-   - 被当前 globals 引用的对象保留
-   - 非当前 globals 引用对象，按 `last_at` 超时删除
-3. `all`
-   - 先回收 `codes`
-   - 再回收 `objects`
-
-## 8. 推荐用法
-
-### 8.1 `TaskSubmitter`
-
-```python
-from pycloud_parallel import TaskSubmitter
-
-with TaskSubmitter.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    blob=blob,
-    runtime="py3",
-    entry_module="task_demo",
-    preferred_runtime_key="demo-runtime",
-) as task:
-    results = task.run(value=7, runtime_key="demo-runtime")
-    print(results)
-
-    resp = task.run.submit(value=8, runtime_key="demo-runtime")
-    more = task.wait_for_results(expected_count=len(resp.accepted), timeout_sec=10.0)
-```
-
-### 8.2 `TaskBatchClient`
-
-```python
-from pycloud_parallel.controlplane.client import TaskBatchClient
-
-with TaskBatchClient.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    blob=blob,
-    runtime="py3",
-    entry_module="task_demo",
-    preferred_runtime_key="demo-runtime",
-) as batch:
-    batch.submit_payloads(
-        [{"value": 1}, {"value": 2}],
-        job_id="job-demo",
-        runtime_key="demo-runtime",
-    )
-    results = batch.wait_for_results(job_id="job-demo", expected_count=2, timeout_sec=10.0)
-```
-
-### 8.3 低层任务流
-
-```python
-from pycloud_parallel.controlplane.client import NodeControlClient
-
-with NodeControlClient("127.0.0.1:50061") as client:
-    upload = client.upload_code_from_bytes(
-        client_id="demo-client",
-        blob=blob,
-        runtime="py3",
-        entry_module="task_demo",
-    )
-    with client.open_task_stream(
-        client_id="demo-client",
-        code_version=upload.code_version,
-    ) as stream:
-        stream.submit_tasks([...], job_id="job-demo")
-        results = stream.pull_results(limit=10, wait_ms=500)
-```
-
-### 8.4 缺依赖时的补装
-
-默认行为：
-
-1. 上传校验时如果发现 `ModuleNotFoundError`
-2. 直接返回错误
-3. 不会自动执行 `pip install`
-
-如果你确认允许节点补装，可以显式传：
-
-```python
-with TaskBatchClient.from_infocenter(
-    infocenter_target="127.0.0.1:50051",
-    artifact_path="./task_src",
-    runtime="py3",
-    entry_module="task_src.main",
-    dependency_allowlist=[
-        "./third_party/my_local_pkg",
-        "/abs/path/to/pkg.whl",
-        "orjson==3.10.18",
-    ],
-) as batch:
-    batch.submit_payloads([{"value": 1}])
-```
-
-当前约束：
-
-1. 节点不会把 `import yaml` 自动猜成 `PyYAML`
-2. 白名单会整批安装到当前 `code_version` 绑定的隔离目录
-3. 同一个 `code_version` 如果换一套白名单，会被拒绝
-
-## 9. 与服务模式的区别
-
-服务模式：
-
-1. owner 需要 keepalive
-2. caller 通常走 `Gateway`
-3. 面向 `service_name + method`
-
-任务模式：
-
-1. 不走 `Gateway`
-2. 不需要 owner keepalive
-3. 面向 `job_id / task_id / runtime_key`
-4. 更关注热代码复用与流式提交
-
-## 10. Python 版本筛选
-
-如果你使用 `TaskSubmitter.from_infocenter(...)` 或 `TaskBatchClient.from_infocenter(...)`：
-
-1. 客户端会先读取 `InfoCenter` 返回的节点 `python_version`
-2. 再按 `runtime` 做筛选
-3. 节点侧上传代码时还会再次校验
-
-因此：
-
-1. `runtime="py3"` 适合大多数通用任务
-2. 精确版本只在你确实依赖该版本特性时使用
+1. 旧共享任务池入口
+2. 旧共享任务池流式入口
+3. 旧共享任务结果拉取与取消链路

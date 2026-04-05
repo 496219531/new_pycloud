@@ -162,6 +162,39 @@ class TestBroadcastProxy:
 class TestDeployedService:
     """测试 DeployedService 类。"""
 
+    def test_deploy_from_bytes_defaults_replace_changed_code(self):
+        """测试高层入口默认开启同名变更代码替换。"""
+        from pycloud_parallel.controlplane.client import DeployedService
+
+        sentinel = object()
+        with patch("pycloud_parallel.controlplane.client.ServiceGroup.deploy_from_infocenter", return_value=sentinel) as mocked:
+            result = DeployedService.deploy_from_bytes(
+                infocenter_target="127.0.0.1:50051",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                service_name="demo-service",
+            )
+
+        assert result is sentinel
+        assert mocked.call_args.kwargs["replace_existing_if_code_changed"] is True
+
+    def test_deploy_from_bytes_can_disable_replace_changed_code(self):
+        """测试高层入口允许显式关闭同名变更代码替换。"""
+        from pycloud_parallel.controlplane.client import DeployedService
+
+        sentinel = object()
+        with patch("pycloud_parallel.controlplane.client.ServiceGroup.deploy_from_infocenter", return_value=sentinel) as mocked:
+            result = DeployedService.deploy_from_bytes(
+                infocenter_target="127.0.0.1:50051",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                service_name="demo-service",
+                replace_existing_if_code_changed=False,
+            )
+
+        assert result is sentinel
+        assert mocked.call_args.kwargs["replace_existing_if_code_changed"] is False
+
     def test_getattr_creates_proxy(self):
         """测试 __getattr__ 创建代理。"""
         from pycloud_parallel.controlplane.client import (
