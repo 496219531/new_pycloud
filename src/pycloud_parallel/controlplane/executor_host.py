@@ -149,7 +149,9 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                     return True
                 future = _submit_callable(executor, payload)
                 try:
-                    status_text, result, err_type, err_message = future.result(timeout=max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)))
+                    status_text, result, err_type, err_message = future.result(
+                        timeout=max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0))
+                    )
                 except FutureTimeout:
                     _rebuild_service_executor(service_id)
                     _send_response(request_id, ok=False, timeout=True, error="invoke timeout")

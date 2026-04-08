@@ -129,17 +129,17 @@ group = DeployedService.deploy_from_infocenter(
 
 则客户端默认直接复用已有服务。
 
-### 6.2 默认自动覆盖
+补充：
 
-如果远端同名服务代码不同，默认会先结束旧服务，再创建新服务。
+1. 同一台机器上，同一个 `owner_client_id + service_name`
+2. 本地 session cache 文件会被 deployservice 持有独占锁
+3. 第二个本地 deploy 进程会直接被拒绝，而不是晚一点在复用/部署阶段失败
 
-只有显式传：
+### 6.2 运行中的同名服务不会被覆盖
 
-```python
-replace_existing_if_code_changed=False
-```
+如果远端同名服务仍在运行，且代码不同，客户端会直接拒绝这次部署。
 
-才会拒绝这次部署。
+要更新同名服务，应该先结束旧服务，再重新部署。
 
 ## 7. 一个更贴近当前实现的示例
 
@@ -155,7 +155,7 @@ group = DeployedService.deploy_from_infocenter(
 )
 ```
 
-这更符合固定 `service_name` 持续迭代代码的部署习惯。
+这更符合“固定 `service_name` 代表同一个运行中服务”的部署语义。
 
 ## 8. owner 推荐长驻方式
 

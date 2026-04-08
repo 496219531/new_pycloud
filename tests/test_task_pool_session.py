@@ -55,3 +55,15 @@ def test_task_pool_session_submit_and_wait() -> None:
         assert len(mapped) == 2
     finally:
         session.close()
+
+
+def test_dedicated_task_pool_proxy_submit_returns_task_id() -> None:
+    from pycloud_parallel.controlplane.client import DedicatedTaskServiceSession
+
+    group, _calls = _fake_group()
+    session = DedicatedTaskServiceSession(group=group, task_method="run", job_id="job-dedicated-submit")
+    try:
+        task_id = session.run.submit(value=7)
+        assert str(task_id).startswith("job-dedicated-submit-task-")
+    finally:
+        session.close()

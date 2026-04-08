@@ -72,6 +72,32 @@ group = DeployedService.deploy_from_infocenter(
 
 `deploy_from_infocenter(...)` 成功后会自动开始 keepalive。
 
+当前 owner 侧还会默认向 `stderr` 输出几类提示：
+
+1. 部署开始
+2. 部署成功
+3. 部分节点部署失败
+4. 无可用 node / 无可调度 node
+5. keepalive 失败导致 owner 退出 `join()`
+
+节点侧现在还会记录服务调用 timing：
+
+1. logger：`pycloud_parallel.service_timing`
+2. 聚合指标会附带在 node heartbeat metadata 中
+3. InfoCenter `/ops` 服务实例表会展示：
+   - `calls`
+   - `errors`
+   - `last_total_ms`
+   - `last_setup_ms`
+   - `last_executor_ms`
+   - `last_finalize_ms`
+   - `avg_total_ms`
+   - `avg_setup_ms`
+   - `avg_executor_ms`
+   - `avg_finalize_ms`
+   - `max_total_ms`
+   - `last_invoke_ms`
+
 owner 长驻推荐：
 
 ```python
@@ -88,6 +114,7 @@ finally:
 1. keepalive 只在 owner 侧部署路径自动开启
 2. `join()` 用于把 owner 进程挂住
 3. `Ctrl+C` 是正常退出路径
+4. 如果所有已部署 session 的 keepalive 连续失败，`join()` 会退出，并在 `stderr` 打印失败节点与原因
 
 ## 3. 调用体验
 
@@ -145,11 +172,19 @@ result = group.call_sync("square", x=7)
 
 并且分两层看：
 
-1. `HTTP` 数据面本质仍然是 `JSON`
-2. 框架会把这 3 种类型自动转成简单 JSON 结构再发送
-3. node 侧调用用户函数前再还原回 `DataFrame / Series / ndarray`
-4. 返回值里这 3 种类型也会自动转回简单结构
-5. 其他复杂 Python 对象不支持，直接报错
+1. 小对象默认走 inline 传输
+2. `HTTP` / gRPC inline 数据面本质仍然是 `JSON/Struct`
+3. 框架会把这 3 种类型自动转成可传输结构再发送
+4. node 侧调用用户函数前再还原回 `DataFrame / Series / ndarray`
+5. 大 `DataFrame / Series / ndarray` 会自动转 `ObjectRef / ResultRef`
+6. 对于 `DataFrame / Series` 的对象路径，数据主体走 bundle：
+   - `data.parquet`
+   - `meta.json`
+7. 这个 bundle 会保留常见 `index/columns` 语义，例如：
+   - `int columns`
+   - `DatetimeIndex`
+   - `MultiIndex`
+8. 其他复杂 Python 对象不支持，直接报错
 
 额外限制：
 
@@ -200,9 +235,10 @@ group = DeployedService.deploy_from_infocenter(
 语义：
 
 1. 同 `owner_client_id + service_name + code_version` 时可复用
-2. 同名但代码变化时默认会自动替换
-3. 显式 `replace_existing_if_code_changed=False` 才会拒绝
+2. 同名但代码变化时，如果旧服务仍在运行，会直接拒绝
+3. 要更新同名服务，先结束旧服务，再重新部署
 4. 客户端会本地缓存 `service_id/service_token`，便于重启后复用
+5. 同一台机器上，同一个 `owner_client_id + service_name` 只允许一个活跃 deployservice 持有该本地 session cache 锁
 
 ## 5.1 依赖补装语义
 

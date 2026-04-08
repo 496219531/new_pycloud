@@ -14,6 +14,7 @@ from typing import Callable, Iterable, List, Optional
 
 import grpc
 
+from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict, touch_object_last_at
 from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, validate_inline_payload_structs
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -352,7 +353,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             touch_object_last_at(self._state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.path))
             with open(artifact.path, "rb") as fp:
                 while True:
-                    part = fp.read(256 * 1024)
+                    part = fp.read(OBJECT_CHUNK_SIZE_BYTES)
                     if not part:
                         break
                     yield pb2.DownloadObjectChunk(
@@ -1198,7 +1199,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             tmp_file.close()
             export_spec = meta.export_spec
 
-            def _iter_chunks(path: str, chunk_size: int = 256 * 1024):
+            def _iter_chunks(path: str, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES):
                 with open(path, "rb") as fp:
                     while True:
                         part = fp.read(max(1, int(chunk_size)))

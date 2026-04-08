@@ -70,6 +70,8 @@ class NodeInfoCenterRegistrar:
                 return False
 
     def _register_once(self) -> bool:
+        metadata = dict(self.metadata)
+        metadata.update(self.state.service_timing_metadata())
         resp = self._client.register_node(
             node_id=self.node_id,
             control_addr=self.control_addr,
@@ -77,7 +79,7 @@ class NodeInfoCenterRegistrar:
             queue_capacity=self.queue_capacity,
             tags=self.tags,
             version=self.version,
-            metadata=self.metadata,
+            metadata=metadata,
             services=self.state.service_reports(),
             active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
@@ -90,6 +92,8 @@ class NodeInfoCenterRegistrar:
 
     def _heartbeat_once(self) -> bool:
         metrics = self.state.metrics()
+        metadata = dict(self.metadata)
+        metadata.update(self.state.service_timing_metadata())
         resp = self._client.heartbeat_node(
             node_id=self.node_id,
             healthy=True,
@@ -101,6 +105,7 @@ class NodeInfoCenterRegistrar:
                 "cpu_percent": 0.0,
                 "mem_percent": 0.0,
             },
+            metadata=metadata,
             services=self.state.service_reports(),
             active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,

@@ -35,7 +35,7 @@ _LOCAL_RUNTIME_DEP_HINT = (
     'Reinstall with `pip install pycloud-parallel` (or avoid `--no-deps`).'
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.10"
 
 
 def pycloud_export(fn):

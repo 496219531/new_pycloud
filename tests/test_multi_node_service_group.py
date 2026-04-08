@@ -401,7 +401,7 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
         n2_state.close()
 
 
-def test_multi_node_group_replace_existing_changed_code_replaces_by_default(tmp_path):
+def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_path):
     info_server, info_target, _info_state = _start_infocenter_server()
     n1_server, n1_target, n1_state = _start_nodecontrol_server("node-replace-01", str(tmp_path / "replace_n1_code"))
     n2_server, n2_target, n2_state = _start_nodecontrol_server("node-replace-02", str(tmp_path / "replace_n2_code"))
@@ -435,9 +435,6 @@ def test_multi_node_group_replace_existing_changed_code_replaces_by_default(tmp_
         _sync_node_services(info_target, node_id="node-replace-01", control_addr=n1_target, tags=["replace"], state=n1_state)
         _sync_node_services(info_target, node_id="node-replace-02", control_addr=n2_target, tags=["replace"], state=n2_state)
 
-        first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
-        group1.close(end_services=False)
-
         try:
             ServiceGroup.deploy_from_infocenter(
                 infocenter_target=info_target,
@@ -460,35 +457,65 @@ def test_multi_node_group_replace_existing_changed_code_replaces_by_default(tmp_
             assert False, "expected explicit replace disable to reject changed code"
         except RuntimeError as exc:
             assert "different code_version" in str(exc)
-            assert "replacement is disabled" in str(exc)
-
-        group2 = ServiceGroup.deploy_from_infocenter(
-            infocenter_target=info_target,
-            owner_client_id="owner-replace-test",
-            service_name="svc-replace-test",
-            blob=blob_v2,
-            runtime="py3",
-            entry_module="svc_replace_test",
-            entry_callable="run",
-            worker_count=2,
-            heartbeat_timeout_sec=30,
-            healthy_only=True,
-            tags=["replace"],
-            min_success_nodes=2,
-            allow_partial=False,
-            timeout_sec=10.0,
-            session_cache_dir=str(cache_dir),
-        )
+            assert "still running" in str(exc)
 
         try:
-            second_ids = {node_id: session.service_id for node_id, session in group2.sessions.items()}
-            assert second_ids != first_ids
+            ServiceGroup.deploy_from_infocenter(
+                infocenter_target=info_target,
+                owner_client_id="owner-replace-test",
+                service_name="svc-replace-test",
+                blob=blob_v2,
+                runtime="py3",
+                entry_module="svc_replace_test",
+                entry_callable="run",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                healthy_only=True,
+                tags=["replace"],
+                min_success_nodes=2,
+                allow_partial=False,
+                timeout_sec=10.0,
+                session_cache_dir=str(cache_dir),
+            )
+            assert False, "expected running service with changed code to be rejected"
+        except RuntimeError as exc:
+            assert "different code_version" in str(exc)
+            assert "stop the active service first" in str(exc)
 
-            _, resp = group2.call_balanced("run", {}, timeout_sec=8.0, refresh_status=False)
-            assert resp["ok"] is True
-            assert resp["data"]["version"] == 2
+        try:
+            first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
+            group1.close(end_services=True, reason="replace old version first")
+            _sync_node_services(info_target, node_id="node-replace-01", control_addr=n1_target, tags=["replace"], state=n1_state)
+            _sync_node_services(info_target, node_id="node-replace-02", control_addr=n2_target, tags=["replace"], state=n2_state)
+
+            group2 = ServiceGroup.deploy_from_infocenter(
+                infocenter_target=info_target,
+                owner_client_id="owner-replace-test",
+                service_name="svc-replace-test",
+                blob=blob_v2,
+                runtime="py3",
+                entry_module="svc_replace_test",
+                entry_callable="run",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                healthy_only=True,
+                tags=["replace"],
+                min_success_nodes=2,
+                allow_partial=False,
+                timeout_sec=10.0,
+                session_cache_dir=str(cache_dir),
+            )
+            try:
+                second_ids = {node_id: session.service_id for node_id, session in group2.sessions.items()}
+                assert second_ids != first_ids
+
+                _, resp = group2.call_balanced("run", {}, timeout_sec=8.0, refresh_status=False)
+                assert resp["ok"] is True
+                assert resp["data"]["version"] == 2
+            finally:
+                group2.close(end_services=True, reason="replace test done")
         finally:
-            group2.close(end_services=True, reason="replace test done")
+            group1.close(end_services=False)
 
         assert not (cache_dir / "owner-replace-test" / "svc-replace-test.json").exists()
     finally:

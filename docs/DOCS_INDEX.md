@@ -26,6 +26,8 @@
 
 - [QUICK_START.md](QUICK_START.md)
   - 顶层 API、启动方式、三层定位、最短示例
+- [PYCLOUDCTL_USAGE.md](PYCLOUDCTL_USAGE.md)
+  - `pycloudctl` 的完整命令说明、运行目录、端口、日志、GC 与常见示例
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
   - 当前控制面、节点、任务模式、服务模式与外部 Web 层的边界
 
@@ -47,6 +49,8 @@
 
 ## 控制面与运维
 
+- [PYCLOUDCTL_USAGE.md](PYCLOUDCTL_USAGE.md)
+  - 本地控制脚本 `pycloudctl` 的详细用法、示例与排障
 - [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
   - `/nodes`、`/services/routes`、`/ops`、节点事实字段
 - [HTTP_SERVICE_DEBUG_FLOW.md](HTTP_SERVICE_DEBUG_FLOW.md)
@@ -55,6 +59,8 @@
   - TaskPool 从创建、提交、执行到结果返回的关键函数链路
 - [PAYLOAD_FLOW_DEBUGGING.md](PAYLOAD_FLOW_DEBUGGING.md)
   - 如何通过 `pycloud_parallel.payload_flow` 判断 payload 走的是哪条路径
+- [RUNTIME_LIMITS.md](RUNTIME_LIMITS.md)
+  - inline / ObjectRef / gRPC 消息大小等运行时阈值的统一调参入口
 - [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
   - `runtime` 作为 Python 版本约束的当前语义
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)

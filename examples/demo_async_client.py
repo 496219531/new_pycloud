@@ -16,10 +16,11 @@ def main():
     dependency_allowlist = []
     blob = (
         b"from pycloud_parallel import pycloud_export\n\n"
+        b"import pandas as pd \n\n"
         b"@pycloud_export\n"
         b"def square(x=0, **_kwargs):\n"
-        b"    x = int(x)\n"
-        b"    return {'x': x, 'y': x * x}\n\n"
+        b"    x=pd.DataFrame(columns=[0,1,2,3,4],index=range(100000)) \n"
+        b"    return x\n\n"
         b"@pycloud_export\n"
         b"def fibonacci(n=0, **_kwargs):\n"
         b"    n = int(n)\n"

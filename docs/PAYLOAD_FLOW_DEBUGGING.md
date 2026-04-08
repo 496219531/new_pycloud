@@ -17,7 +17,7 @@
 
 只看业务代码时，很多时候很难直观看出来：
 
-1. `DataFrame` 这次到底是 inline 了，还是走了 parquet 上传
+1. `DataFrame` / `Series` 这次到底是 inline 了，还是走了 bundle 对象上传
 2. 参数里的 `ObjectRef` 是否在节点侧被成功解引用
 3. 返回结果是 inline dict，还是 `ResultRef`
 4. 用户函数最终收到的是：
@@ -88,12 +88,12 @@
 
 ```text
 event=inline_payload_encode context=service call payload size_bytes=312 summary=DataFrame(shape=(10, 3), index=DatetimeIndex, columns=Index)
-event=object_ref_upload path_type=dataframe format=parquet summary=DataFrame(shape=(5000, 12), index=MultiIndex, columns=Index)
-event=object_ref_resolve materialize_as=dataframe summary=ObjectRef(format=parquet, size_bytes=123456, materialize_as=dataframe)
+event=object_ref_upload path_type=dataframe format=dfbundle summary=DataFrame(shape=(5000, 12), index=MultiIndex, columns=Index)
+event=object_ref_resolve materialize_as=dataframe summary=ObjectRef(format=dfbundle, size_bytes=123456, materialize_as=dataframe)
 event=user_invoke mode=args_kwargs args_summary=list(len=3) kwargs_summary=dict(len=0, keys=[])
 event=result_ref_store path_type=dataframe summary=DataFrame(shape=(80000, 20), index=RangeIndex, columns=Index)
-event=result_ref_fetch format=parquet materialize_as=dataframe target_path=<temp> summary=ResultRef(format=parquet, size_bytes=456789, materialize_as=dataframe, node_id=node-1)
-event=result_materialize materialize_as=dataframe format=parquet path=/tmp/pycloud-result-xxx.parquet
+event=result_ref_fetch format=dfbundle materialize_as=dataframe target_path=<temp> summary=ResultRef(format=dfbundle, size_bytes=456789, materialize_as=dataframe, node_id=node-1)
+event=result_materialize materialize_as=dataframe format=dfbundle path=/tmp/pycloud-result-xxx.zip
 event=taskpool_submit_grpc pool_id=pool-1 task_count=10 job_id=pool-job-1
 event=taskpool_submit_state_result pool_id=pool-1 accepted=10 rejected=0
 event=task_result_report task_id=pool-job-1-task-0001 status=SUCCEEDED result_summary=dict(len=1, keys=['value'])
@@ -297,7 +297,7 @@ fn(payload)
 
 ## 7. pandas 调试时怎么读这些日志
 
-如果你在查 `DataFrame` / `Series`，重点看 `summary`。
+如果你在查 `DataFrame` / `Series`，重点看 `summary` 和 `format`。
 
 例如：
 
@@ -325,7 +325,18 @@ summary=Series(len=200, index=DatetimeIndex, name='nav')
 1. `event=object_ref_upload`
 2. `path_type=dataframe`
 
-说明这次走的是 parquet 对象上传。
+说明这次走的是对象 bundle 上传。
+
+当前 pandas 对象路径的统一语义是：
+
+1. inline 路径
+   - 直接编码成可传输结构
+2. object/result 路径
+   - `DataFrame` 使用 `dfbundle`
+   - `Series` 使用 `seriesbundle`
+   - bundle 内部包含：
+     - `data.parquet`
+     - `meta.json`
 
 如果你在查 taskpool，推荐看这一组组合：
 

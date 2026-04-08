@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -16,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -48,13 +50,17 @@ from pycloud_parallel.controlplane.runtime_spec import (
     matches_python_runtime,
     normalize_python_runtime_spec,
 )
+from pycloud_parallel.controlplane.config import FILE_HASH_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.serialization import (
     convert_arrow_to_dict,
     convert_dict_to_arrow,
+    dataframe_bundle_parquet_frame,
     dict_to_struct,
     is_arrow_compatible,
     log_payload_flow,
     serialize_arrow_compatible,
+    serialize_dataframe_bundle,
+    serialize_series_bundle,
     serialize_inline_result,
     summarize_payload_flow_value,
     struct_to_dict,
@@ -62,6 +68,7 @@ from pycloud_parallel.controlplane.serialization import (
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 _DEFAULT_EXPORT_DECORATOR = "pycloud_export"
+service_timing_logger = logging.getLogger("pycloud_parallel.service_timing")
 
 
 class LargeResultError(ValueError):
@@ -391,7 +398,7 @@ def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) 
     )
 
 
-def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+def _sha256_file(path: Path, *, chunk_size: int = FILE_HASH_CHUNK_SIZE_BYTES) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
         while True:
@@ -448,17 +455,51 @@ def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
 
 
 def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtifact:
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".parquet", dir=str(Path(object_dir).resolve()))
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        frame.to_parquet(tmp_path)
+        import io
+        import zipfile
+
+        parquet_buf = io.BytesIO()
+        dataframe_bundle_parquet_frame(frame).to_parquet(parquet_buf, index=False)
+        meta = serialize_dataframe_bundle(frame)
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("data.parquet", parquet_buf.getvalue())
+            zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
-            fmt="parquet",
+            fmt="dfbundle",
             size_bytes=tmp_path.stat().st_size,
             materialize_as="dataframe",
+        )
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifact:
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        import io
+        import zipfile
+
+        parquet_buf = io.BytesIO()
+        series.to_frame("__pycloud_series_value__").to_parquet(parquet_buf, index=False)
+        meta = serialize_series_bundle(series)
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("data.parquet", parquet_buf.getvalue())
+            zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        return _commit_result_file(
+            tmp_path,
+            object_dir=object_dir,
+            fmt="seriesbundle",
+            size_bytes=tmp_path.stat().st_size,
+            materialize_as="series",
         )
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -497,6 +538,9 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
         if isinstance(ret, pd.DataFrame):
             log_payload_flow("result_ref_store", path_type="dataframe", summary=summarize_payload_flow_value(ret))
             return _store_result_dataframe(ret, object_dir=object_dir)
+        if isinstance(ret, pd.Series):
+            log_payload_flow("result_ref_store", path_type="series", summary=summarize_payload_flow_value(ret))
+            return _store_result_series(ret, object_dir=object_dir)
     except ImportError:
         pass
 
@@ -1245,8 +1289,6 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
                 if materialized == "bytes":
                     return candidate.read_bytes()
                 if materialized == "json":
-                    import json
-
                     return json.loads(candidate.read_text(encoding="utf-8"))
                 if materialized == "ndarray":
                     try:
@@ -1259,7 +1301,40 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
                         import pandas as pd
                     except ImportError as exc:
                         raise ObjectResolutionError("pandas not available on node, cannot materialize dataframe") from exc
+                    if str(value.format or "").strip().lower() == "dfbundle":
+                        import zipfile
+                        from pycloud_parallel.controlplane.serialization import deserialize_dataframe_bundle
+
+                        with zipfile.ZipFile(candidate) as zf:
+                            if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
+                                with zf.open("data.parquet") as fh:
+                                    frame = pd.read_parquet(fh)
+                                with zf.open("meta.json") as fh:
+                                    meta = json.load(fh)
+                                return deserialize_dataframe_bundle(meta, frame)
                     return pd.read_parquet(candidate)
+                if materialized == "series":
+                    try:
+                        import pandas as pd
+                    except ImportError as exc:
+                        raise ObjectResolutionError("pandas not available on node, cannot materialize series") from exc
+                    if str(value.format or "").strip().lower() == "seriesbundle":
+                        import zipfile
+                        from pycloud_parallel.controlplane.serialization import deserialize_series_bundle
+
+                        with zipfile.ZipFile(candidate) as zf:
+                            if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
+                                with zf.open("data.parquet") as fh:
+                                    frame = pd.read_parquet(fh)
+                                with zf.open("meta.json") as fh:
+                                    meta = json.load(fh)
+                                if len(frame.columns) != 1:
+                                    raise ObjectResolutionError("series bundle parquet must contain exactly one column")
+                                return deserialize_series_bundle(meta, frame.iloc[:, 0])
+                    frame = pd.read_parquet(candidate)
+                    if len(frame.columns) != 1:
+                        raise ObjectResolutionError("series parquet must contain exactly one column")
+                    return frame.iloc[:, 0]
                 raise ObjectResolutionError(f"unsupported materialize_as: {value.materialize_as}")
 
             candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
@@ -1537,6 +1612,40 @@ class InfoCenterState:
         self._lock = threading.Lock()
         self._nodes: Dict[str, NodeState] = {}
 
+    def _node_is_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
+        current_time = now or utc_now()
+        return (current_time - state.last_seen_at).total_seconds() > float(self.lease_ttl_sec)
+
+    def _node_is_healthy_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
+        return bool(state.healthy) and not self._node_is_stale_locked(state, now=now)
+
+    def _effective_service_state_locked(
+        self,
+        state: NodeState,
+        svc: NodeServiceState,
+        *,
+        now: Optional[datetime] = None,
+    ) -> Tuple[int, int, int, datetime, bool, str]:
+        current_time = now or utc_now()
+        node_healthy = self._node_is_healthy_locked(state, now=current_time)
+        if node_healthy:
+            return (
+                int(svc.status),
+                int(svc.alive_workers),
+                int(svc.in_flight),
+                svc.lease_expire_at,
+                False,
+                "",
+            )
+        return (
+            int(pb2.SERVICE_STATUS_UNSPECIFIED),
+            0,
+            0,
+            current_time,
+            True,
+            "LOST",
+        )
+
     def register_node_record(
         self,
         *,
@@ -1605,6 +1714,7 @@ class InfoCenterState:
         node_id: str,
         healthy: bool,
         metrics: Optional[NodeMetricsState] = None,
+        metadata: Optional[Dict[str, str]] = None,
         services: Optional[Dict[str, NodeServiceState]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
@@ -1620,6 +1730,8 @@ class InfoCenterState:
             state.last_seen_at = now
             if metrics is not None:
                 state.metrics = metrics
+            if metadata is not None:
+                state.metadata = dict(metadata or {})
             state.services = dict(services or {})
             if python_version:
                 state.python_version = str(python_version).strip()
@@ -1668,31 +1780,79 @@ class InfoCenterState:
             )
         return out
 
+    def mark_node_lost(self, node_id: str, *, reason: str = "") -> NodeState:
+        now = utc_now()
+        with self._lock:
+            state = self._nodes.get(node_id)
+            if state is None:
+                raise KeyError("node not found")
+            state.healthy = False
+            state.schedulable = False
+            state.last_seen_at = now - timedelta(seconds=float(self.lease_ttl_sec) + 1.0)
+            state.reason = str(reason or state.reason or "node lost")
+            degraded: Dict[str, NodeServiceState] = {}
+            for service_id, svc in state.services.items():
+                degraded[service_id] = NodeServiceState(
+                    service_name=svc.service_name,
+                    service_id=svc.service_id,
+                    status=int(pb2.SERVICE_STATUS_UNSPECIFIED),
+                    worker_count=max(0, int(svc.worker_count)),
+                    alive_workers=0,
+                    in_flight=0,
+                    lease_expire_at=now,
+                    http_base_url=svc.http_base_url,
+                )
+            state.services = degraded
+            return NodeState(
+                node_id=state.node_id,
+                control_addr=state.control_addr,
+                capacity=state.capacity,
+                queue_capacity=state.queue_capacity,
+                tags=list(state.tags),
+                version=state.version,
+                python_version=state.python_version,
+                metadata=dict(state.metadata),
+                healthy=False,
+                last_seen_at=state.last_seen_at,
+                metrics=NodeMetricsState(**vars(state.metrics)),
+                services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                active_runtimes=list(state.active_runtimes),
+                service_worker_capacity=state.service_worker_capacity,
+                service_worker_used=state.service_worker_used,
+                schedulable=state.schedulable,
+                drain=state.drain,
+                reason=state.reason,
+            )
+
     def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> List[Dict[str, object]]:
         now = utc_now()
         name_filter = service_name.strip()
         with self._lock:
             out: List[Dict[str, object]] = []
             for state in self._nodes.values():
-                stale = (now - state.last_seen_at).total_seconds() > float(self.lease_ttl_sec)
-                is_healthy = state.healthy and not stale
+                is_healthy = self._node_is_healthy_locked(state, now=now)
                 if healthy_only and not is_healthy:
                     continue
                 for svc in state.services.values():
                     if name_filter and svc.service_name != name_filter:
                         continue
+                    effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
+                        self._effective_service_state_locked(state, svc, now=now)
+                    )
                     out.append(
                         {
                             "service_name": svc.service_name,
                             "service_id": svc.service_id,
-                            "status": svc.status,
+                            "status": effective_status,
+                            "status_text": status_text,
                             "node_id": state.node_id,
                             "control_addr": state.control_addr,
                             "node_healthy": is_healthy,
+                            "stale": stale,
                             "worker_count": svc.worker_count,
-                            "alive_workers": svc.alive_workers,
-                            "in_flight": svc.in_flight,
-                            "lease_expire_at": svc.lease_expire_at,
+                            "alive_workers": effective_alive,
+                            "in_flight": effective_in_flight,
+                            "lease_expire_at": effective_lease_expire_at,
                             "http_base_url": svc.http_base_url,
                         }
                     )
@@ -1713,8 +1873,7 @@ class InfoCenterState:
         with self._lock:
             out: List[NodeState] = []
             for state in self._nodes.values():
-                stale = (now - state.last_seen_at).total_seconds() > float(self.lease_ttl_sec)
-                is_healthy = state.healthy and not stale
+                is_healthy = self._node_is_healthy_locked(state, now=now)
                 if healthy_only and not is_healthy:
                     continue
                 if filter_tags and not filter_tags.issubset(set(state.tags)):
@@ -1907,6 +2066,7 @@ class ServiceSession:
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""
+    timing_metrics: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -2047,6 +2207,101 @@ class NodeControlState:
             self._service_http_gateway.start()
             if not self.service_http_base_url:
                 self.service_http_base_url = self._service_http_gateway.base_url
+
+    def _record_service_timing_locked(
+        self,
+        session: ServiceSession,
+        *,
+        method: str,
+        ok: bool,
+        http_status: int,
+        setup_ms: float,
+        executor_ms: float,
+        finalize_ms: float,
+        total_ms: float,
+        subprocess_timings: Optional[Dict[str, object]] = None,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> None:
+        try:
+            metrics = dict(session.timing_metrics or {})
+            call_count = int(metrics.get("call_count", 0) or 0) + 1
+            error_count = int(metrics.get("error_count", 0) or 0) + (0 if ok else 1)
+            metrics["call_count"] = call_count
+            metrics["error_count"] = error_count
+            metrics["last_method"] = str(method or "")
+            metrics["last_ok"] = bool(ok)
+            metrics["last_http_status"] = int(http_status)
+            metrics["last_total_ms"] = round(float(total_ms), 3)
+            metrics["last_setup_ms"] = round(float(setup_ms), 3)
+            metrics["last_executor_ms"] = round(float(executor_ms), 3)
+            metrics["last_finalize_ms"] = round(float(finalize_ms), 3)
+            metrics["max_total_ms"] = round(max(float(metrics.get("max_total_ms", 0.0) or 0.0), float(total_ms)), 3)
+            metrics["avg_setup_ms"] = round(
+                ((float(metrics.get("avg_setup_ms", 0.0) or 0.0) * (call_count - 1)) + float(setup_ms)) / call_count,
+                3,
+            )
+            metrics["avg_executor_ms"] = round(
+                ((float(metrics.get("avg_executor_ms", 0.0) or 0.0) * (call_count - 1)) + float(executor_ms)) / call_count,
+                3,
+            )
+            metrics["avg_finalize_ms"] = round(
+                ((float(metrics.get("avg_finalize_ms", 0.0) or 0.0) * (call_count - 1)) + float(finalize_ms)) / call_count,
+                3,
+            )
+            metrics["avg_total_ms"] = round(
+                ((float(metrics.get("avg_total_ms", 0.0) or 0.0) * (call_count - 1)) + float(total_ms)) / call_count,
+                3,
+            )
+            if subprocess_timings:
+                invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
+                metrics["last_invoke_ms"] = round(invoke_ms, 3)
+                metrics["avg_invoke_ms"] = round(
+                    ((float(metrics.get("avg_invoke_ms", 0.0) or 0.0) * (call_count - 1)) + invoke_ms) / call_count,
+                    3,
+                )
+            else:
+                metrics.setdefault("last_invoke_ms", 0.0)
+                metrics.setdefault("avg_invoke_ms", 0.0)
+            metrics["last_error_type"] = str(error_type or "")
+            metrics["last_error_message"] = str(error_message or "")
+            metrics["updated_at"] = utc_now().isoformat()
+            session.timing_metrics = metrics
+
+            event = {
+                "event": "service_timing",
+                "service_id": session.service_id,
+                "service_name": session.service_name,
+                "method": str(method or ""),
+                "ok": bool(ok),
+                "http_status": int(http_status),
+                "setup_ms": round(float(setup_ms), 3),
+                "executor_ms": round(float(executor_ms), 3),
+                "finalize_ms": round(float(finalize_ms), 3),
+                "total_ms": round(float(total_ms), 3),
+                "error_type": str(error_type or ""),
+                "error_message": str(error_message or ""),
+            }
+            if subprocess_timings:
+                event["subprocess"] = dict(subprocess_timings)
+            service_timing_logger.info(json.dumps(event, ensure_ascii=False))
+        except Exception as exc:
+            logger = logging.getLogger(__name__)
+            logger.debug("failed to record service timing: %r", exc)
+
+    def service_timing_metadata(self) -> Dict[str, str]:
+        with self._lock:
+            payload: Dict[str, object] = {}
+            for session in self._services.values():
+                if not session.timing_metrics:
+                    continue
+                payload[session.service_id] = {
+                    "service_name": session.service_name,
+                    **dict(session.timing_metrics),
+                }
+        if not payload:
+            return {}
+        return {"service_timing_metrics": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
 
     def close(self) -> None:
         self._stop_event.set()
@@ -3173,6 +3428,7 @@ class NodeControlState:
         service_token: str,
         timeout_sec: float,
     ) -> Tuple[int, Dict[str, object]]:
+        total_start = time.perf_counter()
         requested_method = str(method or "").strip()
         if not requested_method:
             return 400, {"ok": False, "error": "method is required"}
@@ -3194,8 +3450,10 @@ class NodeControlState:
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
             session.in_flight += 1
+        setup_end = time.perf_counter()
 
         try:
+            executor_start = time.perf_counter()
             resp = self._executor_host.call_service(
                 service_id=service_id,
                 timeout_sec=max(0.1, timeout_sec),
@@ -3208,6 +3466,7 @@ class NodeControlState:
                     managed_globals_digest=session.managed_globals_digest,
                 ),
             )
+            executor_end = time.perf_counter()
             if not resp.get("ok", False):
                 if resp.get("timeout", False):
                     raise FutureTimeout()
@@ -3216,35 +3475,112 @@ class NodeControlState:
             result = resp.get("result")
             err_type = str(resp.get("err_type", "") or "")
             err_message = str(resp.get("err_message", "") or "")
+            subprocess_timings = dict(resp.get("timings") or {})
         except FutureTimeout:
             with self._lock:
                 session = self._services.get(service_id)
                 if session is not None:
                     session.in_flight = max(0, session.in_flight - 1)
+                    self._record_service_timing_locked(
+                        session,
+                        method=requested_method,
+                        ok=False,
+                        http_status=504,
+                        setup_ms=(setup_end - total_start) * 1000.0,
+                        executor_ms=(time.perf_counter() - setup_end) * 1000.0,
+                        finalize_ms=0.0,
+                        total_ms=(time.perf_counter() - total_start) * 1000.0,
+                        subprocess_timings=None,
+                        error_type="Timeout",
+                        error_message="invoke timeout",
+                    )
             return 504, {"ok": False, "error": "invoke timeout"}
         except Exception as exc:
             with self._lock:
                 session = self._services.get(service_id)
                 if session is not None:
                     session.in_flight = max(0, session.in_flight - 1)
+                    self._record_service_timing_locked(
+                        session,
+                        method=requested_method,
+                        ok=False,
+                        http_status=500,
+                        setup_ms=(setup_end - total_start) * 1000.0,
+                        executor_ms=(time.perf_counter() - setup_end) * 1000.0,
+                        finalize_ms=0.0,
+                        total_ms=(time.perf_counter() - total_start) * 1000.0,
+                        subprocess_timings=None,
+                        error_type=exc.__class__.__name__,
+                        error_message=repr(exc),
+                    )
             return 500, {"ok": False, "error": repr(exc)}
 
         with self._lock:
             session = self._services.get(service_id)
             if session is not None:
                 session.in_flight = max(0, session.in_flight - 1)
+        finalize_start = time.perf_counter()
 
         if status_text == "SUCCEEDED":
             if isinstance(result, StoredResultArtifact):
                 result = _stored_result_to_result_ref(result, node_id=self.node_id)
+            finalize_end = time.perf_counter()
+            with self._lock:
+                session = self._services.get(service_id)
+                if session is not None:
+                    self._record_service_timing_locked(
+                        session,
+                        method=requested_method,
+                        ok=True,
+                        http_status=200,
+                        setup_ms=(setup_end - total_start) * 1000.0,
+                        executor_ms=(executor_end - executor_start) * 1000.0,
+                        finalize_ms=(finalize_end - finalize_start) * 1000.0,
+                        total_ms=(finalize_end - total_start) * 1000.0,
+                        subprocess_timings=subprocess_timings,
+                    )
             return 200, {"ok": True, "method": requested_method, "data": result or {}}
         if status_text == "FAILED_USER":
+            finalize_end = time.perf_counter()
+            with self._lock:
+                session = self._services.get(service_id)
+                if session is not None:
+                    self._record_service_timing_locked(
+                        session,
+                        method=requested_method,
+                        ok=False,
+                        http_status=400,
+                        setup_ms=(setup_end - total_start) * 1000.0,
+                        executor_ms=(executor_end - executor_start) * 1000.0,
+                        finalize_ms=(finalize_end - finalize_start) * 1000.0,
+                        total_ms=(finalize_end - total_start) * 1000.0,
+                        subprocess_timings=subprocess_timings,
+                        error_type=err_type or "UserError",
+                        error_message=err_message or "user error",
+                    )
             return 400, {
                 "ok": False,
                 "method": requested_method,
                 "error_type": err_type or "UserError",
                 "error": err_message or "user error",
             }
+        finalize_end = time.perf_counter()
+        with self._lock:
+            session = self._services.get(service_id)
+            if session is not None:
+                self._record_service_timing_locked(
+                    session,
+                    method=requested_method,
+                    ok=False,
+                    http_status=503,
+                    setup_ms=(setup_end - total_start) * 1000.0,
+                    executor_ms=(executor_end - executor_start) * 1000.0,
+                    finalize_ms=(finalize_end - finalize_start) * 1000.0,
+                    total_ms=(finalize_end - total_start) * 1000.0,
+                    subprocess_timings=subprocess_timings,
+                    error_type=err_type or "InfraError",
+                    error_message=err_message or "infra error",
+                )
         return 503, {
             "ok": False,
             "method": requested_method,
@@ -3370,6 +3706,7 @@ class NodeControlState:
                 "lease_expire_at": session.lease_expire_at,
                 "http_base_url": session.http_base_url,
                 "methods": sorted(session.methods.keys()),
+                "timing_metrics": dict(session.timing_metrics or {}),
             }
 
     def submit_tasks(self, request: pb2.SubmitTasksRequest) -> Tuple[List[pb2.TaskAccepted], List[pb2.TaskRejected], int]:

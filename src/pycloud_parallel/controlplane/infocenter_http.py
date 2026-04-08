@@ -16,6 +16,14 @@ from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsStat
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
+def _is_client_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
 def _split_host_port(bind: str) -> Tuple[str, int]:
     if ":" not in bind:
         raise ValueError("bind must be host:port")
@@ -63,22 +71,33 @@ def _service_status_text(status: int) -> str:
     return mapping.get(int(status or 0), f"UNKNOWN({int(status or 0)})")
 
 
-def _serialize_service(service: NodeServiceState) -> Dict[str, object]:
+def _effective_service_status_text(*, node_healthy: bool, service_status: int) -> str:
+    if not bool(node_healthy):
+        return "LOST"
+    return _service_status_text(service_status)
+
+
+def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) -> Dict[str, object]:
+    status_text = _effective_service_status_text(node_healthy=node_healthy, service_status=service.status)
     return {
         "service_name": str(service.service_name),
         "service_id": str(service.service_id),
         "status": int(service.status),
-        "status_text": _service_status_text(service.status),
+        "status_text": status_text,
+        "node_healthy": bool(node_healthy),
         "worker_count": int(service.worker_count),
-        "alive_workers": int(service.alive_workers),
-        "in_flight": int(service.in_flight),
+        "alive_workers": int(service.alive_workers if node_healthy else 0),
+        "in_flight": int(service.in_flight if node_healthy else 0),
         "lease_expire_at": _dt_text(service.lease_expire_at),
         "http_base_url": str(service.http_base_url or ""),
     }
 
 
 def _serialize_node(state) -> Dict[str, object]:
-    services = [_serialize_service(svc) for svc in sorted(state.services.values(), key=lambda item: (item.service_name, item.service_id))]
+    services = [
+        _serialize_service(svc, node_healthy=bool(state.healthy))
+        for svc in sorted(state.services.values(), key=lambda item: (item.service_name, item.service_id))
+    ]
     loaded_services = sorted({svc["service_name"] for svc in services})
     return {
         "node_id": state.node_id,
@@ -111,15 +130,35 @@ def _serialize_node(state) -> Dict[str, object]:
     }
 
 
+def _parse_service_timing_metrics(node_metadata: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    raw = str((node_metadata or {}).get("service_timing_metrics", "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: Dict[str, Dict[str, object]] = {}
+    for service_id, item in payload.items():
+        if isinstance(item, dict):
+            out[str(service_id)] = dict(item)
+    return out
+
+
 def _render_ops_page(state: InfoCenterState) -> str:
     nodes = state.list_nodes(healthy_only=False, tags=(), limit=10000)
     node_rows: List[str] = []
     service_rows: List[str] = []
     for node in nodes:
         services = sorted(node.services.values(), key=lambda item: (item.service_name, item.service_id))
+        node_healthy = bool(node.healthy)
+        timing_map = _parse_service_timing_metrics(dict(node.metadata))
         loaded = "<br>".join(
             f"{html.escape(svc.service_name)} "
-            f"<span class='muted'>[{svc.alive_workers}/{svc.worker_count} alive, in-flight {svc.in_flight}]</span>"
+            f"<span class='muted'>[{(svc.alive_workers if node_healthy else 0)}/{svc.worker_count} alive, "
+            f"in-flight {(svc.in_flight if node_healthy else 0)}]</span>"
             for svc in services
         ) or "-"
         active_runtimes = ", ".join(node.active_runtimes[:10]) or "-"
@@ -147,29 +186,50 @@ def _render_ops_page(state: InfoCenterState) -> str:
             "</tr>"
         )
         for svc in services:
+            stale_row = "" if node_healthy else " class='stale-row'"
+            timing = timing_map.get(str(svc.service_id), {})
             service_rows.append(
-                "<tr>"
+                f"<tr{stale_row}>"
                 f"<td>{html.escape(node.node_id)}</td>"
                 f"<td>{html.escape(svc.service_name)}</td>"
                 f"<td>{html.escape(svc.service_id)}</td>"
-                f"<td>{html.escape(_service_status_text(svc.status))}</td>"
+                f"<td>{'yes' if node_healthy else 'no'}</td>"
+                f"<td>{html.escape(_effective_service_status_text(node_healthy=node_healthy, service_status=svc.status))}</td>"
                 f"<td>{svc.worker_count}</td>"
-                f"<td>{svc.alive_workers}</td>"
-                f"<td>{svc.in_flight}</td>"
+                f"<td>{svc.alive_workers if node_healthy else 0}</td>"
+                f"<td>{svc.in_flight if node_healthy else 0}</td>"
+                f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_total_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_setup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_executor_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_finalize_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_setup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_executor_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_finalize_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('max_total_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_invoke_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_method', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_error_type', '-')))}</td>"
                 f"<td>{html.escape(_dt_text(svc.lease_expire_at))}</td>"
                 f"<td>{html.escape(svc.http_base_url or '-')}</td>"
                 "</tr>"
             )
     node_body = "\n".join(node_rows) or "<tr><td colspan='14'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='9'>no services</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='24'>no services</td></tr>"
     return (
         "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
         "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;}th{background:#f5f5f5;text-align:left;}"
-        "h2{margin-top:28px;} .muted{color:#666;} .section-note{color:#555;font-size:12px;margin:6px 0 10px;}</style>"
+        "h2{margin-top:28px;} .muted{color:#666;} .section-note{color:#555;font-size:12px;margin:6px 0 10px;}"
+        ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
         "</head><body>"
         "<h1>InfoCenter Ops</h1>"
-        "<div class='section-note'>Node table shows task-mode pressure and service capacity. Service table below shows each deployed service instance and its worker process counts.</div>"
+        "<div class='section-note'>Node table shows task-mode pressure and service capacity. "
+        "Service table below shows each deployed service instance, worker process counts, and aggregated timing metrics. "
+        "Timing details are split into setup/executor/finalize segments. "
+        "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         "<table><thead><tr>"
         "<th>node_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th>"
         "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
@@ -178,7 +238,7 @@ def _render_ops_page(state: InfoCenterState) -> str:
         "</tbody></table>"
         "<h2>Service Instances</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>service_name</th><th>service_id</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>lease_expire_at</th><th>http_base_url</th>"
+        "<th>node_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>lease_expire_at</th><th>http_base_url</th>"
         "</tr></thead><tbody>"
         f"{service_body}"
         "</tbody></table></body></html>"
@@ -251,6 +311,7 @@ class InfoCenterHttpServer:
                             cpu_percent=float(metrics_raw.get("cpu_percent", 0.0) or 0.0),
                             mem_percent=float(metrics_raw.get("mem_percent", 0.0) or 0.0),
                         ),
+                        metadata=dict(payload.get("metadata") or {}),
                         services=_parse_services(payload.get("services")),
                         python_version=str(payload.get("python_version", "") or ""),
                         active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
@@ -293,6 +354,8 @@ class InfoCenterHttpServer:
                         state.update_node_schedule_state(node_id, drain=True)
                     elif action == "undrain":
                         state.update_node_schedule_state(node_id, drain=False)
+                    elif action == "mark-lost":
+                        state.mark_node_lost(node_id, reason="marked lost via ops")
                     else:
                         self._send_json(404, {"ok": False, "error": "unknown ops action"})
                         return
@@ -337,11 +400,15 @@ class InfoCenterHttpServer:
                     return
                 if parsed.path == "/ops":
                     raw = _render_ops_page(state).encode("utf-8")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(raw)))
-                    self.end_headers()
-                    self.wfile.write(raw)
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                    except Exception as exc:
+                        if not _is_client_disconnect_error(exc):
+                            raise
                     return
                 if len([x for x in parsed.path.split("/") if x]) == 2 and parsed.path.split("/")[1] == "jobs":
                     parts = [x for x in parsed.path.split("/") if x]
@@ -383,11 +450,15 @@ class InfoCenterHttpServer:
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
                 raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                try:
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except Exception as exc:
+                    if not _is_client_disconnect_error(exc):
+                        raise
 
         self._server = ThreadingHTTPServer((host, port), _Handler)
         self._server.pycloud_owner = self  # type: ignore[attr-defined]

@@ -15,6 +15,14 @@ InvokeHandler = Callable[[str, str, dict, str, float], Tuple[int, Dict[str, obje
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
 
 
+def _is_client_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
 def _split_host_port(bind: str) -> Tuple[str, int]:
     if ":" not in bind:
         raise ValueError("bind must be host:port")
@@ -106,11 +114,15 @@ class ServiceHttpGateway:
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
                 raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                try:
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except Exception as exc:
+                    if not _is_client_disconnect_error(exc):
+                        raise
 
         self._server = ThreadingHTTPServer((host, port), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, name="service-http-gateway", daemon=True)

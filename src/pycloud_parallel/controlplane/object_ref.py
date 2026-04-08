@@ -10,7 +10,7 @@ from typing import Any, Dict
 OBJECT_REF_SENTINEL = "__pycloud_object_ref__"
 _OBJECT_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OBJECT_FORMAT_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_MATERIALIZE_AS = {"path", "dataframe", "ndarray", "json", "bytes"}
+_MATERIALIZE_AS = {"path", "dataframe", "series", "ndarray", "json", "bytes"}
 
 
 def normalize_object_id(object_id: str) -> str:

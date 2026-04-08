@@ -111,6 +111,109 @@ print(final["job"]["status"])
 5. 取消 job
 6. 查询 pool 状态
 7. 关闭 pool
+8. `is_alive()`
+9. `failed / failures`
+10. `iter_results(...) / collect_results(...)`
+11. `iter_data(...) / collect_data(...)`
+12. `iter_items(...) / collect_items(...)`
+
+补充说明：
+
+1. `TaskPoolSession` 不强调 `join()` 这类 owner 常驻语义
+2. 更推荐的使用方式是：
+   - 用 `submit_payloads(...)` 持续发任务
+   - 用 `wait_for_results(...)` / `wait_for_data(...)` 持续收结果
+   - 收完后主动 `close()`
+3. 当前 keepalive 已按 node 独立降级：
+   - 单个 node pool 心跳失败时，会记录到 `failures`
+   - 只要还有别的 active node pool，session 仍可继续使用
+   - 所有 active node pool 都失效时，session 才会进入 `failed=True`
+
+如果你想边到边处理结果，而不是等一批结果都回来再统一处理：
+
+```python
+for item in pool.iter_results(max_count=10, timeout_sec=10.0):
+    print(item.task_id, item.status)
+```
+
+如果你想直接拿已经物化好的结果数据：
+
+```python
+for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
+    print(task_id, data)
+```
+
+说明：
+
+1. 默认 `raise_on_error=False`
+2. 失败结果会返回 `(task_id, None)`
+3. 如果你希望遇到失败立即抛异常，可显式传 `raise_on_error=True`
+
+如果你只是想提交单个任务并拿到这次提交的 `task_id`：
+
+```python
+task_id = pool.run(value=7)
+print(task_id)
+```
+
+如果你想保留原来“提交并直接拿结果”的语义，用：
+
+```python
+result = pool.run.sync(value=7)
+print(result)
+```
+
+注意：
+
+1. `run.sync(...)` 启动前要求当前 session 没有历史未收结果
+2. `imap_unordered(...)` 也要求当前 session 是干净的
+3. 如果你之前已经异步提交过任务，需要先把结果接收干净，再进入这两种独占模式
+
+如果你不想自己迭代，也可以直接收集：
+
+```python
+results = pool.collect_results(max_count=10, timeout_sec=10.0)
+items = pool.collect_data(max_count=10, timeout_sec=10.0)
+```
+
+如果你既想保留流式处理，又不希望单条失败直接打断整批，可以用：
+
+```python
+for item in pool.iter_items(timeout_sec=10.0):
+    if item.ok:
+        print(item.task_id, item.data)
+    else:
+        print(item.task_id, item.error_type, item.error_message)
+```
+
+说明：
+
+1. `max_count=None` 是默认语义
+2. 表示“这次等待当前已提交但尚未返回的结果全部回完，或直到超时”
+3. 如果传整数 `N`，表示“本次最多接收 `N` 条结果后就结束这次阻塞”
+4. `iter_data(...) / collect_data(...)` 遇到失败结果会抛异常
+5. `iter_items(...) / collect_items(...)` 会把成功/失败都显式返回给你
+
+如果你想边准备数据、边 submit、边接收结果，推荐直接用：
+
+```python
+for task_id, data in pool.imap_unordered(
+    payloads,
+    max_in_flight=32,
+    receive_batch=4,
+    result_timeout_sec=30.0,
+):
+    print(task_id, data)
+```
+
+语义：
+
+1. `max_in_flight`
+   - 最多同时保留多少个已提交但未返回的任务
+2. `receive_batch`
+   - 每轮最多接收多少条结果
+3. 结果一到就立即 yield，不需要等整批任务全部结束
+4. `imap_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
 
 ## 4. 结果语义
 

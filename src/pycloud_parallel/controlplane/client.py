@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import contextlib
 import errno
 import hashlib
@@ -11,6 +12,7 @@ import importlib
 import inspect
 import json
 import logging
+import io
 import os
 import queue
 import re
@@ -34,6 +36,13 @@ from urllib.request import Request, urlopen
 import grpc
 from google.protobuf import timestamp_pb2
 
+from pycloud_parallel.controlplane.config import (
+    FILE_HASH_CHUNK_SIZE_BYTES,
+    GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES,
+    GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES,
+    OBJECT_CHUNK_SIZE_BYTES,
+    grpc_channel_options,
+)
 from pycloud_parallel.controlplane.runtime_spec import (
     matches_python_runtime,
     normalize_python_runtime_spec,
@@ -48,9 +57,14 @@ from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import (
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     convert_dict_to_arrow,
+    dataframe_bundle_parquet_frame,
+    deserialize_dataframe_bundle,
+    deserialize_series_bundle,
     dict_to_struct,
     log_payload_flow,
     serialize_arrow_compatible,
+    serialize_dataframe_bundle,
+    serialize_series_bundle,
     serialize_inline_payload,
     summarize_payload_flow_value,
     struct_to_dict,
@@ -60,6 +74,31 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)
+
+_SERVICE_SESSION_LOCK_GUARD = threading.Lock()
+_SERVICE_SESSION_LOCKED_PATHS: Set[str] = set()
+
+
+def _emit_owner_notice(message: str) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    print(f"[DeployedService] {text}", file=sys.stderr, flush=True)
+
+
+def _summarize_discovered_nodes(nodes: Sequence["InfoCenterNode"], *, limit: int = 8) -> str:
+    rows: List[str] = []
+    for node in list(nodes)[: max(1, int(limit))]:
+        rows.append(
+            f"{node.node_id}(healthy={'yes' if node.healthy else 'no'},"
+            f"schedulable={'yes' if node.schedulable else 'no'},"
+            f"drain={'yes' if node.drain else 'no'},"
+            f"svc_avail={int(node.service_worker_available)},"
+            f"py={node.python_version or '-'})"
+        )
+    if len(nodes) > max(1, int(limit)):
+        rows.append(f"...+{len(nodes) - max(1, int(limit))} more")
+    return ", ".join(rows) if rows else "(none)"
 
 
 def pycloud_export(fn):
@@ -345,6 +384,10 @@ def _validate_task_submit_items(tasks: Sequence[pb2.TaskSubmitItem], *, request_
     )
 
 
+def _is_bundle_format(fmt: str, *, expected: str) -> bool:
+    return str(fmt or "").strip().lower() == expected
+
+
 def _materialize_downloaded_result(path: Path, *, result_ref: ResultRef):
     materialized = normalize_materialize_as(result_ref.materialize_as, default="path")
     log_payload_flow(
@@ -365,8 +408,35 @@ def _materialize_downloaded_result(path: Path, *, result_ref: ResultRef):
         return np.load(path, allow_pickle=False)
     if materialized == "dataframe":
         import pandas as pd
+        if _is_bundle_format(result_ref.format, expected="dfbundle"):
+            import zipfile
 
+            with zipfile.ZipFile(path) as zf:
+                if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
+                    with zf.open("data.parquet") as fh:
+                        frame = pd.read_parquet(fh)
+                    with zf.open("meta.json") as fh:
+                        meta = json.load(fh)
+                    return deserialize_dataframe_bundle(meta, frame)
         return pd.read_parquet(path)
+    if materialized == "series":
+        import pandas as pd
+        if _is_bundle_format(result_ref.format, expected="seriesbundle"):
+            import zipfile
+
+            with zipfile.ZipFile(path) as zf:
+                if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
+                    with zf.open("data.parquet") as fh:
+                        frame = pd.read_parquet(fh)
+                    with zf.open("meta.json") as fh:
+                        meta = json.load(fh)
+                    if len(frame.columns) != 1:
+                        raise ValueError("series bundle parquet must contain exactly one column")
+                    return deserialize_series_bundle(meta, frame.iloc[:, 0])
+        frame = pd.read_parquet(path)
+        if len(frame.columns) != 1:
+            raise ValueError("series parquet must contain exactly one column")
+        return frame.iloc[:, 0]
     raise ValueError(f"unsupported result materialize_as: {result_ref.materialize_as!r}")
 
 
@@ -628,7 +698,7 @@ def _retry_infocenter_request(
             time.sleep(min(retry_interval_sec, max(0.05, deadline - time.monotonic())))
 
 
-def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+def _sha256_file(path: Path, *, chunk_size: int = FILE_HASH_CHUNK_SIZE_BYTES) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fp:
         while True:
@@ -639,7 +709,7 @@ def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def _iter_file_chunks(path: Path, *, chunk_size: int = 256 * 1024) -> Iterator[bytes]:
+def _iter_file_chunks(path: Path, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> Iterator[bytes]:
     with path.open("rb") as fp:
         while True:
             chunk = fp.read(max(1, int(chunk_size)))
@@ -797,11 +867,30 @@ def _serialize_data_for_object_ref(
 
         if isinstance(data, pd.DataFrame):
             import io
+            import zipfile
 
-            buf = io.BytesIO()
-            data.to_parquet(buf, index=True)
-            log_payload_flow("object_ref_upload", path_type="dataframe", format=(format or "parquet"), summary=summarize_payload_flow_value(data))
-            return "dataframe", normalize_object_format(format or "parquet", default="parquet"), buf.getvalue()
+            parquet_buf = io.BytesIO()
+            dataframe_bundle_parquet_frame(data).to_parquet(parquet_buf, index=False)
+            meta = serialize_dataframe_bundle(data)
+            bundle_buf = io.BytesIO()
+            with zipfile.ZipFile(bundle_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("data.parquet", parquet_buf.getvalue())
+                zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            log_payload_flow("object_ref_upload", path_type="dataframe", format="dfbundle", summary=summarize_payload_flow_value(data))
+            return "dataframe", "dfbundle", bundle_buf.getvalue()
+        if isinstance(data, pd.Series):
+            import io
+            import zipfile
+
+            parquet_buf = io.BytesIO()
+            data.to_frame("__pycloud_series_value__").to_parquet(parquet_buf, index=False)
+            meta = serialize_series_bundle(data)
+            bundle_buf = io.BytesIO()
+            with zipfile.ZipFile(bundle_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("data.parquet", parquet_buf.getvalue())
+                zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            log_payload_flow("object_ref_upload", path_type="series", format="seriesbundle", summary=summarize_payload_flow_value(data))
+            return "series", "seriesbundle", bundle_buf.getvalue()
     except ImportError:
         pass
 
@@ -837,7 +926,7 @@ def _put_data_via_clients(
     data: Any,
     *,
     format: str = "",
-    chunk_size: int = 256 * 1024,
+    chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
 ) -> ObjectRef:
     if isinstance(data, ObjectRef):
         return data
@@ -893,17 +982,48 @@ def _prepare_managed_global_value_for_upload(
 
     try:
         inline_size = _estimate_managed_global_inline_size(value)
-    except Exception:
+    except Exception as exc:
+        log_payload_flow(
+            "managed_global_estimate_failed",
+            threshold_bytes=max(1, int(object_threshold_bytes)),
+            summary=summarize_payload_flow_value(value),
+            error=repr(exc),
+        )
         return value
     if inline_size <= max(1, int(object_threshold_bytes)):
+        log_payload_flow(
+            "managed_global_inline",
+            threshold_bytes=max(1, int(object_threshold_bytes)),
+            size_bytes=inline_size,
+            summary=summarize_payload_flow_value(value),
+        )
         return value
 
     try:
         if isinstance(value, (dict, list)):
-            return _put_data_via_clients(clients, value, format="json")
-        return _put_data_via_clients(clients, value)
-    except Exception:
-        return value
+            prepared = _put_data_via_clients(clients, value, format="json")
+        else:
+            prepared = _put_data_via_clients(clients, value)
+        log_payload_flow(
+            "managed_global_objectref_ready",
+            threshold_bytes=max(1, int(object_threshold_bytes)),
+            size_bytes=inline_size,
+            summary=summarize_payload_flow_value(prepared),
+        )
+        return prepared
+    except Exception as exc:
+        log_payload_flow(
+            "managed_global_objectref_failed",
+            threshold_bytes=max(1, int(object_threshold_bytes)),
+            size_bytes=inline_size,
+            summary=summarize_payload_flow_value(value),
+            error=repr(exc),
+        )
+        raise ValueError(
+            "managed global exceeds inline threshold and ObjectRef upload failed: "
+            f"size_bytes={inline_size} threshold_bytes={max(1, int(object_threshold_bytes))}; "
+            f"error={exc}"
+        ) from exc
 
 
 def _prepare_managed_globals_values_for_upload(
@@ -981,6 +1101,89 @@ def _write_private_json(path: Path, payload: Dict[str, object]) -> None:
                 os.unlink(tmp_name)
             except OSError:
                 pass
+
+
+@dataclass
+class _ServiceSessionFileLock:
+    path: Path
+    _fp: Optional[io.BufferedRandom] = field(default=None, init=False, repr=False)
+
+    def acquire(self) -> "_ServiceSessionFileLock":
+        normalized = str(self.path.resolve())
+        with _SERVICE_SESSION_LOCK_GUARD:
+            if normalized in _SERVICE_SESSION_LOCKED_PATHS:
+                raise RuntimeError(f"local deploy session already holds cache lock: {self.path}")
+        _ensure_private_dir(self.path.parent)
+        fp = open(self.path, "a+b")
+        try:
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+            if os.name == "nt":
+                import msvcrt
+
+                fp.seek(0)
+                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception as exc:
+            fp.close()
+            raise RuntimeError(
+                f"another local deploy process already owns service session cache lock: {self.path}"
+            ) from exc
+        with _SERVICE_SESSION_LOCK_GUARD:
+            _SERVICE_SESSION_LOCKED_PATHS.add(normalized)
+        self._fp = fp
+        return self
+
+    def write_json(self, payload: Dict[str, object]) -> None:
+        if self._fp is None:
+            raise RuntimeError("service session lock is not acquired")
+        data = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+        self._fp.seek(0)
+        self._fp.truncate()
+        self._fp.write(data)
+        self._fp.flush()
+        try:
+            os.fsync(self._fp.fileno())
+        except OSError:
+            pass
+
+    def clear(self) -> None:
+        if self._fp is None:
+            return
+        self._fp.seek(0)
+        self._fp.truncate()
+        self._fp.flush()
+        try:
+            os.fsync(self._fp.fileno())
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        if self._fp is None:
+            return
+        normalized = str(self.path.resolve())
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._fp.seek(0)
+                msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+        finally:
+            try:
+                self._fp.close()
+            finally:
+                self._fp = None
+                with _SERVICE_SESSION_LOCK_GUARD:
+                    _SERVICE_SESSION_LOCKED_PATHS.discard(normalized)
 
 
 def _load_service_session_cache(
@@ -1159,6 +1362,7 @@ class InfoCenterClient:
         node_id: str,
         healthy: bool = True,
         metrics: Optional[Dict[str, object]] = None,
+        metadata: Optional[Dict[str, str]] = None,
         services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
@@ -1187,6 +1391,7 @@ class InfoCenterClient:
                 "node_id": node_id,
                 "healthy": bool(healthy),
                 "metrics": dict(metrics or {}),
+                "metadata": dict(metadata or {}),
                 "services": serialized_services,
                 "python_version": str(python_version or "").strip(),
                 "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
@@ -1767,7 +1972,7 @@ class _TaskPoolCallProxy:
     session: Any
     method_name: str
 
-    def submit(self, *args, **kwargs) -> pb2.SubmitTasksResponse:
+    def _build_payload(self, *args, **kwargs) -> Dict[str, object]:
         payload: Dict[str, object] = {}
         if args:
             payload["args"] = list(args)
@@ -1775,17 +1980,32 @@ class _TaskPoolCallProxy:
                 payload["kwargs"] = kwargs
         elif kwargs:
             payload.update(kwargs)
-        return self.session.submit_payloads([payload], task_method=self.method_name)
+        return payload
 
-    def __call__(self, *args, **kwargs) -> Sequence[Any]:
-        resp = self.submit(*args, **kwargs)
-        return self.session.wait_for_data(expected_count=len(resp.accepted), timeout_sec=30.0)
+    def submit(self, *args, **kwargs) -> str:
+        payload = self._build_payload(*args, **kwargs)
+        resp = self.session.submit_payloads([payload], task_method=self.method_name)
+        if len(resp.accepted) != 1:
+            raise RuntimeError(
+                f"expected exactly one accepted task for method={self.method_name}, "
+                f"got accepted={len(resp.accepted)} rejected={len(resp.rejected)}"
+            )
+        return str(resp.accepted[0].task_id)
+
+    def __call__(self, *args, **kwargs) -> str:
+        return self.submit(*args, **kwargs)
 
     def sync(self, *args, **kwargs):
-        results = self(*args, **kwargs)
-        if len(results) == 1:
-            return results[0]
-        return results
+        self.session._enter_exclusive_mode("run.sync", require_clean=True)  # noqa: SLF001
+        try:
+            task_id = self.submit(*args, **kwargs)
+            items = self.session._collect_data_for_task_ids({task_id}, timeout_sec=30.0)  # noqa: SLF001
+            results = [data for _, data in items]
+            if len(results) == 1:
+                return results[0]
+            return results
+        finally:
+            self.session._exit_exclusive_mode("run.sync")  # noqa: SLF001
 
 
 class DedicatedTaskServiceSession:
@@ -1806,6 +2026,7 @@ class DedicatedTaskServiceSession:
         self._submit_seq = 0
         self._submit_lock = threading.Lock()
         self._results: "queue.Queue[pb2.TaskResult]" = queue.Queue()
+        self._buffered_results: "deque[pb2.TaskResult]" = deque()
         self._futures: Dict[str, Future] = {}
         self._future_lock = threading.Lock()
         submit_workers = max(1, int(max_submit_workers or sum(int(session.worker_count or 1) for session in group.sessions.values()) or 1))
@@ -1929,6 +2150,67 @@ class DedicatedTaskServiceSession:
             results.append(item)
         return results
 
+    def _iter_buffered_results(
+        self,
+        *,
+        task_ids: Optional[Set[str]] = None,
+        max_count: int = 0,
+    ) -> List[pb2.TaskResult]:
+        matched: List[pb2.TaskResult] = []
+        kept: "deque[pb2.TaskResult]" = deque()
+        while self._buffered_results:
+            item = self._buffered_results.popleft()
+            normalized = str(item.task_id or "").strip()
+            if task_ids is not None and normalized not in task_ids:
+                kept.append(item)
+                continue
+            if max_count > 0 and len(matched) >= max_count:
+                kept.append(item)
+                continue
+            matched.append(item)
+        self._buffered_results = kept
+        return matched
+
+    def _iter_result_items(
+        self,
+        *,
+        max_count: int = 0,
+        timeout_sec: float = 30.0,
+        task_ids: Optional[Set[str]] = None,
+    ) -> Iterator[pb2.TaskResult]:
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        yielded = 0
+        while True:
+            buffered = self._iter_buffered_results(task_ids=task_ids, max_count=(max_count - yielded if max_count > 0 else 0))
+            for item in buffered:
+                yielded += 1
+                yield item
+                if max_count > 0 and yielded >= max_count:
+                    return
+
+            remaining = max(0.01, deadline - time.time())
+            if remaining <= 0:
+                return
+            try:
+                item = self._results.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                return
+            normalized = str(item.task_id or "").strip()
+            if task_ids is not None and normalized not in task_ids:
+                self._buffered_results.append(item)
+                continue
+            yielded += 1
+            yield item
+            if max_count > 0 and yielded >= max_count:
+                return
+
+    def _collect_data_for_task_ids(self, task_ids: Set[str], *, timeout_sec: float = 30.0) -> List[Tuple[str, Any]]:
+        adapter = _PoolResultAdapter(self)
+        out: List[Tuple[str, Any]] = []
+        for item in self._iter_result_items(max_count=len(task_ids), timeout_sec=timeout_sec, task_ids=set(task_ids)):
+            out.append((str(item.task_id), adapter.fetch_result_data(item)))
+        return out
+
     def wait_for_data(
         self,
         *,
@@ -1949,6 +2231,60 @@ class DedicatedTaskServiceSession:
         normalized_arg = str(arg_name or "value").strip() or "value"
         payloads = [{normalized_arg: value, **dict(shared_kwargs)} for value in values]
         return self.submit_payloads(payloads, task_method=task_method)
+
+    def imap_unordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        receive_batch: int = 1,
+        submit_timeout_sec: float = 60.0,
+        result_timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+    ) -> Iterator[Tuple[str, Any]]:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        method_name = str(task_method or self._task_method).strip() or self._task_method
+        max_pending = max(1, int(max_in_flight or 1))
+        max_receive = max(1, int(receive_batch or 1))
+        payload_iter = iter(payloads)
+        stream_task_ids: Set[str] = set()
+        input_exhausted = False
+
+        while True:
+            while not input_exhausted and len(stream_task_ids) < max_pending:
+                try:
+                    payload = next(payload_iter)
+                except StopIteration:
+                    input_exhausted = True
+                    break
+                resp = self.submit_payloads([dict(payload or {})], task_method=method_name, timeout_sec=submit_timeout_sec)
+                if len(resp.accepted) != 1:
+                    raise RuntimeError(
+                        f"imap_unordered expected exactly one accepted task per payload, "
+                        f"got accepted={len(resp.accepted)} rejected={len(resp.rejected)}"
+                    )
+                stream_task_ids.add(str(resp.accepted[0].task_id))
+
+            if not stream_task_ids:
+                return
+
+            received_any = False
+            for node_id, item in self._iter_result_items(
+                max_count=max_receive,
+                timeout_sec=result_timeout_sec,
+                wait_ms=wait_ms,
+                task_ids=set(stream_task_ids),
+            ):
+                received_any = True
+                stream_task_ids.discard(str(item.task_id))
+                yield str(item.task_id), self._pools[node_id]._client.fetch_result_data(item)  # noqa: SLF001
+
+            if not received_any and stream_task_ids:
+                raise TimeoutError(
+                    f"imap_unordered did not receive results before timeout; pending_task_ids={sorted(stream_task_ids)}"
+                )
 
     def map(
         self,
@@ -2044,7 +2380,7 @@ class DedicatedTaskServiceSession:
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -2104,6 +2440,17 @@ class _PoolResultAdapter:
         raise RuntimeError(task_result.error.message or "task failed")
 
 
+@dataclass(frozen=True)
+class TaskPoolItem:
+    task_id: str
+    node_id: str
+    ok: bool
+    status: int
+    data: Any = None
+    error_type: str = ""
+    error_message: str = ""
+
+
 class TaskPoolSession:
     """Native dedicated task pool session backed by NodeControl task pool RPCs."""
 
@@ -2126,6 +2473,16 @@ class TaskPoolSession:
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
         self._hb_lock = threading.Lock()
+        self.failed = False
+        self.failures: Dict[str, str] = {}
+        self._active_nodes: set[str] = set(self._pools.keys())
+        self._pending_task_ids: set[str] = set()
+        self._result_state_lock = threading.Lock()
+        self._buffered_result_items: "deque[Tuple[str, pb2.TaskResult]]" = deque()
+        self._exclusive_lock = threading.Lock()
+        self._exclusive_mode = ""
+        self._exclusive_owner_thread_id = 0
+        self._exclusive_depth = 0
 
     @property
     def client_id(self) -> str:
@@ -2185,6 +2542,7 @@ class TaskPoolSession:
         runtime_key: str = "",
     ) -> pb2.SubmitTasksResponse:
         del task_method, timeout_sec, job_id, runtime_key
+        self._assert_session_available("submit_payloads")
         if self._closed:
             raise RuntimeError("task pool session is closed")
         accepted: List[pb2.TaskAccepted] = []
@@ -2209,7 +2567,343 @@ class TaskPoolSession:
             resp = self._pools[node_id].submit_tasks(items, job_id=self.job_id)
             accepted.extend(resp.accepted)
             rejected.extend(resp.rejected)
+        with self._result_state_lock:
+            self._pending_task_ids.update(str(item.task_id) for item in accepted if str(item.task_id).strip())
         return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
+
+    def _mark_result_consumed(self, task_id: str) -> None:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            return
+        with self._result_state_lock:
+            self._pending_task_ids.discard(normalized)
+
+    def _pending_result_count(self) -> int:
+        with self._result_state_lock:
+            return len(self._pending_task_ids)
+
+    def _is_pending_task_id(self, task_id: str) -> bool:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            return False
+        with self._result_state_lock:
+            return normalized in self._pending_task_ids
+
+    def _clear_pending_for_current_job(self) -> None:
+        with self._result_state_lock:
+            self._pending_task_ids.clear()
+            self._buffered_result_items.clear()
+
+    def _buffered_result_count(self) -> int:
+        with self._result_state_lock:
+            return len(self._buffered_result_items)
+
+    def _assert_session_available(self, action: str) -> None:
+        current = threading.get_ident()
+        with self._exclusive_lock:
+            if self._exclusive_mode and self._exclusive_owner_thread_id != current:
+                raise RuntimeError(
+                    f"task pool session is exclusively used by {self._exclusive_mode}; "
+                    f"cannot run {action} concurrently"
+                )
+
+    def _assert_clean_for_exclusive(self, action: str) -> None:
+        pending = self._pending_result_count()
+        buffered = self._buffered_result_count()
+        if pending > 0 or buffered > 0:
+            raise RuntimeError(
+                f"{action} requires a clean task pool session; "
+                f"there are unfinished async tasks or unread results "
+                f"(pending_task_ids={pending}, buffered_results={buffered}). "
+                "Please receive outstanding async results first."
+            )
+
+    def _enter_exclusive_mode(self, mode: str, *, require_clean: bool = False) -> None:
+        current = threading.get_ident()
+        with self._exclusive_lock:
+            if self._exclusive_mode:
+                if self._exclusive_owner_thread_id == current and self._exclusive_mode == mode:
+                    self._exclusive_depth += 1
+                    return
+                raise RuntimeError(
+                    f"task pool session is exclusively used by {self._exclusive_mode}; cannot enter {mode}"
+                )
+        if require_clean:
+            self._assert_clean_for_exclusive(mode)
+        with self._exclusive_lock:
+            if self._exclusive_mode:
+                if self._exclusive_owner_thread_id == current and self._exclusive_mode == mode:
+                    self._exclusive_depth += 1
+                    return
+                raise RuntimeError(
+                    f"task pool session is exclusively used by {self._exclusive_mode}; cannot enter {mode}"
+                )
+            self._exclusive_mode = mode
+            self._exclusive_owner_thread_id = current
+            self._exclusive_depth = 1
+
+    def _exit_exclusive_mode(self, mode: str) -> None:
+        current = threading.get_ident()
+        with self._exclusive_lock:
+            if self._exclusive_mode != mode or self._exclusive_owner_thread_id != current:
+                return
+            self._exclusive_depth -= 1
+            if self._exclusive_depth <= 0:
+                self._exclusive_mode = ""
+                self._exclusive_owner_thread_id = 0
+                self._exclusive_depth = 0
+
+    def _iter_buffered_result_items(
+        self,
+        *,
+        task_ids: Optional[Set[str]] = None,
+        max_count: int = 0,
+    ) -> List[Tuple[str, pb2.TaskResult]]:
+        with self._result_state_lock:
+            matched: List[Tuple[str, pb2.TaskResult]] = []
+            kept: "deque[Tuple[str, pb2.TaskResult]]" = deque()
+            while self._buffered_result_items:
+                node_id, item = self._buffered_result_items.popleft()
+                normalized = str(item.task_id or "").strip()
+                if not self._is_pending_task_id(normalized):
+                    continue
+                if task_ids is not None and normalized not in task_ids:
+                    kept.append((node_id, item))
+                    continue
+                if max_count > 0 and len(matched) >= max_count:
+                    kept.append((node_id, item))
+                    continue
+                matched.append((node_id, item))
+            self._buffered_result_items = kept
+            return matched
+
+    def _iter_result_items(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        task_ids: Optional[Set[str]] = None,
+    ) -> Iterator[Tuple[str, pb2.TaskResult]]:
+        del job_id
+        deadline = time.time() + max(0.1, float(timeout_sec))
+        yielded = 0
+        while time.time() < deadline:
+            effective_target = self._pending_result_count() if max_count is None else max(0, int(max_count))
+            if effective_target > 0 and yielded >= effective_target:
+                return
+            buffered = self._iter_buffered_result_items(
+                task_ids=task_ids,
+                max_count=(effective_target - yielded if effective_target > 0 else 0),
+            )
+            for node_id, item in buffered:
+                self._mark_result_consumed(item.task_id)
+                yielded += 1
+                yield node_id, item
+                if effective_target > 0 and yielded >= effective_target:
+                    return
+            any_result = False
+            remaining_by_max = effective_target - yielded if effective_target > 0 else 0
+            for node_id, pool in self._pools.items():
+                per_pull_limit = max(1, int(limit or 100))
+                if remaining_by_max > 0:
+                    per_pull_limit = max(1, min(per_pull_limit, remaining_by_max))
+                resp = pool.pull_results(limit=per_pull_limit, wait_ms=0, cursor="")
+                if not resp.results:
+                    continue
+                any_result = True
+                for item in resp.results:
+                    normalized = str(item.task_id or "").strip()
+                    if not self._is_pending_task_id(normalized):
+                        continue
+                    if task_ids is not None and normalized not in task_ids:
+                        with self._result_state_lock:
+                            self._buffered_result_items.append((node_id, item))
+                        continue
+                    self._mark_result_consumed(item.task_id)
+                    yielded += 1
+                    yield node_id, item
+                    if effective_target > 0 and yielded >= effective_target:
+                        return
+                if effective_target > 0:
+                    remaining_by_max = effective_target - yielded
+                    if remaining_by_max <= 0:
+                        return
+            if self._pending_result_count() <= 0:
+                return
+            if not any_result:
+                time.sleep(max(0.01, min(0.1, wait_ms / 1000.0 if wait_ms > 0 else 0.02)))
+
+    def iter_results(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+    ) -> Iterator[pb2.TaskResult]:
+        self._assert_session_available("iter_results")
+        for _node_id, item in self._iter_result_items(
+            max_count=max_count,
+            timeout_sec=timeout_sec,
+            wait_ms=wait_ms,
+            limit=limit,
+            job_id=job_id,
+        ):
+            yield item
+
+    def collect_results(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+    ) -> List[pb2.TaskResult]:
+        return list(
+            self.iter_results(
+                max_count=max_count,
+                timeout_sec=timeout_sec,
+                wait_ms=wait_ms,
+                limit=limit,
+                job_id=job_id,
+            )
+        )
+
+    def iter_data(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        raise_on_error: bool = False,
+        task_ids: Optional[Set[str]] = None,
+    ) -> Iterator[Tuple[str, Any]]:
+        self._assert_session_available("iter_data")
+        for item in self.iter_items(
+            max_count=max_count,
+            timeout_sec=timeout_sec,
+            wait_ms=wait_ms,
+            limit=limit,
+            job_id=job_id,
+            task_ids=task_ids,
+        ):
+            if not item.ok:
+                if raise_on_error:
+                    raise RuntimeError(item.error_message or f"task failed: {item.task_id}")
+                yield item.task_id, None
+                continue
+            yield item.task_id, item.data
+
+    def collect_data(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        raise_on_error: bool = False,
+        task_ids: Optional[Set[str]] = None,
+    ) -> List[Tuple[str, Any]]:
+        return list(
+            self.iter_data(
+                max_count=max_count,
+                timeout_sec=timeout_sec,
+                wait_ms=wait_ms,
+                limit=limit,
+                job_id=job_id,
+                raise_on_error=raise_on_error,
+                task_ids=task_ids,
+            )
+        )
+
+    def iter_items(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        task_ids: Optional[Set[str]] = None,
+    ) -> Iterator[TaskPoolItem]:
+        self._assert_session_available("iter_items")
+        for node_id, task_result in self._iter_result_items(
+            max_count=max_count,
+            timeout_sec=timeout_sec,
+            wait_ms=wait_ms,
+            limit=limit,
+            job_id=job_id,
+            task_ids=task_ids,
+        ):
+            if int(task_result.status) != int(pb2.TASK_STATUS_SUCCEEDED):
+                error = task_result.error
+                yield TaskPoolItem(
+                    task_id=str(task_result.task_id or ""),
+                    node_id=str(node_id),
+                    ok=False,
+                    status=int(task_result.status),
+                    data=None,
+                    error_type=str(error.type or ""),
+                    error_message=str(error.message or f"task failed: {task_result.task_id}"),
+                )
+                continue
+            try:
+                data = self._pools[node_id]._client.fetch_result_data(task_result)  # noqa: SLF001
+                yield TaskPoolItem(
+                    task_id=str(task_result.task_id or ""),
+                    node_id=str(node_id),
+                    ok=True,
+                    status=int(task_result.status),
+                    data=data,
+                )
+            except Exception as exc:
+                yield TaskPoolItem(
+                    task_id=str(task_result.task_id or ""),
+                    node_id=str(node_id),
+                    ok=False,
+                    status=int(task_result.status),
+                    data=None,
+                    error_type=exc.__class__.__name__,
+                    error_message=str(exc),
+                )
+
+    def collect_items(
+        self,
+        *,
+        max_count: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        task_ids: Optional[Set[str]] = None,
+    ) -> List[TaskPoolItem]:
+        return list(
+            self.iter_items(
+                max_count=max_count,
+                timeout_sec=timeout_sec,
+                wait_ms=wait_ms,
+                limit=limit,
+                job_id=job_id,
+                task_ids=task_ids,
+            )
+        )
+
+    def _collect_data_for_task_ids(self, task_ids: Set[str], *, timeout_sec: float = 30.0) -> List[Tuple[str, Any]]:
+        out: List[Tuple[str, Any]] = []
+        for node_id, item in self._iter_result_items(max_count=len(task_ids), timeout_sec=timeout_sec, task_ids=set(task_ids)):
+            if int(item.status) != int(pb2.TASK_STATUS_SUCCEEDED):
+                error = item.error
+                raise RuntimeError(str(error.message or f"task failed: {item.task_id}"))
+            out.append((str(item.task_id), self._pools[node_id]._client.fetch_result_data(item)))  # noqa: SLF001
+        return out
 
     def wait_for_results(
         self,
@@ -2220,6 +2914,7 @@ class TaskPoolSession:
         limit: int = 100,
         job_id: str = "",
     ) -> Sequence[pb2.TaskResult]:
+        self._assert_session_available("wait_for_results")
         del job_id
         deadline = time.time() + max(0.1, float(timeout_sec))
         results: List[pb2.TaskResult] = []
@@ -2231,6 +2926,7 @@ class TaskPoolSession:
                     if item.task_id in seen:
                         continue
                     seen.add(item.task_id)
+                    self._mark_result_consumed(item.task_id)
                     results.append(item)
             if expected_count > 0 and len(results) >= expected_count:
                 break
@@ -2243,6 +2939,7 @@ class TaskPoolSession:
         expected_count: int = 0,
         timeout_sec: float = 30.0,
     ) -> Sequence[Any]:
+        self._assert_session_available("wait_for_data")
         results = self.wait_for_results(expected_count=expected_count, timeout_sec=timeout_sec)
         return _resolve_task_results_data(_NativePoolResultAdapter(), results)
 
@@ -2257,6 +2954,62 @@ class TaskPoolSession:
         normalized_arg = str(arg_name or "value").strip() or "value"
         payloads = [{normalized_arg: value, **dict(shared_kwargs)} for value in values]
         return self.submit_payloads(payloads, task_method=task_method)
+
+    def imap_unordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        receive_batch: int = 1,
+        submit_timeout_sec: float = 60.0,
+        result_timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        raise_on_error: bool = True,
+    ) -> Iterator[Tuple[str, Any]]:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        self._enter_exclusive_mode("imap_unordered", require_clean=True)
+        try:
+            method_name = str(task_method or self._task_method).strip() or self._task_method
+            max_pending = max(1, int(max_in_flight or 1))
+            max_receive = max(1, int(receive_batch or 1))
+            payload_iter = iter(payloads)
+            input_exhausted = False
+
+            while True:
+                while not input_exhausted and self._pending_result_count() < max_pending:
+                    try:
+                        payload = next(payload_iter)
+                    except StopIteration:
+                        input_exhausted = True
+                        break
+                    resp = self.submit_payloads([dict(payload or {})], task_method=method_name, timeout_sec=submit_timeout_sec)
+                    if len(resp.accepted) != 1:
+                        raise RuntimeError(
+                            f"imap_unordered expected exactly one accepted task per payload, "
+                            f"got accepted={len(resp.accepted)} rejected={len(resp.rejected)}"
+                        )
+
+                if input_exhausted and self._pending_result_count() <= 0:
+                    return
+
+                received_any = False
+                for task_id, data in self.iter_data(
+                    max_count=max_receive if max_receive > 0 else None,
+                    timeout_sec=result_timeout_sec,
+                    wait_ms=wait_ms,
+                    raise_on_error=raise_on_error,
+                ):
+                    received_any = True
+                    yield str(task_id), data
+
+                if not received_any and self._pending_result_count() > 0:
+                    raise TimeoutError(
+                        f"imap_unordered did not receive results before timeout; pending_task_ids={self._pending_result_count()}"
+                    )
+        finally:
+            self._exit_exclusive_mode("imap_unordered")
 
     def map(
         self,
@@ -2276,6 +3029,7 @@ class TaskPoolSession:
         reason: str = "",
         job_id: str = "",
     ) -> pb2.CancelJobResponse:
+        self._assert_session_available("cancel_job")
         effective_job_id = str(job_id or self.job_id).strip()
         queued_cancelled = 0
         running_marked = 0
@@ -2287,6 +3041,8 @@ class TaskPoolSession:
             running_marked += int(resp.running_marked or 0)
             already_done += int(resp.already_done or 0)
             not_found += int(resp.not_found or 0)
+        if effective_job_id == self.job_id:
+            self._clear_pending_for_current_job()
         return pb2.CancelJobResponse(
             ok=True,
             queued_cancelled=queued_cancelled,
@@ -2298,10 +3054,20 @@ class TaskPoolSession:
     def status_map(self) -> Dict[str, pb2.TaskPoolStatusInfo]:
         return {node_id: pool.get_status() for node_id, pool in self._pools.items()}
 
+    def is_alive(self) -> bool:
+        if self._closed:
+            return False
+        if self.failed:
+            return False
+        return any(node_id in self._active_nodes for node_id in self._pools)
+
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:
             if self._hb_thread is not None and self._hb_thread.is_alive():
                 return
+            self.failed = False
+            self.failures = {}
+            self._active_nodes = set(self._pools.keys())
             default_interval = min(
                 max(1.0, float(min(pool.heartbeat_timeout_sec for pool in self._pools.values())) / 2.0),
                 30.0,
@@ -2329,12 +3095,19 @@ class TaskPoolSession:
         seq = 0
         while not self._hb_stop.wait(interval_sec):
             seq += 1
-            for pool in self._pools.values():
+            for node_id, pool in self._pools.items():
+                if node_id not in self._active_nodes:
+                    continue
                 try:
                     pool.heartbeat(seq=seq)
-                except Exception:
-                    self._hb_stop.set()
-                    break
+                    self.failures.pop(node_id, None)
+                except Exception as exc:
+                    self.failures[node_id] = repr(exc)
+                    self._active_nodes.discard(node_id)
+            if not self._active_nodes:
+                self.failed = True
+                self._hb_stop.set()
+                break
 
     def close(self) -> None:
         if self._closed:
@@ -2391,7 +3164,7 @@ class TaskPoolSession:
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -2882,17 +3655,24 @@ class ServiceSessionClient:
     heartbeat_timeout_sec: int
     worker_count: int
     status: int
+    failed: bool = False
+    last_error: str = ""
+    heartbeat_failure_threshold: int = 3
     _hb_stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _hb_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _hb_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _hb_seq: int = field(default=0, repr=False)
     _hb_interval_sec: float = field(default=0.0, repr=False)
+    _hb_consecutive_failures: int = field(default=0, repr=False)
 
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:
             if self._hb_thread is not None and self._hb_thread.is_alive():
                 return
             self._hb_stop.clear()
+            self.failed = False
+            self.last_error = ""
+            self._hb_consecutive_failures = 0
             default_interval = max(1.0, float(self.heartbeat_timeout_sec) / 2.0)
             self._hb_interval_sec = max(0.5, float(interval_sec if interval_sec is not None else default_interval))
             self._hb_thread = threading.Thread(
@@ -2920,6 +3700,9 @@ class ServiceSessionClient:
             seq=self._hb_seq,
         )
         self.status = resp.status
+        self.failed = False
+        self.last_error = ""
+        self._hb_consecutive_failures = 0
         if resp.next_heartbeat_in_sec > 0:
             self._hb_interval_sec = float(resp.next_heartbeat_in_sec)
         return resp
@@ -3009,9 +3792,15 @@ class ServiceSessionClient:
         while not self._hb_stop.wait(max(0.5, self._hb_interval_sec)):
             try:
                 self.heartbeat()
-            except Exception:
-                # Keep trying. If heartbeat stays broken for too long, server will reclaim service.
-                self._hb_interval_sec = max(1.0, self._hb_interval_sec)
+            except Exception as exc:
+                self._hb_consecutive_failures += 1
+                self.last_error = repr(exc)
+                if self._hb_consecutive_failures >= max(1, int(self.heartbeat_failure_threshold or 1)):
+                    self.failed = True
+                    self.status = pb2.SERVICE_STATUS_STOPPED
+                    break
+                # Keep trying for a short window before declaring the owner-side session failed.
+                self._hb_interval_sec = min(1.0, max(0.1, self._hb_interval_sec))
 
 
 class NodeControlClient:
@@ -3020,7 +3809,7 @@ class NodeControlClient:
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
         self.target = target
         self.timeout_sec = max(0.1, float(timeout_sec))
-        self.channel = grpc.insecure_channel(target)
+        self.channel = grpc.insecure_channel(target, options=grpc_channel_options())
         self.stub = pb2_grpc.NodeControlServiceStub(self.channel)
 
     def close(self) -> None:
@@ -3046,7 +3835,7 @@ class NodeControlClient:
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         code_token: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> pb2.UploadCodeResponse:
         path = Path(artifact_path)
         if not path.exists():
@@ -3093,7 +3882,7 @@ class NodeControlClient:
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         code_token: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> pb2.UploadCodeResponse:
         if not client_id:
             raise ValueError("client_id is required")
@@ -3137,7 +3926,7 @@ class NodeControlClient:
         *,
         file_path: str,
         format: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ObjectRef:
         path = Path(file_path)
         if not path.exists():
@@ -3155,7 +3944,7 @@ class NodeControlClient:
         *,
         blob: bytes,
         format: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ObjectRef:
         digest = hashlib.sha256(blob).hexdigest()
         object_id = object_id_from_sha256_hex(digest)
@@ -3369,7 +4158,7 @@ class NodeControlClient:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ServiceSessionClient:
         path = Path(artifact_path)
         if not path.exists():
@@ -3424,7 +4213,7 @@ class NodeControlClient:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ServiceSessionClient:
         tar_path = _package_paths_to_targz(root_dir=Path(root_dir), paths=paths)
         try:
@@ -3532,7 +4321,7 @@ class NodeControlClient:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ServiceSessionClient:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
@@ -3599,7 +4388,7 @@ class NodeControlClient:
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> NativeTaskPoolClient:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
@@ -3936,6 +4725,8 @@ class ServiceGroup:
     breaker_max_cooldown_sec: float = 120.0
     _clients: Dict[str, NodeControlClient] = field(default_factory=dict, repr=False)
     _session_cache_file: Optional[Path] = field(default=None, repr=False)
+    _session_cache_lock: Optional[_ServiceSessionFileLock] = field(default=None, repr=False)
+    _delete_session_cache_on_close: bool = field(default=False, repr=False)
     _artifact_code_version: str = field(default="", repr=False)
     _route_index: int = field(default=0, repr=False)
     _route_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -3964,7 +4755,7 @@ class ServiceGroup:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -4127,6 +4918,7 @@ class ServiceGroup:
             service_name=effective_service_name,
             cache_dir=session_cache_dir,
         )
+        session_cache_lock: Optional[_ServiceSessionFileLock] = None
 
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
         desired_node_count = max(0, int(node_count or 0))
@@ -4136,6 +4928,14 @@ class ServiceGroup:
             int(node_limit),
             len(requested_node_ids),
             desired_node_count or required_success_nodes,
+        )
+
+        _emit_owner_notice(
+            "deploy start "
+            f"service_name={effective_service_name} owner={effective_owner_client_id} "
+            f"target={infocenter_target} runtime={runtime} "
+            f"requested_node_ids={requested_node_ids or 'auto'} "
+            f"min_success_nodes={required_success_nodes}"
         )
 
         def _discover_from_infocenter() -> Tuple[Sequence[InfoCenterServiceRoute], Sequence[InfoCenterNode]]:
@@ -4162,7 +4962,14 @@ class ServiceGroup:
         )
 
         if not discovered_nodes:
-            raise RuntimeError("no available nodes from InfoCenter")
+            _emit_owner_notice(
+                "deploy failed: no available nodes "
+                f"target={infocenter_target} healthy_only={healthy_only} tags={list(tags or ())}"
+            )
+            raise RuntimeError(
+                f"no available nodes from InfoCenter: target={infocenter_target} "
+                f"healthy_only={healthy_only} tags={list(tags or ())}"
+            )
 
         normalized_runtime = normalize_python_runtime_spec(runtime)
         discovered_node_map = {node.node_id: node for node in discovered_nodes}
@@ -4192,10 +4999,23 @@ class ServiceGroup:
                 candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=normalized_runtime)
             if not candidate_nodes:
                 if normalized_runtime:
-                    raise RuntimeError(
-                        f"no schedulable nodes from InfoCenter for runtime {normalized_runtime}"
+                    _emit_owner_notice(
+                        "deploy failed: no schedulable nodes "
+                        f"target={infocenter_target} runtime={normalized_runtime} "
+                        f"candidates={_summarize_discovered_nodes(discovered_nodes)}"
                     )
-                raise RuntimeError("no schedulable nodes from InfoCenter")
+                    raise RuntimeError(
+                        f"no schedulable nodes from InfoCenter for runtime {normalized_runtime}; "
+                        f"target={infocenter_target}; candidates={_summarize_discovered_nodes(discovered_nodes)}"
+                    )
+                _emit_owner_notice(
+                    "deploy failed: no schedulable nodes "
+                    f"target={infocenter_target} candidates={_summarize_discovered_nodes(discovered_nodes)}"
+                )
+                raise RuntimeError(
+                    f"no schedulable nodes from InfoCenter; target={infocenter_target}; "
+                    f"candidates={_summarize_discovered_nodes(discovered_nodes)}"
+                )
             candidate_nodes.sort(
                 key=lambda node: (
                     -int(node.service_worker_available),
@@ -4248,7 +5068,14 @@ class ServiceGroup:
                             f"service_name already exists with same code_version but no reusable local token cache was found: "
                             f"{effective_service_name}"
                         )
-                    return cls._reuse_existing_group(
+                    try:
+                        session_cache_lock = _ServiceSessionFileLock(session_cache_file).acquire()
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            f"another local deploy process is already active for owner_client_id={effective_owner_client_id!r} "
+                            f"service_name={effective_service_name!r}: {exc}"
+                        ) from exc
+                    group = cls._reuse_existing_group(
                         owner_client_id=effective_owner_client_id,
                         service_name=effective_service_name,
                         artifact_code_version=effective_code_version,
@@ -4261,93 +5088,108 @@ class ServiceGroup:
                         breaker_cooldown_sec=breaker_cooldown_sec,
                         breaker_max_cooldown_sec=breaker_max_cooldown_sec,
                         session_cache_file=session_cache_file,
+                        session_cache_lock=session_cache_lock,
                     )
+                    _emit_owner_notice(
+                        f"reuse existing service service_name={effective_service_name} nodes={list(group.sessions.keys())}"
+                    )
+                    return group
 
-                if not replace_existing_if_code_changed:
-                    raise RuntimeError(
-                        f"service_name already exists with different code_version and replacement is disabled: "
-                        f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}"
-                    )
-                if cached_session is None:
-                    raise RuntimeError(
-                        f"service_name already exists with different code_version but no local token cache was found for replacement: "
-                        f"{effective_service_name}"
-                    )
-
-                cls._end_existing_group(
-                    owner_client_id=effective_owner_client_id,
-                    cache_payload=cached_session,
-                    active_routes=existing_infos,
-                    timeout_sec=timeout_sec,
-                    reason=f"replace service due to code change: {effective_code_version}",
+                raise RuntimeError(
+                    f"service_name already exists with different code_version and is still running: "
+                    f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}; "
+                    "stop the active service first, then redeploy with the same service_name"
                 )
-                try:
-                    session_cache_file.unlink()
-                except FileNotFoundError:
-                    pass
 
-        sessions: Dict[str, ServiceSessionClient] = {}
-        clients: Dict[str, NodeControlClient] = {}
-        nodes: Dict[str, InfoCenterNode] = {}
-        failures: Dict[str, str] = {}
-
-        for node in selected_nodes:
-            client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
+        try:
             try:
-                session = client.create_service_from_bytes(
-                    owner_client_id=effective_owner_client_id,
-                    service_name=effective_service_name,
-                    blob=effective_blob,
-                    runtime=runtime,
-                    entry_module=effective_entry_module,
-                    entry_callable=entry_callable,
-                    package_format=effective_package_format,
-                    export_mode=export_mode,
-                    export_methods=export_methods,
-                    dependency_allowlist=dependency_allowlist,
-                    managed_global_names=managed_global_names,
-                    worker_count=worker_count,
-                    heartbeat_timeout_sec=heartbeat_timeout_sec,
-                    idle_ttl_sec=idle_ttl_sec,
-                    expose_http=expose_http,
-                    chunk_size=chunk_size,
+                session_cache_lock = _ServiceSessionFileLock(session_cache_file).acquire()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"another local deploy process is already active for owner_client_id={effective_owner_client_id!r} "
+                    f"service_name={effective_service_name!r}: {exc}"
+                ) from exc
+            sessions: Dict[str, ServiceSessionClient] = {}
+            clients: Dict[str, NodeControlClient] = {}
+            nodes: Dict[str, InfoCenterNode] = {}
+            failures: Dict[str, str] = {}
+
+            for node in selected_nodes:
+                client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
+                try:
+                    session = client.create_service_from_bytes(
+                        owner_client_id=effective_owner_client_id,
+                        service_name=effective_service_name,
+                        blob=effective_blob,
+                        runtime=runtime,
+                        entry_module=effective_entry_module,
+                        entry_callable=entry_callable,
+                        package_format=effective_package_format,
+                        export_mode=export_mode,
+                        export_methods=export_methods,
+                        dependency_allowlist=dependency_allowlist,
+                        managed_global_names=managed_global_names,
+                        worker_count=worker_count,
+                        heartbeat_timeout_sec=heartbeat_timeout_sec,
+                        idle_ttl_sec=idle_ttl_sec,
+                        expose_http=expose_http,
+                        chunk_size=chunk_size,
+                    )
+                except Exception as exc:
+                    failures[node.node_id] = repr(exc)
+                    client.close()
+                    if not allow_partial:
+                        cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
+                        raise RuntimeError(f"deploy failed on node={node.node_id}: {exc}") from exc
+                    continue
+
+                sessions[node.node_id] = session
+                clients[node.node_id] = client
+                nodes[node.node_id] = node
+
+            if len(sessions) < required_success_nodes:
+                cls._cleanup_created_services(sessions=sessions, clients=clients, reason="insufficient success nodes")
+                _emit_owner_notice(
+                    "deploy failed: insufficient success nodes "
+                    f"service_name={effective_service_name} success={len(sessions)} "
+                    f"required={required_success_nodes} failures={failures}"
                 )
-            except Exception as exc:
-                failures[node.node_id] = repr(exc)
-                client.close()
-                if not allow_partial:
-                    cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
-                    raise RuntimeError(f"deploy failed on node={node.node_id}: {exc}") from exc
-                continue
+                raise RuntimeError(
+                    f"deploy success nodes={len(sessions)} < min_success_nodes={required_success_nodes}; "
+                    f"failures={failures}"
+                )
 
-            sessions[node.node_id] = session
-            clients[node.node_id] = client
-            nodes[node.node_id] = node
-
-        if len(sessions) < required_success_nodes:
-            cls._cleanup_created_services(sessions=sessions, clients=clients, reason="insufficient success nodes")
-            raise RuntimeError(
-                f"deploy success nodes={len(sessions)} < min_success_nodes={required_success_nodes}; "
-                f"failures={failures}"
+            group = cls(
+                owner_client_id=effective_owner_client_id,
+                service_name=effective_service_name,
+                sessions=sessions,
+                nodes=nodes,
+                failures=failures,
+                breaker_enabled=bool(breaker_enabled),
+                breaker_failure_threshold=max(1, int(breaker_failure_threshold)),
+                breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
+                breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
+                _clients=clients,
+                _session_cache_file=session_cache_file,
+                _session_cache_lock=session_cache_lock,
+                _artifact_code_version=effective_code_version,
             )
-
-        group = cls(
-            owner_client_id=effective_owner_client_id,
-            service_name=effective_service_name,
-            sessions=sessions,
-            nodes=nodes,
-            failures=failures,
-            breaker_enabled=bool(breaker_enabled),
-            breaker_failure_threshold=max(1, int(breaker_failure_threshold)),
-            breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
-            breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
-            _clients=clients,
-            _session_cache_file=session_cache_file,
-            _artifact_code_version=effective_code_version,
-        )
-        group._persist_session_cache()
-        group._start_keepalive()
-        return group
+            group._persist_session_cache()
+            group._start_keepalive()
+            deployed_nodes = list(sessions.keys())
+            if failures:
+                _emit_owner_notice(
+                    "deploy success with partial failures "
+                    f"service_name={effective_service_name} nodes={deployed_nodes} failures={failures}"
+                )
+            else:
+                _emit_owner_notice(
+                    f"deploy success service_name={effective_service_name} nodes={deployed_nodes}"
+                )
+            return group
+        except Exception:
+            session_cache_lock.close()
+            raise
 
     @classmethod
     def deploy_from_module(
@@ -4367,7 +5209,7 @@ class ServiceGroup:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -4438,7 +5280,7 @@ class ServiceGroup:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -4511,7 +5353,7 @@ class ServiceGroup:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -4585,7 +5427,7 @@ class ServiceGroup:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
@@ -4689,6 +5531,7 @@ class ServiceGroup:
         breaker_cooldown_sec: float,
         breaker_max_cooldown_sec: float,
         session_cache_file: Path,
+        session_cache_lock: _ServiceSessionFileLock,
     ) -> "ServiceGroup":
         cache_nodes = cache_payload.get("nodes")
         if not isinstance(cache_nodes, dict):
@@ -4759,6 +5602,10 @@ class ServiceGroup:
                     client.close()
                 except Exception:
                     pass
+            try:
+                session_cache_lock.close()
+            except Exception:
+                pass
             raise
 
         group = cls(
@@ -4773,6 +5620,7 @@ class ServiceGroup:
             breaker_max_cooldown_sec=max(0.1, float(breaker_max_cooldown_sec)),
             _clients=clients,
             _session_cache_file=session_cache_file,
+            _session_cache_lock=session_cache_lock,
             _artifact_code_version=artifact_code_version,
         )
         group._persist_session_cache()
@@ -4867,10 +5715,17 @@ class ServiceGroup:
                 "worker_count": int(session.worker_count),
             }
         payload["nodes"] = nodes_payload
-        _write_private_json(self._session_cache_file, payload)
+        if self._session_cache_lock is not None:
+            self._session_cache_lock.write_json(payload)
+        else:
+            _write_private_json(self._session_cache_file, payload)
 
     def _clear_session_cache(self) -> None:
         if self._session_cache_file is None:
+            return
+        if self._session_cache_lock is not None:
+            self._session_cache_lock.clear()
+            self._delete_session_cache_on_close = True
             return
         try:
             self._session_cache_file.unlink()
@@ -4981,7 +5836,7 @@ class ServiceGroup:
         file_path: str,
         *,
         format: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ObjectRef:
         refs = [
             client.upload_object_from_file(
@@ -5004,7 +5859,7 @@ class ServiceGroup:
         blob: bytes,
         *,
         format: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ObjectRef:
         refs = [
             client.upload_object_from_bytes(
@@ -5027,7 +5882,7 @@ class ServiceGroup:
         data: Any,
         *,
         format: str = "",
-        chunk_size: int = 256 * 1024,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
     ) -> ObjectRef:
         return _put_data_via_clients(
             list(self._clients.values()),
@@ -5036,13 +5891,13 @@ class ServiceGroup:
             chunk_size=chunk_size,
         )
 
-    def put_dataframe(self, dataframe: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+    def put_dataframe(self, dataframe: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> ObjectRef:
         return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
 
-    def put_ndarray(self, array: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+    def put_ndarray(self, array: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> ObjectRef:
         return self.put_data(array, format="npy", chunk_size=chunk_size)
 
-    def put_json(self, value: Any, *, chunk_size: int = 256 * 1024) -> ObjectRef:
+    def put_json(self, value: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> ObjectRef:
         return self.put_data(value, format="json", chunk_size=chunk_size)
 
     def update_globals(self, values: Dict[str, object]) -> str:
@@ -5086,6 +5941,15 @@ class ServiceGroup:
                         alive = True
                         break
                 if not alive:
+                    self.failures = {
+                        node_id: session.last_error
+                        for node_id, session in self.sessions.items()
+                        if getattr(session, "failed", False)
+                    }
+                    if self.failures:
+                        _emit_owner_notice(
+                            f"owner keepalive stopped service_name={self.service_name} failures={self.failures}"
+                        )
                     return
                 time.sleep(wait_sec)
         except KeyboardInterrupt:
@@ -5336,6 +6200,15 @@ class ServiceGroup:
             except Exception:
                 pass
         self._clients.clear()
+        if self._session_cache_lock is not None:
+            self._session_cache_lock.close()
+            self._session_cache_lock = None
+        if self._delete_session_cache_on_close and self._session_cache_file is not None:
+            try:
+                self._session_cache_file.unlink()
+            except FileNotFoundError:
+                pass
+            self._delete_session_cache_on_close = False
 
 
 class _CallProxy:

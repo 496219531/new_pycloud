@@ -205,7 +205,46 @@ from pycloud_parallel import (
 
 ```bash
 pycloudctl start
+pycloudctl start-controlplane
+pycloudctl start-infocenter
+pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
+pycloudctl start-node --node-id node-1
 pycloudctl status
+pycloudctl doctor
+pycloudctl stop-node node-1
+```
+
+`start` 支持指定运行目录、端口和 worker 容量，只是这些是全局参数，要写在 `start` 前面：
+
+```bash
+pycloudctl \
+  --runtime-root /tmp/pycloud-dev \
+  --controlplane-port 51051 \
+  --node1-port 51061 \
+  --node1-http 18181 \
+  --node2-port 51062 \
+  --node2-http 18182 \
+  --node-worker-capacity 4 \
+  start
+```
+
+不要写成：
+
+```bash
+pycloudctl start --runtime-root /tmp/pycloud-dev
+```
+
+更完整的命令说明、目录规则、日志位置、GC 和示例见：
+
+- [docs/PYCLOUDCTL_USAGE.md](docs/PYCLOUDCTL_USAGE.md)
+
+如果你要单独起 `infocenter`、`gateway(http)`、`nodecontrol` 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
+
+如果升级后怀疑旧服务没停掉，先看：
+
+```bash
+pycloudctl doctor
+pycloudctl stop --scan-ports
 ```
 
 macOS / Linux:
@@ -257,7 +296,8 @@ group = DeployedService.deploy_from_infocenter(
 
 print(group.square.sync(x=7))
 # group.join() 适合 owner 长驻
-# 重新部署同名服务且代码变化时，默认会自动替换旧版本
+# 重新部署同名服务且代码变化时，需先结束旧服务
+# 同一台机器上，同一个 owner_client_id + service_name 只允许一个活跃 deployservice
 ```
 
 如果你的代码依赖节点上未预装的包，可以显式给白名单：
@@ -318,6 +358,23 @@ with TaskPoolSession.from_infocenter(
     resp = pool.submit_payloads([{"value": 7}])
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
     print(results)
+
+    task_id = pool.run(value=11)
+    print(task_id)
+
+    result = pool.run.sync(value=12)
+    print(result)
+
+    items = pool.collect_data(max_count=1, timeout_sec=10.0)
+    print(items)
+
+    for task_id, data in pool.imap_unordered(
+        [{"value": 20}, {"value": 21}],
+        max_in_flight=2,
+        receive_batch=1,
+        result_timeout_sec=10.0,
+    ):
+        print(task_id, data)
 ```
 
 如果你希望先排队，再由调度器自动创建专属 pool，使用 `JobQueueClient`。

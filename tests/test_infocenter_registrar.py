@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
@@ -98,6 +98,8 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert "Service Instances" in raw
             assert "svc-reg-sync" in raw
             assert ">2</td><td>2</td>" in raw
+            assert "last_total_ms" in raw
+            assert "avg_total_ms" in raw
 
             node_state.end_service(
                 owner_client_id="owner-reg",
@@ -111,6 +113,80 @@ def test_node_registrar_syncs_service_routes(tmp_path):
                 return len(routes) == 0
 
             assert _wait_until(_route_cleared, timeout_sec=6.0)
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
+def test_ops_page_marks_lost_service_instances(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    node_state = NodeControlState(
+        node_id="node-ops-01",
+        queue_capacity=32,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_ops"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_target,
+        node_id="node-ops-01",
+        control_addr="127.0.0.1:50071",
+        state=node_state,
+        capacity=2,
+        queue_capacity=32,
+        tags=["compute"],
+        version="test-v1",
+        fallback_heartbeat_sec=1,
+    )
+
+    try:
+        registrar.start()
+        with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
+            assert _wait_until(lambda: len(infocenter.list_nodes(healthy_only=True, tags=["compute"], limit=20)) == 1)
+
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        node_state.create_service(
+            owner_client_id="owner-ops",
+            service_name="svc-ops",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_ops",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=True,
+            chunks=[blob],
+        )
+        def _service_ready() -> bool:
+            with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
+                return len(infocenter.list_service_routes(service_name="svc-ops", healthy_only=True, limit=20)) == 1
+
+        assert _wait_until(_service_ready)
+
+        req = Request(f"{info_target}/ops/nodes/node-ops-01/mark-lost", method="POST", data=b"")
+        with urlopen(req, timeout=5.0) as resp:
+            assert resp.status == 200
+        with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
+            routes = infocenter.list_service_routes(service_name="svc-ops", healthy_only=False, limit=20)
+        assert len(routes) == 1
+        assert routes[0].node_healthy is False
+        assert routes[0].status == pb2.SERVICE_STATUS_UNSPECIFIED
+        with urlopen(f"{info_target}/ops", timeout=5.0) as resp:
+            raw = resp.read().decode("utf-8")
+        assert "node_healthy" in raw
+        assert "LOST" in raw
+        assert "stale-row" in raw
     finally:
         registrar.close()
         node_state.close()

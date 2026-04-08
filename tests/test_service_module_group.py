@@ -1,6 +1,8 @@
 """测试 DeployedService 的模块化调用功能。"""
 
 import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -195,6 +197,63 @@ class TestDeployedService:
         assert result is sentinel
         assert mocked.call_args.kwargs["replace_existing_if_code_changed"] is False
 
+    def test_managed_global_large_value_uses_object_ref_upload(self):
+        """测试超阈值 managed global 会强制转成 ObjectRef。"""
+        from pycloud_parallel.controlplane.client import _prepare_managed_global_value_for_upload
+        from pycloud_parallel.controlplane.object_ref import ObjectRef
+
+        ref = ObjectRef(object_id="sha256:" + "a" * 64, format="parquet", size_bytes=123, materialize_as="dataframe")
+        with patch(
+            "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
+            return_value=1024,
+        ):
+            with patch(
+                "pycloud_parallel.controlplane.client._put_data_via_clients",
+                return_value=ref,
+            ) as mocked:
+                prepared = _prepare_managed_global_value_for_upload(
+                    [MagicMock()],
+                    object(),
+                    object_threshold_bytes=128,
+                )
+
+        assert prepared is ref
+        mocked.assert_called_once()
+
+    def test_managed_global_large_value_upload_failure_raises(self):
+        """测试超阈值 managed global 上传失败时不能静默回退 inline。"""
+        from pycloud_parallel.controlplane.client import _prepare_managed_global_value_for_upload
+
+        with patch(
+            "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
+            return_value=1024,
+        ):
+            with patch(
+                "pycloud_parallel.controlplane.client._put_data_via_clients",
+                side_effect=RuntimeError("parquet engine missing"),
+            ):
+                with pytest.raises(ValueError, match="ObjectRef upload failed"):
+                    _prepare_managed_global_value_for_upload(
+                        [MagicMock()],
+                        object(),
+                        object_threshold_bytes=128,
+                    )
+
+    def test_service_session_cache_lock_rejects_second_local_owner(self, tmp_path):
+        """测试同一个 session cache 文件不能被第二个本地 deploy 进程持有。"""
+        from pycloud_parallel.controlplane.client import _ServiceSessionFileLock
+
+        path = tmp_path / "owner" / "svc.json"
+        first = _ServiceSessionFileLock(path).acquire()
+        try:
+            with pytest.raises(RuntimeError, match="already holds cache lock|already active"):
+                _ServiceSessionFileLock(path).acquire()
+        finally:
+            first.close()
+
+        second = _ServiceSessionFileLock(path).acquire()
+        second.close()
+
     def test_getattr_creates_proxy(self):
         """测试 __getattr__ 创建代理。"""
         from pycloud_parallel.controlplane.client import (
@@ -368,6 +427,114 @@ class TestDeployedService:
 
         result = group.call_sync("square", x=10)
         assert result == {"result": 100}
+
+    def test_deploy_from_infocenter_emits_message_when_no_nodes(self, capsys):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+
+        with patch(
+            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            return_value=((), []),
+        ):
+            with pytest.raises(RuntimeError, match="no available nodes from InfoCenter"):
+                ServiceGroup.deploy_from_infocenter(
+                    infocenter_target="127.0.0.1:50051",
+                    owner_client_id="owner-demo",
+                    service_name="demo-service",
+                    blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                    entry_module="demo_service",
+                    entry_callable="run",
+                )
+
+        err = capsys.readouterr().err
+        assert "[DeployedService] deploy start" in err
+        assert "[DeployedService] deploy failed: no available nodes" in err
+        assert "127.0.0.1:50051" in err
+
+    def test_deploy_from_infocenter_emits_success_message(self, tmp_path, capsys):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **_kwargs):
+                return SimpleNamespace(
+                    service_id="svc-1",
+                    service_token="token-1",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-1",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            return_value=((), [fake_node]),
+        ), patch(
+            "pycloud_parallel.controlplane.client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            ServiceGroup,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            ServiceGroup,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = ServiceGroup.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-service",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                entry_callable="run",
+                session_cache_dir=str(tmp_path),
+            )
+
+        err = capsys.readouterr().err
+        assert "[DeployedService] deploy start" in err
+        assert "[DeployedService] deploy success service_name=demo-service nodes=['node-1']" in err
+        for client in group._clients.values():  # noqa: SLF001
+            client.close()
+
+    def test_join_emits_failure_summary(self, capsys):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+
+        failed_session = SimpleNamespace(
+            failed=True,
+            last_error="RuntimeError('heartbeat unavailable')",
+            _hb_lock=threading.Lock(),
+            _hb_thread=None,
+        )
+        group = ServiceGroup(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": failed_session},
+            nodes={},
+        )
+
+        group.join(poll_interval_sec=0.01)
+        err = capsys.readouterr().err
+        assert "[DeployedService] owner keepalive stopped service_name=demo-service" in err
+        assert "node-1" in err
 
     def test_async_call_all_interface(self):
         """测试异步 call_all 接口。"""

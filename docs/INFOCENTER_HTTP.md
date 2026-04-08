@@ -124,6 +124,23 @@
 http://127.0.0.1:50051/ops
 ```
 
+当前 `/ops` 页面除了节点健康、服务实例、worker 数外，还会展示聚合 timing 指标：
+
+1. `calls`
+2. `errors`
+3. `last_total_ms`
+4. `last_setup_ms`
+5. `last_executor_ms`
+6. `last_finalize_ms`
+7. `avg_total_ms`
+8. `avg_setup_ms`
+9. `avg_executor_ms`
+10. `avg_finalize_ms`
+11. `max_total_ms`
+12. `last_invoke_ms`
+
+这些指标来自 node 侧服务调用 timing 聚合，并随 heartbeat 同步到 InfoCenter。
+
 当前页面显示：
 
 1. 节点健康状态

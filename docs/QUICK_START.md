@@ -25,6 +25,26 @@
 ./scripts/start_services.sh status
 ```
 
+如果你想指定运行目录或端口，参数要写在子命令前面：
+
+```bash
+python -m pycloud_parallel.controlplane.ctl \
+  --runtime-root /tmp/pycloud-dev \
+  --controlplane-port 51051 \
+  --node1-port 51061 \
+  --node1-http 18181 \
+  --node2-port 51062 \
+  --node2-http 18182 \
+  --node-worker-capacity 4 \
+  start
+```
+
+如果已经安装了 CLI，也可以直接：
+
+```bash
+pycloudctl --runtime-root /tmp/pycloud-dev --controlplane-port 51051 start
+```
+
 默认会启动：
 
 1. `controlplane`：`127.0.0.1:50051`
@@ -108,7 +128,7 @@ group = DeployedService.deploy_from_infocenter(
 
 print(group.square.sync(x=7))
 # owner 长驻时可调用 group.join()
-# 固定 service_name 重新部署时，如果代码变化会默认替换旧服务
+# 固定 service_name 重新部署时，如果代码变化需先结束旧服务
 ```
 
 依赖缺失时可显式给补装白名单：
@@ -156,6 +176,23 @@ with TaskPoolSession.from_infocenter(
     resp = pool.submit_payloads([{"value": 7}])
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
     print(results)
+
+    task_id = pool.run(value=11)
+    print(task_id)
+
+    result = pool.run.sync(value=12)
+    print(result)
+
+    for task_id, data in pool.iter_data(max_count=1, timeout_sec=10.0):
+        print(task_id, data)
+
+    for task_id, data in pool.imap_unordered(
+        [{"value": 20}, {"value": 21}, {"value": 22}],
+        max_in_flight=2,
+        receive_batch=1,
+        result_timeout_sec=10.0,
+    ):
+        print(task_id, data)
 
     mapped = pool.map([8, 9, 10], timeout_sec=10.0)
     print(mapped)

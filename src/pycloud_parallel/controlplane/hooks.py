@@ -139,28 +139,21 @@ class InMemoryResultHook:
         Returns:
             Tuple[List[pb2.TaskResult], str]: (结果列表, 下一个游标)
         """
+        del cursor
         timeout = max(0.0, wait_ms / 1000.0)
-        start_seq = 0
-        if cursor:
-            try:
-                start_seq = int(cursor)
-            except ValueError:
-                start_seq = 0
 
         with self._cv:
-            if not self._has_new_locked(client_id, start_seq) and timeout > 0:
+            if not self._has_new_locked(client_id, 0) and timeout > 0:
                 self._cv.wait(timeout=timeout)
 
             q = self._queues[client_id]
             out: List[pb2.TaskResult] = []
-            last_seq = start_seq
-            for item in q:
-                if item.seq <= start_seq:
-                    continue
+            last_seq = 0
+            max_items = max(1, limit)
+            while q and len(out) < max_items:
+                item = q.popleft()
                 out.append(item.result)
                 last_seq = item.seq
-                if len(out) >= max(1, limit):
-                    break
             return out, str(last_seq)
 
     def _has_new_locked(self, client_id: str, seq: int) -> bool:

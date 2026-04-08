@@ -73,7 +73,7 @@ def main():
         print()
 
         # 方式 4：只提供 service_name，使用默认 owner_client_id
-        # 固定 service_name 重新部署时，如果代码变化会默认替换旧服务。
+        # 固定 service_name 重新部署时，如果代码变化需要先结束旧服务。
         print("方式 4：只提供 service_name")
         print("-" * 60)
         custom_name = "my-custom-service"
@@ -87,7 +87,7 @@ def main():
         groups.append(group4)
         print(f"  自动生成的 owner_client_id: {group4.owner_client_id}")
         print(f"  使用的 service_name: {group4.service_name}")
-        print("  重新部署同名服务且代码变化时，默认会自动替换旧版本")
+        print("  重新部署同名服务且代码变化时，需要先结束旧版本")
         print()
     finally:
         # 清理：结束服务，确保脚本可重复运行。

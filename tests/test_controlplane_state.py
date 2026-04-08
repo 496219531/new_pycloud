@@ -10,7 +10,9 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from pycloud_parallel.controlplane.client import ServiceGroup, ServiceSessionClient
 from pycloud_parallel.controlplane.state import NodeControlState, dict_to_struct, struct_to_dict, utc_now
+from pycloud_parallel.controlplane.state import InfoCenterState, NodeServiceState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -81,6 +83,12 @@ def test_submit_poll_report_and_pull_results(tmp_path):
         assert results[0].job_id == "job-alpha"
         assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
         assert int(next_cursor) >= 1
+
+        results2, next_cursor2 = state.pull_results(
+            pb2.PullResultsRequest(client_id="client-a", limit=10, wait_ms=0, cursor=next_cursor)
+        )
+        assert results2 == []
+        assert next_cursor2 == "0"
     finally:
         state.close()
 
@@ -186,6 +194,8 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
     pytest.importorskip("pyarrow")
 
     from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+    from pycloud_parallel.controlplane.client import _materialize_downloaded_result
+    from pycloud_parallel.controlplane.result_ref import ResultRef
 
     index = pd.MultiIndex.from_tuples(
         [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
@@ -194,12 +204,118 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
     frame = pd.DataFrame([[1, 2], [3, 4]], index=index, columns=[10006, 10007])
 
     kind, fmt, blob = _serialize_data_for_object_ref(frame, format="parquet")
+    import tempfile
+    from pathlib import Path
 
-    restored = pd.read_parquet(io.BytesIO(blob))
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-dfbundle-", suffix=".dfbundle")
+    import os
+    os.close(fd)
+    Path(tmp_name).write_bytes(blob)
+    try:
+        import io
+        import zipfile
 
-    assert kind == "dataframe"
-    assert fmt == "parquet"
-    pd.testing.assert_frame_equal(restored, frame)
+        with zipfile.ZipFile(Path(tmp_name)) as zf:
+            with zf.open("data.parquet") as fh:
+                stored_frame = pd.read_parquet(io.BytesIO(fh.read()))
+        assert list(stored_frame.columns) == ["c0", "c1"]
+
+        restored = _materialize_downloaded_result(
+            Path(tmp_name),
+            result_ref=ResultRef(
+                object_id="sha256:" + "b" * 64,
+                node_id="node-1",
+                format=fmt,
+                size_bytes=len(blob),
+                materialize_as="dataframe",
+            ),
+        )
+
+        assert kind == "dataframe"
+        assert fmt == "dfbundle"
+        pd.testing.assert_frame_equal(restored, frame)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+
+
+def test_series_object_upload_preserves_index_and_name():
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    from pycloud_parallel.controlplane.client import _materialize_downloaded_result
+    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+    from pycloud_parallel.controlplane.result_ref import ResultRef
+
+    series = pd.Series(
+        [1.1, 2.2],
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
+            names=["trade_date", "bucket"],
+        ),
+        name=10006,
+    )
+
+    kind, fmt, blob = _serialize_data_for_object_ref(series)
+
+    import os
+    import tempfile
+    from pathlib import Path
+
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-seriesbundle-", suffix=".seriesbundle")
+    os.close(fd)
+    Path(tmp_name).write_bytes(blob)
+    try:
+        restored = _materialize_downloaded_result(
+            Path(tmp_name),
+            result_ref=ResultRef(
+                object_id="sha256:" + "c" * 64,
+                node_id="node-1",
+                format=fmt,
+                size_bytes=len(blob),
+                materialize_as="series",
+            ),
+        )
+
+        assert kind == "series"
+        assert fmt == "seriesbundle"
+        pd.testing.assert_series_equal(restored, series)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+
+
+def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.controlplane.object_ref import object_storage_path
+    from pycloud_parallel.controlplane.state import _resolve_object_refs_in_payload
+
+    frame = pd.DataFrame(
+        [[1, 2], [3, 4]],
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
+            names=["trade_date", "bucket"],
+        ),
+        columns=[10006, 10007],
+    )
+    _kind, fmt, blob = _serialize_data_for_object_ref(frame)
+    object_id = "sha256:" + "d" * 64
+    path = object_storage_path(tmp_path, object_id=object_id, fmt=fmt)
+    path.write_bytes(blob)
+
+    payload = {
+        "frame": ObjectRef(
+            object_id=object_id,
+            format=fmt,
+            size_bytes=len(blob),
+            materialize_as="dataframe",
+        )
+    }
+
+    restored = _resolve_object_refs_in_payload(payload, object_dir=str(tmp_path))
+    pd.testing.assert_frame_equal(restored["frame"], frame)
 
 
 def test_infra_timeout_requeue_then_retry(tmp_path):
@@ -570,6 +686,10 @@ def test_service_session_http_call_and_end(tmp_path):
             body = json.loads(resp.read().decode("utf-8"))
         assert body["ok"] is True
         assert body["data"]["square"] == 64
+        info = state.service_status_info(session.service_id)
+        timing = dict(info.get("timing_metrics") or {})
+        assert int(timing.get("call_count", 0) or 0) >= 1
+        assert float(timing.get("last_total_ms", 0.0) or 0.0) >= 0.0
 
         hb = state.heartbeat_service(
             owner_client_id="owner-a",
@@ -684,6 +804,72 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
         assert info["status"] == pb2.SERVICE_STATUS_STOPPED
     finally:
         state.close()
+
+
+def test_infocenter_stale_node_degrades_service_route_status():
+    state = InfoCenterState(lease_ttl_sec=1, heartbeat_interval_sec=1)
+    state.register_node_record(
+        node_id="node-stale",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+        services={
+            "svc-1": NodeServiceState(
+                service_name="svc-stale",
+                service_id="svc-1",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+            )
+        },
+    )
+    state._nodes["node-stale"].last_seen_at = utc_now() - timedelta(seconds=5)  # noqa: SLF001
+
+    routes = state.list_service_routes(service_name="svc-stale", healthy_only=False, limit=10)
+    assert len(routes) == 1
+    assert routes[0]["node_healthy"] is False
+    assert routes[0]["stale"] is True
+    assert routes[0]["status"] == pb2.SERVICE_STATUS_UNSPECIFIED
+    assert routes[0]["status_text"] == "LOST"
+    assert routes[0]["alive_workers"] == 0
+    assert routes[0]["in_flight"] == 0
+    assert state.list_service_routes(service_name="svc-stale", healthy_only=True, limit=10) == []
+
+
+def test_service_session_keepalive_fails_fast_after_consecutive_errors():
+    class _FailingClient:
+        def heartbeat_service(self, **_kwargs):
+            raise RuntimeError("heartbeat unavailable")
+
+    session = ServiceSessionClient(
+        _client=_FailingClient(),
+        owner_client_id="owner-x",
+        service_id="svc-x",
+        service_token="token-x",
+        http_base_url="",
+        heartbeat_timeout_sec=1,
+        worker_count=1,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        heartbeat_failure_threshold=2,
+    )
+    group = ServiceGroup(
+        owner_client_id="owner-x",
+        service_name="svc-x",
+        sessions={"node-1": session},
+        nodes={},
+    )
+
+    group._start_keepalive(interval_sec=0.05)
+    start = time.monotonic()
+    group.join(poll_interval_sec=0.05)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0
+    assert session.failed is True
+    assert session.status == pb2.SERVICE_STATUS_STOPPED
+    assert "heartbeat unavailable" in session.last_error
+    assert "node-1" in group.failures
 
 
 def test_service_call_recovers_after_executor_host_restart(tmp_path):

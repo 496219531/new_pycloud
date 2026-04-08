@@ -24,12 +24,8 @@ def main():
         b"@pycloud_export\n"
         b"def process_dataframe(df):\n"
         b"    import pandas as pd\n"
-        b"    return {\n"
-        b"        'rows': len(df),\n"
-        b"        'columns': list(df.columns),\n"
-        b"        'sum': df['value'].sum() if 'value' in df.columns else None,\n"
-        b"        'mean': df['value'].mean() if 'value' in df.columns else None\n"
-        b"    }\n\n"
+        b"    return pd.DataFrame(columns=[1,3,4,5],index=range(100000))\n" 
+        b"    \n\n"
         b"@pycloud_export\n"
         b"def process_series(series):\n"
         b"    import pandas as pd\n"
@@ -127,9 +123,10 @@ def main():
     print("✅ DataFrame 和 Series 可以自动序列化/反序列化！")
     print()
     print("说明：")
-    print("  - 客户端：DataFrame/Series → JSON records (自动)")
-    print("  - 网络传输：JSON 格式")
-    print("  - 服务端：JSON records → DataFrame/Series (自动还原)")
+    print("  - 小对象：DataFrame/Series 会自动走 inline 传输")
+    print("  - 大对象：会自动转成 ObjectRef/ResultRef")
+    print("  - 对象路径：DataFrame/Series 使用 bundle(data.parquet + meta.json)")
+    print("  - 服务端：调用前会自动还原成 DataFrame/Series")
     print()
 
 

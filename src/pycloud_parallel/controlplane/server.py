@@ -10,6 +10,14 @@ from typing import Callable, Optional, Tuple
 
 import grpc
 
+from pycloud_parallel.controlplane.config import (
+    NODE_MAX_WORKERS,
+    NODE_QUEUE_CAPACITY,
+    NODE_WORKER_CAPACITY,
+    SERVICE_DEFAULT_WORKERS,
+    SERVICE_HEARTBEAT_TIMEOUT_SEC,
+    grpc_channel_options,
+)
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp, GatewayHttpServer
 from pycloud_parallel.controlplane.gateway_source import InProcessInfoCenterSource, RemoteInfoCenterSource
@@ -79,16 +87,19 @@ def build_nodecontrol_server(
     bind: str,
     *,
     node_id: str,
-    worker_capacity: int = 32,
-    queue_capacity: int = 4000,
-    max_workers: int = 64,
+    worker_capacity: int = NODE_WORKER_CAPACITY,
+    queue_capacity: int = NODE_QUEUE_CAPACITY,
+    max_workers: int = NODE_MAX_WORKERS,
     service_http_bind: str = "127.0.0.1:18080",
     service_http_base_url: str = "",
-    service_default_worker_count: int = 10,
-    service_default_heartbeat_timeout_sec: int = 30,
+    service_default_worker_count: int = SERVICE_DEFAULT_WORKERS,
+    service_default_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
     on_service_routes_changed: Optional[Callable[[], None]] = None,
 ) -> Tuple[grpc.Server, NodeControlState]:
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max(1, max_workers)))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=max(1, max_workers)),
+        options=grpc_channel_options(),
+    )
     state = NodeControlState(
         node_id=node_id,
         worker_capacity=worker_capacity,
@@ -156,13 +167,13 @@ def main() -> None:
     parser.add_argument("--role", choices=["infocenter", "gateway", "controlplane", "nodecontrol"], required=True)
     parser.add_argument("--bind", default="0.0.0.0:50051")
     parser.add_argument("--node-id", default="node-local-01")
-    parser.add_argument("--queue-capacity", type=int, default=4000)
-    parser.add_argument("--worker-capacity", type=int, default=32)
-    parser.add_argument("--max-workers", type=int, default=64)
+    parser.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY)
+    parser.add_argument("--worker-capacity", type=int, default=NODE_WORKER_CAPACITY)
+    parser.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS)
     parser.add_argument("--service-http-bind", default="127.0.0.1:18080")
     parser.add_argument("--service-http-base-url", default="")
-    parser.add_argument("--service-default-workers", type=int, default=10)
-    parser.add_argument("--service-heartbeat-timeout-sec", type=int, default=30)
+    parser.add_argument("--service-default-workers", type=int, default=SERVICE_DEFAULT_WORKERS)
+    parser.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC)
     parser.add_argument("--infocenter-addr", default="")
     parser.add_argument("--advertise-addr", default="")
     parser.add_argument("--node-tags", default="compute")

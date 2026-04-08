@@ -9,6 +9,13 @@ from typing import Any, Optional, Sequence
 from google.protobuf import json_format
 from google.protobuf import struct_pb2
 
+from pycloud_parallel.controlplane.config import (
+    INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    INLINE_PAYLOAD_REQUEST_LIMIT_BYTES,
+    INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    INLINE_RESULT_HARD_LIMIT_BYTES,
+    INLINE_RESULT_SOFT_LIMIT_BYTES,
+)
 from pycloud_parallel.controlplane.object_ref import (
     ObjectRef,
     is_object_ref_payload,
@@ -21,12 +28,6 @@ from pycloud_parallel.controlplane.result_ref import (
     result_ref_from_payload,
     result_ref_to_payload,
 )
-
-INLINE_PAYLOAD_SOFT_LIMIT_BYTES = 256 * 1024
-INLINE_PAYLOAD_HARD_LIMIT_BYTES = 1024 * 1024
-INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = 4 * 1024 * 1024
-INLINE_RESULT_SOFT_LIMIT_BYTES = 256 * 1024
-INLINE_RESULT_HARD_LIMIT_BYTES = 1024 * 1024
 
 payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
 
@@ -362,6 +363,70 @@ def _deserialize_pandas_index(spec: Any):
         [_deserialize_pandas_label(item) for item in spec.get("values", [])],
         name=_deserialize_pandas_label(spec.get("name")),
     )
+
+
+def serialize_dataframe_bundle(frame: Any) -> dict[str, Any]:
+    import pandas as pd
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError(f"serialize_dataframe_bundle expects DataFrame, got {type(frame).__name__}")
+    return {
+        "version": 1,
+        "index": _serialize_pandas_index(frame.index, path="payload.index"),
+        "columns": _serialize_pandas_index(frame.columns, path="payload.columns"),
+    }
+
+
+def dataframe_bundle_parquet_frame(frame: Any):
+    import pandas as pd
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError(f"dataframe_bundle_parquet_frame expects DataFrame, got {type(frame).__name__}")
+    safe = frame.copy(deep=False)
+    safe.columns = [f"c{idx}" for idx in range(len(frame.columns))]
+    return safe
+
+
+def deserialize_dataframe_bundle(meta: Any, frame: Any):
+    import pandas as pd
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError(f"deserialize_dataframe_bundle expects DataFrame, got {type(frame).__name__}")
+    if not isinstance(meta, dict):
+        raise TypeError("dataframe bundle meta must be dict")
+    version = int(meta.get("version", 0) or 0)
+    if version != 1:
+        raise ValueError(f"unsupported dataframe bundle meta version: {version}")
+    frame.index = _deserialize_pandas_index(meta.get("index"))
+    frame.columns = _deserialize_pandas_index(meta.get("columns"))
+    return frame
+
+
+def serialize_series_bundle(series: Any) -> dict[str, Any]:
+    import pandas as pd
+
+    if not isinstance(series, pd.Series):
+        raise TypeError(f"serialize_series_bundle expects Series, got {type(series).__name__}")
+    return {
+        "version": 1,
+        "index": _serialize_pandas_index(series.index, path="payload.index"),
+        "name": _serialize_arrow_compatible(series.name, path="payload.name"),
+    }
+
+
+def deserialize_series_bundle(meta: Any, series: Any):
+    import pandas as pd
+
+    if not isinstance(series, pd.Series):
+        raise TypeError(f"deserialize_series_bundle expects Series, got {type(series).__name__}")
+    if not isinstance(meta, dict):
+        raise TypeError("series bundle meta must be dict")
+    version = int(meta.get("version", 0) or 0)
+    if version != 1:
+        raise ValueError(f"unsupported series bundle meta version: {version}")
+    series.index = _deserialize_pandas_index(meta.get("index"))
+    series.name = convert_dict_to_arrow(meta.get("name"))
+    return series
 
 
 def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
