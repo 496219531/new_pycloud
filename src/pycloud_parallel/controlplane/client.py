@@ -685,12 +685,18 @@ def _retry_infocenter_request(
     retry_interval_sec: float = 0.25,
 ) -> Any:
     deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    last_exc: Optional[Exception] = None
     while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"InfoCenter {target} not ready for {action} after {float(timeout_sec):.1f}s: {last_exc}"
+            )
         try:
             return fn()
         except Exception as exc:
             if not _is_transient_infocenter_error(exc):
                 raise
+            last_exc = exc
             if time.monotonic() >= deadline:
                 raise RuntimeError(
                     f"InfoCenter {target} not ready for {action} after {float(timeout_sec):.1f}s: {exc}"
@@ -1042,11 +1048,34 @@ def _prepare_managed_globals_values_for_upload(
     }
 
 
-_SERVICE_SESSION_SCHEMA_VERSION = 1
+_SERVICE_SESSION_SCHEMA_VERSION = 2
 
 
-def _artifact_code_version(blob: bytes) -> str:
-    return f"sha256:{hashlib.sha256(blob).hexdigest()}"
+def _artifact_code_version(
+    blob: bytes,
+    *,
+    runtime: str,
+    entry_module: str,
+    entry_callable: str,
+    package_format: str,
+    export_mode: str,
+    export_methods: Optional[Sequence[str]] = None,
+    export_decorator: str = _DEFAULT_EXPORT_DECORATOR,
+    dependency_allowlist: Optional[Sequence[str]] = None,
+) -> str:
+    from pycloud_parallel.controlplane.state import _code_version_from_digest
+
+    return _code_version_from_digest(
+        hashlib.sha256(blob).hexdigest(),
+        runtime=runtime,
+        entry_module=entry_module,
+        entry_callable=entry_callable,
+        package_format=package_format,
+        export_mode=export_mode,
+        export_methods=list(export_methods or ()),
+        export_decorator=export_decorator,
+        dependency_allowlist=list(dependency_allowlist or ()),
+    )
 
 
 def _default_service_session_cache_dir() -> Path:
@@ -1113,8 +1142,14 @@ class _ServiceSessionFileLock:
         with _SERVICE_SESSION_LOCK_GUARD:
             if normalized in _SERVICE_SESSION_LOCKED_PATHS:
                 raise RuntimeError(f"local deploy session already holds cache lock: {self.path}")
-        _ensure_private_dir(self.path.parent)
-        fp = open(self.path, "a+b")
+            _SERVICE_SESSION_LOCKED_PATHS.add(normalized)
+        try:
+            _ensure_private_dir(self.path.parent)
+            fp = open(self.path, "a+b")
+        except Exception:
+            with _SERVICE_SESSION_LOCK_GUARD:
+                _SERVICE_SESSION_LOCKED_PATHS.discard(normalized)
+            raise
         try:
             try:
                 os.chmod(self.path, 0o600)
@@ -1131,11 +1166,11 @@ class _ServiceSessionFileLock:
                 fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except Exception as exc:
             fp.close()
+            with _SERVICE_SESSION_LOCK_GUARD:
+                _SERVICE_SESSION_LOCKED_PATHS.discard(normalized)
             raise RuntimeError(
                 f"another local deploy process already owns service session cache lock: {self.path}"
             ) from exc
-        with _SERVICE_SESSION_LOCK_GUARD:
-            _SERVICE_SESSION_LOCKED_PATHS.add(normalized)
         self._fp = fp
         return self
 
@@ -1229,6 +1264,7 @@ class InfoCenterNodeService:
 
 @dataclass(frozen=True)
 class InfoCenterNode:
+    node_instance_id: str
     node_id: str
     control_addr: str
     healthy: bool
@@ -1255,6 +1291,7 @@ class InfoCenterServiceRoute:
     service_name: str
     service_id: str
     status: int
+    node_instance_id: str
     node_id: str
     control_addr: str
     node_healthy: bool
@@ -1273,6 +1310,35 @@ class NodeCircuitState:
     open_count: int = 0
     probe_in_flight: bool = False
     last_error: str = ""
+
+
+def _node_instance_key_from_node(node: InfoCenterNode) -> str:
+    return str(getattr(node, "node_instance_id", "") or getattr(node, "node_id", "") or getattr(node, "control_addr", "")).strip()
+
+
+def _node_instance_key_from_route(route: InfoCenterServiceRoute) -> str:
+    return str(getattr(route, "node_instance_id", "") or getattr(route, "node_id", "") or getattr(route, "control_addr", "")).strip()
+
+
+def _build_unique_node_id_map(nodes: Sequence[InfoCenterNode], *, requested_ids: Optional[Sequence[str]] = None) -> Dict[str, InfoCenterNode]:
+    out: Dict[str, InfoCenterNode] = {}
+    duplicates: set[str] = set()
+    for node in nodes:
+        node_id = str(getattr(node, "node_id", "") or "").strip()
+        if not node_id:
+            continue
+        if node_id in out:
+            duplicates.add(node_id)
+            continue
+        out[node_id] = node
+    relevant_duplicates = duplicates if requested_ids is None else (duplicates & {str(x).strip() for x in requested_ids if str(x).strip()})
+    if relevant_duplicates:
+        dup_list = sorted(relevant_duplicates)
+        raise RuntimeError(
+            f"requested node_ids are ambiguous because multiple live node instances share the same node_id: {dup_list}; "
+            "please select by node_instance_ids instead"
+        )
+    return out
 
 
 @dataclass
@@ -1310,6 +1376,7 @@ class InfoCenterClient:
         self,
         *,
         node_id: str,
+        node_instance_id: str = "",
         control_addr: str,
         capacity: int = 32,
         queue_capacity: int = 4000,
@@ -1342,6 +1409,7 @@ class InfoCenterClient:
             timeout_sec=self.timeout_sec,
             payload={
                 "node_id": node_id,
+                "node_instance_id": str(node_instance_id or "").strip(),
                 "control_addr": control_addr,
                 "capacity": max(1, int(capacity)),
                 "queue_capacity": max(1, int(queue_capacity)),
@@ -1360,6 +1428,7 @@ class InfoCenterClient:
         self,
         *,
         node_id: str,
+        node_instance_id: str = "",
         healthy: bool = True,
         metrics: Optional[Dict[str, object]] = None,
         metadata: Optional[Dict[str, str]] = None,
@@ -1389,6 +1458,7 @@ class InfoCenterClient:
             timeout_sec=self.timeout_sec,
             payload={
                 "node_id": node_id,
+                "node_instance_id": str(node_instance_id or "").strip(),
                 "healthy": bool(healthy),
                 "metrics": dict(metrics or {}),
                 "metadata": dict(metadata or {}),
@@ -1438,6 +1508,7 @@ class InfoCenterClient:
                 )
             out.append(
                 InfoCenterNode(
+                    node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
                     node_id=str(item.get("node_id", "")),
                     control_addr=str(item.get("control_addr", "")),
                     healthy=bool(item.get("healthy", False)),
@@ -1492,6 +1563,7 @@ class InfoCenterClient:
                     service_name=str(item.get("service_name", "")),
                     service_id=str(item.get("service_id", "")),
                     status=int(item.get("status", 0) or 0),
+                    node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
                     node_id=str(item.get("node_id", "")),
                     control_addr=str(item.get("control_addr", "")),
                     node_healthy=bool(item.get("node_healthy", False)),
@@ -1510,6 +1582,7 @@ class InfoCenterClient:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         limit: int = 100,
         require_credit: bool = True,
@@ -1518,11 +1591,29 @@ class InfoCenterClient:
     ) -> Sequence[InfoCenterNode]:
         nodes = list(self.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit))
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
+        requested_instance_ids = [str(node_id).strip() for node_id in (node_instance_ids or []) if str(node_id).strip()]
         preferred_runtime = str(preferred_runtime_key or "").strip()
         normalized_runtime = normalize_python_runtime_spec(runtime)
-        discovered_node_map = {node.node_id: node for node in nodes}
+        discovered_instance_map = {_node_instance_key_from_node(node): node for node in nodes}
 
-        if requested_node_ids:
+        if requested_instance_ids:
+            missing_instance_ids = [node_id for node_id in requested_instance_ids if node_id not in discovered_instance_map]
+            if missing_instance_ids:
+                raise RuntimeError(f"requested node_instance_ids not found in current discovery scope: {missing_instance_ids}")
+            selected = [discovered_instance_map[node_id] for node_id in requested_instance_ids]
+            if normalized_runtime:
+                incompatible = [
+                    node.node_instance_id
+                    for node in selected
+                    if str(node.python_version or "").strip()
+                    and not matches_python_runtime(node.python_version, normalized_runtime)
+                ]
+                if incompatible:
+                    raise RuntimeError(
+                        f"requested node_instance_ids do not satisfy runtime {normalized_runtime}: {incompatible}"
+                    )
+        elif requested_node_ids:
+            discovered_node_map = _build_unique_node_id_map(nodes, requested_ids=requested_node_ids)
             missing_node_ids = [node_id for node_id in requested_node_ids if node_id not in discovered_node_map]
             if missing_node_ids:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
@@ -1996,7 +2087,12 @@ class _TaskPoolCallProxy:
         return self.submit(*args, **kwargs)
 
     def sync(self, *args, **kwargs):
-        self.session._enter_exclusive_mode("run.sync", require_clean=True)  # noqa: SLF001
+        enter_exclusive = getattr(self.session, "_enter_exclusive_mode", None)
+        exit_exclusive = getattr(self.session, "_exit_exclusive_mode", None)
+        entered_exclusive = False
+        if callable(enter_exclusive) and callable(exit_exclusive):
+            enter_exclusive("run.sync", require_clean=True)
+            entered_exclusive = True
         try:
             task_id = self.submit(*args, **kwargs)
             items = self.session._collect_data_for_task_ids({task_id}, timeout_sec=30.0)  # noqa: SLF001
@@ -2005,7 +2101,8 @@ class _TaskPoolCallProxy:
                 return results[0]
             return results
         finally:
-            self.session._exit_exclusive_mode("run.sync")  # noqa: SLF001
+            if entered_exclusive:
+                exit_exclusive("run.sync")
 
 
 class DedicatedTaskServiceSession:
@@ -2027,6 +2124,7 @@ class DedicatedTaskServiceSession:
         self._submit_lock = threading.Lock()
         self._results: "queue.Queue[pb2.TaskResult]" = queue.Queue()
         self._buffered_results: "deque[pb2.TaskResult]" = deque()
+        self._buffer_lock = threading.Lock()
         self._futures: Dict[str, Future] = {}
         self._future_lock = threading.Lock()
         submit_workers = max(1, int(max_submit_workers or sum(int(session.worker_count or 1) for session in group.sessions.values()) or 1))
@@ -2046,7 +2144,11 @@ class DedicatedTaskServiceSession:
 
     @property
     def node_ids(self) -> Sequence[str]:
-        return list(self._group.sessions.keys())
+        return self._group.node_ids()
+
+    @property
+    def node_instance_ids(self) -> Sequence[str]:
+        return self._group.node_instance_ids()
 
     @property
     def methods(self) -> List[str]:
@@ -2156,20 +2258,21 @@ class DedicatedTaskServiceSession:
         task_ids: Optional[Set[str]] = None,
         max_count: int = 0,
     ) -> List[pb2.TaskResult]:
-        matched: List[pb2.TaskResult] = []
-        kept: "deque[pb2.TaskResult]" = deque()
-        while self._buffered_results:
-            item = self._buffered_results.popleft()
-            normalized = str(item.task_id or "").strip()
-            if task_ids is not None and normalized not in task_ids:
-                kept.append(item)
-                continue
-            if max_count > 0 and len(matched) >= max_count:
-                kept.append(item)
-                continue
-            matched.append(item)
-        self._buffered_results = kept
-        return matched
+        with self._buffer_lock:
+            matched: List[pb2.TaskResult] = []
+            kept: "deque[pb2.TaskResult]" = deque()
+            while self._buffered_results:
+                item = self._buffered_results.popleft()
+                normalized = str(item.task_id or "").strip()
+                if task_ids is not None and normalized not in task_ids:
+                    kept.append(item)
+                    continue
+                if max_count > 0 and len(matched) >= max_count:
+                    kept.append(item)
+                    continue
+                matched.append(item)
+            self._buffered_results = kept
+            return matched
 
     def _iter_result_items(
         self,
@@ -2197,7 +2300,8 @@ class DedicatedTaskServiceSession:
                 return
             normalized = str(item.task_id or "").strip()
             if task_ids is not None and normalized not in task_ids:
-                self._buffered_results.append(item)
+                with self._buffer_lock:
+                    self._buffered_results.append(item)
                 continue
             yielded += 1
             yield item
@@ -2251,6 +2355,7 @@ class DedicatedTaskServiceSession:
         payload_iter = iter(payloads)
         stream_task_ids: Set[str] = set()
         input_exhausted = False
+        adapter = _PoolResultAdapter(self)
 
         while True:
             while not input_exhausted and len(stream_task_ids) < max_pending:
@@ -2271,15 +2376,14 @@ class DedicatedTaskServiceSession:
                 return
 
             received_any = False
-            for node_id, item in self._iter_result_items(
+            for item in self._iter_result_items(
                 max_count=max_receive,
                 timeout_sec=result_timeout_sec,
-                wait_ms=wait_ms,
                 task_ids=set(stream_task_ids),
             ):
                 received_any = True
                 stream_task_ids.discard(str(item.task_id))
-                yield str(item.task_id), self._pools[node_id]._client.fetch_result_data(item)  # noqa: SLF001
+                yield str(item.task_id), adapter.fetch_result_data(item)
 
             if not received_any and stream_task_ids:
                 raise TimeoutError(
@@ -2384,6 +2488,7 @@ class DedicatedTaskServiceSession:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
@@ -2416,6 +2521,7 @@ class DedicatedTaskServiceSession:
             healthy_only=healthy_only,
             tags=tags,
             node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
             node_count=node_count,
             node_limit=node_limit,
             allow_partial=allow_partial,
@@ -2446,6 +2552,7 @@ class TaskPoolItem:
     node_id: str
     ok: bool
     status: int
+    node_instance_id: str = ""
     data: Any = None
     error_type: str = ""
     error_message: str = ""
@@ -2470,6 +2577,7 @@ class TaskPoolSession:
         self._submit_seq = 0
         self._submit_lock = threading.Lock()
         self._pool_cycle = 0
+        self._pool_lock = threading.Lock()
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
         self._hb_lock = threading.Lock()
@@ -2500,6 +2608,10 @@ class TaskPoolSession:
 
     @property
     def node_ids(self) -> Sequence[str]:
+        return [self.nodes[key].node_id if key in self.nodes else key for key in self._pools.keys()]
+
+    @property
+    def node_instance_ids(self) -> Sequence[str]:
         return list(self._pools.keys())
 
     @property
@@ -2525,8 +2637,9 @@ class TaskPoolSession:
         node_ids = list(self._pools.keys())
         if not node_ids:
             raise RuntimeError("task pool has no node pools")
-        idx = self._pool_cycle % len(node_ids)
-        self._pool_cycle += 1
+        with self._pool_lock:
+            idx = self._pool_cycle % len(node_ids)
+            self._pool_cycle += 1
         return node_ids[idx]
 
     def submit_payloads(
@@ -2628,16 +2741,8 @@ class TaskPoolSession:
                 raise RuntimeError(
                     f"task pool session is exclusively used by {self._exclusive_mode}; cannot enter {mode}"
                 )
-        if require_clean:
-            self._assert_clean_for_exclusive(mode)
-        with self._exclusive_lock:
-            if self._exclusive_mode:
-                if self._exclusive_owner_thread_id == current and self._exclusive_mode == mode:
-                    self._exclusive_depth += 1
-                    return
-                raise RuntimeError(
-                    f"task pool session is exclusively used by {self._exclusive_mode}; cannot enter {mode}"
-                )
+            if require_clean:
+                self._assert_clean_for_exclusive(mode)
             self._exclusive_mode = mode
             self._exclusive_owner_thread_id = current
             self._exclusive_depth = 1
@@ -2847,7 +2952,8 @@ class TaskPoolSession:
                 error = task_result.error
                 yield TaskPoolItem(
                     task_id=str(task_result.task_id or ""),
-                    node_id=str(node_id),
+                    node_id=str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id),
+                    node_instance_id=str(node_id),
                     ok=False,
                     status=int(task_result.status),
                     data=None,
@@ -2859,7 +2965,8 @@ class TaskPoolSession:
                 data = self._pools[node_id]._client.fetch_result_data(task_result)  # noqa: SLF001
                 yield TaskPoolItem(
                     task_id=str(task_result.task_id or ""),
-                    node_id=str(node_id),
+                    node_id=str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id),
+                    node_instance_id=str(node_id),
                     ok=True,
                     status=int(task_result.status),
                     data=data,
@@ -2867,7 +2974,8 @@ class TaskPoolSession:
             except Exception as exc:
                 yield TaskPoolItem(
                     task_id=str(task_result.task_id or ""),
-                    node_id=str(node_id),
+                    node_id=str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id),
+                    node_instance_id=str(node_id),
                     ok=False,
                     status=int(task_result.status),
                     data=None,
@@ -3093,7 +3201,13 @@ class TaskPoolSession:
 
     def _heartbeat_loop(self, interval_sec: float) -> None:
         seq = 0
-        while not self._hb_stop.wait(interval_sec):
+        next_tick = time.monotonic() + max(0.1, float(interval_sec))
+        while not self._hb_stop.is_set():
+            now = time.monotonic()
+            wait_sec = max(0.0, next_tick - now)
+            if self._hb_stop.wait(wait_sec):
+                break
+            next_tick += max(0.1, float(interval_sec))
             seq += 1
             for node_id, pool in self._pools.items():
                 if node_id not in self._active_nodes:
@@ -3168,7 +3282,8 @@ class TaskPoolSession:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
-        node_count: int = 1,
+        node_instance_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
         node_limit: int = 100,
         timeout_sec: float = 10.0,
     ) -> "TaskPoolSession":
@@ -3193,14 +3308,16 @@ class TaskPoolSession:
             entry_module = _default_entry_module_for_package(package_format=effective_package_format, entry_module=entry_module, fallback_stem="task_pool_artifact")
 
         effective_owner = str(owner_client_id or f"client-{_get_local_ip()}").strip()
-        desired_count = max(1, int(node_count or 1))
+        requested_count = max(0, int(node_count or 0))
+        fetch_limit = requested_count if requested_count > 0 else node_limit
         with InfoCenterClient(infocenter_target, timeout_sec=timeout_sec) as infocenter:
             selected_nodes = list(
                 infocenter.select_task_nodes(
                     healthy_only=healthy_only,
                     tags=tags,
                     node_ids=node_ids,
-                    node_count=desired_count,
+                    node_instance_ids=node_instance_ids,
+                    node_count=fetch_limit,
                     limit=node_limit,
                     require_credit=False,
                     preferred_runtime_key="",
@@ -3209,10 +3326,11 @@ class TaskPoolSession:
             )
         if not selected_nodes:
             raise RuntimeError("no task pool nodes selected from InfoCenter")
+        desired_nodes = selected_nodes[:requested_count] if requested_count > 0 else selected_nodes
 
         pools: Dict[str, NativeTaskPoolClient] = {}
         nodes: Dict[str, InfoCenterNode] = {}
-        for node in selected_nodes[:desired_count]:
+        for node in desired_nodes:
             client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
             pool = client.create_task_pool_from_bytes(
                 owner_client_id=effective_owner,
@@ -3229,8 +3347,9 @@ class TaskPoolSession:
                 idle_ttl_sec=idle_ttl_sec,
                 chunk_size=chunk_size,
             )
-            pools[node.node_id] = pool
-            nodes[node.node_id] = node
+            node_key = _node_instance_key_from_node(node)
+            pools[node_key] = pool
+            nodes[node_key] = node
         session = cls(pools=pools, nodes=nodes, task_method=entry_callable, job_id=job_id)
         session._start_keepalive()
         return session
@@ -3374,14 +3493,16 @@ class _DiscoveryRouteCache:
         if not candidates:
             raise RuntimeError(f"no available route for service_name={name}")
         if strategy == "round_robin":
-            candidates.sort(key=lambda route: (route.node_id, route.service_id))
+            candidates.sort(key=lambda route: (_node_instance_key_from_route(route), route.service_id))
             with self._lock:
                 idx = self._route_index.get(name, 0)
                 self._route_index[name] = idx + 1
             return candidates[idx % len(candidates)]
         if strategy != "least_inflight":
             raise ValueError("strategy must be one of: least_inflight, round_robin")
-        candidates.sort(key=lambda route: (int(route.in_flight), -int(route.alive_workers), route.node_id, route.service_id))
+        candidates.sort(
+            key=lambda route: (int(route.in_flight), -int(route.alive_workers), _node_instance_key_from_route(route), route.service_id)
+        )
         return candidates[0]
 
     def _route_available(self, service_name: str, service_id: str) -> bool:
@@ -3420,6 +3541,7 @@ def _serialize_route(route: InfoCenterServiceRoute) -> Dict[str, object]:
     return {
         "service_name": route.service_name,
         "service_id": route.service_id,
+        "node_instance_id": route.node_instance_id,
         "node_id": route.node_id,
         "control_addr": route.control_addr,
         "node_healthy": route.node_healthy,
@@ -3661,6 +3783,7 @@ class ServiceSessionClient:
     _hb_stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _hb_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _hb_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _hb_seq_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _hb_seq: int = field(default=0, repr=False)
     _hb_interval_sec: float = field(default=0.0, repr=False)
     _hb_consecutive_failures: int = field(default=0, repr=False)
@@ -3692,12 +3815,14 @@ class ServiceSessionClient:
             self._hb_thread = None
 
     def heartbeat(self) -> pb2.HeartbeatServiceResponse:
-        self._hb_seq += 1
+        with self._hb_seq_lock:
+            self._hb_seq += 1
+            seq = self._hb_seq
         resp = self._client.heartbeat_service(
             owner_client_id=self.owner_client_id,
             service_id=self.service_id,
             service_token=self.service_token,
-            seq=self._hb_seq,
+            seq=seq,
         )
         self.status = resp.status
         self.failed = False
@@ -3781,15 +3906,23 @@ class ServiceSessionClient:
         return self._client.fetch_result_ref_data(ref, target_path=target_path)
 
     def update_globals(self, values: Dict[str, object]) -> pb2.UpdateServiceGlobalsResponse:
+        return self.update_globals_prepared(values)
+
+    def update_globals_prepared(self, prepared_values: Dict[str, object]) -> pb2.UpdateServiceGlobalsResponse:
         return self._client.update_service_globals(
             owner_client_id=self.owner_client_id,
             service_id=self.service_id,
             service_token=self.service_token,
-            values=values,
+            values=prepared_values,
         )
 
     def _keepalive_loop(self) -> None:
-        while not self._hb_stop.wait(max(0.5, self._hb_interval_sec)):
+        next_tick = time.monotonic() + max(0.5, float(self._hb_interval_sec))
+        while not self._hb_stop.is_set():
+            now = time.monotonic()
+            wait_sec = max(0.0, next_tick - now)
+            if self._hb_stop.wait(wait_sec):
+                break
             try:
                 self.heartbeat()
             except Exception as exc:
@@ -3801,6 +3934,7 @@ class ServiceSessionClient:
                     break
                 # Keep trying for a short window before declaring the owner-side session failed.
                 self._hb_interval_sec = min(1.0, max(0.1, self._hb_interval_sec))
+            next_tick = time.monotonic() + max(0.5, float(self._hb_interval_sec))
 
 
 class NodeControlClient:
@@ -4059,9 +4193,13 @@ class NodeControlClient:
                 pb2.DownloadObjectRequest(object_id=str(object_id or "").strip()),
                 timeout=self.timeout_sec,
             )
-            for chunk in stream:
-                if chunk.chunk:
-                    fh.write(chunk.chunk)
+            try:
+                for chunk in stream:
+                    if chunk.chunk:
+                        fh.write(chunk.chunk)
+            finally:
+                with contextlib.suppress(Exception):
+                    stream.cancel()
         return path
 
     def download_object_bytes(self, *, object_id: str) -> bytes:
@@ -4070,9 +4208,13 @@ class NodeControlClient:
             pb2.DownloadObjectRequest(object_id=str(object_id or "").strip()),
             timeout=self.timeout_sec,
         )
-        for chunk in stream:
-            if chunk.chunk:
-                out.extend(chunk.chunk)
+        try:
+            for chunk in stream:
+                if chunk.chunk:
+                    out.extend(chunk.chunk)
+        finally:
+            with contextlib.suppress(Exception):
+                stream.cancel()
         return bytes(out)
 
     def download_result_to_file(self, result_ref: ResultRef, *, target_path: str) -> Path:
@@ -4092,8 +4234,12 @@ class NodeControlClient:
         tmp = tempfile.NamedTemporaryFile(prefix="pycloud-result-", suffix=suffix.suffix, delete=False)
         tmp_path = Path(tmp.name)
         tmp.close()
-        self.download_result_to_file(result_ref, target_path=str(tmp_path))
-        return _materialize_downloaded_result(tmp_path, result_ref=result_ref)
+        try:
+            self.download_result_to_file(result_ref, target_path=str(tmp_path))
+            return _materialize_downloaded_result(tmp_path, result_ref=result_ref)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
         data = struct_to_dict(task_result.result)
@@ -4719,6 +4865,7 @@ class ServiceGroup:
     sessions: Dict[str, ServiceSessionClient]
     nodes: Dict[str, InfoCenterNode]
     failures: Dict[str, str] = field(default_factory=dict)
+    globals_digests: Dict[str, str] = field(default_factory=dict)
     breaker_enabled: bool = True
     breaker_failure_threshold: int = 3
     breaker_cooldown_sec: float = 15.0
@@ -4759,6 +4906,7 @@ class ServiceGroup:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
@@ -4912,7 +5060,17 @@ class ServiceGroup:
         if effective_blob is None:
             raise ValueError("artifact content is empty")
 
-        effective_code_version = _artifact_code_version(effective_blob)
+        effective_code_version = _artifact_code_version(
+            effective_blob,
+            runtime=runtime,
+            entry_module=effective_entry_module,
+            entry_callable=entry_callable,
+            package_format=effective_package_format,
+            export_mode=export_mode,
+            export_methods=export_methods,
+            export_decorator=_DEFAULT_EXPORT_DECORATOR,
+            dependency_allowlist=dependency_allowlist,
+        )
         session_cache_file = _service_session_cache_file(
             owner_client_id=effective_owner_client_id,
             service_name=effective_service_name,
@@ -4921,12 +5079,14 @@ class ServiceGroup:
         session_cache_lock: Optional[_ServiceSessionFileLock] = None
 
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
+        requested_node_instance_ids = [str(node_id).strip() for node_id in (node_instance_ids or []) if str(node_id).strip()]
         desired_node_count = max(0, int(node_count or 0))
         required_success_nodes = max(1, int(min_success_nodes))
         discovery_limit = max(
             1,
             int(node_limit),
             len(requested_node_ids),
+            len(requested_node_instance_ids),
             desired_node_count or required_success_nodes,
         )
 
@@ -4935,6 +5095,7 @@ class ServiceGroup:
             f"service_name={effective_service_name} owner={effective_owner_client_id} "
             f"target={infocenter_target} runtime={runtime} "
             f"requested_node_ids={requested_node_ids or 'auto'} "
+            f"requested_node_instance_ids={requested_node_instance_ids or 'auto'} "
             f"min_success_nodes={required_success_nodes}"
         )
 
@@ -4972,8 +5133,27 @@ class ServiceGroup:
             )
 
         normalized_runtime = normalize_python_runtime_spec(runtime)
-        discovered_node_map = {node.node_id: node for node in discovered_nodes}
-        if requested_node_ids:
+        discovered_instance_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
+        if requested_node_instance_ids:
+            missing_node_instance_ids = [node_id for node_id in requested_node_instance_ids if node_id not in discovered_instance_map]
+            if missing_node_instance_ids:
+                raise RuntimeError(
+                    f"requested node_instance_ids not found in current discovery scope: {missing_node_instance_ids}"
+                )
+            selected_nodes = [discovered_instance_map[node_id] for node_id in requested_node_instance_ids]
+            if normalized_runtime:
+                incompatible = [
+                    _node_instance_key_from_node(node)
+                    for node in selected_nodes
+                    if str(node.python_version or "").strip()
+                    and not matches_python_runtime(node.python_version, normalized_runtime)
+                ]
+                if incompatible:
+                    raise RuntimeError(
+                        f"requested node_instance_ids do not satisfy runtime {normalized_runtime}: {incompatible}"
+                    )
+        elif requested_node_ids:
+            discovered_node_map = _build_unique_node_id_map(discovered_nodes, requested_ids=requested_node_ids)
             missing_node_ids = [node_id for node_id in requested_node_ids if node_id not in discovered_node_map]
             if missing_node_ids:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
@@ -5081,7 +5261,7 @@ class ServiceGroup:
                         artifact_code_version=effective_code_version,
                         cache_payload=cached_session,
                         active_routes=existing_infos,
-                        discovered_node_map=discovered_node_map,
+                        discovered_node_map=discovered_instance_map,
                         timeout_sec=timeout_sec,
                         breaker_enabled=breaker_enabled,
                         breaker_failure_threshold=breaker_failure_threshold,
@@ -5116,6 +5296,9 @@ class ServiceGroup:
 
             for node in selected_nodes:
                 client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
+                node_worker_count = max(1, int(worker_count or 1))
+                if int(getattr(node, "service_worker_available", 0) or 0) > 0:
+                    node_worker_count = max(1, min(node_worker_count, int(getattr(node, "service_worker_available", 0) or 0)))
                 try:
                     session = client.create_service_from_bytes(
                         owner_client_id=effective_owner_client_id,
@@ -5129,23 +5312,26 @@ class ServiceGroup:
                         export_methods=export_methods,
                         dependency_allowlist=dependency_allowlist,
                         managed_global_names=managed_global_names,
-                        worker_count=worker_count,
+                        worker_count=node_worker_count,
                         heartbeat_timeout_sec=heartbeat_timeout_sec,
                         idle_ttl_sec=idle_ttl_sec,
                         expose_http=expose_http,
                         chunk_size=chunk_size,
                     )
                 except Exception as exc:
-                    failures[node.node_id] = repr(exc)
+                    failures[_node_instance_key_from_node(node)] = repr(exc)
                     client.close()
                     if not allow_partial:
                         cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
-                        raise RuntimeError(f"deploy failed on node={node.node_id}: {exc}") from exc
+                        raise RuntimeError(
+                            f"deploy failed on node={node.node_id}/{_node_instance_key_from_node(node)}: {exc}"
+                        ) from exc
                     continue
 
-                sessions[node.node_id] = session
-                clients[node.node_id] = client
-                nodes[node.node_id] = node
+                node_key = _node_instance_key_from_node(node)
+                sessions[node_key] = session
+                clients[node_key] = client
+                nodes[node_key] = node
 
             if len(sessions) < required_success_nodes:
                 cls._cleanup_created_services(sessions=sessions, clients=clients, reason="insufficient success nodes")
@@ -5213,6 +5399,7 @@ class ServiceGroup:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
@@ -5246,6 +5433,7 @@ class ServiceGroup:
             healthy_only=healthy_only,
             tags=tags,
             node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
             node_count=node_count,
             node_limit=node_limit,
             allow_partial=allow_partial,
@@ -5284,6 +5472,7 @@ class ServiceGroup:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
@@ -5318,6 +5507,7 @@ class ServiceGroup:
             healthy_only=healthy_only,
             tags=tags,
             node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
             node_count=node_count,
             node_limit=node_limit,
             allow_partial=allow_partial,
@@ -5357,6 +5547,7 @@ class ServiceGroup:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
@@ -5392,6 +5583,7 @@ class ServiceGroup:
             healthy_only=healthy_only,
             tags=tags,
             node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
             node_count=node_count,
             node_limit=node_limit,
             allow_partial=allow_partial,
@@ -5431,6 +5623,7 @@ class ServiceGroup:
         healthy_only: bool = True,
         tags: Optional[Sequence[str]] = None,
         node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
         node_count: int = 0,
         node_limit: int = 100,
         allow_partial: bool = True,
@@ -5466,6 +5659,7 @@ class ServiceGroup:
             healthy_only=healthy_only,
             tags=tags,
             node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
             node_count=node_count,
             node_limit=node_limit,
             allow_partial=allow_partial,
@@ -5508,7 +5702,7 @@ class ServiceGroup:
                 info = client.get_service_status(service_id=route.service_id)
                 out.append((route, info))
             except Exception as exc:
-                failures[route.node_id] = repr(exc)
+                failures[_node_instance_key_from_route(route)] = repr(exc)
             finally:
                 client.close()
         if failures:
@@ -5543,27 +5737,28 @@ class ServiceGroup:
 
         try:
             for route, info in active_routes:
-                node = discovered_node_map.get(route.node_id)
+                route_key = _node_instance_key_from_route(route)
+                node = discovered_node_map.get(route_key)
                 if node is None:
                     raise RuntimeError(
-                        f"existing service route is outside current discovery scope: node_id={route.node_id}"
+                        f"existing service route is outside current discovery scope: node_instance_id={route_key}"
                     )
 
-                cached_node = cache_nodes.get(route.node_id)
+                cached_node = cache_nodes.get(route_key)
                 if not isinstance(cached_node, dict):
                     raise RuntimeError(
-                        f"local service session cache missing node entry for reuse: node_id={route.node_id}"
+                        f"local service session cache missing node entry for reuse: node_instance_id={route_key}"
                     )
 
                 cached_service_id = str(cached_node.get("service_id", "")).strip()
                 cached_token = str(cached_node.get("service_token", "")).strip()
                 if cached_service_id != route.service_id:
                     raise RuntimeError(
-                        f"local service session cache is stale for node={route.node_id}: "
+                        f"local service session cache is stale for node_instance_id={route_key}: "
                         f"cached_service_id={cached_service_id} route_service_id={route.service_id}"
                     )
                 if not cached_token:
-                    raise RuntimeError(f"local service session cache missing token for node={route.node_id}")
+                    raise RuntimeError(f"local service session cache missing token for node_instance_id={route_key}")
 
                 client = NodeControlClient(route.control_addr, timeout_sec=timeout_sec)
                 try:
@@ -5577,7 +5772,7 @@ class ServiceGroup:
                     client.close()
                     raise
 
-                sessions[route.node_id] = ServiceSessionClient(
+                sessions[route_key] = ServiceSessionClient(
                     _client=client,
                     owner_client_id=owner_client_id,
                     service_id=route.service_id,
@@ -5594,8 +5789,8 @@ class ServiceGroup:
                     worker_count=max(1, int(cached_node.get("worker_count", 0) or info.worker_count or route.worker_count or 1)),
                     status=hb.status or info.status,
                 )
-                clients[route.node_id] = client
-                nodes[route.node_id] = node
+                clients[route_key] = client
+                nodes[route_key] = node
         except Exception:
             for client in clients.values():
                 try:
@@ -5643,14 +5838,15 @@ class ServiceGroup:
 
         failures: Dict[str, str] = {}
         for route, _info in active_routes:
-            cached_node = cache_nodes.get(route.node_id)
+            route_key = _node_instance_key_from_route(route)
+            cached_node = cache_nodes.get(route_key)
             if not isinstance(cached_node, dict):
-                failures[route.node_id] = "missing cached node entry"
+                failures[route_key] = "missing cached node entry"
                 continue
             cached_service_id = str(cached_node.get("service_id", "")).strip()
             cached_token = str(cached_node.get("service_token", "")).strip()
             if cached_service_id != route.service_id or not cached_token:
-                failures[route.node_id] = "stale or missing cached token"
+                failures[route_key] = "stale or missing cached token"
                 continue
 
             client = NodeControlClient(route.control_addr, timeout_sec=timeout_sec)
@@ -5662,7 +5858,7 @@ class ServiceGroup:
                     reason=reason,
                 )
             except Exception as exc:
-                failures[route.node_id] = repr(exc)
+                failures[route_key] = repr(exc)
             finally:
                 client.close()
 
@@ -5699,14 +5895,15 @@ class ServiceGroup:
             "nodes": {},
         }
         nodes_payload: Dict[str, object] = {}
-        for node_id, session in sorted(self.sessions.items()):
-            node = self.nodes.get(node_id)
+        for node_key, session in sorted(self.sessions.items()):
+            node = self.nodes.get(node_key)
             control_addr = ""
             if node is not None:
                 control_addr = node.control_addr
-            elif node_id in self._clients:
-                control_addr = self._clients[node_id].target
-            nodes_payload[node_id] = {
+            elif node_key in self._clients:
+                control_addr = self._clients[node_key].target
+            nodes_payload[node_key] = {
+                "node_id": str(node.node_id if node is not None else ""),
                 "control_addr": control_addr,
                 "service_id": session.service_id,
                 "service_token": session.service_token,
@@ -5901,14 +6098,40 @@ class ServiceGroup:
         return self.put_data(value, format="json", chunk_size=chunk_size)
 
     def update_globals(self, values: Dict[str, object]) -> str:
+        with self._route_lock:
+            sessions_snapshot = list(self.sessions.items())
+            clients_snapshot = dict(self._clients)
+        active_clients = [clients_snapshot[node_id] for node_id, _ in sessions_snapshot if node_id in clients_snapshot]
+        prepared_values = _prepare_managed_globals_values_for_upload(active_clients, values)
         digests: Dict[str, str] = {}
-        for node_id, session in self.sessions.items():
-            resp = session.update_globals(values)
-            digests[node_id] = resp.globals_digest
+        failed_nodes: Dict[str, str] = {}
+        for node_id, session in sessions_snapshot:
+            if getattr(session, "failed", False):
+                failed_nodes[node_id] = str(getattr(session, "last_error", "") or "session failed")
+                continue
+            try:
+                resp = session.update_globals_prepared(prepared_values)
+                digests[node_id] = resp.globals_digest
+            except Exception as exc:
+                failed_nodes[node_id] = repr(exc)
+
+        for node_id, message in failed_nodes.items():
+            with self._route_lock:
+                self.failures[node_id] = message
+                self.sessions.pop(node_id, None)
+                self.nodes.pop(node_id, None)
+                client = self._clients.pop(node_id, None)
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        if not digests:
+            raise RuntimeError(f"update_globals failed on all nodes: {failed_nodes}")
+        self.globals_digests = dict(digests)
         unique = {digest for digest in digests.values() if str(digest).strip()}
-        if len(unique) != 1:
-            raise RuntimeError(f"inconsistent managed globals digest across nodes: {digests}")
-        return next(iter(unique), "")
+        return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()))
 
     def __enter__(self) -> "ServiceGroup":
         return self
@@ -5917,7 +6140,25 @@ class ServiceGroup:
         self.close(end_services=False)
 
     def node_ids(self) -> Sequence[str]:
+        return [self.nodes[key].node_id if key in self.nodes else key for key in self.sessions.keys()]
+
+    def node_instance_ids(self) -> Sequence[str]:
         return list(self.sessions.keys())
+
+    def _resolve_node_key(self, node_ref: str) -> str:
+        normalized = str(node_ref or "").strip()
+        if not normalized:
+            raise KeyError("node reference is required")
+        if normalized in self.sessions:
+            return normalized
+        matched = [node_key for node_key, node in self.nodes.items() if str(node.node_id or "").strip() == normalized]
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            raise KeyError(
+                f"ambiguous node_id: {normalized}; multiple live node instances match. Please use node_instance_id instead."
+            )
+        raise KeyError(f"unknown node reference: {normalized}")
 
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         for session in self.sessions.values():
@@ -5964,8 +6205,8 @@ class ServiceGroup:
 
     def status_map(self) -> Dict[str, pb2.ServiceStatusInfo]:
         out: Dict[str, pb2.ServiceStatusInfo] = {}
-        for node_id, session in self.sessions.items():
-            out[node_id] = session.get_status()
+        for node_key, session in self.sessions.items():
+            out[node_key] = session.get_status()
         return out
 
     def call_on_node(
@@ -5976,9 +6217,10 @@ class ServiceGroup:
         *,
         timeout_sec: float = 60.0,
     ) -> Dict[str, object]:
-        session = self.sessions.get(node_id)
+        node_key = self._resolve_node_key(node_id)
+        session = self.sessions.get(node_key)
         if session is None:
-            raise KeyError(f"unknown node_id: {node_id}")
+            raise KeyError(f"unknown node reference: {node_id}")
         return session.call(method, payload, timeout_sec=timeout_sec)
 
     def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
@@ -5997,9 +6239,11 @@ class ServiceGroup:
             raise RuntimeError("no available service node (all candidates may be open-circuit)")
 
         if strategy == "round_robin":
-            idx = self._route_index % len(candidates)
-            self._route_index += 1
-            return candidates[idx]
+            ranked_candidates = sorted(candidates, key=lambda node_id: (state_rank.get(node_id, 0), node_id))
+            with self._route_lock:
+                idx = self._route_index % len(ranked_candidates)
+                self._route_index += 1
+            return ranked_candidates[idx]
 
         if strategy != "least_inflight":
             raise ValueError("strategy must be one of: least_inflight, round_robin")
@@ -6026,8 +6270,9 @@ class ServiceGroup:
         if best_node_id:
             return best_node_id
 
-        idx = self._route_index % len(candidates)
-        self._route_index += 1
+        with self._route_lock:
+            idx = self._route_index % len(candidates)
+            self._route_index += 1
         return candidates[idx]
 
     def call_balanced(
@@ -6110,7 +6355,7 @@ class ServiceGroup:
                 # 在线程池中执行同步调用，不阻塞事件循环
                 resp = await loop.run_in_executor(
                     None,
-                    lambda: self.sessions[node_id].call(method, serialized_payload, timeout_sec=timeout_sec),
+                    lambda nid=node_id: self.sessions[nid].call(method, serialized_payload, timeout_sec=timeout_sec),
                 )
                 self._breaker_mark_success(node_id)
                 return node_id, resp
@@ -6164,7 +6409,7 @@ class ServiceGroup:
                 try:
                     resp = await loop.run_in_executor(
                         None,
-                        lambda: self.sessions[node_id].call(method, payload, timeout_sec=timeout_sec),
+                        lambda nid=node_id: self.sessions[nid].call(method, payload, timeout_sec=timeout_sec),
                     )
                     self._breaker_mark_success(node_id)
                     return node_id, resp, None
@@ -6928,7 +7173,7 @@ class DirectConnect(DiscoveryServiceClient):
                 service_token=token,
             )
             self._route_cache.mark_success(route)
-            return route.node_id, resp
+            return _node_instance_key_from_route(route), resp
         except DiscoveryCallError as exc:
             if not _is_route_failure(exc):
                 raise RuntimeError(str(exc)) from exc
@@ -6944,7 +7189,7 @@ class DirectConnect(DiscoveryServiceClient):
                     service_token=token,
                 )
                 self._route_cache.mark_success(retry_route)
-                return retry_route.node_id, resp
+                return _node_instance_key_from_route(retry_route), resp
             except DiscoveryCallError as retry_exc:
                 if _is_route_failure(retry_exc):
                     self._route_cache.mark_failure(retry_route, str(retry_exc))

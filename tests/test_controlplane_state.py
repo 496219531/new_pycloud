@@ -11,7 +11,14 @@ from urllib.request import Request, urlopen
 import pytest
 
 from pycloud_parallel.controlplane.client import ServiceGroup, ServiceSessionClient
-from pycloud_parallel.controlplane.state import NodeControlState, dict_to_struct, struct_to_dict, utc_now
+from pycloud_parallel.controlplane.state import (
+    NodeControlState,
+    _build_execute_spec,
+    _execute_payload_in_subprocess,
+    dict_to_struct,
+    struct_to_dict,
+    utc_now,
+)
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeServiceState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -303,6 +310,7 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     _kind, fmt, blob = _serialize_data_for_object_ref(frame)
     object_id = "sha256:" + "d" * 64
     path = object_storage_path(tmp_path, object_id=object_id, fmt=fmt)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(blob)
 
     payload = {
@@ -690,6 +698,11 @@ def test_service_session_http_call_and_end(tmp_path):
         timing = dict(info.get("timing_metrics") or {})
         assert int(timing.get("call_count", 0) or 0) >= 1
         assert float(timing.get("last_total_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_build_execute_spec_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_child_decode_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_child_invoke_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_child_encode_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_invoke_ms", 0.0) or 0.0) == float(timing.get("last_child_invoke_ms", 0.0) or 0.0)
 
         hb = state.heartbeat_service(
             owner_client_id="owner-a",
@@ -802,6 +815,187 @@ def test_service_session_heartbeat_timeout_recycles(tmp_path):
         state._handle_service_timeouts()  # noqa: SLF001
         info = state.service_status_info(session.service_id)
         assert info["status"] == pb2.SERVICE_STATUS_STOPPED
+    finally:
+        state.close()
+
+
+def test_service_sessions_with_same_blob_and_different_managed_globals_can_coexist(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-managed-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_managed"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = (
+            b"A = 1\n"
+            b"B = 2\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'A': A, 'B': B}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session_a = state.create_service(
+            owner_client_id="owner-a",
+            service_name="svc-a",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_managed",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["A"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+        session_b = state.create_service(
+            owner_client_id="owner-b",
+            service_name="svc-b",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_managed",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["B"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        digest_a, updated_a = state.update_service_globals(
+            owner_client_id="owner-a",
+            service_id=session_a.service_id,
+            service_token=session_a.service_token,
+            values={"A": 10},
+        )
+        digest_b, updated_b = state.update_service_globals(
+            owner_client_id="owner-b",
+            service_id=session_b.service_id,
+            service_token=session_b.service_token,
+            values={"B": 20},
+        )
+
+        assert updated_a == ["A"]
+        assert updated_b == ["B"]
+        assert digest_a
+        assert digest_b
+        assert session_a.managed_global_names == ("A",)
+        assert session_b.managed_global_names == ("B",)
+    finally:
+        state.close()
+
+
+def test_task_pool_keeps_instance_managed_global_names(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-managed-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_managed"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"STATE = 1\ndef run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-managed",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_managed",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["STATE"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        assert pool.managed_global_names == ("STATE",)
+    finally:
+        state.close()
+
+
+def test_same_blob_with_different_export_specs_can_coexist(tmp_path):
+    state = NodeControlState(
+        node_id="node-code-cache-variants-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_variants"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': int(value)}\n\n"
+            b"def alt(value=0, **_kwargs):\n"
+            b"    return {'value': int(value) + 1}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        explicit_artifact, explicit_cached = state.put_code(
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="cache_variant_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="explicit",
+            export_methods=["alt"],
+            chunks=[blob],
+        )
+        single_artifact, single_cached = state.put_code(
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="cache_variant_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            chunks=[blob],
+        )
+
+        assert explicit_cached is False
+        assert single_cached is False
+        assert explicit_artifact.code_version != single_artifact.code_version
+        assert explicit_artifact.export_mode == "explicit"
+        assert explicit_artifact.export_methods == ("alt",)
+        assert single_artifact.export_mode == "single"
+        assert single_artifact.export_methods == ("run",)
+
+        failed_status, _failed_result, failed_type, failed_message, _ = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                explicit_artifact,
+                object_dir=tmp_path / "objects",
+                method_name="run",
+                payload={"value": 5},
+            )
+        )
+        assert failed_status == "FAILED_USER"
+        assert failed_type == "RuntimeError"
+        assert "method `run` not exported" in failed_message
+
+        ok_status, ok_result, ok_type, ok_message, _ = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                single_artifact,
+                object_dir=tmp_path / "objects",
+                method_name="run",
+                payload={"value": 5},
+            )
+        )
+        assert ok_status == "SUCCEEDED"
+        assert ok_result == {"value": 5}
+        assert ok_type == ""
+        assert ok_message == ""
     finally:
         state.close()
 

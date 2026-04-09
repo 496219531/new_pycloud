@@ -14,6 +14,8 @@ import inspect
 import os
 import sys
 import tempfile
+import sysconfig
+import importlib.machinery
 import tarfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -32,10 +34,21 @@ class DependencyAnalyzer:
             return set(sys.stdlib_module_names)
 
         # 备用方法：从 sys.path 猜测
-        stdlib_paths = {
-            Path(sys.prefix) / "lib",
-            Path(sys.base_prefix) / "lib",
-        }
+        stdlib_paths = set()
+        for key in ("stdlib", "platstdlib"):
+            value = sysconfig.get_paths().get(key)
+            if value:
+                stdlib_paths.add(Path(value))
+        stdlib_paths.update(
+            {
+                Path(sys.prefix) / "lib",
+                Path(sys.base_prefix) / "lib",
+                Path(sys.exec_prefix) / "lib",
+                Path(sys.prefix) / "Lib",
+                Path(sys.base_prefix) / "Lib",
+                Path(sys.exec_prefix) / "Lib",
+            }
+        )
         stdlib_modules = set()
 
         for name, module in sys.modules.items():
@@ -72,6 +85,7 @@ class DependencyAnalyzer:
         }
 
         # 获取函数所在文件
+        module = None
         try:
             module = importlib.import_module(func.__module__)
             result["file"] = getattr(module, '__file__', None)
@@ -81,7 +95,8 @@ class DependencyAnalyzer:
 
         current_package = ""
         try:
-            current_package = str(getattr(module, "__package__", "") or "")
+            if module is not None:
+                current_package = str(getattr(module, "__package__", "") or "")
         except Exception:
             current_package = ""
 
@@ -96,6 +111,7 @@ class DependencyAnalyzer:
                 current_module_name=str(func.__module__ or ""),
                 current_package=current_package,
             )
+            self._expand_local_dependencies(result, current_package=current_package)
 
         return result
 
@@ -141,6 +157,7 @@ class DependencyAnalyzer:
                     current_module_name=module_name,
                     current_package=str(getattr(module, "__package__", "") or ""),
                 )
+                self._expand_local_dependencies(result, current_package=str(getattr(module, "__package__", "") or ""))
 
             except Exception as e:
                 result["error"] = f"读取模块文件失败: {e}"
@@ -244,6 +261,45 @@ class DependencyAnalyzer:
                 result["third_party_modules"].append(module_name)
                 seen_third_party.add(module_name)
 
+    def _expand_local_dependencies(self, result: Dict[str, Any], *, current_package: str) -> None:
+        pending = [item for item in result.get("local_modules", []) if isinstance(item, dict)]
+        seen_modules = {str(item.get("name", "")).strip() for item in pending if str(item.get("name", "")).strip()}
+        seen_files = set(result.get("local_files", []))
+
+        while pending:
+            item = pending.pop()
+            module_name = str(item.get("name", "") or "").strip()
+            module_file = str(item.get("file", "") or "").strip()
+            if not module_name or not module_file:
+                continue
+            if module_file in seen_files:
+                continue
+            seen_files.add(module_file)
+
+            source = ""
+            if module_file.endswith(".py"):
+                try:
+                    with open(module_file, "r", encoding="utf-8") as f:
+                        source = f.read()
+                except Exception:
+                    source = ""
+            if not source:
+                continue
+
+            imports_ast = self._extract_imports_from_source(source)
+            local_before = {str(item.get("name", "")).strip() for item in result.get("local_modules", [])}
+            self._classify_imports(
+                imports_ast,
+                result,
+                current_module_name=module_name,
+                current_package=current_package,
+            )
+            for new_item in result.get("local_modules", []):
+                name = str(new_item.get("name", "") or "").strip()
+                if name and name not in seen_modules and name not in local_before:
+                    pending.append(new_item)
+                    seen_modules.add(name)
+
     def _resolve_import_module(
         self,
         imp: Dict[str, str],
@@ -292,7 +348,7 @@ class DependencyAnalyzer:
     def _find_module_file(self, module_name: str) -> Optional[str]:
         """查找模块文件路径"""
         try:
-            spec = importlib.util.find_spec(module_name)
+            spec = importlib.machinery.PathFinder.find_spec(module_name)
             if spec and spec.origin:
                 return spec.origin
             return None
@@ -315,6 +371,9 @@ class DependencyAnalyzer:
             Path(sys.prefix) / "lib",
             Path(sys.base_prefix) / "lib",
             Path(sys.exec_prefix) / "lib",
+            Path(sys.prefix) / "Lib",
+            Path(sys.base_prefix) / "Lib",
+            Path(sys.exec_prefix) / "Lib",
         ]):
             return False
 
@@ -354,7 +413,8 @@ class DependencyPackager:
 
         # 创建 tar.gz
         if output_file is None:
-            output_file = tempfile.mktemp(suffix=".tar.gz", prefix="pycloud_func_")
+            fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix="pycloud_func_")
+            os.close(fd)
 
         self._create_tar_package(roots_to_package, output_file, include_tests=include_tests)
 
@@ -387,7 +447,8 @@ class DependencyPackager:
 
         # 创建 tar.gz
         if output_file is None:
-            output_file = tempfile.mktemp(suffix=".tar.gz", prefix="pycloud_module_")
+            fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix="pycloud_module_")
+            os.close(fd)
 
         self._create_tar_package(roots_to_package, output_file, include_tests=include_tests)
 
@@ -470,6 +531,8 @@ class DependencyPackager:
                     for file_path in sorted(root.rglob("*")):
                         if not file_path.is_file():
                             continue
+                        if file_path.is_symlink():
+                            continue
                         if not include_tests and self._should_skip_path(file_path):
                             continue
                         arcname = base_arcname / file_path.relative_to(root)
@@ -477,6 +540,8 @@ class DependencyPackager:
                     continue
 
                 if not include_tests and self._should_skip_path(root):
+                    continue
+                if root.is_symlink():
                     continue
                 tar.add(root, arcname=root.name)
 
@@ -552,17 +617,20 @@ def auto_deploy_function(
         entry_callable = func.__name__
 
     # 读取文件内容
-    with open(package_path, "rb") as f:
-        blob = f.read()
+    try:
+        with open(package_path, "rb") as f:
+            blob = f.read()
 
-    # 上传并部署
-    return TaskPoolSession.from_infocenter(
-        infocenter_target=infocenter_target,
-        job_id=f"auto-{func.__name__}",
-        blob=blob,
-        runtime=runtime,
-        entry_module=entry_module,
-        entry_callable=entry_callable,
-        package_format="tar.gz",
-        **kwargs,
-    )
+        # 上传并部署
+        return TaskPoolSession.from_infocenter(
+            infocenter_target=infocenter_target,
+            job_id=f"auto-{func.__name__}",
+            blob=blob,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format="tar.gz",
+            **kwargs,
+        )
+    finally:
+        Path(package_path).unlink(missing_ok=True)

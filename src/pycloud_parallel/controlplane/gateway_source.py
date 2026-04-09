@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Route sources for Gateway service discovery."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Protocol, Sequence
+import threading
+from typing import Optional, Protocol, Sequence
 
 from pycloud_parallel.controlplane.client import InfoCenterClient, InfoCenterServiceRoute
 from pycloud_parallel.controlplane.state import InfoCenterState
@@ -40,6 +41,7 @@ class InProcessInfoCenterSource:
                     service_name=str(item.get("service_name", "")),
                     service_id=str(item.get("service_id", "")),
                     status=int(item.get("status", 0) or 0),
+                    node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
                     node_id=str(item.get("node_id", "")),
                     control_addr=str(item.get("control_addr", "")),
                     node_healthy=bool(item.get("node_healthy", False)),
@@ -57,9 +59,16 @@ class InProcessInfoCenterSource:
 class RemoteInfoCenterSource:
     target: str
     timeout_sec: float = 10.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _client: Optional[InfoCenterClient] = field(default=None, init=False, repr=False)
 
     def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> Sequence[InfoCenterServiceRoute]:
-        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+        with self._lock:
+            client = self._client
+            if client is None:
+                client = InfoCenterClient(self.target, timeout_sec=self.timeout_sec)
+                self._client = client
+        try:
             return list(
                 client.list_service_routes(
                     service_name=service_name,
@@ -67,3 +76,12 @@ class RemoteInfoCenterSource:
                     limit=limit,
                 )
             )
+        except Exception:
+            with self._lock:
+                if self._client is not None:
+                    try:
+                        self._client.close()
+                    except Exception:
+                        pass
+                    self._client = None
+            raise

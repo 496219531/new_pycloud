@@ -42,10 +42,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                 continue
 
     def _ensure_mp_context():
-        try:
-            return mp.get_context("spawn")
-        except ValueError:
-            return None
+        return mp.get_context("spawn")
 
     def _submit_callable(executor: ProcessPoolExecutor, args: Dict[str, Any]):
         from pycloud_parallel.controlplane.state import _execute_payload_in_subprocess
@@ -66,6 +63,28 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             args["entry_callable"],
             args["payload"],
         )
+
+    def _unpack_subprocess_result(value: Any) -> tuple[str, Any, str, str, Dict[str, Any]]:
+        if isinstance(value, tuple):
+            if len(value) == 5:
+                status_text, result, err_type, err_message, timings = value
+                return (
+                    str(status_text or ""),
+                    result,
+                    str(err_type or ""),
+                    str(err_message or ""),
+                    dict(timings or {}),
+                )
+            if len(value) == 4:
+                status_text, result, err_type, err_message = value
+                return (
+                    str(status_text or ""),
+                    result,
+                    str(err_type or ""),
+                    str(err_message or ""),
+                    {},
+                )
+        raise RuntimeError(f"unexpected subprocess result shape: {type(value).__name__}")
 
     def _ensure_task_executor() -> ProcessPoolExecutor:
         nonlocal task_executor
@@ -148,25 +167,13 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                     _send_response(request_id, ok=False, error="service executor missing")
                     return True
                 future = _submit_callable(executor, payload)
-                try:
-                    status_text, result, err_type, err_message = future.result(
-                        timeout=max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0))
-                    )
-                except FutureTimeout:
-                    _rebuild_service_executor(service_id)
-                    _send_response(request_id, ok=False, timeout=True, error="invoke timeout")
-                    return True
-                except Exception as exc:
-                    _send_response(request_id, ok=False, error=repr(exc))
-                    return True
-                _send_response(
-                    request_id,
-                    ok=True,
-                    status_text=status_text,
-                    result=result,
-                    err_type=err_type,
-                    err_message=err_message,
-                )
+                inflight[future] = {
+                    "kind": "service",
+                    "service_id": service_id,
+                    "request_id": request_id,
+                    "start_at": time.monotonic(),
+                    "timeout_sec": max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)),
+                }
                 return True
 
             if action == "start_runtime_slot":
@@ -223,17 +230,20 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
         if isinstance(message, dict):
             running = _handle_request(message)
 
+        now = time.monotonic()
         completed = [future for future in list(inflight.keys()) if future.done()]
         for future in completed:
             meta = inflight.pop(future, {})
             try:
-                status_text, result, err_type, err_message = future.result()
+                status_text, result, err_type, err_message, timings = _unpack_subprocess_result(future.result())
             except Exception as exc:
                 status_text = "FAILED_INFRA"
                 result = None
                 err_type = "InfraException"
                 err_message = repr(exc)
-            if str(meta.get("kind", "") or "") == "pool":
+                timings = {}
+            kind = str(meta.get("kind", "") or "")
+            if kind == "pool":
                 event_q.put(
                     {
                         "kind": "pool_task_done",
@@ -246,7 +256,8 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                         "err_message": err_message,
                     }
                 )
-            else:
+                continue
+            if kind == "runtime":
                 event_q.put(
                     {
                         "kind": "runtime_task_done",
@@ -259,6 +270,52 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                         "err_message": err_message,
                     }
                 )
+                continue
+            if kind == "service":
+                event_q.put(
+                    {
+                        "kind": "response",
+                        "request_id": str(meta.get("request_id", "") or ""),
+                        "ok": True,
+                        "status_text": status_text,
+                        "result": result,
+                        "err_type": err_type,
+                        "err_message": err_message,
+                        "timings": timings,
+                    }
+                )
+                continue
+
+        timed_out = []
+        for future, meta in list(inflight.items()):
+            if str(meta.get("kind", "") or "") != "service":
+                continue
+            start_at = float(meta.get("start_at", now) or now)
+            timeout_sec = float(meta.get("timeout_sec", 60.0) or 60.0)
+            if now - start_at <= timeout_sec:
+                continue
+            timed_out.append((future, meta))
+        for future, meta in timed_out:
+            inflight.pop(future, None)
+            service_id = str(meta.get("service_id", "") or "")
+            if service_id:
+                executor = service_executors.pop(service_id, None)
+                if executor is not None:
+                    _shutdown_executor(executor, wait=False)
+            else:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+            event_q.put(
+                {
+                    "kind": "response",
+                    "request_id": str(meta.get("request_id", "") or ""),
+                    "ok": False,
+                    "timeout": True,
+                    "error": "invoke timeout",
+                }
+            )
 
     for executor in list(service_executors.values()):
         _shutdown_executor(executor, wait=True)
@@ -273,6 +330,7 @@ class ExecutorHostClient:
         self._request_q = self._ctx.Queue()
         self._event_q = self._ctx.Queue()
         self._responses: Dict[str, Dict[str, Any]] = {}
+        self._expired_requests: set[str] = set()
         self._async_events: Deque[Dict[str, Any]] = deque()
         self._cv = threading.Condition()
         self._seq = 0
@@ -302,6 +360,9 @@ class ExecutorHostClient:
             with self._cv:
                 if kind == "response":
                     request_id = str(item.get("request_id", "") or "")
+                    if request_id in self._expired_requests:
+                        self._expired_requests.discard(request_id)
+                        continue
                     self._responses[request_id] = item
                     self._cv.notify_all()
                 else:
@@ -310,12 +371,12 @@ class ExecutorHostClient:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if self._process.is_alive():
             try:
                 self._request("shutdown", timeout_sec=30.0)
             except Exception:
                 pass
+        self._closed = True
         self._reader_stop.set()
         if self._reader.is_alive():
             self._reader.join(timeout=1.0)
@@ -342,7 +403,7 @@ class ExecutorHostClient:
             return items
 
     def _request(self, action: str, *, payload: Optional[Dict[str, Any]] = None, timeout_sec: float = 10.0) -> Dict[str, Any]:
-        if self._closed:
+        if self._closed and action != "shutdown":
             raise RuntimeError("executor host is closed")
         with self._cv:
             self._seq += 1
@@ -353,7 +414,11 @@ class ExecutorHostClient:
             while request_id not in self._responses:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self._responses.pop(request_id, None)
+                    self._expired_requests.add(request_id)
                     raise TimeoutError(f"executor host request timed out: {action}")
+                if not self._process.is_alive():
+                    raise RuntimeError("executor host process died")
                 self._cv.wait(timeout=min(0.1, remaining))
             return self._responses.pop(request_id)
 

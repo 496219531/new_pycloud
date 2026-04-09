@@ -6,6 +6,8 @@ import hashlib
 import time
 from urllib.request import Request, urlopen
 
+import pytest
+
 from pycloud_parallel.controlplane.client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
@@ -98,8 +100,13 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert "Service Instances" in raw
             assert "svc-reg-sync" in raw
             assert ">2</td><td>2</td>" in raw
+            assert "controlplane_version=" in raw
+            assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>" in raw
             assert "last_total_ms" in raw
             assert "avg_total_ms" in raw
+            assert "last_build_execute_spec_ms" in raw
+            assert "last_child_decode_ms" in raw
+            assert "avg_child_invoke_ms" in raw
 
             node_state.end_service(
                 owner_client_id="owner-reg",
@@ -174,7 +181,9 @@ def test_ops_page_marks_lost_service_instances(tmp_path):
 
         assert _wait_until(_service_ready)
 
-        req = Request(f"{info_target}/ops/nodes/node-ops-01/mark-lost", method="POST", data=b"")
+        with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
+            instance_id = infocenter.list_nodes(healthy_only=False, tags=["compute"], limit=20)[0].node_instance_id
+        req = Request(f"{info_target}/ops/nodes/{instance_id}/mark-lost", method="POST", data=b"")
         with urlopen(req, timeout=5.0) as resp:
             assert resp.status == 200
         with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
@@ -337,6 +346,47 @@ def test_infocenter_client_select_task_nodes_accepts_explicit_node_ids():
                 )
             )
             assert [node.node_id for node in selected] == ["node-b"]
+    finally:
+        info_server.stop()
+
+
+def test_infocenter_client_select_task_nodes_detects_duplicate_node_ids_and_supports_instance_ids():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-dup",
+                node_instance_id="node-dup-a",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            client.register_node(
+                node_id="node-dup",
+                node_instance_id="node-dup-b",
+                control_addr="127.0.0.1:50062",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+
+            with pytest.raises(RuntimeError, match="ambiguous"):
+                list(client.select_task_nodes(healthy_only=True, node_ids=["node-dup"], limit=10))
+
+            selected = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    node_instance_ids=["node-dup-b"],
+                    limit=10,
+                )
+            )
+            assert [node.node_instance_id for node in selected] == ["node-dup-b"]
+            assert [node.control_addr for node in selected] == ["127.0.0.1:50062"]
     finally:
         info_server.stop()
 

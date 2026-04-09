@@ -95,6 +95,8 @@ class InMemoryResultHook:
             item: 队列结果项
         """
         with self._cv:
+            if int(item.seq or 0) <= 0:
+                item = QueuedResult(seq=self._next_seq(), result=item.result)
             q = self._queues[client_id]
             if len(q) >= self._per_client_limit:
                 q.popleft()
@@ -139,11 +141,14 @@ class InMemoryResultHook:
         Returns:
             Tuple[List[pb2.TaskResult], str]: (结果列表, 下一个游标)
         """
-        del cursor
         timeout = max(0.0, wait_ms / 1000.0)
+        try:
+            cursor_seq = int(str(cursor or "0") or "0")
+        except Exception:
+            cursor_seq = 0
 
         with self._cv:
-            if not self._has_new_locked(client_id, 0) and timeout > 0:
+            if not self._has_new_locked(client_id, cursor_seq) and timeout > 0:
                 self._cv.wait(timeout=timeout)
 
             q = self._queues[client_id]

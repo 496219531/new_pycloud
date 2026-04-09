@@ -35,7 +35,7 @@ _LOCAL_RUNTIME_DEP_HINT = (
     'Reinstall with `pip install pycloud-parallel` (or avoid `--no-deps`).'
 )
 
-__version__ = "0.1.10"
+__version__ = "0.1.15"
 
 
 def pycloud_export(fn):
@@ -59,7 +59,7 @@ def _import_controlplane() -> Any:
         return importlib.import_module(".controlplane", __name__)
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
-        if missing == "grpc" or missing == "google" or missing.startswith("google."):
+        if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
             raise ModuleNotFoundError(_CONTROLPLANE_DEP_HINT) from exc
         raise
 
@@ -111,10 +111,11 @@ def _try_bind_controlplane_exports() -> None:
             ObjectRef,
             ResultRef,
             TaskPoolSession,
+            pycloud_export as controlplane_pycloud_export,
         )
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
-        if missing == "grpc" or missing == "google" or missing.startswith("google."):
+        if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
             return
         raise
 
@@ -122,6 +123,7 @@ def _try_bind_controlplane_exports() -> None:
         {
             "ObjectRef": ObjectRef,
             "ResultRef": ResultRef,
+            "pycloud_export": controlplane_pycloud_export,
             "DeployedService": DeployedService,
             "DedicatedTaskServiceSession": DedicatedTaskServiceSession,
             "DirectConnect": DirectConnect,

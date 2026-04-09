@@ -89,14 +89,53 @@ group = DeployedService.deploy_from_infocenter(
    - `errors`
    - `last_total_ms`
    - `last_setup_ms`
+   - `last_build_execute_spec_ms`
    - `last_executor_ms`
    - `last_finalize_ms`
+   - `last_child_decode_ms`
+   - `last_child_invoke_ms`
+   - `last_child_encode_ms`
    - `avg_total_ms`
    - `avg_setup_ms`
+   - `avg_build_execute_spec_ms`
    - `avg_executor_ms`
    - `avg_finalize_ms`
+   - `avg_child_decode_ms`
+   - `avg_child_invoke_ms`
+   - `avg_child_encode_ms`
    - `max_total_ms`
    - `last_invoke_ms`
+
+这些 timing 的当前实现边界如下：
+
+1. `setup`
+   - 发生在 node 父进程
+   - 覆盖 service/method 校验、session/status/token 校验、artifact 查找、executor 可用性检查、`in_flight` 计数更新
+2. `build_execute_spec`
+   - 发生在 node 父进程
+   - 主要对应 `_build_execute_spec(...)`
+   - 能帮助判断 payload 包装、managed globals 带入、执行描述生成是不是慢点
+3. `executor`
+   - 也是父进程视角的整段墙钟时间
+   - 从 `execute_spec` 已经构好并开始调用 `_executor_host.call_service(...)` 起算
+   - 到 executor host 返回结果结束
+   - 它包含父子进程通信、executor 侧等待/排队、用户函数执行，所以不是“纯函数 CPU 时间”
+4. `finalize`
+   - 父进程收尾阶段
+   - 包含成功结果包装、`StoredResultArtifact` 转 `ResultRef`、错误响应组装
+   - timeout 或 executor 提前异常时，这段当前通常记为 `0.0`
+5. `child_decode / child_invoke / child_encode`
+   - 发生在 executor 子进程
+   - `child_decode`：artifact/router 加载、managed globals 应用、payload/ObjectRef 解引用、方法查找
+   - `child_invoke`：真正执行用户函数
+   - `child_encode`：结果标准化，以及必要时转成 `StoredResultArtifact`
+6. `total`
+   - 就是一次 node 侧服务调用从进入 `_invoke_service_call(...)` 到准备返回响应为止的总耗时
+7. `avg_*`
+   - 当前都是 service session 生命周期内的累计平均值，不是最近 N 次滑窗
+8. `last_invoke_ms`
+   - 兼容旧字段
+   - 当前等价于 `last_child_invoke_ms`
 
 owner 长驻推荐：
 
@@ -108,6 +147,15 @@ try:
 finally:
     group.close(end_services=not joined)
 ```
+
+多节点标识说明：
+
+1. `node_id`
+   - 主要用于展示
+   - 允许重复
+2. `node_instance_id`
+   - 是 service group / task pool / InfoCenter 内部使用的唯一键
+   - 当你需要精确指定某一个同名节点实例时，应优先使用 `node_instance_id`
 
 要点：
 

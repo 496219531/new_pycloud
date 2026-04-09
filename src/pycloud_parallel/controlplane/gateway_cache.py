@@ -46,8 +46,10 @@ class GatewayRouteCache:
         self._lock = threading.Lock()
         self._snapshots: Dict[str, ServiceRouteSnapshot] = {}
         self._local_state: Dict[Tuple[str, str], RouteLocalState] = {}
+        self._refresh_events: Dict[str, threading.Event] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._round_robin_counter: int = 0
 
     def start(self) -> None:
         with self._lock:
@@ -83,41 +85,81 @@ class GatewayRouteCache:
         name = str(service_name or "").strip()
         if not name:
             raise ValueError("service_name is required")
-        rows = list(
-            self._source.list_service_routes(
-                service_name=name,
-                healthy_only=True,
-                limit=self.route_limit,
+        rows: List[InfoCenterServiceRoute] = []
+        error: Optional[Exception] = None
+        try:
+            rows = list(
+                self._source.list_service_routes(
+                    service_name=name,
+                    healthy_only=True,
+                    limit=self.route_limit,
+                )
             )
-        )
+        except Exception as exc:
+            error = exc
         snapshot = ServiceRouteSnapshot(
             service_name=name,
             routes=rows,
             refreshed_at=datetime.now(timezone.utc),
         )
         with self._lock:
-            if force or name not in self._snapshots or rows:
+            if error is None and (force or name not in self._snapshots or rows):
                 self._snapshots[name] = snapshot
+            valid_ids = {route.service_id for route in rows}
+            for key in list(self._local_state.keys()):
+                svc_name, svc_id = key
+                if svc_name != name:
+                    continue
+                if valid_ids and svc_id not in valid_ids:
+                    self._local_state.pop(key, None)
+                if not valid_ids:
+                    self._local_state.pop(key, None)
+            event = self._refresh_events.pop(name, None)
+            if event is not None:
+                event.set()
+        if error is not None:
+            raise error
         return rows
 
     def get_routes(self, service_name: str) -> Sequence[InfoCenterServiceRoute]:
         name = str(service_name or "").strip()
         if not name:
             raise ValueError("service_name is required")
+        return list(self._coalesced_refresh(name))
+
+    def _coalesced_refresh(self, service_name: str) -> Sequence[InfoCenterServiceRoute]:
+        name = str(service_name or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
         with self._lock:
             snapshot = self._snapshots.get(name)
-        if snapshot is None:
+            if snapshot is not None and snapshot.routes:
+                return list(snapshot.routes)
+            event = self._refresh_events.get(name)
+            if event is None:
+                event = threading.Event()
+                self._refresh_events[name] = event
+                do_refresh = True
+            else:
+                do_refresh = False
+        if do_refresh:
             return list(self.refresh(name, force=True))
-        if not snapshot.routes:
-            return list(self.refresh(name, force=True))
-        return list(snapshot.routes)
+        event.wait(timeout=max(0.1, self.refresh_interval_sec))
+        with self._lock:
+            snapshot = self._snapshots.get(name)
+            if snapshot is not None:
+                return list(snapshot.routes)
+        return list(self.refresh(name, force=True))
 
     def snapshot_info(self, service_name: str) -> Dict[str, object]:
-        routes = list(self.get_routes(service_name))
+        name = str(service_name or "").strip()
+        routes = list(self.get_routes(name))
         with self._lock:
-            snapshot = self._snapshots.get(str(service_name or "").strip())
+            snapshot = self._snapshots.get(name)
+            if snapshot is not None:
+                routes = list(snapshot.routes)
         return {
-            "service_name": str(service_name or "").strip(),
+            "service_name": name,
             "refreshed_at": snapshot.refreshed_at.isoformat() if snapshot is not None else "",
             "route_count": len(routes),
             "routes": routes,
@@ -147,8 +189,17 @@ class GatewayRouteCache:
         ]
         if not candidates:
             raise RuntimeError(f"no available route for service_name={name}")
-        candidates.sort(key=lambda route: (int(route.in_flight), -int(route.alive_workers), route.node_id, route.service_id))
-        return candidates[0]
+        # Sort by load first; use round-robin as final tiebreaker to spread
+        # traffic when metrics are equal (e.g. all nodes idle with in_flight=0).
+        with self._lock:
+            rr = self._round_robin_counter
+            self._round_robin_counter += 1
+        candidates.sort(key=lambda route: (int(route.in_flight), -int(route.alive_workers)))
+        # Among equal-load candidates, rotate selection via round-robin.
+        min_in_flight = int(candidates[0].in_flight)
+        min_alive = int(candidates[0].alive_workers)
+        top_tier = [r for r in candidates if int(r.in_flight) == min_in_flight and int(r.alive_workers) == min_alive]
+        return top_tier[rr % len(top_tier)]
 
     def _route_available(self, service_name: str, service_id: str) -> bool:
         key = (service_name, service_id)

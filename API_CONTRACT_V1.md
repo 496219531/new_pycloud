@@ -14,6 +14,7 @@
 
 ```json
 {
+  "node_instance_id": "node-1-a1b2c3d4e5f6",
   "node_id": "node-1",
   "control_addr": "127.0.0.1:50061",
   "capacity": 4,
@@ -36,6 +37,7 @@
   "ok": true,
   "heartbeat_interval_sec": 5,
   "node": {
+    "node_instance_id": "node-1-a1b2c3d4e5f6",
     "node_id": "node-1",
     "control_addr": "127.0.0.1:50061",
     "healthy": true,
@@ -56,6 +58,7 @@
 
 ```json
 {
+  "node_instance_id": "node-1-a1b2c3d4e5f6",
   "node_id": "node-1",
   "healthy": true,
   "metrics": {
@@ -109,6 +112,7 @@
   "ok": true,
   "nodes": [
     {
+      "node_instance_id": "node-1-a1b2c3d4e5f6",
       "node_id": "node-1",
       "control_addr": "127.0.0.1:50061",
       "healthy": true,
@@ -145,6 +149,7 @@
       "service_name": "square-service",
       "service_id": "svc-001",
       "status": 2,
+      "node_instance_id": "node-1-a1b2c3d4e5f6",
       "node_id": "node-1",
       "control_addr": "127.0.0.1:50061",
       "node_healthy": true,
@@ -161,12 +166,22 @@
 ### 1.5 运维接口
 
 1. `GET /ops`
-2. `POST /ops/nodes/{node_id}/cordon`
-3. `POST /ops/nodes/{node_id}/uncordon`
-4. `POST /ops/nodes/{node_id}/drain`
-5. `POST /ops/nodes/{node_id}/undrain`
+2. `POST /ops/nodes/{node_instance_id}/cordon`
+3. `POST /ops/nodes/{node_instance_id}/uncordon`
+4. `POST /ops/nodes/{node_instance_id}/drain`
+5. `POST /ops/nodes/{node_instance_id}/undrain`
+6. `POST /ops/nodes/{node_instance_id}/mark-lost`
 
 这些接口当前是轻量运维开关，不做复杂的自动迁移。
+
+节点标识约定：
+
+1. `node_id`
+   - 逻辑展示名
+   - 允许重复
+2. `node_instance_id`
+   - InfoCenter 内部真正的节点主键
+   - `/ops` 运维动作按它定位
 
 ## 2. 服务 HTTP 数据面
 

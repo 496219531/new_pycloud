@@ -3,6 +3,7 @@ from __future__ import annotations
 """Server bootstrap for PyCloud control-plane services."""
 
 import argparse
+import os
 import logging
 import signal
 from concurrent import futures
@@ -23,6 +24,7 @@ from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp, GatewayHt
 from pycloud_parallel.controlplane.gateway_source import InProcessInfoCenterSource, RemoteInfoCenterSource
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
+from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port, resolve_public_host, split_host_port
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
@@ -31,8 +33,14 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 logger = logging.getLogger(__name__)
 
 
+def _resolve_bind(bind: str, *, remote_hint: str = "") -> str:
+    host, port = split_host_port(bind)
+    return format_host_port(resolve_public_host(host, remote_hint=remote_hint), port)
+
+
 def build_infocenter_server(bind: str, *, max_workers: int = 32) -> InfoCenterHttpServer:
-    del max_workers
+    if int(max_workers or 0) != 32:
+        logger.warning("InfoCenterHttpServer does not support max_workers; ignoring %s", max_workers)
     server = InfoCenterHttpServer(
         bind=bind,
         state=InfoCenterState(heartbeat_interval_sec=5),
@@ -80,7 +88,8 @@ def build_gateway_server(
         failure_threshold=gateway_failure_threshold,
         open_sec=gateway_open_sec,
     )
-    return GatewayHttpServer(bind=bind, app=GatewayHttpApp(route_cache=route_cache))
+    allow_private = str(os.getenv("PYCLOUD_GATEWAY_ALLOW_PRIVATE_ADDRS", "true") or "true").lower() in {"1", "true", "yes"}
+    return GatewayHttpServer(bind=bind, app=GatewayHttpApp(route_cache=route_cache, allow_private_addrs=allow_private))
 
 
 def build_nodecontrol_server(
@@ -90,7 +99,7 @@ def build_nodecontrol_server(
     worker_capacity: int = NODE_WORKER_CAPACITY,
     queue_capacity: int = NODE_QUEUE_CAPACITY,
     max_workers: int = NODE_MAX_WORKERS,
-    service_http_bind: str = "127.0.0.1:18080",
+    service_http_bind: str = "0.0.0.0:18080",
     service_http_base_url: str = "",
     service_default_worker_count: int = SERVICE_DEFAULT_WORKERS,
     service_default_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
@@ -154,6 +163,7 @@ def _wait_until_stopped(
         except (ValueError, OSError):
             # ValueError: not in main thread
             # OSError: unsupported signal in current platform/runtime
+            logger.warning("failed to register signal handler %s (not in main thread or unsupported)", sig_name)
             continue
     server.wait_for_termination()
 
@@ -165,12 +175,12 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser(description="PyCloud control-plane server")
     parser.add_argument("--role", choices=["infocenter", "gateway", "controlplane", "nodecontrol"], required=True)
-    parser.add_argument("--bind", default="0.0.0.0:50051")
+    parser.add_argument("--bind", default="")
     parser.add_argument("--node-id", default="node-local-01")
     parser.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY)
     parser.add_argument("--worker-capacity", type=int, default=NODE_WORKER_CAPACITY)
     parser.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS)
-    parser.add_argument("--service-http-bind", default="127.0.0.1:18080")
+    parser.add_argument("--service-http-bind", default="")
     parser.add_argument("--service-http-base-url", default="")
     parser.add_argument("--service-default-workers", type=int, default=SERVICE_DEFAULT_WORKERS)
     parser.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC)
@@ -183,6 +193,11 @@ def main() -> None:
     parser.add_argument("--gateway-open-sec", type=float, default=5.0)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
+    if not str(args.bind or "").strip():
+        default_port = 50051 if args.role in ("infocenter", "controlplane") else (50052 if args.role == "gateway" else 50061)
+        args.bind = format_host_port(detect_local_ip(remote_hint=str(args.infocenter_addr or "")), default_port)
+    if args.role == "nodecontrol" and not str(args.service_http_bind or "").strip():
+        args.service_http_bind = format_host_port(detect_local_ip(remote_hint=str(args.infocenter_addr or "")), 18080)
 
     level_name = str(args.log_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -192,15 +207,17 @@ def main() -> None:
     )
 
     if args.role == "infocenter":
-        logger.info("[Server] starting InfoCenter bind=%s log_level=%s", args.bind, level_name)
-        server = build_infocenter_server(args.bind, max_workers=args.max_workers)
+        bind = _resolve_bind(args.bind)
+        logger.info("[Server] starting InfoCenter bind=%s log_level=%s", bind, level_name)
+        server = build_infocenter_server(bind, max_workers=args.max_workers)
         _wait_until_stopped(server, on_stop=lambda: None)
         return
 
     if args.role == "controlplane":
-        logger.info("[Server] starting ControlPlane bind=%s log_level=%s", args.bind, level_name)
+        bind = _resolve_bind(args.bind)
+        logger.info("[Server] starting ControlPlane bind=%s log_level=%s", bind, level_name)
         server = build_controlplane_server(
-            args.bind,
+            bind,
             gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
             gateway_failure_threshold=args.gateway_failure_threshold,
             gateway_open_sec=args.gateway_open_sec,
@@ -209,14 +226,15 @@ def main() -> None:
         return
 
     if args.role == "gateway":
+        bind = _resolve_bind(args.bind, remote_hint=args.infocenter_addr)
         logger.info(
             "[Server] starting Gateway bind=%s infocenter=%s log_level=%s",
-            args.bind,
+            bind,
             args.infocenter_addr,
             level_name,
         )
         server = build_gateway_server(
-            args.bind,
+            bind,
             infocenter_addr=args.infocenter_addr,
             gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
             gateway_failure_threshold=args.gateway_failure_threshold,
@@ -225,15 +243,25 @@ def main() -> None:
         _wait_until_stopped(server, on_stop=lambda: None)
         return
 
+    bind = _resolve_bind(args.bind, remote_hint=args.infocenter_addr)
+    service_http_bind = _resolve_bind(args.service_http_bind, remote_hint=args.infocenter_addr)
+    advertise_addr = str(args.advertise_addr or "").strip()
+    if not advertise_addr:
+        advertise_host, advertise_port = split_host_port(bind)
+        advertise_addr = format_host_port(resolve_public_host(advertise_host, remote_hint=args.infocenter_addr), advertise_port)
+    service_http_base_url = str(args.service_http_base_url or "").strip()
+    if not service_http_base_url:
+        advertise_host, _advertise_port = split_host_port(advertise_addr)
+        _service_host, service_port = split_host_port(service_http_bind)
+        service_http_base_url = f"http://{resolve_public_host(advertise_host, remote_hint=args.infocenter_addr)}:{int(service_port)}"
     logger.info(
         "[Server] starting NodeControl bind=%s node_id=%s infocenter=%s advertise=%s log_level=%s",
-        args.bind,
+        bind,
         args.node_id,
         args.infocenter_addr,
-        args.advertise_addr or args.bind,
+        advertise_addr,
         level_name,
     )
-    advertise_addr = (args.advertise_addr or args.bind).strip()
     node_tags = [x.strip() for x in args.node_tags.split(",") if x.strip()]
 
     registrar_holder: dict[str, Optional[NodeInfoCenterRegistrar]] = {"value": None}
@@ -244,13 +272,13 @@ def main() -> None:
             registrar.sync_now()
 
     server, state = build_nodecontrol_server(
-        args.bind,
+        bind,
         node_id=args.node_id,
         queue_capacity=args.queue_capacity,
         worker_capacity=args.worker_capacity,
         max_workers=args.max_workers,
-        service_http_bind=args.service_http_bind,
-        service_http_base_url=args.service_http_base_url,
+        service_http_bind=service_http_bind,
+        service_http_base_url=service_http_base_url,
         service_default_worker_count=args.service_default_workers,
         service_default_heartbeat_timeout_sec=args.service_heartbeat_timeout_sec,
         on_service_routes_changed=_sync_routes_now,

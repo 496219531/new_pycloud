@@ -536,6 +536,199 @@ class TestDeployedService:
         assert "[DeployedService] owner keepalive stopped service_name=demo-service" in err
         assert "node-1" in err
 
+    def test_service_group_update_globals_prepares_values_once_for_all_nodes(self):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+
+        session_a = SimpleNamespace(failed=False, last_error="")
+        session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
+        session_b = SimpleNamespace(failed=False, last_error="")
+        session_b.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
+
+        client_a = MagicMock()
+        client_b = MagicMock()
+        group = ServiceGroup(
+            owner_client_id="owner-demo",
+            service_name="svc-demo",
+            sessions={"node-a": session_a, "node-b": session_b},
+            nodes={},
+            _clients={"node-a": client_a, "node-b": client_b},
+        )
+
+        with patch(
+            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            return_value={"cfg": {"k": "v"}},
+        ) as mocked_prepare:
+            digest = group.update_globals({"cfg": {"k": "v"}})
+
+        assert digest == "sha256:same"
+        assert group.globals_digests == {"node-a": "sha256:same", "node-b": "sha256:same"}
+        mocked_prepare.assert_called_once_with([client_a, client_b], {"cfg": {"k": "v"}})
+        session_a.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
+        session_b.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
+
+    def test_service_group_update_globals_prunes_failed_nodes(self):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+
+        session_a = SimpleNamespace(failed=False, last_error="")
+        session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
+        session_b = SimpleNamespace(failed=False, last_error="")
+        session_b.update_globals_prepared = MagicMock(side_effect=RuntimeError("node-b unavailable"))
+
+        client_a = MagicMock()
+        client_b = MagicMock()
+        group = ServiceGroup(
+            owner_client_id="owner-demo",
+            service_name="svc-demo",
+            sessions={"node-a": session_a, "node-b": session_b},
+            nodes={"node-a": MagicMock(), "node-b": MagicMock()},
+            _clients={"node-a": client_a, "node-b": client_b},
+        )
+
+        with patch(
+            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            return_value={"cfg": {"k": "v"}},
+        ):
+            digest = group.update_globals({"cfg": {"k": "v"}})
+
+        assert digest == "sha256:same"
+        assert set(group.sessions.keys()) == {"node-a"}
+        assert set(group._clients.keys()) == {"node-a"}  # noqa: SLF001
+        assert "node-b" in group.failures
+        assert group.globals_digests == {"node-a": "sha256:same"}
+        client_b.close.assert_called_once()
+
+    def test_service_group_update_globals_allows_per_node_digests(self):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+
+        session_a = SimpleNamespace(failed=False, last_error="")
+        session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:a"))
+        session_b = SimpleNamespace(failed=False, last_error="")
+        session_b.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:b"))
+        client_a = MagicMock()
+        client_b = MagicMock()
+        group = ServiceGroup(
+            owner_client_id="owner-demo",
+            service_name="svc-demo",
+            sessions={"node-a": session_a, "node-b": session_b},
+            nodes={},
+            _clients={"node-a": client_a, "node-b": client_b},
+        )
+
+        with patch(
+            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            return_value={"cfg": {"k": "v"}},
+        ):
+            digest = group.update_globals({"cfg": {"k": "v"}})
+
+        assert digest in {"sha256:a", "sha256:b"}
+        assert group.globals_digests == {"node-a": "sha256:a", "node-b": "sha256:b"}
+
+    def test_service_group_update_globals_fails_when_all_nodes_fail(self):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+
+        session_a = SimpleNamespace(failed=False, last_error="")
+        session_a.update_globals_prepared = MagicMock(side_effect=RuntimeError("node-a unavailable"))
+        client_a = MagicMock()
+        group = ServiceGroup(
+            owner_client_id="owner-demo",
+            service_name="svc-demo",
+            sessions={"node-a": session_a},
+            nodes={"node-a": MagicMock()},
+            _clients={"node-a": client_a},
+        )
+
+        with patch(
+            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            return_value={"cfg": {"k": "v"}},
+        ):
+            with pytest.raises(RuntimeError, match="update_globals failed on all nodes"):
+                group.update_globals({"cfg": {"k": "v"}})
+
+    def test_deploy_from_infocenter_clamps_worker_count_per_node_capacity(self, tmp_path):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        node_a = SimpleNamespace(
+            node_id="node-a",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=10,
+            capacity=10,
+            queued=0,
+            python_version="py3.11",
+        )
+        node_b = SimpleNamespace(
+            node_id="node-b",
+            control_addr="127.0.0.1:50062",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=7,
+            capacity=7,
+            queued=0,
+            python_version="py3.11",
+        )
+        create_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append((self.target, dict(kwargs)))
+                return SimpleNamespace(
+                    service_id=f"svc-{self.target.rsplit(':', 1)[-1]}",
+                    service_token="token",
+                    http_base_url=f"http://{self.target}/svc/demo",
+                    heartbeat_timeout_sec=30,
+                    worker_count=int(kwargs["worker_count"]),
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            return_value=((), [node_a, node_b]),
+        ), patch(
+            "pycloud_parallel.controlplane.client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            ServiceGroup,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            ServiceGroup,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = ServiceGroup.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="svc-clamp",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="svc_clamp",
+                entry_callable="run",
+                worker_count=8,
+                node_count=2,
+                min_success_nodes=2,
+                allow_partial=False,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert len(create_calls) == 2
+            call_map = {target: kwargs for target, kwargs in create_calls}
+            assert call_map["127.0.0.1:50061"]["worker_count"] == 8
+            assert call_map["127.0.0.1:50062"]["worker_count"] == 7
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
     def test_async_call_all_interface(self):
         """测试异步 call_all 接口。"""
         from pycloud_parallel.controlplane.client import DeployedService

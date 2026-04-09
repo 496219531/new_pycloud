@@ -113,6 +113,22 @@ Python 客户端当前支持：
 2. 按 `service_worker_available` 选前 N 个节点。
 3. N 由 `node_ids` / `node_count` / `min_success_nodes` 决定。
 
+### 6.4 节点实例唯一键
+
+虽然 `InfoCenterService` 已经从 gRPC service 里移除，但当前 proto 里的节点相关消息仍然统一带上了 `node_instance_id`：
+
+1. `RegisterNodeRequest`
+2. `RegisterNodeResponse`
+3. `HeartbeatNodeRequest`
+4. `NodeInfo`
+5. `ServiceRouteInfo`
+
+约定：
+
+1. `node_id` 主要用于逻辑展示，允许重复
+2. `node_instance_id` 才是节点实例唯一键
+3. HTTP `/services/routes` 与 `/nodes` 返回的也是这套字段
+
 ## 7. 已移除的旧项
 
 以下 gRPC service 已不再存在：

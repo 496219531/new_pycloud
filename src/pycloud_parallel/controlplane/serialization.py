@@ -30,6 +30,7 @@ from pycloud_parallel.controlplane.result_ref import (
 )
 
 payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
+MAX_ARROW_RECURSION_DEPTH = 200
 
 
 def _format_payload_bytes(size_bytes: int) -> str:
@@ -136,9 +137,19 @@ def validate_inline_payload_size(size_bytes: int, *, limit_bytes: int = INLINE_P
     return normalized
 
 
+INLINE_STRUCT_WIRE_OVERHEAD_RATIO = 0.1
+INLINE_STRUCT_WIRE_OVERHEAD_MIN_BYTES = 512
+
+
+def _struct_wire_size_with_overhead(data: struct_pb2.Struct) -> int:
+    size = int(data.ByteSize())
+    overhead = max(INLINE_STRUCT_WIRE_OVERHEAD_MIN_BYTES, int(size * INLINE_STRUCT_WIRE_OVERHEAD_RATIO))
+    return size + overhead
+
+
 def validate_inline_payload_struct(data: struct_pb2.Struct, *, limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES, context: str = "payload") -> int:
     return validate_inline_payload_size(
-        int(data.ByteSize()),
+        _struct_wire_size_with_overhead(data),
         limit_bytes=limit_bytes,
         context=context,
     )
@@ -169,7 +180,7 @@ def validate_inline_result_size(size_bytes: int, *, limit_bytes: int = INLINE_RE
 
 def validate_inline_result_struct(data: struct_pb2.Struct, *, limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES, context: str = "result") -> int:
     return validate_inline_result_size(
-        int(data.ByteSize()),
+        _struct_wire_size_with_overhead(data),
         limit_bytes=limit_bytes,
         context=context,
     )
@@ -240,7 +251,7 @@ def serialize_inline_payload(
 
 def serialize_arrow_compatible(obj: Any) -> Any:
     """Recursively convert Arrow-compatible objects into JSON/Struct-safe data."""
-    return _serialize_arrow_compatible(obj, path="payload")
+    return _serialize_arrow_compatible(obj, path="payload", depth=0)
 
 
 def _child_path(path: str, key: Any) -> str:
@@ -286,7 +297,7 @@ def _serialize_pandas_label(value: Any, *, path: str) -> Any:
             "items": [_serialize_pandas_label(item, path=_child_path(path, idx)) for idx, item in enumerate(value)],
         }
 
-    serialized = _serialize_arrow_compatible(value, path=path)
+    serialized = _serialize_arrow_compatible(value, path=path, depth=0)
     return {"__type__": "pd.label", "kind": "object", "value": serialized}
 
 
@@ -356,7 +367,7 @@ def _deserialize_pandas_index(spec: Any):
         return pd.RangeIndex(
             start=int(spec.get("start", 0) or 0),
             stop=int(spec.get("stop", 0) or 0),
-            step=int(spec.get("step", 1) or 1),
+            step=int(spec.get("step", 1)),
             name=_deserialize_pandas_label(spec.get("name")),
         )
     return pd.Index(
@@ -410,7 +421,7 @@ def serialize_series_bundle(series: Any) -> dict[str, Any]:
     return {
         "version": 1,
         "index": _serialize_pandas_index(series.index, path="payload.index"),
-        "name": _serialize_arrow_compatible(series.name, path="payload.name"),
+        "name": _serialize_arrow_compatible(series.name, path="payload.name", depth=0),
     }
 
 
@@ -429,9 +440,15 @@ def deserialize_series_bundle(meta: Any, series: Any):
     return series
 
 
-def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
+def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
     """Internal recursive serializer with better error locations."""
-    if obj is None or isinstance(obj, (str, int, float, bool)):
+    if depth > MAX_ARROW_RECURSION_DEPTH:
+        raise RecursionError(f"{path} exceeds max serialization depth {MAX_ARROW_RECURSION_DEPTH}")
+    if obj is None or isinstance(obj, (str, float, bool)):
+        return obj
+    if isinstance(obj, int):
+        if abs(obj) > 2**53:
+            return {"__type__": "int64", "value": str(obj)}
         return obj
     if isinstance(obj, datetime):
         return {"__type__": "datetime", "value": obj.isoformat()}
@@ -462,18 +479,20 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
         if isinstance(obj, pd.Timedelta):
             return {"__type__": "pd.Timedelta", "value": obj.isoformat()}
         if isinstance(obj, pd.DataFrame):
+            rows = [list(row) for row in obj.itertuples(index=False, name=None)]
             return {
                 "__type__": "DataFrame",
-                "data": _serialize_arrow_compatible(obj.to_numpy(dtype=object).tolist(), path=f"{path}.data"),
+                "data": _serialize_arrow_compatible(rows, path=f"{path}.data", depth=depth + 1),
                 "index": _serialize_pandas_index(obj.index, path=f"{path}.index"),
                 "columns": _serialize_pandas_index(obj.columns, path=f"{path}.columns"),
+                "column_dtypes": [str(dtype) for dtype in obj.dtypes],
             }
         if isinstance(obj, pd.Series):
             return {
                 "__type__": "Series",
-                "data": _serialize_arrow_compatible(obj.tolist(), path=f"{path}.data"),
+                "data": _serialize_arrow_compatible(obj.tolist(), path=f"{path}.data", depth=depth + 1),
                 "index": _serialize_pandas_index(obj.index, path=f"{path}.index"),
-                "name": _serialize_arrow_compatible(obj.name, path=f"{path}.name"),
+                "name": _serialize_arrow_compatible(obj.name, path=f"{path}.name", depth=depth + 1),
             }
     except ImportError:
         pass
@@ -489,7 +508,7 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
                 )
             return {
                 "__type__": "ndarray",
-                "data": _serialize_arrow_compatible(obj.tolist(), path=f"{path}.data"),
+                "data": _serialize_arrow_compatible(obj.tolist(), path=f"{path}.data", depth=depth + 1),
                 "dtype": str(obj.dtype),
             }
     except ImportError:
@@ -501,10 +520,10 @@ def _serialize_arrow_compatible(obj: Any, *, path: str) -> Any:
         for key, value in obj.items():
             normalized_key = _normalize_mapping_key(key, path=path, existing_keys=seen_keys)
             seen_keys.add(normalized_key)
-            out[normalized_key] = _serialize_arrow_compatible(value, path=_child_path(path, key))
+            out[normalized_key] = _serialize_arrow_compatible(value, path=_child_path(path, key), depth=depth + 1)
         return out
     if isinstance(obj, (list, tuple)):
-        return [_serialize_arrow_compatible(item, path=_child_path(path, idx)) for idx, item in enumerate(obj)]
+        return [_serialize_arrow_compatible(item, path=_child_path(path, idx), depth=depth + 1) for idx, item in enumerate(obj)]
 
     raise TypeError(
         f"{path} has unsupported type {type(obj).__name__}; "
@@ -544,6 +563,12 @@ def convert_arrow_to_dict(obj: Any) -> dict:
 
 def convert_dict_to_arrow(data: Any) -> Any:
     """Restore tagged dict/list payloads back into pandas/numpy objects."""
+    return _convert_dict_to_arrow(data, depth=0)
+
+
+def _convert_dict_to_arrow(data: Any, *, depth: int) -> Any:
+    if depth > MAX_ARROW_RECURSION_DEPTH:
+        raise RecursionError(f"payload exceeds max deserialization depth {MAX_ARROW_RECURSION_DEPTH}")
     if isinstance(data, dict):
         if is_object_ref_payload(data):
             return object_ref_from_payload(data)
@@ -558,6 +583,8 @@ def convert_dict_to_arrow(data: Any) -> Any:
             return time.fromisoformat(str(data["value"]))
         if obj_type == "timedelta":
             return timedelta(seconds=float(data["seconds"]))
+        if obj_type == "int64":
+            return int(str(data.get("value", "0")))
         if obj_type == "pd.Timestamp":
             try:
                 import pandas as pd
@@ -576,9 +603,16 @@ def convert_dict_to_arrow(data: Any) -> Any:
             try:
                 import pandas as pd
 
-                frame = pd.DataFrame(convert_dict_to_arrow(data["data"]))
+                frame = pd.DataFrame(_convert_dict_to_arrow(data["data"], depth=depth + 1))
                 frame.index = _deserialize_pandas_index(data.get("index"))
                 frame.columns = _deserialize_pandas_index(data.get("columns"))
+                dtypes = data.get("column_dtypes")
+                if isinstance(dtypes, list) and len(dtypes) == len(frame.columns):
+                    for col, dtype in zip(frame.columns, dtypes):
+                        try:
+                            frame[col] = frame[col].astype(dtype)
+                        except Exception:
+                            continue
                 return frame
             except ImportError as exc:
                 raise RuntimeError("pandas not available, cannot deserialize DataFrame") from exc
@@ -587,9 +621,9 @@ def convert_dict_to_arrow(data: Any) -> Any:
                 import pandas as pd
 
                 return pd.Series(
-                    convert_dict_to_arrow(data["data"]),
+                    _convert_dict_to_arrow(data["data"], depth=depth + 1),
                     index=_deserialize_pandas_index(data.get("index")),
-                    name=convert_dict_to_arrow(data.get("name")),
+                    name=_convert_dict_to_arrow(data.get("name"), depth=depth + 1),
                 )
             except ImportError as exc:
                 raise RuntimeError("pandas not available, cannot deserialize Series") from exc
@@ -600,9 +634,11 @@ def convert_dict_to_arrow(data: Any) -> Any:
                 return np.array(data["data"], dtype=data.get("dtype"))
             except ImportError as exc:
                 raise RuntimeError("numpy not available, cannot deserialize ndarray") from exc
-        return {k: convert_dict_to_arrow(v) for k, v in data.items()}
+        if obj_type is not None:
+            raise TypeError(f"unsupported payload __type__: {obj_type!r}")
+        return {k: _convert_dict_to_arrow(v, depth=depth + 1) for k, v in data.items()}
     if isinstance(data, list):
-        return [convert_dict_to_arrow(item) for item in data]
+        return [_convert_dict_to_arrow(item, depth=depth + 1) for item in data]
     return data
 
 

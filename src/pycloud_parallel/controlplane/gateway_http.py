@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """HTTP gateway for service-mode callers."""
 
+import errno
+import ipaddress
 import json
 import threading
 from dataclasses import dataclass
@@ -13,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.client import InfoCenterServiceRoute, NodeControlClient
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
+from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow, serialize_arrow_compatible, serialize_inline_payload
 
@@ -21,8 +24,11 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
         return True
     if isinstance(exc, OSError):
-        return True
+        return getattr(exc, "errno", None) in (errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED)
     return False
+
+
+MAX_BODY_BYTES = 64 * 1024 * 1024
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -42,17 +48,29 @@ class GatewayCallError(Exception):
 
 
 class GatewayHttpApp:
-    def __init__(self, *, route_cache: GatewayRouteCache, timeout_sec: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        route_cache: GatewayRouteCache,
+        timeout_sec: float = 10.0,
+        allow_private_addrs: bool = True,
+    ) -> None:
         self.route_cache = route_cache
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self._stopped = False
+        self.allow_private_addrs = bool(allow_private_addrs)
 
     def start(self) -> None:
+        self._stopped = False
         self.route_cache.start()
 
     def stop(self) -> None:
+        self._stopped = True
         self.route_cache.stop()
 
     def handle_post(self, *, path: str, headers, body: bytes) -> Optional[Tuple[int, Dict[str, object]]]:
+        if self._stopped:
+            return 503, {"ok": False, "error": "gateway stopping"}
         parsed = urlparse(path)
         parts = [x for x in parsed.path.split("/") if x]
         if len(parts) != 4 or parts[0] != "svc" or parts[2] != "call":
@@ -88,7 +106,7 @@ class GatewayHttpApp:
             self.route_cache.mark_success(route)
             return 200, resp
         except GatewayCallError as exc:
-            if not tried or not self._is_route_failure(exc):
+            if not self._is_route_failure(exc):
                 return exc.status_code, exc.data
             self.route_cache.mark_failure(route, str(exc))
             try:
@@ -107,6 +125,8 @@ class GatewayHttpApp:
             return 502, {"ok": False, "error": f"gateway call failed: {exc}"}
 
     def handle_get(self, *, path: str, headers) -> Optional[Tuple[int, Dict[str, object]]]:
+        if self._stopped:
+            return 503, {"ok": False, "error": "gateway stopping"}
         del headers
         parsed = urlparse(path)
         parts = [x for x in parsed.path.split("/") if x]
@@ -133,11 +153,13 @@ class GatewayHttpApp:
                 self.route_cache.mark_failure(route, str(exc))
             try:
                 self.route_cache.refresh(service_name, force=True)
-                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
-                resp = self._list_methods(route, include_docs=include_docs)
-                self.route_cache.mark_success(route)
+                retry_route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                resp = self._list_methods(retry_route, include_docs=include_docs)
+                self.route_cache.mark_success(retry_route)
                 return 200, resp
             except Exception as exc:
+                if "retry_route" in locals():
+                    self.route_cache.mark_failure(retry_route, str(exc))
                 return 502, {"ok": False, "error": f"gateway list methods failed: {exc}"}
 
     def _status(self, service_name: str) -> Tuple[int, Dict[str, object]]:
@@ -154,6 +176,7 @@ class GatewayHttpApp:
                 {
                     "service_name": route.service_name,
                     "service_id": route.service_id,
+                    "node_instance_id": route.node_instance_id,
                     "node_id": route.node_id,
                     "control_addr": route.control_addr,
                     "node_healthy": route.node_healthy,
@@ -199,7 +222,10 @@ class GatewayHttpApp:
         timeout_sec: float,
         service_token: str,
     ) -> Dict[str, object]:
-        url = f"{route.http_base_url}/call/{quote(method, safe='')}?timeout_sec={max(0.1, timeout_sec):.3f}"
+        base_url = self._validate_route_url(route.http_base_url)
+        if not base_url:
+            raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid route http_base_url"})
+        url = f"{base_url}/call/{quote(method, safe='')}?timeout_sec={max(0.1, timeout_sec):.3f}"
         headers = {"Content-Type": "application/json"}
         if service_token:
             headers["X-Service-Token"] = service_token
@@ -211,10 +237,17 @@ class GatewayHttpApp:
         )
         try:
             with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-                data = json.loads(resp.read().decode("utf-8") or "{}")
+                raw = resp.read(MAX_BODY_BYTES + 1)
+                if len(raw) > MAX_BODY_BYTES:
+                    raise GatewayCallError(status_code=502, data={"ok": False, "error": "response too large"})
+                data = json.loads(raw.decode("utf-8") or "{}")
         except HTTPError as exc:
             try:
-                data = json.loads((exc.read() or b"{}").decode("utf-8"))
+                raw = exc.read() or b"{}"
+                if len(raw) > MAX_BODY_BYTES:
+                    data = {"ok": False, "error": "response too large"}
+                else:
+                    data = json.loads(raw.decode("utf-8"))
             except Exception:
                 data = {"ok": False, "error": exc.reason}
             raise GatewayCallError(status_code=exc.code, data=data) from exc
@@ -223,7 +256,7 @@ class GatewayHttpApp:
         if not isinstance(data, dict):
             raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
         if not data.get("ok", False):
-            raise GatewayCallError(status_code=502, data=data)
+            raise GatewayCallError(status_code=200, data=data)
         return _attach_result_ref_control_addr(convert_dict_to_arrow(data), control_addr=route.control_addr)
 
     def _extract_token(self, headers) -> str:
@@ -239,10 +272,38 @@ class GatewayHttpApp:
     def _is_route_failure(self, exc: GatewayCallError) -> bool:
         if exc.status_code == 502:
             return True
+        if exc.status_code == 200:
+            return False
         if exc.status_code not in (404, 409, 500):
             return False
         msg = str(exc.data.get("error", "") or "").lower()
         return any(text in msg for text in ("service not found", "service not running", "service executor stopped", "artifact missing"))
+
+    def _validate_route_url(self, http_base_url: str) -> str:
+        raw = str(http_base_url or "").strip()
+        if not raw:
+            return ""
+        parsed = urlparse(raw)
+        if parsed.scheme not in ("http", "https"):
+            return ""
+        if not parsed.netloc:
+            return ""
+        host = parsed.hostname or ""
+        if not host:
+            return ""
+        if host in ("localhost",):
+            return ""
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return raw.rstrip("/")
+        if ip.is_multicast or ip.is_unspecified:
+            return ""
+        if not self.allow_private_addrs and (ip.is_private or ip.is_loopback or ip.is_link_local):
+            return ""
+        if str(ip) == "169.254.169.254":
+            return ""
+        return raw.rstrip("/")
 
 
 class GatewayHttpServer:
@@ -251,18 +312,27 @@ class GatewayHttpServer:
         self.app = app
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._start_lock = threading.Lock()
         self.base_url = ""
 
     def start(self) -> None:
-        if self._server is not None:
-            return
-        host, port = _split_host_port(self._bind)
-        app = self.app
-        app.start()
+        with self._start_lock:
+            if self._server is not None:
+                return
+            host, port = _split_host_port(self._bind)
+            app = self.app
+            app.start()
 
         class _Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
-                body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                except Exception:
+                    length = 0
+                if length > MAX_BODY_BYTES:
+                    self._send_json(413, {"ok": False, "error": "payload too large"})
+                    return
+                body = self.rfile.read(max(0, length))
                 handled = app.handle_post(path=self.path, headers=self.headers, body=body)
                 if handled is None:
                     self._send_json(404, {"ok": False, "error": "not found"})
@@ -293,10 +363,13 @@ class GatewayHttpServer:
                     if not _is_client_disconnect_error(exc):
                         raise
 
-        self._server = ThreadingHTTPServer((host, port), _Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, name="gateway-http", daemon=True)
-        self._thread.start()
-        public_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+        with self._start_lock:
+            if self._server is not None:
+                return
+            self._server = ThreadingHTTPServer((host, port), _Handler)
+            self._thread = threading.Thread(target=self._server.serve_forever, name="gateway-http", daemon=True)
+            self._thread.start()
+        public_host = resolve_public_host(host)
         actual_port = int(self._server.server_address[1])
         self.base_url = f"http://{public_host}:{actual_port}"
 
@@ -307,14 +380,14 @@ class GatewayHttpServer:
 
     def stop(self, grace: int = 0) -> None:
         del grace
+        self.app.stop()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
             self._server = None
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=5.0)
             self._thread = None
-        self.app.stop()
 
 
 def _attach_result_ref_control_addr(data: Dict[str, object], *, control_addr: str) -> Dict[str, object]:

@@ -11,6 +11,14 @@ from pycloud_parallel.controlplane.object_ref import object_id_from_sha256_hex, 
 from pycloud_parallel.controlplane.state import _managed_globals_scope_dir
 
 
+def _mock_public_host(host: str, *, remote_hint: str = "") -> str:
+    del remote_hint
+    text = str(host or "").strip()
+    if text in {"", "0.0.0.0", "::", "[::]"}:
+        return "10.0.0.9"
+    return text.strip("[]")
+
+
 def test_default_node_worker_capacity_is_positive(monkeypatch):
     monkeypatch.setattr(ctl.os, "cpu_count", lambda: 8)
     assert ctl._default_node_worker_capacity() == 4
@@ -61,6 +69,39 @@ def test_ctl_parser_accepts_start_node_command():
     assert args.command == "start-node"
     assert args.node_id == "node-a"
     assert args.bind == "0.0.0.0:51061"
+
+
+def test_ctl_parser_accepts_start_node_port_aliases():
+    parser = ctl.build_parser()
+    args = parser.parse_args(
+        [
+            "start-node",
+            "--node-id",
+            "node-a",
+            "--node-port",
+            "51061",
+            "--service-http-port",
+            "18181",
+            "--advertise-port",
+            "52061",
+        ]
+    )
+    assert args.command == "start-node"
+    assert args.node_port == 51061
+    assert args.service_http_port == 18181
+    assert args.advertise_port == 52061
+
+
+def test_ctl_start_node_help_mentions_bind_and_port_aliases():
+    parser = ctl.build_parser()
+    help_text = parser.format_help()
+    start_node = parser._subparsers._group_actions[0].choices["start-node"]
+    start_node_help = start_node.format_help()
+    assert "--bind" in start_node_help
+    assert "--node-port" in start_node_help
+    assert "--service-http-bind" in start_node_help
+    assert "--advertise-port" in start_node_help
+    assert "start-node" in help_text
 
 
 def test_ctl_parser_accepts_start_gateway_command():
@@ -123,6 +164,8 @@ def test_cmd_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypa
     )
     started_nodes: list[dict[str, object]] = []
 
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
     monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
     monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
@@ -145,6 +188,83 @@ def test_cmd_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypa
 
     assert ctl._cmd_start(args) == 0
     assert [item["worker_capacity"] for item in started_nodes] == [10, 10]
+
+
+def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args(
+        [
+            "--runtime-root",
+            str(tmp_path),
+            "--controlplane-host",
+            "127.0.0.1",
+            "--controlplane-port",
+            "51051",
+            "--node1-host",
+            "0.0.0.0",
+            "--node1-port",
+            "51061",
+            "--node1-http-host",
+            "0.0.0.0",
+            "--node1-http-port",
+            "18181",
+            "--node2-host",
+            "192.168.1.10",
+            "--node2-port",
+            "51062",
+            "--node2-http-host",
+            "127.0.0.1",
+            "--node2-http-port",
+            "18182",
+            "start",
+        ]
+    )
+    controlplane_calls: list[dict[str, object]] = []
+    started_nodes: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
+    monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(
+        ctl,
+        "_start_controlplane",
+        lambda root, port, **kwargs: controlplane_calls.append({"root": root, "port": port, **kwargs}),
+    )
+    monkeypatch.setattr(
+        ctl,
+        "_start_node",
+        lambda root, name, port, http_port, infocenter_target, worker_capacity, **kwargs: started_nodes.append(
+            {
+                "root": root,
+                "name": name,
+                "port": port,
+                "http_port": http_port,
+                "infocenter_target": infocenter_target,
+                "worker_capacity": worker_capacity,
+                **kwargs,
+            }
+        ),
+    )
+
+    assert ctl._cmd_start(args) == 0
+    assert controlplane_calls == [
+        {
+            "root": tmp_path.resolve(),
+            "port": 51051,
+            "bind_host": "127.0.0.1",
+            "remote_hint": "127.0.0.1:51051",
+            "extra_env": {},
+        }
+    ]
+    assert started_nodes[0]["bind_host"] == "10.0.0.9"
+    assert started_nodes[0]["service_http_host"] == "10.0.0.9"
+    assert started_nodes[0]["advertise_host"] == "10.0.0.9"
+    assert started_nodes[0]["infocenter_target"] == "127.0.0.1:51051"
+    assert started_nodes[1]["bind_host"] == "192.168.1.10"
+    assert started_nodes[1]["service_http_host"] == "127.0.0.1"
+    assert started_nodes[1]["advertise_host"] == "192.168.1.10"
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -360,13 +480,11 @@ def test_cmd_doctor_uses_default_ports(tmp_path, monkeypatch, capsys):
     assert "50061 (node-1-grpc): no listener" in out
 
 
-def test_cmd_start_node_defaults_to_controlplane_target_and_local_advertise(tmp_path, monkeypatch):
+def test_cmd_start_node_requires_explicit_infocenter_target(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args([
         "--runtime-root",
         str(tmp_path),
-        "--controlplane-port",
-        "51051",
         "start-node",
         "--node-id",
         "node-blue",
@@ -375,8 +493,35 @@ def test_cmd_start_node_defaults_to_controlplane_target_and_local_advertise(tmp_
         "--service-http-bind",
         "127.0.0.1:18181",
     ])
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="requires an explicit --infocenter-addr target"):
+        ctl._cmd_start_node(args)
+
+
+def test_cmd_start_node_uses_explicit_infocenter_target_and_local_advertise(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-node",
+        "--node-id",
+        "node-blue",
+        "--bind",
+        "0.0.0.0:51061",
+        "--service-http-bind",
+        "127.0.0.1:18181",
+        "--infocenter-addr",
+        "10.0.0.8:51051",
+    ])
     started: list[dict[str, object]] = []
 
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
     monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
     monkeypatch.setattr(ctl, "_default_node_worker_capacity", lambda: 6)
@@ -391,10 +536,10 @@ def test_cmd_start_node_defaults_to_controlplane_target_and_local_advertise(tmp_
         {
             "root": tmp_path.resolve(),
             "node_id": "node-blue",
-            "bind": "0.0.0.0:51061",
+            "bind": "10.0.0.9:51061",
             "service_http_bind": "127.0.0.1:18181",
-            "infocenter_addr": "127.0.0.1:51051",
-            "advertise_addr": "127.0.0.1:51061",
+            "infocenter_addr": "10.0.0.8:51051",
+            "advertise_addr": "10.0.0.9:51061",
             "worker_capacity": 6,
             "queue_capacity": 4000,
             "max_workers": 64,
@@ -420,6 +565,8 @@ def test_cmd_start_node_can_disable_registration(tmp_path, monkeypatch):
     ])
     started: list[dict[str, object]] = []
 
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
     monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
     monkeypatch.setattr(ctl, "_default_node_worker_capacity", lambda: 4)
@@ -432,6 +579,78 @@ def test_cmd_start_node_can_disable_registration(tmp_path, monkeypatch):
     assert ctl._cmd_start_node(args) == 0
     assert started[0]["infocenter_addr"] == ""
     assert started[0]["advertise_addr"] == ""
+
+
+def test_cmd_start_node_port_aliases_override_bind_values(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args(
+        [
+            "--runtime-root",
+            str(tmp_path),
+            "start-node",
+            "--node-id",
+            "node-green",
+            "--node-port",
+            "52061",
+            "--service-http-port",
+            "19181",
+            "--service-http-host",
+            "0.0.0.0",
+            "--advertise-host",
+            "10.0.0.9",
+            "--advertise-port",
+            "62061",
+            "--infocenter-addr",
+            "10.0.0.8:51051",
+        ]
+    )
+    started: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+    monkeypatch.setattr(ctl, "_default_node_worker_capacity", lambda: 3)
+    monkeypatch.setattr(
+        ctl,
+        "_start_standalone_node",
+        lambda root, **kwargs: started.append({"root": root, **kwargs}),
+    )
+
+    assert ctl._cmd_start_node(args) == 0
+    assert started == [
+        {
+            "root": tmp_path.resolve(),
+            "node_id": "node-green",
+            "bind": "10.0.0.9:52061",
+            "service_http_bind": "10.0.0.9:19181",
+            "infocenter_addr": "10.0.0.8:51051",
+            "advertise_addr": "10.0.0.9:62061",
+            "worker_capacity": 3,
+            "queue_capacity": 4000,
+            "max_workers": 64,
+            "service_default_workers": 10,
+            "service_heartbeat_timeout_sec": 30,
+            "node_tags": "compute",
+            "node_version": "v1",
+            "extra_env": {},
+        }
+    ]
+
+
+def test_cmd_start_gateway_requires_explicit_infocenter_target(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-gateway",
+    ])
+
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="start-gateway requires --infocenter-addr"):
+        ctl._cmd_start_gateway(args)
 
 
 def test_spawn_server_passes_env_overrides(tmp_path, monkeypatch):

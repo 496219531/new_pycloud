@@ -3,7 +3,9 @@ from __future__ import annotations
 """Background registrar for NodeControl -> InfoCenter heartbeats."""
 
 import threading
+import uuid
 from typing import Dict, Iterable, Optional
+from importlib import metadata as importlib_metadata
 
 from pycloud_parallel.controlplane.client import InfoCenterClient
 from pycloud_parallel.controlplane.state import NodeControlState
@@ -28,6 +30,7 @@ class NodeInfoCenterRegistrar:
     ) -> None:
         self.infocenter_addr = infocenter_addr
         self.node_id = node_id
+        self.node_instance_id = f"{str(node_id or 'node').strip() or 'node'}-{uuid.uuid4().hex[:12]}"
         self.control_addr = control_addr
         self.state = state
         self.capacity = max(1, int(capacity))
@@ -45,6 +48,13 @@ class NodeInfoCenterRegistrar:
         self._next_hb_sec = self.fallback_heartbeat_sec
         self._sync_lock = threading.Lock()
 
+    @staticmethod
+    def _pycloud_version() -> str:
+        try:
+            return str(importlib_metadata.version("pycloud-parallel"))
+        except Exception:
+            return "unknown"
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -54,26 +64,36 @@ class NodeInfoCenterRegistrar:
 
     def close(self) -> None:
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                return
             self._thread = None
-        self._client.close()
+        with self._sync_lock:
+            self._client.close()
 
     def sync_now(self) -> bool:
-        with self._sync_lock:
-            try:
-                if not self._registered:
-                    return self._register_once()
-                return self._heartbeat_once()
-            except Exception:
+        if not self._sync_lock.acquire(blocking=False):
+            return False
+        try:
+            should_register = not self._registered
+        finally:
+            self._sync_lock.release()
+        try:
+            return self._register_once() if should_register else self._heartbeat_once()
+        except Exception:
+            with self._sync_lock:
                 self._registered = False
-                return False
+            return False
 
     def _register_once(self) -> bool:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
+        metadata["pycloud_version"] = self._pycloud_version()
         resp = self._client.register_node(
             node_id=self.node_id,
+            node_instance_id=self.node_instance_id,
             control_addr=self.control_addr,
             capacity=self.capacity,
             queue_capacity=self.queue_capacity,
@@ -86,16 +106,19 @@ class NodeInfoCenterRegistrar:
             service_worker_used=self.state.service_worker_used(),
             python_version=self.state.python_version,
         )
-        self._registered = True
-        self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
+        with self._sync_lock:
+            self._registered = True
+            self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
         return True
 
     def _heartbeat_once(self) -> bool:
         metrics = self.state.metrics()
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
+        metadata["pycloud_version"] = self._pycloud_version()
         resp = self._client.heartbeat_node(
             node_id=self.node_id,
+            node_instance_id=self.node_instance_id,
             healthy=True,
             metrics={
                 "queued": metrics["queued"],
@@ -112,15 +135,16 @@ class NodeInfoCenterRegistrar:
             service_worker_used=self.state.service_worker_used(),
             python_version=self.state.python_version,
         )
-        if not resp.get("accepted", False):
-            self._registered = False
-            return False
-        self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
+        with self._sync_lock:
+            if not resp.get("accepted", False):
+                self._registered = False
+                return False
+            self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
         return True
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             self.sync_now()
-
-            wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
+            with self._sync_lock:
+                wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
             self._stop_event.wait(max(1, int(wait_sec)))

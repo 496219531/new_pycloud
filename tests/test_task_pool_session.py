@@ -50,7 +50,8 @@ def test_task_pool_session_submit_and_wait() -> None:
         assert len(calls) == 2
         assert all(method == "run" for method, _payload, _timeout in calls)
         assert session.methods == ["run"]
-        assert session.call_sync("run", value=3)["echo"] == {"value": 3}
+        assert session.run.sync(value=3)["echo"] == {"value": 3}
+        assert session.call_sync("run", value=6)["echo"] == {"value": 6}
         mapped = session.map([4, 5], timeout_sec=5.0)
         assert len(mapped) == 2
     finally:

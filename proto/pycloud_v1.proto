@@ -81,6 +81,7 @@ message RegisterNodeRequest {
   string version = 6;
   map<string, string> metadata = 7;
   repeated ServiceRouteReport services = 8;
+  string node_instance_id = 9;
 }
 
 message RegisterNodeResponse {
@@ -90,6 +91,7 @@ message RegisterNodeResponse {
   int32 heartbeat_interval_sec = 4;
   google.protobuf.Timestamp server_time = 5;
   Error error = 6;
+  string node_instance_id = 7;
 }
 
 message HeartbeatNodeRequest {
@@ -99,6 +101,7 @@ message HeartbeatNodeRequest {
   bool healthy = 4;
   string reason = 5;
   repeated ServiceRouteReport services = 6;
+  string node_instance_id = 7;
 }
 
 message HeartbeatNodeResponse {
@@ -126,6 +129,7 @@ message NodeInfo {
   int32 inflight = 8;
   int32 credit = 9;
   repeated string tags = 10;
+  string node_instance_id = 11;
 }
 
 message ListNodesResponse {
@@ -163,6 +167,7 @@ message ServiceRouteInfo {
   int32 in_flight = 9;
   google.protobuf.Timestamp lease_expire_at = 10;
   string http_base_url = 11;
+  string node_instance_id = 12;
 }
 
 message ListServiceRoutesResponse {

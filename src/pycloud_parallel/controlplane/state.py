@@ -95,6 +95,8 @@ class ManagedGlobalsState:
 _EXECUTOR_ACTIVE = object()
 _MANAGED_GLOBALS_CACHE_LOCK = threading.Lock()
 _MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
+_MANAGED_GLOBALS_APPLY_LOCKS_LOCK = threading.Lock()
+_MANAGED_GLOBALS_APPLY_LOCKS: Dict[str, threading.Lock] = {}
 
 
 def _stable_json_bytes(data: Any) -> bytes:
@@ -108,6 +110,35 @@ def _stable_json_bytes(data: Any) -> bytes:
 
 def _sha256_text(data: Any) -> str:
     return f"sha256:{hashlib.sha256(_stable_json_bytes(data)).hexdigest()}"
+
+
+def _code_version_from_digest(
+    digest: str,
+    *,
+    runtime: str,
+    entry_module: str,
+    entry_callable: str,
+    package_format: str,
+    export_mode: str,
+    export_methods: Sequence[str],
+    export_decorator: str,
+    dependency_allowlist: Sequence[str],
+) -> str:
+    normalized_digest = str(digest or "").strip().lower()
+    if not normalized_digest:
+        raise ValueError("invalid code digest")
+    variant_payload = {
+        "runtime": str(runtime or "").strip(),
+        "entry_module": str(entry_module or "").strip(),
+        "entry_callable": str(entry_callable or "").strip(),
+        "package_format": str(package_format or "").strip(),
+        "export_mode": str(export_mode or "").strip(),
+        "export_methods": [str(name) for name in export_methods],
+        "export_decorator": str(export_decorator or "").strip(),
+        "dependency_allowlist": [str(name) for name in dependency_allowlist],
+    }
+    variant_digest = hashlib.sha256(_stable_json_bytes(variant_payload)).hexdigest()[:16]
+    return f"sha256:{normalized_digest}.{variant_digest}"
 
 
 def _managed_globals_scope_dir(base_dir: Path, *, scope_kind: str, scope_key: str) -> Path:
@@ -416,6 +447,7 @@ def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_by
     object_id = object_id_from_sha256_hex(digest)
     normalized_format = normalize_object_format(fmt, source_name=source_path.name, default="bin")
     final_path = object_storage_path(root, object_id=object_id, fmt=normalized_format)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
     if not final_path.exists():
         os.replace(str(source_path), str(final_path))
     else:
@@ -1348,7 +1380,16 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
                 )
                 return resolved
             digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
-            fallback = sorted(root.glob(f"{digest}*"))
+            suffix = object_format_suffix(value.format)
+            legacy_candidate = Path(root) / f"{digest}{suffix}"
+            fallback = []
+            if legacy_candidate.exists():
+                fallback = [legacy_candidate]
+            if not fallback:
+                subdir = Path(root) / digest[:2]
+                fallback = sorted(subdir.glob(f"{digest[2:]}*")) if subdir.exists() else []
+            if not fallback:
+                fallback = sorted(root.glob(f"{digest}*"))
             if fallback:
                 _touch_object_last_at(root, object_id=value.object_id, fallback_path=fallback[0])
                 resolved = _materialize_path(fallback[0])
@@ -1384,44 +1425,51 @@ def _apply_managed_globals_to_router(
     if not normalized_scope_dir or not normalized_digest:
         return
 
-    with _MANAGED_GLOBALS_CACHE_LOCK:
-        if _MANAGED_GLOBALS_CACHE.get(normalized_scope_dir) == normalized_digest:
-            return
+    with _MANAGED_GLOBALS_APPLY_LOCKS_LOCK:
+        apply_lock = _MANAGED_GLOBALS_APPLY_LOCKS.get(normalized_scope_dir)
+        if apply_lock is None:
+            apply_lock = threading.Lock()
+            _MANAGED_GLOBALS_APPLY_LOCKS[normalized_scope_dir] = apply_lock
 
-    manifest_path = _managed_globals_manifest_path(Path(normalized_scope_dir), normalized_digest)
-    if not manifest_path.exists():
-        raise RuntimeError(f"managed globals manifest missing: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
-    values_meta = dict(manifest.get("values") or {})
+    with apply_lock:
+        with _MANAGED_GLOBALS_CACHE_LOCK:
+            if _MANAGED_GLOBALS_CACHE.get(normalized_scope_dir) == normalized_digest:
+                return
 
-    resolved_values: Dict[str, Any] = {}
-    for name, item in values_meta.items():
-        if not isinstance(item, dict):
-            continue
-        value_digest = str(item.get("sha256", "") or "").strip()
-        if not value_digest:
-            continue
-        value_path = _managed_globals_value_path(Path(normalized_scope_dir), value_digest=value_digest)
-        if not value_path.exists():
-            raise RuntimeError(f"managed globals value missing: {value_path}")
-        serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
-        resolved_value = convert_dict_to_arrow(serialized_value)
-        resolved_values[name] = _resolve_object_refs_in_payload(resolved_value, object_dir=object_dir)
+        manifest_path = _managed_globals_manifest_path(Path(normalized_scope_dir), normalized_digest)
+        if not manifest_path.exists():
+            raise RuntimeError(f"managed globals manifest missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
+        values_meta = dict(manifest.get("values") or {})
 
-    seen_globals_ids = set()
-    for fn in router.values():
-        globals_dict = getattr(fn, "__globals__", None)
-        if not isinstance(globals_dict, dict):
-            continue
-        globals_id = id(globals_dict)
-        if globals_id in seen_globals_ids:
-            continue
-        seen_globals_ids.add(globals_id)
-        for name, value in resolved_values.items():
-            globals_dict[name] = value
+        resolved_values: Dict[str, Any] = {}
+        for name, item in values_meta.items():
+            if not isinstance(item, dict):
+                continue
+            value_digest = str(item.get("sha256", "") or "").strip()
+            if not value_digest:
+                continue
+            value_path = _managed_globals_value_path(Path(normalized_scope_dir), value_digest=value_digest)
+            if not value_path.exists():
+                raise RuntimeError(f"managed globals value missing: {value_path}")
+            serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
+            resolved_value = convert_dict_to_arrow(serialized_value)
+            resolved_values[name] = _resolve_object_refs_in_payload(resolved_value, object_dir=object_dir)
 
-    with _MANAGED_GLOBALS_CACHE_LOCK:
-        _MANAGED_GLOBALS_CACHE[normalized_scope_dir] = normalized_digest
+        seen_globals_ids = set()
+        for fn in router.values():
+            globals_dict = getattr(fn, "__globals__", None)
+            if not isinstance(globals_dict, dict):
+                continue
+            globals_id = id(globals_dict)
+            if globals_id in seen_globals_ids:
+                continue
+            seen_globals_ids.add(globals_id)
+            for name, value in resolved_values.items():
+                globals_dict[name] = value
+
+        with _MANAGED_GLOBALS_CACHE_LOCK:
+            _MANAGED_GLOBALS_CACHE[normalized_scope_dir] = normalized_digest
 
 
 def _execute_payload_in_subprocess(
@@ -1438,12 +1486,26 @@ def _execute_payload_in_subprocess(
     method_name: str,
     entry_callable: str,
     payload: dict,
-) -> Tuple[str, Optional[dict], str, str]:
+) -> Tuple[str, Optional[dict], str, str, Dict[str, float]]:
     """Execute uploaded user code in subprocess.
 
     Returns:
-        (status_text, result, error_type, error_message)
+        (status_text, result, error_type, error_message, timings)
     """
+    decode_start = time.perf_counter()
+    decode_end = decode_start
+    invoke_start = decode_start
+    invoke_end = decode_start
+    encode_start = decode_start
+    encode_end = decode_start
+
+    def _timings() -> Dict[str, float]:
+        return {
+            "decode_ms": round(max(0.0, decode_end - decode_start) * 1000.0, 3),
+            "invoke_ms": round(max(0.0, invoke_end - invoke_start) * 1000.0, 3),
+            "encode_ms": round(max(0.0, encode_end - encode_start) * 1000.0, 3),
+        }
+
     try:
         router, _method_info = _load_callable_router(
             artifact_path,
@@ -1456,6 +1518,7 @@ def _execute_payload_in_subprocess(
             entry_callable=entry_callable,
         )
     except Exception as exc:
+        decode_end = time.perf_counter()
         if _is_user_artifact_error(exc):
             return (
                 "FAILED_USER",
@@ -1467,8 +1530,9 @@ def _execute_payload_in_subprocess(
                     entry_callable=entry_callable,
                     package_format=package_format,
                 ),
+                _timings(),
             )
-        return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc))
+        return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
     try:
         with _temporary_import_paths(dependency_path):
             method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
@@ -1482,16 +1546,37 @@ def _execute_payload_in_subprocess(
                 object_dir=object_dir,
             )
             resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
+            decode_end = time.perf_counter()
+            invoke_start = decode_end
             ret = _invoke_user_callable(fn, resolved_payload)
-        return _normalize_user_return(ret, object_dir=object_dir)
+            invoke_end = time.perf_counter()
+            encode_start = invoke_end
+        status_text, result, error_type, error_message = _normalize_user_return(ret, object_dir=object_dir)
+        encode_end = time.perf_counter()
+        return (status_text, result, error_type, error_message, _timings())
     except LargeResultError as exc:
-        return ("FAILED_USER", None, exc.__class__.__name__, str(exc))
+        if decode_end <= decode_start:
+            decode_end = time.perf_counter()
+        if invoke_end <= invoke_start and decode_end > decode_start:
+            invoke_end = time.perf_counter()
+            encode_start = invoke_end
+        encode_end = time.perf_counter()
+        return ("FAILED_USER", None, exc.__class__.__name__, str(exc), _timings())
     except ObjectResolutionError as exc:
-        return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc))
+        if decode_end <= decode_start:
+            decode_end = time.perf_counter()
+        return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc), _timings())
     except Exception as exc:
+        now = time.perf_counter()
+        if decode_end <= decode_start:
+            decode_end = now
+        elif invoke_end <= invoke_start:
+            invoke_end = now
+        else:
+            encode_end = now
         if isinstance(exc, (ImportError, ModuleNotFoundError)):
-            return ("FAILED_USER", None, exc.__class__.__name__, _describe_user_execution_error(exc))
-        return ("FAILED_USER", None, exc.__class__.__name__, repr(exc))
+            return ("FAILED_USER", None, exc.__class__.__name__, _describe_user_execution_error(exc), _timings())
+        return ("FAILED_USER", None, exc.__class__.__name__, repr(exc), _timings())
 
 
 def utc_now() -> datetime:
@@ -1577,6 +1662,7 @@ class NodeState:
         last_seen_at: 最后活跃时间
         metrics: 节点指标
     """
+    node_instance_id: str
     node_id: str
     control_addr: str
     capacity: int
@@ -1649,6 +1735,7 @@ class InfoCenterState:
     def register_node_record(
         self,
         *,
+        node_instance_id: str = "",
         node_id: str,
         control_addr: str,
         capacity: int,
@@ -1663,17 +1750,23 @@ class InfoCenterState:
         python_version: str = "",
     ) -> NodeState:
         now = utc_now()
+        normalized_instance_id = str(node_instance_id or node_id or "").strip()
+        if not normalized_instance_id:
+            raise ValueError("node_instance_id is required")
         with self._lock:
-            state = self._nodes.get(node_id)
+            state = self._nodes.get(normalized_instance_id)
             if state is None:
                 state = NodeState(
+                    node_instance_id=normalized_instance_id,
                     node_id=node_id,
                     control_addr=control_addr,
                     capacity=max(1, capacity),
                     queue_capacity=max(1, queue_capacity),
                     python_version=str(python_version or "").strip(),
                 )
-                self._nodes[node_id] = state
+                self._nodes[normalized_instance_id] = state
+            state.node_instance_id = normalized_instance_id
+            state.node_id = str(node_id or state.node_id or "").strip() or normalized_instance_id
             state.control_addr = control_addr
             state.capacity = max(1, capacity)
             state.queue_capacity = max(1, queue_capacity)
@@ -1694,6 +1787,7 @@ class InfoCenterState:
     def register_node(self, request: pb2.RegisterNodeRequest) -> NodeState:
         metadata = dict(request.metadata)
         return self.register_node_record(
+            node_instance_id=getattr(request, "node_instance_id", "") or request.node_id,
             node_id=request.node_id,
             control_addr=request.control_addr,
             capacity=max(1, request.capacity),
@@ -1711,6 +1805,7 @@ class InfoCenterState:
     def heartbeat_record(
         self,
         *,
+        node_instance_id: str = "",
         node_id: str,
         healthy: bool,
         metrics: Optional[NodeMetricsState] = None,
@@ -1722,10 +1817,15 @@ class InfoCenterState:
         python_version: str = "",
     ) -> Optional[NodeState]:
         now = utc_now()
+        normalized_instance_id = str(node_instance_id or node_id or "").strip()
+        if not normalized_instance_id:
+            return None
         with self._lock:
-            state = self._nodes.get(node_id)
+            state = self._nodes.get(normalized_instance_id)
             if state is None:
                 return None
+            state.node_instance_id = normalized_instance_id
+            state.node_id = str(node_id or state.node_id or "").strip() or normalized_instance_id
             state.healthy = bool(healthy)
             state.last_seen_at = now
             if metrics is not None:
@@ -1750,6 +1850,7 @@ class InfoCenterState:
 
     def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
         return self.heartbeat_record(
+            node_instance_id=getattr(request, "node_instance_id", "") or request.node_id,
             node_id=request.node_id,
             healthy=bool(request.healthy),
             metrics=NodeMetricsState(
@@ -1780,10 +1881,10 @@ class InfoCenterState:
             )
         return out
 
-    def mark_node_lost(self, node_id: str, *, reason: str = "") -> NodeState:
+    def mark_node_lost(self, node_instance_id: str, *, reason: str = "") -> NodeState:
         now = utc_now()
         with self._lock:
-            state = self._nodes.get(node_id)
+            state = self._nodes.get(node_instance_id)
             if state is None:
                 raise KeyError("node not found")
             state.healthy = False
@@ -1804,6 +1905,7 @@ class InfoCenterState:
                 )
             state.services = degraded
             return NodeState(
+                node_instance_id=state.node_instance_id,
                 node_id=state.node_id,
                 control_addr=state.control_addr,
                 capacity=state.capacity,
@@ -1845,6 +1947,7 @@ class InfoCenterState:
                             "service_id": svc.service_id,
                             "status": effective_status,
                             "status_text": status_text,
+                            "node_instance_id": state.node_instance_id,
                             "node_id": state.node_id,
                             "control_addr": state.control_addr,
                             "node_healthy": is_healthy,
@@ -1880,6 +1983,7 @@ class InfoCenterState:
                     continue
                 out.append(
                     NodeState(
+                        node_instance_id=state.node_instance_id,
                         node_id=state.node_id,
                         control_addr=state.control_addr,
                         capacity=state.capacity,
@@ -1905,14 +2009,14 @@ class InfoCenterState:
 
     def update_node_schedule_state(
         self,
-        node_id: str,
+        node_instance_id: str,
         *,
         schedulable: Optional[bool] = None,
         drain: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> NodeState:
         with self._lock:
-            state = self._nodes.get(node_id)
+            state = self._nodes.get(node_instance_id)
             if state is None:
                 raise KeyError("node not found")
             if schedulable is not None:
@@ -1922,6 +2026,7 @@ class InfoCenterState:
             if reason is not None:
                 state.reason = str(reason or "")
             return NodeState(
+                node_instance_id=state.node_instance_id,
                 node_id=state.node_id,
                 control_addr=state.control_addr,
                 capacity=state.capacity,
@@ -2064,6 +2169,7 @@ class ServiceSession:
     alive_workers: int = 0
     stop_reason: str = ""
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    managed_global_names: Tuple[str, ...] = ()
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""
     timing_metrics: Dict[str, object] = field(default_factory=dict)
@@ -2083,6 +2189,7 @@ class TaskPoolState:
     created_at: datetime
     last_heartbeat_at: datetime
     lease_expire_at: datetime
+    managed_global_names: Tuple[str, ...] = ()
     executor_ready: bool = False
     task_count: int = 0
 
@@ -2132,7 +2239,7 @@ class NodeControlState:
         service_default_worker_count: int = 10,
         service_default_heartbeat_timeout_sec: int = 30,
         service_worker_capacity: int = 0,
-        service_http_bind: str = "127.0.0.1:18080",
+        service_http_bind: str = "0.0.0.0:18080",
         service_http_base_url: str = "",
     ) -> None:
         self.node_id = node_id
@@ -2166,6 +2273,9 @@ class NodeControlState:
         self._result_hook = InMemoryResultHook()
         self._pool_result_hook = InMemoryResultHook()
         self._task_pools: Dict[str, TaskPoolState] = {}
+        self._service_worker_reserved = 0
+        self._code_write_locks: Dict[str, threading.Lock] = {}
+        self._object_write_locks: Dict[str, threading.Lock] = {}
 
         # 检测并保存当前 Python 版本
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
@@ -2216,6 +2326,7 @@ class NodeControlState:
         ok: bool,
         http_status: int,
         setup_ms: float,
+        build_execute_spec_ms: float,
         executor_ms: float,
         finalize_ms: float,
         total_ms: float,
@@ -2234,11 +2345,20 @@ class NodeControlState:
             metrics["last_http_status"] = int(http_status)
             metrics["last_total_ms"] = round(float(total_ms), 3)
             metrics["last_setup_ms"] = round(float(setup_ms), 3)
+            metrics["last_build_execute_spec_ms"] = round(float(build_execute_spec_ms), 3)
             metrics["last_executor_ms"] = round(float(executor_ms), 3)
             metrics["last_finalize_ms"] = round(float(finalize_ms), 3)
             metrics["max_total_ms"] = round(max(float(metrics.get("max_total_ms", 0.0) or 0.0), float(total_ms)), 3)
             metrics["avg_setup_ms"] = round(
                 ((float(metrics.get("avg_setup_ms", 0.0) or 0.0) * (call_count - 1)) + float(setup_ms)) / call_count,
+                3,
+            )
+            metrics["avg_build_execute_spec_ms"] = round(
+                (
+                    (float(metrics.get("avg_build_execute_spec_ms", 0.0) or 0.0) * (call_count - 1))
+                    + float(build_execute_spec_ms)
+                )
+                / call_count,
                 3,
             )
             metrics["avg_executor_ms"] = round(
@@ -2254,15 +2374,35 @@ class NodeControlState:
                 3,
             )
             if subprocess_timings:
+                decode_ms = float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
                 invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
+                encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
+                metrics["last_child_decode_ms"] = round(decode_ms, 3)
                 metrics["last_invoke_ms"] = round(invoke_ms, 3)
+                metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
+                metrics["last_child_encode_ms"] = round(encode_ms, 3)
+                metrics["avg_child_decode_ms"] = round(
+                    ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
+                    3,
+                )
                 metrics["avg_invoke_ms"] = round(
                     ((float(metrics.get("avg_invoke_ms", 0.0) or 0.0) * (call_count - 1)) + invoke_ms) / call_count,
                     3,
                 )
+                metrics["avg_child_invoke_ms"] = metrics["avg_invoke_ms"]
+                metrics["avg_child_encode_ms"] = round(
+                    ((float(metrics.get("avg_child_encode_ms", 0.0) or 0.0) * (call_count - 1)) + encode_ms) / call_count,
+                    3,
+                )
             else:
+                metrics.setdefault("last_child_decode_ms", 0.0)
                 metrics.setdefault("last_invoke_ms", 0.0)
+                metrics.setdefault("last_child_invoke_ms", metrics.get("last_invoke_ms", 0.0))
+                metrics.setdefault("last_child_encode_ms", 0.0)
+                metrics.setdefault("avg_child_decode_ms", 0.0)
                 metrics.setdefault("avg_invoke_ms", 0.0)
+                metrics.setdefault("avg_child_invoke_ms", metrics.get("avg_invoke_ms", 0.0))
+                metrics.setdefault("avg_child_encode_ms", 0.0)
             metrics["last_error_type"] = str(error_type or "")
             metrics["last_error_message"] = str(error_message or "")
             metrics["updated_at"] = utc_now().isoformat()
@@ -2276,6 +2416,7 @@ class NodeControlState:
                 "ok": bool(ok),
                 "http_status": int(http_status),
                 "setup_ms": round(float(setup_ms), 3),
+                "build_execute_spec_ms": round(float(build_execute_spec_ms), 3),
                 "executor_ms": round(float(executor_ms), 3),
                 "finalize_ms": round(float(finalize_ms), 3),
                 "total_ms": round(float(total_ms), 3),
@@ -2353,7 +2494,8 @@ class NodeControlState:
         *,
         artifact: CodeArtifact,
     ) -> Optional[ManagedGlobalsState]:
-        if not artifact.managed_global_names:
+        allowed_names = _normalize_managed_global_names(session.managed_global_names)
+        if not allowed_names:
             session.managed_globals_scope_dir = ""
             session.managed_globals_digest = ""
             return None
@@ -2362,7 +2504,7 @@ class NodeControlState:
                 code_version=session.code_version,
                 scope_kind="service",
                 scope_key=session.service_id,
-                allowed_names=artifact.managed_global_names,
+                allowed_names=allowed_names,
             )
             session.managed_globals_scope_dir = state.scope_dir
             session.managed_globals_digest = state.globals_digest
@@ -2371,7 +2513,7 @@ class NodeControlState:
             scope_kind="service",
             scope_key=session.service_id,
             scope_dir=session.managed_globals_scope_dir,
-            allowed_names=_normalize_managed_global_names(artifact.managed_global_names),
+            allowed_names=allowed_names,
             globals_digest=session.managed_globals_digest,
         )
 
@@ -2502,11 +2644,8 @@ class NodeControlState:
                 return artifact
         candidate = object_storage_path(self._object_dir, object_id=normalized, fmt="bin")
         digest = normalized.replace("sha256:", "", 1)
-        fallback = sorted(
-            path
-            for path in self._object_dir.glob(f"{digest}*")
-            if path.is_file()
-        )
+        legacy_candidate = Path(self._object_dir) / f"{digest}.bin"
+        fallback = []
         if candidate.exists():
             return ObjectArtifact(
                 object_id=normalized,
@@ -2515,6 +2654,13 @@ class NodeControlState:
                 size_bytes=candidate.stat().st_size,
                 created_at=utc_now(),
             )
+        if legacy_candidate.exists():
+            fallback = [legacy_candidate]
+        if not fallback:
+            subdir = Path(self._object_dir) / digest[:2]
+            fallback = sorted(path for path in subdir.glob(f"{digest[2:]}*") if path.is_file()) if subdir.exists() else []
+        if not fallback:
+            fallback = sorted(path for path in self._object_dir.glob(f"{digest}*") if path.is_file())
         if fallback:
             path = fallback[0]
             return ObjectArtifact(
@@ -2661,7 +2807,7 @@ class NodeControlState:
 
     def service_worker_used(self) -> int:
         with self._lock:
-            return sum(
+            active = sum(
                 max(0, int(session.worker_count))
                 for session in self._services.values()
                 if session.status in (
@@ -2670,9 +2816,28 @@ class NodeControlState:
                     pb2.SERVICE_STATUS_DRAINING,
                 )
             )
+            return active + max(0, int(self._service_worker_reserved))
 
     def service_worker_available(self) -> int:
         return max(0, int(self.service_worker_capacity) - int(self.service_worker_used()))
+
+    def _get_code_write_lock(self, code_version: str) -> threading.Lock:
+        key = str(code_version or "").strip()
+        with self._lock:
+            lock = self._code_write_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._code_write_locks[key] = lock
+            return lock
+
+    def _get_object_write_lock(self, object_id: str) -> threading.Lock:
+        key = str(object_id or "").strip()
+        with self._lock:
+            lock = self._object_write_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._object_write_locks[key] = lock
+            return lock
 
     def task_pool(self, pool_id: str) -> TaskPoolState:
         normalized = str(pool_id or "").strip()
@@ -2753,32 +2918,6 @@ class NodeControlState:
         if expected and expected != digest:
             raise ValueError(f"sha256 mismatch: expected={expected}, actual={digest}")
 
-        code_version = f"sha256:{digest}"
-        normalized_dependency_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
-        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
-        with self._lock:
-            existing = self._codes.get(code_version)
-            if existing is not None:
-                if existing.managed_global_names != normalized_managed_global_names and (
-                    existing.managed_global_names or normalized_managed_global_names
-                ):
-                    raise ValueError(
-                        "cached code_version exists with different managed_global_names: "
-                        f"existing={list(existing.managed_global_names)} incoming={list(normalized_managed_global_names)}"
-                    )
-                if validate_load:
-                    self._ensure_artifact_ready(
-                        existing,
-                        dependency_allowlist=normalized_dependency_allowlist,
-                    )
-                if str(client_id or "").strip():
-                    self._register_client_code_token_locked(
-                        client_id=client_id,
-                        code_version=code_version,
-                        code_token=code_token,
-                    )
-                return existing, True
-
         normalized_format = _normalize_package_format(package_format, uploaded_path)
         normalized_runtime = _validate_python_runtime_or_raise(
             node_python_version=self.python_version,
@@ -2799,29 +2938,10 @@ class NodeControlState:
             decorator=export_decorator,
             entry_callable=normalized_callable,
         )
-
-        tmp_path = Path(uploaded_path)
-        if not tmp_path.exists():
-            raise ValueError(f"uploaded file missing: {uploaded_path}")
-
-        now = utc_now()
-        code_dir = _code_scope_dir(self._artifact_dir, code_version=code_version)
-        cleanup_paths: List[Path] = [code_dir]
-        code_dir.mkdir(parents=True, exist_ok=True)
-        if normalized_format == "py":
-            final_path = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
-            os.replace(str(tmp_path), str(final_path))
-            artifact_exec_path = str(final_path)
-        else:
-            archive_path = _code_archive_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
-            os.replace(str(tmp_path), str(archive_path))
-            extract_dir = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
-            self._extract_archive(archive_path=archive_path, package_format=normalized_format, out_dir=extract_dir)
-            artifact_exec_path = str(extract_dir)
-
-        artifact = CodeArtifact(
-            code_version=code_version,
-            path=artifact_exec_path,
+        normalized_dependency_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
+        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
+        code_version = _code_version_from_digest(
+            digest,
             runtime=normalized_runtime,
             entry_module=normalized_module,
             entry_callable=normalized_callable,
@@ -2830,36 +2950,112 @@ class NodeControlState:
             export_methods=normalized_export_methods,
             export_decorator=normalized_export_decorator,
             dependency_allowlist=normalized_dependency_allowlist,
-            managed_global_names=normalized_managed_global_names,
-            dependency_path="",
-            size_bytes=max(0, int(size_bytes)),
-            created_at=now,
         )
-        if validate_load:
-            try:
-                self._ensure_artifact_ready(
-                    artifact,
-                    dependency_allowlist=normalized_dependency_allowlist,
-                )
-            except Exception:
-                for target in cleanup_paths:
-                    if target.is_dir():
-                        shutil.rmtree(target, ignore_errors=True)
-                    else:
-                        target.unlink(missing_ok=True)
-                if artifact.dependency_path:
-                    shutil.rmtree(artifact.dependency_path, ignore_errors=True)
-                raise
-        with self._lock:
-            self._codes[code_version] = artifact
-            if str(client_id or "").strip():
-                self._register_client_code_token_locked(
-                    client_id=client_id,
-                    code_version=code_version,
-                    code_token=code_token,
-                )
-        _write_code_meta(self._artifact_dir, artifact)
-        return artifact, False
+        code_lock = self._get_code_write_lock(code_version)
+        with code_lock:
+            with self._lock:
+                existing = self._codes.get(code_version)
+                if existing is not None:
+                    merged_managed_global_names = _normalize_managed_global_names(
+                        [*existing.managed_global_names, *normalized_managed_global_names]
+                    )
+                    if merged_managed_global_names != existing.managed_global_names:
+                        updated = CodeArtifact(
+                            code_version=existing.code_version,
+                            path=existing.path,
+                            runtime=existing.runtime,
+                            entry_module=existing.entry_module,
+                            entry_callable=existing.entry_callable,
+                            package_format=existing.package_format,
+                            export_mode=existing.export_mode,
+                            export_methods=existing.export_methods,
+                            export_decorator=existing.export_decorator,
+                            dependency_allowlist=existing.dependency_allowlist,
+                            managed_global_names=merged_managed_global_names,
+                            dependency_path=existing.dependency_path,
+                            size_bytes=existing.size_bytes,
+                            created_at=existing.created_at,
+                        )
+                        self._ensure_artifact_ready(
+                            updated,
+                            dependency_allowlist=normalized_dependency_allowlist,
+                        )
+                        self._codes[code_version] = updated
+                        existing = updated
+                        _write_code_meta(self._artifact_dir, existing)
+                    if validate_load:
+                        self._ensure_artifact_ready(
+                            existing,
+                            dependency_allowlist=normalized_dependency_allowlist,
+                        )
+                    if str(client_id or "").strip():
+                        self._register_client_code_token_locked(
+                            client_id=client_id,
+                            code_version=code_version,
+                            code_token=code_token,
+                        )
+                    return existing, True
+
+            tmp_path = Path(uploaded_path)
+            if not tmp_path.exists():
+                raise ValueError(f"uploaded file missing: {uploaded_path}")
+
+            now = utc_now()
+            code_dir = _code_scope_dir(self._artifact_dir, code_version=code_version)
+            cleanup_paths: List[Path] = [code_dir]
+            code_dir.mkdir(parents=True, exist_ok=True)
+            if normalized_format == "py":
+                final_path = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
+                os.replace(str(tmp_path), str(final_path))
+                artifact_exec_path = str(final_path)
+            else:
+                archive_path = _code_archive_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
+                os.replace(str(tmp_path), str(archive_path))
+                extract_dir = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
+                self._extract_archive(archive_path=archive_path, package_format=normalized_format, out_dir=extract_dir)
+                artifact_exec_path = str(extract_dir)
+
+            artifact = CodeArtifact(
+                code_version=code_version,
+                path=artifact_exec_path,
+                runtime=normalized_runtime,
+                entry_module=normalized_module,
+                entry_callable=normalized_callable,
+                package_format=normalized_format,
+                export_mode=normalized_export_mode,
+                export_methods=normalized_export_methods,
+                export_decorator=normalized_export_decorator,
+                dependency_allowlist=normalized_dependency_allowlist,
+                managed_global_names=normalized_managed_global_names,
+                dependency_path="",
+                size_bytes=max(0, int(size_bytes)),
+                created_at=now,
+            )
+            if validate_load:
+                try:
+                    self._ensure_artifact_ready(
+                        artifact,
+                        dependency_allowlist=normalized_dependency_allowlist,
+                    )
+                except Exception:
+                    for target in cleanup_paths:
+                        if target.is_dir():
+                            shutil.rmtree(target, ignore_errors=True)
+                        else:
+                            target.unlink(missing_ok=True)
+                    if artifact.dependency_path:
+                        shutil.rmtree(artifact.dependency_path, ignore_errors=True)
+                    raise
+            with self._lock:
+                self._codes[code_version] = artifact
+                if str(client_id or "").strip():
+                    self._register_client_code_token_locked(
+                        client_id=client_id,
+                        code_version=code_version,
+                        code_token=code_token,
+                    )
+            _write_code_meta(self._artifact_dir, artifact)
+            return artifact, False
 
     def put_object_from_uploaded_file(
         self,
@@ -2883,18 +3079,41 @@ class NodeControlState:
             raise ValueError(f"uploaded object missing: {uploaded_path}")
 
         normalized_format = normalize_object_format(format, source_name=uploaded_path, default="bin")
-        with self._lock:
-            existing = self._objects.get(actual_object_id)
-            if existing is not None and Path(existing.path).exists():
-                return existing, True
+        object_lock = self._get_object_write_lock(actual_object_id)
+        with object_lock:
+            with self._lock:
+                existing = self._objects.get(actual_object_id)
+                if existing is not None and Path(existing.path).exists():
+                    return existing, True
 
-        now = utc_now()
-        final_path = object_storage_path(self._object_dir, object_id=actual_object_id, fmt=normalized_format)
-        if final_path.exists():
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            now = utc_now()
+            final_path = object_storage_path(self._object_dir, object_id=actual_object_id, fmt=normalized_format)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                _write_object_meta(
+                    self._object_dir,
+                    object_id=actual_object_id,
+                    fmt=normalized_format,
+                    size_bytes=max(0, int(size_bytes)),
+                    created_at=now,
+                    last_at=now,
+                )
+                artifact = ObjectArtifact(
+                    object_id=actual_object_id,
+                    path=str(final_path),
+                    format=normalized_format,
+                    size_bytes=max(0, int(size_bytes)),
+                    created_at=now,
+                )
+                with self._lock:
+                    self._objects[actual_object_id] = artifact
+                return artifact, True
+
+            os.replace(str(tmp_path), str(final_path))
             _write_object_meta(
                 self._object_dir,
                 object_id=actual_object_id,
@@ -2912,27 +3131,7 @@ class NodeControlState:
             )
             with self._lock:
                 self._objects[actual_object_id] = artifact
-            return artifact, True
-
-        os.replace(str(tmp_path), str(final_path))
-        _write_object_meta(
-            self._object_dir,
-            object_id=actual_object_id,
-            fmt=normalized_format,
-            size_bytes=max(0, int(size_bytes)),
-            created_at=now,
-            last_at=now,
-        )
-        artifact = ObjectArtifact(
-            object_id=actual_object_id,
-            path=str(final_path),
-            format=normalized_format,
-            size_bytes=max(0, int(size_bytes)),
-            created_at=now,
-        )
-        with self._lock:
-            self._objects[actual_object_id] = artifact
-        return artifact, False
+            return artifact, False
 
     def put_code(
         self,
@@ -3015,6 +3214,7 @@ class NodeControlState:
     ) -> ServiceSession:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
+        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
 
         artifact, _cached = self.put_code(
             client_id=owner_client_id,
@@ -3027,7 +3227,7 @@ class NodeControlState:
             export_methods=export_methods,
             export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
+            managed_global_names=normalized_managed_global_names,
             chunks=chunks,
             validate_load=True,
         )
@@ -3037,10 +3237,6 @@ class NodeControlState:
         )
 
         requested_workers = max(1, worker_count or self.service_default_worker_count)
-        available_workers = self.service_worker_available()
-        if available_workers <= 0:
-            raise RuntimeError("service worker capacity exhausted")
-        actual_workers = min(requested_workers, available_workers)
         actual_hb_timeout = max(5, heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec)
         actual_idle_ttl = max(0, idle_ttl_sec)
         now = utc_now()
@@ -3048,36 +3244,65 @@ class NodeControlState:
         token = secrets.token_urlsafe(24)
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
 
-        self._ensure_executor_host_alive_locked(now=now)
-        if self._executor_host is None:
-            raise RuntimeError("executor host unavailable")
-        self._executor_host.create_service(service_id=service_id, worker_count=actual_workers)
-        session = ServiceSession(
-            service_id=service_id,
-            owner_client_id=owner_client_id,
-            service_name=service_name or f"service-{service_id[:8]}",
-            code_version=artifact.code_version,
-            worker_count=actual_workers,
-            heartbeat_timeout_sec=actual_hb_timeout,
-            idle_ttl_sec=actual_idle_ttl,
-            expose_http=bool(expose_http),
-            service_token=token,
-            http_base_url=http_base,
-            status=pb2.SERVICE_STATUS_RUNNING,
-            created_at=now,
-            last_heartbeat_at=now,
-            lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
-            executor_ready=True,
-            alive_workers=actual_workers,
-            methods=method_info,
-        )
-        managed_state = self._ensure_service_managed_globals_state_locked(session, artifact=artifact)
-        if managed_state is not None:
-            session.managed_globals_scope_dir = managed_state.scope_dir
-            session.managed_globals_digest = managed_state.globals_digest
+        reserved = 0
         with self._lock:
-            self._services[service_id] = session
-        return session
+            active = sum(
+                max(0, int(session.worker_count))
+                for session in self._services.values()
+                if session.status in (
+                    pb2.SERVICE_STATUS_STARTING,
+                    pb2.SERVICE_STATUS_RUNNING,
+                    pb2.SERVICE_STATUS_DRAINING,
+                )
+            )
+            available_workers = max(0, int(self.service_worker_capacity) - int(active + self._service_worker_reserved))
+            if available_workers <= 0:
+                raise RuntimeError("service worker capacity exhausted")
+            actual_workers = min(requested_workers, available_workers)
+            self._service_worker_reserved += actual_workers
+            reserved = actual_workers
+            self._ensure_executor_host_alive_locked(now=now)
+            executor_host = self._executor_host
+        if executor_host is None:
+            with self._lock:
+                self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
+            raise RuntimeError("executor host unavailable")
+        try:
+            executor_host.create_service(service_id=service_id, worker_count=actual_workers)
+            session = ServiceSession(
+                service_id=service_id,
+                owner_client_id=owner_client_id,
+                service_name=service_name or f"service-{service_id[:8]}",
+                code_version=artifact.code_version,
+                worker_count=actual_workers,
+                heartbeat_timeout_sec=actual_hb_timeout,
+                idle_ttl_sec=actual_idle_ttl,
+                expose_http=bool(expose_http),
+                service_token=token,
+                http_base_url=http_base,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                created_at=now,
+                last_heartbeat_at=now,
+                lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
+                executor_ready=True,
+                alive_workers=actual_workers,
+                methods=method_info,
+                managed_global_names=normalized_managed_global_names,
+            )
+            managed_state = self._ensure_service_managed_globals_state_locked(session, artifact=artifact)
+            if managed_state is not None:
+                session.managed_globals_scope_dir = managed_state.scope_dir
+                session.managed_globals_digest = managed_state.globals_digest
+            with self._lock:
+                self._services[service_id] = session
+                if reserved:
+                    self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
+            return session
+        except Exception:
+            with self._lock:
+                if reserved:
+                    self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
+            raise
 
     def create_task_pool(
         self,
@@ -3098,6 +3323,7 @@ class NodeControlState:
     ) -> TaskPoolState:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
+        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
         artifact, _cached = self.put_code(
             client_id=owner_client_id,
             sha256=sha256,
@@ -3108,7 +3334,7 @@ class NodeControlState:
             export_mode="single",
             export_methods=[entry_callable],
             dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
+            managed_global_names=normalized_managed_global_names,
             chunks=chunks,
             validate_load=True,
         )
@@ -3138,6 +3364,7 @@ class NodeControlState:
             created_at=now,
             last_heartbeat_at=now,
             lease_expire_at=now + timedelta(seconds=max(5, int(heartbeat_timeout_sec or 30))),
+            managed_global_names=normalized_managed_global_names,
             executor_ready=True,
             task_count=0,
         )
@@ -3453,18 +3680,24 @@ class NodeControlState:
         setup_end = time.perf_counter()
 
         try:
-            executor_start = time.perf_counter()
+            build_execute_spec_ms = 0.0
+            executor_start = 0.0
+            build_start = time.perf_counter()
+            execute_spec = _build_execute_spec(
+                artifact,
+                object_dir=self._object_dir,
+                method_name=requested_method,
+                payload=payload or {},
+                managed_globals_scope_dir=session.managed_globals_scope_dir,
+                managed_globals_digest=session.managed_globals_digest,
+            )
+            build_end = time.perf_counter()
+            build_execute_spec_ms = (build_end - build_start) * 1000.0
+            executor_start = build_end
             resp = self._executor_host.call_service(
                 service_id=service_id,
                 timeout_sec=max(0.1, timeout_sec),
-                execute_spec=_build_execute_spec(
-                    artifact,
-                    object_dir=self._object_dir,
-                    method_name=requested_method,
-                    payload=payload or {},
-                    managed_globals_scope_dir=session.managed_globals_scope_dir,
-                    managed_globals_digest=session.managed_globals_digest,
-                ),
+                execute_spec=execute_spec,
             )
             executor_end = time.perf_counter()
             if not resp.get("ok", False):
@@ -3487,7 +3720,8 @@ class NodeControlState:
                         ok=False,
                         http_status=504,
                         setup_ms=(setup_end - total_start) * 1000.0,
-                        executor_ms=(time.perf_counter() - setup_end) * 1000.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
+                        executor_ms=(time.perf_counter() - executor_start) * 1000.0 if executor_start > 0 else 0.0,
                         finalize_ms=0.0,
                         total_ms=(time.perf_counter() - total_start) * 1000.0,
                         subprocess_timings=None,
@@ -3506,7 +3740,8 @@ class NodeControlState:
                         ok=False,
                         http_status=500,
                         setup_ms=(setup_end - total_start) * 1000.0,
-                        executor_ms=(time.perf_counter() - setup_end) * 1000.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
+                        executor_ms=(time.perf_counter() - executor_start) * 1000.0 if executor_start > 0 else 0.0,
                         finalize_ms=0.0,
                         total_ms=(time.perf_counter() - total_start) * 1000.0,
                         subprocess_timings=None,
@@ -3534,6 +3769,7 @@ class NodeControlState:
                         ok=True,
                         http_status=200,
                         setup_ms=(setup_end - total_start) * 1000.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
                         executor_ms=(executor_end - executor_start) * 1000.0,
                         finalize_ms=(finalize_end - finalize_start) * 1000.0,
                         total_ms=(finalize_end - total_start) * 1000.0,
@@ -3551,6 +3787,7 @@ class NodeControlState:
                         ok=False,
                         http_status=400,
                         setup_ms=(setup_end - total_start) * 1000.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
                         executor_ms=(executor_end - executor_start) * 1000.0,
                         finalize_ms=(finalize_end - finalize_start) * 1000.0,
                         total_ms=(finalize_end - total_start) * 1000.0,
@@ -3574,6 +3811,7 @@ class NodeControlState:
                     ok=False,
                     http_status=503,
                     setup_ms=(setup_end - total_start) * 1000.0,
+                    build_execute_spec_ms=build_execute_spec_ms,
                     executor_ms=(executor_end - executor_start) * 1000.0,
                     finalize_ms=(finalize_end - finalize_start) * 1000.0,
                     total_ms=(finalize_end - total_start) * 1000.0,
@@ -3758,10 +3996,7 @@ class NodeControlState:
                     priority=max(1, item.priority or 1),
                 )
                 self._tasks[item.task_id] = record
-                if self.enable_internal_executor:
-                    self._pending.append(item.task_id)
-                else:
-                    self._pending.append(item.task_id)
+                self._pending.append(item.task_id)
                 accepted.append(pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED))
             if accepted:
                 self._cv.notify_all()
@@ -4069,10 +4304,7 @@ class NodeControlState:
             task.last_heartbeat_at = None
             task.error_type = ""
             task.error_message = ""
-            if self.enable_internal_executor:
-                self._pending.append(task.task_id)
-            else:
-                self._pending.append(task.task_id)
+            self._pending.append(task.task_id)
             return
 
         task.status = pb2.TASK_STATUS_FAILED_INFRA
@@ -4271,20 +4503,20 @@ class NodeControlState:
                 continue
 
     def _drain_executor_events(self) -> None:
-        self._ensure_executor_host_alive_locked()
-        if self._executor_host is None:
-            return
-        for item in self._executor_host.drain_events():
-            if str(item.get("kind", "") or "") == "pool_task_done":
-                pool_id = str(item.get("pool_id", "") or "")
-                task_id = str(item.get("task_id", "") or "")
-                attempt = int(item.get("attempt", 0) or 0)
-                status_text = str(item.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
-                result = item.get("result")
-                err_type = str(item.get("err_type", "") or "")
-                err_message = str(item.get("err_message", "") or "")
-                now = utc_now()
-                with self._cv:
+        with self._cv:
+            self._ensure_executor_host_alive_locked()
+            if self._executor_host is None:
+                return
+            for item in self._executor_host.drain_events():
+                if str(item.get("kind", "") or "") == "pool_task_done":
+                    pool_id = str(item.get("pool_id", "") or "")
+                    task_id = str(item.get("task_id", "") or "")
+                    attempt = int(item.get("attempt", 0) or 0)
+                    status_text = str(item.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
+                    result = item.get("result")
+                    err_type = str(item.get("err_type", "") or "")
+                    err_message = str(item.get("err_message", "") or "")
+                    now = utc_now()
                     task = self._pool_tasks.get(task_id)
                     if task is None or task.attempt != attempt:
                         continue
@@ -4310,17 +4542,16 @@ class NodeControlState:
                         task.error_message = ""
                     self._pool_result_hook.push(pool_id, task.as_result())
                     self._cv.notify_all()
-                continue
-            if str(item.get("kind", "") or "") != "runtime_task_done":
-                continue
-            task_id = str(item.get("task_id", "") or "")
-            attempt = int(item.get("attempt", 0) or 0)
-            status_text = str(item.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
-            result = item.get("result")
-            err_type = str(item.get("err_type", "") or "")
-            err_message = str(item.get("err_message", "") or "")
-            now = utc_now()
-            with self._cv:
+                    continue
+                if str(item.get("kind", "") or "") != "runtime_task_done":
+                    continue
+                task_id = str(item.get("task_id", "") or "")
+                attempt = int(item.get("attempt", 0) or 0)
+                status_text = str(item.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
+                result = item.get("result")
+                err_type = str(item.get("err_type", "") or "")
+                err_message = str(item.get("err_message", "") or "")
+                now = utc_now()
                 task = self._tasks.get(task_id)
                 if task is None:
                     continue

@@ -171,6 +171,7 @@ from pycloud_parallel import (
     configure,
     foreach,
     parallel_for,
+    pycloud_export,
     DeployedService,
     DedicatedTaskServiceSession,
     JobQueueClient,
@@ -195,6 +196,12 @@ from pycloud_parallel import (
 6. `DirectConnect`
    - 客户端本地查路由后直连实例
 
+`pycloud_export` 也已经从顶层包重导出；如果你走模块 / package 部署，而不是直接传 `blob`，可以直接写：
+
+```python
+from pycloud_parallel import pycloud_export
+```
+
 如果你需要更底层的控制面类，请从 `pycloud_parallel.controlplane` 导入。
 
 ## 快速开始
@@ -208,7 +215,8 @@ pycloudctl start
 pycloudctl start-controlplane
 pycloudctl start-infocenter
 pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
-pycloudctl start-node --node-id node-1
+pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
+pycloudctl start-node --node-id node-1 --node-port 50061 --service-http-port 18081 --infocenter-addr 127.0.0.1:50051
 pycloudctl status
 pycloudctl doctor
 pycloudctl stop-node node-1
@@ -221,9 +229,9 @@ pycloudctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
   --node1-port 51061 \
-  --node1-http 18181 \
+  --node1-http-port 18181 \
   --node2-port 51062 \
-  --node2-http 18182 \
+  --node2-http-port 18182 \
   --node-worker-capacity 4 \
   start
 ```
@@ -263,11 +271,24 @@ scripts\start_services.bat status
 
 默认端口：
 
-1. `ControlPlane`: `127.0.0.1:50051`
-2. `NodeControl node-1`: `127.0.0.1:50061`
-3. `NodeControl node-2`: `127.0.0.1:50062`
-4. `node-1 service HTTP`: `127.0.0.1:18081`
-5. `node-2 service HTTP`: `127.0.0.1:18082`
+1. `ControlPlane`: `<auto-detected-local-ip>:50051`
+2. `NodeControl node-1`: `<auto-detected-local-ip>:50061`
+3. `NodeControl node-2`: `<auto-detected-local-ip>:50062`
+4. `node-1 service HTTP`: `<auto-detected-local-ip>:18081`
+5. `node-2 service HTTP`: `<auto-detected-local-ip>:18082`
+
+默认情况下，`pycloudctl start` 不再把这些地址固定成 `127.0.0.1`，而是自动探测本机可达 IP。
+如果你就是想强制只监听回环地址，请显式传：
+
+```bash
+pycloudctl \
+  --controlplane-host 127.0.0.1 \
+  --node1-host 127.0.0.1 \
+  --node1-http-host 127.0.0.1 \
+  --node2-host 127.0.0.1 \
+  --node2-http-host 127.0.0.1 \
+  start
+```
 
 ### 2. 服务模式
 

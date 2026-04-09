@@ -108,6 +108,7 @@ def _demo_route(service_name: str = "svc-demo") -> InfoCenterServiceRoute:
         service_name=service_name,
         service_id="svc-id-1",
         status=pb2.SERVICE_STATUS_RUNNING,
+        node_instance_id="node-1-inst",
         node_id="node-1",
         control_addr="127.0.0.1:50061",
         node_healthy=True,

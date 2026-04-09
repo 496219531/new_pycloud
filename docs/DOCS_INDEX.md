@@ -25,9 +25,9 @@
 ## 入口文档
 
 - [QUICK_START.md](QUICK_START.md)
-  - 顶层 API、启动方式、三层定位、最短示例
+  - 顶层 API、`pycloud_export`、启动方式、三层定位、最短示例
 - [PYCLOUDCTL_USAGE.md](PYCLOUDCTL_USAGE.md)
-  - `pycloudctl` 的完整命令说明、运行目录、端口、日志、GC 与常见示例
+  - `pycloudctl` 的完整命令说明、host 自动探测、显式 `--infocenter-addr`、日志、GC 与常见示例
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
   - 当前控制面、节点、任务模式、服务模式与外部 Web 层的边界
 
@@ -52,7 +52,7 @@
 - [PYCLOUDCTL_USAGE.md](PYCLOUDCTL_USAGE.md)
   - 本地控制脚本 `pycloudctl` 的详细用法、示例与排障
 - [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
-  - `/nodes`、`/services/routes`、`/ops`、节点事实字段
+  - `/nodes`、`/services/routes`、`/ops`、`node_instance_id` 与 timing 指标
 - [HTTP_SERVICE_DEBUG_FLOW.md](HTTP_SERVICE_DEBUG_FLOW.md)
   - HTTP 服务调用从 caller 到节点执行再到返回的关键函数链路
 - [TASKPOOL_DEBUG_FLOW.md](TASKPOOL_DEBUG_FLOW.md)

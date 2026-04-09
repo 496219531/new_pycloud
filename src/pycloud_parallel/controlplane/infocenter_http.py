@@ -2,25 +2,33 @@ from __future__ import annotations
 
 """HTTP + JSON server for InfoCenter control-plane and lightweight ops UI."""
 
+import errno
+import os
 import html
 import json
 import threading
+from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
+from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+
+MAX_BODY_BYTES = 64 * 1024 * 1024
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
     if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
         return True
     if isinstance(exc, OSError):
-        return True
+        return getattr(exc, "errno", None) in (errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED)
     return False
 
 
@@ -36,6 +44,23 @@ def _dt_text(dt) -> str:
         return dt.isoformat()
     except Exception:
         return str(dt)
+
+
+def _parse_dt(raw: object) -> datetime:
+    if isinstance(raw, datetime):
+        return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        except Exception:
+            return utc_now()
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw)
+            return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return utc_now()
+    return utc_now()
 
 
 def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
@@ -54,7 +79,7 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             worker_count=max(0, int(item.get("worker_count", 0) or 0)),
             alive_workers=max(0, int(item.get("alive_workers", 0) or 0)),
             in_flight=max(0, int(item.get("in_flight", 0) or 0)),
-            lease_expire_at=utc_now(),
+            lease_expire_at=_parse_dt(item.get("lease_expire_at") or item.get("lease_expire_at_ts") or utc_now()),
             http_base_url=str(item.get("http_base_url", "") or ""),
         )
     return out
@@ -100,6 +125,7 @@ def _serialize_node(state) -> Dict[str, object]:
     ]
     loaded_services = sorted({svc["service_name"] for svc in services})
     return {
+        "node_instance_id": state.node_instance_id,
         "node_id": state.node_id,
         "control_addr": state.control_addr,
         "healthy": bool(state.healthy),
@@ -147,6 +173,13 @@ def _parse_service_timing_metrics(node_metadata: Dict[str, object]) -> Dict[str,
     return out
 
 
+def _pycloud_version() -> str:
+    try:
+        return str(importlib_metadata.version("pycloud-parallel"))
+    except Exception:
+        return "unknown"
+
+
 def _render_ops_page(state: InfoCenterState) -> str:
     nodes = state.list_nodes(healthy_only=False, tags=(), limit=10000)
     node_rows: List[str] = []
@@ -165,10 +198,12 @@ def _render_ops_page(state: InfoCenterState) -> str:
         node_rows.append(
             "<tr>"
             f"<td>{html.escape(node.node_id)}</td>"
+            f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
             f"<td>{html.escape(node.control_addr)}</td>"
             f"<td>{'yes' if node.healthy else 'no'}</td>"
             f"<td>{'yes' if node.schedulable else 'no'}</td>"
             f"<td>{'yes' if node.drain else 'no'}</td>"
+            f"<td>{html.escape(str((node.metadata or {}).get('pycloud_version', '-') or '-'))}</td>"
             f"<td>{html.escape(node.python_version or '-')}</td>"
             f"<td>{html.escape(active_runtimes)}</td>"
             f"<td>{node.service_worker_capacity}</td>"
@@ -178,10 +213,10 @@ def _render_ops_page(state: InfoCenterState) -> str:
             f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
             "<td>"
-            f"<form method='post' action='/ops/nodes/{html.escape(node.node_id)}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(node.node_id)}/uncordon' style='display:inline'><button type='submit'>uncordon</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(node.node_id)}/drain' style='display:inline'><button type='submit'>drain</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(node.node_id)}/undrain' style='display:inline'><button type='submit'>undrain</button></form>"
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/uncordon' style='display:inline'><button type='submit'>uncordon</button></form> "
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/drain' style='display:inline'><button type='submit'>drain</button></form> "
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/undrain' style='display:inline'><button type='submit'>undrain</button></form>"
             "</td>"
             "</tr>"
         )
@@ -191,6 +226,7 @@ def _render_ops_page(state: InfoCenterState) -> str:
             service_rows.append(
                 f"<tr{stale_row}>"
                 f"<td>{html.escape(node.node_id)}</td>"
+                f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
                 f"<td>{html.escape(svc.service_name)}</td>"
                 f"<td>{html.escape(svc.service_id)}</td>"
                 f"<td>{'yes' if node_healthy else 'no'}</td>"
@@ -202,12 +238,20 @@ def _render_ops_page(state: InfoCenterState) -> str:
                 f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('last_total_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('last_setup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_build_execute_spec_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('last_executor_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('last_finalize_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_child_decode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_child_invoke_ms', timing.get('last_invoke_ms', '-'))))}</td>"
+                f"<td>{html.escape(str(timing.get('last_child_encode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_setup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_build_execute_spec_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_executor_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_finalize_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('max_total_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('last_invoke_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('last_method', '-')))}</td>"
@@ -216,8 +260,8 @@ def _render_ops_page(state: InfoCenterState) -> str:
                 f"<td>{html.escape(svc.http_base_url or '-')}</td>"
                 "</tr>"
             )
-    node_body = "\n".join(node_rows) or "<tr><td colspan='14'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='24'>no services</td></tr>"
+    node_body = "\n".join(node_rows) or "<tr><td colspan='16'>no nodes</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='33'>no services</td></tr>"
     return (
         "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
@@ -225,20 +269,20 @@ def _render_ops_page(state: InfoCenterState) -> str:
         "h2{margin-top:28px;} .muted{color:#666;} .section-note{color:#555;font-size:12px;margin:6px 0 10px;}"
         ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
         "</head><body>"
-        "<h1>InfoCenter Ops</h1>"
+        f"<h1>InfoCenter Ops</h1><div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
         "<div class='section-note'>Node table shows task-mode pressure and service capacity. "
         "Service table below shows each deployed service instance, worker process counts, and aggregated timing metrics. "
-        "Timing details are split into setup/executor/finalize segments. "
+        "Timing details are split into setup/build-execute-spec/executor/finalize plus child decode/invoke/encode segments. "
         "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th>"
+        "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>"
         "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
         "</tr></thead><tbody>"
         f"{node_body}"
         "</tbody></table>"
         "<h2>Service Instances</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>lease_expire_at</th><th>http_base_url</th>"
+        "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_build_execute_spec_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>last_child_decode_ms</th><th>last_child_invoke_ms</th><th>last_child_encode_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_build_execute_spec_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>lease_expire_at</th><th>http_base_url</th>"
         "</tr></thead><tbody>"
         f"{service_body}"
         "</tbody></table></body></html>"
@@ -253,11 +297,14 @@ class InfoCenterHttpServer:
         state: Optional[InfoCenterState] = None,
         gateway_app: Optional[GatewayHttpApp] = None,
         job_queue: Optional[JobQueueManager] = None,
+        auth_token: str = "",
     ) -> None:
         self._bind = bind
         self.state = state or InfoCenterState()
         self.gateway_app = gateway_app
         self.job_queue = job_queue
+        env_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
+        self.auth_token = str(auth_token or env_token or "").strip()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
@@ -275,11 +322,16 @@ class InfoCenterHttpServer:
             def do_POST(self):  # noqa: N802
                 parsed = urlparse(self.path)
                 parts = [x for x in parsed.path.split("/") if x]
+                if self._requires_auth(parsed.path):
+                    if not self._check_auth():
+                        self._send_json(401, {"ok": False, "error": "unauthorized"})
+                        return
                 if parsed.path == "/nodes/register":
                     payload = self._read_json()
                     if payload is None:
                         return
                     node = state.register_node_record(
+                        node_instance_id=str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip(),
                         node_id=str(payload.get("node_id", "")).strip(),
                         control_addr=str(payload.get("control_addr", "")).strip(),
                         capacity=max(1, int(payload.get("capacity", 1) or 1)),
@@ -301,6 +353,7 @@ class InfoCenterHttpServer:
                         return
                     metrics_raw = payload.get("metrics") or {}
                     node = state.heartbeat_record(
+                        node_instance_id=str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip(),
                         node_id=str(payload.get("node_id", "")).strip(),
                         healthy=bool(payload.get("healthy", True)),
                         metrics=NodeMetricsState(
@@ -344,18 +397,18 @@ class InfoCenterHttpServer:
                     self._send_json(200, {"ok": True, "job": state_obj.as_dict()})
                     return
                 if len(parts) == 4 and parts[:2] == ["ops", "nodes"]:
-                    node_id = parts[2]
+                    node_instance_id = parts[2]
                     action = parts[3]
                     if action == "cordon":
-                        state.update_node_schedule_state(node_id, schedulable=False)
+                        state.update_node_schedule_state(node_instance_id, schedulable=False)
                     elif action == "uncordon":
-                        state.update_node_schedule_state(node_id, schedulable=True)
+                        state.update_node_schedule_state(node_instance_id, schedulable=True)
                     elif action == "drain":
-                        state.update_node_schedule_state(node_id, drain=True)
+                        state.update_node_schedule_state(node_instance_id, drain=True)
                     elif action == "undrain":
-                        state.update_node_schedule_state(node_id, drain=False)
+                        state.update_node_schedule_state(node_instance_id, drain=False)
                     elif action == "mark-lost":
-                        state.mark_node_lost(node_id, reason="marked lost via ops")
+                        state.mark_node_lost(node_instance_id, reason="marked lost via ops")
                     else:
                         self._send_json(404, {"ok": False, "error": "unknown ops action"})
                         return
@@ -367,7 +420,9 @@ class InfoCenterHttpServer:
                     self._send_json(200, {"ok": True})
                     return
                 if gateway_app is not None:
-                    body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+                    body = self._read_body()
+                    if body is None:
+                        return
                     handled = gateway_app.handle_post(path=self.path, headers=self.headers, body=body)
                     if handled is not None:
                         code, resp = handled
@@ -377,6 +432,10 @@ class InfoCenterHttpServer:
 
             def do_GET(self):  # noqa: N802
                 parsed = urlparse(self.path)
+                if self._requires_auth(parsed.path):
+                    if not self._check_auth():
+                        self._send_json(401, {"ok": False, "error": "unauthorized"})
+                        return
                 if parsed.path == "/nodes":
                     qs = parse_qs(parsed.query)
                     tags = [x for x in ",".join(qs.get("tags", [])).split(",") if x]
@@ -399,6 +458,10 @@ class InfoCenterHttpServer:
                     self._send_json(200, {"ok": True, "routes": serialized})
                     return
                 if parsed.path == "/ops":
+                    if self._requires_auth(parsed.path):
+                        if not self._check_auth():
+                            self._send_json(401, {"ok": False, "error": "unauthorized"})
+                            return
                     raw = _render_ops_page(state).encode("utf-8")
                     try:
                         self.send_response(200)
@@ -437,7 +500,9 @@ class InfoCenterHttpServer:
                 return self.server.pycloud_owner  # type: ignore[attr-defined]
 
             def _read_json(self) -> Optional[dict]:
-                body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+                body = self._read_body()
+                if body is None:
+                    return None
                 try:
                     payload = json.loads(body.decode("utf-8") if body else "{}")
                 except Exception:
@@ -447,6 +512,34 @@ class InfoCenterHttpServer:
                     self._send_json(400, {"ok": False, "error": "json body must be object"})
                     return None
                 return payload
+
+            def _read_body(self) -> Optional[bytes]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                except Exception:
+                    length = 0
+                if length > MAX_BODY_BYTES:
+                    self._send_json(413, {"ok": False, "error": "payload too large"})
+                    return None
+                return self.rfile.read(max(0, length))
+
+            def _requires_auth(self, path: str) -> bool:
+                if not self.server_ref.auth_token:
+                    return False
+                return path.startswith("/nodes") or path.startswith("/jobs") or path.startswith("/ops")
+
+            def _check_auth(self) -> bool:
+                token = self.server_ref.auth_token
+                if not token:
+                    return True
+                x_token = str(self.headers.get("X-Infocenter-Token", "") or "").strip()
+                if x_token:
+                    return x_token == token
+                auth = str(self.headers.get("Authorization", "") or "").strip()
+                low = auth.lower()
+                if low.startswith("bearer "):
+                    return auth[7:].strip() == token
+                return False
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
                 raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
@@ -464,7 +557,7 @@ class InfoCenterHttpServer:
         self._server.pycloud_owner = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, name="infocenter-http", daemon=True)
         self._thread.start()
-        public_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+        public_host = resolve_public_host(host)
         actual_port = int(self._server.server_address[1])
         self.base_url = f"http://{public_host}:{actual_port}"
         if self.job_queue is not None:

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 """Lightweight HTTP gateway for service-session mode."""
 
+import errno
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible, serialize_inline_payload
 
 
@@ -19,8 +21,11 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
         return True
     if isinstance(exc, OSError):
-        return True
+        return getattr(exc, "errno", None) in (errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED)
     return False
+
+
+MAX_BODY_BYTES = 64 * 1024 * 1024
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -43,12 +48,14 @@ class ServiceHttpGateway:
         self._status_handler = status_handler
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._start_lock = threading.Lock()
         self.base_url = ""
 
     def start(self) -> None:
-        if self._server is not None:
-            return
-        host, port = _split_host_port(self._bind)
+        with self._start_lock:
+            if self._server is not None:
+                return
+            host, port = _split_host_port(self._bind)
 
         invoke_handler = self._invoke_handler
         status_handler = self._status_handler
@@ -67,7 +74,14 @@ class ServiceHttpGateway:
                             timeout_sec = max(0.1, float(qs["timeout_sec"][0]))
                         except Exception:
                             timeout_sec = 60.0
-                    body = self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+                    try:
+                        length = int(self.headers.get("Content-Length", "0") or 0)
+                    except Exception:
+                        length = 0
+                    if length > MAX_BODY_BYTES:
+                        self._send_json(413, {"ok": False, "error": "payload too large"})
+                        return
+                    body = self.rfile.read(max(0, length))
                     try:
                         payload = json.loads(body.decode("utf-8") if body else "{}")
                     except Exception:
@@ -124,11 +138,14 @@ class ServiceHttpGateway:
                     if not _is_client_disconnect_error(exc):
                         raise
 
-        self._server = ThreadingHTTPServer((host, port), _Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, name="service-http-gateway", daemon=True)
-        self._thread.start()
+        with self._start_lock:
+            if self._server is not None:
+                return
+            self._server = ThreadingHTTPServer((host, port), _Handler)
+            self._thread = threading.Thread(target=self._server.serve_forever, name="service-http-gateway", daemon=True)
+            self._thread.start()
 
-        public_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+        public_host = resolve_public_host(host)
         actual_port = int(self._server.server_address[1])
         self.base_url = f"http://{public_host}:{actual_port}"
 

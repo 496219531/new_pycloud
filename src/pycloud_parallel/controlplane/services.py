@@ -5,10 +5,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import os
-import queue
 import tempfile
-import time
-import threading
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
@@ -374,51 +371,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             ok=False,
             error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
         )
-        logger.info(
-            "[NodeControl] SubmitTasks peer=%s client_id=%s job_id=%s code_version=%s tasks=%d",
-            _peer(context),
-            request.client_id,
-            request.job_id,
-            request.code_version,
-            len(request.tasks),
-        )
-        if not request.client_id:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("client_id is required")
-            logger.warning("[NodeControl] SubmitTasks invalid request peer=%s", _peer(context))
-            return pb2.SubmitTasksResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "client_id is required"),
-            )
-        if not request.tasks:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("tasks cannot be empty")
-            return pb2.SubmitTasksResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "tasks cannot be empty"),
-            )
-        try:
-            validate_inline_payload_structs(
-                [item.payload for item in request.tasks],
-                item_context="task payload",
-                request_context="submit tasks request",
-            )
-        except ValueError as exc:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(str(exc))
-            return pb2.SubmitTasksResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
-            )
-        accepted, rejected, credit = self._state.submit_tasks(request)
-        logger.info(
-            "[NodeControl] SubmitTasks result peer=%s accepted=%d rejected=%d credit=%d",
-            _peer(context),
-            len(accepted),
-            len(rejected),
-            int(credit),
-        )
-        return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=credit)
 
     def TaskStream(
         self,
@@ -429,250 +381,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         context.set_details(self._shared_task_mode_removed_message())
         yield pb2.TaskStreamResponse(error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()))
         return
-        peer = _peer(context)
-        sentinel = object()
-        outbound: "queue.Queue[object]" = queue.Queue()
-        stop_event = threading.Event()
-        opened_event = threading.Event()
-        session = {
-            "client_id": "",
-            "code_version": "",
-            "cursor": "",
-            "result_limit": 100,
-            "result_wait_ms": 200,
-            "last_credit": -1,
-        }
-
-        def _push(resp: pb2.TaskStreamResponse) -> None:
-            outbound.put(resp)
-
-        def _push_error(message: str, *, code: int = pb2.ERROR_CODE_INVALID_REQUEST) -> None:
-            _push(pb2.TaskStreamResponse(error=_err(code, message)))
-
-        def _reader() -> None:
-            try:
-                for req in request_iterator:
-                    kind = req.WhichOneof("body")
-                    if kind == "open":
-                        if opened_event.is_set():
-                            _push_error("task stream already opened")
-                            stop_event.set()
-                            break
-                        open_req = req.open
-                        client_id = str(open_req.client_id or "").strip()
-                        code_version = str(open_req.code_version or "").strip()
-                        if not client_id:
-                            _push_error("client_id is required")
-                            stop_event.set()
-                            break
-                        if not code_version:
-                            _push_error("code_version is required")
-                            stop_event.set()
-                            break
-                        session["client_id"] = client_id
-                        session["code_version"] = code_version
-                        session["result_limit"] = max(1, int(open_req.result_limit or 100))
-                        session["result_wait_ms"] = max(0, int(open_req.result_wait_ms or 200))
-                        session["last_credit"] = int(self._state.metrics()["credit"])
-                        logger.info(
-                            "[NodeControl] TaskStream open peer=%s client_id=%s code_version=%s",
-                            peer,
-                            client_id,
-                            code_version,
-                        )
-                        _push(
-                            pb2.TaskStreamResponse(
-                                open_ack=pb2.TaskStreamOpenAck(
-                                    client_id=client_id,
-                                    code_version=code_version,
-                                    node_credit=int(session["last_credit"]),
-                                )
-                            )
-                        )
-                        opened_event.set()
-                        continue
-
-                    if not opened_event.is_set():
-                        _push_error("task stream must start with open")
-                        stop_event.set()
-                        break
-
-                    if kind == "submit":
-                        submit = req.submit
-                        if not submit.tasks:
-                            _push(
-                                pb2.TaskStreamResponse(
-                                    submit_ack=pb2.TaskStreamSubmitAck(
-                                        request_id=submit.request_id,
-                                        job_id=submit.job_id,
-                                        node_credit=int(self._state.metrics()["credit"]),
-                                        error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "tasks cannot be empty"),
-                                    )
-                                )
-                            )
-                            continue
-                        try:
-                            validate_inline_payload_structs(
-                                [item.payload for item in submit.tasks],
-                                item_context="task payload",
-                                request_context="task stream submit request",
-                            )
-                        except ValueError as exc:
-                            _push(
-                                pb2.TaskStreamResponse(
-                                    submit_ack=pb2.TaskStreamSubmitAck(
-                                        request_id=submit.request_id,
-                                        job_id=submit.job_id,
-                                        node_credit=int(self._state.metrics()["credit"]),
-                                        error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
-                                    )
-                                )
-                            )
-                            continue
-                        accepted, rejected, credit = self._state.submit_tasks(
-                            pb2.SubmitTasksRequest(
-                                client_id=str(session["client_id"]),
-                                code_version=str(session["code_version"]),
-                                execution_mode=submit.execution_mode,
-                                tasks=list(submit.tasks),
-                                job_id=submit.job_id,
-                            )
-                        )
-                        session["last_credit"] = int(credit)
-                        _push(
-                            pb2.TaskStreamResponse(
-                                submit_ack=pb2.TaskStreamSubmitAck(
-                                    request_id=submit.request_id,
-                                    job_id=submit.job_id,
-                                    accepted=accepted,
-                                    rejected=rejected,
-                                    node_credit=int(credit),
-                                )
-                            )
-                        )
-                        continue
-
-                    if kind == "cancel_job":
-                        cancel = req.cancel_job
-                        if not cancel.job_id:
-                            _push(
-                                pb2.TaskStreamResponse(
-                                    cancel_job_ack=pb2.TaskStreamCancelJobAck(
-                                        request_id=cancel.request_id,
-                                        job_id="",
-                                        error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "job_id is required"),
-                                    )
-                                )
-                            )
-                            continue
-                        queued_cancelled, running_marked, already_done, not_found = self._state.cancel_job(
-                            pb2.CancelJobRequest(
-                                client_id=str(session["client_id"]),
-                                job_id=cancel.job_id,
-                                reason=cancel.reason,
-                            )
-                        )
-                        _push(
-                            pb2.TaskStreamResponse(
-                                cancel_job_ack=pb2.TaskStreamCancelJobAck(
-                                    request_id=cancel.request_id,
-                                    job_id=cancel.job_id,
-                                    queued_cancelled=queued_cancelled,
-                                    running_marked=running_marked,
-                                    already_done=already_done,
-                                    not_found=not_found,
-                                )
-                            )
-                        )
-                        continue
-
-                    if kind == "close":
-                        logger.info(
-                            "[NodeControl] TaskStream close peer=%s client_id=%s drain=%s",
-                            peer,
-                            session["client_id"],
-                            bool(req.close.drain),
-                        )
-                        stop_event.set()
-                        break
-
-                stop_event.set()
-            except Exception as exc:
-                logger.exception("[NodeControl] TaskStream reader failed peer=%s", peer)
-                _push_error(f"task stream reader failed: {exc}", code=pb2.ERROR_CODE_INTERNAL_ERROR)
-                stop_event.set()
-            finally:
-                outbound.put(sentinel)
-
-        reader = threading.Thread(target=_reader, name="nodecontrol-task-stream-reader", daemon=True)
-        reader.start()
-
-        while context.is_active():
-            if not opened_event.wait(timeout=0.1):
-                if stop_event.is_set():
-                    break
-                try:
-                    item = outbound.get_nowait()
-                except queue.Empty:
-                    continue
-                if item is sentinel:
-                    break
-                yield item  # type: ignore[misc]
-                continue
-
-            try:
-                queued = outbound.get_nowait()
-            except queue.Empty:
-                queued = None
-            if queued is not None:
-                if queued is sentinel:
-                    break
-                yield queued  # type: ignore[misc]
-                continue
-
-            pull_req = pb2.PullResultsRequest(
-                client_id=str(session["client_id"]),
-                limit=int(session["result_limit"]),
-                wait_ms=int(session["result_wait_ms"]),
-                cursor=str(session["cursor"]),
-            )
-            results, next_cursor = self._state.pull_results(pull_req)
-            session["cursor"] = next_cursor
-            metrics = self._state.metrics()
-            credit = int(metrics["credit"])
-            if results:
-                session["last_credit"] = credit
-                yield pb2.TaskStreamResponse(
-                    result_batch=pb2.TaskStreamResultBatch(
-                        results=results,
-                        next_cursor=next_cursor,
-                        node_credit=credit,
-                    )
-                )
-                continue
-
-            if credit != int(session["last_credit"]):
-                session["last_credit"] = credit
-                yield pb2.TaskStreamResponse(
-                    credit_update=pb2.TaskStreamCreditUpdate(
-                        node_credit=credit,
-                        queued=int(metrics["queued"]),
-                        inflight=int(metrics["inflight"]),
-                        running=int(metrics["running"]),
-                    )
-                )
-                continue
-
-            if stop_event.is_set():
-                break
-            time.sleep(0.02)
-
-        yield pb2.TaskStreamResponse(
-            closed=pb2.TaskStreamClosed(
-                reason="stream closed",
-                node_credit=int(self._state.metrics()["credit"]),
-            )
-        )
 
     def UpdateRuntimeGlobals(
         self,
@@ -736,30 +444,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             ok=False,
             error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
         )
-        logger.info(
-            "[NodeControl] PullResults peer=%s client_id=%s limit=%d wait_ms=%d",
-            _peer(context),
-            request.client_id,
-            int(request.limit or 100),
-            int(request.wait_ms),
-        )
-        if not request.client_id:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("client_id is required")
-            logger.warning("[NodeControl] PullResults invalid request peer=%s", _peer(context))
-            return pb2.PullResultsResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "client_id is required"),
-            )
-        results, next_cursor = self._state.pull_results(request)
-        logger.info(
-            "[NodeControl] PullResults result peer=%s client_id=%s results=%d next_cursor=%s",
-            _peer(context),
-            request.client_id,
-            len(results),
-            next_cursor,
-        )
-        return pb2.PullResultsResponse(ok=True, results=results, next_cursor=next_cursor)
 
     def CancelTasks(self, request: pb2.CancelTasksRequest, context: grpc.ServicerContext) -> pb2.CancelTasksResponse:
         context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -768,34 +452,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             ok=False,
             error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
         )
-        logger.info(
-            "[NodeControl] CancelTasks peer=%s client_id=%s task_ids=%d",
-            _peer(context),
-            request.client_id,
-            len(request.task_ids),
-        )
-        if not request.client_id:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("client_id is required")
-            logger.warning("[NodeControl] CancelTasks invalid request peer=%s", _peer(context))
-            return pb2.CancelTasksResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "client_id is required"),
-            )
-        cancelled, not_found, already_done = self._state.cancel_tasks(request)
-        logger.info(
-            "[NodeControl] CancelTasks result peer=%s cancelled=%d not_found=%d already_done=%d",
-            _peer(context),
-            len(cancelled),
-            len(not_found),
-            len(already_done),
-        )
-        return pb2.CancelTasksResponse(
-            ok=True,
-            cancelled=cancelled,
-            not_found=not_found,
-            already_done=already_done,
-        )
 
     def CancelJob(self, request: pb2.CancelJobRequest, context: grpc.ServicerContext) -> pb2.CancelJobResponse:
         context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -803,45 +459,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         return pb2.CancelJobResponse(
             ok=False,
             error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-        logger.info(
-            "[NodeControl] CancelJob peer=%s client_id=%s job_id=%s",
-            _peer(context),
-            request.client_id,
-            request.job_id,
-        )
-        if not request.client_id:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("client_id is required")
-            logger.warning("[NodeControl] CancelJob invalid request peer=%s missing client_id", _peer(context))
-            return pb2.CancelJobResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "client_id is required"),
-            )
-        if not request.job_id:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("job_id is required")
-            logger.warning("[NodeControl] CancelJob invalid request peer=%s missing job_id", _peer(context))
-            return pb2.CancelJobResponse(
-                ok=False,
-                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "job_id is required"),
-            )
-
-        queued_cancelled, running_marked, already_done, not_found = self._state.cancel_job(request)
-        logger.info(
-            "[NodeControl] CancelJob result peer=%s queued_cancelled=%d running_marked=%d already_done=%d not_found=%d",
-            _peer(context),
-            queued_cancelled,
-            running_marked,
-            already_done,
-            not_found,
-        )
-        return pb2.CancelJobResponse(
-            ok=True,
-            queued_cancelled=queued_cancelled,
-            running_marked=running_marked,
-            already_done=already_done,
-            not_found=not_found,
         )
 
     def GetMetrics(self, request: pb2.GetMetricsRequest, context: grpc.ServicerContext) -> pb2.GetMetricsResponse:
@@ -914,7 +531,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
 
         try:
             tmp_file.close()
-            h = hashlib.sha256(Path(tmp_path).read_bytes()).hexdigest()
+            blob = Path(tmp_path).read_bytes()
             pool = self._state.create_task_pool(
                 owner_client_id=meta.owner_client_id,
                 pool_name=meta.pool_name,
@@ -928,7 +545,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 worker_count=meta.worker_count,
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
                 idle_ttl_sec=meta.idle_ttl_sec,
-                chunks=[Path(tmp_path).read_bytes()],
+                chunks=[blob],
             )
         except Exception as exc:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
@@ -1076,10 +693,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
 
     def GetTaskPoolStatus(self, request: pb2.GetTaskPoolStatusRequest, context: grpc.ServicerContext) -> pb2.GetTaskPoolStatusResponse:
         try:
-            info = self._state.task_pool_status_info(request.pool_id)
             pool = self._state.task_pool(request.pool_id)
             if pool.pool_token != str(request.pool_token or "").strip():
                 raise PermissionError("pool_token mismatch")
+            info = self._state.task_pool_status_info(request.pool_id)
             return pb2.GetTaskPoolStatusResponse(
                 ok=True,
                 pool=pb2.TaskPoolStatusInfo(
@@ -1498,6 +1115,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 error=_err(pb2.ERROR_CODE_NODE_DRAINING, str(exc)),
             )
 
+        self._notify_service_routes_changed()
         return pb2.HeartbeatServiceResponse(
             ok=True,
             accepted=True,

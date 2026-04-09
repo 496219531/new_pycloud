@@ -32,9 +32,9 @@ python -m pycloud_parallel.controlplane.ctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
   --node1-port 51061 \
-  --node1-http 18181 \
+  --node1-http-port 18181 \
   --node2-port 51062 \
-  --node2-http 18182 \
+  --node2-http-port 18182 \
   --node-worker-capacity 4 \
   start
 ```
@@ -47,9 +47,19 @@ pycloudctl --runtime-root /tmp/pycloud-dev --controlplane-port 51051 start
 
 默认会启动：
 
-1. `controlplane`：`127.0.0.1:50051`
-2. `node-1`：`127.0.0.1:50061`
-3. `node-2`：`127.0.0.1:50062`
+1. `controlplane`：`<auto-detected-local-ip>:50051`
+2. `node-1`：`<auto-detected-local-ip>:50061`
+3. `node-2`：`<auto-detected-local-ip>:50062`
+4. `node-1 service HTTP`：`<auto-detected-local-ip>:18081`
+5. `node-2 service HTTP`：`<auto-detected-local-ip>:18082`
+
+默认情况下，`pycloudctl start` 会自动探测本机可达 IP 来填充 bind / advertise / service-http 地址，不再固定回退到 `127.0.0.1`。
+如果你要单独起 `gateway` 或 `nodecontrol`，请显式传 `--infocenter-addr`：
+
+```bash
+pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
+pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
+```
 
 Web 运维页：
 
@@ -66,6 +76,7 @@ from pycloud_parallel import (
     configure,
     foreach,
     parallel_for,
+    pycloud_export,
     DeployedService,
     DedicatedTaskServiceSession,
     JobQueueClient,
@@ -89,6 +100,12 @@ from pycloud_parallel import (
    - 通过 Gateway 调用内部函数服务
 6. `DirectConnect`
    - 客户端发现后直连实例
+
+如果你是模块 / package 部署，服务导出装饰器也可以直接从顶层包拿：
+
+```python
+from pycloud_parallel import pycloud_export
+```
 
 ## 3. 本地多进程
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.client import TaskPoolSession
@@ -105,6 +106,7 @@ class JobQueueManager:
         self._controlplane_target = ""
         self._stop = False
         self._thread: Optional[threading.Thread] = None
+        self._retention_sec = max(60, int(os.getenv("PYCLOUD_JOB_QUEUE_RETENTION_SEC", "3600") or 3600))
 
     def start(self, *, controlplane_target: str) -> None:
         with self._lock:
@@ -117,11 +119,18 @@ class JobQueueManager:
     def close(self) -> None:
         with self._cv:
             self._stop = True
+            if self._running_job_id:
+                state = self._jobs.get(self._running_job_id)
+                if state is not None:
+                    state.cancel_requested = True
             self._cv.notify_all()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=1.0)
-        executor = self._current_executor
+            if thread.is_alive():
+                return
+        with self._lock:
+            executor = self._current_executor
         if executor is not None:
             try:
                 executor.close()
@@ -181,6 +190,20 @@ class JobQueueManager:
         waiting.sort(key=lambda item: (-int(item.priority), item.submitted_at.timestamp(), item.job_id))
         return waiting[0]
 
+    def _cleanup_jobs_locked(self) -> None:
+        if self._retention_sec <= 0:
+            return
+        now = utc_now()
+        expired = []
+        for job_id, state in self._jobs.items():
+            if state.status not in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                continue
+            finished_at = state.finished_at or state.submitted_at
+            if (now - finished_at).total_seconds() > self._retention_sec:
+                expired.append(job_id)
+        for job_id in expired:
+            self._jobs.pop(job_id, None)
+
     def _loop(self) -> None:
         while True:
             with self._cv:
@@ -188,6 +211,7 @@ class JobQueueManager:
                     self._cv.wait(timeout=0.1)
                 if self._stop:
                     return
+                self._cleanup_jobs_locked()
                 next_job = self._pick_next_job_locked()
                 if next_job is None:
                     self._cv.wait(timeout=0.1)
@@ -247,8 +271,21 @@ class JobQueueManager:
             if state is None:
                 return
             payload = dict(state.payload)
+            client_id = state.client_id
+            job_id_snapshot = state.job_id
 
-        subtasks = self._expand_subtasks(payload)
+        try:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jobq-expand") as executor:
+                fut = executor.submit(self._expand_subtasks, payload)
+                subtasks = fut.result(timeout=float(payload.get("driver_timeout_sec", 120.0) or 120.0))
+        except Exception as exc:
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is not None:
+                    state.status = "FAILED"
+                    state.finished_at = utc_now()
+                    state.error = f"driver failed: {exc}"
+            return
         if not subtasks:
             with self._lock:
                 state = self._jobs.get(job_id)
@@ -260,8 +297,8 @@ class JobQueueManager:
 
         kwargs = {
             "infocenter_target": self._controlplane_target,
-            "client_id": state.client_id,
-            "job_id": state.job_id,
+            "client_id": client_id,
+            "job_id": job_id_snapshot,
             "runtime": str(payload.get("runtime", "py3") or "py3"),
             "entry_module": str(payload.get("entry_module", "") or "").strip(),
             "entry_callable": str(payload.get("entry_callable", "run") or "run").strip() or "run",
@@ -294,16 +331,17 @@ class JobQueueManager:
                         state.error = "job must provide either code_version or blob_b64"
                 return
             kwargs["blob"] = base64.b64decode(blob_b64.encode("utf-8"))
+        artifact_path = str(payload.get("artifact_path", "") or "").strip()
 
         executor: Optional[Any] = None
         try:
             executor = TaskPoolSession.from_infocenter(
                     infocenter_target=self._controlplane_target,
-                    job_id=state.job_id,
-                    owner_client_id=kwargs.get("client_id") or state.client_id,
-                    pool_name=str(payload.get("pool_name", "") or f"job-pool-{state.job_id}"),
+                    job_id=job_id_snapshot,
+                    owner_client_id=kwargs.get("client_id") or client_id,
+                    pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
                     blob=kwargs.get("blob"),
-                    artifact_path=kwargs.get("artifact_path", ""),
+                    artifact_path=artifact_path,
                     runtime=kwargs.get("runtime", "py3"),
                     entry_module=kwargs.get("entry_module", ""),
                     entry_callable=kwargs.get("entry_callable", "run"),
@@ -316,7 +354,7 @@ class JobQueueManager:
                     healthy_only=kwargs.get("healthy_only", True),
                     tags=kwargs.get("tags"),
                     node_ids=kwargs.get("node_ids"),
-                    node_count=max(1, int(payload.get("pool_node_count", kwargs.get("node_count", 0) or 1) or 1)),
+                    node_count=max(0, int(payload.get("pool_node_count", kwargs.get("node_count", 0) or 0) or 0)),
                     node_limit=kwargs.get("node_limit", 100),
                     timeout_sec=kwargs.get("timeout_sec", 10.0),
                 )
@@ -324,19 +362,52 @@ class JobQueueManager:
                 self._current_executor = executor
             submit_resp = executor.submit_payloads(
                 subtasks,
-                job_id=state.job_id,
+                job_id=job_id_snapshot,
                 timeout_hint_sec=int(payload.get("timeout_hint_sec", 0) or 0),
                 priority=max(1, int(payload.get("task_priority", 1) or 1)),
                 runtime_key=str(payload.get("runtime_key", "") or "").strip(),
             )
-            expected_count = len(submit_resp.accepted)
-            results = executor.wait_for_results(
-                expected_count=expected_count,
-                timeout_sec=float(payload.get("wait_timeout_sec", 3600.0) or 3600.0),
-                wait_ms=int(payload.get("wait_ms", 500) or 500),
-                limit=max(1, int(payload.get("result_limit", 100) or 100)),
-                job_id=state.job_id,
-            )
+            pending = {str(item.task_id or "").strip() for item in submit_resp.accepted}
+            results: List[pb2.TaskResult] = []
+            deadline = time.monotonic() + float(payload.get("wait_timeout_sec", 3600.0) or 3600.0)
+            chunk_timeout = max(0.5, min(10.0, float(payload.get("wait_chunk_timeout_sec", 5.0) or 5.0)))
+            if pending and not hasattr(executor, "iter_results") and hasattr(executor, "wait_for_results"):
+                results = list(
+                    executor.wait_for_results(
+                        expected_count=len(pending),
+                        timeout_sec=max(0.1, deadline - time.monotonic()),
+                        wait_ms=int(payload.get("wait_ms", 500) or 500),
+                        job_id=job_id_snapshot,
+                    )
+                )
+                pending.clear()
+            while pending:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"job wait timeout with pending={len(pending)}")
+                with self._lock:
+                    state = self._jobs.get(job_id)
+                    cancel_requested = bool(state.cancel_requested) if state is not None else False
+                if cancel_requested:
+                    try:
+                        executor.cancel_job(reason="job queue cancel", job_id=job_id_snapshot)
+                    except Exception:
+                        pass
+                    break
+                batch = list(
+                    executor.iter_results(
+                        max_count=min(len(pending), int(payload.get("result_limit", 100) or 100)),
+                        timeout_sec=chunk_timeout,
+                        wait_ms=int(payload.get("wait_ms", 500) or 500),
+                        job_id=job_id_snapshot,
+                    )
+                )
+                for item in batch:
+                    tid = str(item.task_id or "").strip()
+                    if tid in pending:
+                        pending.discard(tid)
+                    results.append(item)
+                if not batch:
+                    time.sleep(0.05)
             rendered_results = [_task_result_to_dict(item) for item in results]
             with self._lock:
                 state = self._jobs.get(job_id)

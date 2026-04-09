@@ -15,7 +15,9 @@ _MATERIALIZE_AS = {"path", "dataframe", "series", "ndarray", "json", "bytes"}
 
 def normalize_object_id(object_id: str) -> str:
     text = str(object_id or "").strip().lower()
-    if text and not _OBJECT_ID_RE.match(text):
+    if not text:
+        raise ValueError("object_id must not be empty")
+    if not _OBJECT_ID_RE.match(text):
         raise ValueError(f"invalid object_id: {object_id!r}")
     return text
 
@@ -47,7 +49,9 @@ def object_storage_path(base_dir: Path, *, object_id: str, fmt: str) -> Path:
     normalized_id = normalize_object_id(object_id)
     digest = normalized_id.replace("sha256:", "", 1)
     suffix = object_format_suffix(fmt)
-    return Path(base_dir) / f"{digest}{suffix}"
+    prefix = digest[:2]
+    rest = digest[2:]
+    return Path(base_dir) / prefix / f"{rest}{suffix}"
 
 
 def normalize_materialize_as(value: str = "", *, default: str = "path") -> str:
