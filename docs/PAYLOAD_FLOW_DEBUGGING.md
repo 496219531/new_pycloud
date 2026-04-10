@@ -255,6 +255,16 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 2. 返回的是 `ResultRef`
 3. caller 再按 `materialize_as` 下载并恢复
 
+补充：
+
+1. 如果返回结果是 `DataFrame / Series / ndarray`，框架会先尝试 inline；超出 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` 才会走本地落盘与 `ResultRef`。
+2. Windows 上在高并发场景里，一旦进入落盘路径，这一步更容易受到杀毒软件、索引器或文件句柄竞争影响。
+3. 如果你观察到 `service_timing` 里 `error_type=PermissionError` 且 `executor_ms` 很高，优先怀疑结果落盘竞争。
+4. 这时可以优先：
+   - 调大 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`
+   - 使用 `imap_unordered(...)`
+   - 限制 `max_in_flight`
+
 ## 6. `user_invoke` 的三种模式
 
 `event=user_invoke` 里最关键的是 `mode`。

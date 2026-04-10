@@ -136,6 +136,7 @@ pycloudctl --help
 1. `pycloudctl start` / `start-infocenter` / `start-gateway` / `start-controlplane` / `start-node`
 2. 如果没有显式传 host，都会自动探测本机可达 IP
 3. 不再默认固定成 `127.0.0.1`
+4. 如果你只想本机回环监听，可以直接加 `--local`
 
 `node-worker-capacity` 默认会按 `CPU 核数 / 2` 自动计算，最少为 `1`。
 
@@ -162,6 +163,12 @@ pycloudctl start
 
 ```bash
 pycloudctl --runtime-root /tmp/pycloud-dev start
+```
+
+强制整套服务只监听本机回环地址：
+
+```bash
+pycloudctl --local start
 ```
 
 自定义端口：
@@ -378,6 +385,12 @@ pycloudctl start-node \
 这些参数会和原有的 `--bind` / `--service-http-bind` / `--advertise-addr` 合并，旧写法仍然可用。
 
 默认情况下，如果你没显式指定 host，`pycloudctl` 现在会自动探测本机 IP 来填充 bind / advertise / service-http 地址，不再默认回退到 `127.0.0.1`。
+
+如果你就是想强制走回环地址，也可以直接写：
+
+```bash
+pycloudctl start-node --local --node-id node-1 --infocenter-addr 127.0.0.1:50051
+```
 
 如果你就是想单独起一个不注册到控制面的 node，可以显式传空字符串：
 

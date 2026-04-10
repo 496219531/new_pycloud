@@ -77,10 +77,11 @@ def main():
         # 同步调用
         result = group.process_dataframe.sync(df)
         print(f"✓ 服务端处理结果:")
-        print(f"  行数: {result['rows']}")
-        print(f"  列: {result['columns']}")
-        print(f"  总和: {result['sum']}")
-        print(f"  平均: {result['mean']}")
+        print(f"  类型: {type(result).__name__}")
+        print(f"  行数: {len(result)}")
+        print(f"  列: {list(result.columns)}")
+        print("  前 3 行:")
+        print(result.head(3))
         print()
 
         # 异步调用
@@ -88,7 +89,7 @@ def main():
 
         async def async_test():
             result = await group.process_dataframe(df)
-            print(f"  {result}")
+            print(f"  类型: {type(result).__name__}, 行数: {len(result)}")
 
         asyncio.run(async_test())
         print()

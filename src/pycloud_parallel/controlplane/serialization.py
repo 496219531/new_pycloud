@@ -6,7 +6,6 @@ from datetime import date, datetime, time, timedelta
 import logging
 from typing import Any, Optional, Sequence
 
-from google.protobuf import json_format
 from google.protobuf import struct_pb2
 
 from pycloud_parallel.controlplane.config import (
@@ -650,7 +649,24 @@ def dict_to_struct(data: Optional[dict]) -> struct_pb2.Struct:
     return out
 
 
+def _value_to_python(value: struct_pb2.Value) -> Any:
+    kind = value.WhichOneof("kind")
+    if kind == "null_value":
+        return None
+    if kind == "number_value":
+        return float(value.number_value)
+    if kind == "string_value":
+        return str(value.string_value)
+    if kind == "bool_value":
+        return bool(value.bool_value)
+    if kind == "struct_value":
+        return {key: _value_to_python(item) for key, item in value.struct_value.fields.items()}
+    if kind == "list_value":
+        return [_value_to_python(item) for item in value.list_value.values]
+    return None
+
+
 def struct_to_dict(data: struct_pb2.Struct) -> dict:
     """Convert protobuf Struct into nested Python objects."""
-    result = json_format.MessageToDict(data, preserving_proto_field_name=True)
+    result = {key: _value_to_python(item) for key, item in data.fields.items()}
     return convert_dict_to_arrow(result)

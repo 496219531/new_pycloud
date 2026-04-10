@@ -391,6 +391,34 @@ def test_infocenter_client_select_task_nodes_detects_duplicate_node_ids_and_supp
         info_server.stop()
 
 
+def test_registering_restarted_node_prunes_stale_same_addr_instance():
+    state = InfoCenterState(lease_ttl_sec=5, heartbeat_interval_sec=2)
+    first = state.register_node_record(
+        node_instance_id="node-a-old",
+        node_id="node-a",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=20,
+        tags=["compute"],
+    )
+    assert first.node_instance_id == "node-a-old"
+
+    state.mark_node_lost("node-a-old", reason="restart")
+
+    second = state.register_node_record(
+        node_instance_id="node-a-new",
+        node_id="node-a",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=20,
+        tags=["compute"],
+    )
+    assert second.node_instance_id == "node-a-new"
+
+    nodes = state.list_nodes(healthy_only=False, tags=[], limit=20)
+    assert [node.node_instance_id for node in nodes] == ["node-a-new"]
+
+
 def test_runtime_spec_helpers_support_exact_major_and_comparators():
     assert normalize_python_runtime_spec("3.11") == "py3.11"
     assert normalize_python_runtime_spec(">=3.11") == ">=py3.11"

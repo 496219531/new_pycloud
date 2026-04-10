@@ -82,8 +82,10 @@ artifact_dir/
         runtime/<scope_hash>/
       meta.json
   objects/
-    <object_sha>.<fmt>
+    <sha_prefix>/<object_sha>.<fmt>
     meta/<object_sha>.json
+    segments/
+    materialized/
 ```
 
 说明：
@@ -93,7 +95,8 @@ artifact_dir/
    - 包含代码本体、补装依赖、managed globals scope 状态与 `meta.json`
 2. `objects/`
    - 大对象与大结果缓存
-   - `meta/<object_sha>.json` 里记录 `created_at` 与 `last_at`
+   - `meta/<object_sha>.json` 里记录 `created_at`、`last_at` 与存储后端
+   - 较大的结果可能会复用 `segments/` 做分段落盘
 
 ### 结果返回机制
 
@@ -290,6 +293,12 @@ pycloudctl \
   start
 ```
 
+现在也可以直接用更短的写法：
+
+```bash
+pycloudctl --local start
+```
+
 ### 2. 服务模式
 
 ```python
@@ -397,6 +406,13 @@ with TaskPoolSession.from_infocenter(
     ):
         print(task_id, data)
 ```
+
+说明：
+
+1. 如果子任务返回 `DataFrame / Series / ndarray`，框架会先尝试 inline 返回；只有超过 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` 才会落到 node 本地对象目录并返回 `ResultRef`。
+2. 如果你希望更大的 `DataFrame / Series / ndarray` 继续走 inline，可以调大 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`。
+3. 在 Windows 上一次性并发提交很多这类大结果任务时，一旦开始走结果落盘，文件系统更容易出现瞬时 `PermissionError(13)`。
+4. 这类场景更推荐 `imap_unordered(...)` 或显式限制并发，例如把 `max_in_flight` 控制在 `8~32`，而不是一次性同时打满几十个任务。
 
 如果你希望先排队，再由调度器自动创建专属 pool，使用 `JobQueueClient`。
 

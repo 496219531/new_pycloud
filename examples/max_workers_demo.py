@@ -53,10 +53,10 @@ def example_mixed_usage():
     print("示例 3: 混合使用全局 runtime 和临时 runtime")
     print("=" * 50)
 
-    from pycloud_parallel import configure, RuntimeConfig
+    from pycloud_parallel import configure
 
     # 配置全局 runtime（2 个进程）
-    configure(config=RuntimeConfig(max_workers=2))
+    configure(max_workers=2, reset=True)
     print("✓ 全局 runtime 已配置（2 个进程）")
 
     # 使用全局 runtime
@@ -101,10 +101,10 @@ def example_without_max_workers():
     print("示例 5: 不指定 max_workers（使用全局 runtime）")
     print("=" * 50)
 
-    from pycloud_parallel import configure, RuntimeConfig
+    from pycloud_parallel import configure
 
     # 配置全局 runtime
-    configure(config=RuntimeConfig(max_workers=3))
+    configure(max_workers=3, reset=True)
     print("✓ 全局 runtime 已配置（3 个进程）")
 
     # 不指定 max_workers，使用全局 runtime

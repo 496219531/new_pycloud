@@ -17,7 +17,7 @@ from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
-from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, utc_now
+from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, NodeTaskPoolInfo, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -85,6 +85,30 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
     return out
 
 
+def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
+    out: Dict[str, NodeTaskPoolInfo] = {}
+    for item in payload or []:
+        if not isinstance(item, dict):
+            continue
+        pool_id = str(item.get("pool_id", "")).strip()
+        if not pool_id:
+            continue
+        out[pool_id] = NodeTaskPoolInfo(
+            pool_id=pool_id,
+            owner_client_id=str(item.get("owner_client_id", "") or ""),
+            pool_name=str(item.get("pool_name", "") or ""),
+            code_version=str(item.get("code_version", "") or ""),
+            status=str(item.get("status", "") or ""),
+            worker_count=max(0, int(item.get("worker_count", 0) or 0)),
+            task_count=max(0, int(item.get("task_count", 0) or 0)),
+            inflight=max(0, int(item.get("inflight", 0) or 0)),
+            created_at=_parse_dt(item.get("created_at") or utc_now()),
+            last_heartbeat_at=_parse_dt(item.get("last_heartbeat_at") or utc_now()),
+            lease_expire_at=_parse_dt(item.get("lease_expire_at") or utc_now()),
+        )
+    return out
+
+
 def _service_status_text(status: int) -> str:
     mapping = {
         int(pb2.SERVICE_STATUS_UNSPECIFIED): "UNSPECIFIED",
@@ -123,6 +147,8 @@ def _serialize_node(state) -> Dict[str, object]:
         _serialize_service(svc, node_healthy=bool(state.healthy))
         for svc in sorted(state.services.values(), key=lambda item: (item.service_name, item.service_id))
     ]
+    task_pools = sorted(state.task_pools.values(), key=lambda item: (item.created_at, item.pool_name, item.pool_id), reverse=True)
+    active_task_pools = [pool for pool in task_pools if str(pool.status or "").strip().upper() == "RUNNING"]
     loaded_services = sorted({svc["service_name"] for svc in services})
     return {
         "node_instance_id": state.node_instance_id,
@@ -150,9 +176,30 @@ def _serialize_node(state) -> Dict[str, object]:
         "service_worker_capacity": int(state.service_worker_capacity),
         "service_worker_used": int(state.service_worker_used),
         "service_worker_available": int(state.service_worker_available()),
+        "task_pool_worker_capacity": int(state.task_pool_worker_capacity),
+        "task_pool_worker_used": int(state.task_pool_worker_used),
+        "task_pool_worker_available": int(state.task_pool_worker_available()),
+        "task_pool_count": int(len(active_task_pools)),
+        "task_pool_total_count": int(len(task_pools)),
         "service_count": int(len(services)),
         "loaded_services": loaded_services,
         "services": services,
+        "task_pools": [
+            {
+                "pool_id": str(pool.pool_id),
+                "owner_client_id": str(pool.owner_client_id),
+                "pool_name": str(pool.pool_name),
+                "code_version": str(pool.code_version),
+                "status": str(pool.status),
+                "worker_count": int(pool.worker_count),
+                "task_count": int(pool.task_count),
+                "inflight": int(pool.inflight),
+                "created_at": _dt_text(pool.created_at),
+                "last_heartbeat_at": _dt_text(pool.last_heartbeat_at),
+                "lease_expire_at": _dt_text(pool.lease_expire_at),
+            }
+            for pool in task_pools
+        ],
     }
 
 
@@ -173,6 +220,23 @@ def _parse_service_timing_metrics(node_metadata: Dict[str, object]) -> Dict[str,
     return out
 
 
+def _parse_task_pool_timing_metrics(node_metadata: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    raw = str((node_metadata or {}).get("task_pool_timing_metrics", "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: Dict[str, Dict[str, object]] = {}
+    for pool_id, item in payload.items():
+        if isinstance(item, dict):
+            out[str(pool_id)] = dict(item)
+    return out
+
+
 def _pycloud_version() -> str:
     try:
         return str(importlib_metadata.version("pycloud-parallel"))
@@ -184,10 +248,13 @@ def _render_ops_page(state: InfoCenterState) -> str:
     nodes = state.list_nodes(healthy_only=False, tags=(), limit=10000)
     node_rows: List[str] = []
     service_rows: List[str] = []
+    pool_entries: List[tuple] = []
     for node in nodes:
         services = sorted(node.services.values(), key=lambda item: (item.service_name, item.service_id))
+        task_pools = sorted(node.task_pools.values(), key=lambda item: (item.created_at, item.pool_name, item.pool_id), reverse=True)
         node_healthy = bool(node.healthy)
         timing_map = _parse_service_timing_metrics(dict(node.metadata))
+        pool_timing_map = _parse_task_pool_timing_metrics(dict(node.metadata))
         loaded = "<br>".join(
             f"{html.escape(svc.service_name)} "
             f"<span class='muted'>[{(svc.alive_workers if node_healthy else 0)}/{svc.worker_count} alive, "
@@ -209,6 +276,11 @@ def _render_ops_page(state: InfoCenterState) -> str:
             f"<td>{node.service_worker_capacity}</td>"
             f"<td>{node.service_worker_used}</td>"
             f"<td>{node.service_worker_available()}</td>"
+            f"<td>{node.task_pool_worker_capacity}</td>"
+            f"<td>{node.task_pool_worker_used}</td>"
+            f"<td>{node.task_pool_worker_available()}</td>"
+            f"<td>{sum(int(getattr(pool, 'inflight', 0) or 0) for pool in task_pools)}</td>"
+            f"<td>{len(task_pools)}</td>"
             f"<td>{len(services)}</td>"
             f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
@@ -260,8 +332,54 @@ def _render_ops_page(state: InfoCenterState) -> str:
                 f"<td>{html.escape(svc.http_base_url or '-')}</td>"
                 "</tr>"
             )
-    node_body = "\n".join(node_rows) or "<tr><td colspan='16'>no nodes</td></tr>"
+        for pool in task_pools:
+            stale_row = "" if node_healthy else " class='stale-row'"
+            timing = pool_timing_map.get(str(pool.pool_id), {})
+            pool_entries.append((
+                getattr(pool, "created_at", None),
+                f"<tr{stale_row}>"
+                f"<td>{html.escape(node.node_id)}</td>"
+                f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
+                f"<td>{html.escape(pool.pool_name)}</td>"
+                f"<td>{html.escape(pool.pool_id)}</td>"
+                f"<td>{html.escape(pool.owner_client_id)}</td>"
+                f"<td>{html.escape(pool.status)}</td>"
+                f"<td>{pool.worker_count}</td>"
+                f"<td>{pool.task_count}</td>"
+                f"<td>{int(getattr(pool, 'inflight', 0) or 0)}</td>"
+                f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_total_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_setup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_build_execute_spec_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_executor_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_finalize_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_child_decode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_child_invoke_ms', timing.get('last_invoke_ms', '-'))))}</td>"
+                f"<td>{html.escape(str(timing.get('last_child_encode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_setup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_build_execute_spec_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_executor_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_finalize_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('max_total_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_invoke_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_method', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_error_type', '-')))}</td>"
+                f"<td>{html.escape(pool.code_version[:20] + ('...' if len(pool.code_version) > 20 else ''))}</td>"
+                f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
+                f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
+                f"<td>{html.escape(_dt_text(pool.lease_expire_at))}</td>"
+                "</tr>"
+            ))
+    node_body = "\n".join(node_rows) or "<tr><td colspan='21'>no nodes</td></tr>"
     service_body = "\n".join(service_rows) or "<tr><td colspan='33'>no services</td></tr>"
+    pool_entries.sort(key=lambda item: item[0], reverse=True)
+    pool_rows = [row for _created_at, row in pool_entries]
+    pool_body = "\n".join(pool_rows) or "<tr><td colspan='28'>no task pools</td></tr>"
     return (
         "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
@@ -270,13 +388,14 @@ def _render_ops_page(state: InfoCenterState) -> str:
         ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
         "</head><body>"
         f"<h1>InfoCenter Ops</h1><div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
-        "<div class='section-note'>Node table shows task-mode pressure and service capacity. "
+        "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
         "Service table below shows each deployed service instance, worker process counts, and aggregated timing metrics. "
+        "Task pool table shows native temporary pools running on each node. "
         "Timing details are split into setup/build-execute-spec/executor/finalize plus child decode/invoke/encode segments. "
         "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         "<table><thead><tr>"
         "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>"
-        "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
+        "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>pool cap</th><th>pool used</th><th>pool avail</th><th>pool inflight</th><th>pool count</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
         "</tr></thead><tbody>"
         f"{node_body}"
         "</tbody></table>"
@@ -285,6 +404,12 @@ def _render_ops_page(state: InfoCenterState) -> str:
         "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_build_execute_spec_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>last_child_decode_ms</th><th>last_child_invoke_ms</th><th>last_child_encode_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_build_execute_spec_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>lease_expire_at</th><th>http_base_url</th>"
         "</tr></thead><tbody>"
         f"{service_body}"
+        "</tbody></table>"
+        "<h2>Task Pools</h2>"
+        "<table><thead><tr>"
+        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_build_execute_spec_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>last_child_decode_ms</th><th>last_child_invoke_ms</th><th>last_child_encode_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_build_execute_spec_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th>"
+        "</tr></thead><tbody>"
+        f"{pool_body}"
         "</tbody></table></body></html>"
     )
 
@@ -341,9 +466,12 @@ class InfoCenterHttpServer:
                         python_version=str(payload.get("python_version", "") or ""),
                         metadata=dict(payload.get("metadata") or {}),
                         services=_parse_services(payload.get("services")),
+                        task_pools=_parse_task_pools(payload.get("task_pools")),
                         active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
                         service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
+                        task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
+                        task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
                     )
                     self._send_json(200, {"ok": True, "heartbeat_interval_sec": state.heartbeat_interval_sec, "node": _serialize_node(node)})
                     return
@@ -366,10 +494,13 @@ class InfoCenterHttpServer:
                         ),
                         metadata=dict(payload.get("metadata") or {}),
                         services=_parse_services(payload.get("services")),
+                        task_pools=_parse_task_pools(payload.get("task_pools")),
                         python_version=str(payload.get("python_version", "") or ""),
                         active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
                         service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
+                        task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
+                        task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
                     )
                     if node is None:
                         self._send_json(404, {"ok": False, "error": "unknown node"})

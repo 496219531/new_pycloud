@@ -915,7 +915,8 @@ def _serialize_data_for_object_ref(
 
     if isinstance(data, (dict, list)):
         log_payload_flow("object_ref_upload", path_type="json", format=(format or "json"), summary=summarize_payload_flow_value(data))
-        return "json", normalize_object_format(format or "json", default="json"), json.dumps(data, ensure_ascii=False).encode("utf-8")
+        serialized = serialize_arrow_compatible(data)
+        return "json", normalize_object_format(format or "json", default="json"), json.dumps(serialized, ensure_ascii=False).encode("utf-8")
 
     if isinstance(data, (bytes, bytearray, memoryview)):
         log_payload_flow("object_ref_upload", path_type="bytes", format=(format or "bin"), summary=summarize_payload_flow_value(data))
@@ -1046,6 +1047,126 @@ def _prepare_managed_globals_values_for_upload(
         )
         for name, value in (values or {}).items()
     }
+
+
+def _prepare_task_payload_for_submit(
+    client: "NodeControlClient",
+    payload: Dict[str, object],
+    *,
+    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+) -> Any:
+    if isinstance(payload, ObjectRef):
+        return payload
+    try:
+        inline_size = _estimate_managed_global_inline_size(payload)
+    except Exception:
+        return payload
+    if inline_size <= max(1, int(object_threshold_bytes)):
+        return payload
+    if isinstance(payload, (dict, list)):
+        ref = _put_data_via_clients([client], payload, format="json")
+    else:
+        ref = _put_data_via_clients([client], payload)
+    return replace(ref, consume_on_read=True)
+
+
+def _prepare_http_payload_value_for_upload(
+    clients: Sequence["NodeControlClient"],
+    value: Any,
+    *,
+    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    preserve_container: bool = False,
+) -> Any:
+    if isinstance(value, ObjectRef):
+        return value
+    if isinstance(value, dict):
+        if not preserve_container:
+            try:
+                inline_size = _estimate_managed_global_inline_size(value)
+            except Exception:
+                inline_size = 0
+            if inline_size > max(1, int(object_threshold_bytes)):
+                return replace(_put_data_via_clients(clients, value, format="json"), consume_on_read=True)
+        return {
+            key: _prepare_http_payload_value_for_upload(
+                clients,
+                item,
+                object_threshold_bytes=object_threshold_bytes,
+                preserve_container=False,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        if not preserve_container:
+            try:
+                inline_size = _estimate_managed_global_inline_size(value)
+            except Exception:
+                inline_size = 0
+            if inline_size > max(1, int(object_threshold_bytes)):
+                return replace(_put_data_via_clients(clients, value, format="json"), consume_on_read=True)
+        return [
+            _prepare_http_payload_value_for_upload(
+                clients,
+                item,
+                object_threshold_bytes=object_threshold_bytes,
+                preserve_container=False,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _prepare_http_payload_value_for_upload(
+                clients,
+                item,
+                object_threshold_bytes=object_threshold_bytes,
+                preserve_container=False,
+            )
+            for item in value
+        ]
+    try:
+        inline_size = _estimate_managed_global_inline_size(value)
+    except Exception:
+        return value
+    if inline_size <= max(1, int(object_threshold_bytes)):
+        return value
+    if isinstance(value, (dict, list)):
+        ref = _put_data_via_clients(clients, value, format="json")
+    else:
+        ref = _put_data_via_clients(clients, value)
+    return replace(ref, consume_on_read=True)
+
+
+def _prepare_http_payload_for_call(
+    clients: Sequence["NodeControlClient"],
+    payload: Optional[Dict[str, object]],
+    *,
+    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+) -> Dict[str, object]:
+    payload = dict(payload or {})
+    if "args" in payload:
+        payload["args"] = _prepare_http_payload_value_for_upload(
+            clients,
+            list(payload.get("args") or []),
+            object_threshold_bytes=object_threshold_bytes,
+            preserve_container=True,
+        )
+    if "kwargs" in payload:
+        payload["kwargs"] = _prepare_http_payload_value_for_upload(
+            clients,
+            dict(payload.get("kwargs") or {}),
+            object_threshold_bytes=object_threshold_bytes,
+            preserve_container=True,
+        )
+    for key in list(payload.keys()):
+        if key in {"args", "kwargs"}:
+            continue
+        payload[key] = _prepare_http_payload_value_for_upload(
+            clients,
+            payload[key],
+            object_threshold_bytes=object_threshold_bytes,
+            preserve_container=False,
+        )
+    return payload
 
 
 _SERVICE_SESSION_SCHEMA_VERSION = 2
@@ -1263,6 +1384,18 @@ class InfoCenterNodeService:
 
 
 @dataclass(frozen=True)
+class InfoCenterNodeTaskPool:
+    pool_id: str
+    owner_client_id: str
+    pool_name: str
+    code_version: str
+    status: str
+    worker_count: int = 0
+    task_count: int = 0
+    inflight: int = 0
+
+
+@dataclass(frozen=True)
 class InfoCenterNode:
     node_instance_id: str
     node_id: str
@@ -1279,11 +1412,15 @@ class InfoCenterNode:
     service_worker_capacity: int = 0
     service_worker_used: int = 0
     service_worker_available: int = 0
+    task_pool_worker_capacity: int = 0
+    task_pool_worker_used: int = 0
+    task_pool_worker_available: int = 0
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
     loaded_services: Tuple[str, ...] = ()
     services: Tuple[InfoCenterNodeService, ...] = ()
+    task_pools: Tuple[InfoCenterNodeTaskPool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1384,9 +1521,12 @@ class InfoCenterClient:
         version: str = "",
         metadata: Optional[Dict[str, str]] = None,
         services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
+        task_pools: Optional[Sequence[Dict[str, object]]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        task_pool_worker_capacity: int = 0,
+        task_pool_worker_used: int = 0,
         python_version: str = "",
     ) -> Dict[str, object]:
         serialized_services = []
@@ -1417,10 +1557,13 @@ class InfoCenterClient:
                 "version": version,
                 "metadata": dict(metadata or {}),
                 "services": serialized_services,
+                "task_pools": list(task_pools or []),
                 "python_version": str(python_version or "").strip(),
                 "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
                 "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
                 "service_worker_used": max(0, int(service_worker_used or 0)),
+                "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
+                "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
             },
         )
 
@@ -1433,9 +1576,12 @@ class InfoCenterClient:
         metrics: Optional[Dict[str, object]] = None,
         metadata: Optional[Dict[str, str]] = None,
         services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
+        task_pools: Optional[Sequence[Dict[str, object]]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        task_pool_worker_capacity: int = 0,
+        task_pool_worker_used: int = 0,
         python_version: str = "",
     ) -> Dict[str, object]:
         serialized_services = []
@@ -1463,10 +1609,13 @@ class InfoCenterClient:
                 "metrics": dict(metrics or {}),
                 "metadata": dict(metadata or {}),
                 "services": serialized_services,
+                "task_pools": list(task_pools or []),
                 "python_version": str(python_version or "").strip(),
                 "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
                 "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
                 "service_worker_used": max(0, int(service_worker_used or 0)),
+                "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
+                "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
             },
         )
 
@@ -1506,6 +1655,20 @@ class InfoCenterClient:
                         http_base_url=str(svc.get("http_base_url", "") or ""),
                     )
                 )
+            task_pools = []
+            for pool in item.get("task_pools", []) or []:
+                task_pools.append(
+                    InfoCenterNodeTaskPool(
+                        pool_id=str(pool.get("pool_id", "") or ""),
+                        owner_client_id=str(pool.get("owner_client_id", "") or ""),
+                        pool_name=str(pool.get("pool_name", "") or ""),
+                        code_version=str(pool.get("code_version", "") or ""),
+                        status=str(pool.get("status", "") or ""),
+                        worker_count=int(pool.get("worker_count", 0) or 0),
+                        task_count=int(pool.get("task_count", 0) or 0),
+                        inflight=int(pool.get("inflight", 0) or 0),
+                    )
+                )
             out.append(
                 InfoCenterNode(
                     node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
@@ -1523,11 +1686,15 @@ class InfoCenterClient:
                     service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
                     service_worker_used=int(item.get("service_worker_used", 0) or 0),
                     service_worker_available=int(item.get("service_worker_available", 0) or 0),
+                    task_pool_worker_capacity=int(item.get("task_pool_worker_capacity", 0) or 0),
+                    task_pool_worker_used=int(item.get("task_pool_worker_used", 0) or 0),
+                    task_pool_worker_available=int(item.get("task_pool_worker_available", 0) or 0),
                     schedulable=bool(item.get("schedulable", True)),
                     drain=bool(item.get("drain", False)),
                     reason=str(item.get("reason", "") or ""),
                     loaded_services=tuple(item.get("loaded_services") or ()),
                     services=tuple(services),
+                    task_pools=tuple(task_pools),
                 )
             )
         return out
@@ -1698,7 +1865,29 @@ class GatewayServiceClient:
         if token:
             headers["X-Service-Token"] = token
         params = urlencode({"timeout_sec": f"{max(0.1, float(timeout_sec)):.3f}"})
-        serialized_payload = _serialize_http_call_payload(payload, context="service call payload")
+        routes = []
+        try:
+            status = self.get_status(service_name=name)
+            routes = list(status.get("routes", [])) if isinstance(status, dict) else []
+        except Exception:
+            routes = []
+        clients: List[NodeControlClient] = []
+        prepared_payload = payload or {}
+        try:
+            for item in routes:
+                if not isinstance(item, dict):
+                    continue
+                control_addr = str(item.get("control_addr", "") or "").strip()
+                if not control_addr:
+                    continue
+                clients.append(NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
+            if clients:
+                prepared_payload = _prepare_http_payload_for_call(clients, payload, object_threshold_bytes=INLINE_PAYLOAD_SOFT_LIMIT_BYTES)
+            serialized_payload = _serialize_http_call_payload(prepared_payload, context="service call payload")
+        finally:
+            for client in clients:
+                with contextlib.suppress(Exception):
+                    client.close()
         return _http_json_request(
             base_url=self.base_url,
             path=f"/svc/{quote(name, safe='')}/call/{quote(method_name, safe='')}?{params}",
@@ -2583,6 +2772,7 @@ class TaskPoolSession:
         self._hb_lock = threading.Lock()
         self.failed = False
         self.failures: Dict[str, str] = {}
+        self.globals_digests: Dict[str, str] = {}
         self._active_nodes: set[str] = set(self._pools.keys())
         self._pending_task_ids: set[str] = set()
         self._result_state_lock = threading.Lock()
@@ -2666,8 +2856,12 @@ class TaskPoolSession:
             task_id = self._next_task_id()
             if prefix:
                 task_id = f"{prefix}-{task_id.rsplit('-', 1)[-1]}"
-            _, payload_struct, _ = serialize_inline_payload(payload or {}, context="task pool payload")
             target_node_id = self._select_pool_node()
+            prepared_payload = _prepare_task_payload_for_submit(
+                self._pools[target_node_id]._client,  # noqa: SLF001
+                dict(payload or {}),
+            )
+            _, payload_struct, _ = serialize_inline_payload(prepared_payload, context="task pool payload")
             grouped.setdefault(target_node_id, []).append(
                 pb2.TaskSubmitItem(
                     task_id=task_id,
@@ -2928,6 +3122,33 @@ class TaskPoolSession:
                 task_ids=task_ids,
             )
         )
+
+    def update_globals(self, values: Dict[str, object]) -> str:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        pools_snapshot = list(self._pools.items())
+        active_clients = [pool._client for _node_id, pool in pools_snapshot]  # noqa: SLF001
+        prepared_values = _prepare_managed_globals_values_for_upload(active_clients, values)
+        digests: Dict[str, str] = {}
+        failed_nodes: Dict[str, str] = {}
+        for node_id, pool in pools_snapshot:
+            try:
+                resp = pool._client.update_runtime_globals_prepared(  # noqa: SLF001
+                    client_id=pool.pool_id,
+                    code_version=pool.code_version,
+                    runtime_key=pool.pool_id,
+                    code_token=pool.pool_token,
+                    prepared_values=prepared_values,
+                )
+                digests[node_id] = resp.globals_digest
+            except Exception as exc:
+                failed_nodes[node_id] = repr(exc)
+
+        if not digests:
+            raise RuntimeError(f"update_globals failed on all nodes: {failed_nodes}")
+        self.globals_digests = dict(digests)
+        unique = {digest for digest in digests.values() if str(digest).strip()}
+        return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()))
 
     def iter_items(
         self,
@@ -3327,6 +3548,7 @@ class TaskPoolSession:
         if not selected_nodes:
             raise RuntimeError("no task pool nodes selected from InfoCenter")
         desired_nodes = selected_nodes[:requested_count] if requested_count > 0 else selected_nodes
+        effective_pool_name = str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}").strip()
 
         pools: Dict[str, NativeTaskPoolClient] = {}
         nodes: Dict[str, InfoCenterNode] = {}
@@ -3334,7 +3556,7 @@ class TaskPoolSession:
             client = NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
             pool = client.create_task_pool_from_bytes(
                 owner_client_id=effective_owner,
-                pool_name=str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}"),
+                pool_name=effective_pool_name,
                 blob=effective_blob,
                 runtime=runtime,
                 entry_module=entry_module,
@@ -3870,7 +4092,8 @@ class ServiceSessionClient:
         auth_token = self.service_token if token is None else token
         if auth_token:
             headers["X-Service-Token"] = auth_token
-        serialized_payload = _serialize_http_call_payload(payload, context="service call payload")
+        prepared_payload = _prepare_http_payload_for_call([self._client], payload, object_threshold_bytes=INLINE_PAYLOAD_SOFT_LIMIT_BYTES)
+        serialized_payload = _serialize_http_call_payload(prepared_payload, context="service call payload")
         req = Request(
             url=url,
             method="POST",
@@ -4272,6 +4495,23 @@ class NodeControlClient:
         values: Dict[str, object],
     ) -> pb2.UpdateRuntimeGlobalsResponse:
         prepared_values = _prepare_managed_globals_values_for_upload([self], values)
+        return self.update_runtime_globals_prepared(
+            client_id=client_id,
+            code_version=code_version,
+            runtime_key=runtime_key,
+            code_token=code_token,
+            prepared_values=prepared_values,
+        )
+
+    def update_runtime_globals_prepared(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str,
+        code_token: str,
+        prepared_values: Dict[str, object],
+    ) -> pb2.UpdateRuntimeGlobalsResponse:
         resp = self.stub.UpdateRuntimeGlobals(
             pb2.UpdateRuntimeGlobalsRequest(
                 client_id=str(client_id or "").strip(),
@@ -7163,7 +7403,24 @@ class DirectConnect(DiscoveryServiceClient):
         route = self._route_cache.select_route(self.service_name, strategy=strategy)
         tried = {route.service_id}
         token = self.service_token
-        serialized_payload = _serialize_arrow_compatible(payload)
+        routes_snapshot = list(self._route_cache.get_routes(self.service_name))
+        clients: List[NodeControlClient] = []
+        try:
+            for item in routes_snapshot:
+                control_addr = str(getattr(item, "control_addr", "") or "").strip()
+                if not control_addr:
+                    continue
+                clients.append(NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
+            prepared_payload = _prepare_http_payload_for_call(
+                clients,
+                payload,
+                object_threshold_bytes=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+            ) if clients else (payload or {})
+            serialized_payload = _serialize_arrow_compatible(prepared_payload)
+        finally:
+            for client in clients:
+                with contextlib.suppress(Exception):
+                    client.close()
         try:
             resp = _call_route_http(
                 route,

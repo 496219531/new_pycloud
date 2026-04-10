@@ -42,20 +42,14 @@ def _exit_infocenter_unavailable(gateway_target: str, exc: BaseException) -> "No
         f"目标地址: http://{gateway_target}\n"
         f"当前解释器: {sys.executable}\n"
         f"原始错误: {exc}\n"
-        "请先启动本示例专用端口的本地服务:\n"
-        "  ./scripts/start_services.sh "
-        "--controlplane-port 51051 "
-        "--node1-port 51061 "
-        "--node1-http 18181 "
-        "--node2-port 51062 "
-        "--node2-http 18182 "
-        "start\n"
+        "请先启动本地服务:\n"
+        "  ./scripts/start_services.sh start\n"
         "再重新运行该示例。"
     ) from exc
 
 
 def main():
-    gateway_target = "127.0.0.1:51051"
+    gateway_target = "127.0.0.1:50051"
     service_name = "compat-demo"
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
@@ -90,7 +84,7 @@ def main():
             export_mode="decorator",
             dependency_allowlist=dependency_allowlist,
             worker_count=2,
-            tags=["demo"],
+            tags=["compute"],
             min_success_nodes=1,
         )
     except (URLError, ConnectionError, OSError) as exc:

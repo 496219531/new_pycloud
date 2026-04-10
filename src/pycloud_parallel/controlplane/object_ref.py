@@ -69,12 +69,14 @@ class ObjectRef:
     format: str = "bin"
     size_bytes: int = 0
     materialize_as: str = "path"
+    consume_on_read: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "object_id", normalize_object_id(self.object_id))
         object.__setattr__(self, "format", normalize_object_format(self.format, default="bin"))
         object.__setattr__(self, "size_bytes", max(0, int(self.size_bytes or 0)))
         object.__setattr__(self, "materialize_as", normalize_materialize_as(self.materialize_as, default="path"))
+        object.__setattr__(self, "consume_on_read", bool(self.consume_on_read))
 
     def to_payload(self) -> Dict[str, Dict[str, object]]:
         return {
@@ -83,6 +85,7 @@ class ObjectRef:
                 "format": self.format,
                 "size_bytes": self.size_bytes,
                 "materialize_as": self.materialize_as,
+                "consume_on_read": self.consume_on_read,
             }
         }
 
@@ -104,6 +107,7 @@ def object_ref_from_payload(data: Dict[str, object]) -> ObjectRef:
         format=str(payload.get("format", "") or ""),
         size_bytes=int(payload.get("size_bytes", 0) or 0),
         materialize_as=str(payload.get("materialize_as", "") or "path"),
+        consume_on_read=bool(payload.get("consume_on_read", False)),
     )
 
 

@@ -150,6 +150,49 @@ def test_native_task_pool_session_status_map() -> None:
         session.close()
 
 
+def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    prepared_values = {}
+
+    def _fake_prepare(clients, values, **_kwargs):
+        prepared_values["clients"] = clients
+        prepared_values["values"] = values
+        return {"cfg": {"k": "v"}}
+
+    pool_a = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-a",
+        pool_token="token-a",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        _client=SimpleNamespace(
+            update_runtime_globals_prepared=lambda **kwargs: SimpleNamespace(globals_digest="sha256:same"),
+        ),
+    )
+    pool_b = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-b",
+        pool_token="token-b",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        _client=SimpleNamespace(
+            update_runtime_globals_prepared=lambda **kwargs: SimpleNamespace(globals_digest="sha256:same"),
+        ),
+    )
+    session = TaskPoolSession(
+        pools={"node-a": pool_a, "node-b": pool_b},
+        nodes={},
+        task_method="run",
+        job_id="job-update-globals",
+    )
+    with patch("pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload", _fake_prepare):
+        digest = session.update_globals({"cfg": {"k": "v"}})
+    assert digest == "sha256:same"
+    assert session.globals_digests == {"node-a": "sha256:same", "node-b": "sha256:same"}
+    assert prepared_values["values"] == {"cfg": {"k": "v"}}
+
+
 def test_native_task_pool_session_submit_values_delegates() -> None:
     from pycloud_parallel.controlplane.client import TaskPoolSession
 

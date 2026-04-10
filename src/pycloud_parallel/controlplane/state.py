@@ -2,7 +2,9 @@ from __future__ import annotations
 
 """In-memory state backends for InfoCenter and NodeControl."""
 
+import contextlib
 import hashlib
+import io
 import importlib
 import importlib.util
 import inspect
@@ -51,6 +53,10 @@ from pycloud_parallel.controlplane.runtime_spec import (
     normalize_python_runtime_spec,
 )
 from pycloud_parallel.controlplane.config import FILE_HASH_CHUNK_SIZE_BYTES
+from pycloud_parallel.controlplane.config import (
+    OBJECT_SEGMENT_MAX_BYTES,
+    OBJECT_SEGMENT_TARGET_BYTES,
+)
 from pycloud_parallel.controlplane.serialization import (
     convert_arrow_to_dict,
     convert_dict_to_arrow,
@@ -81,6 +87,10 @@ class StoredResultArtifact:
     format: str
     size_bytes: int
     materialize_as: str
+    storage_backend: str = "file"
+    segment_relpath: str = ""
+    segment_offset: int = 0
+    segment_length: int = 0
 
 
 @dataclass
@@ -97,6 +107,9 @@ _MANAGED_GLOBALS_CACHE_LOCK = threading.Lock()
 _MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
 _MANAGED_GLOBALS_APPLY_LOCKS_LOCK = threading.Lock()
 _MANAGED_GLOBALS_APPLY_LOCKS: Dict[str, threading.Lock] = {}
+_SEGMENT_WRITER_LOCKS_LOCK = threading.Lock()
+_SEGMENT_WRITER_LOCKS: Dict[Tuple[str, int], threading.Lock] = {}
+_SEGMENT_WRITER_STATE: Dict[Tuple[str, int], str] = {}
 
 
 def _stable_json_bytes(data: Any) -> bytes:
@@ -153,8 +166,14 @@ def _code_digest_from_code_version(code_version: str) -> str:
     return digest
 
 
+def _code_storage_key(code_version: str) -> str:
+    normalized = _code_digest_from_code_version(code_version)
+    # Keep filesystem paths short and stable across variant-suffixed code versions.
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+
 def _code_scope_dir(base_dir: Path, *, code_version: str) -> Path:
-    return Path(base_dir) / "codes" / _code_digest_from_code_version(code_version)
+    return Path(base_dir) / "codes" / _code_storage_key(code_version)
 
 
 def _code_dependency_dir(base_dir: Path, *, code_version: str) -> Path:
@@ -194,6 +213,36 @@ def _objects_meta_dir(object_dir: Path) -> Path:
 def _object_meta_path(object_dir: Path, *, object_id: str) -> Path:
     digest = normalize_object_id(object_id).replace("sha256:", "", 1)
     return _objects_meta_dir(object_dir) / f"{digest}.json"
+
+
+def _segments_dir(object_dir: Path) -> Path:
+    return Path(object_dir) / "segments"
+
+
+def _materialized_objects_dir(object_dir: Path) -> Path:
+    return Path(object_dir) / "materialized"
+
+
+def _segment_writer_key(object_dir: Path) -> Tuple[str, int]:
+    return (str(Path(object_dir).resolve()), os.getpid())
+
+
+def _segment_writer_lock(object_dir: Path) -> threading.Lock:
+    key = _segment_writer_key(object_dir)
+    with _SEGMENT_WRITER_LOCKS_LOCK:
+        lock = _SEGMENT_WRITER_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _SEGMENT_WRITER_LOCKS[key] = lock
+        return lock
+
+
+def _segment_relpath(object_dir: Path, segment_path: Path) -> str:
+    return str(segment_path.resolve().relative_to(Path(object_dir).resolve()))
+
+
+def _segment_path_from_relpath(object_dir: Path, relpath: str) -> Path:
+    return Path(object_dir).resolve() / str(relpath or "").strip()
 
 
 def _managed_globals_manifest_path(scope_dir: Path, globals_digest: str) -> Path:
@@ -314,7 +363,6 @@ def _write_code_meta(base_dir: Path, artifact: "CodeArtifact", *, last_at: Optio
         "export_methods": list(artifact.export_methods),
         "export_decorator": artifact.export_decorator,
         "dependency_allowlist": list(artifact.dependency_allowlist),
-        "managed_global_names": list(artifact.managed_global_names),
         "artifact_path": artifact.path,
         "dependency_path": artifact.dependency_path,
         "size_bytes": int(artifact.size_bytes),
@@ -337,6 +385,17 @@ def touch_code_last_at(base_dir: Path, *, code_version: str) -> None:
     os.replace(str(tmp_path), str(meta_path))
 
 
+def _atomic_write_json(path: Path, payload: Dict[str, Any], *, prefix: str = ".meta-") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _stable_json_bytes(payload)
+    fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=str(path.parent))
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp_name, str(path))
+
+
 def _write_object_meta(
     object_dir: Path,
     *,
@@ -345,6 +404,10 @@ def _write_object_meta(
     size_bytes: int,
     created_at: datetime,
     last_at: Optional[datetime] = None,
+    storage_backend: str = "file",
+    segment_relpath: str = "",
+    segment_offset: int = 0,
+    segment_length: int = 0,
 ) -> None:
     meta_dir = _objects_meta_dir(object_dir)
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -356,10 +419,13 @@ def _write_object_meta(
         "size_bytes": max(0, int(size_bytes or 0)),
         "created_at": created_at.astimezone(timezone.utc).isoformat(),
         "last_at": timestamp,
+        "storage_backend": str(storage_backend or "file").strip() or "file",
     }
-    tmp_path = meta_path.with_suffix(".tmp")
-    tmp_path.write_bytes(_stable_json_bytes(payload))
-    os.replace(str(tmp_path), str(meta_path))
+    if payload["storage_backend"] == "segment":
+        payload["segment_relpath"] = str(segment_relpath or "").strip()
+        payload["segment_offset"] = max(0, int(segment_offset or 0))
+        payload["segment_length"] = max(0, int(segment_length or 0))
+    _atomic_write_json(meta_path, payload)
 
 
 def _load_object_meta(object_dir: Path, *, object_id: str) -> Dict[str, Any]:
@@ -374,21 +440,14 @@ def _touch_object_last_at(object_dir: Path, *, object_id: str, fallback_path: Op
     meta = _load_object_meta(object_root, object_id=object_id)
     now = utc_now()
     if meta:
+        meta["object_id"] = normalize_object_id(object_id)
+        meta["format"] = normalize_object_format(str(meta.get("format", "") or "bin"), default="bin")
+        meta["size_bytes"] = max(0, int(meta.get("size_bytes", 0) or 0))
         created_at_raw = str(meta.get("created_at", "") or "").strip()
-        try:
-            created_at = datetime.fromisoformat(created_at_raw)
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-        except Exception:
-            created_at = now
-        _write_object_meta(
-            object_root,
-            object_id=object_id,
-            fmt=str(meta.get("format", "") or "bin"),
-            size_bytes=int(meta.get("size_bytes", 0) or 0),
-            created_at=created_at,
-            last_at=now,
-        )
+        if not created_at_raw:
+            meta["created_at"] = now.astimezone(timezone.utc).isoformat()
+        meta["last_at"] = now.astimezone(timezone.utc).isoformat()
+        _atomic_write_json(_object_meta_path(object_root, object_id=object_id), meta)
         return
     candidate = Path(fallback_path) if fallback_path is not None else None
     if candidate is None or not candidate.exists():
@@ -400,6 +459,7 @@ def _touch_object_last_at(object_dir: Path, *, object_id: str, fallback_path: Op
         size_bytes=candidate.stat().st_size,
         created_at=datetime.fromtimestamp(candidate.stat().st_ctime, tz=timezone.utc),
         last_at=now,
+        storage_backend="file",
     )
 
 
@@ -429,6 +489,57 @@ def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) 
     )
 
 
+def _materialize_object_bytes(*, blob: bytes, fmt: str, materialize_as: str) -> Any:
+    materialized = normalize_materialize_as(materialize_as, default="path")
+    normalized_format = normalize_object_format(fmt, default="bin")
+    if materialized == "bytes":
+        return bytes(blob)
+    if materialized == "json":
+        return convert_dict_to_arrow(json.loads(blob.decode("utf-8")))
+    if materialized == "ndarray":
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise ObjectResolutionError("numpy not available, cannot materialize ndarray") from exc
+        return np.load(io.BytesIO(blob), allow_pickle=False)
+    if materialized == "dataframe":
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise ObjectResolutionError("pandas not available, cannot materialize dataframe") from exc
+        if normalized_format == "dfbundle":
+            import zipfile
+            from pycloud_parallel.controlplane.serialization import deserialize_dataframe_bundle
+
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                with zf.open("data.parquet") as fh:
+                    frame = pd.read_parquet(fh)
+                with zf.open("meta.json") as fh:
+                    meta = json.load(fh)
+            return deserialize_dataframe_bundle(meta, frame)
+        return pd.read_parquet(io.BytesIO(blob))
+    if materialized == "series":
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise ObjectResolutionError("pandas not available, cannot materialize series") from exc
+        if normalized_format == "seriesbundle":
+            import zipfile
+            from pycloud_parallel.controlplane.serialization import deserialize_series_bundle
+
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                with zf.open("data.parquet") as fh:
+                    frame = pd.read_parquet(fh)
+                with zf.open("meta.json") as fh:
+                    meta = json.load(fh)
+            return deserialize_series_bundle(meta, frame)
+        frame = pd.read_parquet(io.BytesIO(blob))
+        if frame.empty:
+            return pd.Series(dtype=float)
+        return frame.iloc[:, 0]
+    raise ObjectResolutionError(f"blob-backed ObjectRef does not support materialize_as={materialized!r}")
+
+
 def _sha256_file(path: Path, *, chunk_size: int = FILE_HASH_CHUNK_SIZE_BYTES) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
@@ -440,6 +551,266 @@ def _sha256_file(path: Path, *, chunk_size: int = FILE_HASH_CHUNK_SIZE_BYTES) ->
     return h.hexdigest()
 
 
+def _is_transient_filesystem_permission_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return getattr(exc, "errno", None) in {1, 13, 16, 32, 33}
+
+
+def _replace_file_with_retry(source_path: Path, final_path: Path, *, max_attempts: int = 8) -> None:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            if final_path.exists():
+                source_path.unlink(missing_ok=True)
+                return
+            os.replace(str(source_path), str(final_path))
+            return
+        except FileNotFoundError:
+            if final_path.exists() or not source_path.exists():
+                return
+            raise
+        except Exception as exc:
+            if final_path.exists():
+                source_path.unlink(missing_ok=True)
+                return
+            if not _is_transient_filesystem_permission_error(exc):
+                raise
+            last_exc = exc
+            time.sleep(min(0.5, 0.02 * float(attempt + 1)))
+    if final_path.exists():
+        source_path.unlink(missing_ok=True)
+        return
+    if last_exc is not None:
+        raise last_exc
+
+
+def _write_object_meta_with_retry(
+    object_dir: Path,
+    *,
+    object_id: str,
+    fmt: str,
+    size_bytes: int,
+    created_at: datetime,
+    last_at: Optional[datetime] = None,
+    storage_backend: str = "file",
+    segment_relpath: str = "",
+    segment_offset: int = 0,
+    segment_length: int = 0,
+    max_attempts: int = 8,
+) -> None:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            _write_object_meta(
+                object_dir,
+                object_id=object_id,
+                fmt=fmt,
+                size_bytes=size_bytes,
+                created_at=created_at,
+                last_at=last_at,
+                storage_backend=storage_backend,
+                segment_relpath=segment_relpath,
+                segment_offset=segment_offset,
+                segment_length=segment_length,
+            )
+            return
+        except Exception as exc:
+            if not _is_transient_filesystem_permission_error(exc):
+                raise
+            last_exc = exc
+            time.sleep(min(0.5, 0.02 * float(attempt + 1)))
+    if last_exc is not None:
+        raise last_exc
+
+
+def _parse_meta_datetime(value: Any, *, default: Optional[datetime] = None) -> datetime:
+    fallback = default or utc_now()
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return fallback
+
+
+def _artifact_exists(artifact: "ObjectArtifact") -> bool:
+    if artifact.storage_backend == "segment":
+        return bool(artifact.segment_path) and Path(artifact.segment_path).exists()
+    return bool(artifact.path) and Path(artifact.path).exists()
+
+
+def _object_artifact_from_meta(object_dir: Path, *, object_id: str, meta: Dict[str, Any]) -> "ObjectArtifact":
+    normalized_id = normalize_object_id(object_id)
+    normalized_format = normalize_object_format(str(meta.get("format", "") or "bin"), default="bin")
+    storage_backend = str(meta.get("storage_backend", "file") or "file").strip() or "file"
+    created_at = _parse_meta_datetime(meta.get("created_at"))
+    size_bytes = max(0, int(meta.get("size_bytes", 0) or 0))
+    if storage_backend == "segment":
+        relpath = str(meta.get("segment_relpath", "") or "").strip()
+        return ObjectArtifact(
+            object_id=normalized_id,
+            path="",
+            format=normalized_format,
+            size_bytes=size_bytes,
+            created_at=created_at,
+            storage_backend="segment",
+            segment_path=str(_segment_path_from_relpath(object_dir, relpath)),
+            segment_offset=max(0, int(meta.get("segment_offset", 0) or 0)),
+            segment_length=max(0, int(meta.get("segment_length", size_bytes) or size_bytes)),
+        )
+    return ObjectArtifact(
+        object_id=normalized_id,
+        path=str(object_storage_path(object_dir, object_id=normalized_id, fmt=normalized_format)),
+        format=normalized_format,
+        size_bytes=size_bytes,
+        created_at=created_at,
+        storage_backend="file",
+    )
+
+
+def _read_object_artifact_bytes(artifact: "ObjectArtifact") -> bytes:
+    if artifact.storage_backend == "segment":
+        with open(artifact.segment_path, "rb") as fp:
+            fp.seek(max(0, int(artifact.segment_offset or 0)))
+            return fp.read(max(0, int(artifact.segment_length or artifact.size_bytes or 0)))
+    return Path(artifact.path).read_bytes()
+
+
+def _materialized_object_path(root: Path, *, object_id: str, fmt: str) -> Path:
+    return object_storage_path(_materialized_objects_dir(root), object_id=object_id, fmt=fmt)
+
+
+def _materialize_object_artifact(
+    artifact: "ObjectArtifact",
+    *,
+    materialize_as: str,
+    root: Path,
+) -> Any:
+    if artifact.storage_backend == "file":
+        candidate = Path(artifact.path)
+        if materialize_as == "path":
+            return candidate
+        if materialize_as == "bytes":
+            return candidate.read_bytes()
+        if materialize_as == "json":
+            return convert_dict_to_arrow(json.loads(candidate.read_text(encoding="utf-8")))
+        if materialize_as == "ndarray":
+            try:
+                import numpy as np
+            except ImportError as exc:
+                raise ObjectResolutionError("numpy not available on node, cannot materialize ndarray") from exc
+            return np.load(candidate, allow_pickle=False)
+        if materialize_as == "dataframe":
+            try:
+                import pandas as pd
+            except ImportError as exc:
+                raise ObjectResolutionError("pandas not available on node, cannot materialize dataframe") from exc
+            if str(artifact.format or "").strip().lower() == "dfbundle":
+                import zipfile
+                from pycloud_parallel.controlplane.serialization import deserialize_dataframe_bundle
+
+                with zipfile.ZipFile(candidate) as zf:
+                    if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
+                        with zf.open("data.parquet") as fh:
+                            frame = pd.read_parquet(fh)
+                        with zf.open("meta.json") as fh:
+                            meta = json.load(fh)
+                        return deserialize_dataframe_bundle(meta, frame)
+            return pd.read_parquet(candidate)
+        if materialize_as == "series":
+            try:
+                import pandas as pd
+            except ImportError as exc:
+                raise ObjectResolutionError("pandas not available on node, cannot materialize series") from exc
+            if str(artifact.format or "").strip().lower() == "seriesbundle":
+                import zipfile
+                from pycloud_parallel.controlplane.serialization import deserialize_series_bundle
+
+                with zipfile.ZipFile(candidate) as zf:
+                    if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
+                        with zf.open("data.parquet") as fh:
+                            frame = pd.read_parquet(fh)
+                        with zf.open("meta.json") as fh:
+                            meta = json.load(fh)
+                        if len(frame.columns) != 1:
+                            raise ObjectResolutionError("series bundle parquet must contain exactly one column")
+                        return deserialize_series_bundle(meta, frame.iloc[:, 0])
+            frame = pd.read_parquet(candidate)
+            if len(frame.columns) != 1:
+                raise ObjectResolutionError("series parquet must contain exactly one column")
+            return frame.iloc[:, 0]
+        raise ObjectResolutionError(f"unsupported materialize_as: {materialize_as!r}")
+
+    blob = _read_object_artifact_bytes(artifact)
+    if materialize_as == "path":
+        candidate = _materialized_object_path(root, object_id=artifact.object_id, fmt=artifact.format)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        if not candidate.exists():
+            candidate.write_bytes(blob)
+        return candidate
+    return _materialize_object_bytes(blob=blob, fmt=artifact.format, materialize_as=materialize_as)
+
+
+def _append_bytes_to_segment(
+    object_dir: Path,
+    *,
+    object_id: str,
+    fmt: str,
+    blob: bytes,
+    materialize_as: str,
+    created_at: Optional[datetime] = None,
+) -> StoredResultArtifact:
+    root = Path(object_dir).resolve()
+    segments_root = _segments_dir(root)
+    segments_root.mkdir(parents=True, exist_ok=True)
+    lock = _segment_writer_lock(root)
+    with lock:
+        key = _segment_writer_key(root)
+        current_segment = Path(_SEGMENT_WRITER_STATE.get(key, "")).resolve() if _SEGMENT_WRITER_STATE.get(key) else None
+        if (
+            current_segment is None
+            or not current_segment.exists()
+            or (current_segment.stat().st_size + len(blob)) > max(1, int(OBJECT_SEGMENT_TARGET_BYTES))
+        ):
+            current_segment = segments_root / f"segment-{os.getpid()}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.bin"
+            current_segment.touch()
+            _SEGMENT_WRITER_STATE[key] = str(current_segment)
+        with current_segment.open("ab") as fp:
+            offset = fp.tell()
+            fp.write(blob)
+        relpath = _segment_relpath(root, current_segment)
+    current_time = created_at or utc_now()
+    _write_object_meta_with_retry(
+        root,
+        object_id=object_id,
+        fmt=fmt,
+        size_bytes=len(blob),
+        created_at=current_time,
+        last_at=current_time,
+        storage_backend="segment",
+        segment_relpath=relpath,
+        segment_offset=offset,
+        segment_length=len(blob),
+    )
+    return StoredResultArtifact(
+        object_id=object_id,
+        format=normalize_object_format(fmt, default="bin"),
+        size_bytes=len(blob),
+        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        storage_backend="segment",
+        segment_relpath=relpath,
+        segment_offset=offset,
+        segment_length=len(blob),
+    )
+
+
 def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_bytes: int, materialize_as: str) -> StoredResultArtifact:
     root = Path(str(object_dir or "")).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -448,12 +819,9 @@ def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_by
     normalized_format = normalize_object_format(fmt, source_name=source_path.name, default="bin")
     final_path = object_storage_path(root, object_id=object_id, fmt=normalized_format)
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    if not final_path.exists():
-        os.replace(str(source_path), str(final_path))
-    else:
-        source_path.unlink(missing_ok=True)
+    _replace_file_with_retry(source_path, final_path)
     created_at = utc_now()
-    _write_object_meta(
+    _write_object_meta_with_retry(
         root,
         object_id=object_id,
         fmt=normalized_format,
@@ -466,12 +834,32 @@ def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_by
         format=normalized_format,
         size_bytes=max(0, int(size_bytes or final_path.stat().st_size)),
         materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        storage_backend="file",
+    )
+
+
+def _commit_result_segment(blob: bytes, *, object_dir: str, fmt: str, materialize_as: str) -> StoredResultArtifact:
+    digest = hashlib.sha256(blob).hexdigest()
+    object_id = object_id_from_sha256_hex(digest)
+    return _append_bytes_to_segment(
+        Path(object_dir).resolve(),
+        object_id=object_id,
+        fmt=fmt,
+        blob=blob,
+        materialize_as=materialize_as,
     )
 
 
 def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
     if not path.exists() or not path.is_file():
         raise LargeResultError(f"returned path is not a readable file: {path}")
+    if path.stat().st_size <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
+        return _commit_result_segment(
+            path.read_bytes(),
+            object_dir=object_dir,
+            fmt=normalize_object_format("", source_name=path.name, default="bin"),
+            materialize_as="path",
+        )
     suffix = object_format_suffix(normalize_object_format("", source_name=path.name, default="bin")) or ".bin"
     fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=suffix, dir=str(Path(object_dir).resolve()))
     os.close(fd)
@@ -487,9 +875,6 @@ def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
 
 
 def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtifact:
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
     try:
         import io
         import zipfile
@@ -497,9 +882,17 @@ def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtif
         parquet_buf = io.BytesIO()
         dataframe_bundle_parquet_frame(frame).to_parquet(parquet_buf, index=False)
         meta = serialize_dataframe_bundle(frame)
-        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("data.parquet", parquet_buf.getvalue())
             zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        blob = bundle.getvalue()
+        if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
+            return _commit_result_segment(blob, object_dir=object_dir, fmt="dfbundle", materialize_as="dataframe")
+        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        tmp_path.write_bytes(blob)
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -508,14 +901,12 @@ def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtif
             materialize_as="dataframe",
         )
     except Exception:
-        tmp_path.unlink(missing_ok=True)
+        if "tmp_path" in locals():
+            tmp_path.unlink(missing_ok=True)
         raise
 
 
 def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifact:
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
     try:
         import io
         import zipfile
@@ -523,9 +914,17 @@ def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifac
         parquet_buf = io.BytesIO()
         series.to_frame("__pycloud_series_value__").to_parquet(parquet_buf, index=False)
         meta = serialize_series_bundle(series)
-        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("data.parquet", parquet_buf.getvalue())
             zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        blob = bundle.getvalue()
+        if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
+            return _commit_result_segment(blob, object_dir=object_dir, fmt="seriesbundle", materialize_as="series")
+        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        tmp_path.write_bytes(blob)
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -534,19 +933,24 @@ def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifac
             materialize_as="series",
         )
     except Exception:
-        tmp_path.unlink(missing_ok=True)
+        if "tmp_path" in locals():
+            tmp_path.unlink(missing_ok=True)
         raise
 
 
 def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifact:
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".npy", dir=str(Path(object_dir).resolve()))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
     try:
         import numpy as np
 
-        with tmp_path.open("wb") as fh:
-            np.save(fh, array, allow_pickle=False)
+        buf = io.BytesIO()
+        np.save(buf, array, allow_pickle=False)
+        blob = buf.getvalue()
+        if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
+            return _commit_result_segment(blob, object_dir=object_dir, fmt="npy", materialize_as="ndarray")
+        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".npy", dir=str(Path(object_dir).resolve()))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        tmp_path.write_bytes(blob)
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -555,11 +959,22 @@ def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifac
             materialize_as="ndarray",
         )
     except Exception:
-        tmp_path.unlink(missing_ok=True)
+        if "tmp_path" in locals():
+            tmp_path.unlink(missing_ok=True)
         raise
 
 
 def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
+    def _try_inline_result(value: Any) -> Tuple[bool, Any]:
+        serialized = serialize_arrow_compatible(value)
+        wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
+        try:
+            serialize_inline_result(wrapped, context="task result")
+        except ValueError:
+            return False, None
+        log_payload_flow("inline_result_ready", context="task result", summary=summarize_payload_flow_value(value))
+        return True, wrapped
+
     if isinstance(ret, Path):
         log_payload_flow("result_ref_store", path_type="path", summary=summarize_payload_flow_value(ret))
         return _store_result_path(ret, object_dir=object_dir)
@@ -568,9 +983,15 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
         import pandas as pd
 
         if isinstance(ret, pd.DataFrame):
+            inlined, wrapped = _try_inline_result(ret)
+            if inlined:
+                return wrapped
             log_payload_flow("result_ref_store", path_type="dataframe", summary=summarize_payload_flow_value(ret))
             return _store_result_dataframe(ret, object_dir=object_dir)
         if isinstance(ret, pd.Series):
+            inlined, wrapped = _try_inline_result(ret)
+            if inlined:
+                return wrapped
             log_payload_flow("result_ref_store", path_type="series", summary=summarize_payload_flow_value(ret))
             return _store_result_series(ret, object_dir=object_dir)
     except ImportError:
@@ -580,16 +1001,18 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
         import numpy as np
 
         if isinstance(ret, np.ndarray):
+            inlined, wrapped = _try_inline_result(ret)
+            if inlined:
+                return wrapped
             log_payload_flow("result_ref_store", path_type="ndarray", summary=summarize_payload_flow_value(ret))
             return _store_result_ndarray(ret, object_dir=object_dir)
     except ImportError:
         pass
 
-    serialized = serialize_arrow_compatible(ret)
-    wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
-    serialize_inline_result(wrapped, context="task result")
-    log_payload_flow("inline_result_ready", context="task result", summary=summarize_payload_flow_value(ret))
-    return wrapped
+    inlined, wrapped = _try_inline_result(ret)
+    if inlined:
+        return wrapped
+    raise LargeResultError("task result exceeds inline limit and must be returned as Path/DataFrame/Series/ndarray for ResultRef storage")
 
 
 def _normalize_user_return(ret: Any, *, object_dir: str) -> Tuple[str, Optional[Any], str, str]:
@@ -625,6 +1048,7 @@ def _build_execute_spec(
     payload: dict,
     managed_globals_scope_dir: str = "",
     managed_globals_digest: str = "",
+    warmup_only: bool = False,
 ) -> Dict[str, Any]:
     return {
         "artifact_path": artifact.path,
@@ -640,6 +1064,7 @@ def _build_execute_spec(
         "payload": payload or {},
         "managed_globals_scope_dir": str(managed_globals_scope_dir or ""),
         "managed_globals_digest": str(managed_globals_digest or ""),
+        "warmup_only": bool(warmup_only),
     }
 
 
@@ -1119,7 +1544,7 @@ def _discover_callable_methods(
     export_methods: Sequence[str],
     export_decorator: str,
     entry_callable: str,
-) -> Dict[str, Tuple[str, str]]:
+) -> Tuple[Any, Dict[str, Tuple[str, str]]]:
     mode, methods, decorator = _normalize_export_spec(
         mode=export_mode,
         methods=export_methods,
@@ -1140,14 +1565,9 @@ def _discover_callable_methods(
             decorator=decorator,
             entry_callable=entry_callable,
         )
-        return dict(method_info)
+        return module, dict(method_info)
     finally:
-        _purge_loaded_artifact_modules(
-            artifact_path,
-            entry_module=entry_module,
-            package_format=package_format,
-            dependency_path=dependency_path,
-        )
+        pass
 
 
 def _discover_callable_methods_or_raise_user_error(
@@ -1160,7 +1580,7 @@ def _discover_callable_methods_or_raise_user_error(
     export_methods: Sequence[str],
     export_decorator: str,
     entry_callable: str,
-) -> Dict[str, Tuple[str, str]]:
+) -> Tuple[Any, Dict[str, Tuple[str, str]]]:
     try:
         return _discover_callable_methods(
             artifact_path,
@@ -1314,85 +1734,52 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
                 materialize_as=materialized,
                 summary=summarize_payload_flow_value(value),
             )
-
-            def _materialize_path(candidate: Path) -> Any:
-                if materialized == "path":
-                    return candidate
-                if materialized == "bytes":
-                    return candidate.read_bytes()
-                if materialized == "json":
-                    return json.loads(candidate.read_text(encoding="utf-8"))
-                if materialized == "ndarray":
-                    try:
-                        import numpy as np
-                    except ImportError as exc:
-                        raise ObjectResolutionError("numpy not available on node, cannot materialize ndarray") from exc
-                    return np.load(candidate, allow_pickle=False)
-                if materialized == "dataframe":
-                    try:
-                        import pandas as pd
-                    except ImportError as exc:
-                        raise ObjectResolutionError("pandas not available on node, cannot materialize dataframe") from exc
-                    if str(value.format or "").strip().lower() == "dfbundle":
-                        import zipfile
-                        from pycloud_parallel.controlplane.serialization import deserialize_dataframe_bundle
-
-                        with zipfile.ZipFile(candidate) as zf:
-                            if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
-                                with zf.open("data.parquet") as fh:
-                                    frame = pd.read_parquet(fh)
-                                with zf.open("meta.json") as fh:
-                                    meta = json.load(fh)
-                                return deserialize_dataframe_bundle(meta, frame)
-                    return pd.read_parquet(candidate)
-                if materialized == "series":
-                    try:
-                        import pandas as pd
-                    except ImportError as exc:
-                        raise ObjectResolutionError("pandas not available on node, cannot materialize series") from exc
-                    if str(value.format or "").strip().lower() == "seriesbundle":
-                        import zipfile
-                        from pycloud_parallel.controlplane.serialization import deserialize_series_bundle
-
-                        with zipfile.ZipFile(candidate) as zf:
-                            if {"data.parquet", "meta.json"}.issubset(set(zf.namelist())):
-                                with zf.open("data.parquet") as fh:
-                                    frame = pd.read_parquet(fh)
-                                with zf.open("meta.json") as fh:
-                                    meta = json.load(fh)
-                                if len(frame.columns) != 1:
-                                    raise ObjectResolutionError("series bundle parquet must contain exactly one column")
-                                return deserialize_series_bundle(meta, frame.iloc[:, 0])
-                    frame = pd.read_parquet(candidate)
-                    if len(frame.columns) != 1:
-                        raise ObjectResolutionError("series parquet must contain exactly one column")
-                    return frame.iloc[:, 0]
-                raise ObjectResolutionError(f"unsupported materialize_as: {value.materialize_as}")
-
-            candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
-            if candidate.exists():
-                _touch_object_last_at(root, object_id=value.object_id, fallback_path=candidate)
-                resolved = _materialize_path(candidate)
-                log_payload_flow(
-                    "object_ref_resolved",
+            meta = _load_object_meta(root, object_id=value.object_id)
+            artifact: Optional[ObjectArtifact] = None
+            if meta:
+                artifact = _object_artifact_from_meta(root, object_id=value.object_id, meta=meta)
+                if not _artifact_exists(artifact):
+                    artifact = None
+            if artifact is None:
+                candidate = object_storage_path(root, object_id=value.object_id, fmt=value.format)
+                if candidate.exists():
+                    artifact = ObjectArtifact(
+                        object_id=normalize_object_id(value.object_id),
+                        path=str(candidate),
+                        format=normalize_object_format(value.format, source_name=candidate.name, default="bin"),
+                        size_bytes=candidate.stat().st_size,
+                        created_at=utc_now(),
+                        storage_backend="file",
+                    )
+                else:
+                    digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
+                    suffix = object_format_suffix(value.format)
+                    legacy_candidate = Path(root) / f"{digest}{suffix}"
+                    fallback = []
+                    if legacy_candidate.exists():
+                        fallback = [legacy_candidate]
+                    if not fallback:
+                        subdir = Path(root) / digest[:2]
+                        fallback = sorted(subdir.glob(f"{digest[2:]}*")) if subdir.exists() else []
+                    if not fallback:
+                        fallback = sorted(root.glob(f"{digest}*"))
+                    if fallback:
+                        artifact = ObjectArtifact(
+                            object_id=normalize_object_id(value.object_id),
+                            path=str(fallback[0]),
+                            format=normalize_object_format("", source_name=fallback[0].name, default="bin"),
+                            size_bytes=fallback[0].stat().st_size,
+                            created_at=utc_now(),
+                            storage_backend="file",
+                        )
+            if artifact is not None:
+                fallback_path = Path(artifact.path) if artifact.path else Path(artifact.segment_path)
+                _touch_object_last_at(root, object_id=value.object_id, fallback_path=fallback_path)
+                resolved = _materialize_object_artifact(
+                    artifact,
                     materialize_as=materialized,
-                    summary=summarize_payload_flow_value(resolved),
+                    root=root,
                 )
-                return resolved
-            digest = normalize_object_id(value.object_id).replace("sha256:", "", 1)
-            suffix = object_format_suffix(value.format)
-            legacy_candidate = Path(root) / f"{digest}{suffix}"
-            fallback = []
-            if legacy_candidate.exists():
-                fallback = [legacy_candidate]
-            if not fallback:
-                subdir = Path(root) / digest[:2]
-                fallback = sorted(subdir.glob(f"{digest[2:]}*")) if subdir.exists() else []
-            if not fallback:
-                fallback = sorted(root.glob(f"{digest}*"))
-            if fallback:
-                _touch_object_last_at(root, object_id=value.object_id, fallback_path=fallback[0])
-                resolved = _materialize_path(fallback[0])
                 log_payload_flow(
                     "object_ref_resolved",
                     materialize_as=materialized,
@@ -1486,6 +1873,7 @@ def _execute_payload_in_subprocess(
     method_name: str,
     entry_callable: str,
     payload: dict,
+    warmup_only: bool = False,
 ) -> Tuple[str, Optional[dict], str, str, Dict[str, float]]:
     """Execute uploaded user code in subprocess.
 
@@ -1547,6 +1935,12 @@ def _execute_payload_in_subprocess(
             )
             resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
             decode_end = time.perf_counter()
+            if bool(warmup_only):
+                invoke_start = decode_end
+                invoke_end = decode_end
+                encode_start = decode_end
+                encode_end = decode_end
+                return ("SUCCEEDED", {"warmed": True, "worker_pid": os.getpid()}, "", "", _timings())
             invoke_start = decode_end
             ret = _invoke_user_callable(fn, resolved_payload)
             invoke_end = time.perf_counter()
@@ -1647,6 +2041,21 @@ class NodeServiceState:
 
 
 @dataclass
+class NodeTaskPoolInfo:
+    pool_id: str
+    owner_client_id: str
+    pool_name: str
+    code_version: str
+    status: str
+    worker_count: int = 0
+    task_count: int = 0
+    inflight: int = 0
+    created_at: datetime = field(default_factory=utc_now)
+    last_heartbeat_at: datetime = field(default_factory=utc_now)
+    lease_expire_at: datetime = field(default_factory=utc_now)
+
+
+@dataclass
 class NodeState:
     """节点状态。
 
@@ -1675,9 +2084,12 @@ class NodeState:
     last_seen_at: datetime = field(default_factory=utc_now)
     metrics: NodeMetricsState = field(default_factory=NodeMetricsState)
     services: Dict[str, NodeServiceState] = field(default_factory=dict)
+    task_pools: Dict[str, NodeTaskPoolInfo] = field(default_factory=dict)
     active_runtimes: List[str] = field(default_factory=list)
     service_worker_capacity: int = 0
     service_worker_used: int = 0
+    task_pool_worker_capacity: int = 0
+    task_pool_worker_used: int = 0
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
@@ -1689,6 +2101,11 @@ class NodeState:
 
     def active_runtime_count(self) -> int:
         return len(self.active_runtimes)
+
+    def task_pool_worker_available(self) -> int:
+        capacity = max(0, int(self.task_pool_worker_capacity or 0))
+        used = max(0, int(self.task_pool_worker_used or 0))
+        return max(0, capacity - used)
 
 
 class InfoCenterState:
@@ -1704,6 +2121,31 @@ class InfoCenterState:
 
     def _node_is_healthy_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
         return bool(state.healthy) and not self._node_is_stale_locked(state, now=now)
+
+    def _prune_replaced_stale_nodes_locked(
+        self,
+        *,
+        node_instance_id: str,
+        node_id: str,
+        control_addr: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        current_time = now or utc_now()
+        normalized_instance_id = str(node_instance_id or "").strip()
+        normalized_node_id = str(node_id or "").strip()
+        normalized_control_addr = str(control_addr or "").strip()
+        if not normalized_instance_id or not normalized_node_id or not normalized_control_addr:
+            return
+        stale_keys = [
+            key
+            for key, state in self._nodes.items()
+            if key != normalized_instance_id
+            and str(state.node_id or "").strip() == normalized_node_id
+            and str(state.control_addr or "").strip() == normalized_control_addr
+            and self._node_is_stale_locked(state, now=current_time)
+        ]
+        for key in stale_keys:
+            self._nodes.pop(key, None)
 
     def _effective_service_state_locked(
         self,
@@ -1744,9 +2186,12 @@ class InfoCenterState:
         version: str = "",
         metadata: Optional[Dict[str, str]] = None,
         services: Optional[Dict[str, NodeServiceState]] = None,
+        task_pools: Optional[Dict[str, NodeTaskPoolInfo]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        task_pool_worker_capacity: int = 0,
+        task_pool_worker_used: int = 0,
         python_version: str = "",
     ) -> NodeState:
         now = utc_now()
@@ -1754,6 +2199,12 @@ class InfoCenterState:
         if not normalized_instance_id:
             raise ValueError("node_instance_id is required")
         with self._lock:
+            self._prune_replaced_stale_nodes_locked(
+                node_instance_id=normalized_instance_id,
+                node_id=node_id,
+                control_addr=control_addr,
+                now=now,
+            )
             state = self._nodes.get(normalized_instance_id)
             if state is None:
                 state = NodeState(
@@ -1777,9 +2228,12 @@ class InfoCenterState:
             state.healthy = True
             state.last_seen_at = now
             state.services = dict(services or {})
+            state.task_pools = dict(task_pools or {})
             state.active_runtimes = [str(x).strip() for x in (active_runtimes or []) if str(x).strip()]
             state.service_worker_capacity = max(0, int(service_worker_capacity or 0))
             state.service_worker_used = max(0, min(int(service_worker_used or 0), state.service_worker_capacity or int(service_worker_used or 0)))
+            state.task_pool_worker_capacity = max(0, int(task_pool_worker_capacity or 0))
+            state.task_pool_worker_used = max(0, min(int(task_pool_worker_used or 0), state.task_pool_worker_capacity or int(task_pool_worker_used or 0)))
             if state.metrics.credit == 0:
                 state.metrics.credit = state.queue_capacity
             return state
@@ -1796,9 +2250,12 @@ class InfoCenterState:
             version=request.version,
             metadata=metadata,
             services=self._parse_services(request.services),
+            task_pools={},
             active_runtimes=(),
             service_worker_capacity=int(metadata.get("service_worker_capacity", "0") or 0),
             service_worker_used=int(metadata.get("service_worker_used", "0") or 0),
+            task_pool_worker_capacity=int(metadata.get("task_pool_worker_capacity", "0") or 0),
+            task_pool_worker_used=int(metadata.get("task_pool_worker_used", "0") or 0),
             python_version=metadata.get("python_version", ""),
         )
 
@@ -1811,9 +2268,12 @@ class InfoCenterState:
         metrics: Optional[NodeMetricsState] = None,
         metadata: Optional[Dict[str, str]] = None,
         services: Optional[Dict[str, NodeServiceState]] = None,
+        task_pools: Optional[Dict[str, NodeTaskPoolInfo]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
+        task_pool_worker_capacity: int = 0,
+        task_pool_worker_used: int = 0,
         python_version: str = "",
     ) -> Optional[NodeState]:
         now = utc_now()
@@ -1833,6 +2293,7 @@ class InfoCenterState:
             if metadata is not None:
                 state.metadata = dict(metadata or {})
             state.services = dict(services or {})
+            state.task_pools = dict(task_pools or {})
             if python_version:
                 state.python_version = str(python_version).strip()
             if active_runtimes is not None:
@@ -1844,6 +2305,15 @@ class InfoCenterState:
                 min(
                     int(service_worker_used or 0),
                     state.service_worker_capacity or int(service_worker_used or 0),
+                ),
+            )
+            if task_pool_worker_capacity > 0:
+                state.task_pool_worker_capacity = max(0, int(task_pool_worker_capacity))
+            state.task_pool_worker_used = max(
+                0,
+                min(
+                    int(task_pool_worker_used or 0),
+                    state.task_pool_worker_capacity or int(task_pool_worker_used or 0),
                 ),
             )
             return state
@@ -1918,9 +2388,12 @@ class InfoCenterState:
                 last_seen_at=state.last_seen_at,
                 metrics=NodeMetricsState(**vars(state.metrics)),
                 services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
                 active_runtimes=list(state.active_runtimes),
                 service_worker_capacity=state.service_worker_capacity,
                 service_worker_used=state.service_worker_used,
+                task_pool_worker_capacity=state.task_pool_worker_capacity,
+                task_pool_worker_used=state.task_pool_worker_used,
                 schedulable=state.schedulable,
                 drain=state.drain,
                 reason=state.reason,
@@ -1996,9 +2469,12 @@ class InfoCenterState:
                         last_seen_at=state.last_seen_at,
                         metrics=NodeMetricsState(**vars(state.metrics)),
                         services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                        task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
                         active_runtimes=list(state.active_runtimes),
                         service_worker_capacity=state.service_worker_capacity,
                         service_worker_used=state.service_worker_used,
+                        task_pool_worker_capacity=state.task_pool_worker_capacity,
+                        task_pool_worker_used=state.task_pool_worker_used,
                         schedulable=state.schedulable,
                         drain=state.drain,
                         reason=state.reason,
@@ -2039,9 +2515,12 @@ class InfoCenterState:
                 last_seen_at=state.last_seen_at,
                 metrics=NodeMetricsState(**vars(state.metrics)),
                 services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+                task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
                 active_runtimes=list(state.active_runtimes),
                 service_worker_capacity=state.service_worker_capacity,
                 service_worker_used=state.service_worker_used,
+                task_pool_worker_capacity=state.task_pool_worker_capacity,
+                task_pool_worker_used=state.task_pool_worker_used,
                 schedulable=state.schedulable,
                 drain=state.drain,
                 reason=state.reason,
@@ -2068,7 +2547,6 @@ class CodeArtifact:
     export_methods: Tuple[str, ...]
     export_decorator: str
     dependency_allowlist: Tuple[str, ...]
-    managed_global_names: Tuple[str, ...]
     dependency_path: str
     size_bytes: int
     created_at: datetime
@@ -2081,6 +2559,10 @@ class ObjectArtifact:
     format: str
     size_bytes: int
     created_at: datetime
+    storage_backend: str = "file"
+    segment_path: str = ""
+    segment_offset: int = 0
+    segment_length: int = 0
 
 
 @dataclass
@@ -2127,6 +2609,7 @@ class TaskState:
     result: Optional[Any] = None
     error_type: str = ""
     error_message: str = ""
+    dispatch_build_execute_spec_ms: float = 0.0
 
     def as_result(self) -> pb2.TaskResult:
         """转换为 protobuf TaskResult。
@@ -2181,6 +2664,7 @@ class TaskPoolState:
     owner_client_id: str
     pool_name: str
     code_version: str
+    task_method: str
     worker_count: int
     heartbeat_timeout_sec: int
     idle_ttl_sec: int
@@ -2190,8 +2674,11 @@ class TaskPoolState:
     last_heartbeat_at: datetime
     lease_expire_at: datetime
     managed_global_names: Tuple[str, ...] = ()
+    managed_globals_scope_dir: str = ""
+    managed_globals_digest: str = ""
     executor_ready: bool = False
     task_count: int = 0
+    timing_metrics: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -2239,6 +2726,7 @@ class NodeControlState:
         service_default_worker_count: int = 10,
         service_default_heartbeat_timeout_sec: int = 30,
         service_worker_capacity: int = 0,
+        task_pool_worker_capacity: int = 0,
         service_http_bind: str = "0.0.0.0:18080",
         service_http_base_url: str = "",
     ) -> None:
@@ -2256,6 +2744,8 @@ class NodeControlState:
         self.service_default_worker_count = max(1, service_default_worker_count)
         self.service_default_heartbeat_timeout_sec = max(5, service_default_heartbeat_timeout_sec)
         self.service_worker_capacity = max(1, int(service_worker_capacity or worker_capacity))
+        default_task_pool_capacity = max(1, int(os.cpu_count() or 1))
+        self.task_pool_worker_capacity = max(1, int(task_pool_worker_capacity or default_task_pool_capacity))
         self.service_http_bind = service_http_bind
         self.service_http_base_url = service_http_base_url.strip()
         self.started_at = utc_now()
@@ -2274,6 +2764,7 @@ class NodeControlState:
         self._pool_result_hook = InMemoryResultHook()
         self._task_pools: Dict[str, TaskPoolState] = {}
         self._service_worker_reserved = 0
+        self._task_pool_worker_reserved = 0
         self._code_write_locks: Dict[str, threading.Lock] = {}
         self._object_write_locks: Dict[str, threading.Lock] = {}
 
@@ -2288,6 +2779,9 @@ class NodeControlState:
         self._object_dir.mkdir(parents=True, exist_ok=True)
         self._runtime_managed_globals: Dict[Tuple[str, str, str], ManagedGlobalsState] = {}
         self._client_code_tokens: Dict[Tuple[str, str], str] = {}
+        self._client_code_managed_globals: Dict[Tuple[str, str, str], Tuple[str, ...]] = {}
+        self._object_segment_max_bytes = max(0, int(OBJECT_SEGMENT_MAX_BYTES))
+        self._object_segment_target_bytes = max(self._object_segment_max_bytes, int(OBJECT_SEGMENT_TARGET_BYTES))
 
         self._stop_event = threading.Event()
         self._monitor = threading.Thread(target=self._monitor_loop, name="nodecontrol-monitor", daemon=True)
@@ -2377,10 +2871,12 @@ class NodeControlState:
                 decode_ms = float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
                 invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
                 encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
+                queue_wait_ms = max(0.0, float(executor_ms) - decode_ms - invoke_ms - encode_ms)
                 metrics["last_child_decode_ms"] = round(decode_ms, 3)
                 metrics["last_invoke_ms"] = round(invoke_ms, 3)
                 metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
                 metrics["last_child_encode_ms"] = round(encode_ms, 3)
+                metrics["last_queue_wait_ms"] = round(queue_wait_ms, 3)
                 metrics["avg_child_decode_ms"] = round(
                     ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
                     3,
@@ -2430,19 +2926,156 @@ class NodeControlState:
             logger = logging.getLogger(__name__)
             logger.debug("failed to record service timing: %r", exc)
 
+    def _record_task_pool_timing_locked(
+        self,
+        pool: TaskPoolState,
+        *,
+        method: str,
+        ok: bool,
+        setup_ms: float,
+        build_execute_spec_ms: float,
+        executor_ms: float,
+        finalize_ms: float,
+        total_ms: float,
+        subprocess_timings: Optional[Dict[str, object]] = None,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> None:
+        try:
+            metrics = dict(pool.timing_metrics or {})
+            call_count = int(metrics.get("call_count", 0) or 0) + 1
+            error_count = int(metrics.get("error_count", 0) or 0) + (0 if ok else 1)
+            metrics["call_count"] = call_count
+            metrics["error_count"] = error_count
+            metrics["last_method"] = str(method or "")
+            metrics["last_ok"] = bool(ok)
+            metrics["last_total_ms"] = round(float(total_ms), 3)
+            metrics["last_setup_ms"] = round(float(setup_ms), 3)
+            metrics["last_build_execute_spec_ms"] = round(float(build_execute_spec_ms), 3)
+            metrics["last_executor_ms"] = round(float(executor_ms), 3)
+            metrics["last_finalize_ms"] = round(float(finalize_ms), 3)
+            metrics["max_total_ms"] = round(max(float(metrics.get("max_total_ms", 0.0) or 0.0), float(total_ms)), 3)
+            metrics["avg_setup_ms"] = round(
+                ((float(metrics.get("avg_setup_ms", 0.0) or 0.0) * (call_count - 1)) + float(setup_ms)) / call_count,
+                3,
+            )
+            metrics["avg_build_execute_spec_ms"] = round(
+                (
+                    (float(metrics.get("avg_build_execute_spec_ms", 0.0) or 0.0) * (call_count - 1))
+                    + float(build_execute_spec_ms)
+                )
+                / call_count,
+                3,
+            )
+            metrics["avg_executor_ms"] = round(
+                ((float(metrics.get("avg_executor_ms", 0.0) or 0.0) * (call_count - 1)) + float(executor_ms)) / call_count,
+                3,
+            )
+            metrics["avg_finalize_ms"] = round(
+                ((float(metrics.get("avg_finalize_ms", 0.0) or 0.0) * (call_count - 1)) + float(finalize_ms)) / call_count,
+                3,
+            )
+            metrics["avg_total_ms"] = round(
+                ((float(metrics.get("avg_total_ms", 0.0) or 0.0) * (call_count - 1)) + float(total_ms)) / call_count,
+                3,
+            )
+            if subprocess_timings:
+                decode_ms = float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
+                invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
+                encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
+                metrics["last_child_decode_ms"] = round(decode_ms, 3)
+                metrics["last_invoke_ms"] = round(invoke_ms, 3)
+                metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
+                metrics["last_child_encode_ms"] = round(encode_ms, 3)
+                metrics["avg_child_decode_ms"] = round(
+                    ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
+                    3,
+                )
+                metrics["avg_invoke_ms"] = round(
+                    ((float(metrics.get("avg_invoke_ms", 0.0) or 0.0) * (call_count - 1)) + invoke_ms) / call_count,
+                    3,
+                )
+                metrics["avg_child_invoke_ms"] = metrics["avg_invoke_ms"]
+                metrics["avg_child_encode_ms"] = round(
+                    ((float(metrics.get("avg_child_encode_ms", 0.0) or 0.0) * (call_count - 1)) + encode_ms) / call_count,
+                    3,
+                )
+                metrics["avg_queue_wait_ms"] = round(
+                    ((float(metrics.get("avg_queue_wait_ms", 0.0) or 0.0) * (call_count - 1)) + queue_wait_ms) / call_count,
+                    3,
+                )
+            else:
+                metrics.setdefault("last_child_decode_ms", 0.0)
+                metrics.setdefault("last_invoke_ms", 0.0)
+                metrics.setdefault("last_child_invoke_ms", metrics.get("last_invoke_ms", 0.0))
+                metrics.setdefault("last_child_encode_ms", 0.0)
+                metrics.setdefault("last_queue_wait_ms", 0.0)
+                metrics.setdefault("avg_child_decode_ms", 0.0)
+                metrics.setdefault("avg_invoke_ms", 0.0)
+                metrics.setdefault("avg_child_invoke_ms", metrics.get("avg_invoke_ms", 0.0))
+                metrics.setdefault("avg_child_encode_ms", 0.0)
+                metrics.setdefault("avg_queue_wait_ms", 0.0)
+            metrics["last_error_type"] = str(error_type or "")
+            metrics["last_error_message"] = str(error_message or "")
+            metrics["updated_at"] = utc_now().isoformat()
+            pool.timing_metrics = metrics
+
+            event = {
+                "event": "task_pool_timing",
+                "pool_id": pool.pool_id,
+                "pool_name": pool.pool_name,
+                "method": str(method or ""),
+                "ok": bool(ok),
+                "setup_ms": round(float(setup_ms), 3),
+                "build_execute_spec_ms": round(float(build_execute_spec_ms), 3),
+                "executor_ms": round(float(executor_ms), 3),
+                "finalize_ms": round(float(finalize_ms), 3),
+                "total_ms": round(float(total_ms), 3),
+                "error_type": str(error_type or ""),
+                "error_message": str(error_message or ""),
+            }
+            if subprocess_timings:
+                event["subprocess"] = dict(subprocess_timings)
+                event["queue_wait_ms"] = round(
+                    max(
+                        0.0,
+                        float(executor_ms)
+                        - float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
+                        - float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
+                        - float(subprocess_timings.get("encode_ms", 0.0) or 0.0),
+                    ),
+                    3,
+                )
+            service_timing_logger.info(json.dumps(event, ensure_ascii=False))
+        except Exception as exc:
+            logger = logging.getLogger(__name__)
+            logger.debug("failed to record task pool timing: %r", exc)
+
     def service_timing_metadata(self) -> Dict[str, str]:
         with self._lock:
-            payload: Dict[str, object] = {}
+            service_payload: Dict[str, object] = {}
             for session in self._services.values():
                 if not session.timing_metrics:
                     continue
-                payload[session.service_id] = {
+                service_payload[session.service_id] = {
                     "service_name": session.service_name,
                     **dict(session.timing_metrics),
                 }
-        if not payload:
-            return {}
-        return {"service_timing_metrics": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
+            pool_payload: Dict[str, object] = {}
+            for pool in self._task_pools.values():
+                if not pool.timing_metrics:
+                    continue
+                pool_payload[pool.pool_id] = {
+                    "pool_name": pool.pool_name,
+                    "task_method": pool.task_method,
+                    **dict(pool.timing_metrics),
+                }
+        out: Dict[str, str] = {}
+        if service_payload:
+            out["service_timing_metrics"] = json.dumps(service_payload, ensure_ascii=False, separators=(",", ":"))
+        if pool_payload:
+            out["task_pool_timing_metrics"] = json.dumps(pool_payload, ensure_ascii=False, separators=(",", ":"))
+        return out
 
     def close(self) -> None:
         self._stop_event.set()
@@ -2488,12 +3121,7 @@ class NodeControlState:
         _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
         return state
 
-    def _ensure_service_managed_globals_state_locked(
-        self,
-        session: ServiceSession,
-        *,
-        artifact: CodeArtifact,
-    ) -> Optional[ManagedGlobalsState]:
+    def _ensure_service_managed_globals_state_locked(self, session: ServiceSession) -> Optional[ManagedGlobalsState]:
         allowed_names = _normalize_managed_global_names(session.managed_global_names)
         if not allowed_names:
             session.managed_globals_scope_dir = ""
@@ -2523,9 +3151,10 @@ class NodeControlState:
         client_id: str = "",
         code_version: str,
         runtime_key: str,
-        artifact: CodeArtifact,
+        allowed_names: Sequence[str],
     ) -> Optional[ManagedGlobalsState]:
-        if not artifact.managed_global_names:
+        normalized_allowed_names = _normalize_managed_global_names(allowed_names)
+        if not normalized_allowed_names:
             return None
         normalized_key = (
             str(client_id or "").strip(),
@@ -2538,7 +3167,7 @@ class NodeControlState:
                 code_version=code_version,
                 scope_kind="runtime",
                 scope_key=f"{normalized_key[0]}|{normalized_key[1]}|{normalized_key[2]}",
-                allowed_names=artifact.managed_global_names,
+                allowed_names=normalized_allowed_names,
             )
             self._runtime_managed_globals[normalized_key] = state
         return state
@@ -2558,7 +3187,12 @@ class NodeControlState:
         current_values = _load_managed_globals_snapshot_serialized(state)
         updated_names: List[str] = []
         for name, value in values.items():
-            current_values[name] = serialize_arrow_compatible(value)
+            if inspect.ismodule(value) or inspect.isfunction(value) or inspect.isclass(value) or callable(value):
+                raise ValueError(
+                    f"managed globals must be data values, not callables/modules/classes: {[name]}"
+                )
+            prepared_value = self._prepare_managed_globals_value_for_subprocess_locked(value)
+            current_values[name] = serialize_arrow_compatible(prepared_value)
             updated_names.append(name)
         state.globals_digest = _write_managed_globals_snapshot(state, values_serialized=current_values)
         _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
@@ -2583,17 +3217,100 @@ class NodeControlState:
         self._client_code_tokens[(normalized_client_id, normalized_code_version)] = normalized_code_token
         return normalized_code_token
 
+    def _register_client_code_managed_globals_locked(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str = "",
+        managed_global_names: Sequence[str],
+    ) -> Tuple[str, ...]:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        normalized_runtime_key = str(runtime_key or "").strip()
+        normalized_names = _normalize_managed_global_names(managed_global_names)
+        if normalized_client_id and normalized_code_version:
+            self._client_code_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = normalized_names
+        return normalized_names
+
+    @staticmethod
+    def _warmup_fanout(worker_count: int) -> int:
+        return max(1, int(worker_count or 1) * 2)
+
+    def _log_warmup_result(self, *, scope: str, key: str, worker_count: int, worker_pids: Sequence[int]) -> None:
+        unique_pids = sorted({int(pid) for pid in worker_pids if int(pid or 0) > 0})
+        logging.getLogger(__name__).info(
+            "[Warmup] scope=%s key=%s worker_count=%d warmed_workers=%d pids=%s",
+            scope,
+            key,
+            int(worker_count or 0),
+            len(unique_pids),
+            unique_pids,
+        )
+
     def get_client_code_token(self, *, client_id: str, code_version: str) -> str:
         normalized_client_id = str(client_id or "").strip()
         normalized_code_version = str(code_version or "").strip()
         with self._lock:
             return str(self._client_code_tokens.get((normalized_client_id, normalized_code_version), "") or "")
 
+    def get_client_code_managed_globals(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str = "",
+    ) -> Tuple[str, ...]:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        normalized_runtime_key = str(runtime_key or "").strip()
+        with self._lock:
+            return self._get_client_code_managed_globals_locked(
+                client_id=normalized_client_id,
+                code_version=normalized_code_version,
+                runtime_key=normalized_runtime_key,
+            )
+
+    def _get_client_code_managed_globals_locked(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str = "",
+    ) -> Tuple[str, ...]:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        normalized_runtime_key = str(runtime_key or "").strip()
+        exact = self._client_code_managed_globals.get(
+            (normalized_client_id, normalized_code_version, normalized_runtime_key),
+            (),
+        )
+        if exact:
+            return tuple(exact)
+        return tuple(
+            self._client_code_managed_globals.get(
+                (normalized_client_id, normalized_code_version, ""),
+                (),
+            )
+        )
+
     def _executor_host_required(self) -> bool:
         return bool(self.enable_internal_executor or self.enable_service_session)
 
     def _executor_host_alive_locked(self) -> bool:
         return self._executor_host is not None and self._executor_host.is_alive()
+
+    def _delete_object_artifact_locked(self, object_id: str) -> None:
+        artifact = self._objects.pop(object_id, None)
+        if artifact is None:
+            return
+        if artifact.storage_backend == "segment":
+            return
+        if artifact.path:
+            with contextlib.suppress(FileNotFoundError):
+                Path(artifact.path).unlink()
+        with contextlib.suppress(FileNotFoundError):
+            _object_meta_path(self._object_dir, object_id=object_id).unlink()
 
     def _ensure_executor_host_alive_locked(self, *, now: Optional[datetime] = None) -> None:
         if not self._executor_host_required():
@@ -2640,20 +3357,31 @@ class NodeControlState:
         normalized = normalize_object_id(object_id)
         with self._lock:
             artifact = self._objects.get(normalized)
-            if artifact is not None and Path(artifact.path).exists():
+            if artifact is not None and _artifact_exists(artifact):
+                return artifact
+        meta = _load_object_meta(self._object_dir, object_id=normalized)
+        if meta:
+            artifact = _object_artifact_from_meta(self._object_dir, object_id=normalized, meta=meta)
+            if _artifact_exists(artifact):
+                with self._lock:
+                    self._objects[normalized] = artifact
                 return artifact
         candidate = object_storage_path(self._object_dir, object_id=normalized, fmt="bin")
         digest = normalized.replace("sha256:", "", 1)
         legacy_candidate = Path(self._object_dir) / f"{digest}.bin"
         fallback = []
         if candidate.exists():
-            return ObjectArtifact(
+            artifact = ObjectArtifact(
                 object_id=normalized,
                 path=str(candidate),
                 format=normalize_object_format(candidate.suffix, source_name=candidate.name, default="bin"),
                 size_bytes=candidate.stat().st_size,
                 created_at=utc_now(),
+                storage_backend="file",
             )
+            with self._lock:
+                self._objects[normalized] = artifact
+            return artifact
         if legacy_candidate.exists():
             fallback = [legacy_candidate]
         if not fallback:
@@ -2663,43 +3391,91 @@ class NodeControlState:
             fallback = sorted(path for path in self._object_dir.glob(f"{digest}*") if path.is_file())
         if fallback:
             path = fallback[0]
-            return ObjectArtifact(
+            artifact = ObjectArtifact(
                 object_id=normalized,
                 path=str(path),
                 format=normalize_object_format("", source_name=path.name, default="bin"),
                 size_bytes=path.stat().st_size,
                 created_at=utc_now(),
+                storage_backend="file",
             )
+            with self._lock:
+                self._objects[normalized] = artifact
+            return artifact
         raise KeyError("object not found")
+
+    def _resolve_memory_object_refs_in_payload_locked(self, payload: Any) -> Any:
+        return payload
+
+    def _prepare_managed_globals_value_for_subprocess_locked(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self._prepare_managed_globals_value_for_subprocess_locked(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._prepare_managed_globals_value_for_subprocess_locked(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._prepare_managed_globals_value_for_subprocess_locked(item) for item in value)
+        return value
+
+    def _register_stored_result_artifact_locked(self, result: StoredResultArtifact) -> StoredResultArtifact:
+        if result.storage_backend == "segment":
+            artifact = ObjectArtifact(
+                object_id=result.object_id,
+                path="",
+                format=result.format,
+                size_bytes=result.size_bytes,
+                created_at=utc_now(),
+                storage_backend="segment",
+                segment_path=str(_segment_path_from_relpath(self._object_dir, result.segment_relpath)),
+                segment_offset=result.segment_offset,
+                segment_length=result.segment_length,
+            )
+        else:
+            artifact = ObjectArtifact(
+                object_id=result.object_id,
+                path=str(object_storage_path(self._object_dir, object_id=result.object_id, fmt=result.format)),
+                format=result.format,
+                size_bytes=result.size_bytes,
+                created_at=utc_now(),
+                storage_backend="file",
+            )
+        self._objects[result.object_id] = artifact
+        return result
 
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
         return _code_dependency_dir(self._artifact_dir, code_version=code_version)
 
-    def _validate_managed_global_names(
+    def _validate_managed_global_names(self, managed_global_names: Sequence[str], *, module: Any) -> None:
+        normalized_names = _normalize_managed_global_names(managed_global_names)
+        if not normalized_names:
+            return
+        missing = [name for name in normalized_names if not hasattr(module, name)]
+        if missing:
+            raise ValueError(f"managed globals not found in entry module: {missing}")
+
+    def _validate_artifact_methods(
         self,
         artifact: CodeArtifact,
         *,
         dependency_path: str,
-    ) -> None:
-        if not artifact.managed_global_names:
-            return
-        module = _load_user_module(
-            artifact.path,
-            entry_module=artifact.entry_module,
-            package_format=artifact.package_format,
-            dependency_path=dependency_path,
-        )
+        managed_global_names: Sequence[str] = (),
+    ) -> Dict[str, Tuple[str, str]]:
+        module = None
         try:
-            missing = [name for name in artifact.managed_global_names if not hasattr(module, name)]
-            if missing:
-                raise ValueError(f"managed globals not found in entry module: {missing}")
-            invalid = []
-            for name in artifact.managed_global_names:
-                value = getattr(module, name)
-                if inspect.ismodule(value) or inspect.isfunction(value) or inspect.isclass(value) or callable(value):
-                    invalid.append(name)
-            if invalid:
-                raise ValueError(f"managed globals must be data values, not callables/modules/classes: {invalid}")
+            module, methods = _discover_callable_methods(
+                artifact.path,
+                entry_module=artifact.entry_module,
+                package_format=artifact.package_format,
+                dependency_path=dependency_path,
+                export_mode=artifact.export_mode,
+                export_methods=artifact.export_methods,
+                export_decorator=artifact.export_decorator,
+                entry_callable=artifact.entry_callable,
+            )
+            self._validate_managed_global_names(managed_global_names, module=module)
+            return methods
         finally:
             _purge_loaded_artifact_modules(
                 artifact.path,
@@ -2708,30 +3484,12 @@ class NodeControlState:
                 dependency_path=dependency_path,
             )
 
-    def _validate_artifact_methods(
-        self,
-        artifact: CodeArtifact,
-        *,
-        dependency_path: str,
-    ) -> Dict[str, Tuple[str, str]]:
-        methods = _discover_callable_methods(
-            artifact.path,
-            entry_module=artifact.entry_module,
-            package_format=artifact.package_format,
-            dependency_path=dependency_path,
-            export_mode=artifact.export_mode,
-            export_methods=artifact.export_methods,
-            export_decorator=artifact.export_decorator,
-            entry_callable=artifact.entry_callable,
-        )
-        self._validate_managed_global_names(artifact, dependency_path=dependency_path)
-        return methods
-
     def _ensure_artifact_ready(
         self,
         artifact: CodeArtifact,
         *,
         dependency_allowlist: Sequence[str],
+        managed_global_names: Sequence[str] = (),
     ) -> Dict[str, Tuple[str, str]]:
         normalized_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
         installed_dependency_path = str(artifact.dependency_path or "").strip()
@@ -2760,7 +3518,11 @@ class NodeControlState:
             candidate_dependency_path = str(target_dir)
 
         try:
-            method_info = self._validate_artifact_methods(artifact, dependency_path=candidate_dependency_path)
+            method_info = self._validate_artifact_methods(
+                artifact,
+                dependency_path=candidate_dependency_path,
+                managed_global_names=managed_global_names,
+            )
         except Exception as exc:
             if not effective_allowlist or not _missing_import_name(exc):
                 if created_dir:
@@ -2779,7 +3541,11 @@ class NodeControlState:
             target_dir = self._dependency_dir_for_code_version(artifact.code_version)
             try:
                 _install_dependency_allowlist(effective_allowlist, target_dir=target_dir)
-                method_info = self._validate_artifact_methods(artifact, dependency_path=str(target_dir))
+                method_info = self._validate_artifact_methods(
+                    artifact,
+                    dependency_path=str(target_dir),
+                    managed_global_names=managed_global_names,
+                )
             except Exception as repair_exc:
                 if created_dir or target_dir.exists():
                     shutil.rmtree(target_dir, ignore_errors=True)
@@ -2821,6 +3587,46 @@ class NodeControlState:
     def service_worker_available(self) -> int:
         return max(0, int(self.service_worker_capacity) - int(self.service_worker_used()))
 
+    def task_pool_worker_used(self) -> int:
+        with self._lock:
+            active = sum(
+                max(0, int(pool.worker_count))
+                for pool in self._task_pools.values()
+                if str(pool.status or "").strip().upper() == "RUNNING"
+            )
+            return active + max(0, int(self._task_pool_worker_reserved))
+
+    def task_pool_worker_available(self) -> int:
+        return max(0, int(self.task_pool_worker_capacity) - int(self.task_pool_worker_used()))
+
+    def task_pool_reports(self) -> Dict[str, NodeTaskPoolInfo]:
+        with self._lock:
+            inflight_by_pool: Dict[str, int] = {}
+            for task in self._pool_tasks.values():
+                if int(task.status) != int(pb2.TASK_STATUS_RUNNING):
+                    continue
+                pool_id = str(task.client_id or "").strip()
+                if not pool_id:
+                    continue
+                inflight_by_pool[pool_id] = inflight_by_pool.get(pool_id, 0) + 1
+            return {
+                pool.pool_id: NodeTaskPoolInfo(
+                    pool_id=pool.pool_id,
+                    owner_client_id=pool.owner_client_id,
+                    pool_name=pool.pool_name,
+                    code_version=pool.code_version,
+                    status=pool.status,
+                    worker_count=pool.worker_count,
+                    task_count=pool.task_count,
+                    inflight=inflight_by_pool.get(pool.pool_id, 0),
+                    created_at=pool.created_at,
+                    last_heartbeat_at=pool.last_heartbeat_at,
+                    lease_expire_at=pool.lease_expire_at,
+                )
+                for pool in self._task_pools.values()
+                if str(pool.status or "").strip().upper() == "RUNNING" or bool(pool.timing_metrics)
+            }
+
     def _get_code_write_lock(self, code_version: str) -> threading.Lock:
         key = str(code_version or "").strip()
         with self._lock:
@@ -2849,18 +3655,28 @@ class NodeControlState:
 
     def task_pool_status_info(self, pool_id: str) -> Dict[str, object]:
         pool = self.task_pool(pool_id)
+        inflight = 0
+        with self._lock:
+            for task in self._pool_tasks.values():
+                if str(task.client_id or "").strip() != pool.pool_id:
+                    continue
+                if int(task.status) == int(pb2.TASK_STATUS_RUNNING):
+                    inflight += 1
         return {
             "pool_id": pool.pool_id,
             "owner_client_id": pool.owner_client_id,
             "pool_name": pool.pool_name,
             "code_version": pool.code_version,
+            "task_method": pool.task_method,
             "worker_count": pool.worker_count,
             "heartbeat_timeout_sec": pool.heartbeat_timeout_sec,
             "status": str(pool.status),
             "task_count": int(pool.task_count),
+            "inflight": int(inflight),
             "created_at": pool.created_at,
             "last_heartbeat_at": pool.last_heartbeat_at,
             "lease_expire_at": pool.lease_expire_at,
+            "timing_metrics": dict(pool.timing_metrics or {}),
         }
 
     def _extract_archive(self, *, archive_path: Path, package_format: str, out_dir: Path) -> None:
@@ -2956,43 +3772,23 @@ class NodeControlState:
             with self._lock:
                 existing = self._codes.get(code_version)
                 if existing is not None:
-                    merged_managed_global_names = _normalize_managed_global_names(
-                        [*existing.managed_global_names, *normalized_managed_global_names]
-                    )
-                    if merged_managed_global_names != existing.managed_global_names:
-                        updated = CodeArtifact(
-                            code_version=existing.code_version,
-                            path=existing.path,
-                            runtime=existing.runtime,
-                            entry_module=existing.entry_module,
-                            entry_callable=existing.entry_callable,
-                            package_format=existing.package_format,
-                            export_mode=existing.export_mode,
-                            export_methods=existing.export_methods,
-                            export_decorator=existing.export_decorator,
-                            dependency_allowlist=existing.dependency_allowlist,
-                            managed_global_names=merged_managed_global_names,
-                            dependency_path=existing.dependency_path,
-                            size_bytes=existing.size_bytes,
-                            created_at=existing.created_at,
-                        )
-                        self._ensure_artifact_ready(
-                            updated,
-                            dependency_allowlist=normalized_dependency_allowlist,
-                        )
-                        self._codes[code_version] = updated
-                        existing = updated
-                        _write_code_meta(self._artifact_dir, existing)
                     if validate_load:
                         self._ensure_artifact_ready(
                             existing,
                             dependency_allowlist=normalized_dependency_allowlist,
+                            managed_global_names=normalized_managed_global_names,
                         )
                     if str(client_id or "").strip():
                         self._register_client_code_token_locked(
                             client_id=client_id,
                             code_version=code_version,
                             code_token=code_token,
+                        )
+                        self._register_client_code_managed_globals_locked(
+                            client_id=client_id,
+                            code_version=code_version,
+                            runtime_key="",
+                            managed_global_names=normalized_managed_global_names,
                         )
                     return existing, True
 
@@ -3026,7 +3822,6 @@ class NodeControlState:
                 export_methods=normalized_export_methods,
                 export_decorator=normalized_export_decorator,
                 dependency_allowlist=normalized_dependency_allowlist,
-                managed_global_names=normalized_managed_global_names,
                 dependency_path="",
                 size_bytes=max(0, int(size_bytes)),
                 created_at=now,
@@ -3036,6 +3831,7 @@ class NodeControlState:
                     self._ensure_artifact_ready(
                         artifact,
                         dependency_allowlist=normalized_dependency_allowlist,
+                        managed_global_names=normalized_managed_global_names,
                     )
                 except Exception:
                     for target in cleanup_paths:
@@ -3053,6 +3849,12 @@ class NodeControlState:
                         client_id=client_id,
                         code_version=code_version,
                         code_token=code_token,
+                    )
+                    self._register_client_code_managed_globals_locked(
+                        client_id=client_id,
+                        code_version=code_version,
+                        runtime_key="",
+                        managed_global_names=normalized_managed_global_names,
                     )
             _write_code_meta(self._artifact_dir, artifact)
             return artifact, False
@@ -3083,10 +3885,42 @@ class NodeControlState:
         with object_lock:
             with self._lock:
                 existing = self._objects.get(actual_object_id)
-                if existing is not None and Path(existing.path).exists():
+                if existing is not None and _artifact_exists(existing):
                     return existing, True
+            meta = _load_object_meta(self._object_dir, object_id=actual_object_id)
+            if meta:
+                artifact = _object_artifact_from_meta(self._object_dir, object_id=actual_object_id, meta=meta)
+                if _artifact_exists(artifact):
+                    with self._lock:
+                        self._objects[actual_object_id] = artifact
+                    return artifact, True
 
             now = utc_now()
+            if max(0, int(size_bytes or 0)) <= max(0, int(self._object_segment_max_bytes)):
+                result = _append_bytes_to_segment(
+                    self._object_dir,
+                    object_id=actual_object_id,
+                    fmt=normalized_format,
+                    blob=tmp_path.read_bytes(),
+                    materialize_as="path",
+                    created_at=now,
+                )
+                tmp_path.unlink(missing_ok=True)
+                artifact = ObjectArtifact(
+                    object_id=actual_object_id,
+                    path="",
+                    format=normalized_format,
+                    size_bytes=result.size_bytes,
+                    created_at=now,
+                    storage_backend="segment",
+                    segment_path=str(_segment_path_from_relpath(self._object_dir, result.segment_relpath)),
+                    segment_offset=result.segment_offset,
+                    segment_length=result.segment_length,
+                )
+                with self._lock:
+                    self._objects[actual_object_id] = artifact
+                return artifact, False
+
             final_path = object_storage_path(self._object_dir, object_id=actual_object_id, fmt=normalized_format)
             final_path.parent.mkdir(parents=True, exist_ok=True)
             if final_path.exists():
@@ -3108,6 +3942,7 @@ class NodeControlState:
                     format=normalized_format,
                     size_bytes=max(0, int(size_bytes)),
                     created_at=now,
+                    storage_backend="file",
                 )
                 with self._lock:
                     self._objects[actual_object_id] = artifact
@@ -3128,6 +3963,7 @@ class NodeControlState:
                 format=normalized_format,
                 size_bytes=max(0, int(size_bytes)),
                 created_at=now,
+                storage_backend="file",
             )
             with self._lock:
                 self._objects[actual_object_id] = artifact
@@ -3227,13 +4063,13 @@ class NodeControlState:
             export_methods=export_methods,
             export_decorator=export_decorator,
             dependency_allowlist=dependency_allowlist,
-            managed_global_names=normalized_managed_global_names,
             chunks=chunks,
             validate_load=True,
         )
         method_info = self._ensure_artifact_ready(
             artifact,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=normalized_managed_global_names,
         )
 
         requested_workers = max(1, worker_count or self.service_default_worker_count)
@@ -3289,7 +4125,7 @@ class NodeControlState:
                 methods=method_info,
                 managed_global_names=normalized_managed_global_names,
             )
-            managed_state = self._ensure_service_managed_globals_state_locked(session, artifact=artifact)
+            managed_state = self._ensure_service_managed_globals_state_locked(session)
             if managed_state is not None:
                 session.managed_globals_scope_dir = managed_state.scope_dir
                 session.managed_globals_digest = managed_state.globals_digest
@@ -3334,43 +4170,93 @@ class NodeControlState:
             export_mode="single",
             export_methods=[entry_callable],
             dependency_allowlist=dependency_allowlist,
-            managed_global_names=normalized_managed_global_names,
             chunks=chunks,
             validate_load=True,
         )
         self._ensure_artifact_ready(
             artifact,
             dependency_allowlist=dependency_allowlist,
+            managed_global_names=normalized_managed_global_names,
         )
 
         requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
         now = utc_now()
         pool_id = uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
-        self._ensure_executor_host_alive_locked(now=now)
-        if self._executor_host is None:
-            raise RuntimeError("executor host unavailable")
-        self._executor_host.create_task_pool(pool_id=pool_id, worker_count=requested_workers)
-        pool = TaskPoolState(
-            pool_id=pool_id,
-            owner_client_id=owner_client_id,
-            pool_name=str(pool_name or f"task-pool-{pool_id[:8]}"),
-            code_version=artifact.code_version,
-            worker_count=requested_workers,
-            heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
-            idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
-            pool_token=token,
-            status="RUNNING",
-            created_at=now,
-            last_heartbeat_at=now,
-            lease_expire_at=now + timedelta(seconds=max(5, int(heartbeat_timeout_sec or 30))),
-            managed_global_names=normalized_managed_global_names,
-            executor_ready=True,
-            task_count=0,
-        )
+        reserved = 0
         with self._lock:
-            self._task_pools[pool_id] = pool
-        return pool
+            active = sum(
+                max(0, int(pool.worker_count))
+                for pool in self._task_pools.values()
+                if str(pool.status or "").strip().upper() == "RUNNING"
+            )
+            available_workers = max(0, int(self.task_pool_worker_capacity) - int(active + self._task_pool_worker_reserved))
+            if available_workers <= 0:
+                raise RuntimeError("task pool worker capacity exhausted")
+            actual_workers = min(requested_workers, available_workers)
+            self._task_pool_worker_reserved += actual_workers
+            reserved = actual_workers
+            self._ensure_executor_host_alive_locked(now=now)
+            executor_host = self._executor_host
+        if executor_host is None:
+            with self._lock:
+                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+            raise RuntimeError("executor host unavailable")
+        try:
+            executor_host.create_task_pool(pool_id=pool_id, worker_count=actual_workers)
+        except Exception:
+            with self._lock:
+                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+            raise
+        try:
+            pool = TaskPoolState(
+                pool_id=pool_id,
+                owner_client_id=owner_client_id,
+                pool_name=str(pool_name or f"task-pool-{pool_id[:8]}"),
+                code_version=artifact.code_version,
+                task_method=str(entry_callable or "run").strip() or "run",
+                worker_count=actual_workers,
+                heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
+                idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+                pool_token=token,
+                status="RUNNING",
+                created_at=now,
+                last_heartbeat_at=now,
+                lease_expire_at=now + timedelta(seconds=max(5, int(heartbeat_timeout_sec or 30))),
+                managed_global_names=normalized_managed_global_names,
+                executor_ready=True,
+                task_count=0,
+            )
+            managed_state = self._ensure_runtime_managed_globals_state_locked(
+                client_id=pool.pool_id,
+                code_version=pool.code_version,
+                runtime_key=pool.pool_id,
+                allowed_names=pool.managed_global_names,
+            )
+            if managed_state is not None:
+                pool.managed_globals_scope_dir = managed_state.scope_dir
+                pool.managed_globals_digest = managed_state.globals_digest
+            with self._lock:
+                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+                self._task_pools[pool_id] = pool
+                self._register_client_code_token_locked(
+                    client_id=pool.pool_id,
+                    code_version=pool.code_version,
+                    code_token=pool.pool_token,
+                )
+                self._register_client_code_managed_globals_locked(
+                    client_id=pool.pool_id,
+                    code_version=pool.code_version,
+                    runtime_key=pool.pool_id,
+                    managed_global_names=pool.managed_global_names,
+                )
+            return pool
+        except Exception:
+            with self._lock:
+                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+            with contextlib.suppress(Exception):
+                executor_host.stop_task_pool(pool_id=pool_id)
+            raise
 
     def submit_pool_tasks(
         self,
@@ -3428,18 +4314,21 @@ class NodeControlState:
                     last_heartbeat_at=now,
                 )
                 self._pool_tasks[item.task_id] = record
+                build_start = time.perf_counter()
+                execute_spec = _build_execute_spec(
+                    artifact,
+                    object_dir=self._object_dir,
+                    method_name=artifact.entry_callable,
+                    payload=self._resolve_memory_object_refs_in_payload_locked(record.payload),
+                    managed_globals_scope_dir=pool.managed_globals_scope_dir,
+                    managed_globals_digest=pool.managed_globals_digest,
+                )
+                record.dispatch_build_execute_spec_ms = (time.perf_counter() - build_start) * 1000.0
                 self._executor_host.submit_pool_task(
                     pool_id=pool.pool_id,
                     task_id=item.task_id,
                     attempt=record.attempt,
-                    execute_spec=_build_execute_spec(
-                        artifact,
-                        object_dir=self._object_dir,
-                        method_name=artifact.entry_callable,
-                        payload=record.payload,
-                        managed_globals_scope_dir="",
-                        managed_globals_digest="",
-                    ),
+                    execute_spec=execute_spec,
                 )
                 pool.task_count += 1
                 accepted.append(pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED))
@@ -3677,6 +4566,7 @@ class NodeControlState:
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
             session.in_flight += 1
+            prepared_payload = self._resolve_memory_object_refs_in_payload_locked(payload or {})
         setup_end = time.perf_counter()
 
         try:
@@ -3687,7 +4577,7 @@ class NodeControlState:
                 artifact,
                 object_dir=self._object_dir,
                 method_name=requested_method,
-                payload=payload or {},
+                payload=prepared_payload,
                 managed_globals_scope_dir=session.managed_globals_scope_dir,
                 managed_globals_digest=session.managed_globals_digest,
             )
@@ -3758,6 +4648,8 @@ class NodeControlState:
 
         if status_text == "SUCCEEDED":
             if isinstance(result, StoredResultArtifact):
+                with self._lock:
+                    self._register_stored_result_artifact_locked(result)
                 result = _stored_result_to_result_ref(result, node_id=self.node_id)
             finalize_end = time.perf_counter()
             with self._lock:
@@ -3875,16 +4767,33 @@ class NodeControlState:
                 raise PermissionError("owner_client_id mismatch")
             if not service_token or session.service_token != service_token:
                 raise PermissionError("service_token mismatch")
-            artifact = self._codes.get(session.code_version)
-            if artifact is None:
-                raise RuntimeError("artifact missing")
-            state = self._ensure_service_managed_globals_state_locked(session, artifact=artifact)
+            state = self._ensure_service_managed_globals_state_locked(session)
             if state is None:
                 raise ValueError("service artifact did not declare managed globals")
             globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
             session.managed_globals_scope_dir = state.scope_dir
             session.managed_globals_digest = globals_digest
+            artifact = self._codes.get(session.code_version)
+            executor_host = self._executor_host
+            service_id = session.service_id
+            worker_count = session.worker_count
+        if artifact is None or executor_host is None:
             return globals_digest, updated_names
+        worker_pids = executor_host.warmup_service(
+            service_id=service_id,
+            fanout=self._warmup_fanout(worker_count),
+            execute_spec=_build_execute_spec(
+                artifact,
+                object_dir=self._object_dir,
+                method_name=next(iter(session.methods.keys()), artifact.entry_callable),
+                payload={},
+                managed_globals_scope_dir=state.scope_dir,
+                managed_globals_digest=globals_digest,
+                warmup_only=True,
+            ),
+        )
+        self._log_warmup_result(scope="service", key=service_id, worker_count=worker_count, worker_pids=worker_pids)
+        return globals_digest, updated_names
 
     def update_runtime_globals(
         self,
@@ -3905,17 +4814,50 @@ class NodeControlState:
             expected_code_token = self._client_code_tokens.get((normalized_client_id, normalized_code_version), "")
             if not code_token or not expected_code_token or expected_code_token != code_token:
                 raise PermissionError("code_token mismatch")
+            allowed_names = self._get_client_code_managed_globals_locked(
+                client_id=normalized_client_id,
+                code_version=normalized_code_version,
+                runtime_key=normalized_runtime_key,
+            )
             state = self._ensure_runtime_managed_globals_state_locked(
                 client_id=normalized_client_id,
                 code_version=normalized_code_version,
                 runtime_key=normalized_runtime_key,
-                artifact=artifact,
+                allowed_names=allowed_names,
             )
             if state is None:
                 raise ValueError("task artifact did not declare managed globals")
             globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
             self._runtime_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = state
+            executor_host = self._executor_host
+            pool = self._task_pools.get(normalized_client_id)
+            worker_count = int(pool.worker_count if pool is not None else self.worker_capacity)
+        if artifact is None or executor_host is None:
             return globals_digest, updated_names
+        execute_spec = _build_execute_spec(
+            artifact,
+            object_dir=self._object_dir,
+            method_name=artifact.entry_callable,
+            payload={},
+            managed_globals_scope_dir=state.scope_dir,
+            managed_globals_digest=globals_digest,
+            warmup_only=True,
+        )
+        if pool is not None:
+            worker_pids = executor_host.warmup_pool(
+                pool_id=pool.pool_id,
+                fanout=self._warmup_fanout(worker_count),
+                execute_spec=execute_spec,
+            )
+            self._log_warmup_result(scope="pool", key=pool.pool_id, worker_count=worker_count, worker_pids=worker_pids)
+        else:
+            worker_pids = executor_host.warmup_runtime(
+                runtime_key=normalized_runtime_key,
+                fanout=self._warmup_fanout(worker_count),
+                execute_spec=execute_spec,
+            )
+            self._log_warmup_result(scope="runtime", key=normalized_runtime_key, worker_count=worker_count, worker_pids=worker_pids)
+        return globals_digest, updated_names
 
     def _service_status_http(self, service_id: str) -> Tuple[int, Dict[str, object]]:
         try:
@@ -4414,7 +5356,11 @@ class NodeControlState:
                         client_id=task.client_id,
                         code_version=task.code_version,
                         runtime_key=task.runtime_key,
-                        artifact=artifact,
+                        allowed_names=self._get_client_code_managed_globals_locked(
+                            client_id=str(task.client_id or "").strip(),
+                            code_version=str(task.code_version or "").strip(),
+                            runtime_key=str(task.runtime_key or "").strip(),
+                        ),
                     )
                     self._executor_host.submit_runtime_task(
                         runtime_key=slot.runtime_key,
@@ -4424,7 +5370,7 @@ class NodeControlState:
                             artifact,
                             object_dir=self._object_dir,
                             method_name=artifact.entry_callable,
-                            payload=task.payload,
+                            payload=self._resolve_memory_object_refs_in_payload_locked(task.payload),
                             managed_globals_scope_dir=(managed_state.scope_dir if managed_state is not None else ""),
                             managed_globals_digest=(managed_state.globals_digest if managed_state is not None else ""),
                         ),
@@ -4483,7 +5429,11 @@ class NodeControlState:
                     client_id=task.client_id,
                     code_version=task.code_version,
                     runtime_key=task.runtime_key,
-                    artifact=artifact,
+                    allowed_names=self._get_client_code_managed_globals_locked(
+                        client_id=str(task.client_id or "").strip(),
+                        code_version=str(task.code_version or "").strip(),
+                        runtime_key=str(task.runtime_key or "").strip(),
+                    ),
                 )
                 self._executor_host.submit_runtime_task(
                     runtime_key=task.runtime_key,
@@ -4493,7 +5443,7 @@ class NodeControlState:
                         artifact,
                         object_dir=self._object_dir,
                         method_name=artifact.entry_callable,
-                        payload=task.payload,
+                        payload=self._resolve_memory_object_refs_in_payload_locked(task.payload),
                         managed_globals_scope_dir=(managed_state.scope_dir if managed_state is not None else ""),
                         managed_globals_digest=(managed_state.globals_digest if managed_state is not None else ""),
                     ),
@@ -4516,12 +5466,20 @@ class NodeControlState:
                     result = item.get("result")
                     err_type = str(item.get("err_type", "") or "")
                     err_message = str(item.get("err_message", "") or "")
+                    subprocess_timings = dict(item.get("timings") or {})
                     now = utc_now()
                     task = self._pool_tasks.get(task_id)
                     if task is None or task.attempt != attempt:
                         continue
+                    pool = self._task_pools.get(pool_id)
                     task.finished_at = now
                     task.last_heartbeat_at = now
+                    total_ms = max(
+                        0.0,
+                        (now - (task.started_at or now)).total_seconds() * 1000.0,
+                    )
+                    build_execute_spec_ms = float(getattr(task, "dispatch_build_execute_spec_ms", 0.0) or 0.0)
+                    executor_ms = max(0.0, total_ms - build_execute_spec_ms)
                     if status_text == "FAILED_USER":
                         task.status = pb2.TASK_STATUS_FAILED_USER
                         task.result = None
@@ -4535,11 +5493,26 @@ class NodeControlState:
                     else:
                         task.status = pb2.TASK_STATUS_SUCCEEDED
                         if isinstance(result, StoredResultArtifact):
+                            self._register_stored_result_artifact_locked(result)
                             task.result = _stored_result_to_result_ref(result, node_id=self.node_id)
                         else:
                             task.result = result or {}
                         task.error_type = ""
                         task.error_message = ""
+                    if pool is not None:
+                        self._record_task_pool_timing_locked(
+                            pool,
+                            method=pool.task_method,
+                            ok=bool(status_text not in {"FAILED_USER", "FAILED_INFRA"}),
+                            setup_ms=0.0,
+                            build_execute_spec_ms=build_execute_spec_ms,
+                            executor_ms=executor_ms,
+                            finalize_ms=0.0,
+                            total_ms=total_ms,
+                            subprocess_timings=subprocess_timings,
+                            error_type=task.error_type,
+                            error_message=task.error_message,
+                        )
                     self._pool_result_hook.push(pool_id, task.as_result())
                     self._cv.notify_all()
                     continue
@@ -4578,6 +5551,7 @@ class NodeControlState:
                 else:
                     task.status = pb2.TASK_STATUS_SUCCEEDED
                     if isinstance(result, StoredResultArtifact):
+                        self._register_stored_result_artifact_locked(result)
                         task.result = _stored_result_to_result_ref(result, node_id=self.node_id)
                     else:
                         task.result = result or {}

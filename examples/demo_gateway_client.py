@@ -34,19 +34,53 @@ group = DeployedService.deploy_from_infocenter(
 """
 
 import asyncio
-from pycloud_parallel import GatewayConnect
+import time
+from pycloud_parallel import DeployedService, GatewayConnect
 from pycloud_parallel.controlplane.client import GatewayServiceClient
 
 def check_service_exists(gateway_target: str, service_name: str) -> bool:
     """检查服务是否存在。"""
-    with GatewayServiceClient(gateway_target, timeout_sec=5.0) as client:
-        status = client.get_status(service_name=service_name)
-        return status.get("route_count", 0) > 0
+    try:
+        with GatewayServiceClient(gateway_target, timeout_sec=5.0) as client:
+            status = client.get_status(service_name=service_name)
+            return status.get("route_count", 0) > 0
+    except RuntimeError:
+        return False
+
+
+def ensure_service(gateway_target: str, service_name: str):
+    if check_service_exists(gateway_target, service_name):
+        return None
+    blob = (
+        b"from pycloud_parallel import pycloud_export\n\n"
+        b"@pycloud_export\n"
+        b"def square(x=0, **_kwargs):\n"
+        b"    x = int(x)\n"
+        b"    return {'x': x, 'y': x * x}\n"
+    )
+    group = DeployedService.deploy_from_infocenter(
+        infocenter_target=gateway_target,
+        owner_client_id=f"gateway-client-demo-{int(time.time())}",
+        service_name=service_name,
+        blob=blob,
+        runtime="py3",
+        entry_module="square_service",
+        export_mode="decorator",
+        worker_count=1,
+        tags=["compute"],
+        min_success_nodes=1,
+    )
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if check_service_exists(gateway_target, service_name):
+            break
+        time.sleep(0.2)
+    return group
 
 
 def main() -> None:
     gateway_target = "127.0.0.1:50051"
-    service_name = "compute-service"
+    service_name = "square-service"
 
     print("=" * 60)
     print("  PyCloud Gateway Client Demo")
@@ -56,65 +90,64 @@ def main() -> None:
     print(f"  Service: {service_name}")
     print()
 
-    # 检查服务是否存在
-    if not check_service_exists(gateway_target, service_name):
-        raise RuntimeError(
-            f"service {service_name!r} not found; deploy it first with "
-            "python examples/demo_gateway_complete.py"
-        )
+    group = ensure_service(gateway_target, service_name)
 
-    print("[GatewayServiceClient]")
-    print("-" * 60)
+    try:
+        print("[GatewayServiceClient]")
+        print("-" * 60)
 
-    with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
-        methods = client.list_methods(service_name=service_name, include_docs=False)
-        print("可用方法:")
-        for item in methods:
-            print(f"  - {item.get('method')}")
-        print()
+        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
+            methods = client.list_methods(service_name=service_name, include_docs=False)
+            print("可用方法:")
+            for item in methods:
+                print(f"  - {item.get('method')}")
+            print()
 
-        status = client.get_status(service_name=service_name)
-        print(f"路由数量: {status.get('route_count')}")
-        for route in status.get("routes", []):
-            print(
-                "  - "
-                f"node={route.get('node_id')} "
-                f"service_id={route.get('service_id')[:8]}... "
-                f"in_flight={route.get('in_flight')}"
+            status = client.get_status(service_name=service_name)
+            print(f"路由数量: {status.get('route_count')}")
+            for route in status.get("routes", []):
+                print(
+                    "  - "
+                    f"node={route.get('node_id')} "
+                    f"service_id={route.get('service_id')[:8]}... "
+                    f"in_flight={route.get('in_flight')}"
+                )
+            print()
+
+            print("调用服务:")
+            resp = client.call(
+                service_name=service_name,
+                method="square",
+                payload={"x": 7},
+                timeout_sec=10.0,
             )
-        print()
+            print(f"  square(7) = {resp}")
 
-        print("调用服务:")
-        resp = client.call(
+        print()
+        print("[GatewayConnect]")
+        print("-" * 60)
+        module_client = GatewayConnect(
+            gateway_target,
             service_name=service_name,
-            method="square",
-            payload={"x": 7},
             timeout_sec=10.0,
         )
-        print(f"  square(7) = {resp}")
+        print(f"可用方法: {module_client.methods}")
+        print()
 
-    print()
-    print("[GatewayConnect]")
-    print("-" * 60)
-    module_client = GatewayConnect(
-        gateway_target,
-        service_name=service_name,
-        timeout_sec=10.0,
-    )
-    print(f"可用方法: {module_client.methods}")
-    print()
+        print("同步调用:")
+        print(f"  square(9) = {module_client.square.sync(x=9)}")
+        print()
 
-    print("同步调用:")
-    print(f"  square(9) = {module_client.square.sync(x=9)}")
-    print()
+        print("异步调用:")
 
-    print("异步调用:")
+        async def _run() -> None:
+            result = await module_client.square(x=11)
+            print(f"  square(11) = {result}")
 
-    async def _run() -> None:
-        result = await module_client.square(x=11)
-        print(f"  square(11) = {result}")
-
-    asyncio.run(_run())
+        asyncio.run(_run())
+    finally:
+        if group is not None:
+            group.close(end_services=True, reason="demo_gateway_client cleanup")
 
 
 if __name__ == "__main__":

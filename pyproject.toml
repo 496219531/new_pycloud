@@ -6,12 +6,11 @@ build-backend = "setuptools.build_meta"
 # 项目元信息：名称、版本、Python 版本要求以及基础依赖。
 [project]
 name = "pycloud-parallel"
-version = "0.1.15"
+version = "0.1.18"
 description = "Cluster-first task/service orchestration with gRPC control plane, plus lightweight local parallel helpers."
 readme = "README.md"
 requires-python = ">=3.8"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { text = "MIT" }
 authors = [{ name = "pycloud" }]
 keywords = [
   "cluster",

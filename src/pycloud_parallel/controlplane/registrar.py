@@ -91,6 +91,21 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
         metadata["pycloud_version"] = self._pycloud_version()
+        task_pools = [
+            {
+                "pool_id": item.pool_id,
+                "owner_client_id": item.owner_client_id,
+                "pool_name": item.pool_name,
+                "code_version": item.code_version,
+                "status": item.status,
+                "worker_count": int(item.worker_count),
+                "task_count": int(item.task_count),
+                "created_at": item.created_at.isoformat(),
+                "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
+                "lease_expire_at": item.lease_expire_at.isoformat(),
+            }
+            for item in self.state.task_pool_reports().values()
+        ]
         resp = self._client.register_node(
             node_id=self.node_id,
             node_instance_id=self.node_instance_id,
@@ -101,9 +116,12 @@ class NodeInfoCenterRegistrar:
             version=self.version,
             metadata=metadata,
             services=self.state.service_reports(),
+            task_pools=task_pools,
             active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
+            task_pool_worker_capacity=self.state.task_pool_worker_capacity,
+            task_pool_worker_used=self.state.task_pool_worker_used(),
             python_version=self.state.python_version,
         )
         with self._sync_lock:
@@ -116,6 +134,21 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
         metadata["pycloud_version"] = self._pycloud_version()
+        task_pools = [
+            {
+                "pool_id": item.pool_id,
+                "owner_client_id": item.owner_client_id,
+                "pool_name": item.pool_name,
+                "code_version": item.code_version,
+                "status": item.status,
+                "worker_count": int(item.worker_count),
+                "task_count": int(item.task_count),
+                "created_at": item.created_at.isoformat(),
+                "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
+                "lease_expire_at": item.lease_expire_at.isoformat(),
+            }
+            for item in self.state.task_pool_reports().values()
+        ]
         resp = self._client.heartbeat_node(
             node_id=self.node_id,
             node_instance_id=self.node_instance_id,
@@ -130,9 +163,12 @@ class NodeInfoCenterRegistrar:
             },
             metadata=metadata,
             services=self.state.service_reports(),
+            task_pools=task_pools,
             active_runtimes=self.state.active_runtime_keys(limit=10),
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
+            task_pool_worker_capacity=self.state.task_pool_worker_capacity,
+            task_pool_worker_used=self.state.task_pool_worker_used(),
             python_version=self.state.python_version,
         )
         with self._sync_lock:

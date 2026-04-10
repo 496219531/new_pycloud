@@ -10,15 +10,17 @@
 
 | 环境变量 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES` | `262144` | inline payload 建议转 `ObjectRef` 阈值 |
-| `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES` | `1048576` | 单个 inline payload 硬限制 |
-| `PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES` | `4194304` | 单次请求所有 inline payload 总硬限制 |
-| `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES` | `262144` | inline result 建议转 `ResultRef` 阈值 |
-| `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `1048576` | 单个 inline result 硬限制 |
+| `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES` | `524288` | inline payload 建议转 `ObjectRef` 阈值 |
+| `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES` | `2097152` | 单个 inline payload 硬限制 |
+| `PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES` | `8388608` | 单次请求所有 inline payload 总硬限制 |
+| `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES` | `1048576` | inline result 建议转 `ResultRef` 阈值 |
+| `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `4194304` | 单个 inline result 硬限制 |
 | `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES` | `262144` | 对象上传/下载默认分片大小 |
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
-| `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES` | `4194304` | gRPC 单条发送消息限制 |
-| `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `4194304` | gRPC 单条接收消息限制 |
+| `PYCLOUD_OBJECT_SEGMENT_MAX_BYTES` | `8388608` | 单个结果段文件允许的最大大小 |
+| `PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES` | `67108864` | 结果段文件滚动写入的目标大小 |
+| `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条发送消息限制 |
+| `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条接收消息限制 |
 | `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role nodecontrol` 的默认 worker capacity；`pycloudctl start` 未显式指定时优先读它 |
 | `PYCLOUD_NODE_QUEUE_CAPACITY` | `4000` | `pycloud-control --role nodecontrol` 的默认 queue capacity；`pycloudctl start-node` 默认值为 `1000`，也可被它覆盖 |
 | `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl gRPC server 的默认线程池大小 |
@@ -40,24 +42,24 @@
 ### 2.1 inline payload / result
 
 - `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
-  - 默认：`262144` (`256 KiB`)
+  - 默认：`524288` (`512 KiB`)
   - 用于“建议转 ObjectRef”的阈值
 
 - `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES`
-  - 默认：`1048576` (`1 MiB`)
+  - 默认：`2097152` (`2 MiB`)
   - 单个 inline payload 的硬限制
 
 - `PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES`
-  - 默认：`4194304` (`4 MiB`)
+  - 默认：`8388608` (`8 MiB`)
   - 一次请求里所有 inline payload 的总硬限制
 
 - `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES`
-  - 默认：`262144` (`256 KiB`)
+  - 默认：`1048576` (`1 MiB`)
   - 结果建议转 `ResultRef` 的阈值
 
 - `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`
-  - 默认：`1048576` (`1 MiB`)
-  - 单个 inline result 的硬限制
+  - 默认：`4194304` (`4 MiB`)
+  - 单个 inline result 的硬限制；超出后更容易走对象缓存 / `ResultRef`
 
 ### 2.2 object / file chunk
 
@@ -70,13 +72,21 @@
   - 默认：`1048576` (`1 MiB`)
   - 本地文件做 SHA256 计算时的读取分片大小
 
+- `PYCLOUD_OBJECT_SEGMENT_MAX_BYTES`
+  - 默认：`8388608` (`8 MiB`)
+  - 单个对象段文件允许的最大大小
+
+- `PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES`
+  - 默认：`67108864` (`64 MiB`)
+  - 对象 / 结果分段写入时，单个段文件的目标滚动大小
+
 ### 2.3 gRPC message size
 
 - `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES`
-  - 默认：`4194304` (`4 MiB`)
+  - 默认：`16777216` (`16 MiB`)
 
 - `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES`
-  - 默认：`4194304` (`4 MiB`)
+  - 默认：`16777216` (`16 MiB`)
 
 当前 `NodeControlClient` 和 `build_nodecontrol_server(...)` 都会读取这两个值，统一设置 gRPC channel/server 的 message size 限制。
 

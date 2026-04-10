@@ -1,20 +1,29 @@
 """中文说明：验证 gRPC 控制面的核心状态流转（内存后端）。"""
 
 import hashlib
+import inspect
 import io
 import json
+import math
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 import pytest
 
 from pycloud_parallel.controlplane.client import ServiceGroup, ServiceSessionClient
+from pycloud_parallel.controlplane import serialization as serialization_mod
 from pycloud_parallel.controlplane.state import (
     NodeControlState,
     _build_execute_spec,
+    _code_scope_dir,
+    _commit_result_file,
     _execute_payload_in_subprocess,
+    _normalize_user_return,
+    _resolve_object_refs_in_payload,
     dict_to_struct,
     struct_to_dict,
     utc_now,
@@ -98,6 +107,60 @@ def test_submit_poll_report_and_pull_results(tmp_path):
         assert next_cursor2 == "0"
     finally:
         state.close()
+
+
+def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeypatch):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"hello")
+    object_dir = tmp_path / "objects"
+    calls = {"count": 0}
+    real_replace = os.replace
+
+    def _flaky_replace(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise PermissionError(13, "Access is denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _flaky_replace)
+    artifact = _commit_result_file(source, object_dir=str(object_dir), fmt="bin", size_bytes=5, materialize_as="path")
+
+    assert artifact.object_id.startswith("sha256:")
+    digest = artifact.object_id.replace("sha256:", "", 1)
+    stored = object_dir / digest[:2] / f"{digest[2:]}.bin"
+    assert stored.exists()
+    assert stored.read_bytes() == b"hello"
+
+
+def test_normalize_user_return_inlines_dataframe_when_limit_allows(tmp_path, monkeypatch):
+    pd = pytest.importorskip("pandas")
+
+    monkeypatch.setattr(serialization_mod, "INLINE_RESULT_HARD_LIMIT_BYTES", 8 * 1024 * 1024)
+    frame = pd.DataFrame([{"x": 1}, {"x": 2}])
+    status, result, err_type, err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
+
+    assert status == "SUCCEEDED"
+    assert err_type == ""
+    assert err_message == ""
+    assert not isinstance(result, dict) or "__pycloud_result_ref__" not in result
+    restored = struct_to_dict(dict_to_struct({"frame": result}))
+    pd.testing.assert_frame_equal(restored["frame"], frame)
+
+
+def test_normalize_user_return_spills_dataframe_when_limit_too_small(tmp_path, monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import pycloud_parallel.controlplane.state as state_mod
+    from pycloud_parallel.controlplane.state import StoredResultArtifact
+
+    def _raise_inline_limit(*args, **kwargs):
+        raise ValueError("inline result too large")
+
+    monkeypatch.setattr(state_mod, "serialize_inline_result", _raise_inline_limit)
+    frame = pd.DataFrame([{"x": idx, "y": "a" * 50} for idx in range(10)])
+    status, result, _err_type, _err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
+
+    assert status == "SUCCEEDED"
+    assert isinstance(result, StoredResultArtifact)
 
 
 def test_nested_arrow_payload_roundtrip():
@@ -290,6 +353,27 @@ def test_series_object_upload_preserves_index_and_name():
         Path(tmp_name).unlink(missing_ok=True)
 
 
+def test_json_object_upload_roundtrip_supports_nested_series():
+    pd = pytest.importorskip("pandas")
+
+    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+    from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
+
+    payload = {
+        "series": pd.Series([1.0, 2.0], index=[pd.Timestamp("2024-01-02"), pd.Timestamp("2024-01-03")], name="nav"),
+        "value": 3,
+    }
+    kind, fmt, blob = _serialize_data_for_object_ref(payload, format="json")
+
+    assert kind == "json"
+    assert fmt == "json"
+    restored = convert_dict_to_arrow(json.loads(blob.decode("utf-8")))
+    assert restored["value"] == 3
+    assert isinstance(restored["series"], pd.Series)
+    assert restored["series"].name == "nav"
+    assert list(restored["series"]) == [1.0, 2.0]
+
+
 def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
@@ -324,6 +408,135 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
 
     restored = _resolve_object_refs_in_payload(payload, object_dir=str(tmp_path))
     pd.testing.assert_frame_equal(restored["frame"], frame)
+
+
+def test_code_scope_dir_uses_short_storage_key_for_variant_code_versions(tmp_path):
+    code_version = "sha256:" + ("a" * 64) + "." + ("b" * 16)
+    path = _code_scope_dir(tmp_path, code_version=code_version)
+    assert path.parent.name == "codes"
+    assert path.name != code_version.replace("sha256:", "")
+    assert len(path.name) == 40
+
+
+def test_struct_to_dict_preserves_nan_in_dataframe_payload(tmp_path):
+    import pandas as pd
+
+    payload = {
+        "__type__": "DataFrame",
+        "data": [[1.0], [float("nan")]],
+        "index": {"kind": "range", "start": 0, "stop": 2, "step": 1, "name": {"__type__": "pd.label", "kind": "none"}},
+        "columns": {"kind": "index", "values": [{"__type__": "pd.label", "kind": "str", "value": "x"}], "name": {"__type__": "pd.label", "kind": "none"}},
+        "column_dtypes": ["float64"],
+    }
+    restored = struct_to_dict(dict_to_struct(payload))
+    assert isinstance(restored, pd.DataFrame)
+    assert restored.shape == (2, 1)
+    assert math.isnan(float(restored.iloc[1, 0]))
+
+
+def test_put_object_from_uploaded_file_uses_segment_backend_for_medium_objects(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import state as state_mod
+
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    node_state = NodeControlState(
+        node_id="node-object-segment-01",
+        artifact_dir=str(tmp_path / "code_cache_object_segment"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"x" * 512
+        uploaded_path = tmp_path / "upload.bin"
+        uploaded_path.write_bytes(blob)
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        artifact, cached = node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="bin",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+        assert cached is False
+        assert artifact.storage_backend == "segment"
+        assert Path(artifact.segment_path).exists()
+        with open(artifact.segment_path, "rb") as fp:
+            fp.seek(artifact.segment_offset)
+            assert fp.read(artifact.segment_length) == blob
+        loaded = node_state.get_object_artifact(object_id)
+        assert loaded.storage_backend == "segment"
+        assert loaded.segment_length == len(blob)
+    finally:
+        node_state.close()
+
+
+def test_resolve_object_refs_reads_segment_backend(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.controlplane import state as state_mod
+
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    node_state = NodeControlState(
+        node_id="node-object-resolve-01",
+        artifact_dir=str(tmp_path / "code_cache_object_resolve"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = json.dumps({"x": 1}).encode("utf-8")
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        uploaded_path = tmp_path / "upload.json"
+        uploaded_path.write_bytes(blob)
+        node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="json",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+        payload = {
+            "item": ObjectRef(
+                object_id=object_id,
+                format="json",
+                size_bytes=len(blob),
+                materialize_as="json",
+                consume_on_read=True,
+            )
+        }
+        resolved = _resolve_object_refs_in_payload(payload, object_dir=str(node_state.object_dir))
+        assert resolved == {"item": {"x": 1}}
+    finally:
+        node_state.close()
+
+
+def test_put_object_from_uploaded_file_uses_file_backend_for_large_objects(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import state as state_mod
+
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 128)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    node_state = NodeControlState(
+        node_id="node-object-file-01",
+        artifact_dir=str(tmp_path / "code_cache_object_file"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"x" * 512
+        uploaded_path = tmp_path / "upload-large.bin"
+        uploaded_path.write_bytes(blob)
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        artifact, cached = node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="bin",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+        assert cached is False
+        assert artifact.storage_backend == "file"
+        assert Path(artifact.path).exists()
+    finally:
+        node_state.close()
 
 
 def test_infra_timeout_requeue_then_retry(tmp_path):
@@ -895,6 +1108,193 @@ def test_service_sessions_with_same_blob_and_different_managed_globals_can_coexi
         state.close()
 
 
+def test_managed_globals_validation_reuses_single_module_load(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-svc-managed-load-once",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_managed_once"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    calls = {"count": 0}
+    original = sys.modules["pycloud_parallel.controlplane.state"]._load_user_module
+
+    def wrapped(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.state._load_user_module", wrapped)
+    try:
+        blob = (
+            b"A = None\n"
+            b"B = None\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'ok': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _ = state.put_code(
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_managed_once",
+            entry_callable="run",
+            package_format="py",
+            export_mode="decorator",
+            managed_global_names=["A", "B"],
+            chunks=[blob],
+            validate_load=False,
+        )
+        methods = state._validate_artifact_methods(artifact, dependency_path="")
+        assert sorted(methods.keys()) == ["run"]
+        assert calls["count"] == 1
+    finally:
+        state.close()
+
+
+def test_update_service_globals_rejects_callable_module_and_class_values(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-managed-update-guard",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_managed_update"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = (
+            b"A = None\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'ok': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-a",
+            service_name="svc-a",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_managed_update",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["A"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        class _CallableObject:
+            def __call__(self):
+                return "x"
+
+        with pytest.raises(ValueError, match="managed globals must be data values"):
+            state.update_service_globals(
+                owner_client_id="owner-a",
+                service_id=session.service_id,
+                service_token=session.service_token,
+                values={"A": len},
+            )
+
+        with pytest.raises(ValueError, match="managed globals must be data values"):
+            state.update_service_globals(
+                owner_client_id="owner-a",
+                service_id=session.service_id,
+                service_token=session.service_token,
+                values={"A": _CallableObject},
+            )
+
+        with pytest.raises(ValueError, match="managed globals must be data values"):
+            state.update_service_globals(
+                owner_client_id="owner-a",
+                service_id=session.service_id,
+                service_token=session.service_token,
+                values={"A": inspect},
+            )
+
+        with pytest.raises(ValueError, match="managed globals must be data values"):
+            state.update_service_globals(
+                owner_client_id="owner-a",
+                service_id=session.service_id,
+                service_token=session.service_token,
+                values={"A": _CallableObject()},
+            )
+    finally:
+        state.close()
+
+
+def test_update_service_globals_triggers_warmup_with_worker_pids(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-svc-managed-warmup",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_managed_warmup"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    warmup_calls = []
+    monkeypatch.setattr(
+        state,
+        "_log_warmup_result",
+        lambda **kwargs: warmup_calls.append(("log", kwargs)),
+    )
+    try:
+        blob = (
+            b"A = None\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'ok': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-a",
+            service_name="svc-a",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_managed_warmup",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["A"],
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+        monkeypatch.setattr(
+            state._executor_host,
+            "warmup_service",
+            lambda **kwargs: warmup_calls.append(("warmup", kwargs)) or [111, 222],
+        )
+        digest_a, updated = state.update_service_globals(
+            owner_client_id="owner-a",
+            service_id=session.service_id,
+            service_token=session.service_token,
+            values={"A": 10},
+        )
+        assert digest_a
+        assert updated == ["A"]
+        warmup = next(item for kind, item in warmup_calls if kind == "warmup")
+        assert warmup["service_id"] == session.service_id
+        assert warmup["fanout"] == 4
+        logged = next(item for kind, item in warmup_calls if kind == "log")
+        assert logged["worker_pids"] == [111, 222]
+    finally:
+        state.close()
+
+
 def test_task_pool_keeps_instance_managed_global_names(tmp_path):
     state = NodeControlState(
         node_id="node-pool-managed-01",
@@ -922,6 +1322,258 @@ def test_task_pool_keeps_instance_managed_global_names(tmp_path):
             chunks=[blob],
         )
         assert pool.managed_global_names == ("STATE",)
+    finally:
+        state.close()
+
+
+def test_task_pool_execution_uses_private_managed_globals(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-managed-exec-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_managed_exec"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"STATE = None\ndef run(**_kwargs):\n    return {'state': STATE}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-managed-exec",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_managed_exec",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["STATE"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        assert pool.managed_globals_scope_dir
+        assert pool.managed_globals_digest
+
+        globals_digest, updated = state.update_runtime_globals(
+            client_id=pool.pool_id,
+            code_version=pool.code_version,
+            runtime_key=pool.pool_id,
+            code_token=state.get_client_code_token(client_id=pool.pool_id, code_version=pool.code_version),
+            values={"STATE": 123},
+        )
+        assert updated == ["STATE"]
+        pool.managed_globals_digest = globals_digest
+
+        accepted, rejected = state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            tasks=[pb2.TaskSubmitItem(task_id="pool-task-1", payload={})],
+            job_id="job-managed",
+        )
+        assert [x.task_id for x in accepted] == ["pool-task-1"]
+        assert rejected == []
+
+        deadline = time.time() + 5.0
+        results = []
+        while time.time() < deadline:
+            state._drain_executor_events()  # noqa: SLF001
+            results, _cursor = state.pull_pool_results(
+                pool_id=pool.pool_id,
+                pool_token=pool.pool_token,
+                limit=10,
+                wait_ms=0,
+                cursor="",
+            )
+            if results:
+                break
+            time.sleep(0.05)
+
+        assert len(results) == 1
+        assert struct_to_dict(results[0].result) == {"state": 123}
+    finally:
+        state.close()
+
+
+def test_update_runtime_globals_for_pool_triggers_pool_warmup(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-managed-warmup",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_warmup"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    warmup_calls = []
+    monkeypatch.setattr(
+        state,
+        "_log_warmup_result",
+        lambda **kwargs: warmup_calls.append(("log", kwargs)),
+    )
+    try:
+        blob = b"STATE = None\ndef run(**_kwargs):\n    return {'state': STATE}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-managed-warmup",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_managed_warmup",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["STATE"],
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        monkeypatch.setattr(
+            state._executor_host,
+            "warmup_pool",
+            lambda **kwargs: warmup_calls.append(("warmup", kwargs)) or [333, 444],
+        )
+        digest_out, updated = state.update_runtime_globals(
+            client_id=pool.pool_id,
+            code_version=pool.code_version,
+            runtime_key=pool.pool_id,
+            code_token=state.get_client_code_token(client_id=pool.pool_id, code_version=pool.code_version),
+            values={"STATE": 123},
+        )
+        assert digest_out
+        assert updated == ["STATE"]
+        warmup = next(item for kind, item in warmup_calls if kind == "warmup")
+        assert warmup["pool_id"] == pool.pool_id
+        assert warmup["fanout"] == 4
+        logged = next(item for kind, item in warmup_calls if kind == "log")
+        assert logged["worker_pids"] == [333, 444]
+    finally:
+        state.close()
+
+
+def test_runtime_managed_globals_mapping_prefers_runtime_key_and_falls_back(tmp_path):
+    state = NodeControlState(
+        node_id="node-runtime-managed-map-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_runtime_map"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        with state._lock:  # noqa: SLF001
+            state._register_client_code_managed_globals_locked(  # noqa: SLF001
+                client_id="client-a",
+                code_version="sha256:" + ("a" * 64),
+                runtime_key="",
+                managed_global_names=["A"],
+            )
+            state._register_client_code_managed_globals_locked(  # noqa: SLF001
+                client_id="client-a",
+                code_version="sha256:" + ("a" * 64),
+                runtime_key="rt-1",
+                managed_global_names=["B"],
+            )
+
+        assert state.get_client_code_managed_globals(  # noqa: SLF001
+            client_id="client-a",
+            code_version="sha256:" + ("a" * 64),
+            runtime_key="rt-1",
+        ) == ("B",)
+        assert state.get_client_code_managed_globals(  # noqa: SLF001
+            client_id="client-a",
+            code_version="sha256:" + ("a" * 64),
+            runtime_key="rt-2",
+        ) == ("A",)
+    finally:
+        state.close()
+
+
+def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
+    from pycloud_parallel.controlplane.client import _prepare_http_payload_for_call
+    from pycloud_parallel.controlplane.object_ref import ObjectRef
+
+    captured = {}
+
+    def fake_put(clients, data, *, format="", chunk_size=0):
+        captured["data"] = data
+        captured["format"] = format
+        return ObjectRef(
+            object_id="sha256:" + ("f" * 64),
+            format=format or "json",
+            size_bytes=2048,
+            materialize_as="json" if format == "json" else "bytes",
+        )
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
+        lambda value: 2048 if isinstance(value, (dict, list)) else 16,
+    )
+
+    payload = {"small": 1, "big": {"x": [1, 2, 3]}}
+    prepared = _prepare_http_payload_for_call([object()], payload, object_threshold_bytes=1024)
+
+    assert prepared["small"] == 1
+    assert isinstance(prepared["big"], ObjectRef)
+    assert prepared["big"].consume_on_read is True
+    assert captured["format"] == "json"
+
+
+def test_service_and_task_pool_with_same_code_version_keep_independent_managed_globals(tmp_path):
+    state = NodeControlState(
+        node_id="node-shared-code-managed-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_shared_managed"),
+        enable_internal_executor=True,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = (
+            b"A = None\n"
+            b"B = None\n"
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'ok': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-service",
+            service_name="svc-shared",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="shared_managed_demo",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["A"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-shared",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="shared_managed_demo",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["B"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        assert session.code_version == pool.code_version
+        assert session.managed_global_names == ("A",)
+        assert pool.managed_global_names == ("B",)
     finally:
         state.close()
 

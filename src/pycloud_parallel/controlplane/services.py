@@ -347,6 +347,24 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             return
 
         try:
+            if getattr(artifact, "storage_backend", "file") == "segment":
+                touch_object_last_at(self._state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.segment_path))
+                with open(artifact.segment_path, "rb") as fp:
+                    fp.seek(max(0, int(getattr(artifact, "segment_offset", 0) or 0)))
+                    remaining = max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes))
+                    while remaining > 0:
+                        part = fp.read(min(OBJECT_CHUNK_SIZE_BYTES, remaining))
+                        if not part:
+                            break
+                        remaining -= len(part)
+                        yield pb2.DownloadObjectChunk(
+                            object_id=artifact.object_id,
+                            format=artifact.format,
+                            size_bytes=artifact.size_bytes,
+                            chunk=part,
+                        )
+                return
+
             touch_object_last_at(self._state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.path))
             with open(artifact.path, "rb") as fp:
                 while True:
