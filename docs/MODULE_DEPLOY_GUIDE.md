@@ -10,9 +10,9 @@
 import my_job.main
 from pycloud_parallel import DeployedService
 
-group = DeployedService.deploy_from_module(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
-    module=my_job.main,
+    entry_module=my_job.main,
     runtime="py3",
 )
 ```
@@ -40,7 +40,7 @@ group = DeployedService.deploy_from_module(
 
 1. 把数据文件放进模块 / package 目录树内部
 2. 使用 `Path(__file__).resolve().parent / ...` 的相对路径读取
-3. `module` 自动打包会把模块 / package 树里的资源文件一起带上
+3. 传真实模块对象给 `entry_module` 时，会把模块 / package 树里的资源文件一起带上
 
 ## 4. 已移除
 

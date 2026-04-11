@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent import futures
+from datetime import datetime, timezone
 import json
 import time
 from typing import Tuple
@@ -9,7 +10,8 @@ from urllib.request import Request, urlopen
 import grpc
 import pytest
 
-from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, NodeControlClient
+from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, InfoCenterServiceRoute, NodeControlClient
+from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.result_ref import ResultRef
 from pycloud_parallel.controlplane.server import build_controlplane_server, build_gateway_server, build_infocenter_server
 from pycloud_parallel.controlplane.services import NodeControlService
@@ -101,7 +103,7 @@ def _register_node_with_services(
             capacity=8,
             queue_capacity=64,
             tags=["compute"],
-            services=state.service_reports(),
+            services=state.service_report_payloads(),
             service_worker_capacity=state.worker_capacity,
             service_worker_used=state.service_worker_used(),
         )
@@ -158,6 +160,7 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
         assert status_resp["service_name"] == "svc_gateway_controlplane"
         assert status_resp["route_count"] == 1
         assert status_resp["routes"][0]["service_id"] == service_id
+        assert "predicted_busy" in status_resp["routes"][0]
 
         with GatewayServiceClient(controlplane.base_url, timeout_sec=5.0) as gateway:
             methods = gateway.list_methods(service_name="svc_gateway_controlplane", include_docs=False)
@@ -183,6 +186,54 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
         node_server.stop(grace=0)
         node_state.close()
         controlplane.stop()
+
+
+def test_gateway_route_cache_defaults_to_predicted_busy():
+    class _StaticSource:
+        def __init__(self, routes):
+            self._routes = list(routes)
+
+        def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int):
+            del service_name, healthy_only, limit
+            return list(self._routes)
+
+    routes = [
+        InfoCenterServiceRoute(
+            service_name="svc-gateway-cache",
+            service_id="svc-low-inflight",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_instance_id="node-1-inst",
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            node_healthy=True,
+            worker_count=2,
+            alive_workers=2,
+            in_flight=1,
+            lease_expire_at=datetime.now(timezone.utc),
+            http_base_url="http://127.0.0.1:18081/svc/svc-low-inflight",
+            predicted_busy=24.0,
+        ),
+        InfoCenterServiceRoute(
+            service_name="svc-gateway-cache",
+            service_id="svc-low-predicted",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_instance_id="node-2-inst",
+            node_id="node-2",
+            control_addr="127.0.0.1:50062",
+            node_healthy=True,
+            worker_count=2,
+            alive_workers=2,
+            in_flight=3,
+            lease_expire_at=datetime.now(timezone.utc),
+            http_base_url="http://127.0.0.1:18082/svc/svc-low-predicted",
+            predicted_busy=8.0,
+        ),
+    ]
+    cache = GatewayRouteCache(source=_StaticSource(routes), refresh_interval_sec=60.0)
+    try:
+        assert cache.select_route("svc-gateway-cache", force_refresh=True).service_id == "svc-low-predicted"
+    finally:
+        cache.stop()
 
 
 def test_standalone_gateway_reads_routes_from_infocenter(tmp_path):

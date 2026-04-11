@@ -79,6 +79,10 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             worker_count=max(0, int(item.get("worker_count", 0) or 0)),
             alive_workers=max(0, int(item.get("alive_workers", 0) or 0)),
             in_flight=max(0, int(item.get("in_flight", 0) or 0)),
+            received_count=max(0, int(item.get("received_count", 0) or 0)),
+            returned_count=max(0, int(item.get("returned_count", 0) or 0)),
+            ema_child_invoke_ms=float(item.get("ema_child_invoke_ms", 0.0) or 0.0),
+            ema_samples=max(0, int(item.get("ema_samples", 0) or 0)),
             lease_expire_at=_parse_dt(item.get("lease_expire_at") or item.get("lease_expire_at_ts") or utc_now()),
             http_base_url=str(item.get("http_base_url", "") or ""),
         )

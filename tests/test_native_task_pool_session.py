@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+import io
+import tarfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +10,27 @@ import pytest
 
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.serialization import dict_to_struct
+
+
+def _build_task_entry_module(tmp_path, monkeypatch):
+    package_name = "demo_task_pkg_entry"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "helper.py").write_text(
+        "def normalize(value):\n"
+        "    return int(value)\n",
+        encoding="utf-8",
+    )
+    (package_dir / "worker.py").write_text(
+        "from .helper import normalize\n\n"
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': normalize(value)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    return importlib.import_module(f"{package_name}.worker")
 
 
 def test_native_task_pool_session_submit_and_wait() -> None:
@@ -109,6 +133,33 @@ def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None
         session.close()
 
 
+def test_native_task_pool_session_submit_payloads_rejects_unknown_task_method() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+        pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+        heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+        cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPoolSession(
+        pools={"node-1": fake_pool},
+        nodes={},
+        task_method="run",
+        job_id="job-native-method-check",
+    )
+    try:
+        with pytest.raises(AttributeError, match="has no method 'other'"):
+            session.submit_payloads([{"value": 1}], task_method="other")
+    finally:
+        session.close()
+
+
 def test_native_task_pool_session_status_map() -> None:
     from pycloud_parallel.controlplane.client import TaskPoolSession
 
@@ -146,6 +197,106 @@ def test_native_task_pool_session_status_map() -> None:
     try:
         status_map = session.status_map()
         assert status_map["node-1"].status == "RUNNING"
+    finally:
+        session.close()
+
+
+def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    worker_module = _build_task_entry_module(tmp_path, monkeypatch)
+    fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
+    fake_pool_client = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-1",
+        pool_token="token-1",
+        code_version="sha256:test",
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+        pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+        heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    captured = {}
+
+    def _fake_create_task_pool(self, **kwargs):
+        captured.update(kwargs)
+        return fake_pool_client
+
+    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+        _fake_create_task_pool,
+    ):
+        mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
+        session = TaskPoolSession.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-native-module-entry",
+            entry_module=worker_module,
+            entry_callable="run",
+            worker_count=2,
+            node_count=1,
+        )
+
+    try:
+        assert captured["entry_module"] == worker_module.__name__
+        assert captured["package_format"] == "tar.gz"
+        with tarfile.open(fileobj=io.BytesIO(captured["blob"]), mode="r:gz") as tar:
+            names = set(tar.getnames())
+        assert f"{worker_module.__package__}/__init__.py" in names
+        assert f"{worker_module.__package__}/worker.py" in names
+        assert f"{worker_module.__package__}/helper.py" in names
+    finally:
+        session.close()
+
+
+def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    worker_module = _build_task_entry_module(tmp_path, monkeypatch)
+    fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
+    fake_pool_client = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-1",
+        pool_token="token-1",
+        code_version="sha256:test",
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+        pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+        heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    captured = {}
+
+    def _fake_create_task_pool(self, **kwargs):
+        captured.update(kwargs)
+        return fake_pool_client
+
+    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+        _fake_create_task_pool,
+    ):
+        mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
+        session = TaskPoolSession.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-native-callable-entry",
+            entry_callable=worker_module.run,
+            worker_count=2,
+            node_count=1,
+        )
+
+    try:
+        assert captured["entry_module"] == worker_module.__name__
+        assert captured["entry_callable"] == "run"
+        assert captured["package_format"] == "tar.gz"
+        with tarfile.open(fileobj=io.BytesIO(captured["blob"]), mode="r:gz") as tar:
+            names = set(tar.getnames())
+        assert f"{worker_module.__package__}/__init__.py" in names
+        assert f"{worker_module.__package__}/worker.py" in names
+        assert f"{worker_module.__package__}/helper.py" in names
     finally:
         session.close()
 
@@ -485,6 +636,173 @@ def test_native_task_pool_session_imap_unordered_streams_results() -> None:
     assert session._pending_task_ids == set()  # noqa: SLF001
 
 
+def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_polling() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    submissions: dict[str, list[str]] = {"node-1": [], "node-2": []}
+    pull_calls: list[str] = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._client = SimpleNamespace()
+
+        def submit_tasks(self, tasks, job_id=""):
+            submissions[self.node_id].extend(item.task_id for item in tasks)
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            pull_calls.append(self.node_id)
+            return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
+
+    session = TaskPoolSession(
+        pools={"node-1": _Pool("node-1"), "node-2": _Pool("node-2")},
+        nodes={},
+        task_method="run",
+        job_id="job-submit-rr",
+    )
+
+    resp = session.submit_payloads([{"value": 1}, {"value": 2}, {"value": 3}, {"value": 4}], job_id="job-submit-override")
+
+    assert len(resp.accepted) == 4
+    assert submissions["node-1"] == ["job-submit-rr-task-0001", "job-submit-rr-task-0003"]
+    assert submissions["node-2"] == ["job-submit-rr-task-0002", "job-submit-rr-task-0004"]
+    assert pull_calls == []
+    assert session._pending_task_ids == set(resp_task.task_id for resp_task in resp.accepted)  # noqa: SLF001
+
+
+def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    pull_calls: list[str] = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            pull_calls.append(self.node_id)
+            return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
+
+    session = TaskPoolSession(
+        pools={"node-1": _Pool("node-1"), "node-2": _Pool("node-2")},
+        nodes={},
+        task_method="run",
+        job_id="job-poll-rotate",
+    )
+
+    with pytest.raises(TimeoutError, match="imap_unordered did not receive results"):
+        list(
+            session.imap_unordered(
+                [{"value": 1}],
+                max_in_flight=1,
+                receive_batch=1,
+                result_timeout_sec=0.08,
+                wait_ms=1,
+            )
+        )
+
+    assert pull_calls[:4] == ["node-1", "node-2", "node-2", "node-1"]
+
+
+def test_native_task_pool_session_imap_unordered_refills_fast_node() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    submitted_by_node: dict[str, list[str]] = {"node-slow": [], "node-fast": []}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str, *, ready_after_pulls: int) -> None:
+            self.node_id = node_id
+            self._ready_after_pulls = ready_after_pulls
+            self._inflight: list[list[object]] = []
+            self._client = SimpleNamespace(
+                fetch_result_data=lambda task_result, target_path="": {
+                    "task_id": task_result.task_id,
+                    "node_id": self.node_id,
+                }
+            )
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                submitted_by_node[self.node_id].append(item.task_id)
+                self._inflight.append([item.task_id, self._ready_after_pulls])
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            ready: list[pb2.TaskResult] = []
+            kept: list[list[object]] = []
+            for task_id, remaining in self._inflight:
+                next_remaining = int(remaining) - 1
+                if next_remaining <= 0 and len(ready) < limit:
+                    ready.append(
+                        pb2.TaskResult(
+                            task_id=str(task_id),
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"node_id": self.node_id}),
+                        )
+                    )
+                else:
+                    kept.append([task_id, next_remaining])
+            self._inflight = kept
+            return pb2.PullResultsResponse(ok=True, results=ready, next_cursor="")
+
+    session = TaskPoolSession(
+        pools={
+            "node-slow": _Pool("node-slow", ready_after_pulls=3),
+            "node-fast": _Pool("node-fast", ready_after_pulls=1),
+        },
+        nodes={},
+        task_method="run",
+        job_id="job-fast-refill",
+    )
+
+    items = list(
+        session.imap_unordered(
+            [{"value": idx} for idx in range(6)],
+            max_in_flight=4,
+            receive_batch=2,
+            result_timeout_sec=0.5,
+            wait_ms=1,
+        )
+    )
+
+    assert len(items) == 6
+    assert len(submitted_by_node["node-fast"]) == 4
+    assert len(submitted_by_node["node-slow"]) == 2
+    assert {data["node_id"] for _task_id, data in items} == {"node-fast", "node-slow"}
+
+
 def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_arrive() -> None:
     from pycloud_parallel.controlplane.client import TaskPoolSession
 
@@ -523,6 +841,68 @@ def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_a
                 wait_ms=10,
             )
         )
+
+
+def test_native_task_pool_session_imap_unordered_cancels_outstanding_on_error() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    cancel_calls: list[tuple[str, str]] = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self) -> None:
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                if item.task_id.endswith("0001"):
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_FAILED_USER,
+                            error=pb2.TaskError(type="UserError", message="boom"),
+                        )
+                    )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+        def cancel_job(self, job_id="", reason=""):
+            cancel_calls.append((job_id, reason))
+            return pb2.CancelJobResponse(ok=True, queued_cancelled=1, running_marked=0, already_done=0, not_found=0)
+
+    session = TaskPoolSession(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-error-cancel",
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        list(
+            session.imap_unordered(
+                [{"value": 1}, {"value": 2}],
+                max_in_flight=2,
+                receive_batch=1,
+                result_timeout_sec=0.5,
+                wait_ms=1,
+            )
+        )
+
+    assert cancel_calls == [("job-error-cancel", "imap_unordered task failure")]
+    assert session._pending_task_ids == set()  # noqa: SLF001
 
 
 def test_native_task_pool_proxy_sync_requires_clean_session() -> None:

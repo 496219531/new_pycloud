@@ -74,13 +74,16 @@ pip install pycloud-parallel
 ```text
 artifact_dir/
   codes/
-    <code_sha>/
+    <storage_key>/
       artifact.py | pkg/
       deps/
       scopes/
         service/<scope_hash>/
         runtime/<scope_hash>/
       meta.json
+  code_index/
+    <entry_module>__<entry_callable>__<short_code>.meta.json
+    <entry_module>__<entry_callable>__<short_code> -> ../codes/<storage_key>
   objects/
     <sha_prefix>/<object_sha>.<fmt>
     meta/<object_sha>.json
@@ -88,15 +91,29 @@ artifact_dir/
     materialized/
 ```
 
-说明：
+结果说明：
 
-1. `codes/<code_sha>/`
-   - 一套代码的作用域目录
+1. `codes/<storage_key>/`
+   - 一套代码的实际缓存目录
+   - 目录名是稳定存储键，不直接暴露长 `code_version`
    - 包含代码本体、补装依赖、managed globals scope 状态与 `meta.json`
-2. `objects/`
+2. `code_index/`
+   - 人类可读索引目录
+   - 每个条目都用 `entry_module + entry_callable + 短 code 标识` 命名
+   - 索引名本体是一个可直接打开的链接，指向真实 `codes/<storage_key>/`
+   - 同名 `.meta.json` 会记录 `code_version`、真实目录、artifact path 等辅助信息
+3. `objects/`
    - 大对象与大结果缓存
    - `meta/<object_sha>.json` 里记录 `created_at`、`last_at` 与存储后端
    - 较大的结果可能会复用 `segments/` 做分段落盘
+
+如果你想找某份缓存代码，优先看索引而不是直接进 `codes/`：
+
+```bash
+pycloudctl cache-list
+pycloudctl cache-list --match calc_asset_ratio
+open code_cache/code_index/<entry_module>__<entry_callable>__<short_code>
+```
 
 ### 结果返回机制
 
@@ -117,16 +134,24 @@ TaskPool / Service 两条执行链路的结果返回当前是自动分流的：
 当前推荐使用离线命令做 GC，而不是把 GC 挂进常驻服务进程：
 
 ```bash
+pycloudctl cache-list --match demo
 pycloudctl gc --dry-run
 pycloudctl gc --scope codes --older-than-hours 168
 pycloudctl gc --scope objects --older-than-hours 168
 pycloudctl gc --scope all --older-than-hours 168
 ```
 
+说明：
+
+1. 如果 `runtime-root` 下检测到本地受管 `controlplane/node` 进程仍在运行，`gc` 默认会拒绝执行破坏性删除
+2. 这种情况下先停进程，再跑 `gc`
+3. `--dry-run` 允许在线查看候选项
+4. 只有明确知道风险时才用 `--force`
+
 当前规则：
 
 1. `codes`
-   - 按 `codes/<code_sha>/meta.json` 的 `last_at`
+   - 按 `codes/<storage_key>/meta.json` 的 `last_at`
    - 超过阈值就删整个 code scope
 2. `objects`
    - 被“当前 globals 版本”引用的对象保留
@@ -346,15 +371,15 @@ group = DeployedService.deploy_from_infocenter(
 )
 ```
 
-如果你有一份**共享静态数据文件**要跟模块一起部署，当前可直接走 `module` / package 打包模式：
+如果你有一份**共享静态数据文件**要跟模块一起部署，当前直接把真实模块对象传给 `entry_module` 即可：
 
 ```python
 import my_job.main
 from pycloud_parallel import DeployedService
 
-group = DeployedService.deploy_from_module(
+group = DeployedService.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
-    module=my_job.main,
+    entry_module=my_job.main,
     runtime="py3",
 )
 ```
@@ -406,6 +431,12 @@ with TaskPoolSession.from_infocenter(
     ):
         print(task_id, data)
 ```
+
+说明：
+
+1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_callable`
+2. `pool.methods` 会返回这个单一方法名
+3. 如果你手动传 `task_method=...`，它现在会做严格校验；方法名不匹配会直接报错，不再静默回退
 
 说明：
 

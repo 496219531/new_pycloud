@@ -3,12 +3,15 @@ from __future__ import annotations
 """Dedicated local executor host process for user-code execution."""
 
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ProcessPoolExecutor
+import logging
 import multiprocessing as mp
 import queue
 import threading
 import time
 from typing import Any, Deque, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
@@ -18,6 +21,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     pool_workers: Dict[str, int] = {}
     task_executor: Optional[ProcessPoolExecutor] = None
     inflight: Dict[object, Dict[str, Any]] = {}
+    warmup_inflight: Dict[object, Dict[str, Any]] = {}
 
     def _send_response(request_id: str, **payload: object) -> None:
         event_q.put({"kind": "response", "request_id": request_id, **payload})
@@ -54,6 +58,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             args["package_format"],
             args["dependency_path"],
             args["object_dir"],
+            args.get("work_dir", ""),
             args.get("managed_globals_scope_dir", ""),
             args.get("managed_globals_digest", ""),
             args["export_mode"],
@@ -96,22 +101,14 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             )
         return task_executor
 
-    def _warmup_executor(executor: Optional[ProcessPoolExecutor], args: Dict[str, Any], *, fanout: int) -> list[int]:
+    def _submit_warmup(executor: Optional[ProcessPoolExecutor], args: Dict[str, Any], *, fanout: int, kind: str) -> int:
         if executor is None:
-            return []
-        futures = [_submit_callable(executor, dict(args)) for _ in range(max(1, int(fanout or 1)))]
-        pids: list[int] = []
-        for future in futures:
-            try:
-                status_text, result, _err_type, _err_message, _timings = _unpack_subprocess_result(future.result())
-                if status_text != "SUCCEEDED" or not isinstance(result, dict):
-                    continue
-                pid = int(result.get("worker_pid", 0) or 0)
-                if pid > 0:
-                    pids.append(pid)
-            except Exception:
-                continue
-        return pids
+            return 0
+        submitted = max(1, int(fanout or 1))
+        for _ in range(submitted):
+            future = _submit_callable(executor, dict(args))
+            warmup_inflight[future] = {"kind": kind, "submitted_at": time.monotonic()}
+        return submitted
 
     def _rebuild_service_executor(service_id: str) -> Optional[ProcessPoolExecutor]:
         worker_count = max(1, int(service_workers.get(service_id, 1) or 1))
@@ -202,17 +199,9 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                 if executor is None:
                     _send_response(request_id, ok=False, error="service executor missing")
                     return True
-                pids = _warmup_executor(executor, payload, fanout=int(payload.get("fanout", 1) or 1))
-                _send_response(request_id, ok=True, worker_pids=pids)
-                return True
-
-            if action == "start_runtime_slot":
-                _ensure_task_executor()
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "stop_runtime_slot":
-                _send_response(request_id, ok=True)
+                fanout = max(1, int(payload.get("fanout", 1) or 1))
+                submitted = _submit_warmup(executor, payload, fanout=fanout, kind="service")
+                _send_response(request_id, ok=True, submitted=submitted)
                 return True
 
             if action == "submit_runtime_task":
@@ -229,8 +218,9 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
 
             if action == "warmup_runtime":
                 executor = _ensure_task_executor()
-                pids = _warmup_executor(executor, payload, fanout=int(payload.get("fanout", 1) or 1))
-                _send_response(request_id, ok=True, worker_pids=pids)
+                fanout = max(1, int(payload.get("fanout", 1) or 1))
+                submitted = _submit_warmup(executor, payload, fanout=fanout, kind="runtime")
+                _send_response(request_id, ok=True, submitted=submitted)
                 return True
 
             if action == "submit_pool_task":
@@ -260,8 +250,9 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                 if executor is None:
                     _send_response(request_id, ok=False, error="task pool missing")
                     return True
-                pids = _warmup_executor(executor, payload, fanout=int(payload.get("fanout", 1) or 1))
-                _send_response(request_id, ok=True, worker_pids=pids)
+                fanout = max(1, int(payload.get("fanout", 1) or 1))
+                submitted = _submit_warmup(executor, payload, fanout=fanout, kind="pool")
+                _send_response(request_id, ok=True, submitted=submitted)
                 return True
 
             _send_response(request_id, ok=False, error=f"unknown action: {action}")
@@ -335,6 +326,14 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                     }
                 )
                 continue
+
+        completed_warmups = [future for future in list(warmup_inflight.keys()) if future.done()]
+        for future in completed_warmups:
+            meta = warmup_inflight.pop(future, {})
+            try:
+                future.result()
+            except Exception as exc:
+                logger.debug("warmup future failed kind=%s err=%r", str(meta.get("kind", "") or ""), exc)
 
         timed_out = []
         for future, meta in list(inflight.items()):
@@ -508,25 +507,19 @@ class ExecutorHostClient:
             return resp
         return resp
 
-    def warmup_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> list[int]:
+    @staticmethod
+    def _parse_warmup_response(resp: Dict[str, Any], *, action: str) -> int:
+        if not resp.get("ok", False):
+            raise RuntimeError(str(resp.get("error", f"{action} failed")))
+        return int(resp.get("submitted", 0) or 0)
+
+    def warmup_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
         resp = self._request(
             "warmup_service",
             payload={"service_id": service_id, "fanout": int(fanout), **dict(execute_spec)},
             timeout_sec=max(1.0, float(fanout) + 5.0),
         )
-        if not resp.get("ok", False):
-            raise RuntimeError(str(resp.get("error", "warmup_service failed")))
-        return [int(pid) for pid in list(resp.get("worker_pids", [])) if int(pid or 0) > 0]
-
-    def start_runtime_slot(self, *, runtime_key: str) -> None:
-        resp = self._request("start_runtime_slot", payload={"runtime_key": runtime_key})
-        if not resp.get("ok", False):
-            raise RuntimeError(str(resp.get("error", "start_runtime_slot failed")))
-
-    def stop_runtime_slot(self, *, runtime_key: str) -> None:
-        resp = self._request("stop_runtime_slot", payload={"runtime_key": runtime_key})
-        if not resp.get("ok", False):
-            raise RuntimeError(str(resp.get("error", "stop_runtime_slot failed")))
+        return self._parse_warmup_response(resp, action="warmup_service")
 
     def submit_runtime_task(
         self,
@@ -548,15 +541,13 @@ class ExecutorHostClient:
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "submit_runtime_task failed")))
 
-    def warmup_runtime(self, *, runtime_key: str, fanout: int, execute_spec: Dict[str, Any]) -> list[int]:
+    def warmup_runtime(self, *, runtime_key: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
         resp = self._request(
             "warmup_runtime",
             payload={"runtime_key": runtime_key, "fanout": int(fanout), **dict(execute_spec)},
             timeout_sec=max(1.0, float(fanout) + 5.0),
         )
-        if not resp.get("ok", False):
-            raise RuntimeError(str(resp.get("error", "warmup_runtime failed")))
-        return [int(pid) for pid in list(resp.get("worker_pids", [])) if int(pid or 0) > 0]
+        return self._parse_warmup_response(resp, action="warmup_runtime")
 
     def submit_pool_task(
         self,
@@ -578,12 +569,10 @@ class ExecutorHostClient:
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "submit_pool_task failed")))
 
-    def warmup_pool(self, *, pool_id: str, fanout: int, execute_spec: Dict[str, Any]) -> list[int]:
+    def warmup_pool(self, *, pool_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
         resp = self._request(
             "warmup_pool",
             payload={"pool_id": pool_id, "fanout": int(fanout), **dict(execute_spec)},
             timeout_sec=max(1.0, float(fanout) + 5.0),
         )
-        if not resp.get("ok", False):
-            raise RuntimeError(str(resp.get("error", "warmup_pool failed")))
-        return [int(pid) for pid in list(resp.get("worker_pids", [])) if int(pid or 0) > 0]
+        return self._parse_warmup_response(resp, action="warmup_pool")

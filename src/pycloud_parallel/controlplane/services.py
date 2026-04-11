@@ -236,6 +236,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         h = hashlib.sha256()
         tmp_file = None
         tmp_path = ""
+
+        def _ensure_object_dir() -> None:
+            self._state.object_dir.mkdir(parents=True, exist_ok=True)
+
         for req in request_iterator:
             kind = req.WhichOneof("body")
             if kind == "meta":
@@ -256,6 +260,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                         error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "meta frame must come before chunk frames"),
                     )
                 if tmp_file is None:
+                    _ensure_object_dir()
                     tmp_file = tempfile.NamedTemporaryFile(
                         mode="wb",
                         prefix="pycloud-object-",
@@ -288,6 +293,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             )
 
         if tmp_file is None:
+            _ensure_object_dir()
             tmp_file = tempfile.NamedTemporaryFile(
                 mode="wb",
                 prefix="pycloud-object-",

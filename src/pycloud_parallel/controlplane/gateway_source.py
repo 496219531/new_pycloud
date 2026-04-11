@@ -50,6 +50,12 @@ class InProcessInfoCenterSource:
                     in_flight=int(item.get("in_flight", 0) or 0),
                     lease_expire_at=dt,
                     http_base_url=str(item.get("http_base_url", "")),
+                    reported_in_flight=int(item.get("reported_in_flight", 0) or 0),
+                    received_count=int(item.get("received_count", 0) or 0),
+                    returned_count=int(item.get("returned_count", 0) or 0),
+                    ema_child_invoke_ms=float(item.get("ema_child_invoke_ms", 0.0) or 0.0),
+                    ema_samples=int(item.get("ema_samples", 0) or 0),
+                    predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
                 )
             )
         return out

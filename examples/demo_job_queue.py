@@ -21,9 +21,18 @@ def main() -> None:
         b"def build(value=0, count=8, **_kwargs):\n"
         b"    return [{'value': value + i} for i in range(count)]\n"
     )
+    task_blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    value = int(value)\n"
+        b"    return {'value': value, 'square': value * value}\n"
+    )
 
     def build_from_func(value=0, count=4, **_kwargs):
         return [{"value": value + i} for i in range(count)]
+
+    def run_task(value=0, **_kwargs):
+        value = int(value)
+        return {"value": value, "square": value * value}
 
     print("=" * 60)
     print("  Job Queue Demo")
@@ -44,6 +53,7 @@ def main() -> None:
             driver_payload={"value": 10, "count": 6},
             client_id=f"job-demo-{int(time.time())}",
             runtime="py3",
+            task_blob=task_blob,
             task_entry_module="task_demo",
             task_entry_callable="run",
             task_package_format="py",
@@ -63,7 +73,7 @@ def main() -> None:
         print(
             "client.submit_job_from_func("
             "func=build_from_func, "
-            "task_func=build_from_func, "
+            "task_func=run_task, "
             "pool_worker_count=2, pool_node_count=2)"
         )
         print()

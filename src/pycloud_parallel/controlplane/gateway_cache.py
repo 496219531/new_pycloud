@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -194,12 +195,29 @@ class GatewayRouteCache:
         with self._lock:
             rr = self._round_robin_counter
             self._round_robin_counter += 1
-        candidates.sort(key=lambda route: (int(route.in_flight), -int(route.alive_workers)))
-        # Among equal-load candidates, rotate selection via round-robin.
-        min_in_flight = int(candidates[0].in_flight)
-        min_alive = int(candidates[0].alive_workers)
-        top_tier = [r for r in candidates if int(r.in_flight) == min_in_flight and int(r.alive_workers) == min_alive]
+        candidates.sort(key=self._route_sort_key)
+        best_key = self._route_sort_key(candidates[0])
+        top_tier = [route for route in candidates if self._route_sort_key(route) == best_key]
         return top_tier[rr % len(top_tier)]
+
+    @staticmethod
+    def _predicted_busy(route: InfoCenterServiceRoute) -> float:
+        value = float(getattr(route, "predicted_busy", 0.0) or 0.0)
+        if math.isfinite(value) and value > 0.0:
+            return value
+        inflight = max(0, int(getattr(route, "in_flight", 0) or 0))
+        alive_workers = max(1, int(getattr(route, "alive_workers", 0) or 0))
+        return float(inflight) / float(alive_workers)
+
+    @classmethod
+    def _route_sort_key(cls, route: InfoCenterServiceRoute) -> Tuple[object, ...]:
+        return (
+            cls._predicted_busy(route),
+            int(getattr(route, "in_flight", 0) or 0),
+            -int(getattr(route, "alive_workers", 0) or 0),
+            str(getattr(route, "node_instance_id", "") or getattr(route, "node_id", "") or getattr(route, "control_addr", "") or ""),
+            str(getattr(route, "service_id", "") or ""),
+        )
 
     def _route_available(self, service_name: str, service_id: str) -> bool:
         key = (service_name, service_id)

@@ -11,7 +11,7 @@ import inspect
 import json
 import logging
 import os
-import queue
+import re
 import subprocess
 import secrets
 import shutil
@@ -30,7 +30,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from google.protobuf import struct_pb2
 from google.protobuf import timestamp_pb2
 
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
@@ -58,7 +57,6 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_SEGMENT_TARGET_BYTES,
 )
 from pycloud_parallel.controlplane.serialization import (
-    convert_arrow_to_dict,
     convert_dict_to_arrow,
     dataframe_bundle_parquet_frame,
     dict_to_struct,
@@ -102,7 +100,6 @@ class ManagedGlobalsState:
     globals_digest: str
 
 
-_EXECUTOR_ACTIVE = object()
 _MANAGED_GLOBALS_CACHE_LOCK = threading.Lock()
 _MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
 _MANAGED_GLOBALS_APPLY_LOCKS_LOCK = threading.Lock()
@@ -159,11 +156,23 @@ def _managed_globals_scope_dir(base_dir: Path, *, scope_kind: str, scope_key: st
     return Path(base_dir) / scope_kind / digest
 
 
-def _code_digest_from_code_version(code_version: str) -> str:
+def _normalize_code_version(code_version: str) -> str:
     digest = str(code_version or "").replace("sha256:", "").strip().lower()
     if not digest:
         raise ValueError("invalid code_version")
     return digest
+
+
+def _split_code_version(code_version: str) -> Tuple[str, str]:
+    normalized = _normalize_code_version(code_version)
+    if "." not in normalized:
+        return normalized, ""
+    code_digest, variant_digest = normalized.split(".", 1)
+    return code_digest, variant_digest
+
+
+def _code_digest_from_code_version(code_version: str) -> str:
+    return _normalize_code_version(code_version)
 
 
 def _code_storage_key(code_version: str) -> str:
@@ -176,17 +185,105 @@ def _code_scope_dir(base_dir: Path, *, code_version: str) -> Path:
     return Path(base_dir) / "codes" / _code_storage_key(code_version)
 
 
+def _code_subversion_key(code_version: str) -> str:
+    _code_digest, variant_digest = _split_code_version(code_version)
+    return variant_digest or "default"
+
+
+def _code_content_storage_key(code_version: str) -> str:
+    code_digest, _variant_digest = _split_code_version(code_version)
+    # Windows path length is tight once we add pkg/subversions/data nesting, so
+    # keep the shared code directory name short while preserving the full digest
+    # in metadata and logical identifiers.
+    return hashlib.sha1(code_digest.encode("utf-8")).hexdigest()[:20]
+
+
+def _code_content_dir(base_dir: Path, *, code_version: str) -> Path:
+    return Path(base_dir) / "codes" / _code_content_storage_key(code_version)
+
+
+def _code_variant_dir(base_dir: Path, *, code_version: str) -> Path:
+    return _code_content_dir(base_dir, code_version=code_version) / "subversions" / _code_subversion_key(code_version)
+
+
+def _code_pkg_dir(base_dir: Path, *, code_version: str) -> Path:
+    return _code_content_dir(base_dir, code_version=code_version) / "pkg"
+
+
+def _code_globals_dir(base_dir: Path, *, code_version: str) -> Path:
+    return _code_variant_dir(base_dir, code_version=code_version) / "globals"
+
+
+def _code_data_dir(base_dir: Path, *, code_version: str) -> Path:
+    return _code_variant_dir(base_dir, code_version=code_version) / "data"
+
+
+def _code_index_dir(base_dir: Path) -> Path:
+    return Path(base_dir) / "code_index"
+
+
+def _sanitize_code_index_part(value: str, *, fallback: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    normalized = re.sub(r"_+", "_", normalized).strip("._-")
+    return (normalized or fallback)[:64]
+
+
+def _code_index_name(*, code_version: str, entry_module: str, entry_callable: str) -> str:
+    digest = _code_digest_from_code_version(code_version)
+    code_digest, variant_digest = digest, ""
+    if "." in digest:
+        code_digest, variant_digest = digest.split(".", 1)
+    module_part = _sanitize_code_index_part(entry_module, fallback="module")
+    callable_part = _sanitize_code_index_part(entry_callable, fallback="module")
+    suffix = code_digest[:12]
+    if variant_digest:
+        suffix += f"_{variant_digest[:8]}"
+    return f"{module_part}__{callable_part}__{suffix}"
+
+
+def _code_index_link_path(base_dir: Path, *, code_version: str, entry_module: str, entry_callable: str) -> Path:
+    return _code_index_dir(base_dir) / _code_index_name(
+        code_version=code_version,
+        entry_module=entry_module,
+        entry_callable=entry_callable,
+    )
+
+
+def _code_index_meta_path(base_dir: Path, *, code_version: str, entry_module: str, entry_callable: str) -> Path:
+    link_path = _code_index_link_path(
+        base_dir,
+        code_version=code_version,
+        entry_module=entry_module,
+        entry_callable=entry_callable,
+    )
+    return Path(f"{link_path}.meta.json")
+
+
 def _code_dependency_dir(base_dir: Path, *, code_version: str) -> Path:
-    return _code_scope_dir(base_dir, code_version=code_version) / "deps"
+    return _code_variant_dir(base_dir, code_version=code_version) / "deps"
+
+
+def _legacy_code_meta_path(base_dir: Path, *, code_version: str) -> Path:
+    return _code_scope_dir(base_dir, code_version=code_version) / "meta.json"
 
 
 def _code_meta_path(base_dir: Path, *, code_version: str) -> Path:
-    return _code_scope_dir(base_dir, code_version=code_version) / "meta.json"
+    return _code_variant_dir(base_dir, code_version=code_version) / "meta.json"
+
+
+def _existing_code_meta_path(base_dir: Path, *, code_version: str) -> Path:
+    preferred = _code_meta_path(base_dir, code_version=code_version)
+    if preferred.exists():
+        return preferred
+    legacy = _legacy_code_meta_path(base_dir, code_version=code_version)
+    if legacy.exists():
+        return legacy
+    return preferred
 
 
 def _code_archive_path(base_dir: Path, *, code_version: str, package_format: str) -> Path:
     normalized = _normalize_package_format(package_format)
-    code_dir = _code_scope_dir(base_dir, code_version=code_version)
+    code_dir = _code_content_dir(base_dir, code_version=code_version)
     if normalized == "tar.gz":
         return code_dir / "artifact.tar.gz"
     if normalized == "zip":
@@ -198,11 +295,11 @@ def _code_archive_path(base_dir: Path, *, code_version: str, package_format: str
 
 def _code_exec_path(base_dir: Path, *, code_version: str, package_format: str) -> Path:
     normalized = _normalize_package_format(package_format)
-    code_dir = _code_scope_dir(base_dir, code_version=code_version)
+    code_dir = _code_pkg_dir(base_dir, code_version=code_version)
     if normalized == "py":
         return code_dir / "artifact.py"
     if normalized in ("tar.gz", "zip", "whl"):
-        return code_dir / "pkg"
+        return code_dir
     raise ValueError(f"unsupported package_format for code exec path: {package_format}")
 
 
@@ -339,10 +436,110 @@ def _write_managed_globals_snapshot(
 
 
 def _load_code_meta(base_dir: Path, *, code_version: str) -> Dict[str, Any]:
-    meta_path = _code_meta_path(base_dir, code_version=code_version)
+    meta_path = _existing_code_meta_path(base_dir, code_version=code_version)
     if not meta_path.exists():
         return {}
     return json.loads(meta_path.read_text(encoding="utf-8") or "{}")
+
+
+def _parse_timestamp_or_now(raw: Any) -> datetime:
+    text = str(raw or "").strip()
+    if text:
+        with contextlib.suppress(Exception):
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+    return utc_now()
+
+
+def _code_artifact_from_meta(meta: Dict[str, Any]) -> "CodeArtifact":
+    return CodeArtifact(
+        code_version=str(meta.get("code_version", "") or "").strip(),
+        path=str(meta.get("artifact_path", "") or "").strip(),
+        runtime=str(meta.get("runtime", "") or "").strip(),
+        entry_module=str(meta.get("entry_module", "") or "").strip(),
+        entry_callable=str(meta.get("entry_callable", "") or "").strip(),
+        package_format=str(meta.get("package_format", "") or "").strip(),
+        export_mode=str(meta.get("export_mode", "") or "").strip(),
+        export_methods=tuple(str(name or "").strip() for name in list(meta.get("export_methods") or ()) if str(name or "").strip()),
+        export_decorator=str(meta.get("export_decorator", "") or "").strip(),
+        dependency_allowlist=tuple(
+            str(name or "").strip() for name in list(meta.get("dependency_allowlist") or ()) if str(name or "").strip()
+        ),
+        dependency_path=str(meta.get("dependency_path", "") or "").strip(),
+        size_bytes=max(0, int(meta.get("size_bytes", 0) or 0)),
+        created_at=_parse_timestamp_or_now(meta.get("created_at")),
+    )
+
+
+def _write_code_index(base_dir: Path, artifact: "CodeArtifact", *, created_at: str, last_at: str) -> None:
+    code_dir = _code_variant_dir(base_dir, code_version=artifact.code_version)
+    pkg_dir = _code_pkg_dir(base_dir, code_version=artifact.code_version)
+    variant_dir = _code_variant_dir(base_dir, code_version=artifact.code_version)
+    index_dir = _code_index_dir(base_dir)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    link_path = _code_index_link_path(
+        base_dir,
+        code_version=artifact.code_version,
+        entry_module=artifact.entry_module,
+        entry_callable=artifact.entry_callable,
+    )
+    meta_path = _code_index_meta_path(
+        base_dir,
+        code_version=artifact.code_version,
+        entry_module=artifact.entry_module,
+        entry_callable=artifact.entry_callable,
+    )
+    payload = {
+        "code_version": artifact.code_version,
+        "entry_module": artifact.entry_module,
+        "entry_callable": artifact.entry_callable,
+        "package_format": artifact.package_format,
+        "runtime": artifact.runtime,
+        "artifact_path": artifact.path,
+        "dependency_path": artifact.dependency_path,
+        "code_dir": str(code_dir),
+        "pkg_dir": str(pkg_dir),
+        "variant_dir": str(variant_dir),
+        "index_path": str(link_path),
+        "storage_key": code_dir.name,
+        "size_bytes": int(artifact.size_bytes),
+        "created_at": created_at,
+        "last_at": last_at,
+    }
+    _atomic_write_json(meta_path, payload, prefix=".code-index-")
+
+    relative_target = os.path.relpath(code_dir, start=index_dir)
+    try:
+        if link_path.is_symlink():
+            current_target = os.readlink(link_path)
+            current_resolved = (link_path.parent / current_target).resolve(strict=False)
+            expected_resolved = code_dir.resolve(strict=False)
+            if current_resolved == expected_resolved:
+                return
+            link_path.unlink()
+        elif link_path.exists():
+            if link_path.is_dir():
+                shutil.rmtree(link_path, ignore_errors=True)
+            else:
+                link_path.unlink()
+        os.symlink(relative_target, str(link_path), target_is_directory=True)
+    except (FileExistsError, NotImplementedError, OSError):
+        return
+
+
+def _ensure_code_index_entry(base_dir: Path, *, code_version: str) -> bool:
+    meta = _load_code_meta(base_dir, code_version=code_version)
+    if not meta:
+        return False
+    artifact = _code_artifact_from_meta(meta)
+    if not artifact.code_version or not artifact.entry_module:
+        return False
+    created_at = str(meta.get("created_at", "") or artifact.created_at.astimezone(timezone.utc).isoformat())
+    last_at = str(meta.get("last_at", "") or created_at)
+    _write_code_index(base_dir, artifact, created_at=created_at, last_at=last_at)
+    return True
 
 
 def _write_code_meta(base_dir: Path, artifact: "CodeArtifact", *, last_at: Optional[datetime] = None) -> None:
@@ -365,6 +562,7 @@ def _write_code_meta(base_dir: Path, artifact: "CodeArtifact", *, last_at: Optio
         "dependency_allowlist": list(artifact.dependency_allowlist),
         "artifact_path": artifact.path,
         "dependency_path": artifact.dependency_path,
+        "data_path": str(_code_data_dir(base_dir, code_version=artifact.code_version)),
         "size_bytes": int(artifact.size_bytes),
         "created_at": created_at,
         "last_at": effective_last_at,
@@ -372,13 +570,14 @@ def _write_code_meta(base_dir: Path, artifact: "CodeArtifact", *, last_at: Optio
     tmp_path = meta_path.with_suffix(".tmp")
     tmp_path.write_bytes(_stable_json_bytes(payload))
     os.replace(str(tmp_path), str(meta_path))
+    _write_code_index(base_dir, artifact, created_at=created_at, last_at=effective_last_at)
 
 
 def touch_code_last_at(base_dir: Path, *, code_version: str) -> None:
     meta = _load_code_meta(base_dir, code_version=code_version)
     if not meta:
         return
-    meta_path = _code_meta_path(base_dir, code_version=code_version)
+    meta_path = _existing_code_meta_path(base_dir, code_version=code_version)
     meta["last_at"] = utc_now().astimezone(timezone.utc).isoformat()
     tmp_path = meta_path.with_suffix(".tmp")
     tmp_path.write_bytes(_stable_json_bytes(meta))
@@ -644,6 +843,10 @@ def _artifact_exists(artifact: "ObjectArtifact") -> bool:
     if artifact.storage_backend == "segment":
         return bool(artifact.segment_path) and Path(artifact.segment_path).exists()
     return bool(artifact.path) and Path(artifact.path).exists()
+
+
+def _code_artifact_exists(artifact: "CodeArtifact") -> bool:
+    return bool(str(artifact.path or "").strip()) and Path(artifact.path).exists()
 
 
 def _object_artifact_from_meta(object_dir: Path, *, object_id: str, meta: Dict[str, Any]) -> "ObjectArtifact":
@@ -1044,6 +1247,7 @@ def _build_execute_spec(
     artifact: "CodeArtifact",
     *,
     object_dir: Path,
+    work_dir: Optional[Path] = None,
     method_name: str,
     payload: dict,
     managed_globals_scope_dir: str = "",
@@ -1056,6 +1260,7 @@ def _build_execute_spec(
         "package_format": artifact.package_format,
         "dependency_path": artifact.dependency_path,
         "object_dir": str(object_dir),
+        "work_dir": str(work_dir or ""),
         "export_mode": artifact.export_mode,
         "export_methods": list(artifact.export_methods),
         "export_decorator": artifact.export_decorator,
@@ -1276,6 +1481,22 @@ def _temporary_import_paths(*paths: str):
                 sys.path.remove(path)
             except ValueError:
                 pass
+
+
+@contextmanager
+def _temporary_working_dir(path: str):
+    target = str(path or "").strip()
+    if not target:
+        yield
+        return
+    target_path = Path(target)
+    target_path.mkdir(parents=True, exist_ok=True)
+    previous = Path.cwd()
+    os.chdir(target_path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
 
 
 def _install_dependency_allowlist(requirements: Sequence[str], *, target_dir: Path) -> None:
@@ -1865,6 +2086,7 @@ def _execute_payload_in_subprocess(
     package_format: str,
     dependency_path: str,
     object_dir: str,
+    work_dir: str,
     managed_globals_scope_dir: str,
     managed_globals_digest: str,
     export_mode: str,
@@ -1895,82 +2117,87 @@ def _execute_payload_in_subprocess(
         }
 
     try:
-        router, _method_info = _load_callable_router(
-            artifact_path,
-            entry_module=entry_module,
-            package_format=package_format,
-            dependency_path=dependency_path,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            export_decorator=export_decorator,
-            entry_callable=entry_callable,
-        )
+        with _temporary_working_dir(work_dir):
+            try:
+                router, _method_info = _load_callable_router(
+                    artifact_path,
+                    entry_module=entry_module,
+                    package_format=package_format,
+                    dependency_path=dependency_path,
+                    export_mode=export_mode,
+                    export_methods=export_methods,
+                    export_decorator=export_decorator,
+                    entry_callable=entry_callable,
+                )
+            except Exception as exc:
+                decode_end = time.perf_counter()
+                if _is_user_artifact_error(exc):
+                    return (
+                        "FAILED_USER",
+                        None,
+                        "ArtifactLoadError",
+                        _describe_artifact_error(
+                            exc,
+                            entry_module=entry_module,
+                            entry_callable=entry_callable,
+                            package_format=package_format,
+                        ),
+                        _timings(),
+                    )
+                return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
+            try:
+                with _temporary_import_paths(dependency_path):
+                    method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
+                    fn = router.get(method)
+                    if fn is None:
+                        raise RuntimeError(f"method `{method}` not exported")
+                    _apply_managed_globals_to_router(
+                        router,
+                        scope_dir=managed_globals_scope_dir,
+                        globals_digest=managed_globals_digest,
+                        object_dir=object_dir,
+                    )
+                    resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
+                    decode_end = time.perf_counter()
+                    if bool(warmup_only):
+                        invoke_start = decode_end
+                        invoke_end = decode_end
+                        encode_start = decode_end
+                        encode_end = decode_end
+                        return ("SUCCEEDED", {"warmed": True, "worker_pid": os.getpid()}, "", "", _timings())
+                    invoke_start = decode_end
+                    ret = _invoke_user_callable(fn, resolved_payload)
+                    invoke_end = time.perf_counter()
+                    encode_start = invoke_end
+                status_text, result, error_type, error_message = _normalize_user_return(ret, object_dir=object_dir)
+                encode_end = time.perf_counter()
+                return (status_text, result, error_type, error_message, _timings())
+            except LargeResultError as exc:
+                if decode_end <= decode_start:
+                    decode_end = time.perf_counter()
+                if invoke_end <= invoke_start and decode_end > decode_start:
+                    invoke_end = time.perf_counter()
+                    encode_start = invoke_end
+                encode_end = time.perf_counter()
+                return ("FAILED_USER", None, exc.__class__.__name__, str(exc), _timings())
+            except ObjectResolutionError as exc:
+                if decode_end <= decode_start:
+                    decode_end = time.perf_counter()
+                return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc), _timings())
+            except Exception as exc:
+                now = time.perf_counter()
+                if decode_end <= decode_start:
+                    decode_end = now
+                elif invoke_end <= invoke_start:
+                    invoke_end = now
+                else:
+                    encode_end = now
+                if isinstance(exc, (ImportError, ModuleNotFoundError)):
+                    return ("FAILED_USER", None, exc.__class__.__name__, _describe_user_execution_error(exc), _timings())
+                return ("FAILED_USER", None, exc.__class__.__name__, repr(exc), _timings())
     except Exception as exc:
         decode_end = time.perf_counter()
-        if _is_user_artifact_error(exc):
-            return (
-                "FAILED_USER",
-                None,
-                "ArtifactLoadError",
-                _describe_artifact_error(
-                    exc,
-                    entry_module=entry_module,
-                    entry_callable=entry_callable,
-                    package_format=package_format,
-                ),
-                _timings(),
-            )
         return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
-    try:
-        with _temporary_import_paths(dependency_path):
-            method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
-            fn = router.get(method)
-            if fn is None:
-                raise RuntimeError(f"method `{method}` not exported")
-            _apply_managed_globals_to_router(
-                router,
-                scope_dir=managed_globals_scope_dir,
-                globals_digest=managed_globals_digest,
-                object_dir=object_dir,
-            )
-            resolved_payload = _resolve_object_refs_in_payload(payload, object_dir=object_dir)
-            decode_end = time.perf_counter()
-            if bool(warmup_only):
-                invoke_start = decode_end
-                invoke_end = decode_end
-                encode_start = decode_end
-                encode_end = decode_end
-                return ("SUCCEEDED", {"warmed": True, "worker_pid": os.getpid()}, "", "", _timings())
-            invoke_start = decode_end
-            ret = _invoke_user_callable(fn, resolved_payload)
-            invoke_end = time.perf_counter()
-            encode_start = invoke_end
-        status_text, result, error_type, error_message = _normalize_user_return(ret, object_dir=object_dir)
-        encode_end = time.perf_counter()
-        return (status_text, result, error_type, error_message, _timings())
-    except LargeResultError as exc:
-        if decode_end <= decode_start:
-            decode_end = time.perf_counter()
-        if invoke_end <= invoke_start and decode_end > decode_start:
-            invoke_end = time.perf_counter()
-            encode_start = invoke_end
-        encode_end = time.perf_counter()
-        return ("FAILED_USER", None, exc.__class__.__name__, str(exc), _timings())
-    except ObjectResolutionError as exc:
-        if decode_end <= decode_start:
-            decode_end = time.perf_counter()
-        return ("FAILED_INFRA", None, exc.__class__.__name__, str(exc), _timings())
-    except Exception as exc:
-        now = time.perf_counter()
-        if decode_end <= decode_start:
-            decode_end = now
-        elif invoke_end <= invoke_start:
-            invoke_end = now
-        else:
-            encode_end = now
-        if isinstance(exc, (ImportError, ModuleNotFoundError)):
-            return ("FAILED_USER", None, exc.__class__.__name__, _describe_user_execution_error(exc), _timings())
-        return ("FAILED_USER", None, exc.__class__.__name__, repr(exc), _timings())
 
 
 def utc_now() -> datetime:
@@ -2036,6 +2263,10 @@ class NodeServiceState:
     worker_count: int = 0
     alive_workers: int = 0
     in_flight: int = 0
+    received_count: int = 0
+    returned_count: int = 0
+    ema_child_invoke_ms: float = 0.0
+    ema_samples: int = 0
     lease_expire_at: datetime = field(default_factory=utc_now)
     http_base_url: str = ""
 
@@ -2173,6 +2404,15 @@ class InfoCenterState:
             True,
             "LOST",
         )
+
+    @staticmethod
+    def _predicted_busy_score(*, inflight: int, ema_child_invoke_ms: float, alive_workers: int) -> float:
+        normalized_inflight = max(0, int(inflight or 0))
+        normalized_workers = max(1, int(alive_workers or 0))
+        normalized_ema = max(0.0, float(ema_child_invoke_ms or 0.0))
+        if normalized_ema <= 0.0:
+            return float(normalized_inflight) / float(normalized_workers)
+        return (float(normalized_inflight) * normalized_ema) / float(normalized_workers)
 
     def register_node_record(
         self,
@@ -2414,6 +2654,22 @@ class InfoCenterState:
                     effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
                         self._effective_service_state_locked(state, svc, now=now)
                     )
+                    reported_inflight = max(0, int(svc.in_flight or 0))
+                    received_count = max(0, int(svc.received_count or 0))
+                    returned_count = max(0, int(svc.returned_count or 0))
+                    if received_count > 0 or returned_count > 0:
+                        computed_inflight = max(0, received_count - returned_count)
+                    else:
+                        computed_inflight = max(0, int(effective_in_flight or 0))
+                    effective_computed_inflight = computed_inflight if is_healthy else 0
+                    ema_samples = max(0, int(svc.ema_samples or 0))
+                    raw_ema_child_invoke_ms = max(0.0, float(svc.ema_child_invoke_ms or 0.0))
+                    effective_ema_child_invoke_ms = raw_ema_child_invoke_ms if ema_samples >= 10 else 0.0
+                    predicted_busy = self._predicted_busy_score(
+                        inflight=effective_computed_inflight,
+                        ema_child_invoke_ms=effective_ema_child_invoke_ms,
+                        alive_workers=effective_alive,
+                    )
                     out.append(
                         {
                             "service_name": svc.service_name,
@@ -2427,7 +2683,13 @@ class InfoCenterState:
                             "stale": stale,
                             "worker_count": svc.worker_count,
                             "alive_workers": effective_alive,
-                            "in_flight": effective_in_flight,
+                            "in_flight": effective_computed_inflight,
+                            "reported_in_flight": reported_inflight,
+                            "received_count": received_count,
+                            "returned_count": returned_count,
+                            "ema_child_invoke_ms": raw_ema_child_invoke_ms,
+                            "ema_samples": ema_samples,
+                            "predicted_busy": predicted_busy,
                             "lease_expire_at": effective_lease_expire_at,
                             "http_base_url": svc.http_base_url,
                         }
@@ -2437,8 +2699,11 @@ class InfoCenterState:
                     x["service_name"],
                     not x["node_healthy"],
                     int(x["status"] != pb2.SERVICE_STATUS_RUNNING),
+                    float(x.get("predicted_busy", 0.0) or 0.0),
                     int(x["in_flight"]),
+                    -int(x.get("alive_workers", 0) or 0),
                     x["node_id"],
+                    x["service_id"],
                 )
             )
             return out[: max(1, limit)]
@@ -2656,6 +2921,8 @@ class ServiceSession:
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""
     timing_metrics: Dict[str, object] = field(default_factory=dict)
+    request_count: int = 0
+    returned_count: int = 0
 
 
 @dataclass
@@ -2679,19 +2946,7 @@ class TaskPoolState:
     executor_ready: bool = False
     task_count: int = 0
     timing_metrics: Dict[str, object] = field(default_factory=dict)
-
-
-@dataclass
-class RuntimeSlotState:
-    runtime_key: str
-    code_version: str
-    task_ids: Deque[str] = field(default_factory=deque)
-    executor: Optional[object] = None
-    executor_ready: bool = False
-    current_task_id: str = ""
-    current_attempt: int = 0
-    last_used_at: datetime = field(default_factory=utc_now)
-    waiting: bool = False
+    returned_count: int = 0
 
 
 class NodeControlState:
@@ -2714,8 +2969,6 @@ class NodeControlState:
         node_id: str,
         worker_capacity: int = 32,
         queue_capacity: int = 4000,
-        runtime_slot_capacity: int = 0,
-        runtime_slot_idle_ttl_sec: int = 30,
         heartbeat_timeout_sec: int = 90,
         max_retries: int = 3,
         monitor_interval_sec: int = 10,
@@ -2733,8 +2986,6 @@ class NodeControlState:
         self.node_id = node_id
         self.worker_capacity = max(1, worker_capacity)
         self.queue_capacity = max(1, queue_capacity)
-        self.runtime_slot_capacity = max(1, int(runtime_slot_capacity or worker_capacity))
-        self.runtime_slot_idle_ttl_sec = max(1, int(runtime_slot_idle_ttl_sec))
         self.heartbeat_timeout_sec = max(5, heartbeat_timeout_sec)
         self.max_retries = max(0, max_retries)
         self.monitor_interval_sec = max(1, monitor_interval_sec)
@@ -2757,8 +3008,6 @@ class NodeControlState:
         self._pool_tasks: Dict[str, TaskState] = {}
         self._codes: Dict[str, CodeArtifact] = {}
         self._objects: Dict[str, ObjectArtifact] = {}
-        self._runtime_slots: Dict[str, RuntimeSlotState] = {}
-        self._runtime_waiting: Deque[str] = deque()
         self._services: Dict[str, ServiceSession] = {}
         self._result_hook = InMemoryResultHook()
         self._pool_result_hook = InMemoryResultHook()
@@ -2771,7 +3020,7 @@ class NodeControlState:
         # 检测并保存当前 Python 版本
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
 
-        self._artifact_dir = Path(artifact_dir)
+        self._artifact_dir = Path(artifact_dir).expanduser().resolve()
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
         self._codes_dir = self._artifact_dir / "codes"
         self._codes_dir.mkdir(parents=True, exist_ok=True)
@@ -2872,11 +3121,17 @@ class NodeControlState:
                 invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
                 encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
                 queue_wait_ms = max(0.0, float(executor_ms) - decode_ms - invoke_ms - encode_ms)
+                alpha = 0.2
+                prev_ema = float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0)
+                sample_count = int(metrics.get("ema_samples", 0) or 0) + 1
+                ema = invoke_ms if sample_count <= 1 else ((alpha * invoke_ms) + ((1.0 - alpha) * prev_ema))
                 metrics["last_child_decode_ms"] = round(decode_ms, 3)
                 metrics["last_invoke_ms"] = round(invoke_ms, 3)
                 metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
                 metrics["last_child_encode_ms"] = round(encode_ms, 3)
                 metrics["last_queue_wait_ms"] = round(queue_wait_ms, 3)
+                metrics["ema_child_invoke_ms"] = round(ema, 3)
+                metrics["ema_samples"] = sample_count
                 metrics["avg_child_decode_ms"] = round(
                     ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
                     3,
@@ -2983,10 +3238,18 @@ class NodeControlState:
                 decode_ms = float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
                 invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
                 encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
+                queue_wait_ms = max(0.0, float(executor_ms) - decode_ms - invoke_ms - encode_ms)
+                alpha = 0.2
+                prev_ema = float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0)
+                sample_count = int(metrics.get("ema_samples", 0) or 0) + 1
+                ema = invoke_ms if sample_count <= 1 else ((alpha * invoke_ms) + ((1.0 - alpha) * prev_ema))
                 metrics["last_child_decode_ms"] = round(decode_ms, 3)
                 metrics["last_invoke_ms"] = round(invoke_ms, 3)
                 metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
                 metrics["last_child_encode_ms"] = round(encode_ms, 3)
+                metrics["last_queue_wait_ms"] = round(queue_wait_ms, 3)
+                metrics["ema_child_invoke_ms"] = round(ema, 3)
+                metrics["ema_samples"] = sample_count
                 metrics["avg_child_decode_ms"] = round(
                     ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
                     3,
@@ -3010,6 +3273,8 @@ class NodeControlState:
                 metrics.setdefault("last_child_invoke_ms", metrics.get("last_invoke_ms", 0.0))
                 metrics.setdefault("last_child_encode_ms", 0.0)
                 metrics.setdefault("last_queue_wait_ms", 0.0)
+                metrics.setdefault("ema_child_invoke_ms", 0.0)
+                metrics.setdefault("ema_samples", 0)
                 metrics.setdefault("avg_child_decode_ms", 0.0)
                 metrics.setdefault("avg_invoke_ms", 0.0)
                 metrics.setdefault("avg_child_invoke_ms", metrics.get("avg_invoke_ms", 0.0))
@@ -3108,8 +3373,7 @@ class NodeControlState:
         scope_key: str,
         allowed_names: Sequence[str],
     ) -> ManagedGlobalsState:
-        code_dir = _code_scope_dir(self._artifact_dir, code_version=code_version)
-        scopes_dir = code_dir / "scopes"
+        scopes_dir = _code_globals_dir(self._artifact_dir, code_version=code_version)
         state = ManagedGlobalsState(
             scope_kind=str(scope_kind or "").strip(),
             scope_key=str(scope_key or "").strip(),
@@ -3166,7 +3430,7 @@ class NodeControlState:
             state = self._new_managed_globals_state(
                 code_version=code_version,
                 scope_kind="runtime",
-                scope_key=f"{normalized_key[0]}|{normalized_key[1]}|{normalized_key[2]}",
+                scope_key=f"{self.node_id}|{normalized_key[0]}|{normalized_key[1]}|{normalized_key[2]}",
                 allowed_names=normalized_allowed_names,
             )
             self._runtime_managed_globals[normalized_key] = state
@@ -3237,13 +3501,25 @@ class NodeControlState:
     def _warmup_fanout(worker_count: int) -> int:
         return max(1, int(worker_count or 1) * 2)
 
-    def _log_warmup_result(self, *, scope: str, key: str, worker_count: int, worker_pids: Sequence[int]) -> None:
+    @staticmethod
+    def _normalize_warmup_result(result: object, *, fanout: int) -> Tuple[int, List[int]]:
+        if isinstance(result, tuple) and len(result) == 2:
+            submitted_count, worker_pids = result
+        elif isinstance(result, list):
+            submitted_count, worker_pids = fanout, result
+        else:
+            submitted_count, worker_pids = result, []
+        normalized_pids = [int(pid) for pid in (worker_pids or []) if int(pid or 0) > 0]
+        return max(0, int(submitted_count or 0)), normalized_pids
+
+    def _log_warmup_result(self, *, scope: str, key: str, worker_count: int, submitted_count: int, worker_pids: Sequence[int]) -> None:
         unique_pids = sorted({int(pid) for pid in worker_pids if int(pid or 0) > 0})
         logging.getLogger(__name__).info(
-            "[Warmup] scope=%s key=%s worker_count=%d warmed_workers=%d pids=%s",
+            "[Warmup] scope=%s key=%s worker_count=%d submitted=%d warmed_workers=%d pids=%s",
             scope,
             key,
             int(worker_count or 0),
+            int(submitted_count or 0),
             len(unique_pids),
             unique_pids,
         )
@@ -3447,6 +3723,24 @@ class NodeControlState:
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
         return _code_dependency_dir(self._artifact_dir, code_version=code_version)
 
+    def _get_live_code_artifact_locked(self, code_version: str) -> Optional[CodeArtifact]:
+        normalized_code_version = str(code_version or "").strip()
+        if not normalized_code_version:
+            return None
+        artifact = self._codes.get(normalized_code_version)
+        if artifact is None:
+            return None
+        if _code_artifact_exists(artifact):
+            return artifact
+        self._codes.pop(normalized_code_version, None)
+        self._client_code_tokens = {
+            key: value for key, value in self._client_code_tokens.items() if key[1] != normalized_code_version
+        }
+        self._client_code_managed_globals = {
+            key: value for key, value in self._client_code_managed_globals.items() if key[1] != normalized_code_version
+        }
+        return None
+
     def _validate_managed_global_names(self, managed_global_names: Sequence[str], *, module: Any) -> None:
         normalized_names = _normalize_managed_global_names(managed_global_names)
         if not normalized_names:
@@ -3587,6 +3881,14 @@ class NodeControlState:
     def service_worker_available(self) -> int:
         return max(0, int(self.service_worker_capacity) - int(self.service_worker_used()))
 
+    @staticmethod
+    def _service_inflight_locked(session: ServiceSession) -> int:
+        return max(0, int(session.request_count or 0) - int(session.returned_count or 0))
+
+    @staticmethod
+    def _task_pool_inflight_locked(pool: TaskPoolState) -> int:
+        return max(0, int(pool.task_count or 0) - int(pool.returned_count or 0))
+
     def task_pool_worker_used(self) -> int:
         with self._lock:
             active = sum(
@@ -3618,7 +3920,7 @@ class NodeControlState:
                     status=pool.status,
                     worker_count=pool.worker_count,
                     task_count=pool.task_count,
-                    inflight=inflight_by_pool.get(pool.pool_id, 0),
+                    inflight=self._task_pool_inflight_locked(pool),
                     created_at=pool.created_at,
                     last_heartbeat_at=pool.last_heartbeat_at,
                     lease_expire_at=pool.lease_expire_at,
@@ -3629,6 +3931,15 @@ class NodeControlState:
 
     def _get_code_write_lock(self, code_version: str) -> threading.Lock:
         key = str(code_version or "").strip()
+        with self._lock:
+            lock = self._code_write_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._code_write_locks[key] = lock
+            return lock
+
+    def _get_code_content_write_lock(self, code_version: str) -> threading.Lock:
+        key = f"content:{_code_content_storage_key(code_version)}"
         with self._lock:
             lock = self._code_write_locks.get(key)
             if lock is None:
@@ -3767,8 +4078,9 @@ class NodeControlState:
             export_decorator=normalized_export_decorator,
             dependency_allowlist=normalized_dependency_allowlist,
         )
-        code_lock = self._get_code_write_lock(code_version)
-        with code_lock:
+        content_lock = self._get_code_content_write_lock(code_version)
+        variant_lock = self._get_code_write_lock(code_version)
+        with content_lock, variant_lock:
             with self._lock:
                 existing = self._codes.get(code_version)
                 if existing is not None:
@@ -3797,18 +4109,29 @@ class NodeControlState:
                 raise ValueError(f"uploaded file missing: {uploaded_path}")
 
             now = utc_now()
-            code_dir = _code_scope_dir(self._artifact_dir, code_version=code_version)
-            cleanup_paths: List[Path] = [code_dir]
+            code_dir = _code_content_dir(self._artifact_dir, code_version=code_version)
+            variant_dir = _code_variant_dir(self._artifact_dir, code_version=code_version)
+            cleanup_paths: List[Path] = [variant_dir]
             code_dir.mkdir(parents=True, exist_ok=True)
+            variant_dir.mkdir(parents=True, exist_ok=True)
+            _code_data_dir(self._artifact_dir, code_version=code_version).mkdir(parents=True, exist_ok=True)
             if normalized_format == "py":
                 final_path = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
-                os.replace(str(tmp_path), str(final_path))
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                if final_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                else:
+                    os.replace(str(tmp_path), str(final_path))
                 artifact_exec_path = str(final_path)
             else:
                 archive_path = _code_archive_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
-                os.replace(str(tmp_path), str(archive_path))
+                if archive_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                else:
+                    os.replace(str(tmp_path), str(archive_path))
                 extract_dir = _code_exec_path(self._artifact_dir, code_version=code_version, package_format=normalized_format)
-                self._extract_archive(archive_path=archive_path, package_format=normalized_format, out_dir=extract_dir)
+                if not extract_dir.exists():
+                    self._extract_archive(archive_path=archive_path, package_format=normalized_format, out_dir=extract_dir)
                 artifact_exec_path = str(extract_dir)
 
             artifact = CodeArtifact(
@@ -4318,6 +4641,7 @@ class NodeControlState:
                 execute_spec = _build_execute_spec(
                     artifact,
                     object_dir=self._object_dir,
+                    work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
                     method_name=artifact.entry_callable,
                     payload=self._resolve_memory_object_refs_in_payload_locked(record.payload),
                     managed_globals_scope_dir=pool.managed_globals_scope_dir,
@@ -4433,6 +4757,7 @@ class NodeControlState:
                     task.finished_at = utc_now()
                     task.error_type = "Cancelled"
                     task.error_message = reason or f"cancelled by pool job_id={normalized_job_id}"
+                    pool.returned_count += 1
                     self._pool_result_hook.push(normalized_pool_id, task.as_result())
                     queued_cancelled += 1
                 elif task.status == pb2.TASK_STATUS_RUNNING:
@@ -4565,7 +4890,8 @@ class NodeControlState:
             self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
-            session.in_flight += 1
+            session.request_count += 1
+            session.in_flight = self._service_inflight_locked(session)
             prepared_payload = self._resolve_memory_object_refs_in_payload_locked(payload or {})
         setup_end = time.perf_counter()
 
@@ -4576,6 +4902,7 @@ class NodeControlState:
             execute_spec = _build_execute_spec(
                 artifact,
                 object_dir=self._object_dir,
+                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
                 method_name=requested_method,
                 payload=prepared_payload,
                 managed_globals_scope_dir=session.managed_globals_scope_dir,
@@ -4603,7 +4930,8 @@ class NodeControlState:
             with self._lock:
                 session = self._services.get(service_id)
                 if session is not None:
-                    session.in_flight = max(0, session.in_flight - 1)
+                    session.returned_count += 1
+                    session.in_flight = self._service_inflight_locked(session)
                     self._record_service_timing_locked(
                         session,
                         method=requested_method,
@@ -4623,7 +4951,8 @@ class NodeControlState:
             with self._lock:
                 session = self._services.get(service_id)
                 if session is not None:
-                    session.in_flight = max(0, session.in_flight - 1)
+                    session.returned_count += 1
+                    session.in_flight = self._service_inflight_locked(session)
                     self._record_service_timing_locked(
                         session,
                         method=requested_method,
@@ -4643,7 +4972,8 @@ class NodeControlState:
         with self._lock:
             session = self._services.get(service_id)
             if session is not None:
-                session.in_flight = max(0, session.in_flight - 1)
+                session.returned_count += 1
+                session.in_flight = self._service_inflight_locked(session)
         finalize_start = time.perf_counter()
 
         if status_text == "SUCCEEDED":
@@ -4767,24 +5097,28 @@ class NodeControlState:
                 raise PermissionError("owner_client_id mismatch")
             if not service_token or session.service_token != service_token:
                 raise PermissionError("service_token mismatch")
+            artifact = self._get_live_code_artifact_locked(session.code_version)
+            if artifact is None:
+                raise KeyError("code artifact not found")
             state = self._ensure_service_managed_globals_state_locked(session)
             if state is None:
                 raise ValueError("service artifact did not declare managed globals")
             globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
             session.managed_globals_scope_dir = state.scope_dir
             session.managed_globals_digest = globals_digest
-            artifact = self._codes.get(session.code_version)
             executor_host = self._executor_host
             service_id = session.service_id
             worker_count = session.worker_count
         if artifact is None or executor_host is None:
             return globals_digest, updated_names
-        worker_pids = executor_host.warmup_service(
+        fanout = self._warmup_fanout(worker_count)
+        warmup_result = executor_host.warmup_service(
             service_id=service_id,
-            fanout=self._warmup_fanout(worker_count),
+            fanout=fanout,
             execute_spec=_build_execute_spec(
                 artifact,
                 object_dir=self._object_dir,
+                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
                 method_name=next(iter(session.methods.keys()), artifact.entry_callable),
                 payload={},
                 managed_globals_scope_dir=state.scope_dir,
@@ -4792,7 +5126,14 @@ class NodeControlState:
                 warmup_only=True,
             ),
         )
-        self._log_warmup_result(scope="service", key=service_id, worker_count=worker_count, worker_pids=worker_pids)
+        submitted, worker_pids = self._normalize_warmup_result(warmup_result, fanout=fanout)
+        self._log_warmup_result(
+            scope="service",
+            key=service_id,
+            worker_count=worker_count,
+            submitted_count=submitted,
+            worker_pids=worker_pids,
+        )
         return globals_digest, updated_names
 
     def update_runtime_globals(
@@ -4808,7 +5149,7 @@ class NodeControlState:
         normalized_code_version = str(code_version or "").strip()
         normalized_runtime_key = str(runtime_key or normalized_code_version).strip() or normalized_code_version
         with self._lock:
-            artifact = self._codes.get(normalized_code_version)
+            artifact = self._get_live_code_artifact_locked(normalized_code_version)
             if artifact is None:
                 raise KeyError("code artifact not found")
             expected_code_token = self._client_code_tokens.get((normalized_client_id, normalized_code_version), "")
@@ -4837,26 +5178,42 @@ class NodeControlState:
         execute_spec = _build_execute_spec(
             artifact,
             object_dir=self._object_dir,
+            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
             method_name=artifact.entry_callable,
             payload={},
             managed_globals_scope_dir=state.scope_dir,
             managed_globals_digest=globals_digest,
             warmup_only=True,
         )
+        fanout = self._warmup_fanout(worker_count)
         if pool is not None:
-            worker_pids = executor_host.warmup_pool(
+            warmup_result = executor_host.warmup_pool(
                 pool_id=pool.pool_id,
-                fanout=self._warmup_fanout(worker_count),
+                fanout=fanout,
                 execute_spec=execute_spec,
             )
-            self._log_warmup_result(scope="pool", key=pool.pool_id, worker_count=worker_count, worker_pids=worker_pids)
+            submitted, worker_pids = self._normalize_warmup_result(warmup_result, fanout=fanout)
+            self._log_warmup_result(
+                scope="pool",
+                key=pool.pool_id,
+                worker_count=worker_count,
+                submitted_count=submitted,
+                worker_pids=worker_pids,
+            )
         else:
-            worker_pids = executor_host.warmup_runtime(
+            warmup_result = executor_host.warmup_runtime(
                 runtime_key=normalized_runtime_key,
-                fanout=self._warmup_fanout(worker_count),
+                fanout=fanout,
                 execute_spec=execute_spec,
             )
-            self._log_warmup_result(scope="runtime", key=normalized_runtime_key, worker_count=worker_count, worker_pids=worker_pids)
+            submitted, worker_pids = self._normalize_warmup_result(warmup_result, fanout=fanout)
+            self._log_warmup_result(
+                scope="runtime",
+                key=normalized_runtime_key,
+                worker_count=worker_count,
+                submitted_count=submitted,
+                worker_pids=worker_pids,
+            )
         return globals_digest, updated_names
 
     def _service_status_http(self, service_id: str) -> Tuple[int, Dict[str, object]]:
@@ -4879,7 +5236,7 @@ class NodeControlState:
                 "status": int(session.status),
                 "worker_count": session.worker_count,
                 "alive_workers": session.alive_workers,
-                "in_flight": session.in_flight,
+                "in_flight": self._service_inflight_locked(session),
                 "queued": session.queued,
                 "created_at": session.created_at,
                 "last_heartbeat_at": session.last_heartbeat_at,
@@ -5129,7 +5486,10 @@ class NodeControlState:
     def metrics(self) -> Dict[str, int]:
         with self._lock:
             queued = self._queued_count_locked()
-            inflight = self._inflight_count_locked()
+            shared_inflight = self._inflight_count_locked()
+            service_inflight = sum(self._service_inflight_locked(session) for session in self._services.values())
+            pool_inflight = sum(self._task_pool_inflight_locked(pool) for pool in self._task_pools.values())
+            inflight = shared_inflight + service_inflight + pool_inflight
             credit = max(0, self.queue_capacity - (queued + inflight))
             return {
                 "queued": queued,
@@ -5154,10 +5514,35 @@ class NodeControlState:
                         status=session.status,
                         worker_count=session.worker_count,
                         alive_workers=session.alive_workers,
-                        in_flight=session.in_flight,
+                        in_flight=self._service_inflight_locked(session),
                         lease_expire_at=dt_to_ts(session.lease_expire_at),
                         http_base_url=session.http_base_url,
                     )
+                )
+            return out
+
+    def service_report_payloads(self, *, include_stopped: bool = False) -> List[Dict[str, object]]:
+        with self._lock:
+            out: List[Dict[str, object]] = []
+            for session in self._services.values():
+                if not include_stopped and session.status == pb2.SERVICE_STATUS_STOPPED:
+                    continue
+                metrics = dict(session.timing_metrics or {})
+                out.append(
+                    {
+                        "service_name": session.service_name,
+                        "service_id": session.service_id,
+                        "status": int(session.status),
+                        "worker_count": int(session.worker_count),
+                        "alive_workers": int(session.alive_workers),
+                        "in_flight": int(self._service_inflight_locked(session)),
+                        "received_count": int(session.request_count or 0),
+                        "returned_count": int(session.returned_count or 0),
+                        "ema_child_invoke_ms": float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
+                        "ema_samples": int(metrics.get("ema_samples", 0) or 0),
+                        "lease_expire_at": session.lease_expire_at.isoformat(),
+                        "http_base_url": session.http_base_url,
+                    }
                 )
             return out
 
@@ -5196,9 +5581,6 @@ class NodeControlState:
     def credit_locked(self) -> int:
         return max(0, self.queue_capacity - (self._queued_count_locked() + self._inflight_count_locked()))
 
-    def _active_runtime_slot_count_locked(self) -> int:
-        return sum(1 for slot in self._runtime_slots.values() if slot.executor_ready)
-
     def _queued_count_locked(self) -> int:
         return sum(1 for task in self._tasks.values() if task.status == pb2.TASK_STATUS_QUEUED)
 
@@ -5208,32 +5590,6 @@ class NodeControlState:
     def _publish_result_locked(self, task: TaskState) -> None:
         result = task.as_result()
         self._result_hook.push(task.client_id, result)
-
-    def _reset_runtime_slot_locked(
-        self,
-        runtime_key: str,
-        *,
-        now: datetime,
-        drop_queued: bool = False,
-        ensure_host: bool = True,
-    ) -> None:
-        slot = self._runtime_slots.get(runtime_key)
-        if slot is None:
-            return
-        if ensure_host:
-            self._ensure_executor_host_alive_locked(now=now)
-        if self._executor_host is not None and slot.executor_ready:
-            try:
-                self._executor_host.stop_runtime_slot(runtime_key=runtime_key)
-            except Exception:
-                pass
-        slot.executor = None
-        slot.executor_ready = False
-        slot.current_task_id = ""
-        slot.current_attempt = 0
-        slot.last_used_at = now
-        if drop_queued:
-            slot.task_ids.clear()
 
     def _handle_infra_failure_locked(self, task: TaskState, *, reason: str, now: datetime) -> None:
         if task.attempt < self.max_retries:
@@ -5254,137 +5610,6 @@ class NodeControlState:
         task.error_type = "InfraFailure"
         task.error_message = reason
         self._publish_result_locked(task)
-
-    def _start_runtime_slot_locked(self, slot: RuntimeSlotState) -> None:
-        if slot.executor_ready:
-            return
-        self._ensure_executor_host_alive_locked()
-        if self._executor_host is None:
-            raise RuntimeError("executor host unavailable")
-        self._executor_host.start_runtime_slot(runtime_key=slot.runtime_key)
-        slot.executor = _EXECUTOR_ACTIVE
-        slot.executor_ready = True
-        slot.current_task_id = ""
-        slot.current_attempt = 0
-        slot.last_used_at = utc_now()
-        slot.waiting = False
-
-    def _activate_waiting_runtime_slots_locked(self) -> None:
-        while self._active_runtime_slot_count_locked() < self.runtime_slot_capacity and self._runtime_waiting:
-            runtime_key = self._runtime_waiting.popleft()
-            slot = self._runtime_slots.get(runtime_key)
-            if slot is None:
-                continue
-            slot.waiting = False
-            if slot.executor_ready:
-                continue
-            if not slot.task_ids:
-                continue
-            self._start_runtime_slot_locked(slot)
-
-    def _reclaim_idle_runtime_slots_locked(self) -> None:
-        now = utc_now()
-        for runtime_key, slot in list(self._runtime_slots.items()):
-            if not slot.executor_ready:
-                if not slot.task_ids and not slot.waiting:
-                    self._runtime_slots.pop(runtime_key, None)
-                continue
-            if slot.current_task_id or slot.task_ids:
-                continue
-            idle_sec = (now - slot.last_used_at).total_seconds()
-            if idle_sec < self.runtime_slot_idle_ttl_sec:
-                continue
-            if self._executor_host is not None:
-                try:
-                    self._executor_host.stop_runtime_slot(runtime_key=runtime_key)
-                except Exception:
-                    pass
-            slot.executor = None
-            slot.executor_ready = False
-            slot.current_task_id = ""
-            slot.current_attempt = 0
-            slot.last_used_at = now
-
-    def _dispatch_runtime_slots_locked(self) -> None:
-        if not self.enable_internal_executor:
-            return
-        self._activate_waiting_runtime_slots_locked()
-        if self._active_runtime_slot_count_locked() < self.runtime_slot_capacity:
-            for slot in self._runtime_slots.values():
-                if self._active_runtime_slot_count_locked() >= self.runtime_slot_capacity:
-                    break
-                if not slot.executor_ready and slot.task_ids and not slot.waiting:
-                    self._start_runtime_slot_locked(slot)
-
-        for slot in self._runtime_slots.values():
-            if not slot.executor_ready or slot.current_task_id:
-                continue
-            while slot.task_ids:
-                task_id = slot.task_ids[0]
-                task = self._tasks.get(task_id)
-                if task is None or task.status != pb2.TASK_STATUS_QUEUED:
-                    slot.task_ids.popleft()
-                    continue
-                if task.cancel_requested:
-                    slot.task_ids.popleft()
-                    task.status = pb2.TASK_STATUS_CANCELLED
-                    task.finished_at = utc_now()
-                    task.error_type = "Cancelled"
-                    task.error_message = "cancelled by client"
-                    self._publish_result_locked(task)
-                    continue
-
-                artifact = self._codes.get(task.code_version)
-                if artifact is None:
-                    slot.task_ids.popleft()
-                    now = utc_now()
-                    self._handle_infra_failure_locked(task, reason="missing code artifact", now=now)
-                    continue
-
-                slot.task_ids.popleft()
-                now = utc_now()
-                task.status = pb2.TASK_STATUS_RUNNING
-                task.worker_id = f"runtime-slot:{slot.runtime_key}"
-                task.lease_id = str(uuid.uuid4())
-                task.started_at = now
-                task.last_heartbeat_at = now
-                try:
-                    if self._executor_host is None:
-                        raise RuntimeError("executor host unavailable")
-                    touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
-                    managed_state = self._ensure_runtime_managed_globals_state_locked(
-                        client_id=task.client_id,
-                        code_version=task.code_version,
-                        runtime_key=task.runtime_key,
-                        allowed_names=self._get_client_code_managed_globals_locked(
-                            client_id=str(task.client_id or "").strip(),
-                            code_version=str(task.code_version or "").strip(),
-                            runtime_key=str(task.runtime_key or "").strip(),
-                        ),
-                    )
-                    self._executor_host.submit_runtime_task(
-                        runtime_key=slot.runtime_key,
-                        task_id=task.task_id,
-                        attempt=task.attempt,
-                        execute_spec=_build_execute_spec(
-                            artifact,
-                            object_dir=self._object_dir,
-                            method_name=artifact.entry_callable,
-                            payload=self._resolve_memory_object_refs_in_payload_locked(task.payload),
-                            managed_globals_scope_dir=(managed_state.scope_dir if managed_state is not None else ""),
-                            managed_globals_digest=(managed_state.globals_digest if managed_state is not None else ""),
-                        ),
-                    )
-                except Exception as exc:
-                    self._handle_infra_failure_locked(task, reason=repr(exc), now=now)
-                    slot.current_task_id = ""
-                    slot.current_attempt = 0
-                    slot.last_used_at = now
-                    continue
-                slot.current_task_id = task.task_id
-                slot.current_attempt = task.attempt
-                slot.last_used_at = now
-                break
 
     def _touch_internal_heartbeats_locked(self) -> None:
         now = utc_now()
@@ -5442,6 +5667,7 @@ class NodeControlState:
                     execute_spec=_build_execute_spec(
                         artifact,
                         object_dir=self._object_dir,
+                        work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
                         method_name=artifact.entry_callable,
                         payload=self._resolve_memory_object_refs_in_payload_locked(task.payload),
                         managed_globals_scope_dir=(managed_state.scope_dir if managed_state is not None else ""),
@@ -5500,6 +5726,7 @@ class NodeControlState:
                         task.error_type = ""
                         task.error_message = ""
                     if pool is not None:
+                        pool.returned_count += 1
                         self._record_task_pool_timing_locked(
                             pool,
                             method=pool.task_method,

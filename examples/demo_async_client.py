@@ -11,16 +11,15 @@ from pycloud_parallel.controlplane.client import ServiceGroup
 
 def main():
     suffix = int(time.time())
-    # 同步方式（保留原有功能）
-    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
+    # 这个示例关注异步调用模式本身，避免默认返回超大 DataFrame，
+    # 否则高并发阶段会被大 payload 序列化成本淹没。
     dependency_allowlist = []
     blob = (
         b"from pycloud_parallel import pycloud_export\n\n"
-        b"import pandas as pd \n\n"
         b"@pycloud_export\n"
         b"def square(x=0, **_kwargs):\n"
-        b"    x=pd.DataFrame(columns=[0,1,2,3,4],index=range(100000)) \n"
-        b"    return x\n\n"
+        b"    x = int(x)\n"
+        b"    return {'x': x, 'y': x * x}\n\n"
         b"@pycloud_export\n"
         b"def fibonacci(n=0, **_kwargs):\n"
         b"    n = int(n)\n"
@@ -40,7 +39,7 @@ def main():
     group = ServiceGroup.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"async-demo-{suffix}",
-        service_name=f"compute-service",
+        service_name=f"compute-service-{suffix}",
         blob=blob,
         runtime="py3",
         entry_module="compute",

@@ -8,18 +8,16 @@ from collections import deque
 import contextlib
 import errno
 import hashlib
-import importlib
 import inspect
 import json
 import logging
 import io
+import math
 import os
 import queue
 import re
-import secrets
 import socket
 import sys
-import tarfile
 import tempfile
 import threading
 import time
@@ -28,7 +26,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Any, Callable, ClassVar, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -38,8 +36,6 @@ from google.protobuf import timestamp_pb2
 
 from pycloud_parallel.controlplane.config import (
     FILE_HASH_CHUNK_SIZE_BYTES,
-    GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES,
-    GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,
     grpc_channel_options,
 )
@@ -190,6 +186,40 @@ def _normalize_entry_module_arg(entry_module: Any) -> str:
     return str(entry_module or "").strip()
 
 
+def _source_module_from_entry_module_arg(
+    entry_module: Any,
+    *,
+    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
+    blob: Optional[bytes] = None,
+) -> Optional[Any]:
+    if blob is not None or artifact_path:
+        return None
+    if inspect.ismodule(entry_module):
+        return entry_module
+    return None
+
+
+def _normalize_entry_callable_arg(entry_callable: Any) -> str:
+    if not isinstance(entry_callable, str) and callable(entry_callable):
+        return str(getattr(entry_callable, "__name__", "") or "").strip()
+    return str(entry_callable or "").strip()
+
+
+def _source_func_from_entry_callable_arg(
+    entry_callable: Any,
+    *,
+    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
+    blob: Optional[bytes] = None,
+) -> Optional[Callable]:
+    if blob is not None or artifact_path:
+        return None
+    if isinstance(entry_callable, str):
+        return None
+    if callable(entry_callable):
+        return entry_callable
+    return None
+
+
 def _infer_entry_module_from_artifact_path(
     artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
 ) -> str:
@@ -227,12 +257,12 @@ def _prepare_code_blob(
     """
     from pycloud_parallel.controlplane.dependency import DependencyPackager
 
+    packager = DependencyPackager()
+
     # 优先级 1: 模块对象（自动打包整个模块）
     if module is not None:
         if not inspect.ismodule(module):
             raise ValueError("module must be a module object")
-
-        packager = DependencyPackager()
 
         # 创建临时文件
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
@@ -281,43 +311,22 @@ def _prepare_code_blob(
     # 优先级 4: 文件路径 / 路径列表
     if artifact_path:
         if isinstance(artifact_path, (list, tuple)):
-            import zipfile
-
             paths = [Path(str(p)) for p in artifact_path if str(p)]
             if not paths:
                 raise ValueError("artifact_path list is empty")
 
-            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip:
-                tmp_zip_path = tmp_zip.name
-
+            tar_path: Optional[str] = None
             try:
-                with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for path in paths:
-                        if not path.exists():
-                            raise FileNotFoundError(f"Path not found: {path}")
-                        if path.is_file():
-                            zf.write(path, path.name)
-                        elif path.is_dir():
-                            dirs_to_check = {path}
-                            for child in path.rglob("*"):
-                                if child.is_dir():
-                                    dirs_to_check.add(child)
-
-                            for d in sorted(dirs_to_check, key=lambda x: str(x)):
-                                if not (d / "__init__.py").exists():
-                                    init_arcname = path.name / d.relative_to(path) / "__init__.py"
-                                    zf.writestr(str(init_arcname), "")
-
-                            for file_path in path.rglob("*"):
-                                if file_path.is_file():
-                                    arcname = path.name / file_path.relative_to(path)
-                                    zf.write(file_path, str(arcname))
-
-                with open(tmp_zip_path, "rb") as f:
-                    return f.read(), "artifact_bundle.zip"
+                tar_path = packager.package_roots(
+                    paths,
+                    include_tests=False,
+                    synthesize_missing_package_inits=True,
+                )
+                with open(tar_path, "rb") as f:
+                    return f.read(), "artifact_bundle.tar.gz"
             finally:
                 try:
-                    os.unlink(tmp_zip_path)
+                    Path(tar_path).unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -332,24 +341,17 @@ def _prepare_code_blob(
 
         # 如果是目录，打包成 tar.gz
         if path.is_dir():
-            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-                tmp_path = tmp.name
-
+            tar_path: Optional[str] = None
             try:
-                with tarfile.open(tmp_path, "w:gz") as tar:
-                    for item in path.rglob("*"):
-                        if item.is_file():
-                            arcname = item.relative_to(path)
-                            tar.add(item, arcname=arcname)
-
-                with open(tmp_path, "rb") as f:
+                tar_path = packager.package_directory(path, include_tests=False)
+                with open(tar_path, "rb") as f:
                     blob = f.read()
 
                 filename = f"{path.name}.tar.gz"
                 return blob, filename
             finally:
                 try:
-                    os.unlink(tmp_path)
+                    Path(tar_path).unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -806,37 +808,21 @@ def _build_export_spec(
 
 
 def _package_directory_to_targz(dir_path: Path) -> Path:
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-pkg-", suffix=".tar.gz")
-    os.close(fd)
-    out = Path(tmp_name)
-    with tarfile.open(out, "w:gz") as tf:
-        for item in sorted(dir_path.rglob("*")):
-            if item.name == "__pycache__":
-                continue
-            rel = item.relative_to(dir_path)
-            tf.add(item, arcname=str(rel))
-    return out
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    return Path(DependencyPackager().package_directory(dir_path, include_tests=False))
 
 
 def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
-    normalized: List[Path] = []
-    root = root_dir.resolve()
-    for item in paths:
-        p = (root / item).resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"path not found: {item}")
-        if p != root and root not in p.parents:
-            raise ValueError(f"path escapes root_dir: {item}")
-        normalized.append(p)
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
 
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-paths-", suffix=".tar.gz")
-    os.close(fd)
-    out = Path(tmp_name)
-    with tarfile.open(out, "w:gz") as tf:
-        for p in normalized:
-            rel = p.relative_to(root)
-            tf.add(p, arcname=str(rel))
-    return out
+    return Path(
+        DependencyPackager().package_paths(
+            root_dir=root_dir,
+            paths=paths,
+            include_tests=False,
+        )
+    )
 
 
 def _serialize_data_for_object_ref(
@@ -1437,6 +1423,12 @@ class InfoCenterServiceRoute:
     in_flight: int
     lease_expire_at: datetime
     http_base_url: str
+    reported_in_flight: int = 0
+    received_count: int = 0
+    returned_count: int = 0
+    ema_child_invoke_ms: float = 0.0
+    ema_samples: int = 0
+    predicted_busy: float = 0.0
 
 
 @dataclass
@@ -1455,6 +1447,34 @@ def _node_instance_key_from_node(node: InfoCenterNode) -> str:
 
 def _node_instance_key_from_route(route: InfoCenterServiceRoute) -> str:
     return str(getattr(route, "node_instance_id", "") or getattr(route, "node_id", "") or getattr(route, "control_addr", "")).strip()
+
+
+def _route_predicted_busy(route: InfoCenterServiceRoute) -> float:
+    value = float(getattr(route, "predicted_busy", 0.0) or 0.0)
+    if math.isfinite(value) and value > 0.0:
+        return value
+    inflight = max(0, int(getattr(route, "in_flight", 0) or 0))
+    alive_workers = max(1, int(getattr(route, "alive_workers", 0) or 0))
+    return float(inflight) / float(alive_workers)
+
+
+def _route_sort_key(route: InfoCenterServiceRoute, *, strategy: str) -> Tuple[object, ...]:
+    if strategy == "predicted_busy":
+        return (
+            _route_predicted_busy(route),
+            int(getattr(route, "in_flight", 0) or 0),
+            -int(getattr(route, "alive_workers", 0) or 0),
+            _node_instance_key_from_route(route),
+            str(getattr(route, "service_id", "") or ""),
+        )
+    if strategy == "least_inflight":
+        return (
+            int(getattr(route, "in_flight", 0) or 0),
+            -int(getattr(route, "alive_workers", 0) or 0),
+            _node_instance_key_from_route(route),
+            str(getattr(route, "service_id", "") or ""),
+        )
+    raise ValueError("strategy must be one of: predicted_busy, least_inflight, round_robin")
 
 
 def _build_unique_node_id_map(nodes: Sequence[InfoCenterNode], *, requested_ids: Optional[Sequence[str]] = None) -> Dict[str, InfoCenterNode]:
@@ -1520,7 +1540,7 @@ class InfoCenterClient:
         tags: Optional[Sequence[str]] = None,
         version: str = "",
         metadata: Optional[Dict[str, str]] = None,
-        services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
+        services: Optional[Sequence[object]] = None,
         task_pools: Optional[Sequence[Dict[str, object]]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
@@ -1531,6 +1551,9 @@ class InfoCenterClient:
     ) -> Dict[str, object]:
         serialized_services = []
         for item in services or []:
+            if isinstance(item, dict):
+                serialized_services.append(dict(item))
+                continue
             serialized_services.append(
                 {
                     "service_name": str(item.service_name),
@@ -1575,7 +1598,7 @@ class InfoCenterClient:
         healthy: bool = True,
         metrics: Optional[Dict[str, object]] = None,
         metadata: Optional[Dict[str, str]] = None,
-        services: Optional[Sequence[pb2.ServiceRouteReport]] = None,
+        services: Optional[Sequence[object]] = None,
         task_pools: Optional[Sequence[Dict[str, object]]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
         service_worker_capacity: int = 0,
@@ -1586,6 +1609,9 @@ class InfoCenterClient:
     ) -> Dict[str, object]:
         serialized_services = []
         for item in services or []:
+            if isinstance(item, dict):
+                serialized_services.append(dict(item))
+                continue
             serialized_services.append(
                 {
                     "service_name": str(item.service_name),
@@ -1739,6 +1765,12 @@ class InfoCenterClient:
                     in_flight=int(item.get("in_flight", 0) or 0),
                     lease_expire_at=dt.astimezone(timezone.utc),
                     http_base_url=str(item.get("http_base_url", "")),
+                    reported_in_flight=int(item.get("reported_in_flight", 0) or 0),
+                    received_count=int(item.get("received_count", 0) or 0),
+                    returned_count=int(item.get("returned_count", 0) or 0),
+                    ema_child_invoke_ms=float(item.get("ema_child_invoke_ms", 0.0) or 0.0),
+                    ema_samples=int(item.get("ema_samples", 0) or 0),
+                    predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
                 )
             )
         return out
@@ -2661,12 +2693,11 @@ class DedicatedTaskServiceSession:
         owner_client_id: Optional[str] = None,
         service_name: Optional[str] = None,
         func: Optional[Callable] = None,
-        module: Optional[Any] = None,
         artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
         runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
+        entry_module: Any = "",
+        entry_callable: Any = "run",
         package_format: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
@@ -2691,7 +2722,6 @@ class DedicatedTaskServiceSession:
             owner_client_id=owner_client_id,
             service_name=effective_service_name,
             func=func,
-            module=module,
             artifact_path=artifact_path,
             blob=blob,
             runtime=runtime,
@@ -2832,6 +2862,62 @@ class TaskPoolSession:
             self._pool_cycle += 1
         return node_ids[idx]
 
+    def _build_task_submit_item(
+        self,
+        *,
+        node_id: str,
+        payload: Dict[str, object],
+        task_id_prefix: str = "",
+        timeout_hint_sec: int = 0,
+        priority: int = 1,
+    ) -> pb2.TaskSubmitItem:
+        task_id = self._next_task_id()
+        prefix = str(task_id_prefix or f"{self.job_id}-task").strip()
+        if prefix:
+            task_id = f"{prefix}-{task_id.rsplit('-', 1)[-1]}"
+        prepared_payload = _prepare_task_payload_for_submit(
+            self._pools[node_id]._client,  # noqa: SLF001
+            dict(payload or {}),
+        )
+        _, payload_struct, _ = serialize_inline_payload(prepared_payload, context="task pool payload")
+        return pb2.TaskSubmitItem(
+            task_id=task_id,
+            payload=payload_struct,
+            timeout_hint_sec=max(0, int(timeout_hint_sec)),
+            priority=max(1, int(priority)),
+        )
+
+    def _register_pending_task_ids(self, accepted: Sequence[pb2.TaskAccepted]) -> None:
+        with self._result_state_lock:
+            self._pending_task_ids.update(str(item.task_id) for item in accepted if str(item.task_id).strip())
+
+    def _submit_task_items_to_node(
+        self,
+        node_id: str,
+        items: Sequence[pb2.TaskSubmitItem],
+        *,
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        if not items:
+            return pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[], node_credit=0)
+        resp = self._pools[node_id].submit_tasks(items, job_id=str(job_id or self.job_id).strip())
+        self._register_pending_task_ids(resp.accepted)
+        return resp
+
+    def _submit_grouped_task_items(
+        self,
+        grouped: Dict[str, List[pb2.TaskSubmitItem]],
+        *,
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        accepted: List[pb2.TaskAccepted] = []
+        rejected: List[pb2.TaskRejected] = []
+        for node_id, items in grouped.items():
+            resp = self._submit_task_items_to_node(node_id, items, job_id=job_id)
+            accepted.extend(resp.accepted)
+            rejected.extend(resp.rejected)
+        return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
+
     def submit_payloads(
         self,
         payloads: Sequence[Dict[str, object]],
@@ -2844,39 +2930,24 @@ class TaskPoolSession:
         priority: int = 1,
         runtime_key: str = "",
     ) -> pb2.SubmitTasksResponse:
-        del task_method, timeout_sec, job_id, runtime_key
+        del timeout_sec, runtime_key
         self._assert_session_available("submit_payloads")
         if self._closed:
             raise RuntimeError("task pool session is closed")
-        accepted: List[pb2.TaskAccepted] = []
-        rejected: List[pb2.TaskRejected] = []
-        prefix = str(task_id_prefix or f"{self.job_id}-task").strip()
+        self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
         grouped: Dict[str, List[pb2.TaskSubmitItem]] = {}
         for payload in payloads:
-            task_id = self._next_task_id()
-            if prefix:
-                task_id = f"{prefix}-{task_id.rsplit('-', 1)[-1]}"
             target_node_id = self._select_pool_node()
-            prepared_payload = _prepare_task_payload_for_submit(
-                self._pools[target_node_id]._client,  # noqa: SLF001
-                dict(payload or {}),
-            )
-            _, payload_struct, _ = serialize_inline_payload(prepared_payload, context="task pool payload")
             grouped.setdefault(target_node_id, []).append(
-                pb2.TaskSubmitItem(
-                    task_id=task_id,
-                    payload=payload_struct,
+                self._build_task_submit_item(
+                    node_id=target_node_id,
+                    payload=dict(payload or {}),
+                    task_id_prefix=task_id_prefix,
                     timeout_hint_sec=max(0, int(timeout_hint_sec)),
                     priority=max(1, int(priority)),
                 )
             )
-        for node_id, items in grouped.items():
-            resp = self._pools[node_id].submit_tasks(items, job_id=self.job_id)
-            accepted.extend(resp.accepted)
-            rejected.extend(resp.rejected)
-        with self._result_state_lock:
-            self._pending_task_ids.update(str(item.task_id) for item in accepted if str(item.task_id).strip())
-        return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
+        return self._submit_grouped_task_items(grouped, job_id=job_id)
 
     def _mark_result_consumed(self, task_id: str) -> None:
         normalized = str(task_id or "").strip()
@@ -2975,6 +3046,42 @@ class TaskPoolSession:
                 matched.append((node_id, item))
             self._buffered_result_items = kept
             return matched
+
+    def _task_result_to_item(self, node_id: str, task_result: pb2.TaskResult) -> TaskPoolItem:
+        resolved_node_id = str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id)
+        if int(task_result.status) != int(pb2.TASK_STATUS_SUCCEEDED):
+            error = task_result.error
+            return TaskPoolItem(
+                task_id=str(task_result.task_id or ""),
+                node_id=resolved_node_id,
+                node_instance_id=str(node_id),
+                ok=False,
+                status=int(task_result.status),
+                data=None,
+                error_type=str(error.type or ""),
+                error_message=str(error.message or f"task failed: {task_result.task_id}"),
+            )
+        try:
+            data = self._pools[node_id]._client.fetch_result_data(task_result)  # noqa: SLF001
+            return TaskPoolItem(
+                task_id=str(task_result.task_id or ""),
+                node_id=resolved_node_id,
+                node_instance_id=str(node_id),
+                ok=True,
+                status=int(task_result.status),
+                data=data,
+            )
+        except Exception as exc:
+            return TaskPoolItem(
+                task_id=str(task_result.task_id or ""),
+                node_id=resolved_node_id,
+                node_instance_id=str(node_id),
+                ok=False,
+                status=int(task_result.status),
+                data=None,
+                error_type=exc.__class__.__name__,
+                error_message=str(exc),
+            )
 
     def _iter_result_items(
         self,
@@ -3169,40 +3276,7 @@ class TaskPoolSession:
             job_id=job_id,
             task_ids=task_ids,
         ):
-            if int(task_result.status) != int(pb2.TASK_STATUS_SUCCEEDED):
-                error = task_result.error
-                yield TaskPoolItem(
-                    task_id=str(task_result.task_id or ""),
-                    node_id=str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id),
-                    node_instance_id=str(node_id),
-                    ok=False,
-                    status=int(task_result.status),
-                    data=None,
-                    error_type=str(error.type or ""),
-                    error_message=str(error.message or f"task failed: {task_result.task_id}"),
-                )
-                continue
-            try:
-                data = self._pools[node_id]._client.fetch_result_data(task_result)  # noqa: SLF001
-                yield TaskPoolItem(
-                    task_id=str(task_result.task_id or ""),
-                    node_id=str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id),
-                    node_instance_id=str(node_id),
-                    ok=True,
-                    status=int(task_result.status),
-                    data=data,
-                )
-            except Exception as exc:
-                yield TaskPoolItem(
-                    task_id=str(task_result.task_id or ""),
-                    node_id=str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id),
-                    node_instance_id=str(node_id),
-                    ok=False,
-                    status=int(task_result.status),
-                    data=None,
-                    error_type=exc.__class__.__name__,
-                    error_message=str(exc),
-                )
+            yield self._task_result_to_item(node_id, task_result)
 
     def collect_items(
         self,
@@ -3295,48 +3369,246 @@ class TaskPoolSession:
         result_timeout_sec: float = 30.0,
         wait_ms: int = 500,
         raise_on_error: bool = True,
+        node_window_factor: float = 2.0,
     ) -> Iterator[Tuple[str, Any]]:
         if self._closed:
             raise RuntimeError("task pool session is closed")
         self._enter_exclusive_mode("imap_unordered", require_clean=True)
         try:
-            method_name = str(task_method or self._task_method).strip() or self._task_method
+            self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
             max_pending = max(1, int(max_in_flight or 1))
             max_receive = max(1, int(receive_batch or 1))
+            window_factor = max(0.1, float(node_window_factor or 0.0))
             payload_iter = iter(payloads)
+            retry_payloads: "deque[Dict[str, object]]" = deque()
             input_exhausted = False
+            ready_items: "deque[TaskPoolItem]" = deque()
+            node_ids = list(self._pools.keys())
+            if not node_ids:
+                raise RuntimeError("task pool has no node pools")
+            window_by_node = {
+                node_id: max(
+                    1,
+                    int(
+                        math.ceil(
+                            max(1, int(getattr(self._pools[node_id], "worker_count", 1) or 1)) * window_factor
+                        )
+                    ),
+                )
+                for node_id in node_ids
+            }
+            inflight_by_node = {node_id: 0 for node_id in node_ids}
+            disabled_submit_nodes: set[str] = set()
+            scheduler_failures: Dict[str, str] = {}
+            infra_failures_by_node: Dict[str, int] = {}
+            poll_start_idx = 0
+            wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
+            cancelled_for_error = False
+
+            def _plan_targets(
+                available_by_node: Dict[str, int],
+                *,
+                node_order: Sequence[str],
+                max_new_tasks: int,
+            ) -> List[str]:
+                if max_new_tasks <= 0:
+                    return []
+                remaining = {
+                    node_id: max(0, int(available_by_node.get(node_id, 0) or 0))
+                    for node_id in node_order
+                    if node_id not in disabled_submit_nodes
+                }
+                planned: List[str] = []
+                while max_new_tasks > 0:
+                    progressed = False
+                    for node_id in node_order:
+                        if max_new_tasks <= 0:
+                            break
+                        if remaining.get(node_id, 0) <= 0:
+                            continue
+                        planned.append(node_id)
+                        remaining[node_id] -= 1
+                        max_new_tasks -= 1
+                        progressed = True
+                    if not progressed:
+                        break
+                return planned
+
+            def _next_payload() -> Optional[Dict[str, object]]:
+                nonlocal input_exhausted
+                if retry_payloads:
+                    return dict(retry_payloads.popleft() or {})
+                if input_exhausted:
+                    return None
+                try:
+                    return dict(next(payload_iter) or {})
+                except StopIteration:
+                    input_exhausted = True
+                    return None
+
+            def _requeue_payloads_front(items: Sequence[Tuple[Dict[str, object], pb2.TaskSubmitItem]]) -> None:
+                for payload, _item in reversed(list(items)):
+                    retry_payloads.appendleft(dict(payload or {}))
+
+            def _fill_from_quota(
+                available_by_node: Dict[str, int],
+                *,
+                node_order: Sequence[str],
+            ) -> int:
+                available_global = max(0, max_pending - sum(inflight_by_node.values()))
+                if available_global <= 0:
+                    return 0
+                capped_by_node = {
+                    node_id: min(
+                        max(0, int(available_by_node.get(node_id, 0) or 0)),
+                        max(0, int(window_by_node.get(node_id, 0) or 0) - int(inflight_by_node.get(node_id, 0) or 0)),
+                    )
+                    for node_id in node_order
+                    if node_id not in disabled_submit_nodes
+                }
+                targets = _plan_targets(capped_by_node, node_order=node_order, max_new_tasks=available_global)
+                if not targets:
+                    return 0
+                grouped: Dict[str, List[Tuple[Dict[str, object], pb2.TaskSubmitItem]]] = {}
+                for node_id in targets:
+                    payload = _next_payload()
+                    if payload is None:
+                        break
+                    item = self._build_task_submit_item(
+                        node_id=node_id,
+                        payload=payload,
+                        timeout_hint_sec=0,
+                        priority=1,
+                    )
+                    grouped.setdefault(node_id, []).append((payload, item))
+                submitted = 0
+                for node_id in node_order:
+                    entries = grouped.get(node_id, [])
+                    if not entries:
+                        continue
+                    try:
+                        resp = self._submit_task_items_to_node(
+                            node_id,
+                            [item for _payload, item in entries],
+                            job_id=self.job_id,
+                        )
+                    except Exception as exc:
+                        disabled_submit_nodes.add(node_id)
+                        scheduler_failures[node_id] = repr(exc)
+                        _requeue_payloads_front(entries)
+                        continue
+                    accepted_ids = {str(item.task_id) for item in resp.accepted if str(item.task_id).strip()}
+                    if not accepted_ids:
+                        _requeue_payloads_front(entries)
+                        continue
+                    accepted_count = 0
+                    rejected_entries: List[Tuple[Dict[str, object], pb2.TaskSubmitItem]] = []
+                    for entry in entries:
+                        if str(entry[1].task_id) in accepted_ids:
+                            accepted_count += 1
+                        else:
+                            rejected_entries.append(entry)
+                    if rejected_entries:
+                        _requeue_payloads_front(rejected_entries)
+                    inflight_by_node[node_id] += accepted_count
+                    submitted += accepted_count
+                return submitted
+
+            initial_quota = {node_id: window_by_node[node_id] for node_id in node_ids}
+            _fill_from_quota(initial_quota, node_order=node_ids)
+            if self._pending_result_count() <= 0 and not retry_payloads and input_exhausted:
+                return
 
             while True:
-                while not input_exhausted and self._pending_result_count() < max_pending:
-                    try:
-                        payload = next(payload_iter)
-                    except StopIteration:
-                        input_exhausted = True
-                        break
-                    resp = self.submit_payloads([dict(payload or {})], task_method=method_name, timeout_sec=submit_timeout_sec)
-                    if len(resp.accepted) != 1:
-                        raise RuntimeError(
-                            f"imap_unordered expected exactly one accepted task per payload, "
-                            f"got accepted={len(resp.accepted)} rejected={len(resp.rejected)}"
-                        )
+                yielded = 0
+                while ready_items and yielded < max_receive:
+                    item = ready_items.popleft()
+                    if not item.ok:
+                        if raise_on_error:
+                            if not cancelled_for_error:
+                                with contextlib.suppress(Exception):
+                                    self.cancel_job(reason="imap_unordered task failure", job_id=self.job_id)
+                                cancelled_for_error = True
+                            raise RuntimeError(item.error_message or f"task failed: {item.task_id}")
+                        yield item.task_id, None
+                    else:
+                        yield item.task_id, item.data
+                    yielded += 1
+                if yielded > 0:
+                    continue
 
-                if input_exhausted and self._pending_result_count() <= 0:
+                if input_exhausted and not retry_payloads and self._pending_result_count() <= 0:
                     return
 
-                received_any = False
-                for task_id, data in self.iter_data(
-                    max_count=max_receive if max_receive > 0 else None,
-                    timeout_sec=result_timeout_sec,
-                    wait_ms=wait_ms,
-                    raise_on_error=raise_on_error,
-                ):
-                    received_any = True
-                    yield str(task_id), data
+                if self._pending_result_count() <= 0:
+                    idle_quota = {
+                        node_id: max(0, int(window_by_node.get(node_id, 0) or 0) - int(inflight_by_node.get(node_id, 0) or 0))
+                        for node_id in node_ids
+                    }
+                    submitted_now = _fill_from_quota(idle_quota, node_order=node_ids)
+                    if submitted_now > 0:
+                        wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
+                        continue
+                    if retry_payloads or not input_exhausted:
+                        failure_suffix = f"; failures={scheduler_failures}" if scheduler_failures else ""
+                        raise RuntimeError(f"imap_unordered could not submit tasks to any active task pool node{failure_suffix}")
+                    return
 
-                if not received_any and self._pending_result_count() > 0:
+                ordered_node_ids = node_ids[poll_start_idx:] + node_ids[:poll_start_idx]
+                poll_start_idx = (poll_start_idx + 1) % len(node_ids)
+                completed_items: List[TaskPoolItem] = []
+                freed_by_node: Dict[str, int] = {}
+                completion_order: List[str] = []
+                for node_id in ordered_node_ids:
+                    pull_limit = max(1, int(inflight_by_node.get(node_id, 0) or 1))
+                    try:
+                        resp = self._pools[node_id].pull_results(limit=pull_limit, wait_ms=0, cursor="")
+                    except Exception as exc:
+                        disabled_submit_nodes.add(node_id)
+                        scheduler_failures[node_id] = repr(exc)
+                        continue
+                    if not resp.results:
+                        continue
+                    for result in resp.results:
+                        normalized = str(result.task_id or "").strip()
+                        if not self._is_pending_task_id(normalized):
+                            continue
+                        self._mark_result_consumed(result.task_id)
+                        inflight_by_node[node_id] = max(0, inflight_by_node[node_id] - 1)
+                        freed_by_node[node_id] = freed_by_node.get(node_id, 0) + 1
+                        if node_id not in completion_order:
+                            completion_order.append(node_id)
+                        if int(result.status) == int(pb2.TASK_STATUS_FAILED_INFRA):
+                            infra_failures_by_node[node_id] = infra_failures_by_node.get(node_id, 0) + 1
+                            if infra_failures_by_node[node_id] >= 2:
+                                disabled_submit_nodes.add(node_id)
+                        elif int(result.status) == int(pb2.TASK_STATUS_SUCCEEDED):
+                            infra_failures_by_node.pop(node_id, None)
+                        completed_items.append(self._task_result_to_item(node_id, result))
+
+                if completed_items:
+                    wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
+                    ready_items.extend(completed_items)
+                    if not (raise_on_error and any(not item.ok for item in completed_items)):
+                        refill_quota = {
+                            node_id: min(
+                                int(freed_by_node.get(node_id, 0) or 0),
+                                max(
+                                    0,
+                                    int(window_by_node.get(node_id, 0) or 0)
+                                    - int(inflight_by_node.get(node_id, 0) or 0),
+                                ),
+                            )
+                            for node_id in completion_order
+                        }
+                        _fill_from_quota(refill_quota, node_order=completion_order)
+                    continue
+
+                if time.time() >= wait_deadline:
                     raise TimeoutError(
                         f"imap_unordered did not receive results before timeout; pending_task_ids={self._pending_result_count()}"
                     )
+                time.sleep(max(0.01, min(0.1, wait_ms / 1000.0 if wait_ms > 0 else 0.02)))
         finally:
             self._exit_exclusive_mode("imap_unordered")
 
@@ -3487,12 +3759,11 @@ class TaskPoolSession:
         owner_client_id: Optional[str] = None,
         pool_name: Optional[str] = None,
         func: Optional[Callable] = None,
-        module: Optional[Any] = None,
         artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
         runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
+        entry_module: Any = "",
+        entry_callable: Any = "run",
         package_format: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
@@ -3508,23 +3779,43 @@ class TaskPoolSession:
         node_limit: int = 100,
         timeout_sec: float = 10.0,
     ) -> "TaskPoolSession":
-        entry_module = _normalize_entry_module_arg(entry_module)
+        raw_entry_module = entry_module
+        raw_entry_callable = entry_callable
+        source_module = _source_module_from_entry_module_arg(
+            raw_entry_module,
+            artifact_path=artifact_path,
+            blob=blob,
+        )
+        source_func = func
+        if source_func is None and source_module is None:
+            source_func = _source_func_from_entry_callable_arg(
+                raw_entry_callable,
+                artifact_path=artifact_path,
+                blob=blob,
+            )
+        entry_module = _normalize_entry_module_arg(raw_entry_module)
+        entry_callable = _normalize_entry_callable_arg(raw_entry_callable)
         effective_blob, effective_filename = _prepare_code_blob(
-            func=func,
-            module=module,
+            func=source_func,
+            module=source_module,
             artifact_path=artifact_path,
             blob=blob,
         )
         if effective_blob is None:
-            raise ValueError("blob, func, module or artifact_path is required")
-        effective_package_format = _resolve_package_format(package_format, effective_filename, default="py")
+            raise ValueError(
+                "blob, func, artifact_path, module-object entry_module or callable-object entry_callable is required"
+            )
+        requested_package_format = "tar.gz" if (source_func is not None or source_module is not None) else package_format
+        effective_package_format = _resolve_package_format(requested_package_format, effective_filename, default="py")
         if not entry_module:
-            if module is not None:
-                entry_module = _default_entry_module_for_module(module)
-            elif func is not None:
-                entry_module = _default_entry_module_for_func(func)
+            if source_module is not None:
+                entry_module = _default_entry_module_for_module(source_module)
+            elif source_func is not None:
+                entry_module = _default_entry_module_for_func(source_func)
             elif artifact_path:
                 entry_module = _infer_entry_module_from_artifact_path(artifact_path)
+        if source_func is not None and (not entry_callable or entry_callable == "run"):
+            entry_callable = str(getattr(source_func, "__name__", "") or "").strip() or "run"
         if not entry_module and effective_package_format == "py":
             entry_module = _default_entry_module_for_package(package_format=effective_package_format, entry_module=entry_module, fallback_stem="task_pool_artifact")
 
@@ -3698,7 +3989,7 @@ class _DiscoveryRouteCache:
         *,
         exclude_service_ids: Optional[Set[str]] = None,
         force_refresh: bool = False,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
     ) -> InfoCenterServiceRoute:
         name = str(service_name or "").strip()
         routes = list(self.refresh(name, force=True)) if force_refresh else list(self.get_routes(name))
@@ -3720,11 +4011,7 @@ class _DiscoveryRouteCache:
                 idx = self._route_index.get(name, 0)
                 self._route_index[name] = idx + 1
             return candidates[idx % len(candidates)]
-        if strategy != "least_inflight":
-            raise ValueError("strategy must be one of: least_inflight, round_robin")
-        candidates.sort(
-            key=lambda route: (int(route.in_flight), -int(route.alive_workers), _node_instance_key_from_route(route), route.service_id)
-        )
+        candidates.sort(key=lambda route: _route_sort_key(route, strategy=strategy))
         return candidates[0]
 
     def _route_available(self, service_name: str, service_id: str) -> bool:
@@ -3770,6 +4057,12 @@ def _serialize_route(route: InfoCenterServiceRoute) -> Dict[str, object]:
         "worker_count": route.worker_count,
         "alive_workers": route.alive_workers,
         "in_flight": route.in_flight,
+        "reported_in_flight": route.reported_in_flight,
+        "received_count": route.received_count,
+        "returned_count": route.returned_count,
+        "ema_child_invoke_ms": route.ema_child_invoke_ms,
+        "ema_samples": route.ema_samples,
+        "predicted_busy": route.predicted_busy,
         "http_base_url": route.http_base_url,
         "status": int(route.status),
         "lease_expire_at": route.lease_expire_at.isoformat(),
@@ -3905,7 +4198,7 @@ class DiscoveryServiceClient:
         *,
         service_name: str,
         include_docs: bool = False,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
     ) -> Sequence[Dict[str, object]]:
         tried: Set[str] = set()
         try:
@@ -3931,7 +4224,7 @@ class DiscoveryServiceClient:
         payload: Optional[Dict[str, object]] = None,
         timeout_sec: float = 60.0,
         service_token: Optional[str] = None,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
     ) -> Dict[str, object]:
         name = str(service_name or "").strip()
         method_name = str(method or "").strip()
@@ -5127,12 +5420,11 @@ class ServiceGroup:
         owner_client_id: Optional[str] = None,
         service_name: Optional[str] = None,
         func: Optional[Callable] = None,
-        module: Optional[Any] = None,
         artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
         runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
+        entry_module: Any = "",
+        entry_callable: Any = "run",
         package_format: str = "",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
@@ -5171,8 +5463,8 @@ class ServiceGroup:
             artifact_path: 单个文件、单个文件夹或文件/文件夹路径列表
             blob: 直接提供代码内容
             runtime: 运行时版本
-            entry_module: 入口模块名
-            entry_callable: 入口函数名
+            entry_module: 入口模块名，或可导入的真实模块对象
+            entry_callable: 入口函数名，或真实函数对象
             package_format: 包格式 ("py", "zip", "tar.gz")
             export_mode: 导出模式 ("decorator", "explicit", "all", "single")
             export_methods: 显式导出的方法列表
@@ -5201,48 +5493,57 @@ class ServiceGroup:
         Returns:
             ServiceGroup: 部署的服务组
         """
-        entry_module = _normalize_entry_module_arg(entry_module)
-        # 自动本地源码打包：处理模块对象和函数对象
-        if module is not None:
-            effective_blob, effective_filename = _prepare_code_blob(
-                func=None,
-                module=module,
-                artifact_path="",
-                blob=blob,
-            )
-            effective_package_format = "tar.gz"
-
-            # 自动推断 entry_module
-            if not entry_module:
-                entry_module = _default_entry_module_for_module(module)
-        elif func is not None:
-            effective_blob, effective_filename = _prepare_code_blob(
-                func=func,
-                module=None,
-                artifact_path="",
-                blob=blob,
-            )
-            effective_package_format = "tar.gz"
-
-            # 自动推断 entry_module 和 entry_callable
-            if not entry_module:
-                entry_module = _default_entry_module_for_func(func)
-            if not entry_callable or entry_callable == "run":
-                entry_callable = func.__name__
-        else:
-            effective_blob, effective_filename = _prepare_code_blob(
-                func=None,
-                module=None,
+        raw_entry_module = entry_module
+        raw_entry_callable = entry_callable
+        source_module = _source_module_from_entry_module_arg(
+            raw_entry_module,
+            artifact_path=artifact_path,
+            blob=blob,
+        )
+        source_func = func
+        if source_func is None and source_module is None:
+            source_func = _source_func_from_entry_callable_arg(
+                raw_entry_callable,
                 artifact_path=artifact_path,
                 blob=blob,
             )
-            effective_package_format = package_format
+        entry_module = _normalize_entry_module_arg(raw_entry_module)
+        entry_callable = _normalize_entry_callable_arg(raw_entry_callable)
+
+        if source_func is not None:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=source_func,
+                module=None,
+                artifact_path="",
+                blob=blob,
+            )
+            requested_package_format = "tar.gz"
+
+            # 自动推断 entry_module 和 entry_callable
+            if not entry_module:
+                entry_module = _default_entry_module_for_func(source_func)
+            if not entry_callable or entry_callable == "run":
+                entry_callable = str(getattr(source_func, "__name__", "") or "").strip() or "run"
+        else:
+            effective_blob, effective_filename = _prepare_code_blob(
+                func=None,
+                module=source_module,
+                artifact_path=artifact_path,
+                blob=blob,
+            )
+            requested_package_format = "tar.gz" if source_module is not None else package_format
+            if not entry_module and source_module is not None:
+                entry_module = _default_entry_module_for_module(source_module)
 
         effective_package_format = _resolve_package_format(
-            effective_package_format,
+            requested_package_format,
             effective_filename,
             default="py",
         )
+        if effective_blob is None and not artifact_path:
+            raise ValueError(
+                "blob, func, artifact_path, module-object entry_module or callable-object entry_callable is required"
+            )
         if effective_blob is not None and not effective_filename:
             effective_filename = _default_artifact_filename(
                 package_format=effective_package_format,
@@ -5616,78 +5917,6 @@ class ServiceGroup:
         except Exception:
             session_cache_lock.close()
             raise
-
-    @classmethod
-    def deploy_from_module(
-        cls,
-        *,
-        infocenter_target: str,
-        module: Any,
-        owner_client_id: Optional[str] = None,
-        service_name: Optional[str] = None,
-        runtime: str = "py3",
-        entry_callable: str = "run",
-        export_mode: str = "decorator",
-        export_methods: Optional[Sequence[str]] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        worker_count: int = 10,
-        heartbeat_timeout_sec: int = 30,
-        idle_ttl_sec: int = 0,
-        expose_http: bool = True,
-        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-        healthy_only: bool = True,
-        tags: Optional[Sequence[str]] = None,
-        node_ids: Optional[Sequence[str]] = None,
-        node_instance_ids: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        node_limit: int = 100,
-        allow_partial: bool = True,
-        min_success_nodes: int = 1,
-        timeout_sec: float = 10.0,
-        ensure_unique_service_name: bool = True,
-        reuse_existing_same_code: bool = True,
-        replace_existing_if_code_changed: bool = True,
-        session_cache_dir: str = "",
-        breaker_enabled: bool = True,
-        breaker_failure_threshold: int = 3,
-        breaker_cooldown_sec: float = 15.0,
-        breaker_max_cooldown_sec: float = 120.0,
-    ) -> "ServiceGroup":
-        return cls.deploy_from_infocenter(
-            infocenter_target=infocenter_target,
-            owner_client_id=owner_client_id,
-            service_name=service_name,
-            module=module,
-            runtime=runtime,
-            entry_callable=entry_callable,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=managed_global_names,
-            worker_count=worker_count,
-            heartbeat_timeout_sec=heartbeat_timeout_sec,
-            idle_ttl_sec=idle_ttl_sec,
-            expose_http=expose_http,
-            chunk_size=chunk_size,
-            healthy_only=healthy_only,
-            tags=tags,
-            node_ids=node_ids,
-            node_instance_ids=node_instance_ids,
-            node_count=node_count,
-            node_limit=node_limit,
-            allow_partial=allow_partial,
-            min_success_nodes=min_success_nodes,
-            timeout_sec=timeout_sec,
-            ensure_unique_service_name=ensure_unique_service_name,
-            reuse_existing_same_code=reuse_existing_same_code,
-            replace_existing_if_code_changed=replace_existing_if_code_changed,
-            session_cache_dir=session_cache_dir,
-            breaker_enabled=breaker_enabled,
-            breaker_failure_threshold=breaker_failure_threshold,
-            breaker_cooldown_sec=breaker_cooldown_sec,
-            breaker_max_cooldown_sec=breaker_max_cooldown_sec,
-        )
 
     @classmethod
     def deploy_from_func(
@@ -7342,7 +7571,7 @@ class DirectConnect(DiscoveryServiceClient):
             method=name,
             group=self,
             timeout_sec=self.timeout_sec,
-            strategy="least_inflight",
+            strategy="predicted_busy",
             refresh_status=False,
         )
 
@@ -7369,7 +7598,7 @@ class DirectConnect(DiscoveryServiceClient):
         self._ensure_methods_discovered()
         return list(self._discovered_methods or [])
 
-    def list_methods(self, *, include_docs: bool = False, strategy: str = "least_inflight") -> List[Dict[str, object]]:  # type: ignore[override]
+    def list_methods(self, *, include_docs: bool = False, strategy: str = "predicted_busy") -> List[Dict[str, object]]:  # type: ignore[override]
         return list(
             super().list_methods(
                 service_name=self.service_name,
@@ -7395,7 +7624,7 @@ class DirectConnect(DiscoveryServiceClient):
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_attempts: int = 0,
     ) -> Tuple[str, Dict[str, object]]:
@@ -7458,7 +7687,7 @@ class DirectConnect(DiscoveryServiceClient):
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_attempts: int = 0,
     ) -> Tuple[str, Dict[str, object]]:

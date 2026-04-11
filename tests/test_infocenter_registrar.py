@@ -506,7 +506,6 @@ def test_node_registrar_syncs_active_runtimes(tmp_path):
         node_id="node-reg-runtime-01",
         queue_capacity=32,
         worker_capacity=1,
-        runtime_slot_capacity=1,
         artifact_dir=str(tmp_path / "code_cache_runtime"),
         enable_internal_executor=True,
         enable_service_session=False,

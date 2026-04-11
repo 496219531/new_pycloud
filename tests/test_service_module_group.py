@@ -1,11 +1,35 @@
 """测试 DeployedService 的模块化调用功能。"""
 
 import asyncio
+import importlib
+import io
+import tarfile
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
+
+
+def _build_service_entry_module(tmp_path, monkeypatch):
+    package_name = "demo_service_pkg_entry"
+    package_dir = tmp_path / package_name
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "helper.py").write_text(
+        "def normalize(value):\n"
+        "    return int(value)\n",
+        encoding="utf-8",
+    )
+    (package_dir / "worker.py").write_text(
+        "from .helper import normalize\n\n"
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': normalize(value)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    return importlib.import_module(f"{package_name}.worker")
 
 
 class TestCallProxy:
@@ -514,6 +538,156 @@ class TestDeployedService:
         assert "[DeployedService] deploy success service_name=demo-service nodes=['node-1']" in err
         for client in group._clients.values():  # noqa: SLF001
             client.close()
+
+    def test_deploy_from_infocenter_packages_module_object_entry_module(self, tmp_path, monkeypatch):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        create_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    service_id="svc-1",
+                    service_token="token-1",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-1",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            return_value=((), [fake_node]),
+        ), patch(
+            "pycloud_parallel.controlplane.client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            ServiceGroup,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            ServiceGroup,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = ServiceGroup.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-module-service",
+                entry_module=worker_module,
+                entry_callable="run",
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert len(create_calls) == 1
+            create_call = create_calls[0]
+            assert create_call["entry_module"] == worker_module.__name__
+            assert create_call["package_format"] == "tar.gz"
+            with tarfile.open(fileobj=io.BytesIO(create_call["blob"]), mode="r:gz") as tar:
+                names = set(tar.getnames())
+            assert f"{worker_module.__package__}/__init__.py" in names
+            assert f"{worker_module.__package__}/worker.py" in names
+            assert f"{worker_module.__package__}/helper.py" in names
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
+    def test_deploy_from_infocenter_packages_callable_object_entry_callable(self, tmp_path, monkeypatch):
+        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        create_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    service_id="svc-1",
+                    service_token="token-1",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-1",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            return_value=((), [fake_node]),
+        ), patch(
+            "pycloud_parallel.controlplane.client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            ServiceGroup,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            ServiceGroup,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = ServiceGroup.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-callable-service",
+                entry_callable=worker_module.run,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert len(create_calls) == 1
+            create_call = create_calls[0]
+            assert create_call["entry_module"] == worker_module.__name__
+            assert create_call["entry_callable"] == "run"
+            assert create_call["package_format"] == "tar.gz"
+            with tarfile.open(fileobj=io.BytesIO(create_call["blob"]), mode="r:gz") as tar:
+                names = set(tar.getnames())
+            assert f"{worker_module.__package__}/__init__.py" in names
+            assert f"{worker_module.__package__}/worker.py" in names
+            assert f"{worker_module.__package__}/helper.py" in names
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
 
     def test_join_emits_failure_summary(self, capsys):
         from pycloud_parallel.controlplane.client import ServiceGroup

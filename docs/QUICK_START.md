@@ -215,6 +215,12 @@ with TaskPoolSession.from_infocenter(
     print(mapped)
 ```
 
+说明：
+
+1. `TaskPoolSession` 当前是单入口模式，入口名就是 `entry_callable`
+2. `submit_payloads(..., task_method=...)` 只能传这个方法名
+3. `runtime_key` 仍可用于 runtime 逻辑隔离，但不再表示独立 runtime-slot
+
 如果你希望先排队，再由调度器自动创建专属 pool：
 
 ```python

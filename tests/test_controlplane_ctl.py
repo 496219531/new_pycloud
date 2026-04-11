@@ -8,7 +8,14 @@ import pytest
 
 from pycloud_parallel.controlplane import ctl
 from pycloud_parallel.controlplane.object_ref import object_id_from_sha256_hex, object_ref_to_payload, ObjectRef
-from pycloud_parallel.controlplane.state import _managed_globals_scope_dir
+from pycloud_parallel.controlplane.state import (
+    _code_content_dir,
+    _code_index_link_path,
+    _code_index_meta_path,
+    _code_variant_dir,
+    _ensure_code_index_entry,
+    _managed_globals_scope_dir,
+)
 
 
 def _mock_public_host(host: str, *, remote_hint: str = "") -> str:
@@ -43,6 +50,13 @@ def test_ctl_parser_accepts_local_flag_after_start_command():
     parser = ctl.build_parser()
     args = parser.parse_args(["start", "--local"])
     assert args.command == "start"
+    assert args.local is True
+
+
+def test_ctl_parser_accepts_local_flag_before_restart_command():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--local", "restart"])
+    assert args.command == "restart"
     assert args.local is True
 
 
@@ -134,11 +148,25 @@ def test_ctl_parser_accepts_doctor_command():
     assert args.ports == "50051,50061"
 
 
+def test_ctl_parser_accepts_cache_list_command():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["cache-list", "--match", "demo"])
+    assert args.command == "cache-list"
+    assert args.match == "demo"
+
+
 def test_ctl_parser_accepts_gc_command():
     parser = ctl.build_parser()
     args = parser.parse_args(["gc", "--dry-run"])
     assert args.command == "gc"
     assert args.dry_run is True
+
+
+def test_ctl_parser_accepts_gc_force_flag():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["gc", "--force"])
+    assert args.command == "gc"
+    assert args.force is True
 
 
 def test_assert_bind_available_rejects_in_use_port():
@@ -369,7 +397,7 @@ def test_gc_objects_keeps_current_globals_refs_and_deletes_stale_others(tmp_path
     )
 
     code_sha = "c" * 64
-    scopes_dir = artifact_dir / "codes" / code_sha / "scopes"
+    scopes_dir = artifact_dir / "codes" / code_sha / "subversions" / "subv-1" / "globals"
     scope_dir = _managed_globals_scope_dir(scopes_dir, scope_kind="service", scope_key="svc-1")
     globals_digest = "d" * 64
     value_digest = "e" * 64
@@ -423,19 +451,40 @@ def test_gc_objects_keeps_current_globals_refs_and_deletes_stale_others(tmp_path
 
 def test_gc_codes_deletes_stale_code_dirs(tmp_path, capsys):
     artifact_dir = tmp_path / "code_cache"
-    code_dir = artifact_dir / "codes" / ("f" * 64)
-    code_dir.mkdir(parents=True, exist_ok=True)
+    code_version = f"sha256:{'f' * 64}"
+    code_dir = _code_content_dir(artifact_dir, code_version=code_version)
+    variant_dir = _code_variant_dir(artifact_dir, code_version=code_version)
+    variant_dir.mkdir(parents=True, exist_ok=True)
     old_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     _write_json(
-        code_dir / "meta.json",
+        variant_dir / "meta.json",
         {
-            "code_version": f"sha256:{'f'*64}",
-            "artifact_path": str(code_dir / "artifact.py"),
+            "code_version": code_version,
+            "runtime": "py3",
+            "entry_module": "demo.gc_cleanup",
+            "entry_callable": "run",
+            "package_format": "py",
+            "artifact_path": str(code_dir / "pkg" / "artifact.py"),
             "created_at": old_time,
             "last_at": old_time,
         },
     )
-    (code_dir / "artifact.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    (code_dir / "pkg").mkdir(parents=True, exist_ok=True)
+    (code_dir / "pkg" / "artifact.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    assert _ensure_code_index_entry(artifact_dir, code_version=code_version) is True
+    index_path = _code_index_link_path(
+        artifact_dir,
+        code_version=code_version,
+        entry_module="demo.gc_cleanup",
+        entry_callable="run",
+    )
+    index_meta_path = _code_index_meta_path(
+        artifact_dir,
+        code_version=code_version,
+        entry_module="demo.gc_cleanup",
+        entry_callable="run",
+    )
+    assert index_meta_path.exists()
 
     parser = ctl.build_parser()
     args = parser.parse_args([
@@ -453,6 +502,122 @@ def test_gc_codes_deletes_stale_code_dirs(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["deleted_codes"]
     assert not code_dir.exists()
+    assert not index_path.exists()
+    assert not index_meta_path.exists()
+
+
+def test_gc_refuses_destructive_run_when_managed_processes_are_running(tmp_path, monkeypatch, capsys):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "gc",
+        "--artifact-dir",
+        str(tmp_path / "code_cache"),
+    ])
+    monkeypatch.setattr(ctl, "_running_managed_processes", lambda _root: [("node-1", 1234), ("controlplane", 5678)])
+
+    assert ctl._cmd_gc(args) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "refused" in payload["error"]
+    assert payload["running_processes"] == [
+        {"name": "node-1", "pid": 1234},
+        {"name": "controlplane", "pid": 5678},
+    ]
+
+
+def test_gc_allows_dry_run_when_managed_processes_are_running(tmp_path, monkeypatch, capsys):
+    artifact_dir = tmp_path / "code_cache"
+    (artifact_dir / "codes").mkdir(parents=True, exist_ok=True)
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "gc",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--dry-run",
+    ])
+    monkeypatch.setattr(ctl, "_running_managed_processes", lambda _root: [("node-1", 1234)])
+
+    assert ctl._cmd_gc(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["dry_run"] is True
+
+
+def test_gc_allows_force_when_managed_processes_are_running(tmp_path, monkeypatch, capsys):
+    artifact_dir = tmp_path / "code_cache"
+    (artifact_dir / "codes").mkdir(parents=True, exist_ok=True)
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "gc",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--force",
+    ])
+    monkeypatch.setattr(ctl, "_running_managed_processes", lambda _root: [("node-1", 1234)])
+
+    assert ctl._cmd_gc(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["dry_run"] is False
+
+
+def test_cache_list_rebuilds_index_and_returns_readable_paths(tmp_path, capsys):
+    artifact_dir = tmp_path / "code_cache"
+    code_version = f"sha256:{'1' * 64}.{'2' * 16}"
+    code_dir = _code_content_dir(artifact_dir, code_version=code_version)
+    variant_dir = _code_variant_dir(artifact_dir, code_version=code_version)
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    created_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    last_at = datetime.now(timezone.utc).isoformat()
+    _write_json(
+        variant_dir / "meta.json",
+        {
+            "code_version": code_version,
+            "runtime": "py3",
+            "entry_module": "calc_asset_ratio.calc_asset_ratio",
+            "entry_callable": "run_sync",
+            "package_format": "py",
+            "artifact_path": str(code_dir / "pkg" / "artifact.py"),
+            "dependency_path": "",
+            "size_bytes": 128,
+            "created_at": created_at,
+            "last_at": last_at,
+        },
+    )
+    (code_dir / "pkg").mkdir(parents=True, exist_ok=True)
+    (code_dir / "pkg" / "artifact.py").write_text("def run_sync():\n    return 1\n", encoding="utf-8")
+
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "cache-list",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--match",
+        "calc_asset_ratio",
+        "--json",
+    ])
+    assert ctl._cmd_cache_list(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    item = payload["items"][0]
+    assert item["entry_module"] == "calc_asset_ratio.calc_asset_ratio"
+    assert item["entry_callable"] == "run_sync"
+    assert item["code_digest"] == "1" * 64
+    assert item["code_key"] == code_dir.name
+    assert item["subversion_key"] == variant_dir.name
+    assert item["code_dir"] == str(variant_dir)
+    assert item["content_dir"] == str(code_dir)
+    assert "calc_asset_ratio.calc_asset_ratio__run_sync__" in item["index_path"]
+    index_path = Path(item["index_path"])
+    assert index_path.exists() or index_path.is_symlink()
 
 
 def test_cmd_stop_node_only_stops_requested_node(tmp_path, monkeypatch):

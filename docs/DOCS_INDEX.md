@@ -34,7 +34,7 @@
 ## 任务模式
 
 - [TASK_MODE.md](TASK_MODE.md)
-  - 子任务执行层、任务流、`runtime_key`、热点路由、原生 task pool
+  - 子任务执行层、原生 task pool、单入口 `entry_callable`、`runtime_key` 的当前语义
 - [QUICK_START.md](QUICK_START.md)
   - `TaskPoolSession` / `DedicatedTaskServiceSession` / `JobQueueClient` 最小入口
 

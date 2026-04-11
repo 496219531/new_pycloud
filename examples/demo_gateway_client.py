@@ -38,6 +38,7 @@ import time
 from pycloud_parallel import DeployedService, GatewayConnect
 from pycloud_parallel.controlplane.client import GatewayServiceClient
 
+
 def check_service_exists(gateway_target: str, service_name: str) -> bool:
     """检查服务是否存在。"""
     try:
@@ -48,8 +49,31 @@ def check_service_exists(gateway_target: str, service_name: str) -> bool:
         return False
 
 
+def wait_for_service_ready(gateway_target: str, service_name: str, *, timeout_sec: float = 8.0) -> None:
+    deadline = time.time() + max(1.0, float(timeout_sec))
+    last_error = "service route not ready"
+    while time.time() < deadline:
+        try:
+            with GatewayServiceClient(gateway_target, timeout_sec=5.0) as client:
+                status = client.get_status(service_name=service_name)
+                if status.get("route_count", 0) <= 0:
+                    raise RuntimeError("route_count=0")
+                client.call(
+                    service_name=service_name,
+                    method="square",
+                    payload={"x": 1},
+                    timeout_sec=5.0,
+                )
+            return
+        except RuntimeError as exc:
+            last_error = str(exc)
+            time.sleep(0.2)
+    raise RuntimeError(f"service {service_name} not ready via gateway within {timeout_sec:.1f}s: {last_error}")
+
+
 def ensure_service(gateway_target: str, service_name: str):
     if check_service_exists(gateway_target, service_name):
+        wait_for_service_ready(gateway_target, service_name)
         return None
     blob = (
         b"from pycloud_parallel import pycloud_export\n\n"
@@ -70,11 +94,7 @@ def ensure_service(gateway_target: str, service_name: str):
         tags=["compute"],
         min_success_nodes=1,
     )
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        if check_service_exists(gateway_target, service_name):
-            break
-        time.sleep(0.2)
+    wait_for_service_ready(gateway_target, service_name)
     return group
 
 

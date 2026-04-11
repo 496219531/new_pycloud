@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import time
 from concurrent import futures
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from pycloud_parallel.controlplane.client import (
     InfoCenterClient,
     InfoCenterServiceRoute,
     NodeControlClient,
+    _DiscoveryRouteCache,
+    _ServiceRouteSnapshot,
     _CallProxy,
 )
 from pycloud_parallel.controlplane.result_ref import ResultRef
@@ -97,7 +100,7 @@ def _register_node_with_services(
             capacity=8,
             queue_capacity=64,
             tags=["compute"],
-            services=state.service_reports(),
+            services=state.service_report_payloads(),
             service_worker_capacity=state.worker_capacity,
             service_worker_used=state.service_worker_used(),
         )
@@ -120,6 +123,23 @@ def _demo_route(service_name: str = "svc-demo") -> InfoCenterServiceRoute:
     )
 
 
+def test_upload_object_recreates_missing_object_dir(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-object-01", str(tmp_path / "node_object_01"))
+    try:
+        shutil.rmtree(state.object_dir, ignore_errors=True)
+        assert not state.object_dir.exists()
+
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            ref = client.upload_object_from_bytes(blob=b"hello object", format="bin")
+            restored = client.download_object_bytes(object_id=ref.object_id)
+
+        assert restored == b"hello object"
+        assert state.object_dir.exists()
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
 class TestDirectConnect:
     def test_getattr_creates_proxy(self):
         client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
@@ -128,6 +148,7 @@ class TestDirectConnect:
             proxy = client.square
             assert isinstance(proxy, _CallProxy)
             assert proxy._method == "square"
+            assert proxy._strategy == "predicted_busy"
         finally:
             client.close()
 
@@ -280,6 +301,7 @@ def test_discovery_client_direct_call_roundtrip(tmp_path):
             status = client.get_status(service_name="svc_discovery")
             assert status["route_count"] == 1
             assert status["routes"][0]["service_id"] == service_id
+            assert "predicted_busy" in status["routes"][0]
 
         module_client = DirectConnect(controlplane.base_url, service_name="svc_discovery", timeout_sec=5.0)
         try:
@@ -431,3 +453,47 @@ def test_discovery_client_fetches_large_dataframe_result(tmp_path):
         node_server.stop(grace=0)
         node_state.close()
         controlplane.stop()
+
+
+def test_discovery_route_cache_defaults_to_predicted_busy():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    try:
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[
+                InfoCenterServiceRoute(
+                    service_name="svc-demo",
+                    service_id="svc-low-inflight",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    node_instance_id="node-1-inst",
+                    node_id="node-1",
+                    control_addr="127.0.0.1:50061",
+                    node_healthy=True,
+                    worker_count=2,
+                    alive_workers=2,
+                    in_flight=1,
+                    lease_expire_at=datetime.now(timezone.utc),
+                    http_base_url="http://127.0.0.1:18081/svc/svc-low-inflight",
+                    predicted_busy=40.0,
+                ),
+                InfoCenterServiceRoute(
+                    service_name="svc-demo",
+                    service_id="svc-low-predicted",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    node_instance_id="node-2-inst",
+                    node_id="node-2",
+                    control_addr="127.0.0.1:50062",
+                    node_healthy=True,
+                    worker_count=2,
+                    alive_workers=2,
+                    in_flight=3,
+                    lease_expire_at=datetime.now(timezone.utc),
+                    http_base_url="http://127.0.0.1:18082/svc/svc-low-predicted",
+                    predicted_busy=12.0,
+                ),
+            ],
+        )
+        assert cache.select_route("svc-demo").service_id == "svc-low-predicted"
+        assert cache.select_route("svc-demo", strategy="least_inflight").service_id == "svc-low-inflight"
+    finally:
+        cache.stop()

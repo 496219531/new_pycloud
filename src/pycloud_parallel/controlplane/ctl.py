@@ -31,8 +31,38 @@ from pycloud_parallel.controlplane.config import (
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port as _net_format_host_port
 from pycloud_parallel.controlplane.netutil import resolve_public_host, split_host_port as _net_split_host_port
 from pycloud_parallel.controlplane.object_ref import normalize_object_id
+from pycloud_parallel.controlplane.state import (
+    _code_index_link_path,
+    _code_index_meta_path,
+    _ensure_code_index_entry,
+)
 
 _LOCALHOST = "127.0.0.1"
+
+
+class _CtlArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        if args is not None:
+            argv = list(args)
+            local_commands = {"start", "start-infocenter", "start-gateway", "start-controlplane", "start-node", "restart"}
+            command_index = next((idx for idx, token in enumerate(argv) if token in local_commands), -1)
+            if command_index > 0:
+                moved = False
+                reordered: list[str] = []
+                for idx, token in enumerate(argv):
+                    if idx < command_index and token == "--local":
+                        moved = True
+                        continue
+                    reordered.append(token)
+                if moved:
+                    insert_at = reordered.index(argv[command_index]) + 1
+                    reordered.insert(insert_at, "--local")
+                    args = reordered
+        parsed = super().parse_args(args=args, namespace=namespace)
+        parsed.local = bool(getattr(parsed, "local", False) or getattr(parsed, "_global_local", False))
+        if hasattr(parsed, "_global_local"):
+            delattr(parsed, "_global_local")
+        return parsed
 
 
 def _runtime_root(explicit: str = "") -> Path:
@@ -242,6 +272,15 @@ def _managed_process_names(root: Path) -> List[str]:
     names = {"controlplane", "node-1", "node-2"}
     names.update(_pid_names(root))
     return sorted(names, key=_process_sort_key)
+
+
+def _running_managed_processes(root: Path) -> List[Tuple[str, int]]:
+    running: List[Tuple[str, int]] = []
+    for name in _managed_process_names(root):
+        pid = _read_pid(_pid_file(root, name))
+        if pid > 0 and _is_pid_running(pid):
+            running.append((name, pid))
+    return running
 
 
 def _stop_all_managed_processes(root: Path) -> None:
@@ -1234,12 +1273,205 @@ def _load_json(path: Path) -> Dict[str, object]:
         return {}
 
 
+def _parse_iso_datetime(value: object, *, fallback: datetime | None = None) -> datetime:
+    text = str(value or "").strip()
+    if text:
+        with contextlib.suppress(Exception):
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+    return fallback or datetime.now(timezone.utc)
+
+
+def _format_size_bytes(size_bytes: int) -> str:
+    size = max(0, int(size_bytes or 0))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{size} B"
+
+
+def _remove_code_index_entry(artifact_dir: Path, *, code_version: str, entry_module: str, entry_callable: str) -> None:
+    if not str(code_version or "").strip() or not str(entry_module or "").strip():
+        return
+    link_path = _code_index_link_path(
+        artifact_dir,
+        code_version=code_version,
+        entry_module=entry_module,
+        entry_callable=entry_callable,
+    )
+    meta_path = _code_index_meta_path(
+        artifact_dir,
+        code_version=code_version,
+        entry_module=entry_module,
+        entry_callable=entry_callable,
+    )
+    with contextlib.suppress(FileNotFoundError):
+        meta_path.unlink()
+    if link_path.is_symlink():
+        with contextlib.suppress(FileNotFoundError):
+            link_path.unlink()
+        return
+    if link_path.is_dir():
+        shutil.rmtree(link_path, ignore_errors=True)
+        return
+    with contextlib.suppress(FileNotFoundError):
+        link_path.unlink()
+
+
+def _collect_code_cache_rows(
+    artifact_dir: Path,
+    *,
+    match: str = "",
+    limit: int = 0,
+    ensure_index: bool = True,
+) -> List[Dict[str, object]]:
+    codes_dir = artifact_dir / "codes"
+    rows: List[Dict[str, object]] = []
+    pattern = str(match or "").strip().lower()
+    if not codes_dir.exists():
+        return rows
+
+    for meta_path in sorted(codes_dir.glob("*/subversions/*/meta.json")):
+        meta = _load_json(meta_path)
+        code_version = str(meta.get("code_version", "") or "").strip()
+        code_digest = code_version.removeprefix("sha256:").split(".", 1)[0].strip().lower()
+        entry_module = str(meta.get("entry_module", "") or "").strip()
+        entry_callable = str(meta.get("entry_callable", "") or "").strip()
+        if not code_version or not code_digest or not entry_module:
+            continue
+        code_dir = meta_path.parent
+        content_dir = meta_path.parents[2]
+        if ensure_index:
+            _ensure_code_index_entry(artifact_dir, code_version=code_version)
+        index_path = _code_index_link_path(
+            artifact_dir,
+            code_version=code_version,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+        )
+        row = {
+            "code_version": code_version,
+            "code_digest": code_digest,
+            "entry_module": entry_module,
+            "entry_callable": entry_callable,
+            "package_format": str(meta.get("package_format", "") or "").strip(),
+            "runtime": str(meta.get("runtime", "") or "").strip(),
+            "size_bytes": max(0, int(meta.get("size_bytes", 0) or 0)),
+            "size_human": _format_size_bytes(int(meta.get("size_bytes", 0) or 0)),
+            "created_at": str(meta.get("created_at", "") or "").strip(),
+            "last_at": str(meta.get("last_at", "") or "").strip(),
+            "artifact_path": str(meta.get("artifact_path", "") or "").strip(),
+            "dependency_path": str(meta.get("dependency_path", "") or "").strip(),
+            "data_path": str(meta.get("data_path", "") or "").strip(),
+            "code_dir": str(code_dir),
+            "content_dir": str(content_dir),
+            "code_key": content_dir.name,
+            "subversion_key": code_dir.name,
+            "storage_key": code_dir.name,
+            "index_path": str(index_path),
+            "index_ready": bool(index_path.exists() or index_path.is_symlink()),
+        }
+        if pattern:
+            haystack = "\n".join(
+                [
+                    row["entry_module"],
+                    row["entry_callable"],
+                    row["code_digest"],
+                    row["code_key"],
+                    row["subversion_key"],
+                    row["code_version"],
+                    row["artifact_path"],
+                    row["dependency_path"],
+                    row["data_path"],
+                    row["code_dir"],
+                    row["content_dir"],
+                    row["index_path"],
+                ]
+            ).lower()
+            if pattern not in haystack:
+                continue
+        rows.append(row)
+
+    rows.sort(
+        key=lambda item: (
+            _parse_iso_datetime(item.get("last_at")).timestamp(),
+            _parse_iso_datetime(item.get("created_at")).timestamp(),
+            str(item.get("entry_module", "")),
+        ),
+        reverse=True,
+    )
+    if limit > 0:
+        rows = rows[:limit]
+    return rows
+
+
+def _cmd_cache_list(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    artifact_dir = Path(args.artifact_dir).expanduser().resolve() if args.artifact_dir else _default_artifact_dir(root)
+    rows = _collect_code_cache_rows(
+        artifact_dir,
+        match=str(getattr(args, "match", "") or ""),
+        limit=max(0, int(getattr(args, "limit", 0) or 0)),
+        ensure_index=True,
+    )
+    if bool(getattr(args, "json", False)):
+        payload = {
+            "ok": True,
+            "artifact_dir": str(artifact_dir),
+            "index_dir": str(artifact_dir / "code_index"),
+            "match": str(getattr(args, "match", "") or ""),
+            "count": len(rows),
+            "items": rows,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print("============================================")
+    print("  Code Cache")
+    print("============================================")
+    print()
+    print(f"  Artifact Dir: {artifact_dir}")
+    print(f"  Index Dir: {artifact_dir / 'code_index'}")
+    if str(getattr(args, 'match', '') or '').strip():
+        print(f"  Match: {str(getattr(args, 'match', '') or '').strip()}")
+    print(f"  Count: {len(rows)}")
+    print()
+    if not rows:
+        print("  (no cached code artifacts)")
+        return 0
+
+    for idx, row in enumerate(rows, start=1):
+        callable_name = str(row["entry_callable"] or "").strip() or "<module>"
+        print(f"  [{idx}] {row['entry_module']}:{callable_name}")
+        print(
+            f"      index: {row['index_path']}"
+            f"{'' if row['index_ready'] else ' (index link unavailable on this host)'}"
+        )
+        print(f"      target: {row['code_dir']}")
+        print(
+            f"      format: {row['package_format'] or '-'}"
+            f"  size: {row['size_human']}"
+            f"  last_at: {row['last_at'] or '-'}"
+        )
+        print(f"      code_digest: {row['code_digest']}")
+        print(f"      code_key: {row['code_key']}  subversion_key: {row['subversion_key']}")
+        print(f"      code_version: {row['code_version']}")
+    return 0
+
+
 def _collect_current_globals_object_ids(artifact_dir: Path) -> set[str]:
     live: set[str] = set()
     codes_dir = artifact_dir / "codes"
     if not codes_dir.exists():
         return live
-    for current_path in codes_dir.glob("*/scopes/*/*/current.json"):
+    for current_path in codes_dir.glob("*/subversions/*/globals/*/*/current.json"):
         current = _load_json(current_path)
         globals_digest = str(current.get("globals_digest", "") or "").strip()
         if not globals_digest:
@@ -1283,6 +1515,28 @@ def _collect_current_globals_object_ids(artifact_dir: Path) -> set[str]:
 def _cmd_gc(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
     artifact_dir = Path(args.artifact_dir).expanduser().resolve() if args.artifact_dir else _default_artifact_dir(root)
+    if not bool(getattr(args, "dry_run", False)) and not bool(getattr(args, "force", False)):
+        running = _running_managed_processes(root)
+        if running:
+            names = ", ".join(f"{name}(pid={pid})" for name, pid in running)
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "gc refused while managed processes are running",
+                        "runtime_root": str(root),
+                        "artifact_dir": str(artifact_dir),
+                        "running_processes": [
+                            {"name": name, "pid": pid}
+                            for name, pid in running
+                        ],
+                        "hint": "Stop local pycloud processes first, or re-run gc with --dry-run to inspect or --force to override.",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
     object_dir = artifact_dir / "objects"
     meta_dir = _object_meta_dir(object_dir)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(args.older_than_hours)))
@@ -1295,17 +1549,24 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         codes_dir = artifact_dir / "codes"
         if codes_dir.exists():
             for code_dir in sorted(path for path in codes_dir.iterdir() if path.is_dir()):
-                meta_path = code_dir / "meta.json"
-                meta = _load_json(meta_path)
-                last_at_raw = str(meta.get("last_at", "") or "").strip()
-                try:
-                    last_at = datetime.fromisoformat(last_at_raw)
-                    if last_at.tzinfo is None:
-                        last_at = last_at.replace(tzinfo=timezone.utc)
-                except Exception:
+                variant_meta_paths = sorted(code_dir.glob("subversions/*/meta.json"))
+                variant_metas = [_load_json(path) for path in variant_meta_paths]
+                timestamps: List[datetime] = []
+                for meta in variant_metas:
+                    last_at_raw = str(meta.get("last_at", "") or "").strip()
+                    try:
+                        last_at = datetime.fromisoformat(last_at_raw)
+                        if last_at.tzinfo is None:
+                            last_at = last_at.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    timestamps.append(last_at.astimezone(timezone.utc))
+                if timestamps:
+                    last_at = max(timestamps)
+                else:
                     last_at = datetime.fromtimestamp(code_dir.stat().st_mtime, tz=timezone.utc)
                 row = {
-                    "code_sha": code_dir.name,
+                    "code_digest": code_dir.name,
                     "path": str(code_dir),
                     "last_at": last_at.astimezone(timezone.utc).isoformat(),
                 }
@@ -1315,6 +1576,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                     continue
                 deleted_codes.append(row)
                 if not args.dry_run:
+                    for meta in variant_metas:
+                        _remove_code_index_entry(
+                            artifact_dir,
+                            code_version=str(meta.get("code_version", "") or "").strip(),
+                            entry_module=str(meta.get("entry_module", "") or "").strip(),
+                            entry_callable=str(meta.get("entry_callable", "") or "").strip(),
+                        )
                     shutil.rmtree(code_dir, ignore_errors=True)
 
     if args.scope in ("objects", "all") and object_dir.exists():
@@ -1383,18 +1651,21 @@ def _add_env_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_local_argument(parser: argparse.ArgumentParser) -> None:
+def _add_local_argument(parser: argparse.ArgumentParser, *, dest: str = "local") -> None:
     parser.add_argument(
         "--local",
+        dest=dest,
         action="store_true",
+        default=argparse.SUPPRESS,
         help="force default bind hosts to 127.0.0.1 for local-only startup",
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PyCloud local service manager")
+    parser = _CtlArgumentParser(description="PyCloud local service manager")
+    parser.set_defaults(local=False, _global_local=False)
     parser.add_argument("--runtime-root", default="", help="base directory for logs and pid files (default: cwd or PYCLOUD_HOME)")
-    _add_local_argument(parser)
+    _add_local_argument(parser, dest="_global_local")
     parser.add_argument("--controlplane-host", default="", help="bind host used by `pycloudctl start` for controlplane; default auto-detects local IP")
     parser.add_argument("--controlplane-port", type=int, default=50051, help="bind port used by `pycloudctl start` for controlplane")
     parser.add_argument("--node1-host", default="", help="bind host used by `pycloudctl start` for node-1 gRPC; default auto-detects local IP")
@@ -1476,11 +1747,17 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = subparsers.add_parser("doctor", help="inspect runtime-root pid files and listener ports")
     doctor_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for context display (default: 127.0.0.1:<controlplane-port>)")
     doctor_parser.add_argument("--ports", default="", help="comma-separated ports to inspect; default uses controlplane/node http+grpc ports")
+    cache_list_parser = subparsers.add_parser("cache-list", help="list cached code artifacts and readable index paths")
+    cache_list_parser.add_argument("--artifact-dir", default="", help="artifact/code cache directory (default: <runtime-root>/code_cache)")
+    cache_list_parser.add_argument("--match", default="", help="substring filter for module/callable/code_version/path")
+    cache_list_parser.add_argument("--limit", type=int, default=50, help="max rows to print; 0 means all")
+    cache_list_parser.add_argument("--json", action="store_true", help="print JSON instead of human-readable text")
     gc_parser = subparsers.add_parser("gc", help="garbage collect cached object files")
     gc_parser.add_argument("--artifact-dir", default="", help="artifact/code cache directory (default: <runtime-root>/code_cache)")
     gc_parser.add_argument("--scope", choices=["codes", "objects", "all"], default="all")
     gc_parser.add_argument("--older-than-hours", type=int, default=24 * 7)
     gc_parser.add_argument("--dry-run", action="store_true")
+    gc_parser.add_argument("--force", action="store_true", help="allow destructive gc even if managed local processes are still running")
     parser.epilog = (
         "Environment overrides:\n"
         "  start / start-infocenter / start-gateway / start-controlplane / start-node / restart\n"
@@ -1513,6 +1790,8 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_status(args)
     if args.command == "doctor":
         return _cmd_doctor(args)
+    if args.command == "cache-list":
+        return _cmd_cache_list(args)
     if args.command == "gc":
         return _cmd_gc(args)
     parser.error(f"unknown command: {args.command}")

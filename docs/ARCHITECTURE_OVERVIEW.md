@@ -118,6 +118,9 @@
 2. pool 自己 heartbeat 保活
 3. subtasks 不走旧共享任务池
 4. 更适合作为 `JobQueue Mode` 的执行层
+5. 每个 pool 当前只暴露一个任务入口，也就是创建时的 `entry_callable`
+6. `task_method` 是高层单入口校验参数，不是多方法路由协议
+7. `runtime_key` 仍然保留，但它代表 runtime 逻辑隔离键，不再对应独立的 runtime-slot 资源
 
 ## 6. 已移除
 

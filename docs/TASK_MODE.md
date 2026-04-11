@@ -13,6 +13,12 @@
 
 `Gateway` 不参与任务模式。
 
+补充：
+
+1. `TaskPoolSession` 当前是单入口 task pool
+2. 整个 module / package 会一起上传，但真正对外暴露的任务入口只有 `entry_callable`
+3. `runtime_key` 仍然保留，但它表示 runtime 侧的逻辑隔离键，不再对应独立的 runtime-slot 调度器
+
 ## 2. 当前推荐入口
 
 ### 2.1 `TaskPoolSession`
@@ -45,6 +51,12 @@ with TaskPoolSession.from_infocenter(
     mapped = pool.map([9, 10, 11], timeout_sec=10.0)
     print(mapped)
 ```
+
+说明：
+
+1. `pool.methods` 当前只会返回一个方法名，也就是 `entry_callable`
+2. `submit_payloads(..., task_method=...)` 可以显式传方法名，但只能等于这个单一入口
+3. 如果传了别的方法名，现在会直接抛 `AttributeError`，不再静默回退到默认入口
 
 ### 2.2 `JobQueueClient`
 
@@ -128,6 +140,10 @@ print(final["job"]["status"])
    - 单个 node pool 心跳失败时，会记录到 `failures`
    - 只要还有别的 active node pool，session 仍可继续使用
    - 所有 active node pool 都失效时，session 才会进入 `failed=True`
+4. `runtime_key` 的作用主要是：
+   - 作为 runtime 侧 managed globals 的作用域键
+   - 作为节点活跃 runtime 统计的聚合键
+   - 不表示“为该 key 单独常驻一个 runtime-slot”
 
 如果你想边到边处理结果，而不是等一批结果都回来再统一处理：
 

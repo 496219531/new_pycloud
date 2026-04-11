@@ -9,6 +9,8 @@
 3. 结果拉不到
 4. 结果类型不对
 5. pool token / node pool 轮转问题
+6. `task_method` 校验失败
+7. managed globals warmup / worker pid 日志
 
 ## 1. 常见入口
 
@@ -18,6 +20,14 @@
    - 原生 task pool 会话
 2. `NativeTaskPoolClient`
    - 单节点 pool 的低层 gRPC client
+
+当前语义先记住两点：
+
+1. 原生 `TaskPoolSession` 是单入口模式
+   - `methods == [entry_callable]`
+   - 不支持像 Service 那样在一个 pool 里导出多个方法再路由
+2. `runtime_key` 只是 runtime 逻辑隔离键
+   - 不再对应单独的 runtime-slot 调度链路
 
 从高层视角看，典型调用顺序是：
 
@@ -67,9 +77,10 @@
 
 1. 为每个 payload 生成 `task_id`
 2. `serialize_inline_payload(payload, context="task pool payload")`
-3. `_select_pool_node()` 选择一个 node pool
-4. 按节点分组
-5. 调每个底层 `NativeTaskPoolClient.submit_tasks(...)`
+3. 先校验 `task_method` 是否等于当前唯一入口方法
+4. `_select_pool_node()` 选择一个 node pool
+5. 按节点分组
+6. 调每个底层 `NativeTaskPoolClient.submit_tasks(...)`
 
 关键位置：
 
@@ -81,6 +92,7 @@
 1. payload 在提交前是否已被正确序列化
 2. 任务是否按预期轮转到不同节点
 3. task_id 是否重复
+4. `task_method` 是否写成了不是 `entry_callable` 的别名
 
 ## 4. gRPC 提交到 NodeControl
 
@@ -100,6 +112,12 @@
 6. 创建 `TaskState`
 7. `executor_host.submit_pool_task(...)`
 8. 给 caller 返回 `TaskAccepted` / `TaskRejected`
+
+注意：
+
+1. pool 任务最终还是按 `artifact.entry_callable` 执行
+2. 也就是说，gRPC 提交层没有额外 method 路由
+3. `task_method` 的意义主要是高层 API 早失败校验，而不是在节点侧二次分发
 
 关键位置：
 
@@ -138,6 +156,12 @@
 
 1. `state.py` 中 `_execute_payload_in_subprocess()`
 2. `state.py` 中 `_invoke_user_callable()`
+
+如果问题出在 managed globals 更新后“第一次调用变慢”或“warmup 看起来没生效”，还可以看：
+
+1. `update_service_globals()` / `update_runtime_globals()`
+2. `executor_host.warmup_service()` / `warmup_pool()` / `warmup_runtime()`
+3. warmup 日志里的 `worker_pids`
 
 ## 6. 结果写回 NodeState
 
@@ -241,5 +265,6 @@ TaskPool 和普通 `SubmitTasks/PullResults` 的主要差异在于：
 2. `submit_pool_tasks()` 会把任务塞进 `_pool_tasks`
 3. `pull_pool_results()` 走 `_pool_result_hook`
 4. 高层 `TaskPoolSession` 自己做多 pool 轮询和去重
+5. 普通 task 的 `runtime_key` 仍然存在，但它只是共享 runtime executor 的逻辑 key，不是 slot 资源对象
 
 所以排查时不要把它和普通 `Task Mode` 的 `_tasks/_result_hook` 完全混在一起看。

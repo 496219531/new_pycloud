@@ -8,17 +8,203 @@
 """
 
 import ast
+import gzip
 import importlib
 import importlib.util
 import inspect
+import io
 import os
 import sys
 import tempfile
 import sysconfig
 import importlib.machinery
 import tarfile
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+
+@dataclass(frozen=True)
+class _TarSourceEntry:
+    arcname: str
+    source_path: Optional[Path] = None
+    data: bytes = b""
+
+
+def _normalize_arcname(arcname: Path | str) -> str:
+    parts = [part for part in Path(str(arcname)).parts if part not in ("", ".", os.sep)]
+    return str(PurePosixPath(*parts))
+
+
+def _normalized_file_mode(path: Path) -> int:
+    try:
+        return 0o755 if os.access(path, os.X_OK) else 0o644
+    except Exception:
+        return 0o644
+
+
+def _should_skip_packaged_path(path: Path, *, include_tests: bool = False) -> bool:
+    lowered_parts = {part.lower() for part in path.parts}
+    if "__pycache__" in lowered_parts:
+        return True
+    name = path.name.lower()
+    if name.endswith((".pyc", ".pyo")):
+        return True
+    if include_tests:
+        return False
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if "tests" in lowered_parts or "test" in lowered_parts:
+        return True
+    return False
+
+
+def _new_temp_targz_path(*, prefix: str) -> str:
+    fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix=prefix)
+    os.close(fd)
+    return output_file
+
+
+def _iter_directory_entries(
+    dir_path: Path,
+    *,
+    include_tests: bool = False,
+    prefix: Path | None = None,
+    synthesize_missing_package_inits: bool = False,
+) -> List[_TarSourceEntry]:
+    root = Path(dir_path).resolve()
+    effective_prefix = Path(prefix) if prefix is not None else Path()
+    entries: List[_TarSourceEntry] = []
+
+    if synthesize_missing_package_inits:
+        dirs_to_check = {root}
+        dirs_to_check.update(path for path in root.rglob("*") if path.is_dir())
+        for d in sorted(dirs_to_check, key=lambda item: str(item.relative_to(root))):
+            synthetic_path = d / "__init__.py"
+            if synthetic_path.exists():
+                continue
+            if _should_skip_packaged_path(synthetic_path, include_tests=include_tests):
+                continue
+            arcname = effective_prefix / d.relative_to(root) / "__init__.py"
+            entries.append(_TarSourceEntry(arcname=_normalize_arcname(arcname), data=b""))
+
+    for file_path in sorted((path for path in root.rglob("*") if path.is_file()), key=lambda item: str(item.relative_to(root))):
+        if file_path.is_symlink():
+            continue
+        if _should_skip_packaged_path(file_path, include_tests=include_tests):
+            continue
+        arcname = effective_prefix / file_path.relative_to(root)
+        entries.append(_TarSourceEntry(arcname=_normalize_arcname(arcname), source_path=file_path))
+    return entries
+
+
+def _iter_roots_entries(
+    roots: Iterable[Path],
+    *,
+    include_tests: bool = False,
+    synthesize_missing_package_inits: bool = False,
+) -> List[_TarSourceEntry]:
+    entries: List[_TarSourceEntry] = []
+    for root in sorted((Path(item).resolve() for item in roots), key=lambda item: str(item)):
+        if not root.exists():
+            continue
+        if root.is_dir():
+            entries.extend(
+                _iter_directory_entries(
+                    root,
+                    include_tests=include_tests,
+                    prefix=Path(root.name),
+                    synthesize_missing_package_inits=synthesize_missing_package_inits,
+                )
+            )
+            continue
+        if root.is_symlink():
+            continue
+        if _should_skip_packaged_path(root, include_tests=include_tests):
+            continue
+        entries.append(_TarSourceEntry(arcname=_normalize_arcname(root.name), source_path=root))
+    return entries
+
+
+def _iter_relative_path_entries(
+    *,
+    root_dir: Path,
+    paths: Iterable[str | os.PathLike[str]],
+    include_tests: bool = False,
+    synthesize_missing_package_inits: bool = False,
+) -> List[_TarSourceEntry]:
+    root = Path(root_dir).resolve()
+    normalized: List[Path] = []
+    for item in paths:
+        p = (root / str(item)).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"path not found: {item}")
+        if p != root and root not in p.parents:
+            raise ValueError(f"path escapes root_dir: {item}")
+        normalized.append(p)
+
+    entries: List[_TarSourceEntry] = []
+    for p in sorted(normalized, key=lambda item: str(item.relative_to(root))):
+        rel = p.relative_to(root)
+        if p.is_dir():
+            entries.extend(
+                _iter_directory_entries(
+                    p,
+                    include_tests=include_tests,
+                    prefix=Path(rel),
+                    synthesize_missing_package_inits=synthesize_missing_package_inits,
+                )
+            )
+            continue
+        if p.is_symlink():
+            continue
+        if _should_skip_packaged_path(p, include_tests=include_tests):
+            continue
+        entries.append(_TarSourceEntry(arcname=_normalize_arcname(rel), source_path=p))
+    return entries
+
+
+def _write_deterministic_targz(entries: Iterable[_TarSourceEntry], output_file: str) -> None:
+    deduped: Dict[str, _TarSourceEntry] = {}
+    for entry in entries:
+        arcname = _normalize_arcname(entry.arcname)
+        if not arcname:
+            continue
+        deduped[arcname] = _TarSourceEntry(arcname=arcname, source_path=entry.source_path, data=entry.data)
+
+    with open(output_file, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w") as tar:
+                for arcname in sorted(deduped):
+                    entry = deduped[arcname]
+                    if entry.source_path is not None:
+                        source_path = Path(entry.source_path)
+                        info = tar.gettarinfo(str(source_path), arcname=arcname)
+                        if not info.isfile():
+                            continue
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = ""
+                        info.gname = ""
+                        info.mtime = 0
+                        info.mode = _normalized_file_mode(source_path)
+                        info.pax_headers = {}
+                        with source_path.open("rb") as fh:
+                            tar.addfile(info, fh)
+                        continue
+
+                    data = bytes(entry.data or b"")
+                    info = tarfile.TarInfo(name=arcname)
+                    info.size = len(data)
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    info.mtime = 0
+                    info.mode = 0o644
+                    info.type = tarfile.REGTYPE
+                    info.pax_headers = {}
+                    tar.addfile(info, io.BytesIO(data))
 
 
 class DependencyAnalyzer:
@@ -411,12 +597,14 @@ class DependencyPackager:
 
         roots_to_package = self._collect_function_roots(func, deps=deps)
 
-        # 创建 tar.gz
         if output_file is None:
-            fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix="pycloud_func_")
-            os.close(fd)
+            output_file = _new_temp_targz_path(prefix="pycloud_func_")
 
-        self._create_tar_package(roots_to_package, output_file, include_tests=include_tests)
+        self.package_roots(
+            roots_to_package,
+            output_file=output_file,
+            include_tests=include_tests,
+        )
 
         return output_file
 
@@ -445,13 +633,71 @@ class DependencyPackager:
 
         roots_to_package = self._collect_module_roots(module_name, deps=deps)
 
-        # 创建 tar.gz
         if output_file is None:
-            fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix="pycloud_module_")
-            os.close(fd)
+            output_file = _new_temp_targz_path(prefix="pycloud_module_")
 
-        self._create_tar_package(roots_to_package, output_file, include_tests=include_tests)
+        self.package_roots(
+            roots_to_package,
+            output_file=output_file,
+            include_tests=include_tests,
+        )
 
+        return output_file
+
+    def package_roots(
+        self,
+        roots: Iterable[Path],
+        *,
+        output_file: Optional[str] = None,
+        include_tests: bool = False,
+        synthesize_missing_package_inits: bool = False,
+    ) -> str:
+        if output_file is None:
+            output_file = _new_temp_targz_path(prefix="pycloud_roots_")
+        entries = _iter_roots_entries(
+            roots,
+            include_tests=include_tests,
+            synthesize_missing_package_inits=synthesize_missing_package_inits,
+        )
+        _write_deterministic_targz(entries, output_file)
+        return output_file
+
+    def package_directory(
+        self,
+        dir_path: str | os.PathLike[str],
+        *,
+        output_file: Optional[str] = None,
+        include_tests: bool = False,
+    ) -> str:
+        root = Path(dir_path).resolve()
+        if not root.exists():
+            raise FileNotFoundError(f"artifact path not found: {dir_path}")
+        if not root.is_dir():
+            raise ValueError(f"artifact path must be a directory: {dir_path}")
+        if output_file is None:
+            output_file = _new_temp_targz_path(prefix="pycloud_dir_")
+        entries = _iter_directory_entries(root, include_tests=include_tests)
+        _write_deterministic_targz(entries, output_file)
+        return output_file
+
+    def package_paths(
+        self,
+        *,
+        root_dir: str | os.PathLike[str],
+        paths: Iterable[str | os.PathLike[str]],
+        output_file: Optional[str] = None,
+        include_tests: bool = False,
+        synthesize_missing_package_inits: bool = False,
+    ) -> str:
+        if output_file is None:
+            output_file = _new_temp_targz_path(prefix="pycloud_paths_")
+        entries = _iter_relative_path_entries(
+            root_dir=Path(root_dir),
+            paths=paths,
+            include_tests=include_tests,
+            synthesize_missing_package_inits=synthesize_missing_package_inits,
+        )
+        _write_deterministic_targz(entries, output_file)
         return output_file
 
     def _collect_function_roots(self, func: Callable, *, deps: Dict[str, Any]) -> List[Path]:
@@ -522,41 +768,15 @@ class DependencyPackager:
         *,
         include_tests: bool = False,
     ) -> None:
-        """创建 tar.gz 包"""
-        with tarfile.open(output_file, "w:gz") as tar:
-            for root in roots:
-                root = Path(root).resolve()
-                if root.is_dir():
-                    base_arcname = Path(root.name)
-                    for file_path in sorted(root.rglob("*")):
-                        if not file_path.is_file():
-                            continue
-                        if file_path.is_symlink():
-                            continue
-                        if not include_tests and self._should_skip_path(file_path):
-                            continue
-                        arcname = base_arcname / file_path.relative_to(root)
-                        tar.add(file_path, arcname=str(arcname))
-                    continue
-
-                if not include_tests and self._should_skip_path(root):
-                    continue
-                if root.is_symlink():
-                    continue
-                tar.add(root, arcname=root.name)
+        """创建 tar.gz 包。"""
+        self.package_roots(
+            roots,
+            output_file=output_file,
+            include_tests=include_tests,
+        )
 
     def _should_skip_path(self, path: Path) -> bool:
-        lowered_parts = {part.lower() for part in path.parts}
-        if "__pycache__" in lowered_parts:
-            return True
-        name = path.name.lower()
-        if name.endswith((".pyc", ".pyo")):
-            return True
-        if name.startswith("test_") or name.endswith("_test.py"):
-            return True
-        if "tests" in lowered_parts or "test" in lowered_parts:
-            return True
-        return False
+        return _should_skip_packaged_path(path, include_tests=False)
 
 
 def _infer_entry_module_from_source_file(source_file: str) -> str:

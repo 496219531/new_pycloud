@@ -78,7 +78,7 @@ def test_executor_host_service_call_roundtrip(tmp_path):
         state.close()
 
 
-def test_executor_host_runtime_slot_emits_done_event(tmp_path):
+def test_executor_host_runtime_task_emits_done_event(tmp_path):
     state, artifact = _seed_artifact(
         tmp_path,
         blob=(
@@ -90,7 +90,6 @@ def test_executor_host_runtime_slot_emits_done_event(tmp_path):
     )
     host = ExecutorHostClient()
     try:
-        host.start_runtime_slot(runtime_key="rt-host-event")
         host.submit_runtime_task(
             runtime_key="rt-host-event",
             task_id="task-host-1",
@@ -108,7 +107,70 @@ def test_executor_host_runtime_slot_emits_done_event(tmp_path):
         assert event["attempt"] == 1
         assert event["status_text"] == "SUCCEEDED"
         assert event["result"] == {"value": 9, "plus_one": 10}
-        host.stop_runtime_slot(runtime_key="rt-host-event")
+    finally:
+        host.close()
+        state.close()
+
+
+def test_executor_host_warmup_pool_does_not_kill_host_process(tmp_path):
+    state, artifact = _seed_artifact(
+        tmp_path,
+        blob=(
+            b"def run(**_kwargs):\n"
+            b"    return {'ok': True}\n"
+        ),
+        entry_module="executor_host_pool_warmup",
+    )
+    host = ExecutorHostClient()
+    try:
+        host.create_task_pool(pool_id="pool-host-warmup", worker_count=2)
+        submitted = host.warmup_pool(
+            pool_id="pool-host-warmup",
+            fanout=4,
+            execute_spec=_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={},
+                warmup_only=True,
+            ),
+        )
+        assert submitted == 4
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not host.drain_events():
+                break
+            time.sleep(0.05)
+
+        host.submit_pool_task(
+            pool_id="pool-host-warmup",
+            task_id="pool-task-1",
+            attempt=1,
+            execute_spec=_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={},
+            ),
+        )
+
+        deadline = time.monotonic() + 8.0
+        done_event = None
+        while time.monotonic() < deadline:
+            for item in host.drain_events():
+                if item.get("kind") == "pool_task_done":
+                    done_event = item
+                    break
+            if done_event is not None:
+                break
+            time.sleep(0.05)
+
+        assert done_event is not None
+        assert done_event["pool_id"] == "pool-host-warmup"
+        assert done_event["task_id"] == "pool-task-1"
+        assert done_event["status_text"] == "SUCCEEDED"
+        host.stop_task_pool(pool_id="pool-host-warmup")
     finally:
         host.close()
         state.close()
@@ -128,7 +190,6 @@ def test_executor_host_close_cleans_active_runtime_worker(tmp_path):
     )
     host = ExecutorHostClient()
     try:
-        host.start_runtime_slot(runtime_key="rt-host-close")
         host.submit_runtime_task(
             runtime_key="rt-host-close",
             task_id="task-host-close-1",

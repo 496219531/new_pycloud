@@ -31,7 +31,7 @@ async def main():
         export_mode="decorator",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
-        heartbeat_timeout_sec=30,
+        heartbeat_timeout_sec=10,
         healthy_only=True,
         tags=["compute"],
         min_success_nodes=1,
@@ -74,15 +74,15 @@ async def main():
             node_id, resp = result
             print(f"节点 {node_id}: {resp['data']}")
 
-        print("服务已进入长驻模式，按 Ctrl+C 会自动结束远端服务。")
+        print("服务已进入长驻模式，按 Ctrl+C 会停止 owner；远端服务会在心跳超时后自动回收。")
         group.join(
-            end_services_on_interrupt=True,
+            end_services_on_interrupt=False,
             end_reason="owner ctrl+c",
         )
         joined = True
     finally:
         group.close(
-            end_services=not joined,
+            end_services=False,
             reason="grpc_async_demo cleanup",
         )
 

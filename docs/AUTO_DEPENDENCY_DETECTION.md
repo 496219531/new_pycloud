@@ -11,7 +11,7 @@
 ## 当前推荐入口
 
 1. `DeployedService.deploy_from_infocenter(func=...)`
-2. `DeployedService.deploy_from_module(module=...)`
+2. `DeployedService.deploy_from_infocenter(entry_module=<module object>)`
 3. `TaskPoolSession.from_infocenter(...)`
 4. `JobQueueClient.submit_job_from_bytes(...)`
 
