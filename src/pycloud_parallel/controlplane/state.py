@@ -23,12 +23,11 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import TimeoutError as FutureTimeout
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from google.protobuf import timestamp_pb2
 
@@ -3003,13 +3002,10 @@ class NodeControlState:
 
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
-        self._pending: Deque[str] = deque()
-        self._tasks: Dict[str, TaskState] = {}
         self._pool_tasks: Dict[str, TaskState] = {}
         self._codes: Dict[str, CodeArtifact] = {}
         self._objects: Dict[str, ObjectArtifact] = {}
         self._services: Dict[str, ServiceSession] = {}
-        self._result_hook = InMemoryResultHook()
         self._pool_result_hook = InMemoryResultHook()
         self._task_pools: Dict[str, TaskPoolState] = {}
         self._service_worker_reserved = 0
@@ -3056,6 +3052,7 @@ class NodeControlState:
                 bind=self.service_http_bind,
                 invoke_handler=self._invoke_service_http,
                 status_handler=self._service_status_http,
+                methods_handler=self._service_methods_http,
             )
             self._service_http_gateway.start()
             if not self.service_http_base_url:
@@ -3613,15 +3610,6 @@ class NodeControlState:
                 session.status = pb2.SERVICE_STATUS_STOPPED
                 session.stop_reason = "executor host restart failed"
                 session.lease_expire_at = current_time
-
-        for task in self._tasks.values():
-            if task.status != pb2.TASK_STATUS_RUNNING:
-                continue
-            self._handle_infra_failure_locked(
-                task,
-                reason="executor host restarted during task execution",
-                now=current_time,
-            )
 
         if old_host is not None:
             try:
@@ -5223,6 +5211,14 @@ class NodeControlState:
             return 404, {"ok": False, "error": "service not found"}
         return 200, {"ok": True, "service": info}
 
+    def _service_methods_http(self, service_id: str, include_docs: bool) -> Tuple[int, Dict[str, object]]:
+        del include_docs
+        try:
+            methods = self.list_service_methods(service_id)
+        except KeyError:
+            return 404, {"ok": False, "error": "service not found"}
+        return 200, {"ok": True, "service_id": str(service_id or ""), "methods": methods}
+
     def service_status_info(self, service_id: str) -> Dict[str, object]:
         with self._lock:
             session = self._services.get(service_id)
@@ -5246,250 +5242,12 @@ class NodeControlState:
                 "timing_metrics": dict(session.timing_metrics or {}),
             }
 
-    def submit_tasks(self, request: pb2.SubmitTasksRequest) -> Tuple[List[pb2.TaskAccepted], List[pb2.TaskRejected], int]:
-        accepted: List[pb2.TaskAccepted] = []
-        rejected: List[pb2.TaskRejected] = []
-        with self._cv:
-            if request.code_version not in self._codes:
-                for item in request.tasks:
-                    rejected.append(
-                        pb2.TaskRejected(
-                            task_id=item.task_id,
-                            code=pb2.ERROR_CODE_UNKNOWN_CODE_VERSION,
-                            message=f"unknown code_version: {request.code_version}",
-                        )
-                    )
-                return accepted, rejected, self.credit_locked()
-
-            for item in request.tasks:
-                runtime_key = str(item.runtime_key or request.code_version).strip() or str(request.code_version)
-                if item.task_id in self._tasks:
-                    rejected.append(
-                        pb2.TaskRejected(
-                            task_id=item.task_id,
-                            code=pb2.ERROR_CODE_DUPLICATE_TASK,
-                            message="duplicate task_id",
-                        )
-                    )
-                    continue
-
-                if self.credit_locked() <= 0:
-                    rejected.append(
-                        pb2.TaskRejected(
-                            task_id=item.task_id,
-                            code=pb2.ERROR_CODE_NO_CREDIT,
-                            message="node queue/inflight is full",
-                        )
-                    )
-                    continue
-
-                record = TaskState(
-                    task_id=item.task_id,
-                    client_id=request.client_id,
-                    job_id=str(request.job_id or "").strip(),
-                    code_version=request.code_version,
-                    runtime_key=runtime_key,
-                    execution_mode=request.execution_mode,
-                    payload=struct_to_dict(item.payload),
-                    timeout_hint_sec=max(0, item.timeout_hint_sec),
-                    priority=max(1, item.priority or 1),
-                )
-                self._tasks[item.task_id] = record
-                self._pending.append(item.task_id)
-                accepted.append(pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED))
-            if accepted:
-                self._cv.notify_all()
-            return accepted, rejected, self.credit_locked()
-
-    def _claim_task_locked(self, worker_id: str) -> Optional[pb2.TaskEnvelope]:
-        while self._pending:
-            task_id = self._pending.popleft()
-            task = self._tasks.get(task_id)
-            if task is None:
-                continue
-            if task.status != pb2.TASK_STATUS_QUEUED:
-                continue
-            if task.cancel_requested:
-                task.status = pb2.TASK_STATUS_CANCELLED
-                task.finished_at = utc_now()
-                self._publish_result_locked(task)
-                continue
-
-            now = utc_now()
-            task.status = pb2.TASK_STATUS_RUNNING
-            task.worker_id = worker_id
-            task.lease_id = str(uuid.uuid4())
-            task.started_at = now
-            task.last_heartbeat_at = now
-            return pb2.TaskEnvelope(
-                task_id=task.task_id,
-                code_version=task.code_version,
-                attempt=task.attempt,
-                execution_mode=task.execution_mode,
-                payload=dict_to_struct(task.payload),
-                lease_id=task.lease_id,
-                lease_ttl_sec=self.heartbeat_timeout_sec,
-            )
-        return None
-
-    def poll_task(self, worker_id: str) -> Optional[pb2.TaskEnvelope]:
-        with self._cv:
-            return self._claim_task_locked(worker_id)
-
-    def heartbeat_task(self, request: pb2.HeartbeatTaskRequest) -> Tuple[bool, bool]:
-        with self._lock:
-            task = self._tasks.get(request.task_id)
-            if task is None:
-                return False, False
-            if task.attempt != request.attempt:
-                return False, False
-            if task.status not in (pb2.TASK_STATUS_RUNNING, pb2.TASK_STATUS_CANCELLED):
-                return False, False
-            task.last_heartbeat_at = utc_now()
-            return True, task.cancel_requested
-
-    def report_result(self, request: pb2.ReportResultRequest) -> bool:
-        with self._cv:
-            task = self._tasks.get(request.task_id)
-            if task is None:
-                return False
-            if task.attempt != request.attempt:
-                return False
-            if task.status not in (pb2.TASK_STATUS_RUNNING, pb2.TASK_STATUS_CANCELLED):
-                return False
-
-            task.finished_at = utc_now()
-            task.last_heartbeat_at = task.finished_at
-            should_publish = True
-            if request.status == pb2.TASK_STATUS_SUCCEEDED:
-                task.status = pb2.TASK_STATUS_SUCCEEDED
-                task.result = struct_to_dict(request.result)
-                task.error_type = ""
-                task.error_message = ""
-                log_payload_flow(
-                    "task_result_report",
-                    task_id=request.task_id,
-                    status="SUCCEEDED",
-                    result_summary=summarize_payload_flow_value(task.result),
-                )
-            elif request.status == pb2.TASK_STATUS_FAILED_USER:
-                task.status = pb2.TASK_STATUS_FAILED_USER
-                task.result = None
-                task.error_type = request.error.type
-                task.error_message = request.error.message
-                log_payload_flow(
-                    "task_result_report",
-                    task_id=request.task_id,
-                    status="FAILED_USER",
-                    error_type=request.error.type,
-                    error_message=request.error.message,
-                )
-            else:
-                self._handle_infra_failure_locked(
-                    task,
-                    reason=request.error.message or request.error.type or "infra failure",
-                    now=task.finished_at,
-                )
-                should_publish = task.status == pb2.TASK_STATUS_FAILED_INFRA
-                log_payload_flow(
-                    "task_result_report",
-                    task_id=request.task_id,
-                    status="FAILED_INFRA",
-                    error_type=request.error.type,
-                    error_message=request.error.message,
-                )
-
-            if should_publish:
-                self._publish_result_locked(task)
-            self._cv.notify_all()
-            return True
-
-    def pull_results(self, request: pb2.PullResultsRequest) -> Tuple[List[pb2.TaskResult], str]:
-        return self._result_hook.pull(
-            request.client_id,
-            limit=max(1, request.limit or 100),
-            wait_ms=max(0, request.wait_ms),
-            cursor=request.cursor,
-        )
-
-    def cancel_tasks(self, request: pb2.CancelTasksRequest) -> Tuple[List[str], List[str], List[str]]:
-        cancelled: List[str] = []
-        not_found: List[str] = []
-        already_done: List[str] = []
-        with self._cv:
-            for task_id in request.task_ids:
-                task = self._tasks.get(task_id)
-                if task is None:
-                    not_found.append(task_id)
-                    continue
-
-                if task.status in (
-                    pb2.TASK_STATUS_SUCCEEDED,
-                    pb2.TASK_STATUS_FAILED_USER,
-                    pb2.TASK_STATUS_FAILED_INFRA,
-                    pb2.TASK_STATUS_CANCELLED,
-                ):
-                    already_done.append(task_id)
-                    continue
-
-                task.cancel_requested = True
-                if task.status == pb2.TASK_STATUS_QUEUED:
-                    task.status = pb2.TASK_STATUS_CANCELLED
-                    task.finished_at = utc_now()
-                    task.error_type = "Cancelled"
-                    task.error_message = request.reason or "cancelled by client"
-                    self._publish_result_locked(task)
-                cancelled.append(task_id)
-            if cancelled:
-                self._cv.notify_all()
-        return cancelled, not_found, already_done
-
-    def cancel_job(self, request: pb2.CancelJobRequest) -> Tuple[int, int, int, int]:
-        queued_cancelled = 0
-        running_marked = 0
-        already_done = 0
-        matched = 0
-        with self._cv:
-            for task in self._tasks.values():
-                if task.client_id != request.client_id:
-                    continue
-                if task.job_id != request.job_id:
-                    continue
-                matched += 1
-
-                if task.status in (
-                    pb2.TASK_STATUS_SUCCEEDED,
-                    pb2.TASK_STATUS_FAILED_USER,
-                    pb2.TASK_STATUS_FAILED_INFRA,
-                    pb2.TASK_STATUS_CANCELLED,
-                ):
-                    already_done += 1
-                    continue
-
-                task.cancel_requested = True
-                if task.status == pb2.TASK_STATUS_QUEUED:
-                    task.status = pb2.TASK_STATUS_CANCELLED
-                    task.finished_at = utc_now()
-                    task.error_type = "Cancelled"
-                    task.error_message = request.reason or f"cancelled by job_id={request.job_id}"
-                    self._publish_result_locked(task)
-                    queued_cancelled += 1
-                elif task.status == pb2.TASK_STATUS_RUNNING:
-                    running_marked += 1
-
-            if queued_cancelled or running_marked:
-                self._cv.notify_all()
-
-        not_found = 0 if matched else 1
-        return queued_cancelled, running_marked, already_done, not_found
-
     def metrics(self) -> Dict[str, int]:
         with self._lock:
-            queued = self._queued_count_locked()
-            shared_inflight = self._inflight_count_locked()
+            queued = sum(1 for task in self._pool_tasks.values() if task.status == pb2.TASK_STATUS_QUEUED)
             service_inflight = sum(self._service_inflight_locked(session) for session in self._services.values())
-            pool_inflight = sum(self._task_pool_inflight_locked(pool) for pool in self._task_pools.values())
-            inflight = shared_inflight + service_inflight + pool_inflight
+            pool_inflight = sum(1 for task in self._pool_tasks.values() if task.status == pb2.TASK_STATUS_RUNNING)
+            inflight = service_inflight + pool_inflight
             credit = max(0, self.queue_capacity - (queued + inflight))
             return {
                 "queued": queued,
@@ -5550,10 +5308,10 @@ class NodeControlState:
         with self._lock:
             stats: Dict[str, Tuple[int, int, float]] = {}
             now_ts = utc_now().timestamp()
-            for task in self._tasks.values():
+            for task in self._pool_tasks.values():
                 if task.status not in (pb2.TASK_STATUS_QUEUED, pb2.TASK_STATUS_RUNNING):
                     continue
-                runtime_key = str(task.runtime_key or task.code_version).strip() or str(task.code_version or "")
+                runtime_key = str(task.runtime_key or task.client_id or task.code_version).strip() or str(task.code_version or "")
                 running, queued, last_used = stats.get(runtime_key, (0, 0, 0.0))
                 if task.status == pb2.TASK_STATUS_RUNNING:
                     running += 1
@@ -5577,106 +5335,6 @@ class NodeControlState:
             str: Python 版本，如 "py3.11", "py3.10"
         """
         return self._python_version
-
-    def credit_locked(self) -> int:
-        return max(0, self.queue_capacity - (self._queued_count_locked() + self._inflight_count_locked()))
-
-    def _queued_count_locked(self) -> int:
-        return sum(1 for task in self._tasks.values() if task.status == pb2.TASK_STATUS_QUEUED)
-
-    def _inflight_count_locked(self) -> int:
-        return sum(1 for task in self._tasks.values() if task.status == pb2.TASK_STATUS_RUNNING)
-
-    def _publish_result_locked(self, task: TaskState) -> None:
-        result = task.as_result()
-        self._result_hook.push(task.client_id, result)
-
-    def _handle_infra_failure_locked(self, task: TaskState, *, reason: str, now: datetime) -> None:
-        if task.attempt < self.max_retries:
-            task.attempt += 1
-            task.status = pb2.TASK_STATUS_QUEUED
-            task.worker_id = ""
-            task.lease_id = ""
-            task.started_at = None
-            task.finished_at = None
-            task.last_heartbeat_at = None
-            task.error_type = ""
-            task.error_message = ""
-            self._pending.append(task.task_id)
-            return
-
-        task.status = pb2.TASK_STATUS_FAILED_INFRA
-        task.finished_at = now
-        task.error_type = "InfraFailure"
-        task.error_message = reason
-        self._publish_result_locked(task)
-
-    def _touch_internal_heartbeats_locked(self) -> None:
-        now = utc_now()
-        for task in self._tasks.values():
-            if task.status != pb2.TASK_STATUS_RUNNING:
-                continue
-            task.last_heartbeat_at = now
-
-    def _dispatch_task_pool_locked(self) -> None:
-        if not self.enable_internal_executor:
-            return
-        while self._inflight_count_locked() < self.worker_capacity and self._pending:
-            task_id = self._pending.popleft()
-            task = self._tasks.get(task_id)
-            if task is None or task.status != pb2.TASK_STATUS_QUEUED:
-                continue
-            if task.cancel_requested:
-                task.status = pb2.TASK_STATUS_CANCELLED
-                task.finished_at = utc_now()
-                task.error_type = "Cancelled"
-                task.error_message = "cancelled by client"
-                self._publish_result_locked(task)
-                continue
-
-            artifact = self._codes.get(task.code_version)
-            if artifact is None:
-                now = utc_now()
-                self._handle_infra_failure_locked(task, reason="missing code artifact", now=now)
-                continue
-
-            now = utc_now()
-            task.status = pb2.TASK_STATUS_RUNNING
-            task.worker_id = f"runtime-key:{task.runtime_key or task.code_version}"
-            task.lease_id = str(uuid.uuid4())
-            task.started_at = now
-            task.last_heartbeat_at = now
-            try:
-                if self._executor_host is None:
-                    raise RuntimeError("executor host unavailable")
-                touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
-                managed_state = self._ensure_runtime_managed_globals_state_locked(
-                    client_id=task.client_id,
-                    code_version=task.code_version,
-                    runtime_key=task.runtime_key,
-                    allowed_names=self._get_client_code_managed_globals_locked(
-                        client_id=str(task.client_id or "").strip(),
-                        code_version=str(task.code_version or "").strip(),
-                        runtime_key=str(task.runtime_key or "").strip(),
-                    ),
-                )
-                self._executor_host.submit_runtime_task(
-                    runtime_key=task.runtime_key,
-                    task_id=task.task_id,
-                    attempt=task.attempt,
-                    execute_spec=_build_execute_spec(
-                        artifact,
-                        object_dir=self._object_dir,
-                        work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                        method_name=artifact.entry_callable,
-                        payload=self._resolve_memory_object_refs_in_payload_locked(task.payload),
-                        managed_globals_scope_dir=(managed_state.scope_dir if managed_state is not None else ""),
-                        managed_globals_digest=(managed_state.globals_digest if managed_state is not None else ""),
-                    ),
-                )
-            except Exception as exc:
-                self._handle_infra_failure_locked(task, reason=repr(exc), now=now)
-                continue
 
     def _drain_executor_events(self) -> None:
         with self._cv:
@@ -5743,84 +5401,17 @@ class NodeControlState:
                     self._pool_result_hook.push(pool_id, task.as_result())
                     self._cv.notify_all()
                     continue
-                if str(item.get("kind", "") or "") != "runtime_task_done":
-                    continue
-                task_id = str(item.get("task_id", "") or "")
-                attempt = int(item.get("attempt", 0) or 0)
-                status_text = str(item.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
-                result = item.get("result")
-                err_type = str(item.get("err_type", "") or "")
-                err_message = str(item.get("err_message", "") or "")
-                now = utc_now()
-                task = self._tasks.get(task_id)
-                if task is None:
-                    continue
-                if task.attempt != attempt:
-                    continue
-                if task.status not in (pb2.TASK_STATUS_RUNNING, pb2.TASK_STATUS_CANCELLED):
-                    continue
-                task.finished_at = now
-                task.last_heartbeat_at = now
-                if task.cancel_requested:
-                    task.status = pb2.TASK_STATUS_CANCELLED
-                    task.error_type = "Cancelled"
-                    task.error_message = "cancelled by client"
-                    task.result = None
-                    self._publish_result_locked(task)
-                elif status_text == "FAILED_INFRA":
-                    self._handle_infra_failure_locked(task, reason=err_message or err_type or "infra failure", now=now)
-                elif status_text == "FAILED_USER":
-                    task.status = pb2.TASK_STATUS_FAILED_USER
-                    task.result = None
-                    task.error_type = err_type or "UserError"
-                    task.error_message = err_message or "user function failed"
-                    self._publish_result_locked(task)
-                else:
-                    task.status = pb2.TASK_STATUS_SUCCEEDED
-                    if isinstance(result, StoredResultArtifact):
-                        self._register_stored_result_artifact_locked(result)
-                        task.result = _stored_result_to_result_ref(result, node_id=self.node_id)
-                    else:
-                        task.result = result or {}
-                    task.error_type = ""
-                    task.error_message = ""
-                    self._publish_result_locked(task)
-                self._cv.notify_all()
-
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
             self._drain_executor_events()
             with self._cv:
                 self._ensure_executor_host_alive_locked()
-                self._touch_internal_heartbeats_locked()
-                self._dispatch_task_pool_locked()
             self._drain_executor_events()
             self._stop_event.wait(self.executor_poll_interval_sec)
 
     def _monitor_loop(self) -> None:
         while not self._stop_event.wait(self.monitor_interval_sec):
-            self._handle_timeouts()
             self._handle_service_timeouts()
-
-    def _handle_timeouts(self) -> None:
-        now = utc_now()
-        with self._cv:
-            mutated = False
-            for task in self._tasks.values():
-                if task.status != pb2.TASK_STATUS_RUNNING:
-                    continue
-                if task.last_heartbeat_at is None:
-                    continue
-                diff = (now - task.last_heartbeat_at).total_seconds()
-                if diff <= self.heartbeat_timeout_sec:
-                    continue
-                if self.enable_internal_executor:
-                    task.error_message = task.error_message or "heartbeat timeout"
-                self._handle_infra_failure_locked(task, reason="heartbeat timeout", now=now)
-                mutated = True
-
-            if mutated:
-                self._cv.notify_all()
 
     def _handle_service_timeouts(self) -> None:
         now = utc_now()

@@ -81,7 +81,7 @@ def _peer(context: grpc.ServicerContext) -> str:
 class NodeControlService(pb2_grpc.NodeControlServiceServicer):
     """NodeControl gRPC 服务。
 
-    负责代码上传、任务提交、结果拉取等核心功能。
+    负责代码/对象上传、TaskPool 控制面和服务会话模式的 gRPC 能力。
 
     Attributes:
         _state: NodeControl 状态管理器
@@ -98,10 +98,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             self._on_service_routes_changed()
         except Exception:
             logger.exception("[NodeControl] service route sync callback failed")
-
-    @staticmethod
-    def _shared_task_mode_removed_message() -> str:
-        return "shared task mode has been removed; use native TaskPoolSession or JobQueueMode"
 
     def UploadCode(self, request_iterator: Iterable[pb2.UploadCodeRequest], context: grpc.ServicerContext) -> pb2.UploadCodeResponse:
         meta = None
@@ -388,24 +384,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             context.set_details("object file missing")
             return
 
-    def SubmitTasks(self, request: pb2.SubmitTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.SubmitTasksResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-
-    def TaskStream(
-        self,
-        request_iterator: Iterable[pb2.TaskStreamRequest],
-        context: grpc.ServicerContext,
-    ) -> Iterable[pb2.TaskStreamResponse]:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        yield pb2.TaskStreamResponse(error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()))
-        return
-
     def UpdateRuntimeGlobals(
         self,
         request: pb2.UpdateRuntimeGlobalsRequest,
@@ -460,30 +438,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 runtime_key=request.runtime_key or request.code_version,
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
             )
-
-    def PullResults(self, request: pb2.PullResultsRequest, context: grpc.ServicerContext) -> pb2.PullResultsResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.PullResultsResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-
-    def CancelTasks(self, request: pb2.CancelTasksRequest, context: grpc.ServicerContext) -> pb2.CancelTasksResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.CancelTasksResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-
-    def CancelJob(self, request: pb2.CancelJobRequest, context: grpc.ServicerContext) -> pb2.CancelJobResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.CancelJobResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
 
     def GetMetrics(self, request: pb2.GetMetricsRequest, context: grpc.ServicerContext) -> pb2.GetMetricsResponse:
         logger.info("[NodeControl] GetMetrics peer=%s", _peer(context))

@@ -44,7 +44,15 @@ class _CtlArgumentParser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         if args is not None:
             argv = list(args)
-            local_commands = {"start", "start-infocenter", "start-gateway", "start-controlplane", "start-node", "restart"}
+            local_commands = {
+                "start",
+                "start-infocenter",
+                "start-gateway",
+                "start-controlplane",
+                "start-job-orchestrator",
+                "start-node",
+                "restart",
+            }
             command_index = next((idx for idx, token in enumerate(argv) if token in local_commands), -1)
             if command_index > 0:
                 moved = False
@@ -259,17 +267,19 @@ def _pid_names(root: Path) -> List[str]:
 def _process_sort_key(name: str) -> Tuple[int, str]:
     if name.startswith("node-"):
         return (0, name)
-    if name == "gateway":
+    if name == "job-orchestrator":
         return (1, name)
-    if name == "controlplane":
+    if name == "gateway":
         return (2, name)
-    if name == "infocenter":
+    if name == "controlplane":
         return (3, name)
+    if name == "infocenter":
+        return (4, name)
     return (4, name)
 
 
 def _managed_process_names(root: Path) -> List[str]:
-    names = {"controlplane", "node-1", "node-2"}
+    names = {"controlplane", "job-orchestrator", "node-1", "node-2"}
     names.update(_pid_names(root))
     return sorted(names, key=_process_sort_key)
 
@@ -291,6 +301,7 @@ def _stop_all_managed_processes(root: Path) -> None:
 def _default_named_ports(args: argparse.Namespace) -> Dict[str, int]:
     return {
         "controlplane": int(args.controlplane_port),
+        "job-orchestrator": int(args.job_orchestrator_port),
         "node-1-grpc": int(args.node1_port),
         "node-1-http": int(args.node1_http),
         "node-2-grpc": int(args.node2_port),
@@ -421,7 +432,18 @@ def _looks_like_pycloud_process(command: str) -> bool:
 
 def _role_from_command(command: str) -> str:
     match = re.search(r"--role\s+([A-Za-z0-9_-]+)", str(command or ""))
-    return str(match.group(1) if match else "").strip()
+    role = str(match.group(1) if match else "").strip().lower()
+    if role.startswith("info"):
+        return "infocenter"
+    if role.startswith("gate"):
+        return "gateway"
+    if role.startswith("job"):
+        return "joborchestrator"
+    if role.startswith("node"):
+        return "nodecontrol"
+    if role.startswith("cont"):
+        return "controlplane"
+    return role
 
 
 def _node_name_from_command(command: str) -> str:
@@ -463,7 +485,7 @@ def _kill_scanned_port_processes(*, target: str, ports: Iterable[int]) -> List[D
             continue
         node_name = str(row.get("node_name", "") or "").strip()
         role = str(row.get("role", "") or "").strip()
-        if role and role not in {"infocenter", "controlplane", "gateway", "nodecontrol"}:
+        if role and role not in {"infocenter", "controlplane", "gateway", "joborchestrator", "nodecontrol"}:
             continue
         if role == "nodecontrol" and node_name:
             _best_effort_mark_node_lost(target, node_name)
@@ -539,6 +561,28 @@ def _wait_node_registered(infocenter_target: str, node_id: str, timeout_sec: flo
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             nodes = data.get("nodes") or []
             if any(str(item.get("node_id", "")) == node_id for item in nodes if isinstance(item, dict)):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _wait_service_registered(infocenter_target: str, service_name: str, timeout_sec: float) -> bool:
+    target = str(infocenter_target or "").strip()
+    if not target.startswith(("http://", "https://")):
+        target = f"http://{target}"
+    url = (
+        f"{target.rstrip('/')}/services/routes"
+        f"?service_name={quote(str(service_name or '').strip(), safe='')}&healthy_only=true&limit=100"
+    )
+    deadline = time.time() + max(0.1, float(timeout_sec))
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+            routes = data.get("routes") or []
+            if any(isinstance(item, dict) for item in routes):
                 return True
         except Exception:
             pass
@@ -768,6 +812,52 @@ def _start_gateway(
     _log("OK", f"Gateway started (PID: {pid}, Bind: {bind}, InfoCenter: {infocenter_addr})")
 
 
+def _start_job_orchestrator(
+    root: Path,
+    *,
+    bind: str,
+    infocenter_addr: str,
+    node_id: str = "job-orchestrator-01",
+    service_name: str = "job-orchestrator",
+    queue_capacity: int = NODE_QUEUE_CAPACITY,
+    node_tags: str = "job",
+    node_version: str = "v1",
+    extra_env: Dict[str, str] | None = None,
+) -> None:
+    _assert_bind_available(bind)
+    _log("INFO", f"Starting JobOrchestrator on {bind} (InfoCenter: {infocenter_addr}, service: {service_name})...")
+    pid = _spawn_server(
+        root,
+        _logs_dir(root) / "job-orchestrator.log",
+        [
+            "--role",
+            "joborchestrator",
+            "--bind",
+            bind,
+            "--infocenter-addr",
+            infocenter_addr,
+            "--node-id",
+            node_id,
+            "--service-name",
+            service_name,
+            "--queue-capacity",
+            str(int(queue_capacity)),
+            "--node-tags",
+            node_tags,
+            "--node-version",
+            node_version,
+            "--log-level",
+            "INFO",
+        ],
+        extra_env=extra_env,
+    )
+    if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_service_registered(infocenter_addr, service_name, 0.2)):
+        _remove_pid(_pid_file(root, "job-orchestrator"))
+        raise RuntimeError("JobOrchestrator failed to register to InfoCenter")
+    _write_pid(_pid_file(root, "job-orchestrator"), pid)
+    _log("OK", f"JobOrchestrator started (PID: {pid}, Bind: {bind}, InfoCenter: {infocenter_addr})")
+
+
 def _start_node(
     root: Path,
     name: str,
@@ -944,6 +1034,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     _ensure_runtime_dirs(root)
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
     node1_host = resolve_public_host(str(getattr(args, "node1_host", "") or "") or _default_host_for_args(args))
     node1_http_host = resolve_public_host(str(getattr(args, "node1_http_host", "") or "") or _default_host_for_args(args))
     node2_host = resolve_public_host(str(getattr(args, "node2_host", "") or "") or _default_host_for_args(args))
@@ -955,6 +1046,12 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
     infocenter_target = _format_host_port(controlplane_host, int(args.controlplane_port))
     _start_controlplane(root, args.controlplane_port, bind_host=controlplane_host, remote_hint=infocenter_target, extra_env=extra_env)
+    _start_job_orchestrator(
+        root,
+        bind=_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port)),
+        infocenter_addr=infocenter_target,
+        extra_env=extra_env,
+    )
     time.sleep(2.0)
     worker_capacity = int(args.node_worker_capacity or _env_override_int(extra_env, "PYCLOUD_NODE_WORKER_CAPACITY", _default_node_worker_capacity()))
     queue_capacity = _env_override_int(extra_env, "PYCLOUD_NODE_QUEUE_CAPACITY", NODE_QUEUE_CAPACITY)
@@ -1003,6 +1100,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     print("============================================")
     print()
     print(f"  ControlPlane: {_format_host_port(controlplane_host, int(args.controlplane_port))}")
+    print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
     print(
         f"  Node-1:      {_format_host_port(node1_host, int(args.node1_port))} "
         f"(HTTP: {_format_host_port(node1_http_host, int(args.node1_http))})"
@@ -1021,7 +1119,7 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
     target = str(getattr(args, "target", "") or f"127.0.0.1:{int(args.controlplane_port)}")
     for name in _managed_process_names(root):
-        if name not in {"controlplane", "gateway", "infocenter"}:
+        if name not in {"controlplane", "gateway", "infocenter", "job-orchestrator"}:
             _best_effort_mark_node_lost(target, name)
     _stop_all_managed_processes(root)
     if bool(getattr(args, "scan_ports", False)):
@@ -1104,6 +1202,36 @@ def _cmd_start_controlplane(args: argparse.Namespace) -> int:
         gateway_refresh_interval_sec=float(args.gateway_refresh_interval_sec),
         gateway_failure_threshold=int(args.gateway_failure_threshold),
         gateway_open_sec=float(args.gateway_open_sec),
+        extra_env=extra_env,
+    )
+    return 0
+
+
+def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    _ensure_runtime_dirs(root)
+    _stop_named_process(root, "job-orchestrator")
+    extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
+    infocenter_addr = str(getattr(args, "infocenter_addr", "") or "").strip()
+    if not infocenter_addr:
+        raise RuntimeError("start-job-orchestrator requires --infocenter-addr")
+    bind = _resolve_bind_value(
+        str(args.bind),
+        host=str(getattr(args, "host", "") or ""),
+        port=int(getattr(args, "port", 0) or 0),
+        label="job orchestrator bind",
+        remote_hint=infocenter_addr,
+        prefer_local=bool(getattr(args, "local", False)),
+    )
+    _start_job_orchestrator(
+        root,
+        bind=bind,
+        infocenter_addr=infocenter_addr,
+        node_id=str(getattr(args, "node_id", "") or "job-orchestrator-01"),
+        service_name=str(getattr(args, "service_name", "") or "job-orchestrator"),
+        queue_capacity=int(getattr(args, "queue_capacity", NODE_QUEUE_CAPACITY)),
+        node_tags=str(getattr(args, "node_tags", "") or "job"),
+        node_version=str(getattr(args, "node_version", "") or "v1"),
         extra_env=extra_env,
     )
     return 0
@@ -1668,6 +1796,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_local_argument(parser, dest="_global_local")
     parser.add_argument("--controlplane-host", default="", help="bind host used by `pycloudctl start` for controlplane; default auto-detects local IP")
     parser.add_argument("--controlplane-port", type=int, default=50051, help="bind port used by `pycloudctl start` for controlplane")
+    parser.add_argument("--job-orchestrator-host", default="", help="bind host used by `pycloudctl start` for job-orchestrator; default auto-detects local IP")
+    parser.add_argument("--job-orchestrator-port", type=int, default=50053, help="bind port used by `pycloudctl start` for job-orchestrator")
     parser.add_argument("--node1-host", default="", help="bind host used by `pycloudctl start` for node-1 gRPC; default auto-detects local IP")
     parser.add_argument("--node1-port", "--node1-grpc-port", type=int, default=50061, help="bind port used by `pycloudctl start` for node-1 gRPC")
     parser.add_argument("--node1-http-host", default="", help="bind host used by `pycloudctl start` for node-1 service HTTP; default auto-detects local IP")
@@ -1707,6 +1837,18 @@ def build_parser() -> argparse.ArgumentParser:
     start_controlplane.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0, help="gateway route refresh interval in seconds for embedded gateway state")
     start_controlplane.add_argument("--gateway-failure-threshold", type=int, default=3, help="circuit-breaker failure threshold for embedded gateway state")
     start_controlplane.add_argument("--gateway-open-sec", type=float, default=5.0, help="circuit-breaker open duration in seconds for embedded gateway state")
+    start_job_orchestrator = subparsers.add_parser("start-job-orchestrator", help="start one local job-orchestrator process")
+    _add_local_argument(start_job_orchestrator)
+    _add_env_argument(start_job_orchestrator)
+    start_job_orchestrator.add_argument("--bind", default="0.0.0.0:50053", help="full bind address in host:port form for start-job-orchestrator; wildcard hosts auto-resolve to the local IP")
+    start_job_orchestrator.add_argument("--host", default="", help="optional bind host override for start-job-orchestrator; default auto-detects local IP")
+    start_job_orchestrator.add_argument("--port", type=int, default=0, help="optional bind port override for start-job-orchestrator")
+    start_job_orchestrator.add_argument("--infocenter-addr", default="", help="InfoCenter target; required for job-orchestrator registration")
+    start_job_orchestrator.add_argument("--node-id", default="job-orchestrator-01", type=_normalize_managed_name, help="managed node id advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--service-name", default="job-orchestrator", help="service name registered by job-orchestrator")
+    start_job_orchestrator.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="queue capacity advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--node-tags", default="job", help="comma-separated node tags advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--node-version", default="v1", help="node version string advertised by job-orchestrator")
     start_node = subparsers.add_parser("start-node", help="start one local nodecontrol process")
     _add_local_argument(start_node)
     _add_env_argument(start_node)
@@ -1760,7 +1902,7 @@ def build_parser() -> argparse.ArgumentParser:
     gc_parser.add_argument("--force", action="store_true", help="allow destructive gc even if managed local processes are still running")
     parser.epilog = (
         "Environment overrides:\n"
-        "  start / start-infocenter / start-gateway / start-controlplane / start-node / restart\n"
+        "  start / start-infocenter / start-gateway / start-controlplane / start-job-orchestrator / start-node / restart\n"
         "  support repeated '--env KEY=VALUE' arguments. Example:\n"
         "    pycloudctl start --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576"
     )
@@ -1778,6 +1920,8 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_start_gateway(args)
     if args.command == "start-controlplane":
         return _cmd_start_controlplane(args)
+    if args.command == "start-job-orchestrator":
+        return _cmd_start_job_orchestrator(args)
     if args.command == "start-node":
         return _cmd_start_node(args)
     if args.command == "stop":

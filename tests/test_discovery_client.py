@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import time
 from concurrent import futures
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Tuple
 from unittest.mock import patch
@@ -13,6 +14,7 @@ import pytest
 
 from pycloud_parallel.controlplane.client import (
     DirectConnect,
+    DiscoveryCallError,
     DiscoveryServiceClient,
     InfoCenterClient,
     InfoCenterServiceRoute,
@@ -22,6 +24,7 @@ from pycloud_parallel.controlplane.client import (
     _CallProxy,
 )
 from pycloud_parallel.controlplane.result_ref import ResultRef
+from pycloud_parallel.controlplane.object_ref import ObjectRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
@@ -203,6 +206,85 @@ class TestDirectConnect:
 
                 result = asyncio.run(_run())
             assert result == {"y": 64}
+        finally:
+            client.close()
+
+    def test_large_payload_upload_targets_selected_route_only(self, monkeypatch):
+        primary = _demo_route()
+
+        uploads = []
+
+        def fake_estimate(value):
+            return 600000 if isinstance(value, str) else 16
+
+        def fake_put(clients, data, *, format="", chunk_size=0):
+            uploads.append([client.target for client in clients])
+            return ObjectRef(
+                object_id="sha256:" + ("a" * 64),
+                format=format or "bin",
+                size_bytes=2048,
+                materialize_as="bytes",
+            )
+
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        try:
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._estimate_managed_global_inline_size", fake_estimate)
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+            with patch.object(client._route_cache, "select_route", return_value=primary), patch(
+                "pycloud_parallel.controlplane.client._call_route_http",
+                return_value={"ok": True, "data": {"y": 81}},
+            ):
+                result = client.call_sync("square", blob="x" * 2048)
+            assert result == {"y": 81}
+            assert uploads == [[primary.control_addr]]
+        finally:
+            client.close()
+
+    def test_large_payload_retry_uploads_only_to_retry_route(self, monkeypatch):
+        primary = _demo_route()
+        retry = replace(
+            primary,
+            service_id="svc-id-2",
+            node_instance_id="node-2-inst",
+            node_id="node-2",
+            control_addr="127.0.0.1:50062",
+            http_base_url="http://127.0.0.1:18082/svc/svc-id-2",
+        )
+
+        uploads = []
+
+        def fake_estimate(value):
+            return 600000 if isinstance(value, str) else 16
+
+        def fake_put(clients, data, *, format="", chunk_size=0):
+            uploads.append([client.target for client in clients])
+            return ObjectRef(
+                object_id="sha256:" + ("b" * 64),
+                format=format or "bin",
+                size_bytes=2048,
+                materialize_as="bytes",
+            )
+
+        def fake_call(route, *, method, payload, timeout_sec, service_token):
+            if route.service_id == primary.service_id:
+                raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "primary failed"})
+            return {"ok": True, "data": {"y": 100}}
+
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        try:
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._estimate_managed_global_inline_size", fake_estimate)
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+            with patch.object(client._route_cache, "select_route", side_effect=[primary, retry]), patch.object(
+                client._route_cache,
+                "refresh",
+                return_value=[retry],
+            ), patch(
+                "pycloud_parallel.controlplane.client._call_route_http",
+                side_effect=fake_call,
+            ):
+                result = client.call_sync("square", blob="x" * 2048)
+            assert result == {"y": 100}
+            assert uploads == [[primary.control_addr], [retry.control_addr]]
         finally:
             client.close()
 

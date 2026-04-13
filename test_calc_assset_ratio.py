@@ -1,3 +1,4 @@
+import base64
 import asyncio
 import sys
 import time
@@ -10,13 +11,54 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from pycloud_parallel import GatewayConnect,DirectConnect,TaskPoolSession
+from pycloud_parallel import GatewayConnect,DirectConnect,TaskPoolSession,DedicatedTaskServiceSession,JobQueueClient
 from calc_asset_ratio import calc_asset_ratio
 
 def get_fund_nav(fund_list=None,frequency=1):
     fund_nav_df=pd.read_csv('fund_nav_df.csv')
     fund_nav_df['TradingDay']=pd.to_datetime(fund_nav_df['TradingDay'])
     return fund_nav_df
+
+
+def _load_calc_asset_ratio_globals():
+    if all(
+        value is not None
+        for value in (
+            calc_asset_ratio.bench_mark_yield_df,
+            calc_asset_ratio.bench_mark_yield_df_weekly,
+            calc_asset_ratio.bench_mark_closeprice_df,
+        )
+    ):
+        return
+
+    bench_mark_closeprice_df = pd.read_csv(ROOT_DIR / "bench_mark_closeprice_df.csv")
+    bench_mark_closeprice_df["TradingDay"] = pd.to_datetime(bench_mark_closeprice_df["TradingDay"])
+    bench_mark_closeprice_df.set_index("TradingDay", inplace=True)
+    bench_mark_closeprice_df.columns = bench_mark_closeprice_df.columns.astype(int)
+
+    bench_mark_yield_df = pd.read_csv(ROOT_DIR / "bench_mark_yield_df.csv")
+    bench_mark_yield_df["TradingDay"] = pd.to_datetime(bench_mark_yield_df["TradingDay"])
+    bench_mark_yield_df.set_index("TradingDay", inplace=True)
+    bench_mark_yield_df.columns = bench_mark_yield_df.columns.astype(int)
+
+    bench_mark_yield_df_weekly = pd.read_csv(ROOT_DIR / "bench_mark_yield_df_weekly.csv")
+    bench_mark_yield_df_weekly["TradingDay"] = pd.to_datetime(bench_mark_yield_df_weekly["TradingDay"])
+    bench_mark_yield_df_weekly.set_index("TradingDay", inplace=True)
+    bench_mark_yield_df_weekly.columns = bench_mark_yield_df_weekly.columns.astype(int)
+
+    calc_asset_ratio.bench_mark_closeprice_df = bench_mark_closeprice_df
+    calc_asset_ratio.bench_mark_yield_df = bench_mark_yield_df
+    calc_asset_ratio.bench_mark_yield_df_weekly = bench_mark_yield_df_weekly
+
+
+def job_run_fund_asset_ratio(fund_net_value_series,strategy_type=1,frequency=0,**kwargs):
+    _load_calc_asset_ratio_globals()
+    return calc_asset_ratio.get_fund_asset_ratio(
+        fund_net_value_series,
+        strategy_type=strategy_type,
+        frequency=frequency,
+        **kwargs,
+    )
 
 
 def calc_fund_list_asset_ratio(fund_list,strategy_type=1,frequency=1):
@@ -70,8 +112,8 @@ def calc_fund_list_asset_ratio2(fund_list,strategy_type=1,frequency=1):
             "bench_mark_yield_df_weekly",
             "bench_mark_closeprice_df",
         ],
-        worker_count=10,
-        node_count=1,
+        worker_count=5,
+        node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
         # artifact_path=source_dir_list,
@@ -137,6 +179,121 @@ def calc_fund_list_asset_ratio3(fund_list,strategy_type=1,frequency=1):
         return a
 
 
+def calc_fund_list_asset_ratio4(fund_list,strategy_type=1,frequency=1):
+    fund_nav_df=get_fund_nav(fund_list,frequency=frequency)
+    fund_net_value_pvt=fund_nav_df.pivot(index='TradingDay',columns='FundID',values='AdjustedNav')
+    fund_net_value_pvt=fund_net_value_pvt[fund_net_value_pvt.count().sort_values(ascending=False).index.values]
+    from calc_asset_ratio import calc_asset_ratio
+    t0=time.time()
+    with DedicatedTaskServiceSession.from_infocenter(
+        infocenter_target= "127.0.0.1:50051",
+        job_id=f"demo-pool-{int(time.time())}",
+        entry_module=calc_asset_ratio,
+        entry_callable="get_fund_asset_ratio",
+        managed_global_names=[
+            "bench_mark_yield_df",
+            "bench_mark_yield_df_weekly",
+            "bench_mark_closeprice_df",
+        ],
+        worker_count=5,
+        node_count=2,
+        tags=["compute"],
+        timeout_sec=300.0,
+        # artifact_path=source_dir_list,
+    ) as pool:
+        pool.update_globals(calc_asset_ratio.update_globals())
+        print("pool nodes:", pool.node_ids)
+        print("pool status:", {k: v.status for k, v in pool.status_map().items()})
+        t1=time.time()
+        print(t1-t0)
+        for task_id,data in  pool.imap_unordered(
+           [
+                {'fund_net_value_series':fund_net_value_series.dropna(), 'strategy_type':strategy_type,'frequency': 0}
+                for _, fund_net_value_series in fund_net_value_pvt.items()
+            ],
+            result_timeout_sec=300,
+        ):
+            pass
+              
+        t2=time.time()
+        print(t2-t1) 
+
+
+def calc_fund_list_asset_ratio_job(fund_list,strategy_type=1,frequency=1):
+    driver_blob = "\n".join(
+        [
+            "from pathlib import Path",
+            "import pandas as pd",
+            "",
+            "def build(fund_list=None, root_dir='', strategy_type=1, **_kwargs):",
+            "    root_dir = Path(root_dir)",
+            "    fund_nav_df = pd.read_csv(root_dir / 'fund_nav_df.csv')",
+            "    fund_nav_df['TradingDay'] = pd.to_datetime(fund_nav_df['TradingDay'])",
+            "    if fund_list:",
+            "        fund_nav_df = fund_nav_df[fund_nav_df['FundID'].isin(fund_list)]",
+            "    fund_net_value_pvt = fund_nav_df.pivot(index='TradingDay', columns='FundID', values='AdjustedNav')",
+            "    fund_net_value_pvt = fund_net_value_pvt[fund_net_value_pvt.count().sort_values(ascending=False).index.values]",
+            "    return [",
+            "        {",
+            "            'fund_net_value_series': fund_net_value_series.dropna(),",
+            "            'strategy_type': strategy_type,",
+            "            'frequency': 0,",
+            "        }",
+            "        for _, fund_net_value_series in fund_net_value_pvt.items()",
+            "    ]",
+        ]
+    ).encode("utf-8")
+    t0=time.time()
+    client_id=f"asset-ratio-job-client-{int(t0)}"
+
+    with JobQueueClient(
+        "127.0.0.1:50051",
+        client_id=client_id,
+        timeout_sec=10.0,
+    ) as client:
+        # 这里假设 job-orchestrator 和当前脚本共享同一份本地工作区路径。
+        resp = client.submit_job(
+            {
+                "job_id": f"asset-ratio-job-{int(t0)}",
+                "client_id": client_id,
+                "runtime": "py3",
+                "artifact_path": str(ROOT_DIR),
+                "entry_module": "test_calc_assset_ratio",
+                "entry_callable": "job_run_fund_asset_ratio",
+                "driver_blob_b64": base64.b64encode(driver_blob).decode("utf-8"),
+                "driver_entry_module": "asset_ratio_job_driver",
+                "driver_entry_callable": "build",
+                "driver_package_format": "py",
+                "driver_payload": {
+                    "fund_list": fund_list,
+                    "root_dir": str(ROOT_DIR),
+                    "strategy_type": strategy_type,
+                },
+                "pool_worker_count": 7,
+                "node_count": 2,
+                "tags": ["compute"],
+                "timeout_sec": 300.0,
+                "wait_timeout_sec": 300.0,
+            }
+        )
+        job_id = resp["job"]["job_id"]
+        print("submitted job:", job_id)
+        terminal = client.wait_for_terminal(
+            job_id,
+            timeout_sec=300.0,
+            poll_interval_sec=1.0,
+        )
+
+    job = terminal["job"]
+    print("job status:", job["status"])
+    if job["status"] != "SUCCEEDED":
+        raise RuntimeError(f"job {job_id} failed: {job.get('error')}")
+
+    t1=time.time()
+    print(t1-t0)
+    return [item.get("result") for item in job.get("results", [])]
+
+
 
 if __name__ == "__main__":  
 #     from pycloud_parallel.controlplane.client import GatewayServiceClient
@@ -151,6 +308,10 @@ if __name__ == "__main__":
 #     print("IC routes:", c.list_service_routes(service_name="calc_asset_ratio", healthy_only=False, limit=100))
     fund_list=[156695,157112,157541,157670,158463,158624,158875,159467,159858,159879,160041,160057,160216,160217,160996,161044,161081,161629,161663,161820,161860,161990,162175,162192,162193,162430,162453,163269,163388,164852,165747,165901,166299,236965,237213,237422,238019,262084,262120,393169,442942,449552,452965,452989,460460,478874,485939,494206,527458,527469,557725,575845,676027,685885,812974,894218,902755,944418,951556,952128,952172,952469,1401164,1407003,1452421,1465293,1487334,1508664,1529050,1535088,1535620,1537797,1560731,1574709,1578139,1581602,1600394,1616759,1624096,1652875]
     t1=time.time()
-    b=calc_fund_list_asset_ratio3(fund_list,1,1)
+    # b=calc_fund_list_asset_ratio2(fund_list,1,1)
+    # d=calc_fund_list_asset_ratio_job(fund_list,1,1)
+
     t2=time.time()
-    print(t2-t1)
+    c=calc_fund_list_asset_ratio3(fund_list,1,1)
+    t3=time.time()
+    print(t2-t1,t3-t2)

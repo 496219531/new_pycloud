@@ -12,6 +12,7 @@ from pycloud_parallel.controlplane.client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
+from pycloud_parallel.controlplane.server import build_job_orchestrator_server
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -102,11 +103,13 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert ">2</td><td>2</td>" in raw
             assert "controlplane_version=" in raw
             assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>" in raw
-            assert "last_total_ms" in raw
             assert "avg_total_ms" in raw
-            assert "last_build_execute_spec_ms" in raw
-            assert "last_child_decode_ms" in raw
+            assert "avg_child_decode_ms" in raw
             assert "avg_child_invoke_ms" in raw
+            assert "avg_child_encode_ms" in raw
+            assert "last_total_ms" not in raw
+            assert "last_child_decode_ms" not in raw
+            assert "last_build_execute_spec_ms" not in raw
 
             node_state.end_service(
                 owner_client_id="owner-reg",
@@ -199,6 +202,129 @@ def test_ops_page_marks_lost_service_instances(tmp_path):
     finally:
         registrar.close()
         node_state.close()
+        info_server.stop()
+
+
+def test_ops_page_shows_job_queue_status_section():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="job-orchestrator-01",
+                node_instance_id="job-orchestrator-01-inst",
+                control_addr="",
+                capacity=1,
+                queue_capacity=4000,
+                tags=["job"],
+                metadata={
+                    "component": "job-orchestrator",
+                    "pycloud_version": "test-version",
+                    "current_job_id": "job-123",
+                    "current_job_status": "RUNNING",
+                    "job_waiting": "4",
+                    "job_running": "1",
+                    "job_terminal": "7",
+                    "job_recent": (
+                        '[{"job_id":"job-123","status":"RUNNING","submitted_at":"2026-01-01T00:00:00+00:00","finished_at":"","final_result_preview":"","error_preview":""},'
+                        '{"job_id":"job-122","status":"SUCCEEDED","submitted_at":"2025-12-31T23:59:00+00:00","finished_at":"2026-01-01T00:00:10+00:00","final_result_preview":"{\\"count\\":3}","error_preview":""}]'
+                    ),
+                    "job_waiting_list": (
+                        '[{"job_id":"job-200","priority":5,"submitted_at":"2026-01-01T00:01:00+00:00","position":1},'
+                        '{"job_id":"job-201","priority":4,"submitted_at":"2026-01-01T00:02:00+00:00","position":2}]'
+                    ),
+                },
+                services=[
+                    {
+                        "service_name": "job-orchestrator",
+                        "service_id": "svc-job-1",
+                        "status": int(pb2.SERVICE_STATUS_RUNNING),
+                        "worker_count": 1,
+                        "alive_workers": 1,
+                        "in_flight": 1,
+                        "http_base_url": "http://127.0.0.1:50053/svc/svc-job-1",
+                    }
+                ],
+                service_worker_capacity=1,
+                service_worker_used=1,
+            )
+
+        with urlopen(f"{info_target}/ops", timeout=5.0) as resp:
+            raw = resp.read().decode("utf-8")
+        assert "Job Queue" in raw
+        assert "Recent Jobs" in raw
+        assert "Waiting Jobs" in raw
+        assert "job-123" in raw
+        assert "job-122" in raw
+        assert "job-200" in raw
+        assert "job-201" in raw
+        assert "href='http://127.0.0.1:50053/svc/svc-job-1/jobs/job-123?view=html'" in raw
+        assert "href='http://127.0.0.1:50053/svc/svc-job-1/jobs/job-122?view=html'" in raw
+        assert "/ops/job-queues/job-orchestrator-01-inst/jobs/job-200/move-up" in raw
+        assert "/ops/job-queues/job-orchestrator-01-inst/jobs/job-201/move-down" in raw
+        assert "RUNNING" in raw
+        assert ">4</td>" in raw
+        assert ">1</td>" in raw
+        assert ">7</td>" in raw
+        assert "count" in raw
+        assert "http://127.0.0.1:50053/svc/svc-job-1" in raw
+        assert "overflow-wrap:anywhere" in raw
+    finally:
+        info_server.stop()
+
+
+def test_ops_job_queue_reorder_proxies_to_job_orchestrator():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+    orchestrator = build_job_orchestrator_server(
+        "127.0.0.1:0",
+        infocenter_addr=info_target,
+        node_id="job-orchestrator-proxy",
+    )
+    orchestrator.start()
+    with orchestrator.job_queue._cv:  # noqa: SLF001
+        orchestrator.job_queue._running_job_id = "__test_blocked__"  # noqa: SLF001
+
+    try:
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(info_target, timeout_sec=5.0).list_nodes(
+                    healthy_only=False,
+                    tags=["job"],
+                    limit=20,
+                )
+            )
+            == 1
+        )
+        orchestrator.job_queue.submit_job({"job_id": "job-a", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 1}]})
+        orchestrator.job_queue.submit_job({"job_id": "job-b", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 2}]})
+        orchestrator.job_queue.submit_job({"job_id": "job-c", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 3}]})
+        orchestrator._registrar.sync_now()  # noqa: SLF001
+
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            node = client.list_nodes(healthy_only=False, tags=["job"], limit=20)[0]
+            instance_id = node.node_instance_id
+
+        req = Request(
+            f"{info_target}/ops/job-queues/{instance_id}/jobs/job-c/move-up",
+            method="POST",
+            headers={"Accept": "text/html"},
+            data=b"",
+        )
+        with urlopen(req, timeout=5.0) as resp:
+            assert resp.status == 200
+            assert "/ops" in resp.geturl()
+
+        summary = orchestrator.job_queue.summary()
+        waiting_ids = [item["job_id"] for item in summary["waiting_jobs"]]
+        assert waiting_ids == ["job-a", "job-c", "job-b"]
+    finally:
+        orchestrator.stop()
         info_server.stop()
 
 
@@ -534,30 +660,34 @@ def test_node_registrar_syncs_active_runtimes(tmp_path):
             b"    return {'ok': True}\n"
         )
         digest = hashlib.sha256(blob).hexdigest()
-        artifact, _ = node_state.put_code(
+        pool = node_state.create_task_pool(
+            owner_client_id="owner-runtime-reg",
+            pool_name="pool-runtime-reg",
             sha256=f"sha256:{digest}",
             runtime="py3",
             entry_module="runtime_registrar_demo",
             entry_callable="run",
             package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
             chunks=[blob],
         )
-        node_state.submit_tasks(
-            pb2.SubmitTasksRequest(
-                client_id="client-runtime-reg",
-                code_version=artifact.code_version,
-                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-                job_id="job-runtime-reg",
-                tasks=[
-                    pb2.TaskSubmitItem(
-                        task_id="runtime-reg-task-1",
-                        payload={"sleep_ms": 800},
-                        priority=1,
-                        runtime_key="runtime-hot-sync",
-                    )
-                ],
-            )
+        accepted, rejected = node_state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            job_id="job-runtime-reg",
+            tasks=[
+                pb2.TaskSubmitItem(
+                    task_id="runtime-reg-task-1",
+                    payload={"sleep_ms": 800},
+                    priority=1,
+                    runtime_key="runtime-hot-sync",
+                )
+            ],
         )
+        assert [item.task_id for item in accepted] == ["runtime-reg-task-1"]
+        assert rejected == []
 
         registrar.start()
 

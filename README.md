@@ -217,6 +217,7 @@ from pycloud_parallel import (
    - 原生专属任务池会话
 3. `DedicatedTaskServiceSession`
    - 复用 `ServiceGroup` 的兼容专属池实现
+   - 也支持 owner 侧 `update_globals(...)`
 4. `JobQueueClient`
    - 大任务排队客户端
 5. `GatewayConnect`
@@ -243,6 +244,7 @@ pycloudctl start
 pycloudctl start-controlplane
 pycloudctl start-infocenter
 pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
+pycloudctl start-job-orchestrator --infocenter-addr 127.0.0.1:50051
 pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
 pycloudctl start-node --node-id node-1 --node-port 50061 --service-http-port 18081 --infocenter-addr 127.0.0.1:50051
 pycloudctl status
@@ -256,6 +258,7 @@ pycloudctl stop-node node-1
 pycloudctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
+  --job-orchestrator-port 51053 \
   --node1-port 51061 \
   --node1-http-port 18181 \
   --node2-port 51062 \
@@ -274,7 +277,9 @@ pycloudctl start --runtime-root /tmp/pycloud-dev
 
 - [docs/PYCLOUDCTL_USAGE.md](docs/PYCLOUDCTL_USAGE.md)
 
-如果你要单独起 `infocenter`、`gateway(http)`、`nodecontrol` 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
+`pycloudctl start` 现在会默认把独立 `job-orchestrator` 也一起拉起，方便直接走 `gateway -> job-orchestrator -> TaskPool` 这条任务链路。
+
+如果你要单独起 `infocenter`、`gateway(http)`、`job-orchestrator`、`nodecontrol` 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
 
 如果升级后怀疑旧服务没停掉，先看：
 
@@ -450,8 +455,8 @@ with TaskPoolSession.from_infocenter(
 常见高层 helper：
 
 1. `submit_job_from_bytes(...)`
-2. `submit_job_from_func(...)`
-3. `submit_job_from_module(...)`
+2. `submit_job_from_module(...)`
+3. `get_job_status(...)`
 4. `wait_for_terminal(...)`
 
 ### 4. Gateway 调用

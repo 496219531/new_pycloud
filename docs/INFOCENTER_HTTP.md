@@ -128,70 +128,57 @@ http://127.0.0.1:50051/ops
 
 1. `calls`
 2. `errors`
-3. `last_total_ms`
-4. `last_setup_ms`
-5. `last_build_execute_spec_ms`
-6. `last_executor_ms`
-7. `last_finalize_ms`
-8. `last_child_decode_ms`
-9. `last_child_invoke_ms`
-10. `last_child_encode_ms`
-11. `avg_total_ms`
-12. `avg_setup_ms`
-13. `avg_build_execute_spec_ms`
-14. `avg_executor_ms`
-15. `avg_finalize_ms`
-16. `avg_child_decode_ms`
-17. `avg_child_invoke_ms`
-18. `avg_child_encode_ms`
-19. `max_total_ms`
-20. `last_invoke_ms`
+3. `avg_total_ms`
+4. `avg_child_decode_ms`
+5. `avg_child_invoke_ms`
+6. `avg_child_encode_ms`
 
 这些指标来自 node 侧服务调用 timing 聚合，并随 heartbeat 同步到 InfoCenter。
 
+如果注册了独立 `job-orchestrator`，`/ops` 页面还会额外显示 `Job Queue` 区块：
+
+1. `current_job_id`
+2. `current_status`
+3. `waiting`
+4. `running`
+5. `terminal`
+6. `job_count`
+
+同时还会显示 `Recent Jobs` 区块，便于快速查看最近几个 job 的：
+
+1. `job_id`
+2. `status`
+3. `submitted_at`
+4. `finished_at`
+5. `final_result`
+6. `error`
+
+其中 `job_id` 会直接链接到对应 `job-orchestrator` 的 job 详情 JSON。
+
+详情页会按区块展示 `payload / checkpoint / final_result / results`，其中 `results` 支持：
+
+1. 按 `task_id` / `status` 前端过滤
+2. 成功 / 失败结果折叠展开
+3. 失败行高亮
+
+`/ops` 页面上的 `Waiting Jobs` 区块还支持对非运行态 job 做上移 / 下移调序。
+
 计时边界说明：
 
-1. `last_total_ms` / `avg_total_ms`
-   - node 侧一次服务调用的总墙钟时间
-   - 从 `NodeControlState._invoke_service_call(...)` 进入开始计时
-   - 到 node 侧准备好返回 JSON/HTTP body 为止
-   - 不包含浏览器/客户端到 node 的网络传输耗时，也不包含最终 socket 写回后的客户端接收耗时
-2. `last_setup_ms` / `avg_setup_ms`
-   - 父进程前置阶段
-   - 包含：方法名校验、service/session 查找、token/status 校验、artifact 查找、`touch_code_last_at(...)`、`_ensure_executor_host_alive_locked()`、`session.in_flight += 1`
-   - 不包含真正把请求发给 executor host 的等待时间
-3. `last_build_execute_spec_ms` / `avg_build_execute_spec_ms`
-   - 父进程构造执行描述阶段
-   - 主要就是 `_build_execute_spec(...)`
-   - 包含 payload 预处理、managed globals scope/digest 带入、ObjectRef/执行描述包装等
-4. `last_executor_ms` / `avg_executor_ms`
-   - executor host 往返阶段
-   - 从 `_build_execute_spec(...)` 完成、开始调用 `_executor_host.call_service(...)` 起算
-   - 到 executor host 返回结果结束
-   - 当前它包含：父子进程 IPC、executor 侧排队/等待、用户函数执行、executor 返回结果
-   - 所以它仍然不是纯用户函数 CPU 时间
-5. `last_finalize_ms` / `avg_finalize_ms`
-   - 父进程收尾阶段
-   - 成功时主要包含：`StoredResultArtifact -> ResultRef` 转换，以及最终返回体组装
-   - 失败时主要包含：错误返回体组装
-   - 对 timeout / executor 提前报错这类路径，当前通常记为 `0.0`
-6. `last_child_decode_ms` / `avg_child_decode_ms`
-   - 子进程内部前半段
-   - 包含：artifact/router 加载、`managed globals` 应用、payload 里的 `ObjectRef` 解引用、方法查找
-7. `last_child_invoke_ms` / `avg_child_invoke_ms`
-   - 子进程里真正执行 `_invoke_user_callable(...)` 的时间
+1. `avg_total_ms`
+   - node 侧一次服务调用从进入 `_invoke_service_call(...)` 到准备返回响应为止的累计平均墙钟时间
+2. `avg_child_decode_ms`
+   - 子进程内部前半段的累计平均耗时
+   - 包含：artifact/router 加载、managed globals 应用、payload 里的 `ObjectRef` 解引用、方法查找
+3. `avg_child_invoke_ms`
+   - 子进程里真正执行用户函数的累计平均耗时
    - 这是当前最接近“用户函数本体耗时”的指标
-8. `last_child_encode_ms` / `avg_child_encode_ms`
-   - 子进程结果收尾阶段
-   - 包含 `_normalize_user_return(...)`，也就是结果标准化、必要时落成 `StoredResultArtifact`
-9. `max_total_ms`
-   - 当前 service session 生命周期内观测到的最大 `total_ms`
-10. `calls` / `errors`
+4. `avg_child_encode_ms`
+   - 子进程结果收尾阶段的累计平均耗时
+   - 包含结果标准化，以及必要时落成 `StoredResultArtifact`
+5. `calls` / `errors`
    - 当前 service session 生命周期内的累计调用次数和累计错误次数
-11. 这些 `avg_*` 指标是“自该 service session 启动以来的累计平均值”，不是最近 N 次的滑动平均
-12. `last_invoke_ms`
-   - 为兼容旧字段保留
-   - 当前等价于 `last_child_invoke_ms`
+6. 这些 `avg_*` 指标是“自该 service session 启动以来的累计平均值”，不是最近 N 次的滑动平均
 
 当前页面显示：
 

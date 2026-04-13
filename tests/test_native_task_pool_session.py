@@ -1032,6 +1032,93 @@ def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
     mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, wait_ms=500, limit=100, job_id="", raise_on_error=False, task_ids=None)
 
 
+def test_native_task_pool_session_unordered_delegates_to_imap_unordered() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    session = TaskPoolSession(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-unordered",
+    )
+    payloads = [{"value": 1}, {"value": 2}]
+
+    with patch.object(
+        session,
+        "imap_unordered",
+        return_value=iter([("task-1", {"value": 1}), ("task-2", {"value": 2})]),
+    ) as mocked:
+        out = list(
+            session.unordered(
+                payloads,
+                max_in_flight=4,
+                receive_batch=2,
+                submit_timeout_sec=2.0,
+                result_timeout_sec=3.0,
+                wait_ms=20,
+                raise_on_error=False,
+                node_window_factor=1.5,
+            )
+        )
+
+    assert out == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
+    mocked.assert_called_once_with(
+        payloads,
+        task_method="",
+        max_in_flight=4,
+        receive_batch=2,
+        submit_timeout_sec=2.0,
+        result_timeout_sec=3.0,
+        wait_ms=20,
+        raise_on_error=False,
+        node_window_factor=1.5,
+    )
+
+
+def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    session = TaskPoolSession(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-consume-unordered",
+    )
+    payloads = [{"value": 1}, {"value": 2}]
+    handled: list[tuple[str, object]] = []
+
+    with patch.object(
+        session,
+        "unordered",
+        return_value=iter([("task-1", {"value": 1}), ("task-2", {"value": 2})]),
+    ) as mocked:
+        processed = session.consume_unordered(
+            payloads,
+            handle=lambda task_id, result: handled.append((task_id, result)),
+            max_in_flight=3,
+            receive_batch=1,
+            submit_timeout_sec=1.5,
+            result_timeout_sec=2.5,
+            wait_ms=15,
+            raise_on_error=False,
+            node_window_factor=1.25,
+        )
+
+    assert processed == 2
+    assert handled == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
+    mocked.assert_called_once_with(
+        payloads,
+        task_method="",
+        max_in_flight=3,
+        receive_batch=1,
+        submit_timeout_sec=1.5,
+        result_timeout_sec=2.5,
+        wait_ms=15,
+        raise_on_error=False,
+        node_window_factor=1.25,
+    )
+
+
 def test_native_task_pool_session_iter_items_includes_failures() -> None:
     from pycloud_parallel.controlplane.client import TaskPoolSession
 

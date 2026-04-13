@@ -203,6 +203,28 @@ class GatewayHttpApp:
         }
 
     def _list_methods(self, route: InfoCenterServiceRoute, *, include_docs: bool) -> Dict[str, object]:
+        if not str(route.control_addr or "").strip():
+            base_url = self._validate_route_url(route.http_base_url)
+            if not base_url:
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid route http_base_url"})
+            url = f"{base_url}/methods?include_docs={'true' if include_docs else 'false'}"
+            req = Request(url, method="GET")
+            try:
+                with urlopen(req, timeout=max(2.0, self.timeout_sec + 1.0)) as resp:
+                    data = json.loads(resp.read().decode("utf-8") or "{}")
+            except HTTPError as exc:
+                try:
+                    data = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
+                except Exception:
+                    data = {"ok": False, "error": exc.reason}
+                raise GatewayCallError(status_code=exc.code, data=data) from exc
+            except Exception as exc:
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
+            if not isinstance(data, dict):
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
+            if not data.get("ok", False):
+                raise GatewayCallError(status_code=200, data=data)
+            return data
         with NodeControlClient(route.control_addr, timeout_sec=self.timeout_sec) as client:
             methods = client.list_service_methods(service_id=route.service_id, include_docs=include_docs)
         return {

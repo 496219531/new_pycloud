@@ -9,6 +9,7 @@
    - 更适合 CPU 密集型子任务、批处理、高吞吐执行
 2. `JobQueue Mode`
    - 大任务排队与单活调度层
+   - 默认经 `gateway -> 唯一 job-orchestrator -> TaskPool` 这条链路执行
    - 大任务排到后，再展开成 subtasks 交给执行层
 3. `Service Mode`
    - 常驻函数服务层
@@ -169,6 +170,7 @@ group = DeployedService.deploy_from_infocenter(
    - 原生专属 pool，会自动 heartbeat
 2. `DedicatedTaskServiceSession`
    - 兼容专属池实现，底层复用 `ServiceGroup`
+   - owner 侧也支持 `update_globals(...)`
 3. `JobQueueClient`
    - 先提交大任务到队列，排到后再自动创建 `TaskPoolSession`
 
@@ -203,13 +205,21 @@ with TaskPoolSession.from_infocenter(
     for task_id, data in pool.iter_data(max_count=1, timeout_sec=10.0):
         print(task_id, data)
 
-    for task_id, data in pool.imap_unordered(
+    for task_id, data in pool.unordered(
         [{"value": 20}, {"value": 21}, {"value": 22}],
         max_in_flight=2,
         receive_batch=1,
         result_timeout_sec=10.0,
     ):
         print(task_id, data)
+
+    pool.consume_unordered(
+        [{"value": 30}, {"value": 31}],
+        handle=lambda task_id, data: print("handled", task_id, data),
+        max_in_flight=2,
+        receive_batch=1,
+        result_timeout_sec=10.0,
+    )
 
     mapped = pool.map([8, 9, 10], timeout_sec=10.0)
     print(mapped)
@@ -226,40 +236,29 @@ with TaskPoolSession.from_infocenter(
 ```python
 from pycloud_parallel import JobQueueClient
 
-client = JobQueueClient("127.0.0.1:50051")
+client = JobQueueClient("127.0.0.1:50052", client_id="job-demo")
 client.submit_job_from_bytes(
-    blob=driver_blob,
-    driver_entry_module="job_driver_demo",
+    blob=job_blob,
+    entry_module="job_demo",
     runtime="py3",
-    task_entry_module="task_demo",
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    job_payload={"value": 10, "count": 6},
 )
 ```
 
-如果你已经有函数对象，也可以直接：
+这里的目标地址应该指向 `gateway`；`job-orchestrator` 会作为唯一 service 注册到 `infocenter`，再由 `gateway` 转发到它。
 
-```python
-client.submit_job_from_func(
-    func=build_subtasks,
-    task_func=run_subtask,
-    pool_worker_count=2,
-    pool_node_count=2,
-)
-```
+`JobQueueClient` 采用固定约定：job module 需要导出 `run / task_generator / handle_result / finalize`，其余 queue / pool 调度参数由 `job-orchestrator` 负责。
 
 如果你已有模块对象：
 
 ```python
 client.submit_job_from_module(
-    module=job_driver_module,
-    task_module=task_module,
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    module=job_module,
+    job_payload={"value": 10, "count": 6},
 )
 ```
+
+这里推荐直接提交模块对象；`submit_job_from_func(...)` 已移除，避免把函数对象临时拼模块带来的隐式依赖问题。
 
 等待 job 进入终态：
 

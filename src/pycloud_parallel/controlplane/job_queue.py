@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +60,51 @@ def _task_result_to_dict(item: pb2.TaskResult) -> Dict[str, object]:
     }
 
 
+def _preview_job_value(value: object, *, limit: int = 160) -> str:
+    if value is None:
+        return ""
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        text = repr(value)
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= max(16, int(limit)):
+        return normalized
+    return normalized[: max(13, int(limit) - 3)] + "..."
+
+
+def _uses_job_hooks(payload: Dict[str, object]) -> bool:
+    return any(
+        str(payload.get(name, "") or "").strip()
+        for name in (
+            "task_generator_callable",
+            "handle_result_callable",
+            "handledata_callable",
+            "handdata_callable",
+            "finalize_callable",
+        )
+    )
+
+
+def _auth_token_digest(token: str) -> str:
+    normalized = str(token or "").strip()
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _job_auth_ttl_sec() -> int:
+    for key in ("PYCLOUD_JOB_AUTH_TTL_SEC", "PYCLOUD_JOB_CLIENT_AUTH_TTL_SEC"):
+        raw = str(os.environ.get(key, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(60, int(raw))
+        except Exception:
+            continue
+    return 24 * 60 * 60
+
+
 @dataclass
 class JobState:
     job_id: str
@@ -75,6 +122,10 @@ class JobState:
     cancel_requested: bool = False
     error: str = ""
     results: List[Dict[str, object]] = field(default_factory=list)
+    final_result: object = None
+    enqueue_seq: int = 0
+    owner_token_digest: str = ""
+    owner_token_expires_at: Optional[datetime] = None
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -93,6 +144,8 @@ class JobState:
             "cancel_requested": bool(self.cancel_requested),
             "error": self.error,
             "results": list(self.results),
+            "final_result": self.final_result,
+            "enqueue_seq": int(self.enqueue_seq or 0),
         }
 
 
@@ -101,6 +154,8 @@ class JobQueueManager:
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._jobs: Dict[str, JobState] = {}
+        self._waiting_order: List[str] = []
+        self._enqueue_seq = 0
         self._running_job_id = ""
         self._current_executor: Any = None
         self._controlplane_target = ""
@@ -137,23 +192,32 @@ class JobQueueManager:
             except Exception:
                 pass
 
-    def submit_job(self, payload: Dict[str, object]) -> JobState:
+    def submit_job(self, payload: Dict[str, object], *, auth_token: str = "") -> JobState:
         job_id = str(payload.get("job_id", "") or "").strip() or f"jobq-{uuid.uuid4().hex}"
         client_id = str(payload.get("client_id", "") or "").strip() or f"job-client-{uuid.uuid4().hex[:8]}"
         priority = max(0, int(payload.get("priority", 0) or 0))
-        state = JobState(
-            job_id=job_id,
-            client_id=client_id,
-            priority=priority,
-            status="WAITING",
-            submitted_at=utc_now(),
-            code_version=str(payload.get("code_version", "") or "").strip(),
-            entry_module=str(payload.get("entry_module", "") or "").strip(),
-            entry_callable=str(payload.get("entry_callable", "") or "run").strip() or "run",
-            payload=dict(payload),
-        )
+        owner_token_digest = _auth_token_digest(auth_token)
+        submitted_at = utc_now()
+        owner_token_expires_at = submitted_at + timedelta(seconds=_job_auth_ttl_sec()) if owner_token_digest else None
         with self._cv:
+            self._enqueue_seq += 1
+            enqueue_seq = self._enqueue_seq
+            state = JobState(
+                job_id=job_id,
+                client_id=client_id,
+                priority=priority,
+                status="WAITING",
+                submitted_at=submitted_at,
+                code_version=str(payload.get("code_version", "") or "").strip(),
+                entry_module=str(payload.get("entry_module", "") or "").strip(),
+                entry_callable=str(payload.get("entry_callable", "") or "run").strip() or "run",
+                payload=dict(payload),
+                enqueue_seq=enqueue_seq,
+                owner_token_digest=owner_token_digest,
+                owner_token_expires_at=owner_token_expires_at,
+            )
             self._jobs[job_id] = state
+            self._insert_waiting_job_locked(state)
             self._cv.notify_all()
         return state
 
@@ -161,16 +225,80 @@ class JobQueueManager:
         with self._lock:
             return self._jobs.get(str(job_id or "").strip())
 
-    def cancel_job(self, job_id: str) -> Optional[JobState]:
+    def summary(self, *, recent_limit: int = 5, waiting_limit: int = 50) -> Dict[str, object]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+            waiting = sum(1 for item in jobs if item.status == "WAITING" and not item.cancel_requested)
+            running = sum(1 for item in jobs if item.status == "RUNNING")
+            succeeded = sum(1 for item in jobs if item.status == "SUCCEEDED")
+            failed = sum(1 for item in jobs if item.status == "FAILED")
+            cancelled = sum(1 for item in jobs if item.status == "CANCELLED")
+            current = str(self._running_job_id or "").strip()
+            current_state = self._jobs.get(current) if current else None
+            recent_jobs = sorted(
+                jobs,
+                key=lambda item: (
+                    (item.finished_at or item.started_at or item.submitted_at).timestamp(),
+                    item.submitted_at.timestamp(),
+                    item.job_id,
+                ),
+                reverse=True,
+            )[: max(0, int(recent_limit or 0))]
+            waiting_jobs: List[Dict[str, object]] = []
+            for position, job_id in enumerate(list(self._waiting_order)[: max(0, int(waiting_limit or 0))], start=1):
+                item = self._jobs.get(job_id)
+                if item is None or item.status != "WAITING" or item.cancel_requested:
+                    continue
+                waiting_jobs.append(
+                    {
+                        "job_id": str(item.job_id or ""),
+                        "priority": int(item.priority or 0),
+                        "submitted_at": item.submitted_at.isoformat(),
+                        "position": position,
+                    }
+                )
+            return {
+                "job_count": len(jobs),
+                "waiting": waiting,
+                "running": running,
+                "succeeded": succeeded,
+                "failed": failed,
+                "cancelled": cancelled,
+                "terminal": succeeded + failed + cancelled,
+                "current_job_id": current,
+                "current_job_status": str(current_state.status) if current_state is not None else "",
+                "recent_jobs": [
+                    {
+                        "job_id": str(item.job_id or ""),
+                        "status": str(item.status or ""),
+                        "submitted_at": item.submitted_at.isoformat(),
+                        "finished_at": item.finished_at.isoformat() if item.finished_at else "",
+                        "final_result_preview": _preview_job_value(item.final_result),
+                        "error_preview": _preview_job_value(item.error),
+                    }
+                    for item in recent_jobs
+                ],
+                "waiting_jobs": waiting_jobs,
+            }
+
+    def cancel_job(self, job_id: str, *, auth_token: str = "") -> Optional[JobState]:
         normalized = str(job_id or "").strip()
         with self._cv:
             state = self._jobs.get(normalized)
             if state is None:
                 return None
+            if state.owner_token_digest:
+                expires_at = state.owner_token_expires_at
+                if expires_at is not None and utc_now() > expires_at:
+                    raise PermissionError("cancel auth expired")
+                provided_digest = _auth_token_digest(auth_token)
+                if not provided_digest or provided_digest != state.owner_token_digest:
+                    raise PermissionError("cancel auth failed")
             if state.status == "WAITING":
                 state.status = "CANCELLED"
                 state.finished_at = utc_now()
                 state.cancel_requested = True
+                self._remove_waiting_job_locked(state.job_id)
                 return state
             if state.status == "RUNNING":
                 state.cancel_requested = True
@@ -184,11 +312,71 @@ class JobQueueManager:
             return state
 
     def _pick_next_job_locked(self) -> Optional[JobState]:
+        self._prune_waiting_order_locked()
+        for job_id in self._waiting_order:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "WAITING" or job.cancel_requested:
+                continue
+            return job
         waiting = [job for job in self._jobs.values() if job.status == "WAITING" and not job.cancel_requested]
         if not waiting:
             return None
-        waiting.sort(key=lambda item: (-int(item.priority), item.submitted_at.timestamp(), item.job_id))
+        waiting.sort(key=lambda item: (-int(item.priority), item.submitted_at.timestamp(), int(item.enqueue_seq or 0), item.job_id))
+        self._waiting_order = [item.job_id for item in waiting]
         return waiting[0]
+
+    def reorder_job(self, job_id: str, *, direction: str) -> Optional[JobState]:
+        normalized = str(job_id or "").strip()
+        move = str(direction or "").strip().lower()
+        with self._cv:
+            state = self._jobs.get(normalized)
+            if state is None or state.status != "WAITING" or state.cancel_requested:
+                return state
+            self._prune_waiting_order_locked()
+            if normalized not in self._waiting_order:
+                self._insert_waiting_job_locked(state)
+            idx = self._waiting_order.index(normalized)
+            if move == "up" and idx > 0:
+                self._waiting_order[idx - 1], self._waiting_order[idx] = self._waiting_order[idx], self._waiting_order[idx - 1]
+            elif move == "down" and idx < len(self._waiting_order) - 1:
+                self._waiting_order[idx + 1], self._waiting_order[idx] = self._waiting_order[idx], self._waiting_order[idx + 1]
+            elif move not in {"up", "down"}:
+                raise ValueError("direction must be 'up' or 'down'")
+            self._cv.notify_all()
+            return state
+
+    def _remove_waiting_job_locked(self, job_id: str) -> None:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            return
+        self._waiting_order = [item for item in self._waiting_order if item != normalized]
+
+    def _prune_waiting_order_locked(self) -> None:
+        seen: set[str] = set()
+        kept: List[str] = []
+        for job_id in self._waiting_order:
+            if job_id in seen:
+                continue
+            seen.add(job_id)
+            state = self._jobs.get(job_id)
+            if state is None or state.status != "WAITING" or state.cancel_requested:
+                continue
+            kept.append(job_id)
+        self._waiting_order = kept
+
+    def _insert_waiting_job_locked(self, state: JobState) -> None:
+        self._prune_waiting_order_locked()
+        insert_at = len(self._waiting_order)
+        for idx, job_id in enumerate(self._waiting_order):
+            other = self._jobs.get(job_id)
+            if other is None:
+                continue
+            key_state = (-int(state.priority), state.submitted_at.timestamp(), int(state.enqueue_seq or 0), state.job_id)
+            key_other = (-int(other.priority), other.submitted_at.timestamp(), int(other.enqueue_seq or 0), other.job_id)
+            if key_state < key_other:
+                insert_at = idx
+                break
+        self._waiting_order.insert(insert_at, state.job_id)
 
     def _cleanup_jobs_locked(self) -> None:
         if self._retention_sec <= 0:
@@ -202,6 +390,7 @@ class JobQueueManager:
             if (now - finished_at).total_seconds() > self._retention_sec:
                 expired.append(job_id)
         for job_id in expired:
+            self._remove_waiting_job_locked(job_id)
             self._jobs.pop(job_id, None)
 
     def _loop(self) -> None:
@@ -218,6 +407,7 @@ class JobQueueManager:
                     continue
                 next_job.status = "RUNNING"
                 next_job.started_at = utc_now()
+                self._remove_waiting_job_locked(next_job.job_id)
                 self._running_job_id = next_job.job_id
             self._run_job(next_job.job_id)
             with self._cv:
@@ -273,6 +463,15 @@ class JobQueueManager:
             payload = dict(state.payload)
             client_id = state.client_id
             job_id_snapshot = state.job_id
+
+        if _uses_job_hooks(payload):
+            self._run_job_with_hooks(
+                job_id=job_id,
+                payload=payload,
+                client_id=client_id,
+                job_id_snapshot=job_id_snapshot,
+            )
+            return
 
         try:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jobq-expand") as executor:
@@ -430,6 +629,211 @@ class JobQueueManager:
                     state.finished_at = utc_now()
                     state.error = str(exc)
         finally:
+            if executor is not None:
+                try:
+                    executor.close()
+                except Exception:
+                    pass
+
+    def _run_job_with_hooks(
+        self,
+        *,
+        job_id: str,
+        payload: Dict[str, object],
+        client_id: str,
+        job_id_snapshot: str,
+    ) -> None:
+        blob_b64 = str(payload.get("blob_b64", "") or "").strip()
+        if not blob_b64:
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is not None:
+                    state.status = "FAILED"
+                    state.finished_at = utc_now()
+                    state.error = "job hook mode requires blob_b64"
+            return
+
+        package_format = str(payload.get("package_format", "py") or "py").strip() or "py"
+        entry_module = str(payload.get("entry_module", "") or "").strip()
+        task_entry_callable = str(payload.get("entry_callable", "run") or "run").strip() or "run"
+        task_generator_callable = str(payload.get("task_generator_callable", "task_generator") or "task_generator").strip() or "task_generator"
+        handle_result_callable = (
+            str(payload.get("handle_result_callable", "") or "").strip()
+            or str(payload.get("handledata_callable", "") or "").strip()
+            or str(payload.get("handdata_callable", "") or "").strip()
+        )
+        finalize_callable = str(payload.get("finalize_callable", "") or "").strip()
+        job_payload = dict(payload.get("job_payload") or {})
+        update_globals = dict(payload.get("update_globals") or {})
+
+        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-job-hooks-", suffix=_artifact_suffix(package_format))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        executor: Optional[Any] = None
+        try:
+            blob = base64.b64decode(blob_b64.encode("utf-8"))
+            tmp_path.write_bytes(blob)
+            module = _load_user_module(
+                str(tmp_path),
+                entry_module=entry_module,
+                package_format=package_format,
+                dependency_path="",
+            )
+            task_entry = getattr(module, task_entry_callable, None)
+            if task_entry is None or not callable(task_entry):
+                raise RuntimeError(f"task entry callable not found: {task_entry_callable}")
+            task_generator = getattr(module, task_generator_callable, None)
+            if task_generator is None or not callable(task_generator):
+                raise RuntimeError(f"task generator callable not found: {task_generator_callable}")
+            handle_result = None
+            if handle_result_callable:
+                handle_result = getattr(module, handle_result_callable, None)
+                if handle_result is None or not callable(handle_result):
+                    raise RuntimeError(f"handle_result callable not found: {handle_result_callable}")
+            finalize = None
+            if finalize_callable:
+                finalize = getattr(module, finalize_callable, None)
+                if finalize is None or not callable(finalize):
+                    raise RuntimeError(f"finalize callable not found: {finalize_callable}")
+
+            executor = TaskPoolSession.from_infocenter(
+                infocenter_target=self._controlplane_target,
+                job_id=job_id_snapshot,
+                owner_client_id=client_id,
+                pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
+                blob=blob,
+                runtime=str(payload.get("runtime", "py3") or "py3"),
+                entry_module=entry_module,
+                entry_callable=task_entry_callable,
+                package_format=package_format,
+                dependency_allowlist=list(payload.get("dependency_allowlist") or ()),
+                managed_global_names=list(payload.get("managed_global_names") or ()),
+                worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", 1)) or 1)),
+                heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
+                idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
+                healthy_only=bool(payload.get("healthy_only", True)),
+                tags=list(payload.get("tags") or ()),
+                node_ids=list(payload.get("node_ids") or ()),
+                node_count=max(0, int(payload.get("pool_node_count", payload.get("node_count", 0) or 0) or 0)),
+                node_limit=int(payload.get("node_limit", 100) or 100),
+                timeout_sec=float(payload.get("timeout_sec", 10.0) or 10.0),
+            )
+            with self._lock:
+                self._current_executor = executor
+
+            if update_globals:
+                executor.update_globals(update_globals)
+
+            hook_kwargs = dict(job_payload)
+            hook_kwargs.setdefault("job_id", job_id_snapshot)
+            hook_kwargs.setdefault("client_id", client_id)
+            produced = task_generator(**hook_kwargs)
+            if isinstance(produced, dict) and isinstance(produced.get("payloads"), list):
+                produced = produced["payloads"]
+            elif isinstance(produced, dict) and isinstance(produced.get("subtasks"), list):
+                produced = produced["subtasks"]
+            if produced is None:
+                raise RuntimeError("task_generator returned no payloads")
+            if isinstance(produced, dict):
+                raise RuntimeError("task_generator must return an iterable of dict payloads")
+
+            def _payload_stream() -> Any:
+                for item in produced:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("task_generator must yield dict payloads")
+                    yield dict(item)
+
+            state_obj: object = payload.get("initial_state")
+            if state_obj is None:
+                state_obj = {"results": []}
+            rendered_results: List[Dict[str, object]] = []
+            stream = executor.unordered(
+                _payload_stream(),
+                max_in_flight=max(1, int(payload.get("max_in_flight", 32) or 32)),
+                receive_batch=max(1, int(payload.get("receive_batch", 1) or 1)),
+                submit_timeout_sec=float(payload.get("submit_timeout_sec", 60.0) or 60.0),
+                result_timeout_sec=float(payload.get("result_timeout_sec", payload.get("wait_chunk_timeout_sec", 30.0)) or 30.0),
+                wait_ms=int(payload.get("wait_ms", 500) or 500),
+                raise_on_error=True,
+                node_window_factor=float(payload.get("node_window_factor", 2.0) or 2.0),
+            )
+            for task_id, result in stream:
+                with self._lock:
+                    current_state = self._jobs.get(job_id)
+                    cancel_requested = bool(current_state.cancel_requested) if current_state is not None else False
+                if cancel_requested:
+                    try:
+                        executor.cancel_job(reason="job queue cancel", job_id=job_id_snapshot)
+                    except Exception:
+                        pass
+                    break
+                rendered_results.append(
+                    {
+                        "task_id": str(task_id),
+                        "job_id": job_id_snapshot,
+                        "status": int(pb2.TASK_STATUS_SUCCEEDED),
+                        "status_text": pb2.TaskStatus.Name(pb2.TASK_STATUS_SUCCEEDED),
+                        "attempt": 1,
+                        "result": result,
+                    }
+                )
+                if handle_result is None:
+                    if isinstance(state_obj, dict):
+                        state_obj.setdefault("results", [])
+                        results_bucket = state_obj.get("results")
+                        if isinstance(results_bucket, list):
+                            results_bucket.append({"task_id": str(task_id), "result": result})
+                else:
+                    returned_state = handle_result(
+                        str(task_id),
+                        result,
+                        state=state_obj,
+                        job_payload=dict(job_payload),
+                        job_id=job_id_snapshot,
+                        client_id=client_id,
+                    )
+                    if returned_state is not None:
+                        state_obj = returned_state
+                with self._lock:
+                    current_state = self._jobs.get(job_id)
+                    if current_state is not None:
+                        current_state.results = list(rendered_results)
+                        current_state.checkpoint = {
+                            "processed": len(rendered_results),
+                            "current_task_id": str(task_id),
+                        }
+
+            final_result = state_obj
+            if finalize is not None:
+                finalized = finalize(
+                    state=state_obj,
+                    job_payload=dict(job_payload),
+                    job_id=job_id_snapshot,
+                    client_id=client_id,
+                )
+                if finalized is not None:
+                    final_result = finalized
+
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is None:
+                    return
+                state.results = list(rendered_results)
+                state.final_result = final_result
+                state.finished_at = utc_now()
+                if state.cancel_requested:
+                    state.status = "CANCELLED"
+                else:
+                    state.status = "SUCCEEDED"
+        except Exception as exc:
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is not None:
+                    state.status = "FAILED"
+                    state.finished_at = utc_now()
+                    state.error = str(exc)
+        finally:
+            tmp_path.unlink(missing_ok=True)
             if executor is not None:
                 try:
                     executor.close()

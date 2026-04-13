@@ -64,46 +64,40 @@ with TaskPoolSession.from_infocenter(
 
 1. 大任务先排队
 2. 同一时刻只允许一个大任务进入运行态
-3. job 排到后，再自动创建 `TaskPoolSession`
+3. 默认经 `gateway -> 唯一 job-orchestrator -> TaskPoolSession`
+4. job 排到后，再自动创建 `TaskPoolSession`
 
 最小示例：
 
 ```python
 from pycloud_parallel import JobQueueClient
 
-client = JobQueueClient("127.0.0.1:50051")
+client = JobQueueClient("127.0.0.1:50052", client_id="job-demo")
 client.submit_job_from_bytes(
-    blob=driver_blob,
-    driver_entry_module="job_driver_demo",
-    task_entry_module="task_demo",
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    blob=job_blob,
+    entry_module="job_demo",
+    job_payload={"value": 10, "count": 6},
 )
 ```
 
-函数对象写法：
+这里的 `target` 建议指向 `gateway`；`job-orchestrator` 会通过 `infocenter` 暴露成唯一 service route。
 
-```python
-client.submit_job_from_func(
-    func=build_subtasks,
-    task_func=run_subtask,
-    pool_worker_count=2,
-    pool_node_count=2,
-)
-```
+约定：
+
+1. `JobQueueClient` 固定要求 job module 导出 `run / task_generator / handle_result / finalize`
+2. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 决定，不再从 client helper 暴露
 
 模块对象写法：
 
 ```python
 client.submit_job_from_module(
-    module=job_driver_module,
-    task_module=task_module,
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    module=job_module,
+    job_payload={"value": 10, "count": 6},
 )
 ```
+
+推荐优先使用 `submit_job_from_module(...)`。
+`JobQueueClient` 不再提供 `submit_job_from_func(...)`，避免把嵌套函数 / 闭包 / 局部依赖打包成不稳定的隐式模块。
 
 等待 job 终态：
 
@@ -213,13 +207,29 @@ for item in pool.iter_items(timeout_sec=10.0):
 如果你想边准备数据、边 submit、边接收结果，推荐直接用：
 
 ```python
-for task_id, data in pool.imap_unordered(
+for task_id, data in pool.unordered(
     payloads,
     max_in_flight=32,
     receive_batch=4,
     result_timeout_sec=30.0,
 ):
     print(task_id, data)
+```
+
+如果你希望边收结果边执行收尾逻辑，也可以直接：
+
+```python
+def handle(task_id, result):
+    print(task_id, result)
+
+processed = pool.consume_unordered(
+    payloads,
+    handle=handle,
+    max_in_flight=32,
+    receive_batch=4,
+    result_timeout_sec=30.0,
+)
+print(processed)
 ```
 
 语义：
@@ -229,7 +239,7 @@ for task_id, data in pool.imap_unordered(
 2. `receive_batch`
    - 每轮最多接收多少条结果
 3. 结果一到就立即 yield，不需要等整批任务全部结束
-4. `imap_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
+4. `unordered(...)` / `imap_unordered(...)` / `consume_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
 
 ## 4. 结果语义
 
@@ -262,6 +272,7 @@ for task_id, data in pool.imap_unordered(
 1. 是兼容专属池实现
 2. 底层复用 `ServiceGroup`
 3. 适合过渡期使用
+4. owner 侧也支持 `update_globals(...)`，复用 `ServiceGroup` 的 managed globals 更新链路
 
 ## 7. 已移除
 

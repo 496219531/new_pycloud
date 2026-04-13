@@ -24,7 +24,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from urllib.error import HTTPError, URLError
@@ -1156,6 +1156,19 @@ def _prepare_http_payload_for_call(
 
 
 _SERVICE_SESSION_SCHEMA_VERSION = 2
+_JOB_CLIENT_SESSION_SCHEMA_VERSION = 1
+
+
+def _default_job_auth_ttl_sec() -> int:
+    for key in ("PYCLOUD_JOB_AUTH_TTL_SEC", "PYCLOUD_JOB_CLIENT_AUTH_TTL_SEC"):
+        raw = str(os.environ.get(key, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(60, int(raw))
+        except Exception:
+            continue
+    return 24 * 60 * 60
 
 
 def _artifact_code_version(
@@ -1195,6 +1208,118 @@ def _default_service_session_cache_dir() -> Path:
 def _sanitize_session_cache_part(value: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
     return text.strip("._") or "default"
+
+
+def _default_job_client_session_cache_dir() -> Path:
+    custom = str(os.environ.get("PYCLOUD_JOB_CLIENT_SESSION_DIR", "")).strip()
+    if custom:
+        return Path(custom).expanduser()
+    return Path.home() / ".pycloud_parallel" / "job_client_sessions"
+
+
+def _job_client_session_cache_file(
+    *,
+    target: str,
+    service_name: str,
+    client_scope: str = "",
+    cache_dir: str = "",
+) -> Path:
+    base_dir = Path(cache_dir).expanduser() if str(cache_dir).strip() else _default_job_client_session_cache_dir()
+    normalized_target = _target_to_base_url(target)
+    return (
+        base_dir
+        / _sanitize_session_cache_part(normalized_target)
+        / f"{_sanitize_session_cache_part(service_name)}__{_sanitize_session_cache_part(client_scope or 'default')}.json"
+    )
+
+
+def _parse_cache_datetime(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_job_client_session_cache(
+    *,
+    target: str,
+    service_name: str,
+    client_scope: str = "",
+    cache_dir: str = "",
+) -> Optional[Dict[str, object]]:
+    path = _job_client_session_cache_file(
+        target=target,
+        service_name=service_name,
+        client_scope=client_scope,
+        cache_dir=cache_dir,
+    )
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("schema_version", 0) or 0) != _JOB_CLIENT_SESSION_SCHEMA_VERSION:
+        return None
+    if str(payload.get("target", "") or "").strip() != _target_to_base_url(target):
+        return None
+    if str(payload.get("service_name", "") or "").strip() != str(service_name or "").strip():
+        return None
+    cached_client_id = str(payload.get("client_id", "") or "").strip()
+    cached_auth_token = str(payload.get("auth_token", "") or "").strip()
+    expires_at = _parse_cache_datetime(payload.get("expires_at"))
+    if client_scope and cached_client_id != str(client_scope or "").strip():
+        return None
+    if not cached_client_id or not cached_auth_token or expires_at is None:
+        return None
+    if expires_at <= datetime.now(timezone.utc):
+        return None
+    return payload
+
+
+def _write_job_client_session_cache(
+    *,
+    target: str,
+    service_name: str,
+    client_scope: str,
+    client_id: str,
+    auth_token: str,
+    cache_dir: str = "",
+    ttl_sec: int = 0,
+    recent_job_ids: Optional[Sequence[str]] = None,
+) -> None:
+    normalized_client_id = str(client_id or "").strip()
+    normalized_auth_token = str(auth_token or "").strip()
+    if not normalized_client_id or not normalized_auth_token:
+        return
+    ttl = max(60, int(ttl_sec or _default_job_auth_ttl_sec()))
+    now = datetime.now(timezone.utc)
+    payload: Dict[str, object] = {
+        "schema_version": _JOB_CLIENT_SESSION_SCHEMA_VERSION,
+        "target": _target_to_base_url(target),
+        "service_name": str(service_name or "").strip(),
+        "client_scope": str(client_scope or "").strip(),
+        "client_id": normalized_client_id,
+        "auth_token": normalized_auth_token,
+        "saved_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
+        "recent_job_ids": [str(job_id).strip() for job_id in list(recent_job_ids or []) if str(job_id).strip()],
+    }
+    path = _job_client_session_cache_file(
+        target=target,
+        service_name=service_name,
+        client_scope=client_scope,
+        cache_dir=cache_dir,
+    )
+    _write_private_json(path, payload)
 
 
 def _service_session_cache_file(
@@ -1795,11 +1920,21 @@ class InfoCenterClient:
         normalized_runtime = normalize_python_runtime_spec(runtime)
         discovered_instance_map = {_node_instance_key_from_node(node): node for node in nodes}
 
+        def _ensure_control_addrs(selected_nodes: Sequence[InfoCenterNode], *, label: str) -> None:
+            missing = [
+                _node_instance_key_from_node(node) or node.node_id
+                for node in selected_nodes
+                if not str(node.control_addr or "").strip()
+            ]
+            if missing:
+                raise RuntimeError(f"{label} do not expose control_addr and cannot host task pools: {missing}")
+
         if requested_instance_ids:
             missing_instance_ids = [node_id for node_id in requested_instance_ids if node_id not in discovered_instance_map]
             if missing_instance_ids:
                 raise RuntimeError(f"requested node_instance_ids not found in current discovery scope: {missing_instance_ids}")
             selected = [discovered_instance_map[node_id] for node_id in requested_instance_ids]
+            _ensure_control_addrs(selected, label="requested node_instance_ids")
             if normalized_runtime:
                 incompatible = [
                     node.node_instance_id
@@ -1817,6 +1952,7 @@ class InfoCenterClient:
             if missing_node_ids:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
             selected = [discovered_node_map[node_id] for node_id in requested_node_ids]
+            _ensure_control_addrs(selected, label="requested node_ids")
             if normalized_runtime:
                 incompatible = [
                     node.node_id
@@ -1832,7 +1968,11 @@ class InfoCenterClient:
             candidates = [
                 node
                 for node in nodes
-                if node.healthy and node.schedulable and not node.drain and (not require_credit or node.credit > 0)
+                if node.healthy
+                and node.schedulable
+                and not node.drain
+                and str(node.control_addr or "").strip()
+                and (not require_credit or node.credit > 0)
             ]
             if normalized_runtime:
                 candidates = _filter_nodes_by_runtime(candidates, runtime=normalized_runtime)
@@ -1977,16 +2117,156 @@ class GatewayServiceClient:
             return client.fetch_result_ref_data(ref, target_path=target_path)
 
 
-class JobQueueClient:
-    """Thin HTTP client for controlplane job queue endpoints."""
+class _JobOrchestratorDiscoveryClient:
+    """Resolve job-orchestrator via InfoCenter and call its own HTTP endpoint directly."""
 
-    def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
-        self.target = target
-        self.base_url = _target_to_base_url(target)
+    def __init__(self, target: str, *, timeout_sec: float = 10.0, service_token: str = "") -> None:
+        self.target = str(target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self.service_token = str(service_token or "").strip()
 
     def close(self) -> None:
         return None
+
+    def _list_routes(self, *, service_name: str) -> List[InfoCenterServiceRoute]:
+        try:
+            with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+                routes = list(
+                    client.list_service_routes(
+                        service_name=str(service_name or "").strip(),
+                        healthy_only=True,
+                        limit=32,
+                    )
+                )
+        except Exception as exc:
+            raise RuntimeError(f"failed to query service routes from InfoCenter target={self.target}: {exc}") from exc
+        candidates = [
+            route
+            for route in routes
+            if route.status == pb2.SERVICE_STATUS_RUNNING and str(route.http_base_url or "").strip()
+        ]
+        candidates.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
+        return candidates
+
+    def call(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        payload: Optional[Dict[str, object]] = None,
+        timeout_sec: float = 60.0,
+        service_token: Optional[str] = None,
+    ) -> Dict[str, object]:
+        name = str(service_name or "").strip()
+        method_name = str(method or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        if not method_name:
+            raise ValueError("method is required")
+
+        token = self.service_token if service_token is None else str(service_token or "").strip()
+        tried: Set[str] = set()
+        routes = self._list_routes(service_name=name)
+        if not routes:
+            raise RuntimeError(f"no available route for service_name={name}")
+
+        last_exc: Optional[Exception] = None
+        for route in routes:
+            if route.service_id in tried:
+                continue
+            tried.add(route.service_id)
+            try:
+                return _call_route_http(
+                    route,
+                    method=method_name,
+                    payload=payload or {},
+                    timeout_sec=max(0.1, float(timeout_sec)),
+                    service_token=token,
+                )
+            except DiscoveryCallError as exc:
+                last_exc = exc
+                if not _is_route_failure(exc):
+                    raise RuntimeError(str(exc)) from exc
+                continue
+
+        if last_exc is not None:
+            raise RuntimeError(str(last_exc)) from last_exc
+        raise RuntimeError(f"no available route for service_name={name}")
+
+
+class JobQueueClient:
+    """Thin client for the single job-orchestrator service resolved via InfoCenter."""
+
+    def __init__(
+        self,
+        target: str,
+        *,
+        client_id: str = "",
+        auth_token: str = "",
+        timeout_sec: float = 10.0,
+        service_name: str = "job-orchestrator",
+    ) -> None:
+        self.target = str(target or "").strip()
+        self.client_id = str(client_id or "").strip()
+        self._client_scope = self.client_id
+        self.timeout_sec = max(0.1, float(timeout_sec))
+        self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
+        self._auth_ttl_sec = _default_job_auth_ttl_sec()
+        self._recent_job_ids: List[str] = []
+
+        explicit_auth_token = str(auth_token or "").strip()
+        cached_session = None
+        if not explicit_auth_token:
+            cached_session = _load_job_client_session_cache(
+                target=self.target,
+                service_name=self.service_name,
+                client_scope=self._client_scope,
+            )
+        if cached_session is not None:
+            self.client_id = str(cached_session.get("client_id", "") or "").strip()
+            self.auth_token = str(cached_session.get("auth_token", "") or "").strip()
+            self._recent_job_ids = [
+                str(job_id).strip()
+                for job_id in list(cached_session.get("recent_job_ids") or [])
+                if str(job_id).strip()
+            ][:20]
+        else:
+            if not self.client_id:
+                self.client_id = f"job-client-{uuid.uuid4().hex[:8]}"
+            self.auth_token = explicit_auth_token or uuid.uuid4().hex
+
+        self._service_client = _JobOrchestratorDiscoveryClient(
+            self.target,
+            timeout_sec=self.timeout_sec,
+            service_token=self.auth_token,
+        )
+        self._persist_local_session()
+
+    def close(self) -> None:
+        self._service_client.close()
+
+    def _persist_local_session(self) -> None:
+        try:
+            _write_job_client_session_cache(
+                target=self.target,
+                service_name=self.service_name,
+                client_scope=self._client_scope,
+                client_id=self.client_id,
+                auth_token=self.auth_token,
+                ttl_sec=self._auth_ttl_sec,
+                recent_job_ids=self._recent_job_ids,
+            )
+        except Exception:
+            logger.debug("job client session cache persist failed", exc_info=True)
+
+    def _record_job_id(self, job_id: str) -> None:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            return
+        self._recent_job_ids = [item for item in self._recent_job_ids if item != normalized]
+        self._recent_job_ids.insert(0, normalized)
+        self._recent_job_ids = self._recent_job_ids[:20]
+        self._persist_local_session()
 
     def __enter__(self) -> "JobQueueClient":
         return self
@@ -1995,22 +2275,30 @@ class JobQueueClient:
         self.close()
 
     def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return _http_json_request(
-            base_url=self.base_url,
-            path="/jobs/submit",
-            method="POST",
+        prepared_payload = dict(payload or {})
+        if self.client_id and not str(prepared_payload.get("client_id", "") or "").strip():
+            prepared_payload["client_id"] = self.client_id
+        resp = self._service_client.call(
+            service_name=self.service_name,
+            method="submit_job",
+            payload=prepared_payload,
             timeout_sec=self.timeout_sec,
-            payload=payload,
         )
+        job = dict(resp.get("job") or {})
+        self._record_job_id(str(job.get("job_id", "") or "").strip())
+        return resp
+
+    def recent_job_ids(self) -> List[str]:
+        return list(self._recent_job_ids)
 
     def get_job_status(self, job_id: str) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
             raise ValueError("job_id is required")
-        return _http_json_request(
-            base_url=self.base_url,
-            path=f"/jobs/{quote(normalized, safe='')}",
-            method="GET",
+        return self._service_client.call(
+            service_name=self.service_name,
+            method="get_job_status",
+            payload={"job_id": normalized},
             timeout_sec=self.timeout_sec,
         )
 
@@ -2018,178 +2306,53 @@ class JobQueueClient:
         normalized = str(job_id or "").strip()
         if not normalized:
             raise ValueError("job_id is required")
-        return _http_json_request(
-            base_url=self.base_url,
-            path=f"/jobs/{quote(normalized, safe='')}/cancel",
-            method="POST",
+        return self._service_client.call(
+            service_name=self.service_name,
+            method="cancel_job",
+            payload={"job_id": normalized},
             timeout_sec=self.timeout_sec,
-            payload={},
         )
 
     def submit_job_from_bytes(
         self,
         *,
         blob: bytes,
-        driver_entry_module: str,
-        driver_entry_callable: str = "run",
-        driver_payload: Optional[Dict[str, object]] = None,
-        driver_package_format: str = "py",
-        priority: int = 0,
-        client_id: str = "",
+        entry_module: str,
+        job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
-        task_blob: Optional[bytes] = None,
-        task_entry_module: str = "",
-        task_entry_callable: str = "run",
-        task_package_format: str = "py",
-        tags: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        pool_name: str = "",
-        pool_worker_count: int = 1,
-        pool_node_count: int = 1,
-        pool_heartbeat_timeout_sec: int = 30,
-        pool_idle_ttl_sec: int = 0,
-        pool_allow_partial: bool = True,
-        pool_min_success_nodes: int = 1,
-        wait_timeout_sec: float = 3600.0,
-        task_priority: int = 1,
-        dependency_allowlist: Optional[Sequence[str]] = None,
+        package_format: str = "py",
     ) -> Dict[str, object]:
         payload: Dict[str, object] = {
-            "client_id": str(client_id or "").strip(),
-            "priority": max(0, int(priority)),
+            "job_mode": "hooks",
             "runtime": str(runtime or "py3"),
-            "blob_b64": base64.b64encode((task_blob if task_blob is not None else blob)).decode("utf-8"),
-            "entry_module": str(task_entry_module or "").strip(),
-            "entry_callable": str(task_entry_callable or "run").strip() or "run",
-            "package_format": str(task_package_format or "py").strip() or "py",
-            "tags": list(tags or ()),
-            "node_count": int(node_count or 0),
-            "wait_timeout_sec": float(wait_timeout_sec or 3600.0),
-            "task_priority": max(1, int(task_priority or 1)),
-            "dependency_allowlist": list(dependency_allowlist or ()),
-            "pool_name": str(pool_name or "").strip(),
-            "pool_worker_count": max(1, int(pool_worker_count or 1)),
-            "pool_node_count": max(1, int(pool_node_count or 1)),
-            "pool_heartbeat_timeout_sec": max(5, int(pool_heartbeat_timeout_sec or 30)),
-            "pool_idle_ttl_sec": max(0, int(pool_idle_ttl_sec or 0)),
-            "pool_allow_partial": bool(pool_allow_partial),
-            "pool_min_success_nodes": max(1, int(pool_min_success_nodes or 1)),
-            "driver_blob_b64": base64.b64encode(blob).decode("utf-8"),
-            "driver_entry_module": str(driver_entry_module or "").strip(),
-            "driver_entry_callable": str(driver_entry_callable or "run").strip() or "run",
-            "driver_payload": dict(driver_payload or {}),
-            "driver_package_format": str(driver_package_format or "py").strip() or "py",
+            "blob_b64": base64.b64encode(blob).decode("utf-8"),
+            "entry_module": str(entry_module or "").strip(),
+            "entry_callable": "run",
+            "package_format": _resolve_package_format(package_format, default="py"),
+            "task_generator_callable": "task_generator",
+            "handle_result_callable": "handle_result",
+            "finalize_callable": "finalize",
+            "job_payload": dict(job_payload or {}),
         }
+        if self.client_id:
+            payload["client_id"] = self.client_id
         return self.submit_job(payload)
-
-    def submit_job_from_func(
-        self,
-        *,
-        func: Callable,
-        driver_entry_callable: Optional[str] = None,
-        driver_payload: Optional[Dict[str, object]] = None,
-        priority: int = 0,
-        client_id: str = "",
-        runtime: str = "py3",
-        task_func: Optional[Callable] = None,
-        task_entry_callable: str = "run",
-        tags: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        pool_name: str = "",
-        pool_worker_count: int = 1,
-        pool_node_count: int = 1,
-        pool_heartbeat_timeout_sec: int = 30,
-        pool_idle_ttl_sec: int = 0,
-        pool_allow_partial: bool = True,
-        pool_min_success_nodes: int = 1,
-        wait_timeout_sec: float = 3600.0,
-        task_priority: int = 1,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-    ) -> Dict[str, object]:
-        driver_blob, _ = _prepare_code_blob(func=func)
-        driver_module = _default_entry_module_for_func(func)
-        actual_driver_callable = str(driver_entry_callable or func.__name__).strip() or func.__name__
-        effective_task_func = task_func or func
-        task_blob, _ = _prepare_code_blob(func=effective_task_func)
-        task_module = _default_entry_module_for_func(effective_task_func)
-        actual_task_callable = str(task_entry_callable or effective_task_func.__name__).strip() or effective_task_func.__name__
-        return self.submit_job_from_bytes(
-            blob=driver_blob or b"",
-            driver_entry_module=driver_module,
-            driver_entry_callable=actual_driver_callable,
-            driver_payload=driver_payload,
-            priority=priority,
-            client_id=client_id,
-            runtime=runtime,
-            task_blob=task_blob,
-            task_entry_module=task_module,
-            task_entry_callable=actual_task_callable,
-            tags=tags,
-            node_count=node_count,
-            pool_name=pool_name,
-            pool_worker_count=pool_worker_count,
-            pool_node_count=pool_node_count,
-            pool_heartbeat_timeout_sec=pool_heartbeat_timeout_sec,
-            pool_idle_ttl_sec=pool_idle_ttl_sec,
-            pool_allow_partial=pool_allow_partial,
-            pool_min_success_nodes=pool_min_success_nodes,
-            wait_timeout_sec=wait_timeout_sec,
-            task_priority=task_priority,
-            dependency_allowlist=dependency_allowlist,
-        )
 
     def submit_job_from_module(
         self,
         *,
         module: Any,
-        driver_entry_callable: str = "run",
-        driver_payload: Optional[Dict[str, object]] = None,
-        priority: int = 0,
-        client_id: str = "",
+        job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
-        task_module: Optional[Any] = None,
-        task_entry_callable: str = "run",
-        tags: Optional[Sequence[str]] = None,
-        node_count: int = 0,
-        pool_name: str = "",
-        pool_worker_count: int = 1,
-        pool_node_count: int = 1,
-        pool_heartbeat_timeout_sec: int = 30,
-        pool_idle_ttl_sec: int = 0,
-        pool_allow_partial: bool = True,
-        pool_min_success_nodes: int = 1,
-        wait_timeout_sec: float = 3600.0,
-        task_priority: int = 1,
-        dependency_allowlist: Optional[Sequence[str]] = None,
     ) -> Dict[str, object]:
-        driver_blob, _ = _prepare_code_blob(module=module)
-        driver_module_name = _default_entry_module_for_module(module)
-        effective_task_module = task_module or module
-        task_blob, _ = _prepare_code_blob(module=effective_task_module)
-        task_module_name = _default_entry_module_for_module(effective_task_module)
+        module_blob, module_filename = _prepare_code_blob(module=module)
+        module_name = _default_entry_module_for_module(module)
         return self.submit_job_from_bytes(
-            blob=driver_blob or b"",
-            driver_entry_module=driver_module_name,
-            driver_entry_callable=driver_entry_callable,
-            driver_payload=driver_payload,
-            priority=priority,
-            client_id=client_id,
+            blob=module_blob or b"",
+            entry_module=module_name,
+            job_payload=job_payload,
             runtime=runtime,
-            task_blob=task_blob,
-            task_entry_module=task_module_name,
-            task_entry_callable=task_entry_callable,
-            tags=tags,
-            node_count=node_count,
-            pool_name=pool_name,
-            pool_worker_count=pool_worker_count,
-            pool_node_count=pool_node_count,
-            pool_heartbeat_timeout_sec=pool_heartbeat_timeout_sec,
-            pool_idle_ttl_sec=pool_idle_ttl_sec,
-            pool_allow_partial=pool_allow_partial,
-            pool_min_success_nodes=pool_min_success_nodes,
-            wait_timeout_sec=wait_timeout_sec,
-            task_priority=task_priority,
-            dependency_allowlist=dependency_allowlist,
+            package_format=_resolve_package_format("", module_filename, default="py"),
         )
 
     def wait_for_terminal(
@@ -2518,7 +2681,7 @@ class DedicatedTaskServiceSession:
             try:
                 item = self._results.get(timeout=min(0.1, remaining))
             except queue.Empty:
-                return
+                continue
             normalized = str(item.task_id or "").strip()
             if task_ids is not None and normalized not in task_ids:
                 with self._buffer_lock:
@@ -2556,6 +2719,16 @@ class DedicatedTaskServiceSession:
         normalized_arg = str(arg_name or "value").strip() or "value"
         payloads = [{normalized_arg: value, **dict(shared_kwargs)} for value in values]
         return self.submit_payloads(payloads, task_method=task_method)
+
+    def update_globals(self, values: Dict[str, object]) -> str:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        return self._group.update_globals(values)
+
+    def status_map(self) -> Dict[str, pb2.ServiceStatusInfo]:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        return self._group.status_map()
 
     def imap_unordered(
         self,
@@ -2610,6 +2783,55 @@ class DedicatedTaskServiceSession:
                 raise TimeoutError(
                     f"imap_unordered did not receive results before timeout; pending_task_ids={sorted(stream_task_ids)}"
                 )
+
+    def unordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        receive_batch: int = 1,
+        submit_timeout_sec: float = 60.0,
+        result_timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+    ) -> Iterator[Tuple[str, Any]]:
+        yield from self.imap_unordered(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            receive_batch=receive_batch,
+            submit_timeout_sec=submit_timeout_sec,
+            result_timeout_sec=result_timeout_sec,
+            wait_ms=wait_ms,
+        )
+
+    def consume_unordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        handle: Callable[[str, Any], Any],
+        task_method: str = "",
+        max_in_flight: int = 32,
+        receive_batch: int = 1,
+        submit_timeout_sec: float = 60.0,
+        result_timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+    ) -> int:
+        if not callable(handle):
+            raise TypeError("handle must be callable")
+        processed = 0
+        for task_id, result in self.unordered(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            receive_batch=receive_batch,
+            submit_timeout_sec=submit_timeout_sec,
+            result_timeout_sec=result_timeout_sec,
+            wait_ms=wait_ms,
+        ):
+            handle(task_id, result)
+            processed += 1
+        return processed
 
     def map(
         self,
@@ -3612,6 +3834,63 @@ class TaskPoolSession:
         finally:
             self._exit_exclusive_mode("imap_unordered")
 
+    def unordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        receive_batch: int = 1,
+        submit_timeout_sec: float = 60.0,
+        result_timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        raise_on_error: bool = True,
+        node_window_factor: float = 2.0,
+    ) -> Iterator[Tuple[str, Any]]:
+        yield from self.imap_unordered(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            receive_batch=receive_batch,
+            submit_timeout_sec=submit_timeout_sec,
+            result_timeout_sec=result_timeout_sec,
+            wait_ms=wait_ms,
+            raise_on_error=raise_on_error,
+            node_window_factor=node_window_factor,
+        )
+
+    def consume_unordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        handle: Callable[[str, Any], Any],
+        task_method: str = "",
+        max_in_flight: int = 32,
+        receive_batch: int = 1,
+        submit_timeout_sec: float = 60.0,
+        result_timeout_sec: float = 30.0,
+        wait_ms: int = 500,
+        raise_on_error: bool = True,
+        node_window_factor: float = 2.0,
+    ) -> int:
+        if not callable(handle):
+            raise TypeError("handle must be callable")
+        processed = 0
+        for task_id, result in self.unordered(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            receive_batch=receive_batch,
+            submit_timeout_sec=submit_timeout_sec,
+            result_timeout_sec=result_timeout_sec,
+            wait_ms=wait_ms,
+            raise_on_error=raise_on_error,
+            node_window_factor=node_window_factor,
+        ):
+            handle(task_id, result)
+            processed += 1
+        return processed
+
     def map(
         self,
         values: Sequence[Any],
@@ -4107,6 +4386,36 @@ def _call_route_http(
     return data
 
 
+def _list_route_methods_http(
+    route: InfoCenterServiceRoute,
+    *,
+    include_docs: bool,
+    timeout_sec: float,
+) -> List[Dict[str, object]]:
+    params = urlencode({"include_docs": "true" if include_docs else "false"})
+    url = f"{route.http_base_url}/methods?{params}"
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            data = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
+        except Exception:
+            data = {"ok": False, "error": exc.reason}
+        raise DiscoveryCallError(status_code=exc.code, data=data) from exc
+    except Exception as exc:
+        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
+    if not isinstance(data, dict):
+        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "invalid methods response"})
+    if not data.get("ok", False):
+        raise DiscoveryCallError(status_code=502, data=data)
+    methods = data.get("methods", [])
+    if not isinstance(methods, list):
+        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "invalid methods payload"})
+    return [item for item in methods if isinstance(item, dict)]
+
+
 def _is_route_failure(exc: DiscoveryCallError) -> bool:
     if exc.status_code == 502:
         return True
@@ -4268,6 +4577,8 @@ class DiscoveryServiceClient:
                 raise RuntimeError(str(retry_exc)) from retry_exc
 
     def _list_methods_via_route(self, route: InfoCenterServiceRoute, *, include_docs: bool) -> List[Dict[str, object]]:
+        if not str(route.control_addr or "").strip():
+            return _list_route_methods_http(route, include_docs=include_docs, timeout_sec=self.timeout_sec)
         with NodeControlClient(route.control_addr, timeout_sec=self.timeout_sec) as client:
             methods = client.list_service_methods(service_id=route.service_id, include_docs=include_docs)
         return [
@@ -7632,29 +7943,24 @@ class DirectConnect(DiscoveryServiceClient):
         route = self._route_cache.select_route(self.service_name, strategy=strategy)
         tried = {route.service_id}
         token = self.service_token
-        routes_snapshot = list(self._route_cache.get_routes(self.service_name))
-        clients: List[NodeControlClient] = []
+
+        def _prepare_route_payload(selected_route: InfoCenterServiceRoute) -> Dict[str, object]:
+            control_addr = str(getattr(selected_route, "control_addr", "") or "").strip()
+            if not control_addr:
+                return dict(payload or {})
+            with NodeControlClient(control_addr, timeout_sec=self.timeout_sec) as route_client:
+                return _prepare_http_payload_for_call(
+                    [route_client],
+                    payload,
+                    object_threshold_bytes=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+                )
+
         try:
-            for item in routes_snapshot:
-                control_addr = str(getattr(item, "control_addr", "") or "").strip()
-                if not control_addr:
-                    continue
-                clients.append(NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
-            prepared_payload = _prepare_http_payload_for_call(
-                clients,
-                payload,
-                object_threshold_bytes=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-            ) if clients else (payload or {})
-            serialized_payload = _serialize_arrow_compatible(prepared_payload)
-        finally:
-            for client in clients:
-                with contextlib.suppress(Exception):
-                    client.close()
-        try:
+            prepared_payload = _prepare_route_payload(route)
             resp = _call_route_http(
                 route,
                 method=method,
-                payload=serialized_payload,
+                payload=prepared_payload,
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=token,
             )
@@ -7667,10 +7973,11 @@ class DirectConnect(DiscoveryServiceClient):
             self._route_cache.refresh(self.service_name, force=True)
             retry_route = self._route_cache.select_route(self.service_name, exclude_service_ids=tried, strategy=strategy)
             try:
+                retry_payload = _prepare_route_payload(retry_route)
                 resp = _call_route_http(
                     retry_route,
                     method=method,
-                    payload=serialized_payload,
+                    payload=retry_payload,
                     timeout_sec=max(0.1, float(timeout_sec)),
                     service_token=token,
                 )

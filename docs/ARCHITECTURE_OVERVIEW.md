@@ -11,6 +11,7 @@
    - 内部常驻函数服务层
 3. `JobQueue Mode`
    - 大任务排队与单活调度层
+   - 默认经 `gateway -> 唯一 job-orchestrator -> TaskPool`
 4. `TaskPool Mode`
    - 子任务执行层
 

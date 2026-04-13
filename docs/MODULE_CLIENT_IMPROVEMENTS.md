@@ -20,7 +20,7 @@
 |---|---|---|
 | `DeployedService` | Service | 部署并拥有内部函数服务 |
 | `TaskPoolSession` | TaskPool | 创建原生专属任务池并执行 subtasks |
-| `DedicatedTaskServiceSession` | Compat TaskPool | 兼容专属池实现 |
+| `DedicatedTaskServiceSession` | Compat TaskPool | 兼容专属池实现，支持复用 `ServiceGroup.update_globals(...)` |
 | `JobQueueClient` | JobQueue | 提交大任务、排队、单活调度 |
 | `GatewayConnect` | Gateway | 按服务名调用内部函数服务 |
 

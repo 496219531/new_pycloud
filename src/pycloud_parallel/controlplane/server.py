@@ -23,6 +23,10 @@ from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp, GatewayHttpServer
 from pycloud_parallel.controlplane.gateway_source import InProcessInfoCenterSource, RemoteInfoCenterSource
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
+from pycloud_parallel.controlplane.job_orchestrator import (
+    DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME,
+    JobOrchestratorServer,
+)
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port, resolve_public_host, split_host_port
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
@@ -31,6 +35,23 @@ from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlStat
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_role(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("info"):
+        return "infocenter"
+    if text.startswith("gate"):
+        return "gateway"
+    if text.startswith("job"):
+        return "joborchestrator"
+    if text.startswith("node"):
+        return "nodecontrol"
+    if text.startswith("cont"):
+        return "controlplane"
+    raise argparse.ArgumentTypeError(
+        "role must start with one of: info, gate, job, node"
+    )
 
 
 def _resolve_bind(bind: str, *, remote_hint: str = "") -> str:
@@ -90,6 +111,29 @@ def build_gateway_server(
     )
     allow_private = str(os.getenv("PYCLOUD_GATEWAY_ALLOW_PRIVATE_ADDRS", "true") or "true").lower() in {"1", "true", "yes"}
     return GatewayHttpServer(bind=bind, app=GatewayHttpApp(route_cache=route_cache, allow_private_addrs=allow_private))
+
+
+def build_job_orchestrator_server(
+    bind: str,
+    *,
+    infocenter_addr: str,
+    node_id: str,
+    service_name: str = DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME,
+    queue_capacity: int = NODE_QUEUE_CAPACITY,
+    tags: Optional[list[str]] = None,
+    version: str = "",
+) -> JobOrchestratorServer:
+    if not infocenter_addr:
+        raise ValueError("infocenter_addr is required for joborchestrator role")
+    return JobOrchestratorServer(
+        bind=bind,
+        infocenter_addr=infocenter_addr,
+        node_id=node_id,
+        service_name=service_name,
+        queue_capacity=queue_capacity,
+        tags=tags,
+        version=version,
+    )
 
 
 def build_nodecontrol_server(
@@ -174,9 +218,10 @@ def main() -> None:
     根据命令行参数启动 InfoCenter 或 NodeControl 服务器。
     """
     parser = argparse.ArgumentParser(description="PyCloud control-plane server")
-    parser.add_argument("--role", choices=["infocenter", "gateway", "controlplane", "nodecontrol"], required=True)
+    parser.add_argument("--role", type=_normalize_role, required=True)
     parser.add_argument("--bind", default="")
     parser.add_argument("--node-id", default="node-local-01")
+    parser.add_argument("--service-name", default=DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME)
     parser.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY)
     parser.add_argument("--worker-capacity", type=int, default=NODE_WORKER_CAPACITY)
     parser.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS)
@@ -194,7 +239,11 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     if not str(args.bind or "").strip():
-        default_port = 50051 if args.role in ("infocenter", "controlplane") else (50052 if args.role == "gateway" else 50061)
+        default_port = (
+            50051
+            if args.role in ("infocenter", "controlplane")
+            else (50052 if args.role == "gateway" else (50053 if args.role == "joborchestrator" else 50061))
+        )
         args.bind = format_host_port(detect_local_ip(remote_hint=str(args.infocenter_addr or "")), default_port)
     if args.role == "nodecontrol" and not str(args.service_http_bind or "").strip():
         args.service_http_bind = format_host_port(detect_local_ip(remote_hint=str(args.infocenter_addr or "")), 18080)
@@ -239,6 +288,30 @@ def main() -> None:
             gateway_refresh_interval_sec=args.gateway_refresh_interval_sec,
             gateway_failure_threshold=args.gateway_failure_threshold,
             gateway_open_sec=args.gateway_open_sec,
+        )
+        _wait_until_stopped(server, on_stop=lambda: None)
+        return
+
+    if args.role == "joborchestrator":
+        bind = _resolve_bind(args.bind, remote_hint=args.infocenter_addr)
+        orchestrator_node_id = str(args.node_id or "").strip() or "job-orchestrator-01"
+        if orchestrator_node_id == "node-local-01":
+            orchestrator_node_id = "job-orchestrator-01"
+        logger.info(
+            "[Server] starting JobOrchestrator bind=%s infocenter=%s service_name=%s log_level=%s",
+            bind,
+            args.infocenter_addr,
+            args.service_name,
+            level_name,
+        )
+        server = build_job_orchestrator_server(
+            bind,
+            infocenter_addr=args.infocenter_addr,
+            node_id=orchestrator_node_id,
+            service_name=args.service_name,
+            queue_capacity=args.queue_capacity,
+            tags=[x.strip() for x in args.node_tags.split(",") if x.strip()] or ["job"],
+            version=args.node_version,
         )
         _wait_until_stopped(server, on_stop=lambda: None)
         return

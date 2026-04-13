@@ -43,37 +43,29 @@ with TaskPoolSession.from_infocenter(
 ```python
 from pycloud_parallel import JobQueueClient
 
-client = JobQueueClient("127.0.0.1:50051")
+client = JobQueueClient("127.0.0.1:50052", client_id="job-demo")
 client.submit_job_from_bytes(
-    blob=driver_blob,
-    driver_entry_module="job_driver_demo",
-    task_entry_module="task_demo",
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    blob=job_blob,
+    entry_module="job_demo",
+    job_payload={"value": 10, "count": 6},
 )
 ```
 
-如果你直接持有函数对象：
+约定：
 
-```python
-client.submit_job_from_func(
-    func=build_subtasks,
-    task_func=run_subtask,
-    pool_worker_count=2,
-    pool_node_count=2,
-)
-```
+1. `JobQueueClient` 固定要求 job module 导出 `run / task_generator / handle_result / finalize`
+2. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 负责，不再从 client helper 暴露
 
 如果你直接持有模块对象：
 
 ```python
 client.submit_job_from_module(
-    module=job_driver_module,
-    task_module=task_module,
-    task_entry_callable="run",
+    module=job_module,
+    job_payload={"value": 10, "count": 6},
 )
 ```
+
+这里推荐直接提交模块对象；`submit_job_from_func(...)` 已移除，避免把函数对象临时拼模块带来的不稳定依赖。
 
 等待终态：
 

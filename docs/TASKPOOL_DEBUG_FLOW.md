@@ -167,18 +167,19 @@
 
 任务执行完成后，结果最终回到：
 
-1. `NodeControlState.report_result()`
+1. `NodeControlState._drain_executor_events()`
 
 这里负责：
 
-1. 更新任务状态
-2. 成功时 `task.result = struct_to_dict(request.result)`
-3. 失败时记录 `error_type` / `error_message`
-4. 调 `_publish_result_locked(task)` 把结果推到 result hook
+1. 消费 executor host 返回的 `pool_task_done`
+2. 更新 `_pool_tasks` 中对应任务的状态
+3. 成功时写入 `task.result`
+4. 失败时记录 `error_type` / `error_message`
+5. 调 `_pool_result_hook.push(...)` 把结果推到 pool result hook
 
 关键位置：
 
-1. `state.py` 中 `report_result()` 在 `3417` 左右
+1. `state.py` 中 `_drain_executor_events()` 附近
 
 如果“任务明明执行完成，但 caller 拉不到结果”，先看这里有没有 publish。
 
@@ -231,7 +232,7 @@ results = pool.map(values, timeout_sec=...)
 4. `NativeTaskPoolClient.submit_tasks()`
 5. `NodeControlState.submit_pool_tasks()`
 6. executor host 执行
-7. `NodeControlState.report_result()`
+7. `NodeControlState._drain_executor_events()`
 8. `TaskPoolSession.wait_for_data()`
 
 这是最适合调试的一条主线。
@@ -245,7 +246,7 @@ results = pool.map(values, timeout_sec=...)
 3. `NodeControlState.submit_pool_tasks()`
 4. `_execute_payload_in_subprocess()`
 5. `_invoke_user_callable()`
-6. `NodeControlState.report_result()`
+6. `NodeControlState._drain_executor_events()`
 7. `TaskPoolSession.wait_for_results()`
 8. `NodeControlState.pull_pool_results()`
 
@@ -257,14 +258,11 @@ results = pool.map(values, timeout_sec=...)
 4. 结果 publish
 5. caller 轮询聚合
 
-## 10. 和普通 Task 流的区别
+## 10. 当前边界
 
-TaskPool 和普通 `SubmitTasks/PullResults` 的主要差异在于：
+当前仓库里任务执行链路已经收敛到 `TaskPool`：
 
-1. client_id 不再是普通 caller id，而是 `pool_id`
-2. `submit_pool_tasks()` 会把任务塞进 `_pool_tasks`
-3. `pull_pool_results()` 走 `_pool_result_hook`
-4. 高层 `TaskPoolSession` 自己做多 pool 轮询和去重
-5. 普通 task 的 `runtime_key` 仍然存在，但它只是共享 runtime executor 的逻辑 key，不是 slot 资源对象
-
-所以排查时不要把它和普通 `Task Mode` 的 `_tasks/_result_hook` 完全混在一起看。
+1. `submit_pool_tasks()` 会把任务塞进 `_pool_tasks`
+2. `pull_pool_results()` 走 `_pool_result_hook`
+3. 高层 `TaskPoolSession` 自己做多 pool 轮询和去重
+4. `runtime_key` 仍然存在，但它主要用于 runtime 逻辑隔离与活跃 runtime 聚合

@@ -6,7 +6,7 @@ import errno
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from pycloud_parallel.controlplane.netutil import resolve_public_host
@@ -15,6 +15,8 @@ from pycloud_parallel.controlplane.serialization import serialize_arrow_compatib
 
 InvokeHandler = Callable[[str, str, dict, str, float], Tuple[int, Dict[str, object]]]
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
+MethodsHandler = Callable[[str, bool], Tuple[int, Dict[str, object]]]
+ExtraGetHandler = Callable[[str, list[str], Dict[str, list[str]]], Optional[Tuple[Any, ...]]]
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
@@ -42,10 +44,14 @@ class ServiceHttpGateway:
         bind: str,
         invoke_handler: InvokeHandler,
         status_handler: StatusHandler,
+        methods_handler: Optional[MethodsHandler] = None,
+        extra_get_handler: Optional[ExtraGetHandler] = None,
     ) -> None:
         self._bind = bind
         self._invoke_handler = invoke_handler
         self._status_handler = status_handler
+        self._methods_handler = methods_handler
+        self._extra_get_handler = extra_get_handler
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._start_lock = threading.Lock()
@@ -59,6 +65,8 @@ class ServiceHttpGateway:
 
         invoke_handler = self._invoke_handler
         status_handler = self._status_handler
+        methods_handler = self._methods_handler
+        extra_get_handler = self._extra_get_handler
 
         class _Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
@@ -105,11 +113,32 @@ class ServiceHttpGateway:
             def do_GET(self):  # noqa: N802
                 parsed = urlparse(self.path)
                 parts = [x for x in parsed.path.split("/") if x]
+                qs = parse_qs(parsed.query)
+                if len(parts) == 3 and parts[0] == "svc" and parts[2] == "methods":
+                    if methods_handler is None:
+                        self._send_json(404, {"ok": False, "error": "methods unavailable"})
+                        return
+                    service_id = parts[1]
+                    include_docs = str((qs.get("include_docs", ["false"]) or ["false"])[0]).lower() in ("1", "true", "yes")
+                    code, resp = methods_handler(service_id, include_docs)
+                    self._send_json(code, resp)
+                    return
                 if len(parts) == 3 and parts[0] == "svc" and parts[2] == "status":
                     service_id = parts[1]
                     code, resp = status_handler(service_id)
                     self._send_json(code, resp)
                     return
+                if len(parts) >= 3 and parts[0] == "svc" and extra_get_handler is not None:
+                    service_id = parts[1]
+                    handled = extra_get_handler(service_id, parts[2:], qs)
+                    if handled is not None:
+                        if len(handled) == 3:
+                            code, resp, content_type = handled
+                            self._send_body(code, resp, content_type=str(content_type or "text/plain; charset=utf-8"))
+                        else:
+                            code, resp = handled
+                            self._send_json(code, resp)
+                        return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
             def log_message(self, fmt, *args):  # noqa: A003
@@ -128,9 +157,13 @@ class ServiceHttpGateway:
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
                 raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
+                self._send_body(status_code, raw, content_type="application/json; charset=utf-8")
+
+            def _send_body(self, status_code: int, body: Any, *, content_type: str) -> None:
+                raw = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
                 try:
                     self.send_response(status_code)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Type", str(content_type or "application/octet-stream"))
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)

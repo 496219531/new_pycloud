@@ -67,18 +67,24 @@ InfoCenter 当前只保留 HTTP：
 NodeControl 当前保留 gRPC：
 
 1. `UploadCode`
-2. `TaskStream`
-3. `SubmitTasks`
-4. `PullResults`
-5. `CancelTasks`
-6. `CancelJob`
-7. `GetMetrics`
-8. `CreateService`
-9. `ListServiceMethods`
-10. `CallService`
-11. `HeartbeatService`
-12. `EndService`
-13. `GetServiceStatus`
+2. `UploadObject`
+3. `DownloadObject`
+4. `UpdateRuntimeGlobals`
+5. `GetMetrics`
+6. `CreateTaskPool`
+7. `HeartbeatTaskPool`
+8. `SubmitPoolTasks`
+9. `PullPoolResults`
+10. `CancelPoolJob`
+11. `GetTaskPoolStatus`
+12. `CloseTaskPool`
+13. `CreateService`
+14. `ListServiceMethods`
+15. `CallService`
+16. `UpdateServiceGlobals`
+17. `HeartbeatService`
+18. `EndService`
+19. `GetServiceStatus`
 
 ### 4.3 已移除
 
@@ -91,12 +97,11 @@ NodeControl 当前保留 gRPC：
 ### 5.1 任务模式
 
 1. 客户端上传代码。
-2. 获得 `code_version`。
-3. 从 `InfoCenter` 选任务节点。
-4. 向目标 `NodeControl` 建立 `TaskStream`。
-5. 提交任务到 NodeControl。
-6. NodeControl 用 runtime slot + 本机进程执行。
-7. 客户端拉取结果。
+2. 从 `InfoCenter` 选任务节点。
+3. 向目标 `NodeControl` 创建 `TaskPool`。
+4. 通过 `SubmitPoolTasks` 提交任务。
+5. NodeControl 用 TaskPool worker + 本机进程执行。
+6. 通过 `PullPoolResults` 拉取结果。
 
 这条链路适合高频任务提交，因此仍保留 gRPC。
 

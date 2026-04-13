@@ -7,7 +7,11 @@ from typing import Tuple
 import grpc
 
 from pycloud_parallel.controlplane.client import InfoCenterClient, JobQueueClient, NodeControlClient, TaskPoolSession
-from pycloud_parallel.controlplane.server import build_controlplane_server
+from pycloud_parallel.controlplane.server import (
+    build_gateway_server,
+    build_infocenter_server,
+    build_job_orchestrator_server,
+)
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
@@ -56,13 +60,13 @@ def _register_node(info_target: str, *, node_id: str, control_addr: str, state: 
 
 
 def test_native_task_pool_session_end_to_end(tmp_path):
-    controlplane = build_controlplane_server("127.0.0.1:0")
-    controlplane.start()
+    infocenter = build_infocenter_server("127.0.0.1:0")
+    infocenter.start()
     node_server, node_target, node_state = _start_nodecontrol_server("node-pool-01", str(tmp_path / "node_pool_01"))
 
     try:
-        _register_node(controlplane.base_url, node_id="node-pool-01", control_addr=node_target, state=node_state)
-        assert _wait_until(lambda: len(InfoCenterClient(controlplane.base_url, timeout_sec=5.0).list_nodes(limit=10)) == 1)
+        _register_node(infocenter.base_url, node_id="node-pool-01", control_addr=node_target, state=node_state)
+        assert _wait_until(lambda: len(InfoCenterClient(infocenter.base_url, timeout_sec=5.0).list_nodes(limit=10)) == 1)
 
         blob = (
             b"def run(value=0, sleep_ms=0, **_kwargs):\n"
@@ -75,7 +79,7 @@ def test_native_task_pool_session_end_to_end(tmp_path):
         )
 
         with TaskPoolSession.from_infocenter(
-            infocenter_target=controlplane.base_url,
+            infocenter_target=infocenter.base_url,
             job_id="job-pool-e2e",
             blob=blob,
             runtime="py3",
@@ -100,44 +104,54 @@ def test_native_task_pool_session_end_to_end(tmp_path):
     finally:
         node_server.stop(grace=0)
         node_state.close()
-        controlplane.stop()
+        infocenter.stop()
 
 
 def test_job_queue_uses_native_task_pool_end_to_end(tmp_path):
-    controlplane = build_controlplane_server("127.0.0.1:0")
-    controlplane.start()
+    infocenter = build_infocenter_server("127.0.0.1:0")
+    infocenter.start()
+    gateway = build_gateway_server("127.0.0.1:0", infocenter_addr=infocenter.base_url)
+    gateway.start()
+    job_orchestrator = build_job_orchestrator_server(
+        "127.0.0.1:0",
+        infocenter_addr=infocenter.base_url,
+        node_id="job-orchestrator-01",
+    )
+    job_orchestrator.start()
     node_server, node_target, node_state = _start_nodecontrol_server("node-jobq-01", str(tmp_path / "node_jobq_01"))
 
     try:
-        _register_node(controlplane.base_url, node_id="node-jobq-01", control_addr=node_target, state=node_state)
-        assert _wait_until(lambda: len(InfoCenterClient(controlplane.base_url, timeout_sec=5.0).list_nodes(limit=10)) == 1)
-
-        driver_blob = (
-            b"def build(value=0, count=3, **_kwargs):\n"
-            b"    return [{'value': value + i} for i in range(count)]\n"
+        _register_node(infocenter.base_url, node_id="node-jobq-01", control_addr=node_target, state=node_state)
+        assert _wait_until(lambda: len(InfoCenterClient(infocenter.base_url, timeout_sec=5.0).list_nodes(limit=10)) >= 2)
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(infocenter.base_url, timeout_sec=5.0).list_service_routes(
+                    service_name="job-orchestrator",
+                    healthy_only=True,
+                    limit=10,
+                )
+            )
+            == 1
         )
-        task_blob = (
+
+        job_blob = (
             b"def run(value=0, **_kwargs):\n"
             b"    value = int(value)\n"
-            b"    return {'value': value, 'square': value * value}\n"
+            b"    return {'value': value, 'square': value * value}\n\n"
+            b"def task_generator(value=0, count=3, **_kwargs):\n"
+            b"    return [{'value': value + i} for i in range(count)]\n\n"
+            b"def handle_result(task_id, result, state=None, **_kwargs):\n"
+            b"    state.setdefault('items', []).append(result)\n\n"
+            b"def finalize(state=None, **_kwargs):\n"
+            b"    return {'count': len(state.get('items', []))}\n"
         )
-        client = JobQueueClient(controlplane.base_url, timeout_sec=10.0)
+        client = JobQueueClient(infocenter.base_url, client_id="jobq-client", timeout_sec=10.0)
         try:
             submit = client.submit_job_from_bytes(
-                blob=driver_blob,
-                driver_entry_module="job_driver_demo",
-                driver_entry_callable="build",
-                driver_payload={"value": 5, "count": 3},
-                client_id="jobq-client",
+                blob=job_blob,
+                entry_module="job_hooks_demo",
+                job_payload={"value": 5, "count": 3},
                 runtime="py3",
-                task_blob=task_blob,
-                task_entry_module="task_pool_demo",
-                task_entry_callable="run",
-                task_package_format="py",
-                tags=["compute"],
-                pool_worker_count=2,
-                pool_node_count=1,
-                wait_timeout_sec=10.0,
             )
             job_id = submit["job"]["job_id"]
 
@@ -153,9 +167,12 @@ def test_job_queue_uses_native_task_pool_end_to_end(tmp_path):
             assert final is not None
             assert final["status"] == "SUCCEEDED"
             assert len(final["results"]) == 3
+            assert final["final_result"] == {"count": 3}
         finally:
             client.close()
     finally:
         node_server.stop(grace=0)
         node_state.close()
-        controlplane.stop()
+        job_orchestrator.stop()
+        gateway.stop()
+        infocenter.stop()

@@ -13,22 +13,33 @@
 
 ## 2. NodeControlService 方法
 
-### 2.1 任务模式
+### 2.1 代码与对象管理
 
 1. `UploadCode(stream UploadCodeRequest)`
-2. `SubmitTasks(SubmitTasksRequest)`
-3. `PullResults(PullResultsRequest)`
-4. `CancelTasks(CancelTasksRequest)`
+2. `UploadObject(stream UploadObjectRequest)`
+3. `DownloadObject(DownloadObjectRequest)`
+4. `UpdateRuntimeGlobals(UpdateRuntimeGlobalsRequest)`
 5. `GetMetrics(GetMetricsRequest)`
 
-### 2.2 服务会话模式
+### 2.2 TaskPool 模式
+
+1. `CreateTaskPool(stream CreateTaskPoolRequest)`
+2. `HeartbeatTaskPool(HeartbeatTaskPoolRequest)`
+3. `SubmitPoolTasks(SubmitPoolTasksRequest)`
+4. `PullPoolResults(PullPoolResultsRequest)`
+5. `CancelPoolJob(CancelPoolJobRequest)`
+6. `GetTaskPoolStatus(GetTaskPoolStatusRequest)`
+7. `CloseTaskPool(CloseTaskPoolRequest)`
+
+### 2.3 服务会话模式
 
 1. `CreateService(stream CreateServiceRequest)`
 2. `ListServiceMethods(ListServiceMethodsRequest)`
 3. `CallService(CallServiceRequest)`
-4. `HeartbeatService(HeartbeatServiceRequest)`
-5. `EndService(EndServiceRequest)`
-6. `GetServiceStatus(GetServiceStatusRequest)`
+4. `UpdateServiceGlobals(UpdateServiceGlobalsRequest)`
+5. `HeartbeatService(HeartbeatServiceRequest)`
+6. `EndService(EndServiceRequest)`
+7. `GetServiceStatus(GetServiceStatusRequest)`
 
 ## 3. 上传与工程包
 
@@ -135,6 +146,14 @@ Python 客户端当前支持：
 
 1. `InfoCenterService`
 2. `WorkerInternalService`
+
+以下共享任务模式 RPC 已从当前 `NodeControlService` 契约移除：
+
+1. `TaskStream`
+2. `SubmitTasks`
+3. `PullResults`
+4. `CancelTasks`
+5. `CancelJob`
 
 如果旧文档或旧代码还在引用它们，应以当前 proto 为准。
 

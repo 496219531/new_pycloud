@@ -2,9 +2,13 @@
 """
 最小 Job Queue 演示。
 
-提交一个大任务到 controlplane 队列中。
-当它排到执行时，会先运行 driver 代码生成 subtasks，
-再把 subtasks 交给当前 Task Pool 并行执行。
+提交一个大任务到唯一的 job-orchestrator service。
+JobQueueClient 会先向 InfoCenter 查询 job-orchestrator route，再直连它自己的 HTTP 数据面。
+job module 里同时定义：
+1. `run`              子任务入口
+2. `task_generator`   生成 payloads
+3. `handle_result`    收到每个结果时处理
+4. `finalize`         收尾并产出最终结果
 """
 
 from __future__ import annotations
@@ -17,72 +21,45 @@ from pycloud_parallel import JobQueueClient
 def main() -> None:
     target = "127.0.0.1:50051"
 
-    driver_blob = (
-        b"def build(value=0, count=8, **_kwargs):\n"
-        b"    return [{'value': value + i} for i in range(count)]\n"
-    )
-    task_blob = (
+    job_blob = (
         b"def run(value=0, **_kwargs):\n"
         b"    value = int(value)\n"
-        b"    return {'value': value, 'square': value * value}\n"
+        b"    return {'value': value, 'square': value * value}\n\n"
+        b"def task_generator(value=0, count=4, **_kwargs):\n"
+        b"    return [{'value': value + i} for i in range(count)]\n\n"
+        b"def handle_result(task_id, result, state=None, **_kwargs):\n"
+        b"    state.setdefault('squares', []).append(result['square'])\n\n"
+        b"def finalize(state=None, **_kwargs):\n"
+        b"    values = state.get('squares', [])\n"
+        b"    return {'count': len(values), 'sum_square': sum(values)}\n"
     )
-
-    def build_from_func(value=0, count=4, **_kwargs):
-        return [{"value": value + i} for i in range(count)]
-
-    def run_task(value=0, **_kwargs):
-        value = int(value)
-        return {"value": value, "square": value * value}
 
     print("=" * 60)
     print("  Job Queue Demo")
     print("=" * 60)
-    print(f"  ControlPlane: {target}")
+    print(f"  InfoCenter: {target}")
     print()
     print("可选提交方式：")
-    print("  1. submit_job_from_bytes(...)  适合显式控制 driver / task blob")
-    print("  2. submit_job_from_func(...)   适合直接提交函数对象")
-    print("  3. submit_job_from_module(...) 适合直接提交模块对象")
+    print("  1. submit_job_from_bytes(...)  适合直接提交 job module blob")
+    print("  2. submit_job_from_module(...) 适合直接提交模块对象")
     print()
 
-    with JobQueueClient(target, timeout_sec=10.0) as client:
+    with JobQueueClient(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
         resp = client.submit_job_from_bytes(
-            blob=driver_blob,
-            driver_entry_module="job_driver_demo",
-            driver_entry_callable="build",
-            driver_payload={"value": 10, "count": 6},
-            client_id=f"job-demo-{int(time.time())}",
+            blob=job_blob,
+            entry_module="job_demo",
+            # job_payload={"value": 10, "count": 6},
             runtime="py3",
-            task_blob=task_blob,
-            task_entry_module="task_demo",
-            task_entry_callable="run",
-            task_package_format="py",
-            tags=["compute"],
-            node_count=2,
-            pool_name="demo-job-pool",
-            pool_worker_count=2,
-            pool_node_count=2,
-            pool_heartbeat_timeout_sec=30,
-            priority=5,
         )
         job = resp["job"]
         job_id = job["job_id"]
         print(f"submitted job_id={job_id} status={job['status']}")
         print()
-        print("等价的函数对象写法：")
-        print(
-            "client.submit_job_from_func("
-            "func=build_from_func, "
-            "task_func=run_task, "
-            "pool_worker_count=2, pool_node_count=2)"
-        )
-        print()
         print("模块对象写法：")
         print(
             "client.submit_job_from_module("
-            "module=my_driver_module, "
-            "task_module=my_task_module, "
-            "task_entry_callable='run')"
+            "module=my_job_module, "
+            "job_payload={'value': 10, 'count': 6})"
         )
         print()
 
@@ -90,7 +67,11 @@ def main() -> None:
         while time.time() < deadline:
             status = client.get_job_status(job_id)
             job = status["job"]
-            print(f"status={job['status']} results={len(job.get('results') or [])}")
+            print(
+                f"status={job['status']} "
+                f"results={len(job.get('results') or [])} "
+                f"final_result={job.get('final_result')}"
+            )
             if job["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
                 print(job)
                 break
