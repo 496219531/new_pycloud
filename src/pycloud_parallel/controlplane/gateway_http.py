@@ -8,16 +8,23 @@ import json
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.client import InfoCenterServiceRoute, NodeControlClient
+from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
+from pycloud_parallel.controlplane.client import (
+    InfoCenterServiceRoute,
+    NodeControlClient,
+    _decode_http_request_body,
+    _decode_http_response_body,
+    _encode_http_json_body,
+    _serialize_http_call_payload,
+)
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.netutil import resolve_public_host
-from pycloud_parallel.controlplane.result_ref import ResultRef
-from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow, serialize_arrow_compatible, serialize_inline_payload
+from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
@@ -54,11 +61,15 @@ class GatewayHttpApp:
         route_cache: GatewayRouteCache,
         timeout_sec: float = 10.0,
         allow_private_addrs: bool = True,
+        register_data_ref: Optional[Callable[..., object]] = None,
+        controlplane_target: str = "",
     ) -> None:
         self.route_cache = route_cache
         self.timeout_sec = max(0.1, float(timeout_sec))
         self._stopped = False
         self.allow_private_addrs = bool(allow_private_addrs)
+        self.register_data_ref = register_data_ref
+        self.controlplane_target = str(controlplane_target or "").strip()
 
     def start(self) -> None:
         self._stopped = False
@@ -79,13 +90,7 @@ class GatewayHttpApp:
         service_name = parts[1]
         method = parts[3]
         try:
-            payload = json.loads(body.decode("utf-8") if body else "{}")
-        except Exception:
-            return 400, {"ok": False, "error": "invalid json body"}
-        if not isinstance(payload, dict):
-            return 400, {"ok": False, "error": "json body must be object"}
-        try:
-            payload, _, _ = serialize_inline_payload(payload, context="service call payload")
+            payload = _decode_http_request_body(body, context="service call payload")
         except ValueError as exc:
             return 400, {"ok": False, "error": str(exc)}
 
@@ -203,6 +208,28 @@ class GatewayHttpApp:
         }
 
     def _list_methods(self, route: InfoCenterServiceRoute, *, include_docs: bool) -> Dict[str, object]:
+        if not str(route.control_addr or "").strip():
+            base_url = self._validate_route_url(route.http_base_url)
+            if not base_url:
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid route http_base_url"})
+            url = f"{base_url}/methods?include_docs={'true' if include_docs else 'false'}"
+            req = Request(url, method="GET")
+            try:
+                with urlopen(req, timeout=max(2.0, self.timeout_sec + 1.0)) as resp:
+                    data = json.loads(resp.read().decode("utf-8") or "{}")
+            except HTTPError as exc:
+                try:
+                    data = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
+                except Exception:
+                    data = {"ok": False, "error": exc.reason}
+                raise GatewayCallError(status_code=exc.code, data=data) from exc
+            except Exception as exc:
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
+            if not isinstance(data, dict):
+                raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
+            if not data.get("ok", False):
+                raise GatewayCallError(status_code=200, data=data)
+            return data
         with NodeControlClient(route.control_addr, timeout_sec=self.timeout_sec) as client:
             methods = client.list_service_methods(service_id=route.service_id, include_docs=include_docs)
         return {
@@ -239,21 +266,21 @@ class GatewayHttpApp:
             url=url,
             method="POST",
             headers=headers,
-            data=json.dumps(payload or {}).encode("utf-8"),
+            data=_encode_http_json_body(_serialize_http_call_payload(payload, context="service call payload")),
         )
         try:
             with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
                 raw = resp.read(MAX_BODY_BYTES + 1)
                 if len(raw) > MAX_BODY_BYTES:
                     raise GatewayCallError(status_code=502, data={"ok": False, "error": "response too large"})
-                data = json.loads(raw.decode("utf-8") or "{}")
+                data = _decode_http_response_body(raw, control_addr=route.control_addr)
         except HTTPError as exc:
             try:
                 raw = exc.read() or b"{}"
                 if len(raw) > MAX_BODY_BYTES:
                     data = {"ok": False, "error": "response too large"}
                 else:
-                    data = json.loads(raw.decode("utf-8"))
+                    data = _decode_http_response_body(raw)
             except Exception:
                 data = {"ok": False, "error": exc.reason}
             raise GatewayCallError(status_code=exc.code, data=data) from exc
@@ -263,7 +290,10 @@ class GatewayHttpApp:
             raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid json response"})
         if not data.get("ok", False):
             raise GatewayCallError(status_code=200, data=data)
-        return _attach_result_ref_control_addr(convert_dict_to_arrow(data), control_addr=route.control_addr)
+        return self._attach_controlplane_locator(
+            _attach_result_ref_control_addr(data, control_addr=route.control_addr),
+            route=route,
+        )
 
     def _extract_token(self, headers) -> str:
         x_token = str(headers.get("X-Service-Token", "") or "").strip()
@@ -310,6 +340,35 @@ class GatewayHttpApp:
         if str(ip) == "169.254.169.254":
             return ""
         return raw.rstrip("/")
+
+    def _attach_controlplane_locator(self, data: Dict[str, object], *, route: InfoCenterServiceRoute) -> Dict[str, object]:
+        if not isinstance(data, dict) or "data" not in data:
+            return data
+        updated = with_data_ref_locator(
+            data.get("data"),
+            locator_kind="controlplane" if self.controlplane_target else "node_control",
+            locator_token=self.controlplane_target or str(route.control_addr or ""),
+            node_id=str(route.node_id or ""),
+            node_instance_id=str(route.node_instance_id or ""),
+        )
+        if updated is data.get("data"):
+            return data
+        ref = maybe_data_ref(updated)
+        if ref is not None and callable(self.register_data_ref):
+            try:
+                self.register_data_ref(
+                    ref=updated,
+                    node_id=str(route.node_id or ""),
+                    node_instance_id=str(route.node_instance_id or ""),
+                    control_addr=str(route.control_addr or ""),
+                    locator_kind="node_control",
+                    locator_token=str(route.control_addr or ""),
+                )
+            except Exception:
+                pass
+        body = dict(data)
+        body["data"] = updated
+        return body
 
 
 class GatewayHttpServer:
@@ -358,7 +417,7 @@ class GatewayHttpServer:
                 return
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
-                raw = json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
+                raw = _encode_http_json_body(data)
                 try:
                     self.send_response(status_code)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -400,14 +459,8 @@ def _attach_result_ref_control_addr(data: Dict[str, object], *, control_addr: st
     if not isinstance(data, dict):
         return data
     result = data.get("data")
-    if isinstance(result, ResultRef) and control_addr and not result.control_addr:
+    updated = with_data_ref_control_addr(result, control_addr=control_addr)
+    if updated is not result:
         data = dict(data)
-        data["data"] = ResultRef(
-            object_id=result.object_id,
-            node_id=result.node_id,
-            control_addr=control_addr,
-            format=result.format,
-            size_bytes=result.size_bytes,
-            materialize_as=result.materialize_as,
-        )
+        data["data"] = updated
     return data

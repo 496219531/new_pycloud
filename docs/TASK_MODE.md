@@ -16,7 +16,7 @@
 补充：
 
 1. `TaskPoolSession` 当前是单入口 task pool
-2. 整个 module / package 会一起上传，但真正对外暴露的任务入口只有 `entry_callable`
+2. 模块对象自动打包当前只会收 `.py / .pyd / .so` 文件闭包，不会把整个仓库或 package 目录树原样上传
 3. `runtime_key` 仍然保留，但它表示 runtime 侧的逻辑隔离键，不再对应独立的 runtime-slot 调度器
 
 ## 2. 当前推荐入口
@@ -54,9 +54,10 @@ with TaskPoolSession.from_infocenter(
 
 说明：
 
-1. `pool.methods` 当前只会返回一个方法名，也就是 `entry_callable`
-2. `submit_payloads(..., task_method=...)` 可以显式传方法名，但只能等于这个单一入口
-3. 如果传了别的方法名，现在会直接抛 `AttributeError`，不再静默回退到默认入口
+1. `pool.methods` 当前只会返回一个方法名，也就是任务入口名
+2. `entry_func` 是更直接的 callable 入口口径；`entry_callable` 是字符串名口径
+3. `submit_payloads(..., task_method=...)` 可以显式传方法名，但只能等于这个单一入口
+4. 如果传了别的方法名，现在会直接抛 `AttributeError`，不再静默回退到默认入口
 
 ### 2.2 `JobQueueClient`
 
@@ -64,46 +65,76 @@ with TaskPoolSession.from_infocenter(
 
 1. 大任务先排队
 2. 同一时刻只允许一个大任务进入运行态
-3. job 排到后，再自动创建 `TaskPoolSession`
+3. `JobQueueClient` 会先向 `InfoCenter / controlplane` 查询 `job-orchestrator` route，再直连它自己的 HTTP 数据面
+4. job 排到后，再自动创建 `TaskPoolSession`
 
 最小示例：
 
 ```python
 from pycloud_parallel import JobQueueClient
 
-client = JobQueueClient("127.0.0.1:50051")
+client = JobQueueClient("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
-    blob=driver_blob,
-    driver_entry_module="job_driver_demo",
-    task_entry_module="task_demo",
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    blob=job_blob,
+    entry_module="job_demo",
+    job_payload={"value": 10, "count": 6},
 )
 ```
 
-函数对象写法：
+这里的 `target` 建议指向 `InfoCenter` 或带内嵌 `InfoCenter` 的 `controlplane`；`JobQueueClient` 会先发现唯一的 `job-orchestrator` route，再直连它。
 
-```python
-client.submit_job_from_func(
-    func=build_subtasks,
-    task_func=run_subtask,
-    pool_worker_count=2,
-    pool_node_count=2,
-)
-```
+约定：
+
+1. `JobQueueClient` 的 job module 固定约定 5 个函数位：
+2. `run(payload...)`
+   - 必选
+   - 子任务入口
+3. `task_generator(...)`
+   - 必选
+   - 返回 payload 迭代器或 `list[dict]`
+4. `update_globals(...)`
+   - 可选
+   - 只负责在 job-orch 端生成共享数据 `dict`
+5. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+   - 可选
+   - 每个结果到达时增量更新状态
+6. `finalize(state=..., ...)`
+   - 可选
+   - 产出最终 `final_result`
+7. `apply_managed_globals(values, **context)`
+   - 可选
+   - 在 worker/node 端运行
+   - 决定共享数据怎么作用到 runtime
+   - `None` -> 不再默认 raw assign
+   - `dict` -> 再把这个 dict 写回入口模块 A 的 globals
+8. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 决定，不再从 client helper 暴露
+
+说明：
+
+1. `job_payload` 是可选 `dict`
+2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
+4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
+5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 
 模块对象写法：
 
 ```python
 client.submit_job_from_module(
-    module=job_driver_module,
-    task_module=task_module,
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    module=job_module,
+    job_payload={"value": 10, "count": 6},
 )
 ```
+
+推荐优先使用 `submit_job_from_module(...)`。
+`JobQueueClient` 不再提供 `submit_job_from_func(...)`，避免把嵌套函数 / 闭包 / 局部依赖打包成不稳定的隐式模块。
+
+补充边界：
+
+1. `submit_job_from_module(module=...)` 当前按“已加载 module object + 真实文件”收集本地依赖
+2. 自动打包只收 `.py / .pyd / .so`
+3. 非 Python 资源文件不会自动进入包
+4. 如果 job 依赖 `.csv` 等静态资源，请自行构建归档后再上传
 
 等待 job 终态：
 
@@ -213,13 +244,29 @@ for item in pool.iter_items(timeout_sec=10.0):
 如果你想边准备数据、边 submit、边接收结果，推荐直接用：
 
 ```python
-for task_id, data in pool.imap_unordered(
+for task_id, data in pool.unordered(
     payloads,
     max_in_flight=32,
     receive_batch=4,
     result_timeout_sec=30.0,
 ):
     print(task_id, data)
+```
+
+如果你希望边收结果边执行收尾逻辑，也可以直接：
+
+```python
+def handle(task_id, result):
+    print(task_id, result)
+
+processed = pool.consume_unordered(
+    payloads,
+    handle=handle,
+    max_in_flight=32,
+    receive_batch=4,
+    result_timeout_sec=30.0,
+)
+print(processed)
 ```
 
 语义：
@@ -229,7 +276,7 @@ for task_id, data in pool.imap_unordered(
 2. `receive_batch`
    - 每轮最多接收多少条结果
 3. 结果一到就立即 yield，不需要等整批任务全部结束
-4. `imap_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
+4. `unordered(...)` / `imap_unordered(...)` / `consume_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
 
 ## 4. 结果语义
 
@@ -262,6 +309,7 @@ for task_id, data in pool.imap_unordered(
 1. 是兼容专属池实现
 2. 底层复用 `ServiceGroup`
 3. 适合过渡期使用
+4. owner 侧也支持 `update_globals(...)`，复用 `ServiceGroup` 的 managed globals 更新链路
 
 ## 7. 已移除
 

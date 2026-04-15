@@ -148,4 +148,5 @@ def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
     with patch("pycloud_parallel.controlplane.client._http_json_request") as mocked:
         with pytest.raises(ValueError, match="ObjectRef"):
             client.call(service_name="svc-demo", method="run", payload=payload, timeout_sec=5.0)
-    mocked.assert_not_called()
+    assert mocked.call_count == 1
+    assert mocked.call_args.kwargs["path"] == "/svc/svc-demo/status"

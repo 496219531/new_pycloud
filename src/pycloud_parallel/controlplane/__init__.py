@@ -9,6 +9,10 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 _CLIENT_EXPORTS = {
+    "Artifact",
+    "ArtifactDeps",
+    "ArtifactExports",
+    "DataRef",
     "ObjectRef",
     "ResultRef",
     "pycloud_export",
@@ -44,6 +48,10 @@ def _import_client_module() -> Any:
 
 if TYPE_CHECKING:
     from .client import (
+        Artifact,
+        ArtifactDeps,
+        ArtifactExports,
+        DataRef,
         DedicatedTaskServiceSession,
         DeployedService,
         DirectConnect,
@@ -65,6 +73,10 @@ if TYPE_CHECKING:
 def _try_bind_client_exports() -> None:
     try:
         from .client import (
+            Artifact,
+            ArtifactDeps,
+            ArtifactExports,
+            DataRef,
             DedicatedTaskServiceSession,
             DeployedService,
             DirectConnect,
@@ -89,6 +101,10 @@ def _try_bind_client_exports() -> None:
 
     globals().update(
         {
+            "Artifact": Artifact,
+            "ArtifactDeps": ArtifactDeps,
+            "ArtifactExports": ArtifactExports,
+            "DataRef": DataRef,
             "ObjectRef": ObjectRef,
             "ResultRef": ResultRef,
             "pycloud_export": pycloud_export,
@@ -127,6 +143,10 @@ def __dir__() -> list[str]:
 __all__ = [
     "ObjectRef",
     "ResultRef",
+    "Artifact",
+    "ArtifactDeps",
+    "ArtifactExports",
+    "DataRef",
     "pycloud_export",
     "DeployedService",
     "DirectConnect",

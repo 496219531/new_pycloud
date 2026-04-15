@@ -14,6 +14,10 @@ _LOCAL_RUNTIME_EXPORTS = {
 }
 
 _CONTROLPLANE_EXPORTS = {
+    "Artifact",
+    "ArtifactDeps",
+    "ArtifactExports",
+    "DataRef",
     "ObjectRef",
     "ResultRef",
     "pycloud_export",
@@ -66,6 +70,10 @@ def _import_controlplane() -> Any:
 
 if TYPE_CHECKING:
     from .controlplane import (
+        Artifact,
+        ArtifactDeps,
+        ArtifactExports,
+        DataRef,
         DedicatedTaskServiceSession,
         DeployedService,
         DirectConnect,
@@ -103,6 +111,10 @@ def _try_bind_local_runtime_exports() -> None:
 def _try_bind_controlplane_exports() -> None:
     try:
         from .controlplane import (
+            Artifact,
+            ArtifactDeps,
+            ArtifactExports,
+            DataRef,
             DedicatedTaskServiceSession,
             DeployedService,
             DirectConnect,
@@ -121,6 +133,10 @@ def _try_bind_controlplane_exports() -> None:
 
     globals().update(
         {
+            "Artifact": Artifact,
+            "ArtifactDeps": ArtifactDeps,
+            "ArtifactExports": ArtifactExports,
+            "DataRef": DataRef,
             "ObjectRef": ObjectRef,
             "ResultRef": ResultRef,
             "pycloud_export": controlplane_pycloud_export,
@@ -166,6 +182,10 @@ __all__ = [
     # ControlPlane Module Clients（新命名）
     "ObjectRef",
     "ResultRef",
+    "Artifact",
+    "ArtifactDeps",
+    "ArtifactExports",
+    "DataRef",
     "pycloud_export",
     "DeployedService",
     "DedicatedTaskServiceSession",

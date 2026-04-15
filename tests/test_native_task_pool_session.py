@@ -22,6 +22,7 @@ def _build_task_entry_module(tmp_path, monkeypatch):
         "    return int(value)\n",
         encoding="utf-8",
     )
+    (package_dir / "ignored.csv").write_text("value\n1\n", encoding="utf-8")
     (package_dir / "worker.py").write_text(
         "from .helper import normalize\n\n"
         "def run(value=0, **_kwargs):\n"
@@ -247,6 +248,7 @@ def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeyp
         assert f"{worker_module.__package__}/__init__.py" in names
         assert f"{worker_module.__package__}/worker.py" in names
         assert f"{worker_module.__package__}/helper.py" in names
+        assert f"{worker_module.__package__}/ignored.csv" not in names
     finally:
         session.close()
 
@@ -297,6 +299,52 @@ def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, mon
         assert f"{worker_module.__package__}/__init__.py" in names
         assert f"{worker_module.__package__}/worker.py" in names
         assert f"{worker_module.__package__}/helper.py" in names
+        assert f"{worker_module.__package__}/ignored.csv" not in names
+    finally:
+        session.close()
+
+
+def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    worker_module = _build_task_entry_module(tmp_path, monkeypatch)
+    fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
+    fake_pool_client = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-1",
+        pool_token="token-1",
+        code_version="sha256:test",
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+        pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+        heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    captured = {}
+
+    def _fake_create_task_pool(self, **kwargs):
+        captured.update(kwargs)
+        return fake_pool_client
+
+    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+        _fake_create_task_pool,
+    ):
+        mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
+        session = TaskPoolSession.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-native-entry-func",
+            entry_func=worker_module.run,
+            worker_count=2,
+            node_count=1,
+        )
+
+    try:
+        assert captured["entry_module"] == worker_module.__name__
+        assert captured["entry_callable"] == "run"
+        assert captured["package_format"] == "tar.gz"
     finally:
         session.close()
 
@@ -1030,6 +1078,93 @@ def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
 
     assert out == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
     mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, wait_ms=500, limit=100, job_id="", raise_on_error=False, task_ids=None)
+
+
+def test_native_task_pool_session_unordered_delegates_to_imap_unordered() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    session = TaskPoolSession(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-unordered",
+    )
+    payloads = [{"value": 1}, {"value": 2}]
+
+    with patch.object(
+        session,
+        "imap_unordered",
+        return_value=iter([("task-1", {"value": 1}), ("task-2", {"value": 2})]),
+    ) as mocked:
+        out = list(
+            session.unordered(
+                payloads,
+                max_in_flight=4,
+                receive_batch=2,
+                submit_timeout_sec=2.0,
+                result_timeout_sec=3.0,
+                wait_ms=20,
+                raise_on_error=False,
+                node_window_factor=1.5,
+            )
+        )
+
+    assert out == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
+    mocked.assert_called_once_with(
+        payloads,
+        task_method="",
+        max_in_flight=4,
+        receive_batch=2,
+        submit_timeout_sec=2.0,
+        result_timeout_sec=3.0,
+        wait_ms=20,
+        raise_on_error=False,
+        node_window_factor=1.5,
+    )
+
+
+def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
+    from pycloud_parallel.controlplane.client import TaskPoolSession
+
+    session = TaskPoolSession(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-consume-unordered",
+    )
+    payloads = [{"value": 1}, {"value": 2}]
+    handled: list[tuple[str, object]] = []
+
+    with patch.object(
+        session,
+        "unordered",
+        return_value=iter([("task-1", {"value": 1}), ("task-2", {"value": 2})]),
+    ) as mocked:
+        processed = session.consume_unordered(
+            payloads,
+            handle=lambda task_id, result: handled.append((task_id, result)),
+            max_in_flight=3,
+            receive_batch=1,
+            submit_timeout_sec=1.5,
+            result_timeout_sec=2.5,
+            wait_ms=15,
+            raise_on_error=False,
+            node_window_factor=1.25,
+        )
+
+    assert processed == 2
+    assert handled == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
+    mocked.assert_called_once_with(
+        payloads,
+        task_method="",
+        max_in_flight=3,
+        receive_batch=1,
+        submit_timeout_sec=1.5,
+        result_timeout_sec=2.5,
+        wait_ms=15,
+        raise_on_error=False,
+        node_window_factor=1.25,
+    )
 
 
 def test_native_task_pool_session_iter_items_includes_failures() -> None:

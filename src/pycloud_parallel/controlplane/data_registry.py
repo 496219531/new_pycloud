@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+"""Control-plane data reference resolution helpers."""
+
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence
+
+from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
+
+
+@dataclass(frozen=True)
+class ResolvedDataRef:
+    ref: DataRef
+    control_addr: str
+    node_id: str = ""
+    node_instance_id: str = ""
+    locator_kind: str = ""
+    locator_token: str = ""
+    via_registry: bool = False
+
+
+class DataRegistryClient:
+    def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+        self.target = str(target or "").strip()
+        self.timeout_sec = max(0.1, float(timeout_sec))
+
+    def register(
+        self,
+        ref: DataRef | object,
+        *,
+        ttl_sec: int = 3600,
+        node_id: str = "",
+        node_instance_id: str = "",
+        control_addr: str = "",
+        locator_kind: str = "",
+        locator_token: str = "",
+        replicas: Optional[Sequence[Dict[str, object]]] = None,
+    ) -> Dict[str, object]:
+        data_ref = ref if isinstance(ref, DataRef) else coerce_data_ref(ref)
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+
+        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+            return client.register_data_ref(
+                ref=data_ref,
+                ttl_sec=ttl_sec,
+                node_id=node_id,
+                node_instance_id=node_instance_id,
+                control_addr=control_addr,
+                locator_kind=locator_kind,
+                locator_token=locator_token,
+                replicas=replicas,
+            )
+
+    def touch(self, ref_id: str) -> Dict[str, object]:
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+
+        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+            return client.touch_data_ref(ref_id=ref_id)
+
+    def release(self, ref_id: str) -> Dict[str, object]:
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+
+        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+            return client.release_data_ref(ref_id=ref_id)
+
+    def resolve(self, ref: DataRef | object) -> ResolvedDataRef:
+        data_ref = ref if isinstance(ref, DataRef) else coerce_data_ref(ref)
+
+        if str(data_ref.control_addr or "").strip():
+            return ResolvedDataRef(
+                ref=data_ref,
+                control_addr=str(data_ref.control_addr or "").strip(),
+                node_id=str(data_ref.node_id or "").strip(),
+                node_instance_id=str(data_ref.node_instance_id or "").strip(),
+                locator_kind=str(data_ref.locator_kind or ""),
+                locator_token=str(data_ref.locator_token or ""),
+                via_registry=False,
+            )
+
+        locator_kind = str(data_ref.locator_kind or "").strip().lower()
+        locator_token = str(data_ref.locator_token or self.target or "").strip()
+
+        if locator_kind == "node_control" and locator_token:
+            return ResolvedDataRef(
+                ref=data_ref,
+                control_addr=locator_token,
+                node_id=str(data_ref.node_id or "").strip(),
+                node_instance_id=str(data_ref.node_instance_id or "").strip(),
+                locator_kind=locator_kind,
+                locator_token=locator_token,
+                via_registry=False,
+            )
+
+        if locator_kind in {"controlplane", "node_local", ""} and locator_token:
+            from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+
+            with InfoCenterClient(locator_token, timeout_sec=self.timeout_sec) as client:
+                try:
+                    payload = client.resolve_data_ref(ref_id=data_ref.ref_id)
+                except Exception:
+                    payload = {}
+                entry = dict(payload.get("entry") or {})
+                control_addr = str(entry.get("control_addr", "") or "").strip()
+                if control_addr:
+                    return ResolvedDataRef(
+                        ref=data_ref,
+                        control_addr=control_addr,
+                        node_id=str(entry.get("node_id", "") or data_ref.node_id or ""),
+                        node_instance_id=str(entry.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                        locator_kind=str(entry.get("locator_kind", "") or locator_kind),
+                        locator_token=str(entry.get("locator_token", "") or locator_token),
+                        via_registry=True,
+                    )
+
+                replicas = [
+                    dict(item)
+                    for item in (entry.get("replicas") or ())
+                    if isinstance(item, dict) and str(item.get("control_addr", "") or "").strip()
+                ]
+                if replicas:
+                    nodes = list(client.list_nodes(healthy_only=False, limit=2000))
+                    healthy_map = {
+                        str(getattr(node, "node_instance_id", "") or "").strip(): bool(getattr(node, "healthy", False))
+                        for node in nodes
+                    }
+                    replicas.sort(
+                        key=lambda item: (
+                            0 if healthy_map.get(str(item.get("node_instance_id", "") or "").strip(), True) else 1,
+                            str(item.get("node_instance_id", "") or ""),
+                            str(item.get("node_id", "") or ""),
+                        )
+                    )
+                    best = replicas[0]
+                    return ResolvedDataRef(
+                        ref=data_ref,
+                        control_addr=str(best.get("control_addr", "") or "").strip(),
+                        node_id=str(best.get("node_id", "") or data_ref.node_id or ""),
+                        node_instance_id=str(best.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                        locator_kind="node_control",
+                        locator_token=str(best.get("control_addr", "") or "").strip(),
+                        via_registry=True,
+                    )
+
+                nodes = list(client.list_nodes(healthy_only=False, limit=2000))
+
+            node_instance_id = str(data_ref.node_instance_id or "").strip()
+            node_id = str(data_ref.node_id or "").strip()
+            if node_instance_id:
+                matches = [node for node in nodes if str(getattr(node, "node_instance_id", "") or "").strip() == node_instance_id]
+                if len(matches) == 1:
+                    node = matches[0]
+                    control_addr = str(getattr(node, "control_addr", "") or "").strip()
+                    if control_addr:
+                        return ResolvedDataRef(
+                            ref=data_ref,
+                            control_addr=control_addr,
+                            node_id=str(getattr(node, "node_id", "") or node_id),
+                            node_instance_id=node_instance_id,
+                            locator_kind=locator_kind,
+                            locator_token=locator_token,
+                            via_registry=True,
+                        )
+                if len(matches) > 1:
+                    raise RuntimeError(f"data ref resolution is ambiguous for node_instance_id={node_instance_id!r}")
+
+            if node_id:
+                matches = [node for node in nodes if str(getattr(node, "node_id", "") or "").strip() == node_id]
+                if len(matches) == 1:
+                    node = matches[0]
+                    control_addr = str(getattr(node, "control_addr", "") or "").strip()
+                    if control_addr:
+                        return ResolvedDataRef(
+                            ref=data_ref,
+                            control_addr=control_addr,
+                            node_id=node_id,
+                            node_instance_id=str(getattr(node, "node_instance_id", "") or ""),
+                            locator_kind=locator_kind,
+                            locator_token=locator_token,
+                            via_registry=True,
+                        )
+                if len(matches) > 1:
+                    raise RuntimeError(
+                        f"data ref resolution is ambiguous for node_id={node_id!r}; use node_instance_id-backed refs"
+                    )
+            raise RuntimeError(
+                f"data ref could not be resolved via controlplane target={locator_token!r}: "
+                f"ref_id={data_ref.ref_id!r} node_id={node_id!r} node_instance_id={node_instance_id!r}"
+            )
+
+        raise RuntimeError(
+            f"data ref is missing a resolvable locator: ref_id={data_ref.ref_id!r} locator_kind={locator_kind!r}"
+        )
+
+
+def resolve_data_ref(ref: DataRef | object, *, target: str = "", timeout_sec: float = 10.0) -> ResolvedDataRef:
+    return DataRegistryClient(target, timeout_sec=timeout_sec).resolve(ref)
+
+
+__all__ = [
+    "DataRegistryClient",
+    "ResolvedDataRef",
+    "resolve_data_ref",
+]

@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package pycloud.v1;
 
-import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -184,12 +183,9 @@ service NodeControlService {
   rpc UploadCode(stream UploadCodeRequest) returns (UploadCodeResponse);
   rpc UploadObject(stream UploadObjectRequest) returns (UploadObjectResponse);
   rpc DownloadObject(DownloadObjectRequest) returns (stream DownloadObjectChunk);
+  rpc PinObject(PinObjectRequest) returns (PinObjectResponse);
+  rpc ReleaseObject(ReleaseObjectRequest) returns (ReleaseObjectResponse);
   rpc UpdateRuntimeGlobals(UpdateRuntimeGlobalsRequest) returns (UpdateRuntimeGlobalsResponse);
-  rpc TaskStream(stream TaskStreamRequest) returns (stream TaskStreamResponse);
-  rpc SubmitTasks(SubmitTasksRequest) returns (SubmitTasksResponse);
-  rpc PullResults(PullResultsRequest) returns (PullResultsResponse);
-  rpc CancelTasks(CancelTasksRequest) returns (CancelTasksResponse);
-  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
   rpc CreateTaskPool(stream CreateTaskPoolRequest) returns (CreateTaskPoolResponse);
   rpc HeartbeatTaskPool(HeartbeatTaskPoolRequest) returns (HeartbeatTaskPoolResponse);
@@ -224,6 +220,7 @@ message UploadCodeMeta {
   repeated string dependency_allowlist = 8;
   repeated string managed_global_names = 9;
   string code_token = 10;
+  string dependency_policy_mode = 11; // prebuilt | node_preinstalled | allow_install
 }
 
 message UploadCodeRequest {
@@ -276,6 +273,28 @@ message DownloadObjectChunk {
   bytes chunk = 4;
 }
 
+message PinObjectRequest {
+  string object_id = 1;
+  string ref_id = 2;
+}
+
+message PinObjectResponse {
+  bool ok = 1;
+  bool pinned = 2;
+  Error error = 3;
+}
+
+message ReleaseObjectRequest {
+  string object_id = 1;
+  string ref_id = 2;
+}
+
+message ReleaseObjectResponse {
+  bool ok = 1;
+  bool released = 2;
+  Error error = 3;
+}
+
 message UpdateRuntimeGlobalsRequest {
   string client_id = 1;
   string code_version = 2;
@@ -301,14 +320,6 @@ message TaskSubmitItem {
   string runtime_key = 5;
 }
 
-message SubmitTasksRequest {
-  string client_id = 1;
-  string code_version = 2;
-  ExecutionMode execution_mode = 3;
-  repeated TaskSubmitItem tasks = 4;
-  string job_id = 5;
-}
-
 message TaskAccepted {
   string task_id = 1;
   TaskStatus status = 2; // expected: TASK_STATUS_QUEUED
@@ -328,13 +339,6 @@ message SubmitTasksResponse {
   Error error = 5;
 }
 
-message PullResultsRequest {
-  string client_id = 1;
-  int32 limit = 2;
-  int32 wait_ms = 3;
-  string cursor = 4;
-}
-
 message TaskResult {
   string task_id = 1;
   TaskStatus status = 2;
@@ -351,114 +355,6 @@ message PullResultsResponse {
   repeated TaskResult results = 2;
   string next_cursor = 3;
   Error error = 4;
-}
-
-message TaskStreamOpen {
-  string client_id = 1;
-  string code_version = 2;
-  int32 result_limit = 3;
-  int32 result_wait_ms = 4;
-}
-
-message TaskStreamOpenAck {
-  string client_id = 1;
-  string code_version = 2;
-  int32 node_credit = 3;
-}
-
-message TaskStreamSubmit {
-  string request_id = 1;
-  string job_id = 2;
-  ExecutionMode execution_mode = 3;
-  repeated TaskSubmitItem tasks = 4;
-}
-
-message TaskStreamSubmitAck {
-  string request_id = 1;
-  string job_id = 2;
-  repeated TaskAccepted accepted = 3;
-  repeated TaskRejected rejected = 4;
-  int32 node_credit = 5;
-  Error error = 6;
-}
-
-message TaskStreamResultBatch {
-  repeated TaskResult results = 1;
-  string next_cursor = 2;
-  int32 node_credit = 3;
-}
-
-message TaskStreamCancelJob {
-  string request_id = 1;
-  string job_id = 2;
-  string reason = 3;
-}
-
-message TaskStreamCancelJobAck {
-  string request_id = 1;
-  string job_id = 2;
-  int32 queued_cancelled = 3;
-  int32 running_marked = 4;
-  int32 already_done = 5;
-  int32 not_found = 6;
-  Error error = 7;
-}
-
-message TaskStreamCreditUpdate {
-  int32 node_credit = 1;
-  int32 queued = 2;
-  int32 inflight = 3;
-  int32 running = 4;
-}
-
-message TaskStreamClose {
-  bool drain = 1;
-}
-
-message TaskStreamClosed {
-  string reason = 1;
-  int32 node_credit = 2;
-}
-
-message TaskStreamRequest {
-  oneof body {
-    TaskStreamOpen open = 1;
-    TaskStreamSubmit submit = 2;
-    TaskStreamCancelJob cancel_job = 3;
-    TaskStreamClose close = 4;
-  }
-}
-
-message TaskStreamResponse {
-  oneof body {
-    TaskStreamOpenAck open_ack = 1;
-    TaskStreamSubmitAck submit_ack = 2;
-    TaskStreamResultBatch result_batch = 3;
-    TaskStreamCancelJobAck cancel_job_ack = 4;
-    TaskStreamCreditUpdate credit_update = 5;
-    TaskStreamClosed closed = 6;
-    Error error = 7;
-  }
-}
-
-message CancelTasksRequest {
-  string client_id = 1;
-  repeated string task_ids = 2;
-  string reason = 3;
-}
-
-message CancelTasksResponse {
-  bool ok = 1;
-  repeated string cancelled = 2;
-  repeated string not_found = 3;
-  repeated string already_done = 4;
-  Error error = 5;
-}
-
-message CancelJobRequest {
-  string client_id = 1;
-  string job_id = 2;
-  string reason = 3;
 }
 
 message CancelJobResponse {
@@ -500,6 +396,7 @@ message CreateTaskPoolMeta {
   string package_format = 10;
   repeated string dependency_allowlist = 11;
   repeated string managed_global_names = 12;
+  string dependency_policy_mode = 13; // prebuilt | node_preinstalled | allow_install
 }
 
 message CreateTaskPoolRequest {
@@ -610,6 +507,7 @@ message CreateServiceMeta {
   ModuleExportSpec export_spec = 12;
   repeated string dependency_allowlist = 13;
   repeated string managed_global_names = 14;
+  string dependency_policy_mode = 15; // prebuilt | node_preinstalled | allow_install
 }
 
 message CreateServiceRequest {
@@ -735,67 +633,5 @@ message ServiceStatusInfo {
 message GetServiceStatusResponse {
   bool ok = 1;
   ServiceStatusInfo service = 2;
-  Error error = 3;
-}
-
-message PollTaskRequest {
-  string worker_id = 1;
-  int32 max_tasks = 2; // V1 uses 1 by default
-}
-
-message TaskEnvelope {
-  string task_id = 1;
-  string code_version = 2;
-  int32 attempt = 3;
-  ExecutionMode execution_mode = 4;
-  google.protobuf.Struct payload = 5;
-  string lease_id = 6;
-  int32 lease_ttl_sec = 7;
-}
-
-message PollTaskResponse {
-  bool ok = 1;
-  oneof state {
-    TaskEnvelope task = 2;
-    google.protobuf.Empty idle = 3;
-  }
-  Error error = 4;
-}
-
-message WorkerProgress {
-  int64 done = 1;
-  int64 total = 2;
-}
-
-message HeartbeatTaskRequest {
-  string worker_id = 1;
-  string task_id = 2;
-  int32 attempt = 3;
-  google.protobuf.Timestamp timestamp = 4;
-  bool child_alive = 5;
-  WorkerProgress progress = 6;
-}
-
-message HeartbeatTaskResponse {
-  bool ok = 1;
-  bool accepted = 2;
-  bool cancel_requested = 3;
-  Error error = 4;
-}
-
-message ReportResultRequest {
-  string worker_id = 1;
-  string task_id = 2;
-  int32 attempt = 3;
-  TaskStatus status = 4; // expected: SUCCEEDED / FAILED_USER
-  google.protobuf.Struct result = 5;
-  TaskError error = 6;
-  google.protobuf.Timestamp started_at = 7;
-  google.protobuf.Timestamp finished_at = 8;
-}
-
-message ReportResultResponse {
-  bool ok = 1;
-  bool accepted = 2;
   Error error = 3;
 }

@@ -149,7 +149,7 @@ logging.getLogger("pycloud_parallel.controlplane.client").setLevel(logging.DEBUG
 
 ```bash
 python -m pycloud_parallel.controlplane.server \
-  --role controlplane \
+  --role cont \
   --bind 0.0.0.0:50051 \
   --log-level DEBUG
 ```

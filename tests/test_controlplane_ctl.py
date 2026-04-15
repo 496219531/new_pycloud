@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pycloud_parallel.controlplane import ctl
+from pycloud_parallel.controlplane import server as controlplane_server
 from pycloud_parallel.controlplane.object_ref import object_id_from_sha256_hex, object_ref_to_payload, ObjectRef
 from pycloud_parallel.controlplane.state import (
     _code_content_dir,
@@ -134,6 +135,29 @@ def test_ctl_parser_accepts_start_gateway_command():
     assert args.infocenter_addr == "127.0.0.1:50051"
 
 
+def test_ctl_parser_accepts_start_job_orchestrator_command():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["start-job-orchestrator", "--bind", "0.0.0.0:50053", "--infocenter-addr", "127.0.0.1:50051"])
+    assert args.command == "start-job-orchestrator"
+    assert args.bind == "0.0.0.0:50053"
+    assert args.infocenter_addr == "127.0.0.1:50051"
+
+
+def test_server_role_prefixes_normalize_to_canonical_names():
+    assert controlplane_server._normalize_role("info") == "infocenter"
+    assert controlplane_server._normalize_role("gateway") == "gateway"
+    assert controlplane_server._normalize_role("job-runner") == "joborchestrator"
+    assert controlplane_server._normalize_role("node-local") == "nodecontrol"
+    assert controlplane_server._normalize_role("controlplane") == "controlplane"
+
+
+def test_ctl_role_from_command_normalizes_prefixes():
+    assert ctl._role_from_command("python -m pycloud_parallel.controlplane.server --role info") == "infocenter"
+    assert ctl._role_from_command("python -m pycloud_parallel.controlplane.server --role gate-http") == "gateway"
+    assert ctl._role_from_command("python -m pycloud_parallel.controlplane.server --role job-main") == "joborchestrator"
+    assert ctl._role_from_command("python -m pycloud_parallel.controlplane.server --role node-blue") == "nodecontrol"
+
+
 def test_ctl_parser_accepts_status_target_option():
     parser = ctl.build_parser()
     args = parser.parse_args(["status", "--target", "127.0.0.1:50071"])
@@ -206,6 +230,7 @@ def test_cmd_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypa
     monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
     monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
     monkeypatch.setattr(ctl, "_start_controlplane", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ctl, "_start_job_orchestrator", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         ctl,
         "_start_node",
@@ -256,6 +281,7 @@ def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
         ]
     )
     controlplane_calls: list[dict[str, object]] = []
+    job_orchestrator_calls: list[dict[str, object]] = []
     started_nodes: list[dict[str, object]] = []
 
     monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
@@ -267,6 +293,11 @@ def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
         ctl,
         "_start_controlplane",
         lambda root, port, **kwargs: controlplane_calls.append({"root": root, "port": port, **kwargs}),
+    )
+    monkeypatch.setattr(
+        ctl,
+        "_start_job_orchestrator",
+        lambda root, **kwargs: job_orchestrator_calls.append({"root": root, **kwargs}),
     )
     monkeypatch.setattr(
         ctl,
@@ -294,6 +325,14 @@ def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
             "extra_env": {},
         }
     ]
+    assert job_orchestrator_calls == [
+        {
+            "root": tmp_path.resolve(),
+            "bind": "10.0.0.9:50053",
+            "infocenter_addr": "127.0.0.1:51051",
+            "extra_env": {},
+        }
+    ]
     assert started_nodes[0]["bind_host"] == "10.0.0.9"
     assert started_nodes[0]["service_http_host"] == "10.0.0.9"
     assert started_nodes[0]["advertise_host"] == "10.0.0.9"
@@ -314,6 +353,7 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
         ]
     )
     controlplane_calls: list[dict[str, object]] = []
+    job_orchestrator_calls: list[dict[str, object]] = []
     started_nodes: list[dict[str, object]] = []
 
     monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
@@ -325,6 +365,11 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
         ctl,
         "_start_controlplane",
         lambda root, port, **kwargs: controlplane_calls.append({"root": root, "port": port, **kwargs}),
+    )
+    monkeypatch.setattr(
+        ctl,
+        "_start_job_orchestrator",
+        lambda root, **kwargs: job_orchestrator_calls.append({"root": root, **kwargs}),
     )
     monkeypatch.setattr(
         ctl,
@@ -345,6 +390,14 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
     assert ctl._cmd_start(args) == 0
     assert controlplane_calls[0]["bind_host"] == "127.0.0.1"
     assert controlplane_calls[0]["remote_hint"] == "127.0.0.1:50051"
+    assert job_orchestrator_calls == [
+        {
+            "root": tmp_path.resolve(),
+            "bind": "127.0.0.1:50053",
+            "infocenter_addr": "127.0.0.1:50051",
+            "extra_env": {},
+        }
+    ]
     assert started_nodes[0]["bind_host"] == "127.0.0.1"
     assert started_nodes[0]["service_http_host"] == "127.0.0.1"
     assert started_nodes[0]["advertise_host"] == "127.0.0.1"
@@ -447,6 +500,148 @@ def test_gc_objects_keeps_current_globals_refs_and_deletes_stale_others(tmp_path
     assert ctl._cmd_gc(run_args) == 0
     assert not stale_path.exists()
     assert live_path.exists()
+
+
+def test_gc_objects_keeps_active_data_ref_objects(tmp_path, monkeypatch, capsys):
+    artifact_dir = tmp_path / "code_cache"
+    object_dir = artifact_dir / "objects"
+    meta_dir = object_dir / "meta"
+    object_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    kept_digest = "1" * 64
+    stale_digest = "2" * 64
+    kept_id = object_id_from_sha256_hex(kept_digest)
+    stale_id = object_id_from_sha256_hex(stale_digest)
+    kept_path = object_dir / f"{kept_digest}.bin"
+    stale_path = object_dir / f"{stale_digest}.bin"
+    kept_path.write_bytes(b"keep")
+    stale_path.write_bytes(b"stale")
+
+    old_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    _write_json(
+        meta_dir / f"{kept_digest}.json",
+        {
+            "object_id": kept_id,
+            "format": "bin",
+            "size_bytes": 4,
+            "created_at": old_time,
+            "last_at": old_time,
+        },
+    )
+    _write_json(
+        meta_dir / f"{stale_digest}.json",
+        {
+            "object_id": stale_id,
+            "format": "bin",
+            "size_bytes": 5,
+            "created_at": old_time,
+            "last_at": old_time,
+        },
+    )
+
+    monkeypatch.setattr(
+        ctl,
+        "_collect_active_data_ref_object_ids",
+        lambda target: {kept_id} if target == "http://127.0.0.1:50051" else set(),
+    )
+
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "gc",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--target",
+        "http://127.0.0.1:50051",
+        "--older-than-hours",
+        "168",
+    ])
+    assert ctl._cmd_gc(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    kept_reasons = {row["object_id"]: row["reason"] for row in payload["kept_objects"]}
+    deleted_ids = {row["object_id"] for row in payload["deleted_objects"]}
+    assert kept_reasons[kept_id] == "referenced_by_active_data_ref"
+    assert stale_id in deleted_ids
+    assert kept_path.exists()
+    assert not stale_path.exists()
+
+
+def test_gc_segments_compacts_live_segment_and_deletes_orphan_segment(tmp_path, capsys):
+    artifact_dir = tmp_path / "code_cache"
+    object_dir = artifact_dir / "objects"
+    meta_dir = object_dir / "meta"
+    segments_dir = object_dir / "segments"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    segments_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_id = object_id_from_sha256_hex("3" * 64)
+    live_id = object_id_from_sha256_hex("4" * 64)
+    orphan_segment = segments_dir / "segment-orphan.bin"
+    orphan_segment.write_bytes(b"orphan")
+    segment_path = segments_dir / "segment-live.bin"
+    stale_blob = b"dead"
+    live_blob = b"live-data"
+    segment_path.write_bytes(stale_blob + live_blob)
+    old_time = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    recent_time = datetime.now(timezone.utc).isoformat()
+
+    _write_json(
+        meta_dir / f"{stale_id.replace('sha256:', '')}.json",
+        {
+            "object_id": stale_id,
+            "format": "bin",
+            "size_bytes": len(stale_blob),
+            "created_at": old_time,
+            "last_at": old_time,
+            "storage_backend": "segment",
+            "segment_relpath": "segments/segment-live.bin",
+            "segment_offset": 0,
+            "segment_length": len(stale_blob),
+        },
+    )
+    _write_json(
+        meta_dir / f"{live_id.replace('sha256:', '')}.json",
+        {
+            "object_id": live_id,
+            "format": "bin",
+            "size_bytes": len(live_blob),
+            "created_at": old_time,
+            "last_at": recent_time,
+            "storage_backend": "segment",
+            "segment_relpath": "segments/segment-live.bin",
+            "segment_offset": len(stale_blob),
+            "segment_length": len(live_blob),
+        },
+    )
+
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "gc",
+        "--artifact-dir",
+        str(artifact_dir),
+        "--scope",
+        "objects",
+        "--older-than-hours",
+        "168",
+    ])
+    assert ctl._cmd_gc(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    deleted_ids = {row["object_id"] for row in payload["deleted_objects"]}
+    assert stale_id in deleted_ids
+    assert orphan_segment.exists() is False
+    assert any(row["segment_relpath"] == "segments/segment-orphan.bin" for row in payload["deleted_segments"])
+    assert any(row["segment_relpath"] == "segments/segment-live.bin" for row in payload["compacted_segments"])
+
+    meta = json.loads((meta_dir / f"{live_id.replace('sha256:', '')}.json").read_text(encoding="utf-8"))
+    assert int(meta["segment_offset"]) == 0
+    assert int(meta["segment_length"]) == len(live_blob)
+    assert segment_path.read_bytes() == live_blob
 
 
 def test_gc_codes_deletes_stale_code_dirs(tmp_path, capsys):
@@ -652,7 +847,7 @@ def test_cmd_stop_stops_all_pid_backed_processes(tmp_path, monkeypatch):
     monkeypatch.setattr(ctl, "_log", lambda *_args: None)
 
     assert ctl._cmd_stop(args) == 0
-    assert [name for _, name in stopped] == ["node-1", "node-2", "node-blue", "gateway", "controlplane"]
+    assert [name for _, name in stopped] == ["node-1", "node-2", "node-blue", "job-orchestrator", "gateway", "controlplane"]
     assert cleaned == [
         ("127.0.0.1:50051", "node-1"),
         ("127.0.0.1:50051", "node-2"),
@@ -700,7 +895,7 @@ def test_cmd_doctor_uses_default_ports(tmp_path, monkeypatch, capsys):
     assert "PyCloud Doctor" in out
     assert "Runtime Root:" in out
     assert "50051 (controlplane): pid=123 pycloud=yes role=controlplane node=-" in out
-    assert "50061 (node-1-grpc): no listener" in out
+    assert "50053 (job-orchestrator): no listener" in out
 
 
 def test_cmd_start_node_requires_explicit_infocenter_target(tmp_path, monkeypatch):
@@ -781,6 +976,7 @@ def test_cmd_start_node_uses_explicit_infocenter_target_and_local_advertise(tmp_
         (["start-infocenter", "--local"], "127.0.0.1:50051", None),
         (["start-controlplane", "--local"], "127.0.0.1:50051", None),
         (["start-gateway", "--local", "--infocenter-addr", "127.0.0.1:50051"], "127.0.0.1:50052", "127.0.0.1:50051"),
+        (["start-job-orchestrator", "--local", "--infocenter-addr", "127.0.0.1:50051"], "127.0.0.1:50053", "127.0.0.1:50051"),
     ],
 )
 def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
@@ -795,6 +991,7 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
     infocenter_calls: list[dict[str, object]] = []
     controlplane_calls: list[dict[str, object]] = []
     gateway_calls: list[dict[str, object]] = []
+    job_orchestrator_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
     monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
@@ -815,6 +1012,11 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
         "_start_gateway",
         lambda root, **kwargs: gateway_calls.append({"root": root, **kwargs}),
     )
+    monkeypatch.setattr(
+        ctl,
+        "_start_job_orchestrator",
+        lambda root, **kwargs: job_orchestrator_calls.append({"root": root, **kwargs}),
+    )
 
     if args.command == "start-infocenter":
         assert ctl._cmd_start_infocenter(args) == 0
@@ -830,6 +1032,23 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
                 "gateway_refresh_interval_sec": 3.0,
                 "gateway_failure_threshold": 3,
                 "gateway_open_sec": 5.0,
+                "extra_env": {},
+            }
+        ]
+        return
+
+    if args.command == "start-job-orchestrator":
+        assert ctl._cmd_start_job_orchestrator(args) == 0
+        assert job_orchestrator_calls == [
+            {
+                "root": tmp_path.resolve(),
+                "bind": expected_bind,
+                "infocenter_addr": expected_infocenter,
+                "node_id": "job-orchestrator-01",
+                "service_name": "job-orchestrator",
+                "queue_capacity": 4000,
+                "node_tags": "job",
+                "node_version": "v1",
                 "extra_env": {},
             }
         ]
@@ -994,6 +1213,21 @@ def test_cmd_start_gateway_requires_explicit_infocenter_target(tmp_path, monkeyp
 
     with pytest.raises(RuntimeError, match="start-gateway requires --infocenter-addr"):
         ctl._cmd_start_gateway(args)
+
+
+def test_cmd_start_job_orchestrator_requires_explicit_infocenter_target(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-job-orchestrator",
+    ])
+
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="start-job-orchestrator requires --infocenter-addr"):
+        ctl._cmd_start_job_orchestrator(args)
 
 
 def test_spawn_server_passes_env_overrides(tmp_path, monkeypatch):

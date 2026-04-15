@@ -30,7 +30,8 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port as _net_format_host_port
 from pycloud_parallel.controlplane.netutil import resolve_public_host, split_host_port as _net_split_host_port
-from pycloud_parallel.controlplane.object_ref import normalize_object_id
+from pycloud_parallel.controlplane.data_ref import maybe_data_ref
+from pycloud_parallel.controlplane.object_ref import normalize_object_format, normalize_object_id, object_format_suffix, object_storage_path
 from pycloud_parallel.controlplane.state import (
     _code_index_link_path,
     _code_index_meta_path,
@@ -44,7 +45,15 @@ class _CtlArgumentParser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         if args is not None:
             argv = list(args)
-            local_commands = {"start", "start-infocenter", "start-gateway", "start-controlplane", "start-node", "restart"}
+            local_commands = {
+                "start",
+                "start-infocenter",
+                "start-gateway",
+                "start-controlplane",
+                "start-job-orchestrator",
+                "start-node",
+                "restart",
+            }
             command_index = next((idx for idx, token in enumerate(argv) if token in local_commands), -1)
             if command_index > 0:
                 moved = False
@@ -259,17 +268,19 @@ def _pid_names(root: Path) -> List[str]:
 def _process_sort_key(name: str) -> Tuple[int, str]:
     if name.startswith("node-"):
         return (0, name)
-    if name == "gateway":
+    if name == "job-orchestrator":
         return (1, name)
-    if name == "controlplane":
+    if name == "gateway":
         return (2, name)
-    if name == "infocenter":
+    if name == "controlplane":
         return (3, name)
+    if name == "infocenter":
+        return (4, name)
     return (4, name)
 
 
 def _managed_process_names(root: Path) -> List[str]:
-    names = {"controlplane", "node-1", "node-2"}
+    names = {"controlplane", "job-orchestrator", "node-1", "node-2"}
     names.update(_pid_names(root))
     return sorted(names, key=_process_sort_key)
 
@@ -291,6 +302,7 @@ def _stop_all_managed_processes(root: Path) -> None:
 def _default_named_ports(args: argparse.Namespace) -> Dict[str, int]:
     return {
         "controlplane": int(args.controlplane_port),
+        "job-orchestrator": int(args.job_orchestrator_port),
         "node-1-grpc": int(args.node1_port),
         "node-1-http": int(args.node1_http),
         "node-2-grpc": int(args.node2_port),
@@ -421,7 +433,18 @@ def _looks_like_pycloud_process(command: str) -> bool:
 
 def _role_from_command(command: str) -> str:
     match = re.search(r"--role\s+([A-Za-z0-9_-]+)", str(command or ""))
-    return str(match.group(1) if match else "").strip()
+    role = str(match.group(1) if match else "").strip().lower()
+    if role.startswith("info"):
+        return "infocenter"
+    if role.startswith("gate"):
+        return "gateway"
+    if role.startswith("job"):
+        return "joborchestrator"
+    if role.startswith("node"):
+        return "nodecontrol"
+    if role.startswith("cont"):
+        return "controlplane"
+    return role
 
 
 def _node_name_from_command(command: str) -> str:
@@ -463,7 +486,7 @@ def _kill_scanned_port_processes(*, target: str, ports: Iterable[int]) -> List[D
             continue
         node_name = str(row.get("node_name", "") or "").strip()
         role = str(row.get("role", "") or "").strip()
-        if role and role not in {"infocenter", "controlplane", "gateway", "nodecontrol"}:
+        if role and role not in {"infocenter", "controlplane", "gateway", "joborchestrator", "nodecontrol"}:
             continue
         if role == "nodecontrol" and node_name:
             _best_effort_mark_node_lost(target, node_name)
@@ -539,6 +562,28 @@ def _wait_node_registered(infocenter_target: str, node_id: str, timeout_sec: flo
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             nodes = data.get("nodes") or []
             if any(str(item.get("node_id", "")) == node_id for item in nodes if isinstance(item, dict)):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _wait_service_registered(infocenter_target: str, service_name: str, timeout_sec: float) -> bool:
+    target = str(infocenter_target or "").strip()
+    if not target.startswith(("http://", "https://")):
+        target = f"http://{target}"
+    url = (
+        f"{target.rstrip('/')}/services/routes"
+        f"?service_name={quote(str(service_name or '').strip(), safe='')}&healthy_only=true&limit=100"
+    )
+    deadline = time.time() + max(0.1, float(timeout_sec))
+    while time.time() < deadline:
+        try:
+            with urlopen(url, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+            routes = data.get("routes") or []
+            if any(isinstance(item, dict) for item in routes):
                 return True
         except Exception:
             pass
@@ -768,6 +813,52 @@ def _start_gateway(
     _log("OK", f"Gateway started (PID: {pid}, Bind: {bind}, InfoCenter: {infocenter_addr})")
 
 
+def _start_job_orchestrator(
+    root: Path,
+    *,
+    bind: str,
+    infocenter_addr: str,
+    node_id: str = "job-orchestrator-01",
+    service_name: str = "job-orchestrator",
+    queue_capacity: int = NODE_QUEUE_CAPACITY,
+    node_tags: str = "job",
+    node_version: str = "v1",
+    extra_env: Dict[str, str] | None = None,
+) -> None:
+    _assert_bind_available(bind)
+    _log("INFO", f"Starting JobOrchestrator on {bind} (InfoCenter: {infocenter_addr}, service: {service_name})...")
+    pid = _spawn_server(
+        root,
+        _logs_dir(root) / "job-orchestrator.log",
+        [
+            "--role",
+            "joborchestrator",
+            "--bind",
+            bind,
+            "--infocenter-addr",
+            infocenter_addr,
+            "--node-id",
+            node_id,
+            "--service-name",
+            service_name,
+            "--queue-capacity",
+            str(int(queue_capacity)),
+            "--node-tags",
+            node_tags,
+            "--node-version",
+            node_version,
+            "--log-level",
+            "INFO",
+        ],
+        extra_env=extra_env,
+    )
+    if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_service_registered(infocenter_addr, service_name, 0.2)):
+        _remove_pid(_pid_file(root, "job-orchestrator"))
+        raise RuntimeError("JobOrchestrator failed to register to InfoCenter")
+    _write_pid(_pid_file(root, "job-orchestrator"), pid)
+    _log("OK", f"JobOrchestrator started (PID: {pid}, Bind: {bind}, InfoCenter: {infocenter_addr})")
+
+
 def _start_node(
     root: Path,
     name: str,
@@ -944,6 +1035,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     _ensure_runtime_dirs(root)
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
     node1_host = resolve_public_host(str(getattr(args, "node1_host", "") or "") or _default_host_for_args(args))
     node1_http_host = resolve_public_host(str(getattr(args, "node1_http_host", "") or "") or _default_host_for_args(args))
     node2_host = resolve_public_host(str(getattr(args, "node2_host", "") or "") or _default_host_for_args(args))
@@ -955,6 +1047,12 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
     infocenter_target = _format_host_port(controlplane_host, int(args.controlplane_port))
     _start_controlplane(root, args.controlplane_port, bind_host=controlplane_host, remote_hint=infocenter_target, extra_env=extra_env)
+    _start_job_orchestrator(
+        root,
+        bind=_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port)),
+        infocenter_addr=infocenter_target,
+        extra_env=extra_env,
+    )
     time.sleep(2.0)
     worker_capacity = int(args.node_worker_capacity or _env_override_int(extra_env, "PYCLOUD_NODE_WORKER_CAPACITY", _default_node_worker_capacity()))
     queue_capacity = _env_override_int(extra_env, "PYCLOUD_NODE_QUEUE_CAPACITY", NODE_QUEUE_CAPACITY)
@@ -1003,6 +1101,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     print("============================================")
     print()
     print(f"  ControlPlane: {_format_host_port(controlplane_host, int(args.controlplane_port))}")
+    print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
     print(
         f"  Node-1:      {_format_host_port(node1_host, int(args.node1_port))} "
         f"(HTTP: {_format_host_port(node1_http_host, int(args.node1_http))})"
@@ -1021,7 +1120,7 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
     target = str(getattr(args, "target", "") or f"127.0.0.1:{int(args.controlplane_port)}")
     for name in _managed_process_names(root):
-        if name not in {"controlplane", "gateway", "infocenter"}:
+        if name not in {"controlplane", "gateway", "infocenter", "job-orchestrator"}:
             _best_effort_mark_node_lost(target, name)
     _stop_all_managed_processes(root)
     if bool(getattr(args, "scan_ports", False)):
@@ -1104,6 +1203,36 @@ def _cmd_start_controlplane(args: argparse.Namespace) -> int:
         gateway_refresh_interval_sec=float(args.gateway_refresh_interval_sec),
         gateway_failure_threshold=int(args.gateway_failure_threshold),
         gateway_open_sec=float(args.gateway_open_sec),
+        extra_env=extra_env,
+    )
+    return 0
+
+
+def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    _ensure_runtime_dirs(root)
+    _stop_named_process(root, "job-orchestrator")
+    extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
+    infocenter_addr = str(getattr(args, "infocenter_addr", "") or "").strip()
+    if not infocenter_addr:
+        raise RuntimeError("start-job-orchestrator requires --infocenter-addr")
+    bind = _resolve_bind_value(
+        str(args.bind),
+        host=str(getattr(args, "host", "") or ""),
+        port=int(getattr(args, "port", 0) or 0),
+        label="job orchestrator bind",
+        remote_hint=infocenter_addr,
+        prefer_local=bool(getattr(args, "local", False)),
+    )
+    _start_job_orchestrator(
+        root,
+        bind=bind,
+        infocenter_addr=infocenter_addr,
+        node_id=str(getattr(args, "node_id", "") or "job-orchestrator-01"),
+        service_name=str(getattr(args, "service_name", "") or "job-orchestrator"),
+        queue_capacity=int(getattr(args, "queue_capacity", NODE_QUEUE_CAPACITY)),
+        node_tags=str(getattr(args, "node_tags", "") or "job"),
+        node_version=str(getattr(args, "node_version", "") or "v1"),
         extra_env=extra_env,
     )
     return 0
@@ -1266,6 +1395,10 @@ def _object_meta_dir(object_dir: Path) -> Path:
     return object_dir / "meta"
 
 
+def _segment_dir(object_dir: Path) -> Path:
+    return object_dir / "segments"
+
+
 def _load_json(path: Path) -> Dict[str, object]:
     try:
         return json.loads(path.read_text(encoding="utf-8") or "{}")
@@ -1282,6 +1415,11 @@ def _parse_iso_datetime(value: object, *, fallback: datetime | None = None) -> d
                 return parsed.replace(tzinfo=timezone.utc)
             return parsed.astimezone(timezone.utc)
     return fallback or datetime.now(timezone.utc)
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 def _format_size_bytes(size_bytes: int) -> str:
@@ -1494,13 +1632,10 @@ def _collect_current_globals_object_ids(artifact_dir: Path) -> set[str]:
             while stack:
                 value = stack.pop()
                 if isinstance(value, dict):
-                    if set(value.keys()) == {"__pycloud_object_ref__"} and isinstance(value.get("__pycloud_object_ref__"), dict):
-                        ref = value["__pycloud_object_ref__"]
-                        raw_id = str(ref.get("object_id", "") or "")
-                        if not raw_id:
-                            continue
+                    ref = maybe_data_ref(value)
+                    if ref is not None:
                         try:
-                            object_id = normalize_object_id(raw_id)
+                            object_id = normalize_object_id(ref.object_id)
                         except ValueError:
                             continue
                         live.add(object_id)
@@ -1510,6 +1645,136 @@ def _collect_current_globals_object_ids(artifact_dir: Path) -> set[str]:
                 if isinstance(value, list):
                     stack.extend(value)
     return live
+
+
+def _collect_active_data_ref_object_ids(target: str) -> set[str]:
+    normalized_target = str(target or "").strip()
+    if not normalized_target:
+        return set()
+    try:
+        from pycloud_parallel.controlplane.client import InfoCenterClient
+
+        with InfoCenterClient(normalized_target, timeout_sec=3.0) as client:
+            refs = list(client.list_data_refs(limit=5000))
+    except Exception:
+        return set()
+
+    live: set[str] = set()
+    for item in refs:
+        if not isinstance(item, dict):
+            continue
+        raw_id = str(item.get("storage_id", "") or item.get("ref_id", "") or "").strip()
+        if not raw_id:
+            continue
+        try:
+            live.add(normalize_object_id(raw_id))
+        except ValueError:
+            continue
+    return live
+
+
+def _object_backing_path_from_meta(object_dir: Path, *, object_id: str, meta: Dict[str, object]) -> Path | None:
+    normalized_id = normalize_object_id(object_id)
+    digest = normalized_id.replace("sha256:", "", 1)
+    fmt = normalize_object_format(str(meta.get("format", "") or "bin"), default="bin")
+    storage_backend = str(meta.get("storage_backend", "file") or "file").strip() or "file"
+    if storage_backend == "segment":
+        relpath = str(meta.get("segment_relpath", "") or "").strip()
+        return (_segment_dir(object_dir).parent / relpath).resolve() if relpath else None
+    candidates = [
+        object_storage_path(object_dir, object_id=normalized_id, fmt=fmt),
+        object_dir / f"{digest}{object_format_suffix(fmt)}",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    subdir = object_dir / digest[:2]
+    if subdir.exists():
+        matches = sorted(path for path in subdir.glob(f"{digest[2:]}*") if path.is_file())
+        if matches:
+            return matches[0]
+    matches = sorted(path for path in object_dir.glob(f"{digest}*") if path.is_file())
+    if matches:
+        return matches[0]
+    return candidates[0]
+
+
+def _segment_ref_rows_from_meta(object_dir: Path, meta_dir: Path) -> Dict[str, List[Dict[str, object]]]:
+    out: Dict[str, List[Dict[str, object]]] = {}
+    for meta_path in sorted(meta_dir.glob("*.json")):
+        meta = _load_json(meta_path)
+        if str(meta.get("storage_backend", "file") or "file").strip() != "segment":
+            continue
+        object_id = str(meta.get("object_id", "") or "").strip()
+        relpath = str(meta.get("segment_relpath", "") or "").strip()
+        if not object_id or not relpath:
+            continue
+        row = {
+            "object_id": object_id,
+            "meta_path": meta_path,
+            "segment_relpath": relpath,
+            "segment_offset": max(0, int(meta.get("segment_offset", 0) or 0)),
+            "segment_length": max(0, int(meta.get("segment_length", meta.get("size_bytes", 0)) or 0)),
+            "size_bytes": max(0, int(meta.get("size_bytes", 0) or 0)),
+        }
+        out.setdefault(relpath, []).append(row)
+    for rows in out.values():
+        rows.sort(key=lambda item: (int(item["segment_offset"]), str(item["object_id"])))
+    return out
+
+
+def _segment_compaction_plan(segment_path: Path, refs: List[Dict[str, object]]) -> Dict[str, object]:
+    live_bytes = sum(int(item.get("segment_length", 0) or 0) for item in refs)
+    file_size = int(segment_path.stat().st_size)
+    current_offset = 0
+    already_compact = live_bytes == file_size
+    if already_compact:
+        for item in refs:
+            length = int(item.get("segment_length", 0) or 0)
+            offset = int(item.get("segment_offset", 0) or 0)
+            if offset != current_offset:
+                already_compact = False
+                break
+            current_offset += length
+    return {
+        "file_size": file_size,
+        "live_bytes": live_bytes,
+        "wasted_bytes": max(0, file_size - live_bytes),
+        "needs_compaction": bool(refs) and not already_compact,
+    }
+
+
+def _compact_segment_file(object_dir: Path, *, relpath: str, refs: List[Dict[str, object]]) -> Dict[str, object]:
+    segment_path = (object_dir / relpath).resolve()
+    plan = _segment_compaction_plan(segment_path, refs)
+    if not plan["needs_compaction"]:
+        return {
+            "segment_relpath": relpath,
+            "path": str(segment_path),
+            **plan,
+            "compacted": False,
+        }
+    tmp_path = segment_path.with_suffix(segment_path.suffix + ".tmp")
+    current_offset = 0
+    with segment_path.open("rb") as src, tmp_path.open("wb") as dst:
+        for ref in refs:
+            src.seek(int(ref["segment_offset"]))
+            blob = src.read(int(ref["segment_length"]))
+            if len(blob) != int(ref["segment_length"]):
+                raise RuntimeError(f"segment compaction failed: truncated read for {ref['object_id']}")
+            dst.write(blob)
+            meta = _load_json(ref["meta_path"])
+            meta["segment_offset"] = current_offset
+            meta["segment_length"] = int(ref["segment_length"])
+            _write_json(ref["meta_path"], meta)
+            current_offset += int(ref["segment_length"])
+    os.replace(tmp_path, segment_path)
+    return {
+        "segment_relpath": relpath,
+        "path": str(segment_path),
+        **plan,
+        "compacted": True,
+    }
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
@@ -1544,6 +1809,10 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     kept_objects: List[Dict[str, object]] = []
     deleted_codes: List[Dict[str, object]] = []
     kept_codes: List[Dict[str, object]] = []
+    deleted_segments: List[Dict[str, object]] = []
+    kept_segments: List[Dict[str, object]] = []
+    compacted_segments: List[Dict[str, object]] = []
+    active_registry_object_ids = _collect_active_data_ref_object_ids(str(getattr(args, "target", "") or "").strip())
 
     if args.scope in ("codes", "all"):
         codes_dir = artifact_dir / "codes"
@@ -1587,32 +1856,41 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     if args.scope in ("objects", "all") and object_dir.exists():
         live_object_ids = _collect_current_globals_object_ids(artifact_dir)
-        for object_path in sorted(path for path in object_dir.iterdir() if path.is_file()):
-            object_id = ""
+        for meta_path in sorted(meta_dir.glob("*.json")) if meta_dir.exists() else []:
+            meta = _load_json(meta_path)
+            object_id = str(meta.get("object_id", "") or "").strip()
+            if not object_id:
+                continue
             try:
-                stem = object_path.name.split(".", 1)[0]
-                object_id = normalize_object_id(f"sha256:{stem}")
+                object_id = normalize_object_id(object_id)
             except Exception:
                 continue
-
-            meta_path = meta_dir / f"{object_path.name.split('.', 1)[0]}.json"
-            meta = _load_json(meta_path)
+            backing_path = _object_backing_path_from_meta(object_dir, object_id=object_id, meta=meta)
             last_at_raw = str(meta.get("last_at", "") or "").strip()
             try:
                 last_at = datetime.fromisoformat(last_at_raw)
                 if last_at.tzinfo is None:
                     last_at = last_at.replace(tzinfo=timezone.utc)
             except Exception:
-                last_at = datetime.fromtimestamp(object_path.stat().st_mtime, tz=timezone.utc)
+                if backing_path is not None and backing_path.exists():
+                    last_at = datetime.fromtimestamp(backing_path.stat().st_mtime, tz=timezone.utc)
+                else:
+                    last_at = datetime.now(timezone.utc)
+            storage_backend = str(meta.get("storage_backend", "file") or "file").strip() or "file"
 
             row = {
                 "object_id": object_id,
-                "path": str(object_path),
-                "size_bytes": int(object_path.stat().st_size),
+                "path": str(backing_path) if backing_path is not None else "",
+                "storage_backend": storage_backend,
+                "size_bytes": int(meta.get("size_bytes", 0) or (backing_path.stat().st_size if backing_path is not None and backing_path.exists() else 0)),
                 "last_at": last_at.astimezone(timezone.utc).isoformat(),
             }
             if object_id in live_object_ids:
                 row["reason"] = "referenced_by_current_globals"
+                kept_objects.append(row)
+                continue
+            if object_id in active_registry_object_ids:
+                row["reason"] = "referenced_by_active_data_ref"
                 kept_objects.append(row)
                 continue
             if last_at >= cutoff:
@@ -1622,9 +1900,48 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             deleted_objects.append(row)
             if not args.dry_run:
                 with contextlib.suppress(FileNotFoundError):
-                    object_path.unlink()
-                with contextlib.suppress(FileNotFoundError):
                     meta_path.unlink()
+                if storage_backend != "segment" and backing_path is not None:
+                    with contextlib.suppress(FileNotFoundError):
+                        backing_path.unlink()
+
+        segment_refs = _segment_ref_rows_from_meta(object_dir, meta_dir)
+        segments_root = _segment_dir(object_dir)
+        if segments_root.exists():
+            for segment_path in sorted(path for path in segments_root.glob("**/*") if path.is_file()):
+                relpath = str(segment_path.resolve().relative_to(object_dir.resolve()))
+                refs = segment_refs.get(relpath, [])
+                if not refs:
+                    row = {
+                        "segment_relpath": relpath,
+                        "path": str(segment_path),
+                        "size_bytes": int(segment_path.stat().st_size),
+                        "reason": "orphan_segment",
+                    }
+                    deleted_segments.append(row)
+                    if not args.dry_run:
+                        with contextlib.suppress(FileNotFoundError):
+                            segment_path.unlink()
+                    continue
+                plan = _segment_compaction_plan(segment_path, refs)
+                segment_row = {
+                    "segment_relpath": relpath,
+                    "path": str(segment_path),
+                    "size_bytes": int(segment_path.stat().st_size),
+                    "live_bytes": int(plan["live_bytes"]),
+                    "wasted_bytes": int(plan["wasted_bytes"]),
+                }
+                if plan["needs_compaction"] and (not args.dry_run):
+                    compacted = _compact_segment_file(object_dir, relpath=relpath, refs=refs)
+                    compacted_segments.append(compacted)
+                    segment_row["reason"] = "compacted"
+                    kept_segments.append(segment_row)
+                    continue
+                if plan["needs_compaction"]:
+                    segment_row["reason"] = "needs_compaction"
+                else:
+                    segment_row["reason"] = "in_use"
+                kept_segments.append(segment_row)
 
     payload = {
         "ok": True,
@@ -1632,8 +1949,12 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         "dry_run": bool(args.dry_run),
         "scope": args.scope,
         "older_than_hours": int(args.older_than_hours),
+        "target": str(getattr(args, "target", "") or "").strip(),
         "deleted_objects": deleted_objects,
         "kept_objects": kept_objects,
+        "deleted_segments": deleted_segments,
+        "kept_segments": kept_segments,
+        "compacted_segments": compacted_segments,
         "deleted_codes": deleted_codes,
         "kept_codes": kept_codes,
     }
@@ -1668,6 +1989,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_local_argument(parser, dest="_global_local")
     parser.add_argument("--controlplane-host", default="", help="bind host used by `pycloudctl start` for controlplane; default auto-detects local IP")
     parser.add_argument("--controlplane-port", type=int, default=50051, help="bind port used by `pycloudctl start` for controlplane")
+    parser.add_argument("--job-orchestrator-host", default="", help="bind host used by `pycloudctl start` for job-orchestrator; default auto-detects local IP")
+    parser.add_argument("--job-orchestrator-port", type=int, default=50053, help="bind port used by `pycloudctl start` for job-orchestrator")
     parser.add_argument("--node1-host", default="", help="bind host used by `pycloudctl start` for node-1 gRPC; default auto-detects local IP")
     parser.add_argument("--node1-port", "--node1-grpc-port", type=int, default=50061, help="bind port used by `pycloudctl start` for node-1 gRPC")
     parser.add_argument("--node1-http-host", default="", help="bind host used by `pycloudctl start` for node-1 service HTTP; default auto-detects local IP")
@@ -1707,6 +2030,18 @@ def build_parser() -> argparse.ArgumentParser:
     start_controlplane.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0, help="gateway route refresh interval in seconds for embedded gateway state")
     start_controlplane.add_argument("--gateway-failure-threshold", type=int, default=3, help="circuit-breaker failure threshold for embedded gateway state")
     start_controlplane.add_argument("--gateway-open-sec", type=float, default=5.0, help="circuit-breaker open duration in seconds for embedded gateway state")
+    start_job_orchestrator = subparsers.add_parser("start-job-orchestrator", help="start one local job-orchestrator process")
+    _add_local_argument(start_job_orchestrator)
+    _add_env_argument(start_job_orchestrator)
+    start_job_orchestrator.add_argument("--bind", default="0.0.0.0:50053", help="full bind address in host:port form for start-job-orchestrator; wildcard hosts auto-resolve to the local IP")
+    start_job_orchestrator.add_argument("--host", default="", help="optional bind host override for start-job-orchestrator; default auto-detects local IP")
+    start_job_orchestrator.add_argument("--port", type=int, default=0, help="optional bind port override for start-job-orchestrator")
+    start_job_orchestrator.add_argument("--infocenter-addr", default="", help="InfoCenter target; required for job-orchestrator registration")
+    start_job_orchestrator.add_argument("--node-id", default="job-orchestrator-01", type=_normalize_managed_name, help="managed node id advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--service-name", default="job-orchestrator", help="service name registered by job-orchestrator")
+    start_job_orchestrator.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="queue capacity advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--node-tags", default="job", help="comma-separated node tags advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--node-version", default="v1", help="node version string advertised by job-orchestrator")
     start_node = subparsers.add_parser("start-node", help="start one local nodecontrol process")
     _add_local_argument(start_node)
     _add_env_argument(start_node)
@@ -1754,13 +2089,14 @@ def build_parser() -> argparse.ArgumentParser:
     cache_list_parser.add_argument("--json", action="store_true", help="print JSON instead of human-readable text")
     gc_parser = subparsers.add_parser("gc", help="garbage collect cached object files")
     gc_parser.add_argument("--artifact-dir", default="", help="artifact/code cache directory (default: <runtime-root>/code_cache)")
+    gc_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target used to preserve active DataRef-backed objects during gc")
     gc_parser.add_argument("--scope", choices=["codes", "objects", "all"], default="all")
     gc_parser.add_argument("--older-than-hours", type=int, default=24 * 7)
     gc_parser.add_argument("--dry-run", action="store_true")
     gc_parser.add_argument("--force", action="store_true", help="allow destructive gc even if managed local processes are still running")
     parser.epilog = (
         "Environment overrides:\n"
-        "  start / start-infocenter / start-gateway / start-controlplane / start-node / restart\n"
+        "  start / start-infocenter / start-gateway / start-controlplane / start-job-orchestrator / start-node / restart\n"
         "  support repeated '--env KEY=VALUE' arguments. Example:\n"
         "    pycloudctl start --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576"
     )
@@ -1778,6 +2114,8 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_start_gateway(args)
     if args.command == "start-controlplane":
         return _cmd_start_controlplane(args)
+    if args.command == "start-job-orchestrator":
+        return _cmd_start_job_orchestrator(args)
     if args.command == "start-node":
         return _cmd_start_node(args)
     if args.command == "stop":

@@ -217,6 +217,7 @@ from pycloud_parallel import (
    - 原生专属任务池会话
 3. `DedicatedTaskServiceSession`
    - 复用 `ServiceGroup` 的兼容专属池实现
+   - 也支持 owner 侧 `update_globals(...)`
 4. `JobQueueClient`
    - 大任务排队客户端
 5. `GatewayConnect`
@@ -243,6 +244,7 @@ pycloudctl start
 pycloudctl start-controlplane
 pycloudctl start-infocenter
 pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
+pycloudctl start-job-orchestrator --infocenter-addr 127.0.0.1:50051
 pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
 pycloudctl start-node --node-id node-1 --node-port 50061 --service-http-port 18081 --infocenter-addr 127.0.0.1:50051
 pycloudctl status
@@ -256,6 +258,7 @@ pycloudctl stop-node node-1
 pycloudctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
+  --job-orchestrator-port 51053 \
   --node1-port 51061 \
   --node1-http-port 18181 \
   --node2-port 51062 \
@@ -274,7 +277,9 @@ pycloudctl start --runtime-root /tmp/pycloud-dev
 
 - [docs/PYCLOUDCTL_USAGE.md](docs/PYCLOUDCTL_USAGE.md)
 
-如果你要单独起 `infocenter`、`gateway(http)`、`nodecontrol` 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
+`pycloudctl start` 现在会默认把独立 `job-orchestrator` 也一起拉起，方便直接走 `gateway -> job-orchestrator -> TaskPool` 这条任务链路。
+
+如果你要单独起 `infocenter`、`gateway(http)`、`job-orchestrator`、`nodecontrol` 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
 
 如果升级后怀疑旧服务没停掉，先看：
 
@@ -371,7 +376,7 @@ group = DeployedService.deploy_from_infocenter(
 )
 ```
 
-如果你有一份**共享静态数据文件**要跟模块一起部署，当前直接把真实模块对象传给 `entry_module` 即可：
+如果你直接传真实模块对象：
 
 ```python
 import my_job.main
@@ -384,11 +389,16 @@ group = DeployedService.deploy_from_infocenter(
 )
 ```
 
-要求：
+当前自动打包边界：
 
-1. 数据文件放在模块 / package 目录树内
-2. 代码里用 `Path(__file__)` 的相对路径读取
-3. 不要指望单文件 `.py` 模块自动带上旁边的兄弟数据文件
+1. 自动打包只收 `.py / .pyd / .so`
+2. 依赖分析直接基于“已加载 module object + 真实文件”
+3. 非 Python 资源文件不会自动带上
+
+如果你必须一起带 `.csv / .json` 等资源：
+
+1. 预先自行构建 `zip / tar.gz / whl`
+2. 再通过 `artifact_path=<archive file>` 或 `blob=...` 上传
 
 完整说明见 [MODULE_DEPLOY_GUIDE.md](docs/MODULE_DEPLOY_GUIDE.md)。
 
@@ -434,7 +444,7 @@ with TaskPoolSession.from_infocenter(
 
 说明：
 
-1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_callable`
+1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
 2. `pool.methods` 会返回这个单一方法名
 3. 如果你手动传 `task_method=...`，它现在会做严格校验；方法名不匹配会直接报错，不再静默回退
 
@@ -450,9 +460,46 @@ with TaskPoolSession.from_infocenter(
 常见高层 helper：
 
 1. `submit_job_from_bytes(...)`
-2. `submit_job_from_func(...)`
-3. `submit_job_from_module(...)`
+2. `submit_job_from_module(...)`
+3. `get_job_status(...)`
 4. `wait_for_terminal(...)`
+
+job module 约定：
+
+1. `run(payload...)`
+   - 必选，子任务入口
+2. `task_generator(...)`
+   - 必选
+   - 返回 `list[dict]` 或 payload 迭代器
+3. `update_globals(...)`
+   - 可选
+   - 只负责在 job-orch 端生成共享数据 `dict`
+4. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+   - 可选，增量聚合结果
+5. `finalize(state=..., ...)`
+   - 可选，生成最终 `final_result`
+6. `apply_managed_globals(values, **context)`
+   - 可选
+   - 在 node/worker 端运行
+   - 负责决定共享数据怎么作用到 runtime
+   - 返回 `None` 时不做默认 raw assign
+   - 返回 `dict` 时再把这个 dict 写回入口模块 A 的 globals
+
+说明：
+
+1. `job_payload` 是可选 `dict`
+2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
+4. `apply_managed_globals` 不需要通过 payload 传，worker 固定按约定名在入口模块 A 里查找
+5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
+6. `submit_job_from_module(...)` 自动打包时只会收 `.py / .pyd / .so`
+7. 如果 job 依赖非 Python 资源文件，请预先自行构建归档后再上传
+
+本地调试自动打包结果：
+
+```bash
+python scripts/debug_package_module.py calc_asset_ratio_job_module
+```
 
 ### 4. Gateway 调用
 

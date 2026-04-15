@@ -11,6 +11,7 @@
    - 内部常驻函数服务层
 3. `JobQueue Mode`
    - 大任务排队与单活调度层
+   - `JobQueueClient` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
 4. `TaskPool Mode`
    - 子任务执行层
 
@@ -94,7 +95,8 @@
 1. 大任务先入队
 2. 同一时刻只放行一个大任务进入 `RUNNING`
 3. 放行后再创建 `TaskPoolSession`
-4. 由 driver 生成 subtasks，交给 pool 执行
+4. 由 job module 的 `task_generator` 生成 payloads，交给 pool 执行
+5. 可选通过 `update_globals` 先向 worker 广播共享全局数据
 
 当前推荐入口：
 

@@ -11,13 +11,23 @@ from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
+from pycloud_parallel.controlplane.data_ref import coerce_data_ref
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import resolve_public_host
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
-from pycloud_parallel.controlplane.state import InfoCenterState, NodeMetricsState, NodeServiceState, NodeTaskPoolInfo, utc_now
+from pycloud_parallel.controlplane.state import (
+    DataRegistryEntry,
+    InfoCenterState,
+    NodeMetricsState,
+    NodeServiceState,
+    NodeTaskPoolInfo,
+    utc_now,
+)
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -207,6 +217,34 @@ def _serialize_node(state) -> Dict[str, object]:
     }
 
 
+def _serialize_data_registry_entry(entry: DataRegistryEntry) -> Dict[str, object]:
+    return {
+        "ref_id": str(entry.ref_id or ""),
+        "storage_id": str(entry.storage_id or ""),
+        "logical_type": str(entry.logical_type or ""),
+        "format": str(entry.format or ""),
+        "size_bytes": int(entry.size_bytes or 0),
+        "materialize_as": str(entry.materialize_as or ""),
+        "locator_kind": str(entry.locator_kind or ""),
+        "locator_token": str(entry.locator_token or ""),
+        "consume_on_read": bool(entry.consume_on_read),
+        "node_id": str(entry.node_id or ""),
+        "node_instance_id": str(entry.node_instance_id or ""),
+        "control_addr": str(entry.control_addr or ""),
+        "replicas": [
+            {
+                "node_id": str(item.get("node_id", "") or ""),
+                "node_instance_id": str(item.get("node_instance_id", "") or ""),
+                "control_addr": str(item.get("control_addr", "") or ""),
+            }
+            for item in (entry.replicas or ())
+        ],
+        "created_at": _dt_text(entry.created_at),
+        "last_at": _dt_text(entry.last_at),
+        "ttl_sec": int(entry.ttl_sec or 0),
+    }
+
+
 def _parse_service_timing_metrics(node_metadata: Dict[str, object]) -> Dict[str, Dict[str, object]]:
     raw = str((node_metadata or {}).get("service_timing_metrics", "") or "").strip()
     if not raw:
@@ -241,6 +279,40 @@ def _parse_task_pool_timing_metrics(node_metadata: Dict[str, object]) -> Dict[st
     return out
 
 
+def _parse_job_recent_entries(node_metadata: Dict[str, object]) -> List[Dict[str, object]]:
+    raw = str((node_metadata or {}).get("job_recent", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    out: List[Dict[str, object]] = []
+    for item in payload:
+        if isinstance(item, dict):
+            out.append(dict(item))
+    return out
+
+
+def _parse_job_waiting_entries(node_metadata: Dict[str, object]) -> List[Dict[str, object]]:
+    raw = str((node_metadata or {}).get("job_waiting_list", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    out: List[Dict[str, object]] = []
+    for item in payload:
+        if isinstance(item, dict):
+            out.append(dict(item))
+    return out
+
+
 def _pycloud_version() -> str:
     try:
         return str(importlib_metadata.version("pycloud-parallel"))
@@ -248,11 +320,116 @@ def _pycloud_version() -> str:
         return "unknown"
 
 
-def _render_ops_page(state: InfoCenterState) -> str:
+def _job_detail_link(http_base_url: str, job_id: object) -> str:
+    base = str(http_base_url or "").strip().rstrip("/")
+    normalized_job_id = str(job_id or "").strip()
+    if not base or not normalized_job_id:
+        return html.escape(normalized_job_id or "-")
+    return (
+        f"<a href='{html.escape(base)}/jobs/{html.escape(normalized_job_id)}?view=html' target='_blank'>"
+        f"{html.escape(normalized_job_id)}</a>"
+    )
+
+
+def _job_queue_service_http_base(state: InfoCenterState, owner: str) -> str:
+    normalized = str(owner or "").strip()
+    if normalized == "embedded":
+        return ""
+    for node in state.list_nodes(healthy_only=False, tags=(), limit=10000):
+        if str(getattr(node, "node_instance_id", "") or "") != normalized:
+            continue
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        if str(metadata.get("component", "") or "").strip() != "job-orchestrator":
+            continue
+        for svc in getattr(node, "services", {}).values():
+            if str(getattr(svc, "service_name", "") or "") == "job-orchestrator" and str(getattr(svc, "http_base_url", "") or "").strip():
+                return str(getattr(svc, "http_base_url", "") or "").strip().rstrip("/")
+    return ""
+
+
+def _reorder_job_via_http(http_base_url: str, job_id: str, *, direction: str) -> Dict[str, object]:
+    base = str(http_base_url or "").strip().rstrip("/")
+    if not base:
+        raise RuntimeError("job orchestrator route has no http_base_url")
+    raw = json.dumps({"job_id": str(job_id or "").strip(), "direction": str(direction or "").strip()}).encode("utf-8")
+    req = Request(
+        f"{base}/call/reorder_job?timeout_sec=5.000",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=raw,
+    )
+    with urlopen(req, timeout=6.0) as resp:
+        payload = json.loads(resp.read().decode("utf-8") or "{}")
+    if not isinstance(payload, dict) or not payload.get("ok", False):
+        raise RuntimeError(str((payload or {}).get("error", "reorder failed")))
+    return payload
+
+
+def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager] = None) -> str:
     nodes = state.list_nodes(healthy_only=False, tags=(), limit=10000)
     node_rows: List[str] = []
     service_rows: List[str] = []
     pool_entries: List[tuple] = []
+    job_queue_rows: List[str] = []
+    recent_job_rows: List[tuple] = []
+    waiting_job_rows: List[tuple] = []
+    if job_queue is not None:
+        summary = dict(job_queue.summary() or {})
+        job_queue_rows.append(
+            "<tr>"
+            "<td>embedded</td>"
+            "<td>-</td>"
+            "<td>yes</td>"
+            "<td>-</td>"
+            f"<td>{html.escape(str(summary.get('current_job_id', '') or '-'))}</td>"
+            f"<td>{html.escape(str(summary.get('current_job_status', '') or '-'))}</td>"
+            f"<td>{int(summary.get('waiting', 0) or 0)}</td>"
+            f"<td>{int(summary.get('running', 0) or 0)}</td>"
+            f"<td>{int(summary.get('terminal', 0) or 0)}</td>"
+            f"<td>{int(summary.get('job_count', 0) or 0)}</td>"
+            "<td>-</td>"
+            "</tr>"
+        )
+        for item in summary.get("recent_jobs") or []:
+            if not isinstance(item, dict):
+                continue
+            recent_job_rows.append(
+                (
+                    str(item.get("submitted_at", "") or ""),
+                    "<tr>"
+                    "<td>embedded</td>"
+                    "<td>-</td>"
+                    f"<td>{html.escape(str(item.get('job_id', '') or '-'))}</td>"
+                    f"<td>{html.escape(str(item.get('status', '') or '-'))}</td>"
+                    f"<td>{html.escape(str(item.get('submitted_at', '') or '-'))}</td>"
+                    f"<td>{html.escape(str(item.get('finished_at', '') or '-'))}</td>"
+                    f"<td>{html.escape(str(item.get('final_result_preview', '') or '-'))}</td>"
+                    f"<td>{html.escape(str(item.get('error_preview', '') or '-'))}</td>"
+                    "</tr>"
+                )
+            )
+        waiting_jobs = list(summary.get("waiting_jobs") or [])
+        for idx, item in enumerate(waiting_jobs):
+            if not isinstance(item, dict):
+                continue
+            job_id = str(item.get("job_id", "") or "")
+            waiting_job_rows.append(
+                (
+                    int(item.get("position", idx + 1) or (idx + 1)),
+                    "<tr>"
+                    "<td>embedded</td>"
+                    "<td>-</td>"
+                    f"<td>{html.escape(job_id or '-')}</td>"
+                    f"<td>{html.escape(str(item.get('priority', 0) or 0))}</td>"
+                    f"<td>{html.escape(str(item.get('submitted_at', '') or '-'))}</td>"
+                    f"<td>{html.escape(str(item.get('position', idx + 1) or (idx + 1)))}</td>"
+                    "<td>"
+                    f"<form method='post' action='/ops/job-queues/embedded/jobs/{html.escape(job_id)}/move-up' style='display:inline'><button type='submit'>up</button></form> "
+                    f"<form method='post' action='/ops/job-queues/embedded/jobs/{html.escape(job_id)}/move-down' style='display:inline'><button type='submit'>down</button></form>"
+                    "</td>"
+                    "</tr>"
+                )
+            )
     for node in nodes:
         services = sorted(node.services.values(), key=lambda item: (item.service_name, item.service_id))
         task_pools = sorted(node.task_pools.values(), key=lambda item: (item.created_at, item.pool_name, item.pool_id), reverse=True)
@@ -312,26 +489,10 @@ def _render_ops_page(state: InfoCenterState) -> str:
                 f"<td>{svc.in_flight if node_healthy else 0}</td>"
                 f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_setup_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_build_execute_spec_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_executor_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_finalize_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_child_decode_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_child_invoke_ms', timing.get('last_invoke_ms', '-'))))}</td>"
-                f"<td>{html.escape(str(timing.get('last_child_encode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_setup_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_build_execute_spec_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_executor_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_finalize_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('max_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_invoke_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_method', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_error_type', '-')))}</td>"
                 f"<td>{html.escape(_dt_text(svc.lease_expire_at))}</td>"
                 f"<td>{html.escape(svc.http_base_url or '-')}</td>"
                 "</tr>"
@@ -353,49 +514,100 @@ def _render_ops_page(state: InfoCenterState) -> str:
                 f"<td>{int(getattr(pool, 'inflight', 0) or 0)}</td>"
                 f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_setup_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_build_execute_spec_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_executor_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_finalize_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_child_decode_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_child_invoke_ms', timing.get('last_invoke_ms', '-'))))}</td>"
-                f"<td>{html.escape(str(timing.get('last_child_encode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_setup_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_build_execute_spec_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_executor_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_finalize_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('max_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_invoke_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_method', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('last_error_type', '-')))}</td>"
                 f"<td>{html.escape(pool.code_version[:20] + ('...' if len(pool.code_version) > 20 else ''))}</td>"
                 f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.lease_expire_at))}</td>"
                 "</tr>"
             ))
+        metadata = dict(node.metadata or {})
+        component = str(metadata.get("component", "") or "").strip()
+        if component == "job-orchestrator":
+            job_service = next((svc for svc in services if svc.service_name == "job-orchestrator"), None)
+            job_waiting = str(metadata.get("job_waiting", "0") or "0")
+            job_running = str(metadata.get("job_running", "0") or "0")
+            job_terminal = str(metadata.get("job_terminal", "0") or "0")
+            job_queue_rows.append(
+                "<tr>"
+                f"<td>{html.escape(node.node_id)}</td>"
+                f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
+                f"<td>{'yes' if node_healthy else 'no'}</td>"
+                f"<td>{html.escape(str(metadata.get('pycloud_version', '-') or '-'))}</td>"
+                f"<td>{html.escape(str(metadata.get('current_job_id', '') or '-'))}</td>"
+                f"<td>{html.escape(str(metadata.get('current_job_status', '') or '-'))}</td>"
+                f"<td>{html.escape(job_waiting)}</td>"
+                f"<td>{html.escape(job_running)}</td>"
+                f"<td>{html.escape(job_terminal)}</td>"
+                f"<td>{html.escape(str(sum(int(value or 0) for value in (job_waiting, job_running, job_terminal))))}</td>"
+                f"<td>{html.escape((job_service.http_base_url if job_service is not None else '') or '-')}</td>"
+                "</tr>"
+            )
+            for item in _parse_job_recent_entries(metadata):
+                job_http_base = job_service.http_base_url if job_service is not None else ""
+                recent_job_rows.append(
+                    (
+                        str(item.get("submitted_at", "") or ""),
+                        "<tr>"
+                        f"<td>{html.escape(node.node_id)}</td>"
+                        f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
+                        f"<td>{_job_detail_link(job_http_base, item.get('job_id', ''))}</td>"
+                        f"<td>{html.escape(str(item.get('status', '') or '-'))}</td>"
+                        f"<td>{html.escape(str(item.get('submitted_at', '') or '-'))}</td>"
+                        f"<td>{html.escape(str(item.get('finished_at', '') or '-'))}</td>"
+                        f"<td>{html.escape(str(item.get('final_result_preview', '') or '-'))}</td>"
+                        f"<td>{html.escape(str(item.get('error_preview', '') or '-'))}</td>"
+                        "</tr>"
+                    )
+                )
+            for idx, item in enumerate(_parse_job_waiting_entries(metadata)):
+                if not isinstance(item, dict):
+                    continue
+                job_id = str(item.get("job_id", "") or "")
+                waiting_job_rows.append(
+                    (
+                        int(item.get("position", idx + 1) or (idx + 1)),
+                        "<tr>"
+                        f"<td>{html.escape(node.node_id)}</td>"
+                        f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
+                        f"<td>{_job_detail_link(job_service.http_base_url if job_service is not None else '', job_id)}</td>"
+                        f"<td>{html.escape(str(item.get('priority', 0) or 0))}</td>"
+                        f"<td>{html.escape(str(item.get('submitted_at', '') or '-'))}</td>"
+                        f"<td>{html.escape(str(item.get('position', idx + 1) or (idx + 1)))}</td>"
+                        "<td>"
+                        f"<form method='post' action='/ops/job-queues/{html.escape(getattr(node, 'node_instance_id', '-') or '-')}/jobs/{html.escape(job_id)}/move-up' style='display:inline'><button type='submit'>up</button></form> "
+                        f"<form method='post' action='/ops/job-queues/{html.escape(getattr(node, 'node_instance_id', '-') or '-')}/jobs/{html.escape(job_id)}/move-down' style='display:inline'><button type='submit'>down</button></form>"
+                        "</td>"
+                        "</tr>"
+                    )
+                )
     node_body = "\n".join(node_rows) or "<tr><td colspan='21'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='33'>no services</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='17'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
-    pool_body = "\n".join(pool_rows) or "<tr><td colspan='28'>no task pools</td></tr>"
+    pool_body = "\n".join(pool_rows) or "<tr><td colspan='18'>no task pools</td></tr>"
+    job_queue_body = "\n".join(job_queue_rows) or "<tr><td colspan='11'>no job queues</td></tr>"
+    recent_job_rows.sort(key=lambda item: item[0], reverse=True)
+    recent_job_body = "\n".join(row for _sort_key, row in recent_job_rows) or "<tr><td colspan='8'>no recent jobs</td></tr>"
+    waiting_job_rows.sort(key=lambda item: item[0])
+    waiting_job_body = "\n".join(row for _sort_key, row in waiting_job_rows) or "<tr><td colspan='7'>no waiting jobs</td></tr>"
     return (
-        "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
+        "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='10'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
-        "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;}th{background:#f5f5f5;text-align:left;}"
+        "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}"
+        "th{background:#f5f5f5;text-align:left;}"
         "h2{margin-top:28px;} .muted{color:#666;} .section-note{color:#555;font-size:12px;margin:6px 0 10px;}"
         ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
         "</head><body>"
         f"<h1>InfoCenter Ops</h1><div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
+        "<div class='section-note'>auto_refresh_sec=10</div>"
         "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
-        "Service table below shows each deployed service instance, worker process counts, and aggregated timing metrics. "
+        "Service table below shows each deployed service instance, worker process counts, and reduced timing metrics. "
         "Task pool table shows native temporary pools running on each node. "
-        "Timing details are split into setup/build-execute-spec/executor/finalize plus child decode/invoke/encode segments. "
+        "Timing columns keep only average total latency plus child decode/invoke/encode averages. "
         "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         "<table><thead><tr>"
         "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>"
@@ -403,15 +615,35 @@ def _render_ops_page(state: InfoCenterState) -> str:
         "</tr></thead><tbody>"
         f"{node_body}"
         "</tbody></table>"
+        "<h2>Job Queue</h2>"
+        "<div class='section-note'>Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.</div>"
+        "<table><thead><tr>"
+        "<th>owner</th><th>instance_id</th><th>healthy</th><th>pycloud</th><th>current_job_id</th><th>current_status</th><th>waiting</th><th>running</th><th>terminal</th><th>job_count</th><th>http_base_url</th>"
+        "</tr></thead><tbody>"
+        f"{job_queue_body}"
+        "</tbody></table>"
+        "<h2>Recent Jobs</h2>"
+        "<table><thead><tr>"
+        "<th>owner</th><th>instance_id</th><th>job_id</th><th>status</th><th>submitted_at</th><th>finished_at</th><th>final_result</th><th>error</th>"
+        "</tr></thead><tbody>"
+        f"{recent_job_body}"
+        "</tbody></table>"
+        "<h2>Waiting Jobs</h2>"
+        "<div class='section-note'>Only waiting jobs can be reordered. Running jobs keep their current slot.</div>"
+        "<table><thead><tr>"
+        "<th>owner</th><th>instance_id</th><th>job_id</th><th>priority</th><th>submitted_at</th><th>position</th><th>actions</th>"
+        "</tr></thead><tbody>"
+        f"{waiting_job_body}"
+        "</tbody></table>"
         "<h2>Service Instances</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_build_execute_spec_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>last_child_decode_ms</th><th>last_child_invoke_ms</th><th>last_child_encode_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_build_execute_spec_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>lease_expire_at</th><th>http_base_url</th>"
+        "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>lease_expire_at</th><th>http_base_url</th>"
         "</tr></thead><tbody>"
         f"{service_body}"
         "</tbody></table>"
         "<h2>Task Pools</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>last_total_ms</th><th>last_setup_ms</th><th>last_build_execute_spec_ms</th><th>last_executor_ms</th><th>last_finalize_ms</th><th>last_child_decode_ms</th><th>last_child_invoke_ms</th><th>last_child_encode_ms</th><th>avg_total_ms</th><th>avg_setup_ms</th><th>avg_build_execute_spec_ms</th><th>avg_executor_ms</th><th>avg_finalize_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>max_total_ms</th><th>last_invoke_ms</th><th>last_method</th><th>last_error_type</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th>"
+        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th>"
         "</tr></thead><tbody>"
         f"{pool_body}"
         "</tbody></table></body></html>"
@@ -511,6 +743,85 @@ class InfoCenterHttpServer:
                         return
                     self._send_json(200, {"ok": True, "accepted": True, "next_heartbeat_in_sec": state.heartbeat_interval_sec})
                     return
+                if parsed.path == "/data/register":
+                    payload = self._read_json()
+                    if payload is None:
+                        return
+                    try:
+                        ref_payload = payload.get("ref")
+                        entry = state.register_data_ref_record(
+                            ref=coerce_data_ref(ref_payload),
+                            ttl_sec=max(1, int(payload.get("ttl_sec", 3600) or 3600)),
+                            node_id=str(payload.get("node_id", "") or "").strip(),
+                            node_instance_id=str(payload.get("node_instance_id", "") or "").strip(),
+                            control_addr=str(payload.get("control_addr", "") or "").strip(),
+                            locator_kind=str(payload.get("locator_kind", "") or "").strip(),
+                            locator_token=str(payload.get("locator_token", "") or "").strip(),
+                            replicas=list(payload.get("replicas") or ()),
+                        )
+                    except Exception as exc:
+                        self._send_json(400, {"ok": False, "error": str(exc)})
+                        return
+                    pin_targets = list(entry.replicas or ())
+                    if not pin_targets and str(entry.control_addr or "").strip():
+                        pin_targets = [{"control_addr": str(entry.control_addr or "").strip()}]
+                    for item in pin_targets:
+                        control_addr = str(item.get("control_addr", "") or "").strip()
+                        if not control_addr:
+                            continue
+                        try:
+                            with NodeControlClient(control_addr, timeout_sec=5.0) as client:
+                                client.pin_object(
+                                    object_id=str(entry.storage_id or entry.ref_id or ""),
+                                    ref_id=str(entry.ref_id or ""),
+                                )
+                        except Exception:
+                            continue
+                    self._send_json(200, {"ok": True, "entry": _serialize_data_registry_entry(entry)})
+                    return
+                if parsed.path == "/data/touch":
+                    payload = self._read_json()
+                    if payload is None:
+                        return
+                    try:
+                        entry = state.touch_data_ref_record(str(payload.get("ref_id", "") or "").strip())
+                    except KeyError:
+                        self._send_json(404, {"ok": False, "error": "data ref not found"})
+                        return
+                    except Exception as exc:
+                        self._send_json(400, {"ok": False, "error": str(exc)})
+                        return
+                    self._send_json(200, {"ok": True, "entry": _serialize_data_registry_entry(entry)})
+                    return
+                if parsed.path == "/data/release":
+                    payload = self._read_json()
+                    if payload is None:
+                        return
+                    ref_id = str(payload.get("ref_id", "") or "").strip()
+                    try:
+                        entry = state.resolve_data_ref_record(ref_id)
+                    except KeyError:
+                        self._send_json(404, {"ok": False, "error": "data ref not found"})
+                        return
+                    released = state.release_data_ref_record(ref_id)
+                    if released and bool(entry.consume_on_read):
+                        release_targets = list(entry.replicas or ())
+                        if not release_targets and str(entry.control_addr or "").strip():
+                            release_targets = [{"control_addr": str(entry.control_addr or "").strip()}]
+                        for item in release_targets:
+                            control_addr = str(item.get("control_addr", "") or "").strip()
+                            if not control_addr:
+                                continue
+                            try:
+                                with NodeControlClient(control_addr, timeout_sec=5.0) as client:
+                                    client.release_object_ref(
+                                        object_id=str(entry.storage_id or entry.ref_id or ""),
+                                        ref_id=str(entry.ref_id or ""),
+                                    )
+                            except Exception:
+                                continue
+                    self._send_json(200, {"ok": True, "released": bool(released)})
+                    return
                 if parsed.path == "/jobs/submit":
                     if self.server_ref.job_queue is None:
                         self._send_json(503, {"ok": False, "error": "job queue unavailable"})
@@ -546,6 +857,40 @@ class InfoCenterHttpServer:
                         state.mark_node_lost(node_instance_id, reason="marked lost via ops")
                     else:
                         self._send_json(404, {"ok": False, "error": "unknown ops action"})
+                        return
+                    if "text/html" in (self.headers.get("Accept", "")):
+                        self.send_response(303)
+                        self.send_header("Location", "/ops")
+                        self.end_headers()
+                        return
+                    self._send_json(200, {"ok": True})
+                    return
+                if len(parts) == 6 and parts[:2] == ["ops", "job-queues"] and parts[3] == "jobs":
+                    owner = str(parts[2] or "").strip()
+                    job_id = str(parts[4] or "").strip()
+                    action = str(parts[5] or "").strip()
+                    direction = "up" if action == "move-up" else ("down" if action == "move-down" else "")
+                    if not direction:
+                        self._send_json(404, {"ok": False, "error": "unknown job queue action"})
+                        return
+                    try:
+                        if owner == "embedded":
+                            if self.server_ref.job_queue is None:
+                                raise RuntimeError("embedded job queue unavailable")
+                            state_obj = self.server_ref.job_queue.reorder_job(job_id, direction=direction)
+                            if state_obj is None:
+                                self._send_json(404, {"ok": False, "error": "job not found"})
+                                return
+                            if state_obj.status != "WAITING":
+                                self._send_json(409, {"ok": False, "error": "only waiting jobs can be reordered"})
+                                return
+                        else:
+                            http_base_url = _job_queue_service_http_base(state, owner)
+                            if not http_base_url:
+                                raise RuntimeError("job orchestrator route not found")
+                            _reorder_job_via_http(http_base_url, job_id, direction=direction)
+                    except Exception as exc:
+                        self._send_json(502, {"ok": False, "error": str(exc)})
                         return
                     if "text/html" in (self.headers.get("Accept", "")):
                         self.send_response(303)
@@ -592,12 +937,35 @@ class InfoCenterHttpServer:
                         serialized.append(row)
                     self._send_json(200, {"ok": True, "routes": serialized})
                     return
+                if parsed.path == "/data/refs":
+                    qs = parse_qs(parsed.query)
+                    limit = max(1, int((qs.get("limit", ["1000"]) or ["1000"])[0]))
+                    node_id = str((qs.get("node_id", [""]) or [""])[0] or "").strip()
+                    node_instance_id = str((qs.get("node_instance_id", [""]) or [""])[0] or "").strip()
+                    entries = [
+                        _serialize_data_registry_entry(item)
+                        for item in state.list_data_ref_records(
+                            limit=limit,
+                            node_id=node_id,
+                            node_instance_id=node_instance_id,
+                        )
+                    ]
+                    self._send_json(200, {"ok": True, "refs": entries})
+                    return
+                if len(parts := [x for x in parsed.path.split("/") if x]) == 3 and parts[0] == "data" and parts[1] == "resolve":
+                    try:
+                        entry = state.resolve_data_ref_record(unquote(parts[2]))
+                    except KeyError:
+                        self._send_json(404, {"ok": False, "error": "data ref not found"})
+                        return
+                    self._send_json(200, {"ok": True, "entry": _serialize_data_registry_entry(entry)})
+                    return
                 if parsed.path == "/ops":
                     if self._requires_auth(parsed.path):
                         if not self._check_auth():
                             self._send_json(401, {"ok": False, "error": "unauthorized"})
                             return
-                    raw = _render_ops_page(state).encode("utf-8")
+                    raw = _render_ops_page(state, self.server_ref.job_queue).encode("utf-8")
                     try:
                         self.send_response(200)
                         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -695,6 +1063,8 @@ class InfoCenterHttpServer:
         public_host = resolve_public_host(host)
         actual_port = int(self._server.server_address[1])
         self.base_url = f"http://{public_host}:{actual_port}"
+        if self.gateway_app is not None:
+            self.gateway_app.controlplane_target = self.base_url
         if self.job_queue is not None:
             self.job_queue.start(controlplane_target=self.base_url)
 

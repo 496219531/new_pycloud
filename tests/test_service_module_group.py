@@ -21,6 +21,7 @@ def _build_service_entry_module(tmp_path, monkeypatch):
         "    return int(value)\n",
         encoding="utf-8",
     )
+    (package_dir / "ignored.csv").write_text("value\n1\n", encoding="utf-8")
     (package_dir / "worker.py").write_text(
         "from .helper import normalize\n\n"
         "def run(value=0, **_kwargs):\n"
@@ -610,6 +611,7 @@ class TestDeployedService:
             assert f"{worker_module.__package__}/__init__.py" in names
             assert f"{worker_module.__package__}/worker.py" in names
             assert f"{worker_module.__package__}/helper.py" in names
+            assert f"{worker_module.__package__}/ignored.csv" not in names
         finally:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()
@@ -685,6 +687,7 @@ class TestDeployedService:
             assert f"{worker_module.__package__}/__init__.py" in names
             assert f"{worker_module.__package__}/worker.py" in names
             assert f"{worker_module.__package__}/helper.py" in names
+            assert f"{worker_module.__package__}/ignored.csv" not in names
         finally:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()

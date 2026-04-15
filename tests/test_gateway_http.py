@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import time
 from typing import Tuple
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import grpc
@@ -12,8 +13,13 @@ import pytest
 
 from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, InfoCenterServiceRoute, NodeControlClient
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
-from pycloud_parallel.controlplane.result_ref import ResultRef
-from pycloud_parallel.controlplane.server import build_controlplane_server, build_gateway_server, build_infocenter_server
+from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.controlplane.server import (
+    build_controlplane_server,
+    build_gateway_server,
+    build_infocenter_server,
+    build_job_orchestrator_server,
+)
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -345,9 +351,13 @@ def test_gateway_service_client_fetches_large_dataframe_result(tmp_path):
                 timeout_sec=5.0,
             )
             assert body["ok"] is True
-            assert isinstance(body["data"], ResultRef)
-            assert body["data"].node_id == "node-gw-large-01"
-            assert body["data"].control_addr == node_target
+            if isinstance(body["data"], DataRef):
+                assert body["data"].node_id == "node-gw-large-01"
+                assert body["data"].locator_kind == "controlplane"
+                assert body["data"].locator_token == controlplane.base_url
+                assert body["data"].control_addr == ""
+            else:
+                assert isinstance(body["data"], pd.DataFrame)
             frame = gateway.fetch_result_data(body)
             assert isinstance(frame, pd.DataFrame)
             assert list(frame["x"]) == [11, 12]
@@ -426,3 +436,197 @@ def test_gateway_retries_second_route_when_first_route_is_broken(tmp_path):
         node_server.stop(grace=0)
         node_state.close()
         controlplane.stop()
+
+
+def test_gateway_supports_http_only_job_orchestrator_service():
+    infocenter = build_infocenter_server("127.0.0.1:0")
+    infocenter.start()
+    gateway = build_gateway_server("127.0.0.1:0", infocenter_addr=infocenter.base_url)
+    gateway.start()
+    job_orchestrator = build_job_orchestrator_server(
+        "127.0.0.1:0",
+        infocenter_addr=infocenter.base_url,
+        node_id="job-orchestrator-test",
+    )
+    job_orchestrator.start()
+    with job_orchestrator.job_queue._cv:  # noqa: SLF001
+        job_orchestrator.job_queue._running_job_id = "__test_blocked__"  # noqa: SLF001
+
+    try:
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(infocenter.base_url, timeout_sec=5.0).list_service_routes(
+                    service_name="job-orchestrator",
+                    healthy_only=True,
+                    limit=10,
+                )
+            )
+            == 1
+        )
+
+        with GatewayServiceClient(gateway.base_url, timeout_sec=5.0) as client:
+            methods = client.list_methods(service_name="job-orchestrator", include_docs=False)
+            assert sorted(item["method"] for item in methods) == ["cancel_job", "get_job_status", "reorder_job", "submit_job"]
+
+        with GatewayServiceClient(gateway.base_url, timeout_sec=5.0, service_token="job-owner-token") as owner_client:
+            submit = owner_client.call(
+                service_name="job-orchestrator",
+                method="submit_job",
+                payload={
+                    "client_id": "gw-job-test",
+                    "subtasks": [{"value": 1}],
+                    "entry_module": "task_demo",
+                    "code_version": "sha256:test",
+                },
+                timeout_sec=5.0,
+            )
+            assert submit["ok"] is True
+            job_id = str(submit["job"]["job_id"])
+            assert job_id
+            second = owner_client.call(
+                service_name="job-orchestrator",
+                method="submit_job",
+                payload={
+                    "client_id": "gw-job-test",
+                    "subtasks": [{"value": 2}],
+                    "entry_module": "task_demo",
+                    "code_version": "sha256:test",
+                },
+                timeout_sec=5.0,
+            )
+            second_job_id = str(second["job"]["job_id"])
+            third = owner_client.call(
+                service_name="job-orchestrator",
+                method="submit_job",
+                payload={
+                    "client_id": "gw-job-test",
+                    "subtasks": [{"value": 3}],
+                    "entry_module": "task_demo",
+                    "code_version": "sha256:test",
+                },
+                timeout_sec=5.0,
+            )
+            third_job_id = str(third["job"]["job_id"])
+            reorder = owner_client.call(
+                service_name="job-orchestrator",
+                method="reorder_job",
+                payload={"job_id": third_job_id, "direction": "up"},
+                timeout_sec=5.0,
+            )
+            assert reorder["ok"] is True
+            waiting_ids = [item["job_id"] for item in reorder["queue"]["waiting_jobs"]]
+            assert second_job_id in waiting_ids and third_job_id in waiting_ids
+            assert waiting_ids.index(third_job_id) < waiting_ids.index(second_job_id)
+
+            with GatewayServiceClient(gateway.base_url, timeout_sec=5.0, service_token="job-other-token") as other_client:
+                with pytest.raises(RuntimeError, match="cancel auth failed"):
+                    other_client.call(
+                        service_name="job-orchestrator",
+                        method="cancel_job",
+                        payload={"job_id": job_id},
+                        timeout_sec=5.0,
+                    )
+
+            cancelled = owner_client.call(
+                service_name="job-orchestrator",
+                method="cancel_job",
+                payload={"job_id": second_job_id},
+                timeout_sec=5.0,
+            )
+            assert cancelled["ok"] is True
+            assert cancelled["job"]["status"] == "CANCELLED"
+
+        job_state = job_orchestrator.job_queue.get_job(job_id)
+        assert job_state is not None
+        job_state.status = "FAILED"
+        job_state.final_result = {"processed": 2}
+        job_state.results = [
+            {
+                "task_id": "task-ok-1",
+                "status": int(pb2.TASK_STATUS_SUCCEEDED),
+                "status_text": "SUCCEEDED",
+                "attempt": 1,
+                "result": {"value": 1, "square": 1},
+            },
+            {
+                "task_id": "task-fail-2",
+                "status": int(pb2.TASK_STATUS_FAILED_USER),
+                "status_text": "FAILED_USER",
+                "attempt": 1,
+                "error": {"type": "UserError", "message": "boom"},
+            },
+        ]
+
+        with urlopen(f"{job_orchestrator.base_url}/svc/{job_orchestrator.service_id}/jobs/{job_id}", timeout=5.0) as resp:
+            detail = json.loads(resp.read().decode("utf-8") or "{}")
+        assert detail["ok"] is True
+        assert detail["job"]["job_id"] == job_id
+
+        with urlopen(f"{job_orchestrator.base_url}/svc/{job_orchestrator.service_id}/jobs/{job_id}?view=html", timeout=5.0) as resp:
+            html_detail = resp.read().decode("utf-8")
+        assert "Job Detail" in html_detail
+        assert "auto_refresh_sec=10" in html_detail
+        assert "http-equiv='refresh' content='10'" in html_detail
+        assert "white-space:pre-wrap" in html_detail
+        assert "Payload" in html_detail
+        assert "Checkpoint" in html_detail
+        assert "Final Result" in html_detail
+        assert "Results" in html_detail
+        assert "task-filter" in html_detail
+        assert "filterJobResults()" in html_detail
+        assert "details" in html_detail
+        assert "result-row-failed" in html_detail
+        assert "task-ok-1" in html_detail
+        assert "task-fail-2" in html_detail
+        assert job_id in html_detail
+
+        with pytest.raises(HTTPError):
+            urlopen(f"{job_orchestrator.base_url}/svc/{job_orchestrator.service_id}/jobs/not-found", timeout=5.0)
+    finally:
+        job_orchestrator.stop()
+        gateway.stop()
+        infocenter.stop()
+
+
+def test_gateway_service_client_call_uses_http_payload_policy(monkeypatch) -> None:
+    captured = {}
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, timeout_sec: float = 10.0) -> None:
+            del timeout_sec
+            self.target = target
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.client.NodeControlClient",
+        _FakeNodeControlClient,
+    )
+    monkeypatch.setattr(
+        GatewayServiceClient,
+        "get_status",
+        lambda self, *, service_name: {"routes": [{"control_addr": "127.0.0.1:50061"}]},
+    )
+
+    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy):
+        del put_data, estimate_inline_size
+        captured["mode"] = policy.mode
+        captured["preserve_args_kwargs_container"] = policy.preserve_args_kwargs_container
+        return dict(payload or {})
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.client.prepare_outbound_payload",
+        _fake_prepare,
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.client._http_json_request",
+        lambda **kwargs: {"ok": True, "data": kwargs.get("payload", {})},
+    )
+
+    with GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0) as gateway:
+        resp = gateway.call(service_name="svc-demo", method="run", payload={"args": [1], "kwargs": {"x": 2}})
+
+    assert resp["ok"] is True
+    assert captured["mode"] == "http_call"
+    assert captured["preserve_args_kwargs_container"] is True

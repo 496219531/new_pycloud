@@ -10,6 +10,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
 import pytest
@@ -20,10 +21,12 @@ from pycloud_parallel.controlplane.state import (
     NodeControlState,
     _build_execute_spec,
     _code_content_dir,
+    _code_version_from_digest,
     _code_data_dir,
     _code_index_link_path,
     _code_pkg_dir,
     _code_variant_dir,
+    _describe_artifact_error,
     _commit_result_file,
     _execute_payload_in_subprocess,
     _normalize_user_return,
@@ -34,84 +37,6 @@ from pycloud_parallel.controlplane.state import (
 )
 from pycloud_parallel.controlplane.state import InfoCenterState, NodeServiceState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-
-
-def _seed_code(state: NodeControlState) -> str:
-    blob = (
-        b"def run(value=0, should_fail=False, **_kwargs):\n"
-        b"    value = int(value)\n"
-        b"    if should_fail:\n"
-        b"        raise ValueError(f'intentional failure value={value}')\n"
-        b"    return {'input': value, 'output': value * value}\n"
-    )
-    digest = hashlib.sha256(blob).hexdigest()
-    artifact, _ = state.put_code(
-        sha256=f"sha256:{digest}",
-        runtime="py3",
-        entry_module="demo",
-        entry_callable="run",
-        package_format="py",
-        chunks=[blob],
-    )
-    return artifact.code_version
-
-
-def test_submit_poll_report_and_pull_results(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-01",
-        queue_capacity=16,
-        worker_capacity=4,
-        artifact_dir=str(tmp_path / "code_cache"),
-        enable_internal_executor=False,
-        enable_service_session=False,
-    )
-    try:
-        code_version = _seed_code(state)
-        submit_req = pb2.SubmitTasksRequest(
-            client_id="client-a",
-            code_version=code_version,
-            execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-            job_id="job-alpha",
-            tasks=[
-                pb2.TaskSubmitItem(task_id="task-1", payload={"x": 1}, timeout_hint_sec=10, priority=1),
-            ],
-        )
-        accepted, rejected, _credit = state.submit_tasks(submit_req)
-        assert [x.task_id for x in accepted] == ["task-1"]
-        assert rejected == []
-
-        envelope = state.poll_task(worker_id="worker-1")
-        assert envelope is not None
-        assert envelope.task_id == "task-1"
-
-        ok = state.report_result(
-            pb2.ReportResultRequest(
-                worker_id="worker-1",
-                task_id="task-1",
-                attempt=1,
-                status=pb2.TASK_STATUS_SUCCEEDED,
-                result={"value": 2},
-            )
-        )
-        assert ok is True
-
-        results, next_cursor = state.pull_results(
-            pb2.PullResultsRequest(client_id="client-a", limit=10, wait_ms=0, cursor="")
-        )
-        assert len(results) == 1
-        assert results[0].task_id == "task-1"
-        assert results[0].job_id == "job-alpha"
-        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
-        assert int(next_cursor) >= 1
-
-        results2, next_cursor2 = state.pull_results(
-            pb2.PullResultsRequest(client_id="client-a", limit=10, wait_ms=0, cursor=next_cursor)
-        )
-        assert results2 == []
-        assert next_cursor2 == "0"
-    finally:
-        state.close()
-
 
 def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeypatch):
     source = tmp_path / "source.bin"
@@ -187,6 +112,86 @@ def test_nested_arrow_payload_roundtrip():
     assert restored["bundle"]["series"].tolist() == [10, 20]
     assert restored["bundle"]["arr"].tolist() == [3, 4, 5]
     assert restored["plain"] == [1, True, None]
+
+
+def test_code_version_distinguishes_dependency_policy_mode():
+    digest = hashlib.sha256(b"print('hello')\n").hexdigest()
+
+    prebuilt = _code_version_from_digest(
+        digest,
+        runtime="py3",
+        entry_module="demo_mod",
+        entry_callable="run",
+        package_format="py",
+        export_mode="single",
+        export_methods=("run",),
+        export_decorator="pycloud_export",
+        dependency_policy_mode="prebuilt",
+        dependency_allowlist=(),
+    )
+    node_preinstalled = _code_version_from_digest(
+        digest,
+        runtime="py3",
+        entry_module="demo_mod",
+        entry_callable="run",
+        package_format="py",
+        export_mode="single",
+        export_methods=("run",),
+        export_decorator="pycloud_export",
+        dependency_policy_mode="node_preinstalled",
+        dependency_allowlist=(),
+    )
+    allow_install = _code_version_from_digest(
+        digest,
+        runtime="py3",
+        entry_module="demo_mod",
+        entry_callable="run",
+        package_format="py",
+        export_mode="single",
+        export_methods=("run",),
+        export_decorator="pycloud_export",
+        dependency_policy_mode="allow_install",
+        dependency_allowlist=("orjson==3.10.18",),
+    )
+
+    assert prebuilt != node_preinstalled
+    assert prebuilt != allow_install
+    assert node_preinstalled != allow_install
+
+
+def test_describe_artifact_error_mentions_dependency_policy():
+    exc = ModuleNotFoundError("No module named 'missing_demo_dep'")
+    exc.name = "missing_demo_dep"
+
+    prebuilt_message = _describe_artifact_error(
+        exc,
+        entry_module="demo_mod",
+        entry_callable="run",
+        package_format="py",
+        dependency_policy_mode="prebuilt",
+    )
+    node_preinstalled_message = _describe_artifact_error(
+        exc,
+        entry_module="demo_mod",
+        entry_callable="run",
+        package_format="py",
+        dependency_policy_mode="node_preinstalled",
+    )
+    allow_install_message = _describe_artifact_error(
+        exc,
+        entry_module="demo_mod",
+        entry_callable="run",
+        package_format="py",
+        dependency_policy_mode="allow_install",
+        install_failed=True,
+    )
+
+    assert "artifact dependency policy is `prebuilt`" in prebuilt_message
+    assert "ArtifactDeps.allow_install" in prebuilt_message
+    assert "artifact dependency policy is `node_preinstalled`" in node_preinstalled_message
+    assert "Preinstall it on the node" in node_preinstalled_message
+    assert "artifact dependency policy is `allow_install`" in allow_install_message
+    assert "dependency install failed" in allow_install_message
 
 
 def test_dataframe_round_trips_int_columns_and_multiindex():
@@ -414,6 +419,223 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd.testing.assert_frame_equal(restored["frame"], frame)
 
 
+def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.controlplane.object_ref import object_storage_path
+    from pycloud_parallel.controlplane.state import _resolve_object_refs_in_payload
+
+    frame = pd.DataFrame(
+        [[1, 2], [3, 4]],
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
+            names=["trade_date", "bucket"],
+        ),
+        columns=[10006, 10007],
+    )
+    _kind, fmt, blob = _serialize_data_for_object_ref(frame)
+    object_id = "sha256:" + "e" * 64
+    path = object_storage_path(tmp_path, object_id=object_id, fmt=fmt)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(blob)
+
+    payload = {
+        "frame": DataRef(
+            ref_id=object_id,
+            storage_id=object_id,
+            logical_type="dataframe",
+            format=fmt,
+            size_bytes=len(blob),
+            materialize_as="auto",
+        )
+    }
+
+    restored = _resolve_object_refs_in_payload(payload, object_dir=str(tmp_path))
+    pd.testing.assert_frame_equal(restored["frame"], frame)
+
+
+def test_data_store_builds_result_and_data_refs() -> None:
+    from pycloud_parallel.controlplane.data_store import DataStore, StoredDataArtifact
+
+    store = DataStore(object_dir="/tmp/objects", node_id="node-1", control_addr="127.0.0.1:50061")
+    artifact = StoredDataArtifact(
+        object_id="sha256:" + ("f" * 64),
+        format="dfbundle",
+        size_bytes=1234,
+        materialize_as="dataframe",
+    )
+
+    data_ref = store.data_ref_from_stored_artifact(artifact)
+    result_ref = store.result_ref_from_stored_artifact(artifact)
+
+    assert data_ref.object_id == artifact.object_id
+    assert data_ref.logical_type == "dataframe"
+    assert data_ref.control_addr == "127.0.0.1:50061"
+    assert result_ref.object_id == artifact.object_id
+    assert result_ref.node_id == "node-1"
+
+
+def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.controlplane.data_registry import resolve_data_ref
+
+    class _FakeInfoCenterClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def list_nodes(self, *, healthy_only: bool = True, tags=None, limit: int = 100):
+            del healthy_only, tags, limit
+            return [
+                SimpleNamespace(
+                    node_id="node-1",
+                    node_instance_id="node-1-inst",
+                    control_addr="127.0.0.1:50061",
+                )
+            ]
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient", _FakeInfoCenterClient)
+
+    resolved = resolve_data_ref(
+        DataRef(
+            ref_id="sha256:" + ("1" * 64),
+            storage_id="sha256:" + ("1" * 64),
+            format="dfbundle",
+            logical_type="dataframe",
+            node_id="node-1",
+            locator_kind="controlplane",
+            locator_token="http://127.0.0.1:50051",
+        ),
+        timeout_sec=5.0,
+    )
+
+    assert resolved.control_addr == "127.0.0.1:50061"
+    assert resolved.via_registry is True
+
+
+def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.controlplane.data_registry import DataRegistryClient
+    from pycloud_parallel.controlplane.server import build_controlplane_server
+
+    controlplane = build_controlplane_server("127.0.0.1:0")
+    controlplane.start()
+    try:
+        client = DataRegistryClient(controlplane.base_url, timeout_sec=5.0)
+        ref = DataRef(
+            ref_id="sha256:" + ("2" * 64),
+            storage_id="sha256:" + ("2" * 64),
+            logical_type="dataframe",
+            format="dfbundle",
+            size_bytes=2048,
+            materialize_as="auto",
+            locator_kind="controlplane",
+            locator_token=controlplane.base_url,
+            node_id="node-http",
+            node_instance_id="node-http-inst",
+        )
+
+        registered = client.register(
+            ref,
+            ttl_sec=120,
+            node_id="node-http",
+            node_instance_id="node-http-inst",
+            control_addr="127.0.0.1:50061",
+            locator_kind="node_control",
+            locator_token="127.0.0.1:50061",
+        )
+        assert registered["ok"] is True
+        assert registered["entry"]["ref_id"] == ref.ref_id
+
+        resolved = client.resolve(ref)
+        assert resolved.control_addr == "127.0.0.1:50061"
+        assert resolved.via_registry is True
+
+        touched = client.touch(ref.ref_id)
+        assert touched["ok"] is True
+        assert touched["entry"]["ref_id"] == ref.ref_id
+
+        released = client.release(ref.ref_id)
+        assert released["ok"] is True
+
+        with pytest.raises(RuntimeError, match="data ref could not be resolved|data ref not found"):
+            client.resolve(ref)
+    finally:
+        controlplane.stop()
+
+
+def test_data_registry_release_triggers_node_release_for_consume_on_read(monkeypatch) -> None:
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.controlplane.data_registry import DataRegistryClient
+    from pycloud_parallel.controlplane.server import build_controlplane_server
+
+    released: list[str] = []
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def pin_object(self, *, object_id: str, ref_id: str) -> bool:
+            return True
+
+        def release_object_ref(self, *, object_id: str, ref_id: str = "") -> bool:
+            released.append(f"{object_id}:{ref_id}")
+            return True
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.infocenter_http.NodeControlClient", _FakeNodeControlClient)
+
+    controlplane = build_controlplane_server("127.0.0.1:0")
+    controlplane.start()
+    try:
+        client = DataRegistryClient(controlplane.base_url, timeout_sec=5.0)
+        ref = DataRef(
+            ref_id="sha256:" + ("3" * 64),
+            storage_id="sha256:" + ("3" * 64),
+            logical_type="bytes",
+            format="bin",
+            size_bytes=16,
+            materialize_as="bytes",
+            locator_kind="controlplane",
+            locator_token=controlplane.base_url,
+            consume_on_read=True,
+            node_id="node-release",
+            node_instance_id="node-release-inst",
+        )
+
+        registered = client.register(
+            ref,
+            ttl_sec=60,
+            node_id="node-release",
+            node_instance_id="node-release-inst",
+            control_addr="127.0.0.1:50061",
+            locator_kind="node_control",
+            locator_token="127.0.0.1:50061",
+        )
+        assert registered["ok"] is True
+
+        released_payload = client.release(ref.ref_id)
+        assert released_payload["ok"] is True
+        assert released == [f"{ref.object_id}:{ref.ref_id}"]
+    finally:
+        controlplane.stop()
+
+
 def test_code_content_and_variant_dirs_use_digest_and_subversion_key(tmp_path):
     code_version = "sha256:" + ("a" * 64) + "." + ("b" * 16)
     content_dir = _code_content_dir(tmp_path, code_version=code_version)
@@ -565,6 +787,61 @@ def test_struct_to_dict_preserves_nan_in_dataframe_payload(tmp_path):
     assert math.isnan(float(restored.iloc[1, 0]))
 
 
+def test_execute_payload_in_subprocess_uses_unified_inbound_normalizer(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-normalize-subprocess-01",
+        artifact_dir=str(tmp_path / "code_cache_normalize_subprocess"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        artifact, _cached = state.put_code(
+            client_id="client-a",
+            sha256="sha256:" + hashlib.sha256(blob).hexdigest(),
+            runtime="py3",
+            entry_module="normalize_subprocess_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            chunks=[blob],
+        )
+
+        captured = {}
+
+        def _fake_normalize(payload, *, object_dir, policy, resolve_object_refs=None):
+            del resolve_object_refs
+            captured["payload"] = dict(payload or {})
+            captured["object_dir"] = object_dir
+            captured["mode"] = policy.mode
+            return {"value": 9}
+
+        monkeypatch.setattr(
+            "pycloud_parallel.controlplane.state.normalize_inbound_payload",
+            _fake_normalize,
+        )
+
+        status, result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={"value": 5},
+                payload_mode="task_submit",
+            )
+        )
+
+        assert status == "SUCCEEDED"
+        assert result == {"value": 9}
+        assert err_type == ""
+        assert err_message == ""
+        assert captured["payload"] == {"value": 5}
+        assert captured["mode"] == "task_submit"
+    finally:
+        state.close()
+
+
 def test_put_object_from_uploaded_file_uses_segment_backend_for_medium_objects(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane import state as state_mod
 
@@ -597,6 +874,44 @@ def test_put_object_from_uploaded_file_uses_segment_backend_for_medium_objects(t
         loaded = node_state.get_object_artifact(object_id)
         assert loaded.storage_backend == "segment"
         assert loaded.segment_length == len(blob)
+    finally:
+        node_state.close()
+
+
+def test_release_object_removes_orphan_segment_file(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import state as state_mod
+
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    node_state = NodeControlState(
+        node_id="node-release-segment-01",
+        artifact_dir=str(tmp_path / "code_cache_release_segment"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = json.dumps({"x": 1}).encode("utf-8")
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        uploaded_path = tmp_path / "upload-release-segment.json"
+        uploaded_path.write_bytes(blob)
+        artifact, cached = node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="json",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+        assert cached is False
+        assert artifact.storage_backend == "segment"
+        segment_path = Path(artifact.segment_path)
+        assert segment_path.exists()
+
+        released = node_state.release_object(object_id)
+
+        assert released is True
+        assert not segment_path.exists()
+        with pytest.raises(KeyError):
+            node_state.get_object_artifact(object_id)
     finally:
         node_state.close()
 
@@ -640,6 +955,65 @@ def test_resolve_object_refs_reads_segment_backend(tmp_path, monkeypatch):
         node_state.close()
 
 
+def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path, monkeypatch):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+
+    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
+    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.controlplane import state as state_mod
+
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 10 * 1024 * 1024)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 10 * 1024 * 1024)
+    node_state = NodeControlState(
+        node_id="node-object-series-segment-01",
+        artifact_dir=str(tmp_path / "code_cache_object_series_segment"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        series = pd.Series(
+            [1.1, 2.2],
+            index=pd.MultiIndex.from_tuples(
+                [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
+                names=["trade_date", "bucket"],
+            ),
+            name=10006,
+        )
+        kind, fmt, blob = _serialize_data_for_object_ref(series)
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        uploaded_path = tmp_path / "upload.seriesbundle"
+        uploaded_path.write_bytes(blob)
+
+        artifact, cached = node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format=fmt,
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+
+        assert cached is False
+        assert kind == "series"
+        assert fmt == "seriesbundle"
+        assert artifact.storage_backend == "segment"
+
+        payload = {
+            "item": ObjectRef(
+                object_id=object_id,
+                format=fmt,
+                size_bytes=len(blob),
+                materialize_as="series",
+                consume_on_read=True,
+            )
+        }
+        resolved = _resolve_object_refs_in_payload(payload, object_dir=str(node_state.object_dir))
+
+        pd.testing.assert_series_equal(resolved["item"], series)
+    finally:
+        node_state.close()
+
+
 def test_put_object_from_uploaded_file_uses_file_backend_for_large_objects(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane import state as state_mod
 
@@ -670,319 +1044,80 @@ def test_put_object_from_uploaded_file_uses_file_backend_for_large_objects(tmp_p
         node_state.close()
 
 
-def test_infra_timeout_requeue_then_retry(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-02",
-        queue_capacity=16,
-        worker_capacity=4,
-        heartbeat_timeout_sec=1,
-        max_retries=2,
-        monitor_interval_sec=60,  # disable periodic checks in test
-        artifact_dir=str(tmp_path / "code_cache"),
+def test_release_object_removes_file_backend_object(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import state as state_mod
+
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 1)
+    node_state = NodeControlState(
+        node_id="node-release-object-file-01",
+        artifact_dir=str(tmp_path / "code_cache_release_object_file"),
         enable_internal_executor=False,
         enable_service_session=False,
     )
     try:
-        code_version = _seed_code(state)
-        submit_req = pb2.SubmitTasksRequest(
-            client_id="client-b",
-            code_version=code_version,
-            execution_mode=pb2.EXECUTION_MODE_EPHEMERAL,
-            tasks=[pb2.TaskSubmitItem(task_id="task-retry", payload={"x": 3}, priority=1)],
+        blob = b"x" * 64
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        uploaded_path = tmp_path / "upload.bin"
+        uploaded_path.write_bytes(blob)
+        artifact, cached = node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="bin",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
         )
-        accepted, rejected, _ = state.submit_tasks(submit_req)
-        assert len(accepted) == 1
-        assert not rejected
+        assert cached is False
+        assert Path(artifact.path).exists()
 
-        first = state.poll_task(worker_id="worker-2")
-        assert first is not None
-        assert first.attempt == 1
+        released = node_state.release_object(object_id)
 
-        # 模拟心跳超时，触发基础设施重试。
-        task = state._tasks["task-retry"]  # noqa: SLF001
-        task.last_heartbeat_at = utc_now() - timedelta(seconds=5)
-        state._handle_timeouts()  # noqa: SLF001
-
-        second = state.poll_task(worker_id="worker-3")
-        assert second is not None
-        assert second.attempt == 2
+        assert released is True
+        assert not Path(artifact.path).exists()
+        with pytest.raises(KeyError):
+            node_state.get_object_artifact(object_id)
     finally:
-        state.close()
+        node_state.close()
 
 
-def test_internal_executor_runs_tasks_without_external_worker(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-03",
-        queue_capacity=16,
-        worker_capacity=2,
-        artifact_dir=str(tmp_path / "code_cache"),
-        enable_internal_executor=True,
-        enable_service_session=False,
-    )
-    try:
-        code_version = _seed_code(state)
-        submit_req = pb2.SubmitTasksRequest(
-            client_id="client-c",
-            code_version=code_version,
-            execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-            tasks=[
-                pb2.TaskSubmitItem(task_id="task-auto-1", payload={"value": 9, "sleep_ms": 20}, priority=1),
-                pb2.TaskSubmitItem(task_id="task-auto-2", payload={"value": 5, "sleep_ms": 20, "should_fail": True}, priority=1),
-            ],
-        )
-        accepted, rejected, _ = state.submit_tasks(submit_req)
-        assert len(accepted) == 2
-        assert not rejected
+def test_pin_and_release_object_refcount_keeps_file_until_last_ref(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import state as state_mod
 
-        deadline = time.time() + 10
-        results = []
-        cursor = ""
-        while time.time() < deadline and len(results) < 2:
-            batch, cursor = state.pull_results(
-                pb2.PullResultsRequest(client_id="client-c", limit=10, wait_ms=200, cursor=cursor)
-            )
-            results.extend(batch)
-
-        assert len(results) == 2
-        statuses = sorted(item.status for item in results)
-        assert statuses == [pb2.TASK_STATUS_SUCCEEDED, pb2.TASK_STATUS_FAILED_USER]
-    finally:
-        state.close()
-
-
-def test_internal_executor_runtime_keys_queue_and_complete(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-runtime-key-01",
-        queue_capacity=16,
-        worker_capacity=1,
-        artifact_dir=str(tmp_path / "code_cache_runtime_key"),
-        enable_internal_executor=True,
-        enable_service_session=False,
-        executor_poll_interval_sec=0.02,
-    )
-    try:
-        blob = (
-            b"import time\n"
-            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
-            b"    sleep_ms = int(sleep_ms)\n"
-            b"    if sleep_ms > 0:\n"
-            b"        time.sleep(sleep_ms / 1000.0)\n"
-            b"    value = int(value)\n"
-            b"    return {'value': value, 'square': value * value}\n"
-        )
-        digest = hashlib.sha256(blob).hexdigest()
-        artifact, _ = state.put_code(
-            sha256=f"sha256:{digest}",
-            runtime="py3",
-            entry_module="runtime_key_demo",
-            entry_callable="run",
-            package_format="py",
-            chunks=[blob],
-        )
-        code_version = artifact.code_version
-        accepted, rejected, _ = state.submit_tasks(
-            pb2.SubmitTasksRequest(
-                client_id="client-slot",
-                code_version=code_version,
-                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-                tasks=[
-                    pb2.TaskSubmitItem(task_id="slot-a-1", payload={"value": 2, "sleep_ms": 40}, priority=1, runtime_key="rt-a"),
-                    pb2.TaskSubmitItem(task_id="slot-a-2", payload={"value": 3, "sleep_ms": 40}, priority=1, runtime_key="rt-a"),
-                    pb2.TaskSubmitItem(task_id="slot-b-1", payload={"value": 4, "sleep_ms": 40}, priority=1, runtime_key="rt-b"),
-                ],
-            )
-        )
-        assert len(accepted) == 3
-        assert not rejected
-
-        time.sleep(0.1)
-        with state._lock:  # noqa: SLF001
-            running = [task.task_id for task in state._tasks.values() if task.status == pb2.TASK_STATUS_RUNNING]  # noqa: SLF001
-            queued = [task.task_id for task in state._tasks.values() if task.status == pb2.TASK_STATUS_QUEUED]  # noqa: SLF001
-            assert len(running) == 1
-            assert len(queued) == 2
-
-        deadline = time.time() + 10
-        cursor = ""
-        results = []
-        while time.time() < deadline and len(results) < 3:
-            batch, cursor = state.pull_results(
-                pb2.PullResultsRequest(client_id="client-slot", limit=10, wait_ms=200, cursor=cursor)
-            )
-            results.extend(batch)
-
-        assert len(results) == 3
-        assert {item.status for item in results} == {pb2.TASK_STATUS_SUCCEEDED}
-        with state._lock:  # noqa: SLF001
-            assert state._inflight_count_locked() == 0  # noqa: SLF001
-            assert state._queued_count_locked() == 0  # noqa: SLF001
-    finally:
-        state.close()
-
-
-def test_internal_executor_timeout_allows_retry(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-runtime-timeout-01",
-        queue_capacity=16,
-        worker_capacity=1,
-        heartbeat_timeout_sec=1,
-        max_retries=2,
-        monitor_interval_sec=60,
-        artifact_dir=str(tmp_path / "code_cache_runtime_timeout"),
-        enable_internal_executor=True,
-        enable_service_session=False,
-        executor_poll_interval_sec=0.02,
-    )
-    try:
-        blob = (
-            b"import time\n"
-            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
-            b"    sleep_ms = int(sleep_ms)\n"
-            b"    if sleep_ms > 0:\n"
-            b"        time.sleep(sleep_ms / 1000.0)\n"
-            b"    value = int(value)\n"
-            b"    return {'value': value, 'square': value * value}\n"
-        )
-        digest = hashlib.sha256(blob).hexdigest()
-        artifact, _ = state.put_code(
-            sha256=f"sha256:{digest}",
-            runtime="py3",
-            entry_module="runtime_timeout_demo",
-            entry_callable="run",
-            package_format="py",
-            chunks=[blob],
-        )
-        accepted, rejected, _ = state.submit_tasks(
-            pb2.SubmitTasksRequest(
-                client_id="client-timeout",
-                code_version=artifact.code_version,
-                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-                tasks=[
-                    pb2.TaskSubmitItem(
-                        task_id="timeout-task-1",
-                        payload={"value": 6, "sleep_ms": 5000},
-                        priority=1,
-                        runtime_key="rt-timeout",
-                    ),
-                ],
-            )
-        )
-        assert len(accepted) == 1
-        assert not rejected
-
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            with state._lock:  # noqa: SLF001
-                task = state._tasks["timeout-task-1"]  # noqa: SLF001
-                if task.status == pb2.TASK_STATUS_RUNNING:
-                    break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("task never entered running state")
-
-        with state._lock:  # noqa: SLF001
-            task = state._tasks["timeout-task-1"]  # noqa: SLF001
-            task.payload["sleep_ms"] = 0
-            task.last_heartbeat_at = utc_now() - timedelta(seconds=5)
-
-        state._handle_timeouts()  # noqa: SLF001
-
-        deadline = time.time() + 10
-        results = []
-        cursor = ""
-        while time.time() < deadline and not results:
-            batch, cursor = state.pull_results(
-                pb2.PullResultsRequest(client_id="client-timeout", limit=10, wait_ms=200, cursor=cursor)
-            )
-            results.extend(batch)
-
-        assert len(results) == 1
-        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
-        assert results[0].attempt == 2
-        assert dict(results[0].result) == {"value": 6, "square": 36}
-        with state._lock:  # noqa: SLF001
-            task = state._tasks["timeout-task-1"]  # noqa: SLF001
-            assert task.status == pb2.TASK_STATUS_SUCCEEDED
-            assert state._inflight_count_locked() == 0  # noqa: SLF001
-    finally:
-        state.close()
-
-
-def test_cancel_job_marks_matching_tasks(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-cancel-job",
-        queue_capacity=16,
-        worker_capacity=2,
-        artifact_dir=str(tmp_path / "code_cache"),
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1)
+    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 1)
+    node_state = NodeControlState(
+        node_id="node-pin-release-object-file-01",
+        artifact_dir=str(tmp_path / "code_cache_pin_release_object_file"),
         enable_internal_executor=False,
         enable_service_session=False,
     )
     try:
-        code_version = _seed_code(state)
-        accepted, rejected, _ = state.submit_tasks(
-            pb2.SubmitTasksRequest(
-                client_id="client-job",
-                code_version=code_version,
-                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-                job_id="job-42",
-                tasks=[
-                    pb2.TaskSubmitItem(task_id="task-running", payload={"value": 2}, priority=1),
-                    pb2.TaskSubmitItem(task_id="task-queued", payload={"value": 3}, priority=1),
-                ],
-            )
+        blob = b"y" * 64
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        uploaded_path = tmp_path / "upload-pin.bin"
+        uploaded_path.write_bytes(blob)
+        artifact, cached = node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="bin",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
         )
-        assert len(accepted) == 2
-        assert not rejected
+        assert cached is False
+        assert Path(artifact.path).exists()
 
-        envelope = state.poll_task(worker_id="worker-job")
-        assert envelope is not None
-        assert envelope.task_id == "task-running"
+        assert node_state.pin_object(object_id, ref_id="ref-a") is True
+        assert node_state.pin_object(object_id, ref_id="ref-b") is True
+        assert node_state.release_object(object_id, ref_id="ref-a") is True
+        assert Path(artifact.path).exists()
+        assert node_state.get_object_artifact(object_id).object_id == object_id
 
-        queued_cancelled, running_marked, already_done, not_found = state.cancel_job(
-            pb2.CancelJobRequest(
-                client_id="client-job",
-                job_id="job-42",
-                reason="debug stop",
-            )
-        )
-        assert queued_cancelled == 1
-        assert running_marked == 1
-        assert already_done == 0
-        assert not_found == 0
-
-        assert state._tasks["task-running"].cancel_requested is True  # noqa: SLF001
-        assert state._tasks["task-queued"].status == pb2.TASK_STATUS_CANCELLED  # noqa: SLF001
-
-        results, _ = state.pull_results(
-            pb2.PullResultsRequest(client_id="client-job", limit=10, wait_ms=0, cursor="")
-        )
-        assert len(results) == 1
-        assert results[0].task_id == "task-queued"
-        assert results[0].job_id == "job-42"
-        assert results[0].status == pb2.TASK_STATUS_CANCELLED
+        assert node_state.release_object(object_id, ref_id="ref-b") is True
+        assert not Path(artifact.path).exists()
+        with pytest.raises(KeyError):
+            node_state.get_object_artifact(object_id)
     finally:
-        state.close()
-
-
-def test_cancel_job_returns_not_found_for_unknown_job(tmp_path):
-    state = NodeControlState(
-        node_id="node-test-cancel-job-miss",
-        queue_capacity=8,
-        worker_capacity=1,
-        artifact_dir=str(tmp_path / "code_cache"),
-        enable_internal_executor=False,
-        enable_service_session=False,
-    )
-    try:
-        queued_cancelled, running_marked, already_done, not_found = state.cancel_job(
-            pb2.CancelJobRequest(client_id="client-miss", job_id="job-missing", reason="noop")
-        )
-        assert queued_cancelled == 0
-        assert running_marked == 0
-        assert already_done == 0
-        assert not_found == 1
-    finally:
-        state.close()
+        node_state.close()
 
 
 def test_service_session_http_call_and_end(tmp_path):
@@ -1771,6 +1906,116 @@ def test_runtime_managed_globals_mapping_prefers_runtime_key_and_falls_back(tmp_
         state.close()
 
 
+def test_apply_managed_globals_allows_indirect_runtime_binding_for_task_pool(tmp_path):
+    state = NodeControlState(
+        node_id="node-apply-managed-globals-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_apply_managed_globals"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = (
+            b"RUNTIME_STATE = {}\n"
+            b"GLOBAL_CFG = None\n\n"
+            b"def apply_managed_globals(values, **context):\n"
+            b"    RUNTIME_STATE['cfg'] = values.get('cfg')\n"
+            b"    RUNTIME_STATE['context'] = dict(context)\n"
+            b"    return {'GLOBAL_CFG': values.get('cfg')}\n\n"
+            b"def run(**_kwargs):\n"
+            b"    return {\n"
+            b"        'cfg': GLOBAL_CFG,\n"
+            b"        'runtime_cfg': RUNTIME_STATE.get('cfg'),\n"
+            b"        'session_kind': RUNTIME_STATE.get('context', {}).get('session_kind'),\n"
+            b"        'method_name': RUNTIME_STATE.get('context', {}).get('method_name'),\n"
+            b"        'entry_module': RUNTIME_STATE.get('context', {}).get('entry_module'),\n"
+            b"    }\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _cached = state.put_code(
+            client_id="owner-apply",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_apply_globals_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            managed_global_names=["cfg"],
+            chunks=[blob],
+            validate_load=True,
+        )
+        globals_digest, updated_names = state.update_runtime_globals(
+            client_id="owner-apply",
+            code_version=artifact.code_version,
+            runtime_key="rt-apply",
+            code_token=state.get_client_code_token(client_id="owner-apply", code_version=artifact.code_version),
+            values={"cfg": {"mode": "fast"}},
+        )
+        assert globals_digest
+        assert updated_names == ["cfg"]
+
+        with state._lock:  # noqa: SLF001
+            artifact = state._codes[artifact.code_version]  # noqa: SLF001
+            managed_state = state._runtime_managed_globals[("owner-apply", artifact.code_version, "rt-apply")]  # noqa: SLF001
+
+        status, result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                work_dir=_code_data_dir(Path(state.artifact_dir), code_version=artifact.code_version),
+                method_name="run",
+                payload={},
+                payload_mode="task_submit",
+                managed_globals_scope_dir=managed_state.scope_dir,
+                managed_globals_digest=managed_state.globals_digest,
+            )
+        )
+
+        assert status == "SUCCEEDED"
+        assert err_type == ""
+        assert err_message == ""
+        assert result["cfg"] == {"mode": "fast"}
+        assert result["runtime_cfg"] == {"mode": "fast"}
+        assert result["session_kind"] == "task_pool"
+        assert result["method_name"] == "run"
+        assert result["entry_module"] == "pool_apply_globals_demo"
+    finally:
+        state.close()
+
+
+def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp_path):
+    state = NodeControlState(
+        node_id="node-managed-globals-strict-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_managed_globals_strict"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        with pytest.raises(ValueError, match="managed globals not found in entry module"):
+            state.create_task_pool(
+                owner_client_id="owner-strict",
+                pool_name="pool-strict",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="pool_strict_globals_demo",
+                entry_callable="run",
+                package_format="py",
+                managed_global_names=["cfg"],
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                chunks=[blob],
+            )
+    finally:
+        state.close()
+
+
 def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
     from pycloud_parallel.controlplane.client import _prepare_http_payload_for_call
     from pycloud_parallel.controlplane.object_ref import ObjectRef
@@ -2194,87 +2439,5 @@ def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
         assert session.status == pb2.SERVICE_STATUS_RUNNING
         assert "compute_service" not in sys.modules
         assert "compute_service.main" not in sys.modules
-    finally:
-        state.close()
-
-
-def test_internal_executor_recovers_after_executor_host_restart(tmp_path):
-    state = NodeControlState(
-        node_id="node-runtime-host-restart-01",
-        queue_capacity=16,
-        worker_capacity=1,
-        artifact_dir=str(tmp_path / "code_cache_runtime_host_restart"),
-        heartbeat_timeout_sec=30,
-        max_retries=2,
-        enable_internal_executor=True,
-        enable_service_session=False,
-        executor_poll_interval_sec=0.02,
-        monitor_interval_sec=60,
-    )
-    try:
-        blob = (
-            b"import time\n"
-            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
-            b"    sleep_ms = int(sleep_ms)\n"
-            b"    if sleep_ms > 0:\n"
-            b"        time.sleep(sleep_ms / 1000.0)\n"
-            b"    value = int(value)\n"
-            b"    return {'value': value, 'square': value * value}\n"
-        )
-        digest = hashlib.sha256(blob).hexdigest()
-        artifact, _ = state.put_code(
-            sha256=f"sha256:{digest}",
-            runtime="py3",
-            entry_module="runtime_host_restart_demo",
-            entry_callable="run",
-            package_format="py",
-            chunks=[blob],
-        )
-        accepted, rejected, _ = state.submit_tasks(
-            pb2.SubmitTasksRequest(
-                client_id="client-host-restart",
-                code_version=artifact.code_version,
-                execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-                tasks=[
-                    pb2.TaskSubmitItem(
-                        task_id="restart-task-1",
-                        payload={"value": 7, "sleep_ms": 5000},
-                        priority=1,
-                        runtime_key="rt-host-restart",
-                    ),
-                ],
-            )
-        )
-        assert len(accepted) == 1
-        assert not rejected
-
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            with state._lock:  # noqa: SLF001
-                task = state._tasks["restart-task-1"]  # noqa: SLF001
-                if task.status == pb2.TASK_STATUS_RUNNING:
-                    task.payload["sleep_ms"] = 0
-                    break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("task never entered running state")
-
-        assert state._executor_host is not None  # noqa: SLF001
-        state._executor_host._process.terminate()  # noqa: SLF001
-        state._executor_host._process.join(timeout=5.0)  # noqa: SLF001
-
-        deadline = time.time() + 15
-        results = []
-        cursor = ""
-        while time.time() < deadline and not results:
-            batch, cursor = state.pull_results(
-                pb2.PullResultsRequest(client_id="client-host-restart", limit=10, wait_ms=200, cursor=cursor)
-            )
-            results.extend(batch)
-
-        assert len(results) == 1
-        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
-        assert results[0].attempt == 2
-        assert dict(results[0].result) == {"value": 7, "square": 49}
     finally:
         state.close()

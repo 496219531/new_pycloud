@@ -21,6 +21,7 @@ import importlib.machinery
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
@@ -29,6 +30,9 @@ class _TarSourceEntry:
     arcname: str
     source_path: Optional[Path] = None
     data: bytes = b""
+
+
+_PACKAGED_PYTHON_FILE_SUFFIXES = frozenset({".py", ".pyd", ".so"})
 
 
 def _normalize_arcname(arcname: Path | str) -> str:
@@ -59,6 +63,17 @@ def _should_skip_packaged_path(path: Path, *, include_tests: bool = False) -> bo
     return False
 
 
+def _is_packaged_python_file(path: Path, *, include_tests: bool = False) -> bool:
+    normalized = Path(path)
+    if not normalized.exists() or not normalized.is_file():
+        return False
+    if normalized.is_symlink():
+        return False
+    if _should_skip_packaged_path(normalized, include_tests=include_tests):
+        return False
+    return normalized.suffix.lower() in _PACKAGED_PYTHON_FILE_SUFFIXES
+
+
 def _new_temp_targz_path(*, prefix: str) -> str:
     fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix=prefix)
     os.close(fd)
@@ -75,10 +90,15 @@ def _iter_directory_entries(
     root = Path(dir_path).resolve()
     effective_prefix = Path(prefix) if prefix is not None else Path()
     entries: List[_TarSourceEntry] = []
+    package_files = [
+        path
+        for path in root.rglob("*")
+        if _is_packaged_python_file(path, include_tests=include_tests)
+    ]
 
     if synthesize_missing_package_inits:
         dirs_to_check = {root}
-        dirs_to_check.update(path for path in root.rglob("*") if path.is_dir())
+        dirs_to_check.update(path.parent for path in package_files)
         for d in sorted(dirs_to_check, key=lambda item: str(item.relative_to(root))):
             synthetic_path = d / "__init__.py"
             if synthetic_path.exists():
@@ -88,11 +108,7 @@ def _iter_directory_entries(
             arcname = effective_prefix / d.relative_to(root) / "__init__.py"
             entries.append(_TarSourceEntry(arcname=_normalize_arcname(arcname), data=b""))
 
-    for file_path in sorted((path for path in root.rglob("*") if path.is_file()), key=lambda item: str(item.relative_to(root))):
-        if file_path.is_symlink():
-            continue
-        if _should_skip_packaged_path(file_path, include_tests=include_tests):
-            continue
+    for file_path in sorted(package_files, key=lambda item: str(item.relative_to(root))):
         arcname = effective_prefix / file_path.relative_to(root)
         entries.append(_TarSourceEntry(arcname=_normalize_arcname(arcname), source_path=file_path))
     return entries
@@ -118,9 +134,7 @@ def _iter_roots_entries(
                 )
             )
             continue
-        if root.is_symlink():
-            continue
-        if _should_skip_packaged_path(root, include_tests=include_tests):
+        if not _is_packaged_python_file(root, include_tests=include_tests):
             continue
         entries.append(_TarSourceEntry(arcname=_normalize_arcname(root.name), source_path=root))
     return entries
@@ -156,9 +170,7 @@ def _iter_relative_path_entries(
                 )
             )
             continue
-        if p.is_symlink():
-            continue
-        if _should_skip_packaged_path(p, include_tests=include_tests):
+        if not _is_packaged_python_file(p, include_tests=include_tests):
             continue
         entries.append(_TarSourceEntry(arcname=_normalize_arcname(rel), source_path=p))
     return entries
@@ -279,47 +291,46 @@ class DependencyAnalyzer:
         except (ImportError, AttributeError):
             pass
 
-        current_package = ""
-        try:
-            if module is not None:
-                current_package = str(getattr(module, "__package__", "") or "")
-        except Exception:
-            current_package = ""
-
-        # 分析函数所在模块的源码（包含函数体内的 import）
         module_source = self._get_module_source(func)
         if module_source:
-            imports_ast = self._extract_imports_from_source(module_source)
-            result["imports"] = imports_ast
-            self._classify_imports(
-                imports_ast,
-                result,
-                current_module_name=str(func.__module__ or ""),
-                current_package=current_package,
-            )
-            self._expand_local_dependencies(result, current_package=current_package)
+            result["imports"] = self._extract_imports_from_source(module_source)
+
+        if module is not None:
+            module_infos = self._collect_loaded_module_infos(module, root_source=module_source)
+            root_name = str(getattr(module, "__name__", "") or "").strip()
+            root_file = str(result.get("source_file") or result.get("file") or "").strip()
+            for item in module_infos:
+                item_name = str(item.get("name", "") or "").strip()
+                item_file = str(item.get("file", "") or "").strip()
+                if not item_name or not item_file:
+                    continue
+                if item_name == root_name and item_file == root_file:
+                    continue
+                result["local_modules"].append(item)
+                result["local_files"].append(item_file)
 
         return result
 
-    def analyze_module(self, module_name: str) -> Dict[str, Any]:
+    def analyze_module(self, module_name: str | ModuleType) -> Dict[str, Any]:
         """分析模块的所有依赖
 
         Args:
-            module_name: 模块名
+            module_name: 模块名或已加载的模块对象
 
         Returns:
             依赖信息字典
         """
         try:
-            module = importlib.import_module(module_name)
+            module = module_name if inspect.ismodule(module_name) else importlib.import_module(str(module_name))
         except ImportError as e:
             return {
                 "error": f"无法导入模块: {e}",
-                "module_name": module_name,
+                "module_name": str(module_name),
             }
 
+        normalized_module_name = str(getattr(module, "__name__", "") or module_name or "").strip()
         result = {
-            "module_name": module_name,
+            "module_name": normalized_module_name,
             "file": getattr(module, '__file__', None),
             "imports": [],
             "local_files": [],
@@ -330,23 +341,23 @@ class DependencyAnalyzer:
 
         # 获取模块源码
         module_file = getattr(module, '__file__', None)
-        if module_file and module_file.endswith('.py'):
-            try:
-                with open(module_file, 'r', encoding='utf-8') as f:
-                    source = f.read()
+        source = self._read_module_source(module_file)
+        if source:
+            result["imports"] = self._extract_imports_from_source(source)
+        elif module_file and str(module_file).endswith('.py'):
+            result["error"] = "读取模块文件失败"
 
-                imports_ast = self._extract_imports_from_source(source)
-                result["imports"] = imports_ast
-                self._classify_imports(
-                    imports_ast,
-                    result,
-                    current_module_name=module_name,
-                    current_package=str(getattr(module, "__package__", "") or ""),
-                )
-                self._expand_local_dependencies(result, current_package=str(getattr(module, "__package__", "") or ""))
-
-            except Exception as e:
-                result["error"] = f"读取模块文件失败: {e}"
+        module_infos = self._collect_loaded_module_infos(module, root_source=source)
+        root_file = str(result.get("file") or "").strip()
+        for item in module_infos:
+            item_name = str(item.get("name", "") or "").strip()
+            item_file = str(item.get("file", "") or "").strip()
+            if not item_name or not item_file:
+                continue
+            if item_name == normalized_module_name and item_file == root_file:
+                continue
+            result["local_modules"].append(item)
+            result["local_files"].append(item_file)
 
         return result
 
@@ -370,6 +381,169 @@ class DependencyAnalyzer:
                 return f.read()
         except (OSError, TypeError):
             return None
+
+    def _read_module_source(self, module_file: str | os.PathLike[str] | None) -> str:
+        path = Path(str(module_file or "")).resolve()
+        if not path.exists() or path.suffix.lower() != ".py":
+            return ""
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return fh.read()
+        except Exception:
+            return ""
+
+    def _collect_loaded_module_infos(
+        self,
+        module: ModuleType,
+        *,
+        root_source: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        pending: List[Tuple[ModuleType, Optional[str]]] = [(module, root_source)]
+        seen_names: Set[str] = set()
+        collected: List[Dict[str, str]] = []
+
+        while pending:
+            current_module, current_source = pending.pop()
+            current_name = str(getattr(current_module, "__name__", "") or "").strip()
+            if not current_name or current_name in seen_names:
+                continue
+            seen_names.add(current_name)
+
+            current_file = self._module_file_from_object(current_module)
+            if not current_file or not self._is_local_module(current_file):
+                continue
+
+            current_path = Path(current_file).resolve()
+            if not _is_packaged_python_file(current_path):
+                continue
+            collected.append({
+                "name": current_name,
+                "file": str(current_path),
+            })
+
+            for parent_module in reversed(self._iter_parent_package_modules(current_module)):
+                parent_name = str(getattr(parent_module, "__name__", "") or "").strip()
+                if parent_name and parent_name not in seen_names:
+                    pending.append((parent_module, None))
+
+            source = current_source if current_source is not None else self._read_module_source(current_path)
+            if not source:
+                continue
+
+            imports_ast = self._extract_imports_from_source(source)
+            for imported_module in reversed(self._resolve_imported_modules(current_module, imports_ast)):
+                imported_name = str(getattr(imported_module, "__name__", "") or "").strip()
+                if imported_name and imported_name not in seen_names:
+                    pending.append((imported_module, None))
+
+        return collected
+
+    def _iter_parent_package_modules(self, module: ModuleType) -> List[ModuleType]:
+        module_name = str(getattr(module, "__name__", "") or "").strip()
+        if not module_name or "." not in module_name:
+            return []
+
+        parents: List[ModuleType] = []
+        parts = module_name.split(".")
+        for index in range(1, len(parts)):
+            parent_name = ".".join(parts[:index])
+            parent_module = self._load_module_object(parent_name)
+            if parent_module is not None:
+                parents.append(parent_module)
+        return parents
+
+    def _resolve_imported_modules(
+        self,
+        module: ModuleType,
+        imports_ast: Iterable[Dict[str, str]],
+    ) -> List[ModuleType]:
+        resolved: List[ModuleType] = []
+        seen_names: Set[str] = set()
+        for imp in imports_ast:
+            imported_module = self._resolve_imported_module(module, imp)
+            if imported_module is None:
+                continue
+            imported_name = str(getattr(imported_module, "__name__", "") or "").strip()
+            if not imported_name or imported_name in seen_names:
+                continue
+            resolved.append(imported_module)
+            seen_names.add(imported_name)
+        return resolved
+
+    def _resolve_imported_module(self, module: ModuleType, imp: Dict[str, str]) -> Optional[ModuleType]:
+        module_dict = getattr(module, "__dict__", {})
+        imp_type = str(imp.get("type", "") or "")
+
+        if imp_type == "import":
+            imported_name = str(imp.get("module", "") or "").strip()
+            if not imported_name:
+                return None
+
+            loaded_module = self._load_module_object(imported_name)
+            if loaded_module is not None:
+                return loaded_module
+
+            bound_name = str(imp.get("asname", "") or "").strip() or imported_name.split(".", 1)[0]
+            bound_module = self._module_from_object(module_dict.get(bound_name))
+            if bound_module is not None:
+                return self._load_module_object(imported_name) or bound_module
+
+            return self._load_module_object(imported_name)
+
+        if imp_type != "from...import":
+            return None
+
+        alias_name = str(imp.get("name", "") or "").strip()
+        bound_name = str(imp.get("asname", "") or alias_name or "").strip()
+        if bound_name:
+            bound_module = self._module_from_object(module_dict.get(bound_name))
+            if bound_module is not None:
+                return bound_module
+
+        resolved_base = self._resolve_import_module(
+            imp,
+            current_module_name=str(getattr(module, "__name__", "") or ""),
+            current_package=str(getattr(module, "__package__", "") or ""),
+        )
+        if not resolved_base:
+            return None
+
+        if alias_name and alias_name != "*":
+            child_module = self._load_module_object(f"{resolved_base}.{alias_name}")
+            if child_module is not None:
+                return child_module
+
+        return self._load_module_object(resolved_base)
+
+    def _module_from_object(self, obj: Any) -> Optional[ModuleType]:
+        if inspect.ismodule(obj):
+            return obj
+
+        module_name = str(getattr(obj, "__module__", "") or "").strip()
+        if not module_name:
+            return None
+        return self._load_module_object(module_name)
+
+    def _load_module_object(self, module_name: str) -> Optional[ModuleType]:
+        normalized = str(module_name or "").strip()
+        if not normalized:
+            return None
+
+        loaded = sys.modules.get(normalized)
+        if inspect.ismodule(loaded):
+            return loaded
+
+        try:
+            imported = importlib.import_module(normalized)
+        except Exception:
+            return None
+        return imported if inspect.ismodule(imported) else None
+
+    def _module_file_from_object(self, module: ModuleType) -> str:
+        module_file = str(getattr(module, "__file__", "") or "").strip()
+        if not module_file:
+            return ""
+        return str(Path(module_file).resolve())
 
     def _extract_imports_from_source(self, source: str) -> List[Dict[str, str]]:
         """从源码提取 import 语句"""
@@ -533,10 +707,16 @@ class DependencyAnalyzer:
 
     def _find_module_file(self, module_name: str) -> Optional[str]:
         """查找模块文件路径"""
+        module = self._load_module_object(module_name)
+        if module is not None:
+            module_file = self._module_file_from_object(module)
+            if module_file:
+                return module_file
+
         try:
             spec = importlib.machinery.PathFinder.find_spec(module_name)
             if spec and spec.origin:
-                return spec.origin
+                return str(Path(spec.origin).resolve())
             return None
         except (ImportError, ModuleNotFoundError, ValueError):
             return None
@@ -595,22 +775,17 @@ class DependencyPackager:
         if deps.get("error"):
             raise RuntimeError(deps["error"])
 
-        roots_to_package = self._collect_function_roots(func, deps=deps)
-
         if output_file is None:
             output_file = _new_temp_targz_path(prefix="pycloud_func_")
 
-        self.package_roots(
-            roots_to_package,
-            output_file=output_file,
-            include_tests=include_tests,
-        )
+        module_entries = self._build_function_entries(func, deps=deps, include_tests=include_tests)
+        _write_deterministic_targz(module_entries, output_file)
 
         return output_file
 
     def package_module(
         self,
-        module_name: str,
+        module_name: str | ModuleType,
         *,
         output_file: Optional[str] = None,
         include_tests: bool = False,
@@ -625,22 +800,25 @@ class DependencyPackager:
         Returns:
             打包文件的路径
         """
-        # 分析依赖
-        deps = self.analyzer.analyze_module(module_name)
+        try:
+            loaded_module = module_name if inspect.ismodule(module_name) else importlib.import_module(str(module_name))
+        except ImportError as exc:
+            raise RuntimeError(f"无法导入模块: {exc}") from exc
+        deps = self.analyzer.analyze_module(loaded_module)
 
         if deps.get("error"):
             raise RuntimeError(deps["error"])
 
-        roots_to_package = self._collect_module_roots(module_name, deps=deps)
-
         if output_file is None:
             output_file = _new_temp_targz_path(prefix="pycloud_module_")
 
-        self.package_roots(
-            roots_to_package,
-            output_file=output_file,
+        module_entries = self._build_module_entries(
+            module_name=str(getattr(loaded_module, "__name__", "") or deps.get("module_name") or ""),
+            module_file=str(deps.get("file") or ""),
+            deps=deps,
             include_tests=include_tests,
         )
+        _write_deterministic_targz(module_entries, output_file)
 
         return output_file
 
@@ -778,6 +956,84 @@ class DependencyPackager:
     def _should_skip_path(self, path: Path) -> bool:
         return _should_skip_packaged_path(path, include_tests=False)
 
+    def _build_function_entries(
+        self,
+        func: Callable,
+        *,
+        deps: Dict[str, Any],
+        include_tests: bool,
+    ) -> List[_TarSourceEntry]:
+        module_name = str(func.__module__ or "").strip()
+        module_file = str(deps.get("source_file") or deps.get("file") or "").strip()
+        return self._build_module_entries(
+            module_name=module_name,
+            module_file=module_file,
+            deps=deps,
+            include_tests=include_tests,
+        )
+
+    def _build_module_entries(
+        self,
+        *,
+        module_name: str,
+        module_file: str,
+        deps: Dict[str, Any],
+        include_tests: bool,
+    ) -> List[_TarSourceEntry]:
+        entries: Dict[str, _TarSourceEntry] = {}
+        for item_name, item_file in self._iter_dependency_module_files(
+            module_name=module_name,
+            module_file=module_file,
+            deps=deps,
+        ):
+            path = Path(item_file).resolve()
+            if not _is_packaged_python_file(path, include_tests=include_tests):
+                continue
+            arcname = self._arcname_for_module_file(item_name, path)
+            if not arcname:
+                continue
+            entries[arcname] = _TarSourceEntry(arcname=arcname, source_path=path)
+        return [entries[key] for key in sorted(entries)]
+
+    def _iter_dependency_module_files(
+        self,
+        *,
+        module_name: str,
+        module_file: str,
+        deps: Dict[str, Any],
+    ) -> List[Tuple[str, str]]:
+        items: List[Tuple[str, str]] = []
+        normalized_root_name = str(module_name or "").strip()
+        normalized_root_file = str(module_file or "").strip()
+        if normalized_root_name and normalized_root_file:
+            items.append((normalized_root_name, normalized_root_file))
+
+        for item in deps.get("local_modules", []):
+            item_name = str(item.get("name", "") or "").strip()
+            item_file = str(item.get("file", "") or "").strip()
+            if not item_name or not item_file:
+                continue
+            items.append((item_name, item_file))
+        return items
+
+    def _arcname_for_module_file(self, module_name: str, module_file: Path) -> str:
+        normalized_name = str(module_name or "").strip()
+        path = Path(module_file).resolve()
+        if not normalized_name:
+            return _normalize_arcname(path.name)
+
+        module_parts = [part for part in normalized_name.split(".") if part]
+        if not module_parts:
+            return _normalize_arcname(path.name)
+
+        if path.name == "__init__.py":
+            return _normalize_arcname(Path(*module_parts) / "__init__.py")
+
+        if len(module_parts) == 1:
+            return _normalize_arcname(path.name)
+
+        return _normalize_arcname(Path(*module_parts[:-1]) / path.name)
+
 
 def _infer_entry_module_from_source_file(source_file: str) -> str:
     path = Path(str(source_file or "")).resolve()
@@ -854,3 +1110,24 @@ def auto_deploy_function(
         )
     finally:
         Path(package_path).unlink(missing_ok=True)
+
+
+def package_module_for_debug(
+    module_name: str | ModuleType,
+    *,
+    output_file: Optional[str] = None,
+    include_tests: bool = False,
+) -> Dict[str, Any]:
+    """本地打包模块并返回调试信息。"""
+    packager = DependencyPackager()
+    package_path = packager.package_module(
+        module_name,
+        output_file=output_file,
+        include_tests=include_tests,
+    )
+    with tarfile.open(package_path, "r:gz") as tar:
+        entries = sorted(tar.getnames())
+    return {
+        "package_path": str(Path(package_path).resolve()),
+        "entries": entries,
+    }

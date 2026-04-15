@@ -21,8 +21,8 @@
 | `PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES` | `67108864` | 结果段文件滚动写入的目标大小 |
 | `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条发送消息限制 |
 | `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条接收消息限制 |
-| `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role nodecontrol` 的默认 worker capacity；`pycloudctl start` 未显式指定时优先读它 |
-| `PYCLOUD_NODE_QUEUE_CAPACITY` | `4000` | `pycloud-control --role nodecontrol` 的默认 queue capacity；`pycloudctl start-node` 默认值为 `1000`，也可被它覆盖 |
+| `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role node` 的默认 worker capacity；`pycloudctl start` 未显式指定时优先读它 |
+| `PYCLOUD_NODE_QUEUE_CAPACITY` | `4000` | `pycloud-control --role node` 的默认 queue capacity；`pycloudctl start-node` 默认值为 `1000`，也可被它覆盖 |
 | `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl gRPC server 的默认线程池大小 |
 | `PYCLOUD_SERVICE_DEFAULT_WORKERS` | `10` | 单个 service 默认 worker 数 |
 | `PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC` | `30` | service 默认 heartbeat timeout |
@@ -94,12 +94,12 @@
 
 - `PYCLOUD_NODE_WORKER_CAPACITY`
   - 默认：`32`
-  - 影响 `pycloud-control --role nodecontrol` 默认 worker capacity
+  - 影响 `pycloud-control --role node` 默认 worker capacity
   - `pycloudctl start` / `start-node` 如果没有显式给 `--node-worker-capacity` / `--worker-capacity`，也会优先使用它
 
 - `PYCLOUD_NODE_QUEUE_CAPACITY`
   - 默认：`4000`
-  - 影响 `pycloud-control --role nodecontrol` 默认 queue capacity
+  - 影响 `pycloud-control --role node` 默认 queue capacity
   - `pycloudctl start-node` 的默认 queue capacity 也可被它覆盖
 
 - `PYCLOUD_NODE_MAX_WORKERS`

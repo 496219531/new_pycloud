@@ -9,6 +9,7 @@
    - 更适合 CPU 密集型子任务、批处理、高吞吐执行
 2. `JobQueue Mode`
    - 大任务排队与单活调度层
+   - `JobQueueClient` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
    - 大任务排到后，再展开成 subtasks 交给执行层
 3. `Service Mode`
    - 常驻函数服务层
@@ -169,6 +170,7 @@ group = DeployedService.deploy_from_infocenter(
    - 原生专属 pool，会自动 heartbeat
 2. `DedicatedTaskServiceSession`
    - 兼容专属池实现，底层复用 `ServiceGroup`
+   - owner 侧也支持 `update_globals(...)`
 3. `JobQueueClient`
    - 先提交大任务到队列，排到后再自动创建 `TaskPoolSession`
 
@@ -203,7 +205,7 @@ with TaskPoolSession.from_infocenter(
     for task_id, data in pool.iter_data(max_count=1, timeout_sec=10.0):
         print(task_id, data)
 
-    for task_id, data in pool.imap_unordered(
+    for task_id, data in pool.unordered(
         [{"value": 20}, {"value": 21}, {"value": 22}],
         max_in_flight=2,
         receive_batch=1,
@@ -211,13 +213,21 @@ with TaskPoolSession.from_infocenter(
     ):
         print(task_id, data)
 
+    pool.consume_unordered(
+        [{"value": 30}, {"value": 31}],
+        handle=lambda task_id, data: print("handled", task_id, data),
+        max_in_flight=2,
+        receive_batch=1,
+        result_timeout_sec=10.0,
+    )
+
     mapped = pool.map([8, 9, 10], timeout_sec=10.0)
     print(mapped)
 ```
 
 说明：
 
-1. `TaskPoolSession` 当前是单入口模式，入口名就是 `entry_callable`
+1. `TaskPoolSession` 当前是单入口模式，入口名就是 `entry_func / entry_callable`
 2. `submit_payloads(..., task_method=...)` 只能传这个方法名
 3. `runtime_key` 仍可用于 runtime 逻辑隔离，但不再表示独立 runtime-slot
 
@@ -226,40 +236,56 @@ with TaskPoolSession.from_infocenter(
 ```python
 from pycloud_parallel import JobQueueClient
 
-client = JobQueueClient("127.0.0.1:50051")
+client = JobQueueClient("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
-    blob=driver_blob,
-    driver_entry_module="job_driver_demo",
+    blob=job_blob,
+    entry_module="job_demo",
     runtime="py3",
-    task_entry_module="task_demo",
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    job_payload={"value": 10, "count": 6},
 )
 ```
 
-如果你已经有函数对象，也可以直接：
+这里的目标地址应该指向 `InfoCenter` 或内嵌 `InfoCenter` 的 `controlplane`；`JobQueueClient` 会先发现 `job-orchestrator` route，再直连它自己的 HTTP 数据面。
 
-```python
-client.submit_job_from_func(
-    func=build_subtasks,
-    task_func=run_subtask,
-    pool_worker_count=2,
-    pool_node_count=2,
-)
-```
+`JobQueueClient` 的 job module 约定如下：
+
+1. `run(payload...)`
+   - 必选，子任务入口
+2. `task_generator(...)`
+   - 必选
+   - 返回 `list[dict]` 或 payload 迭代器
+3. `update_globals(...)`
+   - 可选
+   - 只负责在 job-orch 端生成共享数据 `dict`
+4. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+   - 可选，增量聚合中间结果
+5. `finalize(state=..., ...)`
+   - 可选，生成最终 `final_result`
+6. `apply_managed_globals(values, **context)`
+   - 可选
+   - 在 worker 端运行
+   - 负责把共享数据作用到入口模块 A 或它依赖的模块 B
+   - 返回 `None` 时不做默认 raw assign
+   - 返回 `dict` 时再把这个 dict 写回入口模块 A 的 globals
+
+说明：
+
+1. `job_payload` 是可选 `dict`
+2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
+4. `apply_managed_globals` 不走 payload，worker 固定按约定名在入口模块 A 中查找
+5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 
 如果你已有模块对象：
 
 ```python
 client.submit_job_from_module(
-    module=job_driver_module,
-    task_module=task_module,
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    module=job_module,
+    job_payload={"value": 10, "count": 6},
 )
 ```
+
+这里推荐直接提交模块对象；`submit_job_from_func(...)` 已移除，避免把函数对象临时拼模块带来的隐式依赖问题。
 
 等待 job 进入终态：
 

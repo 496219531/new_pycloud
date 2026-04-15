@@ -53,35 +53,20 @@ class NodeControlServiceStub(object):
                 request_serializer=pycloud__v1__pb2.DownloadObjectRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.DownloadObjectChunk.FromString,
                 _registered_method=True)
+        self.PinObject = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/PinObject',
+                request_serializer=pycloud__v1__pb2.PinObjectRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.PinObjectResponse.FromString,
+                _registered_method=True)
+        self.ReleaseObject = channel.unary_unary(
+                '/pycloud.v1.NodeControlService/ReleaseObject',
+                request_serializer=pycloud__v1__pb2.ReleaseObjectRequest.SerializeToString,
+                response_deserializer=pycloud__v1__pb2.ReleaseObjectResponse.FromString,
+                _registered_method=True)
         self.UpdateRuntimeGlobals = channel.unary_unary(
                 '/pycloud.v1.NodeControlService/UpdateRuntimeGlobals',
                 request_serializer=pycloud__v1__pb2.UpdateRuntimeGlobalsRequest.SerializeToString,
                 response_deserializer=pycloud__v1__pb2.UpdateRuntimeGlobalsResponse.FromString,
-                _registered_method=True)
-        self.TaskStream = channel.stream_stream(
-                '/pycloud.v1.NodeControlService/TaskStream',
-                request_serializer=pycloud__v1__pb2.TaskStreamRequest.SerializeToString,
-                response_deserializer=pycloud__v1__pb2.TaskStreamResponse.FromString,
-                _registered_method=True)
-        self.SubmitTasks = channel.unary_unary(
-                '/pycloud.v1.NodeControlService/SubmitTasks',
-                request_serializer=pycloud__v1__pb2.SubmitTasksRequest.SerializeToString,
-                response_deserializer=pycloud__v1__pb2.SubmitTasksResponse.FromString,
-                _registered_method=True)
-        self.PullResults = channel.unary_unary(
-                '/pycloud.v1.NodeControlService/PullResults',
-                request_serializer=pycloud__v1__pb2.PullResultsRequest.SerializeToString,
-                response_deserializer=pycloud__v1__pb2.PullResultsResponse.FromString,
-                _registered_method=True)
-        self.CancelTasks = channel.unary_unary(
-                '/pycloud.v1.NodeControlService/CancelTasks',
-                request_serializer=pycloud__v1__pb2.CancelTasksRequest.SerializeToString,
-                response_deserializer=pycloud__v1__pb2.CancelTasksResponse.FromString,
-                _registered_method=True)
-        self.CancelJob = channel.unary_unary(
-                '/pycloud.v1.NodeControlService/CancelJob',
-                request_serializer=pycloud__v1__pb2.CancelJobRequest.SerializeToString,
-                response_deserializer=pycloud__v1__pb2.CancelJobResponse.FromString,
                 _registered_method=True)
         self.GetMetrics = channel.unary_unary(
                 '/pycloud.v1.NodeControlService/GetMetrics',
@@ -185,37 +170,19 @@ class NodeControlServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PinObject(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseObject(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def UpdateRuntimeGlobals(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def TaskStream(self, request_iterator, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def SubmitTasks(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def PullResults(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def CancelTasks(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def CancelJob(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -329,35 +296,20 @@ def add_NodeControlServiceServicer_to_server(servicer, server):
                     request_deserializer=pycloud__v1__pb2.DownloadObjectRequest.FromString,
                     response_serializer=pycloud__v1__pb2.DownloadObjectChunk.SerializeToString,
             ),
+            'PinObject': grpc.unary_unary_rpc_method_handler(
+                    servicer.PinObject,
+                    request_deserializer=pycloud__v1__pb2.PinObjectRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.PinObjectResponse.SerializeToString,
+            ),
+            'ReleaseObject': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseObject,
+                    request_deserializer=pycloud__v1__pb2.ReleaseObjectRequest.FromString,
+                    response_serializer=pycloud__v1__pb2.ReleaseObjectResponse.SerializeToString,
+            ),
             'UpdateRuntimeGlobals': grpc.unary_unary_rpc_method_handler(
                     servicer.UpdateRuntimeGlobals,
                     request_deserializer=pycloud__v1__pb2.UpdateRuntimeGlobalsRequest.FromString,
                     response_serializer=pycloud__v1__pb2.UpdateRuntimeGlobalsResponse.SerializeToString,
-            ),
-            'TaskStream': grpc.stream_stream_rpc_method_handler(
-                    servicer.TaskStream,
-                    request_deserializer=pycloud__v1__pb2.TaskStreamRequest.FromString,
-                    response_serializer=pycloud__v1__pb2.TaskStreamResponse.SerializeToString,
-            ),
-            'SubmitTasks': grpc.unary_unary_rpc_method_handler(
-                    servicer.SubmitTasks,
-                    request_deserializer=pycloud__v1__pb2.SubmitTasksRequest.FromString,
-                    response_serializer=pycloud__v1__pb2.SubmitTasksResponse.SerializeToString,
-            ),
-            'PullResults': grpc.unary_unary_rpc_method_handler(
-                    servicer.PullResults,
-                    request_deserializer=pycloud__v1__pb2.PullResultsRequest.FromString,
-                    response_serializer=pycloud__v1__pb2.PullResultsResponse.SerializeToString,
-            ),
-            'CancelTasks': grpc.unary_unary_rpc_method_handler(
-                    servicer.CancelTasks,
-                    request_deserializer=pycloud__v1__pb2.CancelTasksRequest.FromString,
-                    response_serializer=pycloud__v1__pb2.CancelTasksResponse.SerializeToString,
-            ),
-            'CancelJob': grpc.unary_unary_rpc_method_handler(
-                    servicer.CancelJob,
-                    request_deserializer=pycloud__v1__pb2.CancelJobRequest.FromString,
-                    response_serializer=pycloud__v1__pb2.CancelJobResponse.SerializeToString,
             ),
             'GetMetrics': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMetrics,
@@ -531,6 +483,60 @@ class NodeControlService(object):
             _registered_method=True)
 
     @staticmethod
+    def PinObject(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/PinObject',
+            pycloud__v1__pb2.PinObjectRequest.SerializeToString,
+            pycloud__v1__pb2.PinObjectResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseObject(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/pycloud.v1.NodeControlService/ReleaseObject',
+            pycloud__v1__pb2.ReleaseObjectRequest.SerializeToString,
+            pycloud__v1__pb2.ReleaseObjectResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def UpdateRuntimeGlobals(request,
             target,
             options=(),
@@ -547,141 +553,6 @@ class NodeControlService(object):
             '/pycloud.v1.NodeControlService/UpdateRuntimeGlobals',
             pycloud__v1__pb2.UpdateRuntimeGlobalsRequest.SerializeToString,
             pycloud__v1__pb2.UpdateRuntimeGlobalsResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def TaskStream(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_stream(
-            request_iterator,
-            target,
-            '/pycloud.v1.NodeControlService/TaskStream',
-            pycloud__v1__pb2.TaskStreamRequest.SerializeToString,
-            pycloud__v1__pb2.TaskStreamResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def SubmitTasks(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/pycloud.v1.NodeControlService/SubmitTasks',
-            pycloud__v1__pb2.SubmitTasksRequest.SerializeToString,
-            pycloud__v1__pb2.SubmitTasksResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def PullResults(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/pycloud.v1.NodeControlService/PullResults',
-            pycloud__v1__pb2.PullResultsRequest.SerializeToString,
-            pycloud__v1__pb2.PullResultsResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def CancelTasks(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/pycloud.v1.NodeControlService/CancelTasks',
-            pycloud__v1__pb2.CancelTasksRequest.SerializeToString,
-            pycloud__v1__pb2.CancelTasksResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def CancelJob(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/pycloud.v1.NodeControlService/CancelJob',
-            pycloud__v1__pb2.CancelJobRequest.SerializeToString,
-            pycloud__v1__pb2.CancelJobResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -34,7 +34,7 @@ with TaskPoolSession.from_infocenter(
 
 说明：
 
-1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_callable`
+1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
 2. 如果手动传 `task_method=...`，它必须和这个入口名一致
 3. `runtime_key` 保留为 runtime 逻辑隔离键，但不再表示独立 runtime-slot
 
@@ -43,36 +43,69 @@ with TaskPoolSession.from_infocenter(
 ```python
 from pycloud_parallel import JobQueueClient
 
-client = JobQueueClient("127.0.0.1:50051")
+client = JobQueueClient("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
-    blob=driver_blob,
-    driver_entry_module="job_driver_demo",
-    task_entry_module="task_demo",
-    task_entry_callable="run",
-    pool_worker_count=2,
-    pool_node_count=2,
+    blob=job_blob,
+    entry_module="job_demo",
+    job_payload={"value": 10, "count": 6},
 )
 ```
 
-如果你直接持有函数对象：
+约定：
 
-```python
-client.submit_job_from_func(
-    func=build_subtasks,
-    task_func=run_subtask,
-    pool_worker_count=2,
-    pool_node_count=2,
-)
-```
+1. `JobQueueClient` 的 target 应指向 `InfoCenter` 或内嵌 `InfoCenter` 的 `controlplane`
+2. `JobQueueClient` 会先发现 `job-orchestrator` route，再直连它自己的 HTTP 数据面
+3. job module 约定 6 个 hook 位：
+4. `run(payload...)`
+   - 必选，子任务入口
+5. `task_generator(...)`
+   - 必选
+   - 返回 `list[dict]` 或 payload 迭代器
+6. `update_globals(...)`
+   - 可选
+   - 只负责在 job-orch 端生成共享数据 `dict`
+7. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+   - 可选，增量更新聚合状态
+8. `finalize(state=..., ...)`
+   - 可选，输出最终 `final_result`
+9. `apply_managed_globals(values, **context)`
+   - 可选
+   - 在 worker/node 端运行
+   - 决定共享数据怎么作用到入口模块 A 或依赖模块 B
+   - `None` -> 不再默认 raw assign
+   - `dict` -> 再把这个 dict 写回入口模块 A 的 globals
+10. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 负责，不再从 client helper 暴露
+
+说明：
+
+1. `job_payload` 是可选 `dict`
+2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
+4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
+5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 
 如果你直接持有模块对象：
 
 ```python
 client.submit_job_from_module(
-    module=job_driver_module,
-    task_module=task_module,
-    task_entry_callable="run",
+    module=job_module,
+    job_payload={"value": 10, "count": 6},
 )
+```
+
+这里推荐直接提交模块对象；`submit_job_from_func(...)` 已移除，避免把函数对象临时拼模块带来的不稳定依赖。
+
+模块对象自动打包当前有两个关键约束：
+
+1. 依赖分析基于“已加载 module object + 真实 `__file__`”
+2. 自动打包只收 `.py / .pyd / .so`
+3. `.csv / .json / README / docs` 等非 Python 文件不会自动带上
+4. 如果 job 依赖非 Python 资源，请预先自己构建 `zip / tar.gz / whl`，再走 `submit_job_from_bytes(...)`
+
+如果你想本地检查自动打包产物：
+
+```bash
+python scripts/debug_package_module.py calc_asset_ratio_job_module
 ```
 
 等待终态：

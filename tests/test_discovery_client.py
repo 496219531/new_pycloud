@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import time
 from concurrent import futures
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Tuple
 from unittest.mock import patch
@@ -13,6 +14,7 @@ import pytest
 
 from pycloud_parallel.controlplane.client import (
     DirectConnect,
+    DiscoveryCallError,
     DiscoveryServiceClient,
     InfoCenterClient,
     InfoCenterServiceRoute,
@@ -21,7 +23,8 @@ from pycloud_parallel.controlplane.client import (
     _ServiceRouteSnapshot,
     _CallProxy,
 )
-from pycloud_parallel.controlplane.result_ref import ResultRef
+from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.controlplane.object_ref import ObjectRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.state import NodeControlState
@@ -203,6 +206,85 @@ class TestDirectConnect:
 
                 result = asyncio.run(_run())
             assert result == {"y": 64}
+        finally:
+            client.close()
+
+    def test_large_payload_upload_targets_selected_route_only(self, monkeypatch):
+        primary = _demo_route()
+
+        uploads = []
+
+        def fake_estimate(value):
+            return 600000 if isinstance(value, str) else 16
+
+        def fake_put(clients, data, *, format="", chunk_size=0):
+            uploads.append([client.target for client in clients])
+            return ObjectRef(
+                object_id="sha256:" + ("a" * 64),
+                format=format or "bin",
+                size_bytes=2048,
+                materialize_as="bytes",
+            )
+
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        try:
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._estimate_managed_global_inline_size", fake_estimate)
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+            with patch.object(client._route_cache, "select_route", return_value=primary), patch(
+                "pycloud_parallel.controlplane.client._call_route_http",
+                return_value={"ok": True, "data": {"y": 81}},
+            ):
+                result = client.call_sync("square", blob="x" * 2048)
+            assert result == {"y": 81}
+            assert uploads == [[primary.control_addr]]
+        finally:
+            client.close()
+
+    def test_large_payload_retry_uploads_only_to_retry_route(self, monkeypatch):
+        primary = _demo_route()
+        retry = replace(
+            primary,
+            service_id="svc-id-2",
+            node_instance_id="node-2-inst",
+            node_id="node-2",
+            control_addr="127.0.0.1:50062",
+            http_base_url="http://127.0.0.1:18082/svc/svc-id-2",
+        )
+
+        uploads = []
+
+        def fake_estimate(value):
+            return 600000 if isinstance(value, str) else 16
+
+        def fake_put(clients, data, *, format="", chunk_size=0):
+            uploads.append([client.target for client in clients])
+            return ObjectRef(
+                object_id="sha256:" + ("b" * 64),
+                format=format or "bin",
+                size_bytes=2048,
+                materialize_as="bytes",
+            )
+
+        def fake_call(route, *, method, payload, timeout_sec, service_token):
+            if route.service_id == primary.service_id:
+                raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "primary failed"})
+            return {"ok": True, "data": {"y": 100}}
+
+        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        try:
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._estimate_managed_global_inline_size", fake_estimate)
+            monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+            with patch.object(client._route_cache, "select_route", side_effect=[primary, retry]), patch.object(
+                client._route_cache,
+                "refresh",
+                return_value=[retry],
+            ), patch(
+                "pycloud_parallel.controlplane.client._call_route_http",
+                side_effect=fake_call,
+            ):
+                result = client.call_sync("square", blob="x" * 2048)
+            assert result == {"y": 100}
+            assert uploads == [[primary.control_addr], [retry.control_addr]]
         finally:
             client.close()
 
@@ -401,7 +483,8 @@ def test_discovery_client_fetches_large_dataframe_result(tmp_path):
             b"@pycloud_export\n"
             b"def run(value=0, **_kwargs):\n"
             b"    value = int(value)\n"
-            b"    return pd.DataFrame([{'x': value}, {'x': value + 1}, {'x': value + 2}])\n"
+            b"    rows = 100000\n"
+            b"    return pd.DataFrame({'x': list(range(value, value + rows)), 'tag': ['x' * 128] * rows})\n"
         )
         with NodeControlClient(node_target, timeout_sec=10.0) as client:
             session = client.create_service_from_bytes(
@@ -443,12 +526,16 @@ def test_discovery_client_fetches_large_dataframe_result(tmp_path):
                 timeout_sec=5.0,
             )
             assert body["ok"] is True
-            assert isinstance(body["data"], ResultRef)
+            assert isinstance(body["data"], DataRef)
             assert body["data"].node_id == "node-discovery-large-01"
-            assert body["data"].control_addr == node_target
+            assert body["data"].locator_kind == "controlplane"
+            assert body["data"].locator_token == controlplane.base_url
+            assert body["data"].control_addr == ""
             frame = client.fetch_result_data(body)
             assert isinstance(frame, pd.DataFrame)
-            assert list(frame["x"]) == [4, 5, 6]
+            assert list(frame["x"].head(3)) == [4, 5, 6]
+            assert frame["tag"].iloc[0] == "x" * 128
+            assert len(frame) == 100000
     finally:
         node_server.stop(grace=0)
         node_state.close()
@@ -497,3 +584,42 @@ def test_discovery_route_cache_defaults_to_predicted_busy():
         assert cache.select_route("svc-demo", strategy="least_inflight").service_id == "svc-low-inflight"
     finally:
         cache.stop()
+
+
+def test_discovery_service_client_call_uses_http_payload_policy(monkeypatch):
+    route = _demo_route()
+    captured = {}
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, timeout_sec: float = 10.0) -> None:
+            del timeout_sec
+            self.target = target
+
+        def close(self) -> None:
+            return None
+
+    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy):
+        del put_data, estimate_inline_size
+        captured["mode"] = policy.mode
+        captured["preserve_args_kwargs_container"] = policy.preserve_args_kwargs_container
+        return dict(payload or {})
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.client.NodeControlClient", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.controlplane.client.prepare_outbound_payload", _fake_prepare)
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.client._call_route_http",
+        lambda route, *, method, payload, timeout_sec, service_token: {"ok": True, "data": payload},
+    )
+
+    client = DiscoveryServiceClient("127.0.0.1:50051", timeout_sec=8.0)
+    try:
+        monkeypatch.setattr(client._route_cache, "select_route", lambda *args, **kwargs: route)
+        monkeypatch.setattr(client._route_cache, "get_routes", lambda *args, **kwargs: [route])
+        monkeypatch.setattr(client._route_cache, "mark_success", lambda *args, **kwargs: None)
+
+        result = client.call(service_name="svc-demo", method="square", payload={"args": [7], "kwargs": {"x": 8}})
+        assert result == {"ok": True, "data": {"args": [7], "kwargs": {"x": 8}}}
+        assert captured["mode"] == "http_call"
+        assert captured["preserve_args_kwargs_container"] is True
+    finally:
+        client.close()

@@ -39,6 +39,11 @@ class ResultRef:
             }
         }
 
+    def to_data_ref(self):
+        from pycloud_parallel.controlplane.data_ref import data_ref_from_result_ref
+
+        return data_ref_from_result_ref(self)
+
 
 def is_result_ref_payload(data: Any) -> bool:
     return (
@@ -64,3 +69,17 @@ def result_ref_from_payload(data: Dict[str, object]) -> ResultRef:
 
 def result_ref_to_payload(ref: ResultRef) -> Dict[str, Dict[str, object]]:
     return ref.to_payload()
+
+
+def result_ref_from_data_ref(ref: object) -> ResultRef:
+    from pycloud_parallel.controlplane.data_ref import coerce_data_ref
+
+    data_ref = coerce_data_ref(ref)
+    return ResultRef(
+        object_id=data_ref.object_id,
+        node_id=str(data_ref.node_id or ""),
+        control_addr=str(data_ref.control_addr or ""),
+        format=data_ref.format,
+        size_bytes=data_ref.size_bytes,
+        materialize_as=data_ref.materialize_as if data_ref.materialize_as != "auto" else "path",
+    )

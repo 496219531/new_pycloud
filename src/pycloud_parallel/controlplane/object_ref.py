@@ -10,7 +10,7 @@ from typing import Any, Dict
 OBJECT_REF_SENTINEL = "__pycloud_object_ref__"
 _OBJECT_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OBJECT_FORMAT_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_MATERIALIZE_AS = {"path", "dataframe", "series", "ndarray", "json", "bytes"}
+_MATERIALIZE_AS = {"path", "dataframe", "series", "ndarray", "json", "bytes", "text"}
 
 
 def normalize_object_id(object_id: str) -> str:
@@ -89,6 +89,11 @@ class ObjectRef:
             }
         }
 
+    def to_data_ref(self):
+        from pycloud_parallel.controlplane.data_ref import data_ref_from_object_ref
+
+        return data_ref_from_object_ref(self)
+
 
 def is_object_ref_payload(data: Any) -> bool:
     return (
@@ -113,3 +118,16 @@ def object_ref_from_payload(data: Dict[str, object]) -> ObjectRef:
 
 def object_ref_to_payload(ref: ObjectRef) -> Dict[str, Dict[str, object]]:
     return ref.to_payload()
+
+
+def object_ref_from_data_ref(ref: object) -> ObjectRef:
+    from pycloud_parallel.controlplane.data_ref import coerce_data_ref
+
+    data_ref = coerce_data_ref(ref)
+    return ObjectRef(
+        object_id=data_ref.object_id,
+        format=data_ref.format,
+        size_bytes=data_ref.size_bytes,
+        materialize_as=data_ref.materialize_as if data_ref.materialize_as != "auto" else "path",
+        consume_on_read=bool(data_ref.consume_on_read),
+    )

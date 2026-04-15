@@ -15,6 +15,12 @@ from pycloud_parallel.controlplane.config import (
     INLINE_RESULT_HARD_LIMIT_BYTES,
     INLINE_RESULT_SOFT_LIMIT_BYTES,
 )
+from pycloud_parallel.controlplane.data_ref import (
+    DataRef,
+    data_ref_from_payload,
+    data_ref_to_payload,
+    is_data_ref_payload,
+)
 from pycloud_parallel.controlplane.object_ref import (
     ObjectRef,
     is_object_ref_payload,
@@ -44,6 +50,11 @@ def _format_payload_bytes(size_bytes: int) -> str:
 def summarize_payload_flow_value(value: Any) -> str:
     if value is None:
         return "None"
+    if isinstance(value, DataRef):
+        return (
+            f"DataRef(logical_type={value.logical_type}, format={value.format}, "
+            f"size_bytes={value.size_bytes}, materialize_as={value.materialize_as})"
+        )
     if isinstance(value, ObjectRef):
         return (
             f"ObjectRef(format={value.format}, size_bytes={value.size_bytes}, "
@@ -461,6 +472,8 @@ def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
         return object_ref_to_payload(obj)
     if isinstance(obj, ResultRef):
         return result_ref_to_payload(obj)
+    if isinstance(obj, DataRef):
+        return data_ref_to_payload(obj)
 
     try:
         import numpy as np
@@ -569,6 +582,8 @@ def _convert_dict_to_arrow(data: Any, *, depth: int) -> Any:
     if depth > MAX_ARROW_RECURSION_DEPTH:
         raise RecursionError(f"payload exceeds max deserialization depth {MAX_ARROW_RECURSION_DEPTH}")
     if isinstance(data, dict):
+        if is_data_ref_payload(data):
+            return data_ref_from_payload(data)
         if is_object_ref_payload(data):
             return object_ref_from_payload(data)
         if is_result_ref_payload(data):

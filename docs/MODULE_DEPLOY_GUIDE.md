@@ -21,7 +21,7 @@ group = DeployedService.deploy_from_infocenter(
 
 1. 内部常驻函数服务
 2. 模块 / package 级别部署
-3. 需要一起带上模块资源文件
+3. 需要自动收集本地 Python 依赖闭包
 
 ## 2. 任务侧
 
@@ -38,11 +38,27 @@ group = DeployedService.deploy_from_infocenter(
 
 如果你有共享静态数据文件：
 
-1. 把数据文件放进模块 / package 目录树内部
-2. 使用 `Path(__file__).resolve().parent / ...` 的相对路径读取
-3. 传真实模块对象给 `entry_module` 时，会把模块 / package 树里的资源文件一起带上
+1. 不要依赖模块对象自动打包把资源文件一起带上
+2. 当前自动打包只会收 `.py / .pyd / .so`
+3. `.csv / .json / README / docs` 等非 Python 文件都不会自动进入包
+4. 如果必须带资源文件，请预先自行构建 `zip / tar.gz / whl`，再通过 `artifact_path=<archive file>` 或 `blob=...` 上传
+5. 代码里如果仍要走相对路径，建议在你自己构建的归档里保留所需目录结构
 
-## 4. 已移除
+## 4. 本地调试模块打包
+
+可以直接用调试脚本查看自动打包结果：
+
+```bash
+python scripts/debug_package_module.py my_job.main
+```
+
+输出：
+
+1. 本地生成的 `tar.gz` 路径
+2. 包内文件清单
+3. 同目录下的 `*.contents.txt` manifest
+
+## 5. 已移除
 
 以下旧入口已移除：
 

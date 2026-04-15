@@ -11,7 +11,8 @@ from typing import Callable, Iterable, List, Optional
 
 import grpc
 
-from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
+from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_payload_policy
+from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict, touch_object_last_at
 from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, validate_inline_payload_structs
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -81,7 +82,7 @@ def _peer(context: grpc.ServicerContext) -> str:
 class NodeControlService(pb2_grpc.NodeControlServiceServicer):
     """NodeControl gRPC 服务。
 
-    负责代码上传、任务提交、结果拉取等核心功能。
+    负责代码/对象上传、TaskPool 控制面和服务会话模式的 gRPC 能力。
 
     Attributes:
         _state: NodeControl 状态管理器
@@ -98,10 +99,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             self._on_service_routes_changed()
         except Exception:
             logger.exception("[NodeControl] service route sync callback failed")
-
-    @staticmethod
-    def _shared_task_mode_removed_message() -> str:
-        return "shared task mode has been removed; use native TaskPoolSession or JobQueueMode"
 
     def UploadCode(self, request_iterator: Iterable[pb2.UploadCodeRequest], context: grpc.ServicerContext) -> pb2.UploadCodeResponse:
         meta = None
@@ -186,6 +183,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 export_mode=export_spec.mode,
                 export_methods=list(export_spec.methods),
                 export_decorator=export_spec.decorator,
+                dependency_policy_mode=meta.dependency_policy_mode,
                 dependency_allowlist=list(meta.dependency_allowlist),
                 managed_global_names=list(meta.managed_global_names),
                 code_token=meta.code_token,
@@ -305,7 +303,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
 
         try:
             tmp_file.close()
-            artifact, cached = self._state.put_object_from_uploaded_file(
+            artifact, cached = self._state.data_store.put_uploaded_file(
                 object_id=meta.object_id,
                 format=meta.format,
                 uploaded_path=tmp_path,
@@ -388,23 +386,71 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             context.set_details("object file missing")
             return
 
-    def SubmitTasks(self, request: pb2.SubmitTasksRequest, context: grpc.ServicerContext) -> pb2.SubmitTasksResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.SubmitTasksResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-
-    def TaskStream(
+    def PinObject(
         self,
-        request_iterator: Iterable[pb2.TaskStreamRequest],
+        request: pb2.PinObjectRequest,
         context: grpc.ServicerContext,
-    ) -> Iterable[pb2.TaskStreamResponse]:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        yield pb2.TaskStreamResponse(error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()))
-        return
+    ) -> pb2.PinObjectResponse:
+        object_id = str(request.object_id or "").strip()
+        ref_id = str(request.ref_id or "").strip()
+        if not object_id or not ref_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("object_id and ref_id are required")
+            return pb2.PinObjectResponse(
+                ok=False,
+                pinned=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "object_id and ref_id are required"),
+            )
+        try:
+            pinned = self._state.pin_object(object_id, ref_id=ref_id)
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.PinObjectResponse(
+                ok=False,
+                pinned=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
+        if not pinned:
+            return pb2.PinObjectResponse(
+                ok=False,
+                pinned=False,
+                error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, "object not found"),
+            )
+        return pb2.PinObjectResponse(ok=True, pinned=True)
+
+    def ReleaseObject(
+        self,
+        request: pb2.ReleaseObjectRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.ReleaseObjectResponse:
+        object_id = str(request.object_id or "").strip()
+        ref_id = str(request.ref_id or "").strip()
+        if not object_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("object_id is required")
+            return pb2.ReleaseObjectResponse(
+                ok=False,
+                released=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "object_id is required"),
+            )
+        try:
+            released = self._state.release_object(object_id, ref_id=ref_id)
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.ReleaseObjectResponse(
+                ok=False,
+                released=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
+        if not released:
+            return pb2.ReleaseObjectResponse(
+                ok=False,
+                released=False,
+                error=_err(pb2.ERROR_CODE_TASK_NOT_FOUND, "object not found"),
+            )
+        return pb2.ReleaseObjectResponse(ok=True, released=True)
 
     def UpdateRuntimeGlobals(
         self,
@@ -424,7 +470,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 code_version=request.code_version,
                 runtime_key=request.runtime_key,
                 code_token=request.code_token,
-                values=struct_to_dict(request.values),
+                values=decode_payload_from_transport(
+                    struct_to_dict(request.values),
+                    policy=get_payload_policy("managed_globals"),
+                ),
             )
             return pb2.UpdateRuntimeGlobalsResponse(
                 ok=True,
@@ -460,30 +509,6 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 runtime_key=request.runtime_key or request.code_version,
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
             )
-
-    def PullResults(self, request: pb2.PullResultsRequest, context: grpc.ServicerContext) -> pb2.PullResultsResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.PullResultsResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-
-    def CancelTasks(self, request: pb2.CancelTasksRequest, context: grpc.ServicerContext) -> pb2.CancelTasksResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.CancelTasksResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
-
-    def CancelJob(self, request: pb2.CancelJobRequest, context: grpc.ServicerContext) -> pb2.CancelJobResponse:
-        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-        context.set_details(self._shared_task_mode_removed_message())
-        return pb2.CancelJobResponse(
-            ok=False,
-            error=_err(pb2.ERROR_CODE_INVALID_REQUEST, self._shared_task_mode_removed_message()),
-        )
 
     def GetMetrics(self, request: pb2.GetMetricsRequest, context: grpc.ServicerContext) -> pb2.GetMetricsResponse:
         logger.info("[NodeControl] GetMetrics peer=%s", _peer(context))
@@ -564,6 +589,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 entry_module=meta.entry_module,
                 entry_callable=meta.entry_callable,
                 package_format=meta.package_format,
+                dependency_policy_mode=meta.dependency_policy_mode,
                 dependency_allowlist=list(meta.dependency_allowlist),
                 managed_global_names=list(meta.managed_global_names),
                 worker_count=meta.worker_count,
@@ -859,6 +885,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 export_mode=export_spec.mode,
                 export_methods=list(export_spec.methods),
                 export_decorator=export_spec.decorator,
+                dependency_policy_mode=meta.dependency_policy_mode,
                 dependency_allowlist=list(meta.dependency_allowlist),
                 managed_global_names=list(meta.managed_global_names),
                 worker_count=meta.worker_count,
@@ -978,7 +1005,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         code, body = self._state.call_service(
             service_id=request.service_id,
             method=request.method,
-            payload=struct_to_dict(request.payload),
+            payload=decode_payload_from_transport(
+                struct_to_dict(request.payload),
+                policy=get_payload_policy("http_call"),
+            ),
             service_token=request.service_token,
             timeout_sec=max(0.1, float(request.timeout_sec or 60.0)),
         )
@@ -1045,7 +1075,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 owner_client_id=request.owner_client_id,
                 service_id=request.service_id,
                 service_token=request.service_token,
-                values=struct_to_dict(request.values),
+                values=decode_payload_from_transport(
+                    struct_to_dict(request.values),
+                    policy=get_payload_policy("managed_globals"),
+                ),
             )
             return pb2.UpdateServiceGlobalsResponse(
                 ok=True,

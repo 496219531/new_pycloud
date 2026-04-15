@@ -57,6 +57,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             args["entry_module"],
             args["package_format"],
             args["dependency_path"],
+            str(args.get("dependency_policy_mode", "prebuilt") or "prebuilt"),
             args["object_dir"],
             args.get("work_dir", ""),
             args.get("managed_globals_scope_dir", ""),
@@ -68,6 +69,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             args["entry_callable"],
             args["payload"],
             bool(args.get("warmup_only", False)),
+            str(args.get("payload_mode", "task_submit") or "task_submit"),
         )
 
     def _unpack_subprocess_result(value: Any) -> tuple[str, Any, str, str, Dict[str, Any]]:

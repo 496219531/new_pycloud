@@ -5,10 +5,11 @@
 它当前负责的对象主要是：
 
 1. `controlplane`
-2. `node-1`
-3. `node-2`
-4. 本地运行目录下的 `logs/`、`pids/`
-5. `code_cache/` 下的离线 GC
+2. `job-orchestrator`
+3. `node-1`
+4. `node-2`
+5. 本地运行目录下的 `logs/`、`pids/`
+6. `code_cache/` 下的离线 GC
 
 如果你已经把项目安装成包，入口命令是：
 
@@ -37,6 +38,7 @@ start
 start-infocenter
 start-gateway
 start-controlplane
+start-job-orchestrator
 start-node
 stop
 stop-node
@@ -80,6 +82,7 @@ pycloudctl --help
    - `start-infocenter`
    - `start-gateway`
    - `start-controlplane`
+   - `start-job-orchestrator`
    - `start-node`
    - `stop`
    - `stop-node`
@@ -109,12 +112,14 @@ pycloudctl --help
 <runtime-root>/
   logs/
     controlplane.log
+    job-orchestrator.log
     infocenter.log
     gateway.log
     node-1.log
     node-2.log
   pids/
     controlplane.pid
+    job-orchestrator.pid
     infocenter.pid
     gateway.pid
     node-1.pid
@@ -126,14 +131,15 @@ pycloudctl --help
 默认端口：
 
 1. `controlplane`: `50051`
-2. `node-1 gRPC`: `50061`
-3. `node-1 service HTTP`: `18081`
-4. `node-2 gRPC`: `50062`
-5. `node-2 service HTTP`: `18082`
+2. `job-orchestrator`: `50053`
+3. `node-1 gRPC`: `50061`
+4. `node-1 service HTTP`: `18081`
+5. `node-2 gRPC`: `50062`
+6. `node-2 service HTTP`: `18082`
 
 默认 host：
 
-1. `pycloudctl start` / `start-infocenter` / `start-gateway` / `start-controlplane` / `start-node`
+1. `pycloudctl start` / `start-infocenter` / `start-gateway` / `start-controlplane` / `start-job-orchestrator` / `start-node`
 2. 如果没有显式传 host，都会自动探测本机可达 IP
 3. 不再默认固定成 `127.0.0.1`
 4. 如果你只想本机回环监听，可以直接加 `--local`
@@ -144,7 +150,7 @@ pycloudctl --help
 
 用途：
 
-1. 启动一套本地 `controlplane + node-1 + node-2`
+1. 启动一套本地 `controlplane + job-orchestrator + node-1 + node-2`
 2. 启动前会先尝试停止当前 `runtime-root` 下记录的旧进程
 
 最常用：
@@ -176,6 +182,7 @@ pycloudctl --local start
 ```bash
 pycloudctl \
   --controlplane-port 51051 \
+  --job-orchestrator-port 51053 \
   --node1-port 51061 \
   --node1-http-port 18181 \
   --node2-port 51062 \
@@ -191,6 +198,8 @@ pycloudctl \
 pycloudctl \
   --controlplane-host 127.0.0.1 \
   --controlplane-port 51051 \
+  --job-orchestrator-host 127.0.0.1 \
+  --job-orchestrator-port 51053 \
   --node1-host 0.0.0.0 \
   --node1-port 51061 \
   --node1-http-host 127.0.0.1 \
@@ -214,6 +223,7 @@ pycloudctl --node-worker-capacity 8 start
 pycloudctl \
   --runtime-root /tmp/pycloud-ci \
   --controlplane-port 51051 \
+  --job-orchestrator-port 51053 \
   --node1-port 51061 \
   --node1-http-port 18181 \
   --node2-port 51062 \
@@ -225,10 +235,11 @@ pycloudctl \
 启动成功后通常会看到：
 
 1. `ControlPlane` 地址
-2. `Node-1` 地址
-3. `Node-2` 地址
-4. `Logs` 路径
-5. `PIDs` 路径
+2. `JobQueue / job-orchestrator` 地址
+3. `Node-1` 地址
+4. `Node-2` 地址
+5. `Logs` 路径
+6. `PIDs` 路径
 
 ## 4. 单独起各角色
 
@@ -262,7 +273,8 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server --help
 1. `infocenter`
 2. `gateway`
 3. `controlplane`
-4. `nodecontrol`
+4. `job-orchestrator`
+5. `nodecontrol`
 
 先说明一个容易混淆的点：
 
@@ -275,14 +287,17 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server --help
 3. `gateway`
    - 是单独的 HTTP Gateway
    - 需要连到已有 `infocenter`
-4. `nodecontrol`
+4. `job-orchestrator`
+   - 是独立的大任务排队入口
+   - 需要连到已有 `infocenter`
+5. `nodecontrol`
    - 是单独节点进程
    - 它自己还会带一个 node 本地的 `service HTTP`
 
 也就是说：
 
 1. 想最省事，起 `controlplane` 就够了
-2. 想拆成“注册中心 + HTTP 网关”，就起 `infocenter + gateway`
+2. 想拆成“注册中心 + HTTP 网关 + 大任务调度”，就起 `infocenter + gateway + job-orchestrator`
 3. 想接入执行节点，就再起一个或多个 `nodecontrol`
 
 ### 4.1 用 `pycloudctl` 单独起 `infocenter`
@@ -342,11 +357,24 @@ pycloudctl start-controlplane \
 pycloudctl start
 pycloudctl restart
 pycloudctl start-gateway
+pycloudctl start-job-orchestrator
 pycloudctl start-node
 pycloudctl start-infocenter
 ```
 
-### 4.4 用 `pycloudctl` 单独起 `nodecontrol`
+### 4.4 用 `pycloudctl` 单独起 `job-orchestrator`
+
+```bash
+pycloudctl start-job-orchestrator --infocenter-addr 127.0.0.1:50051
+```
+
+自定义 bind：
+
+```bash
+pycloudctl start-job-orchestrator --bind 0.0.0.0:50053 --infocenter-addr 127.0.0.1:50051
+```
+
+### 4.5 用 `pycloudctl` 单独起 `nodecontrol`
 
 ```bash
 pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
@@ -409,11 +437,19 @@ pycloudctl start-node --node-id node-standalone --infocenter-addr ""
 
 下面这些示例仍然有效：
 
+`--role` 现在按前缀归一化，常用短写可以直接用：
+
+1. `info`
+2. `gate`
+3. `job`
+4. `node`
+5. `cont`
+
 ### 4.6 单独起 `infocenter`
 
 ```bash
 pycloud-control \
-  --role infocenter \
+  --role info \
   --bind 0.0.0.0:50051
 ```
 
@@ -421,7 +457,7 @@ pycloud-control \
 
 ```bash
 PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
-  --role infocenter \
+  --role info \
   --bind 0.0.0.0:50051
 ```
 
@@ -434,7 +470,7 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
 
 ```bash
 pycloud-control \
-  --role gateway \
+  --role gate \
   --bind 0.0.0.0:50052 \
   --infocenter-addr 127.0.0.1:50051
 ```
@@ -443,7 +479,7 @@ pycloud-control \
 
 ```bash
 PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
-  --role gateway \
+  --role gate \
   --bind 0.0.0.0:50052 \
   --infocenter-addr 127.0.0.1:50051
 ```
@@ -458,7 +494,7 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
 
 ```bash
 pycloud-control \
-  --role controlplane \
+  --role cont \
   --bind 0.0.0.0:50051
 ```
 
@@ -466,7 +502,7 @@ pycloud-control \
 
 ```bash
 PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
-  --role controlplane \
+  --role cont \
   --bind 0.0.0.0:50051
 ```
 
@@ -480,7 +516,7 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
 
 ```bash
 pycloud-control \
-  --role nodecontrol \
+  --role node \
   --bind 192.168.1.23:50061 \
   --node-id node-1 \
   --worker-capacity 8 \
@@ -494,7 +530,7 @@ pycloud-control \
 
 ```bash
 PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
-  --role nodecontrol \
+  --role node \
   --bind 192.168.1.23:50061 \
   --node-id node-1 \
   --worker-capacity 8 \
@@ -532,18 +568,18 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
 组合 A，一体化最简本地部署：
 
 ```bash
-pycloud-control --role controlplane --bind 0.0.0.0:50051
-pycloud-control --role nodecontrol --bind 192.168.1.23:50061 --node-id node-1 --service-http-bind 192.168.1.23:18081 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.23:50061
-pycloud-control --role nodecontrol --bind 192.168.1.24:50062 --node-id node-2 --service-http-bind 192.168.1.24:18082 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.24:50062
+pycloud-control --role cont --bind 0.0.0.0:50051
+pycloud-control --role node --bind 192.168.1.23:50061 --node-id node-1 --service-http-bind 192.168.1.23:18081 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.23:50061
+pycloud-control --role node --bind 192.168.1.24:50062 --node-id node-2 --service-http-bind 192.168.1.24:18082 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.24:50062
 ```
 
 组合 B，拆成独立 `infocenter + gateway + nodes`：
 
 ```bash
-pycloud-control --role infocenter --bind 0.0.0.0:50051
-pycloud-control --role gateway --bind 0.0.0.0:50052 --infocenter-addr 127.0.0.1:50051
-pycloud-control --role nodecontrol --bind 192.168.1.23:50061 --node-id node-1 --service-http-bind 192.168.1.23:18081 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.23:50061
-pycloud-control --role nodecontrol --bind 192.168.1.24:50062 --node-id node-2 --service-http-bind 192.168.1.24:18082 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.24:50062
+pycloud-control --role info --bind 0.0.0.0:50051
+pycloud-control --role gate --bind 0.0.0.0:50052 --infocenter-addr 127.0.0.1:50051
+pycloud-control --role node --bind 192.168.1.23:50061 --node-id node-1 --service-http-bind 192.168.1.23:18081 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.23:50061
+pycloud-control --role node --bind 192.168.1.24:50062 --node-id node-2 --service-http-bind 192.168.1.24:18082 --infocenter-addr 127.0.0.1:50051 --advertise-addr 192.168.1.24:50062
 ```
 
 如果 caller 走独立 Gateway，就把目标地址指向 `127.0.0.1:50052`。
