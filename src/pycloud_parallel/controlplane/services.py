@@ -79,6 +79,28 @@ def _peer(context: grpc.ServicerContext) -> str:
         return "unknown-peer"
 
 
+def _normalize_object_integrity_mode(meta: pb2.UploadObjectMeta) -> str:
+    requested = str(getattr(meta, "integrity_mode", "") or "").strip().lower()
+    if requested in {"client_declared", "server_authoritative"}:
+        return requested
+    if str(getattr(meta, "object_id", "") or "").strip():
+        return "client_declared"
+    return "server_authoritative"
+
+
+def _expected_object_id(meta: pb2.UploadObjectMeta, actual_sha256: str) -> str:
+    mode = _normalize_object_integrity_mode(meta)
+    from pycloud_parallel.controlplane.object_ref import object_id_from_sha256_hex
+
+    authoritative_object_id = object_id_from_sha256_hex(str(actual_sha256 or "").strip().lower())
+    if mode == "server_authoritative":
+        return authoritative_object_id
+    declared_object_id = str(getattr(meta, "object_id", "") or "").strip()
+    if not declared_object_id:
+        raise ValueError("object_id is required when integrity_mode=client_declared")
+    return declared_object_id
+
+
 class NodeControlService(pb2_grpc.NodeControlServiceServicer):
     """NodeControl gRPC 服务。
 
@@ -275,10 +297,11 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                     chunk_count += 1
 
         logger.info(
-            "[NodeControl] UploadObject peer=%s object_id=%s format=%s chunks=%d",
+            "[NodeControl] UploadObject peer=%s object_id=%s format=%s integrity_mode=%s chunks=%d",
             _peer(context),
             (meta.object_id if meta is not None else ""),
             (meta.format if meta is not None else ""),
+            (_normalize_object_integrity_mode(meta) if meta is not None else ""),
             chunk_count,
         )
 
@@ -303,8 +326,9 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
 
         try:
             tmp_file.close()
+            expected_object_id = _expected_object_id(meta, h.hexdigest())
             artifact, cached = self._state.data_store.put_uploaded_file(
-                object_id=meta.object_id,
+                object_id=expected_object_id,
                 format=meta.format,
                 uploaded_path=tmp_path,
                 actual_sha256=h.hexdigest(),
@@ -330,6 +354,45 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             format=artifact.format,
             cached=cached,
             size_bytes=artifact.size_bytes,
+            created_at=dt_to_ts(artifact.created_at),
+        )
+
+    def GetObjectMeta(
+        self,
+        request: pb2.GetObjectMetaRequest,
+        context: grpc.ServicerContext,
+    ) -> pb2.GetObjectMetaResponse:
+        object_id = str(request.object_id or "").strip()
+        if not object_id:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("object_id is required")
+            return pb2.GetObjectMetaResponse(
+                ok=False,
+                exists=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "object_id is required"),
+            )
+        try:
+            artifact = self._state.get_object_artifact(object_id)
+        except ValueError as exc:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(exc))
+            return pb2.GetObjectMetaResponse(
+                ok=False,
+                exists=False,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
+            )
+        except KeyError:
+            return pb2.GetObjectMetaResponse(
+                ok=True,
+                exists=False,
+                object_id=object_id,
+            )
+        return pb2.GetObjectMetaResponse(
+            ok=True,
+            exists=True,
+            object_id=artifact.object_id,
+            format=artifact.format,
+            size_bytes=int(artifact.size_bytes or 0),
             created_at=dt_to_ts(artifact.created_at),
         )
 

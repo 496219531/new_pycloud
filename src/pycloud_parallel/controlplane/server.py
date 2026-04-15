@@ -107,6 +107,7 @@ def build_controlplane_server(
     gateway_app = GatewayHttpApp(
         route_cache=route_cache,
         register_data_ref=_register_data_ref,
+        controlplane_target="",
     )
     return InfoCenterHttpServer(
         bind=bind,
@@ -133,7 +134,14 @@ def build_gateway_server(
         open_sec=gateway_open_sec,
     )
     allow_private = str(os.getenv("PYCLOUD_GATEWAY_ALLOW_PRIVATE_ADDRS", "true") or "true").lower() in {"1", "true", "yes"}
-    return GatewayHttpServer(bind=bind, app=GatewayHttpApp(route_cache=route_cache, allow_private_addrs=allow_private))
+    return GatewayHttpServer(
+        bind=bind,
+        app=GatewayHttpApp(
+            route_cache=route_cache,
+            allow_private_addrs=allow_private,
+            controlplane_target=infocenter_addr,
+        ),
+    )
 
 
 def build_job_orchestrator_server(

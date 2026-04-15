@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from concurrent import futures
 from datetime import datetime, timezone
+from email.message import Message
+import io
 import json
+from pathlib import Path
 import time
 from typing import Tuple
 from urllib.error import HTTPError
@@ -12,6 +15,8 @@ import grpc
 import pytest
 
 from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, InfoCenterServiceRoute, NodeControlClient
+from pycloud_parallel.controlplane.gateway_http import GatewayCallError, GatewayHttpApp
+from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.data_ref import DataRef
 from pycloud_parallel.controlplane.server import (
@@ -87,6 +92,40 @@ def _create_exported_service(target: str, service_name: str) -> str:
             runtime="py3",
             entry_module=service_name,
             entry_callable="add",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=True,
+        )
+    return session.service_id
+
+
+def _create_uploaded_file_service(target: str, service_name: str) -> str:
+    blob = (
+        b"from pathlib import Path\n\n"
+        b"def pycloud_export(fn):\n"
+        b"    fn.__pycloud_export__ = True\n"
+        b"    return fn\n\n"
+        b"@pycloud_export\n"
+        b"def inspect(doc=None, user_id='', **_kwargs):\n"
+        b"    path = Path(doc)\n"
+        b"    text = path.read_text(encoding='utf-8')\n"
+        b"    return {\n"
+        b"        'name': path.name,\n"
+        b"        'suffix': path.suffix,\n"
+        b"        'size': path.stat().st_size,\n"
+        b"        'preview': text[:32],\n"
+        b"        'user_id': user_id,\n"
+        b"    }\n"
+    )
+    with NodeControlClient(target, timeout_sec=10.0) as client:
+        session = client.create_service_from_bytes(
+            owner_client_id=f"owner-{service_name}",
+            service_name=service_name,
+            blob=blob,
+            runtime="py3",
+            entry_module=service_name,
+            entry_callable="inspect",
             worker_count=2,
             heartbeat_timeout_sec=30,
             idle_ttl_sec=0,
@@ -192,6 +231,436 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
         node_server.stop(grace=0)
         node_state.close()
         controlplane.stop()
+
+
+def test_controlplane_embeds_gateway_for_upload_call(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "gateway_stage_controlplane"
+    monkeypatch.setenv("PYCLOUD_GATEWAY_STAGE_DIR", str(stage_dir))
+    controlplane = build_controlplane_server("127.0.0.1:0")
+    controlplane.start()
+    node_server, node_target, node_state = _start_nodecontrol_server("node-gw-upload-01", str(tmp_path / "node_gw_upload_01"))
+
+    try:
+        service_id = _create_uploaded_file_service(node_target, "svc_gateway_upload_controlplane")
+        _register_node_with_services(
+            controlplane.base_url,
+            node_id="node-gw-upload-01",
+            control_addr=node_target,
+            state=node_state,
+        )
+        assert service_id
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(controlplane.base_url, timeout_sec=5.0).list_service_routes(
+                    service_name="svc_gateway_upload_controlplane",
+                    healthy_only=True,
+                    limit=20,
+                )
+            )
+            == 1
+        )
+
+        upload_path = tmp_path / "input_upload.txt"
+        upload_path.write_text("hello gateway upload\nsecond line", encoding="utf-8")
+        with GatewayServiceClient(controlplane.base_url, timeout_sec=5.0) as gateway:
+            body = gateway.upload_call(
+                service_name="svc_gateway_upload_controlplane",
+                method="inspect",
+                payload={"doc": {"kind": "uploaded_file", "slot": "input_txt"}, "user_id": "u1"},
+                files={"input_txt": upload_path},
+                timeout_sec=5.0,
+            )
+
+        assert body["ok"] is True
+        assert body["data"]["suffix"] == ".txt"
+        assert body["data"]["size"] == upload_path.stat().st_size
+        assert body["data"]["preview"].startswith("hello gateway upload")
+        assert body["data"]["user_id"] == "u1"
+        requests_dir = stage_dir / "requests"
+        assert not requests_dir.exists() or not any(requests_dir.iterdir())
+    finally:
+        node_server.stop(grace=0)
+        node_state.close()
+        controlplane.stop()
+
+
+def test_standalone_gateway_upload_call_supports_file_map(tmp_path, monkeypatch):
+    stage_dir = tmp_path / "gateway_stage_standalone"
+    monkeypatch.setenv("PYCLOUD_GATEWAY_STAGE_DIR", str(stage_dir))
+    infocenter = build_infocenter_server("127.0.0.1:0")
+    infocenter.start()
+    gateway = build_gateway_server("127.0.0.1:0", infocenter_addr=infocenter.base_url)
+    gateway.start()
+    node_server, node_target, node_state = _start_nodecontrol_server("node-gw-upload-02", str(tmp_path / "node_gw_upload_02"))
+
+    try:
+        _create_uploaded_file_service(node_target, "svc_gateway_upload_remote")
+        _register_node_with_services(
+            infocenter.base_url,
+            node_id="node-gw-upload-02",
+            control_addr=node_target,
+            state=node_state,
+        )
+        assert _wait_until(
+            lambda: len(
+                InfoCenterClient(infocenter.base_url, timeout_sec=5.0).list_service_routes(
+                    service_name="svc_gateway_upload_remote",
+                    healthy_only=True,
+                    limit=20,
+                )
+            )
+            == 1
+        )
+
+        upload_path = tmp_path / "remote_upload.txt"
+        upload_path.write_text("remote gateway upload", encoding="utf-8")
+        with GatewayServiceClient(gateway.base_url, timeout_sec=5.0) as client:
+            body = client.upload_call(
+                service_name="svc_gateway_upload_remote",
+                method="inspect",
+                payload={"doc": None, "user_id": "u2"},
+                file_map={"doc": "input_txt"},
+                files={"input_txt": upload_path},
+                timeout_sec=5.0,
+            )
+
+        assert body["ok"] is True
+        assert body["data"]["suffix"] == ".txt"
+        assert body["data"]["size"] == upload_path.stat().st_size
+        assert body["data"]["preview"] == "remote gateway upload"
+        assert body["data"]["user_id"] == "u2"
+        requests_dir = stage_dir / "requests"
+        assert not requests_dir.exists() or not any(requests_dir.iterdir())
+    finally:
+        node_server.stop(grace=0)
+        node_state.close()
+        gateway.stop()
+        infocenter.stop()
+
+
+@pytest.mark.parametrize(
+    ("payload", "file_map", "expected_error"),
+    [
+        ({"doc": None}, None, "must reference uploaded files"),
+        ({"doc": None}, {"doc.path": "input_txt"}, "file_map path not found"),
+    ],
+)
+def test_gateway_upload_call_rejects_invalid_payload_before_upload(
+    tmp_path,
+    payload,
+    file_map,
+    expected_error,
+):
+    stage_manager = GatewayStageManager(root_dir=str(tmp_path / "gateway_stage_invalid"), failure_ttl_sec=600, gc_interval_sec=60)
+
+    class _NeverRouteCache:
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False):
+            raise AssertionError(f"route selection should not run for invalid upload-call payload: {service_name}")
+
+        def mark_success(self, route) -> None:
+            del route
+            return None
+
+        def mark_failure(self, route, error: str) -> None:
+            del route, error
+            return None
+
+        def refresh(self, service_name: str, force: bool = False) -> None:
+            del service_name, force
+            return None
+
+    def _build_raw_upload(*, boundary: str, payload_obj: dict, file_map_obj: dict | None) -> bytes:
+        chunks = [
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload\"\r\nContent-Type: application/json\r\n\r\n".encode("utf-8"),
+            json.dumps(payload_obj).encode("utf-8"),
+            b"\r\n",
+        ]
+        if file_map_obj:
+            chunks.extend(
+                [
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"file_map\"\r\nContent-Type: application/json\r\n\r\n".encode("utf-8"),
+                    json.dumps(file_map_obj).encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+        chunks.extend(
+            [
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[input_txt]\"; filename=\"input.txt\"\r\nContent-Type: text/plain\r\n\r\n".encode("utf-8"),
+                b"gateway invalid upload",
+                b"\r\n",
+                f"--{boundary}--\r\n".encode("utf-8"),
+            ]
+        )
+        return b"".join(chunks)
+
+    boundary = "invalid-upload-boundary"
+    raw = _build_raw_upload(boundary=boundary, payload_obj=payload, file_map_obj=file_map)
+    headers = Message()
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    headers["Content-Length"] = str(len(raw))
+
+    app = GatewayHttpApp(route_cache=_NeverRouteCache(), stage_manager=stage_manager, controlplane_target="http://127.0.0.1:50051")
+    app.start()
+    try:
+        code, body = app.handle_post_stream(
+            path="/svc/svc-invalid/upload-call/inspect?timeout_sec=5.000",
+            headers=headers,
+            stream=io.BytesIO(raw),
+            content_length=len(raw),
+        )
+        assert code == 400
+        assert expected_error in str(body["error"])
+        requests_dir = stage_manager.requests_dir
+        assert not requests_dir.exists() or not any(requests_dir.iterdir())
+    finally:
+        app.stop()
+
+
+def test_gateway_upload_call_reuses_stage_file_on_route_retry(tmp_path):
+    stage_manager = GatewayStageManager(root_dir=str(tmp_path / "gateway_stage_retry"), failure_ttl_sec=600, gc_interval_sec=60)
+
+    class _FakeRouteCache:
+        def __init__(self) -> None:
+            self.failures = []
+            self.successes = []
+            self.refreshed = []
+            self.route_1 = InfoCenterServiceRoute(
+                service_name="svc-retry",
+                service_id="svc-retry-1",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                node_instance_id="node-1-inst",
+                node_id="node-1",
+                control_addr="127.0.0.1:50061",
+                node_healthy=True,
+                worker_count=1,
+                alive_workers=1,
+                in_flight=0,
+                lease_expire_at=datetime.now(timezone.utc),
+                http_base_url="http://127.0.0.1:18081/svc/svc-retry-1",
+            )
+            self.route_2 = InfoCenterServiceRoute(
+                service_name="svc-retry",
+                service_id="svc-retry-2",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                node_instance_id="node-2-inst",
+                node_id="node-2",
+                control_addr="127.0.0.1:50062",
+                node_healthy=True,
+                worker_count=1,
+                alive_workers=1,
+                in_flight=0,
+                lease_expire_at=datetime.now(timezone.utc),
+                http_base_url="http://127.0.0.1:18082/svc/svc-retry-2",
+            )
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False):
+            del service_name, force_refresh
+            excluded = set(exclude_service_ids or ())
+            if "svc-retry-1" not in excluded:
+                return self.route_1
+            return self.route_2
+
+        def mark_success(self, route) -> None:
+            self.successes.append(route.service_id)
+
+        def mark_failure(self, route, error: str) -> None:
+            self.failures.append((route.service_id, error))
+
+        def refresh(self, service_name: str, force: bool = False) -> None:
+            self.refreshed.append((service_name, force))
+
+    app = GatewayHttpApp(route_cache=_FakeRouteCache(), stage_manager=stage_manager, controlplane_target="http://127.0.0.1:50051")
+    upload_attempts = []
+    call_attempts = []
+    release_attempts = []
+
+    def _fake_upload(*, request, route, files, timeout_sec):
+        del timeout_sec
+        stage_file = files["input_txt"]
+        upload_attempts.append((request.request_id, route.service_id, str(stage_file.path), stage_file.size_bytes))
+        return {
+            "input_txt": DataRef(
+                ref_id=f"gateway-upload:{request.request_id}:{route.service_id}:input_txt",
+                storage_id="sha256:" + ("a" * 64),
+                format="txt",
+                size_bytes=stage_file.size_bytes,
+                locator_kind="node_control",
+                locator_token=str(route.control_addr or ""),
+                control_addr=str(route.control_addr or ""),
+            )
+        }
+
+    def _fake_invoke(self, route, *, method, payload, timeout_sec, service_token):
+        del timeout_sec, service_token
+        call_attempts.append((route.service_id, method, payload))
+        if route.service_id == "svc-retry-1":
+            raise GatewayCallError(status_code=502, data={"ok": False, "error": "upstream unavailable"})
+        return {"ok": True, "data": {"route": route.service_id, "doc": str(payload["doc"].ref_id)}}
+
+    def _fake_release(*, route, refs_by_slot, timeout_sec):
+        del timeout_sec
+        release_attempts.append(
+            (
+                route.service_id,
+                sorted((slot, ref.ref_id, ref.object_id) for slot, ref in refs_by_slot.items()),
+            )
+        )
+
+    boundary = "retry-boundary"
+    payload = json.dumps({"doc": {"kind": "uploaded_file", "slot": "input_txt"}}).encode("utf-8")
+    file_bytes = b"retry via stage file"
+    raw = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload\"\r\nContent-Type: application/json\r\n\r\n".encode("utf-8")
+        + payload
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[input_txt]\"; filename=\"retry.txt\"\r\nContent-Type: text/plain\r\n\r\n".encode("utf-8")
+        + file_bytes
+        + b"\r\n"
+        + f"--{boundary}--\r\n".encode("utf-8")
+    )
+    headers = Message()
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    headers["Content-Length"] = str(len(raw))
+
+    app.start()
+    try:
+        with (
+            pytest.MonkeyPatch.context() as monkeypatch,
+        ):
+            monkeypatch.setattr("pycloud_parallel.controlplane.gateway_http.upload_staged_files_to_route", _fake_upload)
+            monkeypatch.setattr("pycloud_parallel.controlplane.gateway_http.release_uploaded_refs_on_route", _fake_release)
+            monkeypatch.setattr(GatewayHttpApp, "_invoke_route", _fake_invoke)
+            code, body = app.handle_post_stream(
+                path="/svc/svc-retry/upload-call/inspect?timeout_sec=5.000",
+                headers=headers,
+                stream=io.BytesIO(raw),
+                content_length=len(raw),
+            )
+        assert code == 200
+        assert body["data"]["route"] == "svc-retry-2"
+        assert len(upload_attempts) == 2
+        assert upload_attempts[0][2] == upload_attempts[1][2]
+        assert upload_attempts[0][3] == len(file_bytes)
+        assert len(call_attempts) == 2
+        assert release_attempts[0][0] == "svc-retry-1"
+        assert release_attempts[1][0] == "svc-retry-2"
+        assert release_attempts[0][1][0][0] == "input_txt"
+        assert release_attempts[1][1][0][0] == "input_txt"
+        assert release_attempts[0][1][0][2] == release_attempts[1][1][0][2]
+        assert release_attempts[0][1][0][1] != release_attempts[1][1][0][1]
+        assert call_attempts[0][2]["doc"].locator_token == "127.0.0.1:50061"
+        assert call_attempts[1][2]["doc"].locator_token == "127.0.0.1:50062"
+        requests_dir = stage_manager.requests_dir
+        assert not requests_dir.exists() or not any(requests_dir.iterdir())
+    finally:
+        app.stop()
+
+
+def test_upload_staged_files_to_route_pins_request_scoped_refs(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.gateway_upload import release_uploaded_refs_on_route, upload_staged_files_to_route
+    from pycloud_parallel.controlplane.gateway_stage import GatewayStageRequest, GatewayStageFile
+    from pycloud_parallel.controlplane.object_ref import ObjectRef
+
+    pinned = []
+    released = []
+
+    class _FakeNodeClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def upload_object_from_file(self, *, file_path: str, format: str = "", trusted_precheck=None, transfer_mode: str = "", chunk_size: int = 0):
+            del file_path, trusted_precheck, transfer_mode, chunk_size
+            return ObjectRef(
+                object_id="sha256:" + ("a" * 64),
+                format=format or "txt",
+                size_bytes=32,
+            )
+
+        def pin_object(self, *, object_id: str, ref_id: str) -> bool:
+            pinned.append((object_id, ref_id))
+            return True
+
+        def release_object_ref(self, *, object_id: str, ref_id: str = "") -> bool:
+            released.append((object_id, ref_id))
+            return True
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_upload.NodeControlClient", _FakeNodeClient)
+
+    request_dir = tmp_path / "req"
+    files_dir = request_dir / "files"
+    files_dir.mkdir(parents=True)
+    upload_path = files_dir / "input.txt"
+    upload_path.write_text("hello", encoding="utf-8")
+    request = GatewayStageRequest(
+        request_id="req-1",
+        service_name="svc-upload",
+        method="inspect",
+        request_dir=request_dir,
+        files_dir=files_dir,
+        meta_path=request_dir / "meta.json",
+    )
+    route = InfoCenterServiceRoute(
+        service_name="svc-upload",
+        service_id="svc-upload-1",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_instance_id="node-1-inst",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        node_healthy=True,
+        worker_count=1,
+        alive_workers=1,
+        in_flight=0,
+        lease_expire_at=datetime.now(timezone.utc),
+        http_base_url="http://127.0.0.1:18081/svc/svc-upload-1",
+    )
+    files = {
+        "input_txt": GatewayStageFile(
+            slot="input_txt",
+            field_name="files[input_txt]",
+            original_name="input.txt",
+            content_type="text/plain",
+            path=upload_path,
+            size_bytes=upload_path.stat().st_size,
+        )
+    }
+
+    refs = upload_staged_files_to_route(
+        request=request,
+        route=route,
+        files=files,
+        timeout_sec=5.0,
+    )
+
+    ref = refs["input_txt"]
+    assert ref.object_id == "sha256:" + ("a" * 64)
+    assert ref.ref_id.startswith("gateway-upload:req-1:svc-upload-1:input_txt")
+    assert pinned == [(ref.object_id, ref.ref_id)]
+
+    release_uploaded_refs_on_route(
+        route=route,
+        refs_by_slot=refs,
+        timeout_sec=5.0,
+    )
+    assert released == [(ref.object_id, ref.ref_id)]
 
 
 def test_gateway_route_cache_defaults_to_predicted_busy():

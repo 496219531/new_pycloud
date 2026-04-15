@@ -804,7 +804,7 @@ class InfoCenterHttpServer:
                         self._send_json(404, {"ok": False, "error": "data ref not found"})
                         return
                     released = state.release_data_ref_record(ref_id)
-                    if released and bool(entry.consume_on_read):
+                    if released:
                         release_targets = list(entry.replicas or ())
                         if not release_targets and str(entry.control_addr or "").strip():
                             release_targets = [{"control_addr": str(entry.control_addr or "").strip()}]
@@ -900,6 +900,20 @@ class InfoCenterHttpServer:
                     self._send_json(200, {"ok": True})
                     return
                 if gateway_app is not None:
+                    try:
+                        length = int(self.headers.get("Content-Length", "0") or 0)
+                    except Exception:
+                        length = 0
+                    handled = gateway_app.handle_post_stream(
+                        path=self.path,
+                        headers=self.headers,
+                        stream=self.rfile,
+                        content_length=length,
+                    )
+                    if handled is not None:
+                        code, resp = handled
+                        self._send_json(code, resp)
+                        return
                     body = self._read_body()
                     if body is None:
                         return

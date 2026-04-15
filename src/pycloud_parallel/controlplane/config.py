@@ -24,12 +24,38 @@ def env_int(name: str, default: int) -> int:
     return _env_int(name, default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    logging.warning("invalid bool env %s=%r; using default %s", name, raw, default)
+    return bool(default)
+
+
+def _env_choice(name: str, default: str, choices: set[str]) -> str:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if not raw:
+        return str(default or "").strip().lower()
+    if raw in choices:
+        return raw
+    logging.warning("invalid choice env %s=%r; using default %s", name, raw, default)
+    return str(default or "").strip().lower()
+
+
 INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
 INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024)
 INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024)
 JOB_PAYLOAD_MAX_BYTES = _env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024)
 JOB_STAGING_REPLICA_COUNT = _env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2)
 JOB_STAGED_REF_TTL_SEC = _env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60)
+GATEWAY_STAGE_TTL_SEC = _env_int("PYCLOUD_GATEWAY_STAGE_TTL_SEC", 30 * 60)
+GATEWAY_STAGE_GC_INTERVAL_SEC = _env_int("PYCLOUD_GATEWAY_STAGE_GC_INTERVAL_SEC", 60)
+GATEWAY_MAX_UPLOAD_FILE_BYTES = _env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", 512 * 1024 * 1024)
+GATEWAY_MAX_UPLOAD_TOTAL_BYTES = _env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", 1024 * 1024 * 1024)
 INLINE_RESULT_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", 1024 * 1024)
 INLINE_RESULT_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024)
 
@@ -37,6 +63,13 @@ OBJECT_CHUNK_SIZE_BYTES = _env_int("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES", 256 * 1024
 FILE_HASH_CHUNK_SIZE_BYTES = _env_int("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES", 1024 * 1024)
 OBJECT_SEGMENT_MAX_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024)
 OBJECT_SEGMENT_TARGET_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024)
+OBJECT_UPLOAD_TRUSTED_PRECHECK = _env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True)
+TRUST_MODE = _env_choice("PYCLOUD_TRUST_MODE", "trusted", {"trusted", "balanced", "strict"})
+OBJECT_TRANSFER_MODE = _env_choice(
+    "PYCLOUD_OBJECT_TRANSFER_MODE",
+    "auto",
+    {"auto", "known_digest_precheck", "single_pass_authoritative"},
+)
 
 GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
 GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
@@ -49,6 +82,8 @@ SERVICE_HEARTBEAT_TIMEOUT_SEC = _env_int("PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC"
 
 
 PayloadMode = Literal["http_call", "job_submit", "task_submit", "managed_globals", "result"]
+TrustMode = Literal["trusted", "balanced", "strict"]
+ObjectTransferMode = Literal["auto", "known_digest_precheck", "single_pass_authoritative"]
 
 
 @dataclass(frozen=True)
@@ -115,6 +150,29 @@ def get_runtime_limits() -> PayloadLimits:
     )
 
 
+def get_trust_mode() -> TrustMode:
+    return str(TRUST_MODE or "trusted").strip().lower()  # type: ignore[return-value]
+
+
+def get_object_transfer_mode() -> ObjectTransferMode:
+    return str(OBJECT_TRANSFER_MODE or "auto").strip().lower()  # type: ignore[return-value]
+
+
+def resolve_object_transfer_mode(*, source_kind: str, local_digest_known: bool) -> ObjectTransferMode:
+    mode = get_object_transfer_mode()
+    if mode == "auto":
+        normalized_source_kind = str(source_kind or "").strip().lower()
+        if normalized_source_kind == "memory":
+            mode = "known_digest_precheck"
+        elif normalized_source_kind == "file":
+            mode = "known_digest_precheck" if bool(local_digest_known) else "single_pass_authoritative"
+        else:
+            raise ValueError(f"unsupported object transfer source_kind: {source_kind!r}")
+    if get_trust_mode() != "trusted" and mode == "single_pass_authoritative":
+        return "known_digest_precheck"
+    return mode  # type: ignore[return-value]
+
+
 def get_payload_policy(mode: PayloadMode) -> PayloadPolicy:
     limits = get_runtime_limits()
     if mode == "http_call":
@@ -168,12 +226,23 @@ def reload_config() -> None:
         JOB_PAYLOAD_MAX_BYTES=_env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024),
         JOB_STAGING_REPLICA_COUNT=_env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2),
         JOB_STAGED_REF_TTL_SEC=_env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60),
+        GATEWAY_STAGE_TTL_SEC=_env_int("PYCLOUD_GATEWAY_STAGE_TTL_SEC", 30 * 60),
+        GATEWAY_STAGE_GC_INTERVAL_SEC=_env_int("PYCLOUD_GATEWAY_STAGE_GC_INTERVAL_SEC", 60),
+        GATEWAY_MAX_UPLOAD_FILE_BYTES=_env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", 512 * 1024 * 1024),
+        GATEWAY_MAX_UPLOAD_TOTAL_BYTES=_env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", 1024 * 1024 * 1024),
         INLINE_RESULT_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", 1024 * 1024),
         INLINE_RESULT_HARD_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024),
         OBJECT_CHUNK_SIZE_BYTES=_env_int("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES", 256 * 1024),
         FILE_HASH_CHUNK_SIZE_BYTES=_env_int("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES", 1024 * 1024),
         OBJECT_SEGMENT_MAX_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024),
         OBJECT_SEGMENT_TARGET_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024),
+        OBJECT_UPLOAD_TRUSTED_PRECHECK=_env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True),
+        TRUST_MODE=_env_choice("PYCLOUD_TRUST_MODE", "trusted", {"trusted", "balanced", "strict"}),
+        OBJECT_TRANSFER_MODE=_env_choice(
+            "PYCLOUD_OBJECT_TRANSFER_MODE",
+            "auto",
+            {"auto", "known_digest_precheck", "single_pass_authoritative"},
+        ),
         GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
         GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
         NODE_WORKER_CAPACITY=_env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32),

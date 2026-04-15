@@ -3,9 +3,12 @@ from __future__ import annotations
 """Gateway HTTP caller facade extracted from the legacy client module."""
 
 import contextlib
+import http.client
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
-from urllib.parse import quote, urlencode
+import uuid
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import quote, urlencode, urlparse
 
 from pycloud_parallel.controlplane import client as client_mod
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_locator
@@ -84,6 +87,41 @@ class GatewayServiceClient:
             timeout_sec=max(self.timeout_sec, max(0.1, float(timeout_sec)) + 1.0),
             payload=serialized_payload,
             headers=headers,
+        )
+        return self._attach_controlplane_locator(response)
+
+    def upload_call(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        payload: Dict[str, object],
+        files: Dict[str, Union[str, Path, bytes, bytearray, memoryview]],
+        file_map: Optional[Dict[str, str]] = None,
+        timeout_sec: float = 60.0,
+        service_token: Optional[str] = None,
+    ) -> Dict[str, object]:
+        name = str(service_name or "").strip()
+        method_name = str(method or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        if not method_name:
+            raise ValueError("method is required")
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be object")
+        if not files:
+            raise ValueError("files are required")
+        token = self.service_token if service_token is None else str(service_token or "").strip()
+        params = urlencode({"timeout_sec": f"{max(0.1, float(timeout_sec)):.3f}"})
+        path = f"/svc/{quote(name, safe='')}/upload-call/{quote(method_name, safe='')}?{params}"
+        response = _http_multipart_request(
+            base_url=self.base_url,
+            path=path,
+            payload=client_mod._serialize_http_call_payload(payload, context="gateway upload-call payload"),
+            files=files,
+            file_map=file_map or {},
+            timeout_sec=max(self.timeout_sec, max(0.1, float(timeout_sec)) + 1.0),
+            headers={"X-Service-Token": token} if token else {},
         )
         return self._attach_controlplane_locator(response)
 
@@ -180,3 +218,130 @@ class GatewayServiceClient:
 
 
 __all__ = ["GatewayServiceClient"]
+
+
+def _multipart_part_header(*, boundary: str, name: str, filename: str = "", content_type: str = "") -> bytes:
+    lines = [f"--{boundary}\r\n"]
+    disposition = f'Content-Disposition: form-data; name="{name}"'
+    if filename:
+        disposition += f'; filename="{filename}"'
+    lines.append(disposition + "\r\n")
+    if content_type:
+        lines.append(f"Content-Type: {content_type}\r\n")
+    lines.append("\r\n")
+    return "".join(lines).encode("utf-8")
+
+
+def _coerce_upload_file_entry(
+    value: Union[str, Path, bytes, bytearray, memoryview],
+) -> Tuple[str, Optional[Path], bytes]:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "upload.bin", None, bytes(value)
+    path = Path(value).expanduser()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"upload file not found: {value}")
+    return path.name, path, b""
+
+
+def _multipart_content_length(
+    *,
+    boundary: str,
+    payload_bytes: bytes,
+    file_map_bytes: bytes,
+    files: Dict[str, Union[str, Path, bytes, bytearray, memoryview]],
+) -> int:
+    total = 0
+    total += len(_multipart_part_header(boundary=boundary, name="payload", content_type="application/json"))
+    total += len(payload_bytes) + 2
+    if file_map_bytes:
+        total += len(_multipart_part_header(boundary=boundary, name="file_map", content_type="application/json"))
+        total += len(file_map_bytes) + 2
+    for slot, value in files.items():
+        filename, path, inline = _coerce_upload_file_entry(value)
+        total += len(
+            _multipart_part_header(
+                boundary=boundary,
+                name=f"files[{slot}]",
+                filename=filename,
+                content_type="application/octet-stream",
+            )
+        )
+        total += (path.stat().st_size if path is not None else len(inline)) + 2
+    total += len(f"--{boundary}--\r\n".encode("utf-8"))
+    return total
+
+
+def _http_multipart_request(
+    *,
+    base_url: str,
+    path: str,
+    payload: Dict[str, object],
+    files: Dict[str, Union[str, Path, bytes, bytearray, memoryview]],
+    file_map: Dict[str, str],
+    timeout_sec: float,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, object]:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError(f"unsupported gateway scheme: {parsed.scheme!r}")
+    boundary = f"pycloud-{uuid.uuid4().hex}"
+    payload_bytes = json.dumps(client_mod.serialize_arrow_compatible(payload), ensure_ascii=False).encode("utf-8")
+    file_map_bytes = (
+        json.dumps({str(path): str(slot) for path, slot in dict(file_map or {}).items()}, ensure_ascii=False).encode("utf-8")
+        if file_map
+        else b""
+    )
+    request_headers = dict(headers or {})
+    request_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    request_headers["Content-Length"] = str(
+        _multipart_content_length(
+            boundary=boundary,
+            payload_bytes=payload_bytes,
+            file_map_bytes=file_map_bytes,
+            files=files,
+        )
+    )
+    connection_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    connection = connection_cls(parsed.hostname, parsed.port, timeout=max(0.1, float(timeout_sec)))
+    try:
+        connection.putrequest("POST", path)
+        for name, value in request_headers.items():
+            if str(value or "").strip():
+                connection.putheader(str(name), str(value))
+        connection.endheaders()
+        connection.send(_multipart_part_header(boundary=boundary, name="payload", content_type="application/json"))
+        connection.send(payload_bytes)
+        connection.send(b"\r\n")
+        if file_map_bytes:
+            connection.send(_multipart_part_header(boundary=boundary, name="file_map", content_type="application/json"))
+            connection.send(file_map_bytes)
+            connection.send(b"\r\n")
+        for slot, value in files.items():
+            filename, path_obj, inline = _coerce_upload_file_entry(value)
+            connection.send(
+                _multipart_part_header(
+                    boundary=boundary,
+                    name=f"files[{slot}]",
+                    filename=filename,
+                    content_type="application/octet-stream",
+                )
+            )
+            if path_obj is not None:
+                with path_obj.open("rb") as fh:
+                    while True:
+                        chunk = fh.read(256 * 1024)
+                        if not chunk:
+                            break
+                        connection.send(chunk)
+            else:
+                connection.send(inline)
+            connection.send(b"\r\n")
+        connection.send(f"--{boundary}--\r\n".encode("utf-8"))
+        response = connection.getresponse()
+        raw = response.read()
+        if 200 <= int(response.status) < 300:
+            return client_mod._decode_http_response_body(raw)
+        data = client_mod._decode_http_response_body(raw) if raw else {"ok": False, "error": response.reason}
+        raise RuntimeError(str(data.get("error", response.reason)))
+    finally:
+        connection.close()

@@ -182,6 +182,7 @@ message ListServiceRoutesResponse {
 service NodeControlService {
   rpc UploadCode(stream UploadCodeRequest) returns (UploadCodeResponse);
   rpc UploadObject(stream UploadObjectRequest) returns (UploadObjectResponse);
+  rpc GetObjectMeta(GetObjectMetaRequest) returns (GetObjectMetaResponse);
   rpc DownloadObject(DownloadObjectRequest) returns (stream DownloadObjectChunk);
   rpc PinObject(PinObjectRequest) returns (PinObjectResponse);
   rpc ReleaseObject(ReleaseObjectRequest) returns (ReleaseObjectResponse);
@@ -243,6 +244,7 @@ message UploadCodeResponse {
 message UploadObjectMeta {
   string object_id = 1;
   string format = 2;
+  string integrity_mode = 3; // client_declared | server_authoritative
 }
 
 message UploadObjectRequest {
@@ -257,6 +259,20 @@ message UploadObjectResponse {
   string object_id = 2;
   string format = 3;
   bool cached = 4;
+  int64 size_bytes = 5;
+  google.protobuf.Timestamp created_at = 6;
+  Error error = 7;
+}
+
+message GetObjectMetaRequest {
+  string object_id = 1;
+}
+
+message GetObjectMetaResponse {
+  bool ok = 1;
+  bool exists = 2;
+  string object_id = 3;
+  string format = 4;
   int64 size_bytes = 5;
   google.protobuf.Timestamp created_at = 6;
   Error error = 7;

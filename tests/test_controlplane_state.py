@@ -7,7 +7,9 @@ import json
 import math
 import os
 import sys
+import tarfile
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1693,7 +1695,8 @@ def test_task_pool_execution_uses_private_managed_globals(tmp_path):
             values={"STATE": 123},
         )
         assert updated == ["STATE"]
-        pool.managed_globals_digest = globals_digest
+        assert pool.managed_globals_scope_dir
+        assert pool.managed_globals_digest == globals_digest
 
         accepted, rejected = state.submit_pool_tasks(
             pool_id=pool.pool_id,
@@ -2439,5 +2442,56 @@ def test_service_create_does_not_keep_package_module_in_parent(tmp_path):
         assert session.status == pb2.SERVICE_STATUS_RUNNING
         assert "compute_service" not in sys.modules
         assert "compute_service.main" not in sys.modules
+    finally:
+        state.close()
+
+
+def test_extract_archive_tar_gz_avoids_extractall_deprecation_warning(tmp_path):
+    state = NodeControlState(
+        node_id="node-extract-tar-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_extract_tar"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        archive_path = tmp_path / "artifact.tar.gz"
+        file_bytes = b"VALUE = 1\n"
+        with tarfile.open(archive_path, "w:gz") as tf:
+            info = tarfile.TarInfo("demo_pkg/__init__.py")
+            info.size = len(file_bytes)
+            tf.addfile(info, io.BytesIO(file_bytes))
+
+        out_dir = tmp_path / "out_tar"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            state._extract_archive(archive_path=archive_path, package_format="tar.gz", out_dir=out_dir)  # noqa: SLF001
+
+        assert (out_dir / "demo_pkg" / "__init__.py").read_bytes() == file_bytes
+        assert not any("extractall" in str(item.message).lower() for item in caught)
+    finally:
+        state.close()
+
+
+def test_extract_archive_tar_gz_rejects_symlink_entries(tmp_path):
+    state = NodeControlState(
+        node_id="node-extract-tar-02",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_extract_tar_symlink"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        archive_path = tmp_path / "artifact_symlink.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as tf:
+            link = tarfile.TarInfo("demo_pkg/link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../outside"
+            tf.addfile(link)
+
+        with pytest.raises(ValueError, match="unsupported link entry"):
+            state._extract_archive(archive_path=archive_path, package_format="tar.gz", out_dir=tmp_path / "out_symlink")  # noqa: SLF001
     finally:
         state.close()

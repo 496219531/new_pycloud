@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -1250,18 +1251,60 @@ class NodeControlState:
                 raise ValueError(f"archive path escapes destination: {name}")
             return candidate
 
+        def _apply_mode(path: Path, mode: int) -> None:
+            normalized_mode = int(mode or 0) & 0o777
+            if not normalized_mode:
+                return
+            with contextlib.suppress(OSError):
+                path.chmod(normalized_mode)
+
+        def _reject_unsupported_tar_member(member: tarfile.TarInfo) -> None:
+            if member.issym() or member.islnk():
+                raise ValueError(f"tar archive contains unsupported link entry: {member.name}")
+            if member.isdev() or member.ischr() or member.isblk() or member.isfifo():
+                raise ValueError(f"tar archive contains unsupported special entry: {member.name}")
+
+        def _zip_info_mode(info: zipfile.ZipInfo) -> int:
+            return (int(info.external_attr or 0) >> 16) & 0o777
+
+        def _zip_info_is_symlink(info: zipfile.ZipInfo) -> bool:
+            file_type = ((int(info.external_attr or 0) >> 16) & 0o170000)
+            return file_type == stat.S_IFLNK
+
         if package_format in ("zip", "whl"):
             with zipfile.ZipFile(archive_path, "r") as zf:
                 for info in zf.infolist():
-                    _safe_join(info.filename)
-                zf.extractall(out_dir)
+                    target = _safe_join(info.filename)
+                    if _zip_info_is_symlink(info):
+                        raise ValueError(f"zip archive contains unsupported link entry: {info.filename}")
+                    if info.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        _apply_mode(target, _zip_info_mode(info))
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info, "r") as src, target.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    _apply_mode(target, _zip_info_mode(info))
             return
 
         if package_format == "tar.gz":
             with tarfile.open(archive_path, "r:gz") as tf:
                 for member in tf.getmembers():
-                    _safe_join(member.name)
-                tf.extractall(out_dir)
+                    target = _safe_join(member.name)
+                    _reject_unsupported_tar_member(member)
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        _apply_mode(target, member.mode)
+                        continue
+                    if not member.isfile():
+                        raise ValueError(f"tar archive contains unsupported member type: {member.name}")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        raise ValueError(f"tar archive member could not be read: {member.name}")
+                    with extracted, target.open("wb") as dst:
+                        shutil.copyfileobj(extracted, dst)
+                    _apply_mode(target, member.mode)
             return
 
         raise ValueError(f"unsupported package format for extraction: {package_format}")
@@ -2443,6 +2486,9 @@ class NodeControlState:
             self._runtime_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = state
             executor_host = self._executor_host
             pool = self._task_pools.get(normalized_client_id)
+            if pool is not None:
+                pool.managed_globals_scope_dir = state.scope_dir
+                pool.managed_globals_digest = globals_digest
             worker_count = int(pool.worker_count if pool is not None else self.worker_capacity)
         if artifact is None or executor_host is None:
             return globals_digest, updated_names

@@ -594,11 +594,29 @@ def _stage_job_submit_value(
     replica_count: int,
     ttl_sec: int,
 ) -> Any:
-    if _maybe_data_ref(value) is not None:
-        return value
+    existing_ref = _maybe_data_ref(value)
+    if existing_ref is not None:
+        locator_kind = str(existing_ref.locator_kind or "").strip().lower()
+        locator_token = str(existing_ref.locator_token or "").strip()
+        control_addr = str(existing_ref.control_addr or "").strip()
+        if locator_kind == "node_local" and not locator_token and not control_addr:
+            raise ValueError(
+                "job_payload/update_globals refs must use controlplane staging or include a node control locator"
+            )
+        return existing_ref
     if value is None or isinstance(value, (bool, int, float, datetime, date, dt_time, timedelta)):
         return value
     if isinstance(value, str):
+        path = Path(value).expanduser()
+        if path.exists() and path.is_file():
+            return _stage_job_value_as_data_ref(
+                target=target,
+                value=path,
+                runtime=runtime,
+                timeout_sec=timeout_sec,
+                replica_count=replica_count,
+                ttl_sec=ttl_sec,
+            )
         if estimate_payload_inline_size(value) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
             return value
         return _stage_job_value_as_data_ref(
@@ -695,7 +713,19 @@ def _stage_job_submit_value(
             )
             for item in value
         )
-    return value
+    try:
+        if estimate_payload_inline_size(value) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+            return value
+    except Exception:
+        pass
+    return _stage_job_value_as_data_ref(
+        target=target,
+        value=value,
+        runtime=runtime,
+        timeout_sec=timeout_sec,
+        replica_count=replica_count,
+        ttl_sec=ttl_sec,
+    )
 
 
 def _stage_job_submit_payload_for_transport(
@@ -877,6 +907,11 @@ def _prepare_job_submit_payload_for_call(
     timeout_sec: float,
 ) -> Dict[str, object]:
     prepared = dict(payload or {})
+    preserved_fields = {
+        field_name: prepared.pop(field_name)
+        for field_name in _JOB_SUBMIT_STAGING_FIELDS
+        if field_name in prepared
+    }
     clients: List[NodeControlClient] = []
     try:
         clients = _job_submit_upload_clients(
@@ -885,13 +920,16 @@ def _prepare_job_submit_payload_for_call(
             timeout_sec=timeout_sec,
         )
         if not clients:
+            prepared.update(preserved_fields)
             return prepared
-        return prepare_outbound_payload(
+        outbound = prepare_outbound_payload(
             prepared,
             put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format),
             estimate_inline_size=_estimate_managed_global_inline_size,
             policy=get_payload_policy("job_submit"),
         )
+        outbound.update(preserved_fields)
+        return outbound
     finally:
         for client in clients:
             with contextlib.suppress(Exception):

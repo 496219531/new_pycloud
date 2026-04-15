@@ -8,11 +8,15 @@ import json
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, Dict, Optional, Sequence, Tuple
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
+from pycloud_parallel.controlplane.config import (
+    GATEWAY_MAX_UPLOAD_FILE_BYTES,
+    GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
+)
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
 from pycloud_parallel.controlplane.client import (
     InfoCenterServiceRoute,
@@ -23,6 +27,16 @@ from pycloud_parallel.controlplane.client import (
     _serialize_http_call_payload,
 )
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
+from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
+from pycloud_parallel.controlplane.gateway_upload import (
+    collect_used_upload_slots,
+    GatewayUploadError,
+    is_gateway_upload_call_path,
+    parse_gateway_upload_call,
+    release_uploaded_refs_on_route,
+    rewrite_payload_with_uploaded_refs,
+    upload_staged_files_to_route,
+)
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
@@ -63,6 +77,9 @@ class GatewayHttpApp:
         allow_private_addrs: bool = True,
         register_data_ref: Optional[Callable[..., object]] = None,
         controlplane_target: str = "",
+        stage_manager: Optional[GatewayStageManager] = None,
+        max_upload_file_bytes: int = GATEWAY_MAX_UPLOAD_FILE_BYTES,
+        max_upload_total_bytes: int = GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
     ) -> None:
         self.route_cache = route_cache
         self.timeout_sec = max(0.1, float(timeout_sec))
@@ -70,14 +87,118 @@ class GatewayHttpApp:
         self.allow_private_addrs = bool(allow_private_addrs)
         self.register_data_ref = register_data_ref
         self.controlplane_target = str(controlplane_target or "").strip()
+        self.stage_manager = stage_manager or GatewayStageManager()
+        self.max_upload_file_bytes = max(1, int(max_upload_file_bytes or GATEWAY_MAX_UPLOAD_FILE_BYTES))
+        self.max_upload_total_bytes = max(self.max_upload_file_bytes, int(max_upload_total_bytes or GATEWAY_MAX_UPLOAD_TOTAL_BYTES))
 
     def start(self) -> None:
         self._stopped = False
         self.route_cache.start()
+        self.stage_manager.start()
 
     def stop(self) -> None:
         self._stopped = True
         self.route_cache.stop()
+        self.stage_manager.stop()
+
+    def handle_post_stream(
+        self,
+        *,
+        path: str,
+        headers,
+        stream: BinaryIO,
+        content_length: int,
+    ) -> Optional[Tuple[int, Dict[str, object]]]:
+        if self._stopped:
+            return 503, {"ok": False, "error": "gateway stopping"}
+        parsed = urlparse(path)
+        if not is_gateway_upload_call_path(parsed.path):
+            return None
+
+        parts = [x for x in parsed.path.split("/") if x]
+        service_name = parts[1]
+        method = parts[3]
+        qs = parse_qs(parsed.query)
+        timeout_sec = self.timeout_sec
+        if "timeout_sec" in qs:
+            try:
+                timeout_sec = max(0.1, float(qs["timeout_sec"][0]))
+            except Exception:
+                timeout_sec = self.timeout_sec
+        service_token = self._extract_token(headers)
+        try:
+            parsed_upload = parse_gateway_upload_call(
+                headers=headers,
+                stream=stream,
+                content_length=max(0, int(content_length or 0)),
+                service_name=service_name,
+                method=method,
+                stage_manager=self.stage_manager,
+                max_total_bytes=self.max_upload_total_bytes,
+                max_file_bytes=self.max_upload_file_bytes,
+            )
+        except GatewayUploadError as exc:
+            message = str(exc)
+            status_code = 413 if "limit" in message.lower() or "too large" in message.lower() else 400
+            return status_code, {"ok": False, "error": message}
+        except Exception as exc:
+            return 400, {"ok": False, "error": f"invalid upload-call request: {exc}"}
+
+        request = parsed_upload.request
+        try:
+            parsed_upload.used_slots = tuple(
+                collect_used_upload_slots(
+                    payload=parsed_upload.payload,
+                    file_slots=tuple(parsed_upload.files.keys()),
+                    file_map=parsed_upload.file_map,
+                )
+            )
+        except GatewayUploadError as exc:
+            self.stage_manager.cleanup(request)
+            return 400, {"ok": False, "error": str(exc)}
+        tried = set()
+        try:
+            route = self.route_cache.select_route(service_name)
+            tried.add(route.service_id)
+            resp = self._invoke_uploaded_route(
+                route,
+                method=method,
+                parsed_upload=parsed_upload,
+                timeout_sec=timeout_sec,
+                service_token=service_token,
+            )
+            self.route_cache.mark_success(route)
+            self.stage_manager.cleanup(request)
+            return 200, resp
+        except GatewayCallError as exc:
+            self.stage_manager.preserve_failure(request, status="call_failed")
+            if not self._is_route_failure(exc):
+                return exc.status_code, exc.data
+            self.route_cache.mark_failure(route, str(exc))
+            try:
+                self.route_cache.refresh(service_name, force=True)
+                retry_route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                resp = self._invoke_uploaded_route(
+                    retry_route,
+                    method=method,
+                    parsed_upload=parsed_upload,
+                    timeout_sec=timeout_sec,
+                    service_token=service_token,
+                )
+                self.route_cache.mark_success(retry_route)
+                self.stage_manager.cleanup(request)
+                return 200, resp
+            except GatewayCallError as retry_exc:
+                self.stage_manager.preserve_failure(request, status="retry_failed")
+                if self._is_route_failure(retry_exc):
+                    self.route_cache.mark_failure(retry_route, str(retry_exc))
+                return retry_exc.status_code, retry_exc.data
+            except Exception as retry_exc:
+                self.stage_manager.preserve_failure(request, status="retry_failed")
+                return 502, {"ok": False, "error": f"gateway retry failed: {retry_exc}"}
+        except Exception as exc:
+            self.stage_manager.preserve_failure(request, status="failed")
+            return 502, {"ok": False, "error": f"gateway upload-call failed: {exc}"}
 
     def handle_post(self, *, path: str, headers, body: bytes) -> Optional[Tuple[int, Dict[str, object]]]:
         if self._stopped:
@@ -295,6 +416,68 @@ class GatewayHttpApp:
             route=route,
         )
 
+    def _invoke_uploaded_route(
+        self,
+        route: InfoCenterServiceRoute,
+        *,
+        method: str,
+        parsed_upload,
+        timeout_sec: float,
+        service_token: str,
+    ) -> Dict[str, object]:
+        request = parsed_upload.request
+        self.stage_manager.mark_status(request, status="uploading")
+        self.stage_manager.record_route(
+            request,
+            route={
+                "service_id": str(route.service_id or ""),
+                "node_id": str(route.node_id or ""),
+                "node_instance_id": str(route.node_instance_id or ""),
+                "control_addr": str(route.control_addr or ""),
+                "http_base_url": str(route.http_base_url or ""),
+            },
+        )
+        used_slots = tuple(parsed_upload.used_slots or ())
+        upload_files = {
+            slot: stage_file
+            for slot, stage_file in parsed_upload.files.items()
+            if not used_slots or slot in set(used_slots)
+        }
+        refs_by_slot: Dict[str, object] = {}
+        try:
+            refs_by_slot = upload_staged_files_to_route(
+                request=request,
+                route=route,
+                files=upload_files,
+                timeout_sec=timeout_sec,
+            )
+            self.stage_manager.record_resolved_refs(
+                request,
+                refs_by_slot={
+                    slot: serialize_arrow_compatible(ref)
+                    for slot, ref in refs_by_slot.items()
+                },
+            )
+            rewritten_payload, _used_slots = rewrite_payload_with_uploaded_refs(
+                payload=parsed_upload.payload,
+                refs_by_slot=refs_by_slot,
+                file_map=parsed_upload.file_map,
+            )
+            self.stage_manager.mark_status(request, status="calling")
+            return self._invoke_route(
+                route,
+                method=method,
+                payload=rewritten_payload,
+                timeout_sec=timeout_sec,
+                service_token=service_token,
+            )
+        finally:
+            release_uploaded_refs_on_route(
+                route=route,
+                refs_by_slot=refs_by_slot,
+                timeout_sec=timeout_sec,
+            )
+
     def _extract_token(self, headers) -> str:
         x_token = str(headers.get("X-Service-Token", "") or "").strip()
         if x_token:
@@ -394,6 +577,16 @@ class GatewayHttpServer:
                     length = int(self.headers.get("Content-Length", "0") or 0)
                 except Exception:
                     length = 0
+                handled = app.handle_post_stream(
+                    path=self.path,
+                    headers=self.headers,
+                    stream=self.rfile,
+                    content_length=length,
+                )
+                if handled is not None:
+                    code, resp = handled
+                    self._send_json(code, resp)
+                    return
                 if length > MAX_BODY_BYTES:
                     self._send_json(413, {"ok": False, "error": "payload too large"})
                     return

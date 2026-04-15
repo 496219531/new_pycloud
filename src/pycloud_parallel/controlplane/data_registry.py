@@ -3,7 +3,7 @@ from __future__ import annotations
 """Control-plane data reference resolution helpers."""
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
 
@@ -17,6 +17,32 @@ class ResolvedDataRef:
     locator_kind: str = ""
     locator_token: str = ""
     via_registry: bool = False
+    replicas: Tuple[Dict[str, str], ...] = ()
+
+
+def _normalize_resolved_replicas(replicas: Sequence[Dict[str, object]]) -> Tuple[Dict[str, str], ...]:
+    out = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in replicas or ():
+        if not isinstance(item, dict):
+            continue
+        control_addr = str(item.get("control_addr", "") or "").strip()
+        node_id = str(item.get("node_id", "") or "").strip()
+        node_instance_id = str(item.get("node_instance_id", "") or "").strip()
+        if not control_addr:
+            continue
+        key = (control_addr, node_id, node_instance_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "control_addr": control_addr,
+                "node_id": node_id,
+                "node_instance_id": node_instance_id,
+            }
+        )
+    return tuple(out)
 
 
 class DataRegistryClient:
@@ -67,6 +93,15 @@ class DataRegistryClient:
         data_ref = ref if isinstance(ref, DataRef) else coerce_data_ref(ref)
 
         if str(data_ref.control_addr or "").strip():
+            direct_replicas = _normalize_resolved_replicas(
+                (
+                    {
+                        "control_addr": str(data_ref.control_addr or "").strip(),
+                        "node_id": str(data_ref.node_id or "").strip(),
+                        "node_instance_id": str(data_ref.node_instance_id or "").strip(),
+                    },
+                )
+            )
             return ResolvedDataRef(
                 ref=data_ref,
                 control_addr=str(data_ref.control_addr or "").strip(),
@@ -75,12 +110,22 @@ class DataRegistryClient:
                 locator_kind=str(data_ref.locator_kind or ""),
                 locator_token=str(data_ref.locator_token or ""),
                 via_registry=False,
+                replicas=direct_replicas,
             )
 
         locator_kind = str(data_ref.locator_kind or "").strip().lower()
         locator_token = str(data_ref.locator_token or self.target or "").strip()
 
         if locator_kind == "node_control" and locator_token:
+            direct_replicas = _normalize_resolved_replicas(
+                (
+                    {
+                        "control_addr": locator_token,
+                        "node_id": str(data_ref.node_id or "").strip(),
+                        "node_instance_id": str(data_ref.node_instance_id or "").strip(),
+                    },
+                )
+            )
             return ResolvedDataRef(
                 ref=data_ref,
                 control_addr=locator_token,
@@ -89,6 +134,7 @@ class DataRegistryClient:
                 locator_kind=locator_kind,
                 locator_token=locator_token,
                 via_registry=False,
+                replicas=direct_replicas,
             )
 
         if locator_kind in {"controlplane", "node_local", ""} and locator_token:
@@ -101,22 +147,20 @@ class DataRegistryClient:
                     payload = {}
                 entry = dict(payload.get("entry") or {})
                 control_addr = str(entry.get("control_addr", "") or "").strip()
-                if control_addr:
-                    return ResolvedDataRef(
-                        ref=data_ref,
-                        control_addr=control_addr,
-                        node_id=str(entry.get("node_id", "") or data_ref.node_id or ""),
-                        node_instance_id=str(entry.get("node_instance_id", "") or data_ref.node_instance_id or ""),
-                        locator_kind=str(entry.get("locator_kind", "") or locator_kind),
-                        locator_token=str(entry.get("locator_token", "") or locator_token),
-                        via_registry=True,
-                    )
-
                 replicas = [
                     dict(item)
                     for item in (entry.get("replicas") or ())
                     if isinstance(item, dict) and str(item.get("control_addr", "") or "").strip()
                 ]
+                if control_addr:
+                    replicas.append(
+                        {
+                            "control_addr": control_addr,
+                            "node_id": str(entry.get("node_id", "") or data_ref.node_id or ""),
+                            "node_instance_id": str(entry.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                        }
+                    )
+                replicas = list(_normalize_resolved_replicas(replicas))
                 if replicas:
                     nodes = list(client.list_nodes(healthy_only=False, limit=2000))
                     healthy_map = {
@@ -128,6 +172,7 @@ class DataRegistryClient:
                             0 if healthy_map.get(str(item.get("node_instance_id", "") or "").strip(), True) else 1,
                             str(item.get("node_instance_id", "") or ""),
                             str(item.get("node_id", "") or ""),
+                            str(item.get("control_addr", "") or ""),
                         )
                     )
                     best = replicas[0]
@@ -139,6 +184,33 @@ class DataRegistryClient:
                         locator_kind="node_control",
                         locator_token=str(best.get("control_addr", "") or "").strip(),
                         via_registry=True,
+                        replicas=tuple(
+                            {
+                                "control_addr": str(item.get("control_addr", "") or "").strip(),
+                                "node_id": str(item.get("node_id", "") or "").strip(),
+                                "node_instance_id": str(item.get("node_instance_id", "") or "").strip(),
+                            }
+                            for item in replicas
+                        ),
+                    )
+                if control_addr:
+                    return ResolvedDataRef(
+                        ref=data_ref,
+                        control_addr=control_addr,
+                        node_id=str(entry.get("node_id", "") or data_ref.node_id or ""),
+                        node_instance_id=str(entry.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                        locator_kind=str(entry.get("locator_kind", "") or locator_kind),
+                        locator_token=str(entry.get("locator_token", "") or locator_token),
+                        via_registry=True,
+                        replicas=_normalize_resolved_replicas(
+                            (
+                                {
+                                    "control_addr": control_addr,
+                                    "node_id": str(entry.get("node_id", "") or data_ref.node_id or ""),
+                                    "node_instance_id": str(entry.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                                },
+                            )
+                        ),
                     )
 
                 nodes = list(client.list_nodes(healthy_only=False, limit=2000))
@@ -159,6 +231,15 @@ class DataRegistryClient:
                             locator_kind=locator_kind,
                             locator_token=locator_token,
                             via_registry=True,
+                            replicas=_normalize_resolved_replicas(
+                                (
+                                    {
+                                        "control_addr": control_addr,
+                                        "node_id": str(getattr(node, "node_id", "") or node_id),
+                                        "node_instance_id": node_instance_id,
+                                    },
+                                )
+                            ),
                         )
                 if len(matches) > 1:
                     raise RuntimeError(f"data ref resolution is ambiguous for node_instance_id={node_instance_id!r}")
@@ -177,6 +258,15 @@ class DataRegistryClient:
                             locator_kind=locator_kind,
                             locator_token=locator_token,
                             via_registry=True,
+                            replicas=_normalize_resolved_replicas(
+                                (
+                                    {
+                                        "control_addr": control_addr,
+                                        "node_id": node_id,
+                                        "node_instance_id": str(getattr(node, "node_instance_id", "") or ""),
+                                    },
+                                )
+                            ),
                         )
                 if len(matches) > 1:
                     raise RuntimeError(

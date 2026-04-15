@@ -143,6 +143,50 @@ def test_upload_object_recreates_missing_object_dir(tmp_path):
         state.close()
 
 
+def test_upload_object_from_file_uses_trusted_precheck_by_default(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-object-precheck-01", str(tmp_path / "node_object_precheck_01"))
+    try:
+        upload_path = tmp_path / "dup.bin"
+        upload_path.write_bytes(b"duplicate object payload")
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            first = client.upload_object_from_file(file_path=str(upload_path), format="bin")
+            meta = client.get_object_meta(object_id=first.object_id)
+            assert meta.exists is True
+            with patch.object(client.stub, "UploadObject", wraps=client.stub.UploadObject) as mocked_upload:
+                second = client.upload_object_from_file(file_path=str(upload_path), format="bin")
+            assert second.object_id == first.object_id
+            assert second.size_bytes == first.size_bytes
+            mocked_upload.assert_not_called()
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
+def test_upload_object_from_file_can_disable_trusted_precheck(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-object-precheck-02", str(tmp_path / "node_object_precheck_02"))
+    try:
+        upload_path = tmp_path / "dup-legacy.bin"
+        upload_path.write_bytes(b"duplicate object payload legacy")
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            first = client.upload_object_from_file(file_path=str(upload_path), format="bin")
+            assert client.has_object(object_id=first.object_id) is True
+            with (
+                patch.object(client.stub, "GetObjectMeta", wraps=client.stub.GetObjectMeta) as mocked_meta,
+                patch.object(client.stub, "UploadObject", wraps=client.stub.UploadObject) as mocked_upload,
+            ):
+                second = client.upload_object_from_file(
+                    file_path=str(upload_path),
+                    format="bin",
+                    trusted_precheck=False,
+                )
+            assert second.object_id == first.object_id
+            mocked_meta.assert_not_called()
+            assert mocked_upload.call_count == 1
+    finally:
+        server.stop(grace=0)
+        state.close()
+
+
 class TestDirectConnect:
     def test_getattr_creates_proxy(self):
         client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)

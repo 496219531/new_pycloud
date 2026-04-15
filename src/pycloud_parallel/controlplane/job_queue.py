@@ -16,13 +16,13 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.client import (
+    InfoCenterClient,
     NodeControlClient,
     TaskPoolSession,
 )
-from pycloud_parallel.controlplane.config import get_payload_policy
+from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.object_ref import ObjectRef
 from pycloud_parallel.controlplane.payload_transport import normalize_inbound_payload
@@ -31,7 +31,6 @@ from pycloud_parallel.controlplane.state import (
     _invoke_user_callable,
     _load_user_module,
     _purge_loaded_artifact_modules,
-    _resolve_object_refs_in_payload,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -83,30 +82,6 @@ def _payload_object_ref(value: object) -> Optional[ObjectRef | DataRef]:
     return maybe_data_ref(value)
 
 
-def _collect_payload_data_ref_ids(value: object) -> List[str]:
-    out: List[str] = []
-    seen: set[str] = set()
-
-    def _walk(item: object) -> None:
-        ref = maybe_data_ref(item)
-        if ref is not None:
-            ref_id = str(ref.ref_id or "").strip()
-            if ref_id and ref_id not in seen:
-                seen.add(ref_id)
-                out.append(ref_id)
-            return
-        if isinstance(item, dict):
-            for nested in item.values():
-                _walk(nested)
-            return
-        if isinstance(item, (list, tuple)):
-            for nested in item:
-                _walk(nested)
-
-    _walk(value)
-    return out
-
-
 _JOB_DELAYED_RESOLVE_SKIP_KEYS = {
     "blob_ref",
     "blob_b64",
@@ -117,6 +92,66 @@ _JOB_DELAYED_RESOLVE_SKIP_KEYS = {
 }
 
 
+def _should_skip_delayed_resolve_key(*, path: str, key: str) -> bool:
+    return str(path or "").strip() == "payload" and str(key or "").strip() in _JOB_DELAYED_RESOLVE_SKIP_KEYS
+
+
+def _collect_payload_data_ref_ids(value: object) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _walk(item: object, *, path: str = "payload") -> None:
+        ref = maybe_data_ref(item)
+        if ref is not None:
+            ref_id = str(ref.ref_id or "").strip()
+            if ref_id and ref_id not in seen:
+                seen.add(ref_id)
+                out.append(ref_id)
+            return
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                normalized_key = str(key)
+                if _should_skip_delayed_resolve_key(path=path, key=normalized_key):
+                    continue
+                _walk(nested, path=f"{path}.{normalized_key}")
+            return
+        if isinstance(item, (list, tuple)):
+            for idx, nested in enumerate(item):
+                _walk(nested, path=f"{path}[{idx}]")
+
+    _walk(value)
+    return out
+
+
+def _validate_delayed_resolve_refs(value: object) -> None:
+    def _walk(item: object, *, path: str = "payload") -> None:
+        ref = maybe_data_ref(item)
+        if ref is not None:
+            locator_kind = str(ref.locator_kind or "").strip().lower()
+            locator_token = str(ref.locator_token or "").strip()
+            control_addr = str(ref.control_addr or "").strip()
+            if locator_kind == "node_local" and not locator_token and not control_addr:
+                raise ValueError(
+                    f"{path} contains an ObjectRef/DataRef without a resolvable locator; "
+                    "use controlplane staging for business payload data"
+                )
+            if locator_kind == "node_control" and not locator_token and not control_addr:
+                raise ValueError(f"{path} contains a node_control DataRef without control_addr")
+            return
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                normalized_key = str(key)
+                if _should_skip_delayed_resolve_key(path=path, key=normalized_key):
+                    continue
+                _walk(nested, path=f"{path}.{normalized_key}")
+            return
+        if isinstance(item, (list, tuple)):
+            for idx, nested in enumerate(item):
+                _walk(nested, path=f"{path}[{idx}]")
+
+    _walk(value)
+
+
 def _resolve_payload_data_refs(
     value: object,
     *,
@@ -125,42 +160,61 @@ def _resolve_payload_data_refs(
 ) -> object:
     registry = DataRegistryClient(registry_target, timeout_sec=max(0.1, float(timeout_sec)))
 
-    def _resolve(item: object) -> object:
+    def _resolve(item: object, *, path: str = "payload") -> object:
         data_ref = maybe_data_ref(item)
         if data_ref is not None:
             last_exc: Optional[Exception] = None
-            resolved = None
-            for backoff in (0.5, 1.0, 2.0):
+            for backoff in (0.0, 0.5, 1.0, 2.0):
+                if backoff > 0.0:
+                    time.sleep(backoff)
                 try:
                     resolved = registry.resolve(data_ref)
-                    break
                 except Exception as exc:
                     last_exc = exc
-                    time.sleep(backoff)
-            if resolved is None:
+                    continue
+                replicas = [
+                    dict(candidate)
+                    for candidate in getattr(resolved, "replicas", ()) or ()
+                    if isinstance(candidate, dict) and str(candidate.get("control_addr", "") or "").strip()
+                ]
+                if not replicas and str(resolved.control_addr or "").strip():
+                    replicas = [
+                        {
+                            "control_addr": str(resolved.control_addr or "").strip(),
+                            "node_id": str(resolved.node_id or "").strip(),
+                            "node_instance_id": str(resolved.node_instance_id or "").strip(),
+                        }
+                    ]
+                for replica in replicas:
+                    control_addr = str(replica.get("control_addr", "") or "").strip()
+                    if not control_addr:
+                        continue
+                    try:
+                        with NodeControlClient(control_addr, timeout_sec=max(0.1, float(timeout_sec))) as client:
+                            return client.fetch_result_ref_data(data_ref)
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+            if last_exc is None:
                 raise RuntimeError(
-                    f"staging data unavailable for ref_id={data_ref.ref_id}: {last_exc}"
+                    f"staging data unavailable for ref_id={data_ref.ref_id}: no readable replica"
                 )
-            try:
-                with NodeControlClient(resolved.control_addr, timeout_sec=max(0.1, float(timeout_sec))) as client:
-                    return client.fetch_result_ref_data(data_ref)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"staging data unavailable for ref_id={data_ref.ref_id}: {exc}"
-                ) from exc
+            raise RuntimeError(
+                f"staging data unavailable for ref_id={data_ref.ref_id}: {last_exc}"
+            )
         if isinstance(item, dict):
             out: Dict[str, object] = {}
             for key, value in item.items():
                 normalized_key = str(key)
-                if normalized_key in _JOB_DELAYED_RESOLVE_SKIP_KEYS:
+                if _should_skip_delayed_resolve_key(path=path, key=normalized_key):
                     out[normalized_key] = value
                 else:
-                    out[normalized_key] = _resolve(value)
+                    out[normalized_key] = _resolve(value, path=f"{path}.{normalized_key}")
             return out
         if isinstance(item, list):
-            return [_resolve(nested) for nested in item]
+            return [_resolve(nested, path=f"{path}[{idx}]") for idx, nested in enumerate(item)]
         if isinstance(item, tuple):
-            return tuple(_resolve(nested) for nested in item)
+            return tuple(_resolve(nested, path=f"{path}[{idx}]") for idx, nested in enumerate(item))
         return item
 
     return _resolve(value)
@@ -314,6 +368,41 @@ def _job_auth_ttl_sec() -> int:
     return 24 * 60 * 60
 
 
+def _default_job_worker_count() -> int:
+    return max(1, int((os.cpu_count() or 1) * 0.5))
+
+
+def _default_job_node_count(
+    *,
+    controlplane_target: str,
+    payload: Dict[str, object],
+) -> int:
+    explicit_node_ids = [str(item).strip() for item in list(payload.get("node_ids") or ()) if str(item).strip()]
+    if explicit_node_ids:
+        return len(explicit_node_ids)
+
+    runtime = str(payload.get("runtime", "py3") or "py3")
+    tags = list(payload.get("tags") or ())
+    node_limit = int(payload.get("node_limit", 100) or 100)
+    try:
+        with InfoCenterClient(controlplane_target, timeout_sec=float(payload.get("timeout_sec", 10.0) or 10.0)) as infocenter:
+            selected = list(
+                infocenter.select_task_nodes(
+                    healthy_only=bool(payload.get("healthy_only", True)),
+                    tags=tags,
+                    node_ids=explicit_node_ids or None,
+                    node_count=0,
+                    limit=node_limit,
+                    require_credit=False,
+                    preferred_runtime_key=str(payload.get("preferred_runtime_key", "") or "").strip(),
+                    runtime=runtime,
+                )
+            )
+    except Exception:
+        return 0
+    return len(selected)
+
+
 @dataclass
 class JobState:
     job_id: str
@@ -377,7 +466,6 @@ class JobQueueManager:
         self._stop = False
         self._thread: Optional[threading.Thread] = None
         self._retention_sec = max(60, int(os.getenv("PYCLOUD_JOB_QUEUE_RETENTION_SEC", "3600") or 3600))
-        self._staged_ref_touch_interval_sec = 300.0
 
     def start(self, *, controlplane_target: str) -> None:
         with self._lock:
@@ -398,15 +486,16 @@ class JobQueueManager:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=1.0)
-            if thread.is_alive():
-                return
         with self._lock:
             executor = self._current_executor
+            release_states = [state for state in self._jobs.values() if state.staged_ref_ids]
         if executor is not None:
             try:
                 executor.close()
             except Exception:
                 pass
+        for state in release_states:
+            self._release_job_refs(state)
 
     def submit_job(self, payload: Dict[str, object], *, auth_token: str = "") -> JobState:
         raw_payload = dict(payload or {})
@@ -418,6 +507,7 @@ class JobQueueManager:
         )
         if not isinstance(normalized_payload, dict):
             raise ValueError("job payload must resolve to a dict")
+        _validate_delayed_resolve_refs(normalized_payload)
         job_id = str(normalized_payload.get("job_id", "") or "").strip() or f"jobq-{uuid.uuid4().hex}"
         client_id = str(normalized_payload.get("client_id", "") or "").strip() or f"job-client-{uuid.uuid4().hex[:8]}"
         priority = max(0, int(normalized_payload.get("priority", 0) or 0))
@@ -613,9 +703,9 @@ class JobQueueManager:
                 break
         self._waiting_order.insert(insert_at, state.job_id)
 
-    def _cleanup_jobs_locked(self) -> None:
+    def _cleanup_jobs_locked(self) -> List[JobState]:
         if self._retention_sec <= 0:
-            return
+            return []
         now = utc_now()
         expired = []
         for job_id, state in self._jobs.items():
@@ -624,9 +714,20 @@ class JobQueueManager:
             finished_at = state.finished_at or state.submitted_at
             if (now - finished_at).total_seconds() > self._retention_sec:
                 expired.append(job_id)
+        released: List[JobState] = []
         for job_id in expired:
             self._remove_waiting_job_locked(job_id)
-            self._jobs.pop(job_id, None)
+            state = self._jobs.pop(job_id, None)
+            if state is not None:
+                released.append(state)
+        return released
+
+    def _job_ref_touch_interval_sec(self, state: JobState) -> float:
+        ttl_sec = max(
+            1,
+            int((state.payload or {}).get("staging_ttl_sec", JOB_STAGED_REF_TTL_SEC) or JOB_STAGED_REF_TTL_SEC),
+        )
+        return max(1.0, min(float(ttl_sec) / 3.0, 300.0))
 
     def _jobs_needing_ref_touch_locked(self, *, now: datetime) -> List[JobState]:
         out: List[JobState] = []
@@ -636,7 +737,7 @@ class JobQueueManager:
             if not state.staged_ref_ids:
                 continue
             last_touch = state.last_ref_touch_at or state.submitted_at
-            if (now - last_touch).total_seconds() >= self._staged_ref_touch_interval_sec:
+            if (now - last_touch).total_seconds() >= self._job_ref_touch_interval_sec(state):
                 out.append(state)
         return out
 
@@ -672,12 +773,14 @@ class JobQueueManager:
     def _loop(self) -> None:
         while True:
             refs_to_touch: List[JobState] = []
+            refs_to_release: List[JobState] = []
+            next_job: Optional[JobState] = None
             with self._cv:
                 while not self._stop and self._running_job_id:
                     self._cv.wait(timeout=0.1)
                 if self._stop:
                     return
-                self._cleanup_jobs_locked()
+                refs_to_release = self._cleanup_jobs_locked()
                 refs_to_touch = self._jobs_needing_ref_touch_locked(now=utc_now())
                 next_job = self._pick_next_job_locked()
                 if next_job is None:
@@ -690,6 +793,8 @@ class JobQueueManager:
                     next_job.checkpoint["phase"] = "preparing"
                     self._remove_waiting_job_locked(next_job.job_id)
                     self._running_job_id = next_job.job_id
+            for state in refs_to_release:
+                self._release_job_refs(state)
             for state in refs_to_touch:
                 self._touch_job_refs(state)
             if next_job is None:
@@ -774,6 +879,10 @@ class JobQueueManager:
             job_id_snapshot = state.job_id
 
         try:
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is not None:
+                    state.checkpoint["phase"] = "resolving_refs"
             resolved_payload = _resolve_payload_data_refs(
                 payload,
                 registry_target=self._controlplane_target,
@@ -845,6 +954,17 @@ class JobQueueManager:
             "preferred_runtime_key": str(payload.get("preferred_runtime_key", "") or "").strip(),
             "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
         }
+        prepared_update_globals = (
+            dict(payload.get("update_globals"))
+            if isinstance(payload.get("update_globals"), dict)
+            else {}
+        )
+        if prepared_update_globals and not kwargs["managed_global_names"]:
+            kwargs["managed_global_names"] = [
+                str(name).strip()
+                for name in prepared_update_globals.keys()
+                if str(name).strip()
+            ]
 
         code_version = str(payload.get("code_version", "") or "").strip()
         if code_version:
@@ -866,13 +986,14 @@ class JobQueueManager:
                 return
             kwargs["blob"] = blob
         artifact_path = str(payload.get("artifact_path", "") or "").strip()
+        default_worker_count = _default_job_worker_count()
+        default_node_count = _default_job_node_count(
+            controlplane_target=self._controlplane_target,
+            payload=payload,
+        )
 
         executor: Optional[Any] = None
         try:
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is not None:
-                    state.checkpoint["phase"] = "running_tasks"
             executor = TaskPoolSession.from_infocenter(
                     infocenter_target=self._controlplane_target,
                     job_id=job_id_snapshot,
@@ -886,18 +1007,28 @@ class JobQueueManager:
                     package_format=kwargs.get("package_format", ""),
                     dependency_allowlist=kwargs.get("dependency_allowlist"),
                     managed_global_names=kwargs.get("managed_global_names"),
-                    worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", 1)) or 1)),
+                    worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
                     heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
                     idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
                     healthy_only=kwargs.get("healthy_only", True),
                     tags=kwargs.get("tags"),
                     node_ids=kwargs.get("node_ids"),
-                    node_count=max(0, int(payload.get("pool_node_count", kwargs.get("node_count", 0) or 0) or 0)),
+                    node_count=max(0, int(payload.get("pool_node_count", kwargs.get("node_count", default_node_count) or default_node_count) or 0)),
                     node_limit=kwargs.get("node_limit", 100),
                     timeout_sec=kwargs.get("timeout_sec", 10.0),
                 )
             with self._lock:
                 self._current_executor = executor
+            if prepared_update_globals:
+                with self._lock:
+                    state = self._jobs.get(job_id)
+                    if state is not None:
+                        state.checkpoint["phase"] = "fanout_globals"
+                executor.update_globals(dict(prepared_update_globals))
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is not None:
+                    state.checkpoint["phase"] = "running_tasks"
             submit_resp = executor.submit_payloads(
                 subtasks,
                 job_id=job_id_snapshot,
@@ -1058,6 +1189,11 @@ class JobQueueManager:
                     for name in prepared_update_globals.keys()
                     if str(name).strip()
                 ]
+            default_worker_count = _default_job_worker_count()
+            default_node_count = _default_job_node_count(
+                controlplane_target=self._controlplane_target,
+                payload=payload,
+            )
 
             executor = TaskPoolSession.from_infocenter(
                 infocenter_target=self._controlplane_target,
@@ -1068,13 +1204,13 @@ class JobQueueManager:
                 runtime=str(payload.get("runtime", "py3") or "py3"),
                 dependency_allowlist=list(payload.get("dependency_allowlist") or ()),
                 managed_global_names=effective_managed_global_names,
-                worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", 1)) or 1)),
+                worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
                 heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
                 idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
                 healthy_only=bool(payload.get("healthy_only", True)),
                 tags=list(payload.get("tags") or ()),
                 node_ids=list(payload.get("node_ids") or ()),
-                node_count=max(0, int(payload.get("pool_node_count", payload.get("node_count", 0) or 0) or 0)),
+                node_count=max(0, int(payload.get("pool_node_count", payload.get("node_count", default_node_count) or default_node_count) or 0)),
                 node_limit=int(payload.get("node_limit", 100) or 100),
                 timeout_sec=float(payload.get("timeout_sec", 10.0) or 10.0),
             )
@@ -1110,8 +1246,8 @@ class JobQueueManager:
                     current_state.checkpoint["phase"] = "running_tasks"
             stream = executor.unordered(
                 _payload_stream(),
-                max_in_flight=max(1, int(payload.get("max_in_flight", 32) or 32)),
-                receive_batch=max(1, int(payload.get("receive_batch", 1) or 1)),
+                max_in_flight=max(1, int(payload.get("max_in_flight", 100) or 100)),
+                receive_batch=max(1, int(payload.get("receive_batch", 10) or 10)),
                 submit_timeout_sec=float(payload.get("submit_timeout_sec", 60.0) or 60.0),
                 result_timeout_sec=float(payload.get("result_timeout_sec", payload.get("wait_chunk_timeout_sec", 30.0)) or 30.0),
                 wait_ms=int(payload.get("wait_ms", 500) or 500),
