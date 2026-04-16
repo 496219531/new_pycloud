@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
-from pycloud_parallel.controlplane.result_ref import ResultRef
 
 
 @dataclass(frozen=True)
@@ -100,14 +99,19 @@ class DataStore:
             control_addr=normalized_control_addr,
         )
 
-    def result_ref_from_stored_artifact(self, result: StoredDataArtifact) -> ResultRef:
-        return ResultRef(
-            object_id=str(result.object_id or ""),
+    def result_ref_from_stored_artifact(self, result: StoredDataArtifact) -> DataRef:
+        normalized_control_addr = str(self.control_addr or "").strip()
+        return DataRef(
+            ref_id=str(result.object_id or ""),
+            storage_id=str(result.object_id or ""),
+            logical_type="",
             node_id=str(self.node_id or ""),
-            control_addr=str(self.control_addr or ""),
             format=str(result.format or "bin"),
             size_bytes=int(result.size_bytes or 0),
             materialize_as=str(result.materialize_as or "path"),
+            locator_kind="node_control" if normalized_control_addr else "node_local",
+            locator_token=normalized_control_addr,
+            control_addr=normalized_control_addr,
         )
 
 

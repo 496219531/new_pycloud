@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from pycloud_parallel.controlplane.client import _decode_http_request_body, _encode_http_json_body
+from pycloud_parallel.controlplane.client_transport import _decode_http_request_body, _encode_http_json_body
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 

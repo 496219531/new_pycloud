@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
-from pycloud_parallel.controlplane.object_ref import ObjectRef, object_ref_to_payload
+from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
 
 
 def test_submit_and_cancel_waiting_job() -> None:
@@ -80,7 +80,7 @@ def test_submit_job_rejects_unresolvable_object_ref_payloads() -> None:
                 "subtasks": [
                     {
                         "blob": object_ref_to_payload(
-                            ObjectRef(
+                            NodeStoredRef(
                                 object_id="sha256:" + ("c" * 64),
                                 format="json",
                                 size_bytes=12,
@@ -263,7 +263,7 @@ def test_run_job_prefers_task_pool_session() -> None:
             return None
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-pool-1")  # noqa: SLF001
 
     mocked.assert_called_once()
@@ -328,7 +328,7 @@ def test_run_job_with_hooks_uses_generator_handler_and_finalize() -> None:
             return None
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-hooks-1")  # noqa: SLF001
 
     mocked.assert_called_once()
@@ -386,7 +386,7 @@ def test_run_job_with_hooks_accepts_update_globals_callable_name() -> None:
             return None
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-hooks-globals-name")  # noqa: SLF001
 
     assert fake_pool.updated_globals == [{"cfg": {"base": 2, "count": 3}}]
@@ -439,7 +439,7 @@ def test_run_job_with_hooks_uses_entryfunc_for_taskpool() -> None:
             return None
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-hooks-entryfunc")  # noqa: SLF001
 
     call_kwargs = mocked.call_args.kwargs
@@ -489,7 +489,7 @@ def test_run_job_with_hooks_accepts_direct_payload_list_task_generator() -> None
             return None
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool):
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool):
         queue._run_job("job-hooks-direct-payloads")  # noqa: SLF001
 
     job = queue.get_job("job-hooks-direct-payloads")
@@ -542,7 +542,7 @@ def test_run_job_with_hooks_accepts_update_globals_dict() -> None:
             return None
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-hooks-globals-dict")  # noqa: SLF001
 
     assert fake_pool.updated_globals == [{"cfg": {"mode": "fast"}}]
@@ -553,7 +553,7 @@ def test_run_job_with_hooks_accepts_update_globals_dict() -> None:
 
 
 def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
-    from pycloud_parallel.controlplane.object_ref import ObjectRef, object_ref_to_payload
+    from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
 
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
@@ -575,7 +575,7 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
             "client_id": "client-a",
             "priority": 5,
             "blob_ref": object_ref_to_payload(
-                ObjectRef(
+                NodeStoredRef(
                     object_id="sha256:" + ("b" * 64),
                     format="py",
                     size_bytes=len(module_blob),
@@ -616,7 +616,7 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
 
     fake_pool = _FakePool()
     with (
-        patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool),
+        patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool),
         patch(
             "pycloud_parallel.controlplane.job_queue.NodeControlClient.download_object_bytes",
             return_value=module_blob,
@@ -750,7 +750,7 @@ def test_submit_job_rejects_nested_unresolvable_business_blob_ref() -> None:
                 "package_format": "py",
                 "job_payload": {
                     "blob_ref": object_ref_to_payload(
-                        ObjectRef(
+                        NodeStoredRef(
                             object_id="sha256:" + ("e" * 64),
                             format="json",
                             size_bytes=12,
@@ -846,7 +846,7 @@ def test_run_job_with_hooks_purges_loaded_modules() -> None:
     with (
         patch("pycloud_parallel.controlplane.job_queue._purge_loaded_artifact_modules") as mocked,
         patch("pycloud_parallel.controlplane.job_queue.gc.collect") as mocked_gc,
-        patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool),
+        patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool),
     ):
         queue._run_job("job-hooks-purge-1")  # noqa: SLF001
 
@@ -860,9 +860,9 @@ def test_run_job_with_hooks_purges_loaded_modules() -> None:
 
 
 def test_job_queue_client_submit_job_from_bytes_uses_minimal_payload() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
 
     def _fake_submit(payload):
@@ -887,9 +887,9 @@ def test_job_queue_client_submit_job_from_bytes_uses_minimal_payload() -> None:
 
 
 def test_job_queue_client_submit_job_from_bytes_auto_binds_update_globals() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
 
     def _fake_submit(payload):
@@ -910,9 +910,9 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_update_globals() -> N
 
 
 def test_job_queue_client_submit_job_from_bytes_auto_binds_handle_data_alias() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
 
     def _fake_submit(payload):
@@ -934,9 +934,9 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_handle_data_alias() -
 
 
 def test_job_queue_client_submit_job_from_bytes_auto_binds_finalize_when_present() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
 
     def _fake_submit(payload):
@@ -958,7 +958,7 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_finalize_when_present
 
 def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypatch) -> None:
     from pycloud_parallel.controlplane.client import _prepare_job_blob_submit_fields
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.data.object_ref import NodeStoredRef
 
     monkeypatch.setattr(
         "pycloud_parallel.controlplane.client._job_blob_requires_object_ref",
@@ -970,7 +970,7 @@ def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypat
     )
     monkeypatch.setattr(
         "pycloud_parallel.controlplane.client.NodeControlClient.upload_object_from_bytes",
-        lambda self, **kwargs: ObjectRef(
+        lambda self, **kwargs: NodeStoredRef(
             object_id="sha256:" + ("a" * 64),
             format="tar.gz",
             size_bytes=4096,
@@ -1031,9 +1031,9 @@ def test_prepare_job_submit_payload_for_call_preserves_staged_update_globals(mon
 
 
 def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payload(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import DataRef, JobQueueClient
+    from pycloud_parallel import DataRef, JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     data_ref = DataRef(
         ref_id="sha256:" + ("a" * 64),
         storage_id="sha256:" + ("a" * 64),
@@ -1067,12 +1067,12 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
 
 
 def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import DataRef, JobQueueClient
+    from pycloud_parallel import DataRef, JobQueue
     import pycloud_parallel.controlplane.client as client_mod
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.data.object_ref import NodeStoredRef
 
-    monkeypatch.setattr(client_mod, "INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 32)
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    monkeypatch.setattr("pycloud_parallel.execution.support.INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 32)
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
     registered = {}
     replicas = [
@@ -1094,7 +1094,7 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -
 
         def upload_object_from_bytes(self, *, blob, format="", chunk_size=0):
             del blob, chunk_size
-            return ObjectRef(
+            return NodeStoredRef(
                 object_id="sha256:" + ("d" * 64),
                 format=format or "txt",
                 size_bytes=256,
@@ -1104,7 +1104,7 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -
             return None
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._select_job_staging_clients",
+        "pycloud_parallel.execution.support._select_job_staging_clients",
         lambda **kwargs: (
             [_FakeStageClient("127.0.0.1:50061"), _FakeStageClient("127.0.0.1:50062")],
             list(replicas),
@@ -1115,7 +1115,7 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -
         lambda self, ref, **kwargs: registered.update({"ref": ref, **kwargs}) or {"ok": True},
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._job_submit_upload_clients",
+        "pycloud_parallel.execution.support._job_submit_upload_clients",
         lambda **kwargs: [],
     )
 
@@ -1140,20 +1140,20 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -
 
 
 def test_job_queue_client_submit_job_keeps_directory_root_dir_inline(monkeypatch, tmp_path) -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
 
     def _fail_if_staged(**kwargs):
         raise AssertionError(f"directory payload should not be staged: {kwargs}")
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._select_job_staging_clients",
+        "pycloud_parallel.execution.support._select_job_staging_clients",
         _fail_if_staged,
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._job_submit_upload_clients",
+        "pycloud_parallel.execution.support._job_submit_upload_clients",
         lambda **kwargs: [],
     )
 
@@ -1176,9 +1176,9 @@ def test_job_queue_client_submit_job_keeps_directory_root_dir_inline(monkeypatch
 
 
 def test_job_queue_client_submit_job_uses_unified_outbound_policy(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-a")
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
 
     class _FakeUploadClient:
@@ -1186,7 +1186,7 @@ def test_job_queue_client_submit_job_uses_unified_outbound_policy(monkeypatch) -
             return None
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._job_submit_upload_clients",
+        "pycloud_parallel.execution.support._job_submit_upload_clients",
         lambda **kwargs: [_FakeUploadClient()],
     )
 
@@ -1198,7 +1198,7 @@ def test_job_queue_client_submit_job_uses_unified_outbound_policy(monkeypatch) -
         return dict(payload or {})
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.prepare_outbound_payload",
+        "pycloud_parallel.execution.support.prepare_outbound_payload",
         _fake_prepare,
     )
 
@@ -1213,10 +1213,10 @@ def test_job_queue_client_submit_job_uses_unified_outbound_policy(monkeypatch) -
 def test_job_queue_client_restores_cached_session(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PYCLOUD_JOB_CLIENT_SESSION_DIR", str(tmp_path))
 
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    first = JobQueueClient("127.0.0.1:50051")
-    second = JobQueueClient("127.0.0.1:50051")
+    first = JobQueue("127.0.0.1:50051")
+    second = JobQueue("127.0.0.1:50051")
 
     assert first.client_id == second.client_id
     assert first.auth_token == second.auth_token
@@ -1225,9 +1225,10 @@ def test_job_queue_client_restores_cached_session(monkeypatch, tmp_path) -> None
 def test_job_queue_client_rotates_expired_cached_session(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PYCLOUD_JOB_CLIENT_SESSION_DIR", str(tmp_path))
 
-    from pycloud_parallel.controlplane.client import JobQueueClient, _job_client_session_cache_file
+    from pycloud_parallel import JobQueue
+    from pycloud_parallel.controlplane.client import _job_client_session_cache_file
 
-    first = JobQueueClient("127.0.0.1:50051", client_id="client-cache")
+    first = JobQueue("127.0.0.1:50051", client_id="client-cache")
     cache_path = _job_client_session_cache_file(
         target="127.0.0.1:50051",
         service_name="job-orchestrator",
@@ -1237,7 +1238,7 @@ def test_job_queue_client_rotates_expired_cached_session(monkeypatch, tmp_path) 
     payload["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
     cache_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    second = JobQueueClient("127.0.0.1:50051", client_id="client-cache")
+    second = JobQueue("127.0.0.1:50051", client_id="client-cache")
 
     assert second.client_id == "client-cache"
     assert second.auth_token != first.auth_token
@@ -1246,9 +1247,9 @@ def test_job_queue_client_rotates_expired_cached_session(monkeypatch, tmp_path) 
 def test_job_queue_client_recent_job_ids_tracks_and_restores(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("PYCLOUD_JOB_CLIENT_SESSION_DIR", str(tmp_path))
 
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-recent")
+    client = JobQueue("127.0.0.1:50051", client_id="client-recent")
     job_ids = iter(["job-1", "job-2", "job-1"])
 
     def _fake_call(*, service_name, method, payload=None, timeout_sec=60.0, service_token=None):
@@ -1264,12 +1265,13 @@ def test_job_queue_client_recent_job_ids_tracks_and_restores(monkeypatch, tmp_pa
 
     assert client.recent_job_ids() == ["job-1", "job-2"]
 
-    restored = JobQueueClient("127.0.0.1:50051", client_id="client-recent")
+    restored = JobQueue("127.0.0.1:50051", client_id="client-recent")
     assert restored.recent_job_ids() == ["job-1", "job-2"]
 
 
 def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import InfoCenterServiceRoute, JobQueueClient
+    from pycloud_parallel import JobQueue
+    from pycloud_parallel.controlplane.client import InfoCenterServiceRoute
     from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
     route = InfoCenterServiceRoute(
@@ -1303,15 +1305,15 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
         return {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.InfoCenterClient.list_service_routes",
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.list_service_routes",
         _fake_list_service_routes,
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._call_route_http",
+        "pycloud_parallel.execution.queue._call_route_http",
         _fake_call_route_http,
     )
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-discovery", auth_token="token-discovery")
+    client = JobQueue("127.0.0.1:50051", client_id="client-discovery", auth_token="token-discovery")
     try:
         resp = client.get_job_status("job-1")
     finally:
@@ -1326,9 +1328,9 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
 
 
 def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-module")
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
     captured = {}
 
     def _fake_submit(payload):
@@ -1366,9 +1368,9 @@ def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
 
 
 def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-module")
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
     captured = {}
 
     def _fake_submit(payload):
@@ -1404,9 +1406,9 @@ def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> 
 
 
 def test_job_queue_client_submit_job_from_module_auto_binds_handle_data_alias() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-module")
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
     captured = {}
 
     def _fake_submit(payload):
@@ -1441,9 +1443,9 @@ def test_job_queue_client_submit_job_from_module_auto_binds_handle_data_alias() 
 
 
 def test_job_queue_client_submit_job_from_module_auto_binds_finalize_when_present() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-module")
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
     captured = {}
 
     def _fake_submit(payload):
@@ -1477,9 +1479,9 @@ def test_job_queue_client_submit_job_from_module_auto_binds_finalize_when_presen
 
 
 def test_job_queue_client_submit_job_from_module_accepts_update_globals_dict() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051", client_id="client-module")
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
     captured = {}
 
     def _fake_submit(payload):
@@ -1559,7 +1561,7 @@ def test_run_job_with_hooks_uses_larger_default_worker_node_and_inflight(monkeyp
     )
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-hooks-defaults")  # noqa: SLF001
 
     assert mocked.call_args.kwargs["worker_count"] == 4
@@ -1615,7 +1617,7 @@ def test_run_job_non_hook_uses_larger_default_worker_and_all_nodes(monkeypatch) 
     )
 
     fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue.TaskPoolSession.from_infocenter", return_value=fake_pool) as mocked:
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
         queue._run_job("job-defaults-non-hook")  # noqa: SLF001
 
     assert mocked.call_args.kwargs["worker_count"] == 3
@@ -1623,9 +1625,9 @@ def test_run_job_non_hook_uses_larger_default_worker_and_all_nodes(monkeypatch) 
 
 
 def test_job_queue_client_wait_for_terminal_polls_until_done() -> None:
-    from pycloud_parallel.controlplane.client import JobQueueClient
+    from pycloud_parallel import JobQueue
 
-    client = JobQueueClient("127.0.0.1:50051")
+    client = JobQueue("127.0.0.1:50051")
     states = [
         {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}},
         {"ok": True, "job": {"job_id": "job-1", "status": "RUNNING"}},

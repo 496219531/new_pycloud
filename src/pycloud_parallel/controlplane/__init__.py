@@ -13,21 +13,12 @@ _CLIENT_EXPORTS = {
     "ArtifactDeps",
     "ArtifactExports",
     "DataRef",
-    "ObjectRef",
-    "ResultRef",
     "pycloud_export",
-    "DeployedService",
-    "DirectConnect",
-    "GatewayConnect",
-    "DedicatedTaskServiceSession",
-    "JobQueueClient",
-    "TaskPoolSession",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
     "InfoCenterServiceRoute",
-    "ServiceGroup",
 }
 
 _CONTROLPLANE_DEP_HINT = (
@@ -52,20 +43,11 @@ if TYPE_CHECKING:
         ArtifactDeps,
         ArtifactExports,
         DataRef,
-        DedicatedTaskServiceSession,
-        DeployedService,
-        DirectConnect,
         DiscoveryServiceClient,
-        GatewayConnect,
         GatewayServiceClient,
         InfoCenterClient,
         InfoCenterNode,
         InfoCenterServiceRoute,
-        JobQueueClient,
-        ObjectRef,
-        ResultRef,
-        ServiceGroup,
-        TaskPoolSession,
         pycloud_export,
     )
 
@@ -77,20 +59,11 @@ def _try_bind_client_exports() -> None:
             ArtifactDeps,
             ArtifactExports,
             DataRef,
-            DedicatedTaskServiceSession,
-            DeployedService,
-            DirectConnect,
             DiscoveryServiceClient,
-            GatewayConnect,
             GatewayServiceClient,
             InfoCenterClient,
             InfoCenterNode,
             InfoCenterServiceRoute,
-            JobQueueClient,
-            ObjectRef,
-            ResultRef,
-            ServiceGroup,
-            TaskPoolSession,
             pycloud_export,
         )
     except ModuleNotFoundError as exc:
@@ -105,27 +78,14 @@ def _try_bind_client_exports() -> None:
             "ArtifactDeps": ArtifactDeps,
             "ArtifactExports": ArtifactExports,
             "DataRef": DataRef,
-            "ObjectRef": ObjectRef,
-            "ResultRef": ResultRef,
             "pycloud_export": pycloud_export,
-            "DeployedService": DeployedService,
-            "DirectConnect": DirectConnect,
-            "GatewayConnect": GatewayConnect,
-            "DedicatedTaskServiceSession": DedicatedTaskServiceSession,
-            "JobQueueClient": JobQueueClient,
-            "TaskPoolSession": TaskPoolSession,
             "DiscoveryServiceClient": DiscoveryServiceClient,
             "GatewayServiceClient": GatewayServiceClient,
             "InfoCenterClient": InfoCenterClient,
             "InfoCenterNode": InfoCenterNode,
             "InfoCenterServiceRoute": InfoCenterServiceRoute,
-            "ServiceGroup": ServiceGroup,
         }
     )
-
-
-_try_bind_client_exports()
-
 
 def __getattr__(name: str):
     if name in _CLIENT_EXPORTS:
@@ -141,23 +101,14 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    "ObjectRef",
-    "ResultRef",
     "Artifact",
     "ArtifactDeps",
     "ArtifactExports",
     "DataRef",
     "pycloud_export",
-    "DeployedService",
-    "DirectConnect",
-    "GatewayConnect",
-    "DedicatedTaskServiceSession",
-    "JobQueueClient",
-    "TaskPoolSession",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
     "InfoCenterServiceRoute",
-    "ServiceGroup",
 ]

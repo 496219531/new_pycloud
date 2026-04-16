@@ -342,7 +342,7 @@ pycloudctl start-controlplane --bind 0.0.0.0:51051
 
 ### 4.3.1 通过 `--env KEY=VALUE` 透传运行时限制
 
-如果你要调整 inline / ObjectRef / gRPC 大小限制，可以直接把环境变量透传给 `pycloudctl` 启动的子进程：
+如果你要调整 inline / DataRef / gRPC 大小限制，可以直接把环境变量透传给 `pycloudctl` 启动的子进程：
 
 ```bash
 pycloudctl start-controlplane \

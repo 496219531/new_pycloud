@@ -12,9 +12,12 @@ from typing import Callable, Iterable, List, Optional
 import grpc
 
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_payload_policy
+from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
-from pycloud_parallel.controlplane.state import NodeControlState, dt_to_ts, struct_to_dict, touch_object_last_at
 from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, validate_inline_payload_structs
+from pycloud_parallel.controlplane.state_time import dt_to_ts
+from pycloud_parallel.controlplane.serialization import struct_to_dict
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -90,7 +93,7 @@ def _normalize_object_integrity_mode(meta: pb2.UploadObjectMeta) -> str:
 
 def _expected_object_id(meta: pb2.UploadObjectMeta, actual_sha256: str) -> str:
     mode = _normalize_object_integrity_mode(meta)
-    from pycloud_parallel.controlplane.object_ref import object_id_from_sha256_hex
+    from pycloud_parallel.data.object_ref import object_id_from_sha256_hex
 
     authoritative_object_id = object_id_from_sha256_hex(str(actual_sha256 or "").strip().lower())
     if mode == "server_authoritative":

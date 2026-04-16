@@ -17,28 +17,28 @@
 
 当前常见 HTTP caller 有两类：
 
-1. `GatewayConnect`
+1. gateway caller
    - 模块化调用体验，如 `client.foo.sync(...)`
 2. `GatewayServiceClient`
    - 显式 HTTP 调用体验，如 `client.call(service_name=..., method=..., payload=...)`
 
-如果你走 `GatewayConnect`：
+如果你走 gateway caller：
 
-1. `GatewayConnect.__getattr__()` 动态返回 `_CallProxy`
-2. `_SyncCallProxy.__call__()` 或 `_CallProxy.__call__()` 进入 `GatewayConnect.call_balanced()`
-3. `GatewayConnect.call_balanced()` 再调用父类 `GatewayServiceClient.call()`
+1. caller facade 的 `__getattr__()` 动态返回 `_CallProxy`
+2. `_SyncCallProxy.__call__()` 或 `_CallProxy.__call__()` 进入 caller facade 的 `call_balanced()`
+3. 再调用父类 `GatewayServiceClient.call()`
 
 关键位置：
 
 1. `src/pycloud_parallel/controlplane/client.py`
-2. `GatewayConnect` 从 `5674` 左右开始
+2. gateway caller facade 从 caller facade 模块开始
 3. `GatewayServiceClient.call()` 在 `1365` 左右
 
 ## 2. 客户端发请求
 
 HTTP 请求真正发出前，关键函数顺序是：
 
-1. `GatewayConnect.call_balanced()`
+1. gateway caller facade 的 `call_balanced()`
 2. `GatewayServiceClient.call()`
 3. `_serialize_http_call_payload()`
 4. `_http_json_request()`
@@ -50,7 +50,7 @@ HTTP 请求真正发出前，关键函数顺序是：
    - 先把 payload 送去 `_serialize_http_call_payload()`
 2. `_serialize_http_call_payload()`
    - 内部调用 `serialize_inline_payload(...)`
-   - 这里会做 pandas / numpy / datetime / ObjectRef 等 inline 序列化
+   - 这里会做 pandas / numpy / datetime / DataRef 等 inline 序列化
 3. `_http_json_request()`
    - 负责真正的 JSON body 编码和 `urlopen(...)`
    - 这里现在只打 `logger.debug(...)`，默认不会直接 `print`
@@ -130,8 +130,8 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 
 文档里只需要先记住入口：
 
-1. `src/pycloud_parallel/controlplane/state.py`
-2. `call_service()` 在 `3208` 左右
+1. `src/pycloud_parallel/controlplane/nodecontrol_state.py`
+2. `NodeControlState.call_service()`
 
 如果想继续往下追用户代码执行，最关键是下一层。
 
@@ -156,16 +156,16 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 
 关键位置：
 
-1. `src/pycloud_parallel/controlplane/state.py`
-2. `_invoke_user_callable()` 在 `1144` 左右
-3. `_execute_payload_in_subprocess()` 在 `1313` 左右
-4. `_normalize_user_return()` 在 `513` 左右
+1. `src/pycloud_parallel/controlplane/node/execution.py`
+2. `_invoke_user_callable()`
+3. `_execute_payload_in_subprocess()`
+4. `src/pycloud_parallel/controlplane/node/results.py` 中 `_normalize_user_return()`
 
 如果“请求到了，但函数行为不对”，通常就是在这里查：
 
 1. 反序列化后 payload 到底长什么样
 2. 最终是 `fn(*args, **kwargs)` 还是 `fn(**payload)`
-3. 返回值是否被转成 `ResultRef` / DataFrame / ndarray / inline dict
+3. 返回值是否被转成 `DataRef` / DataFrame / ndarray / inline dict
 
 ## 7. 返回结果路径
 
@@ -174,20 +174,20 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 1. inline 结果
    - 直接放进 `CallServiceResponse.data`
 2. 大对象结果
-   - 先落成对象文件，再包装成 `ResultRef`
+   - 先落成对象文件，再包装成 `DataRef`
 
 客户端侧取结果的关键函数：
 
 1. `_normalize_http_response_body()`
 2. `convert_dict_to_arrow(...)`
-3. 如果结果里是 `ResultRef`
+3. 如果结果里是 `DataRef`
    - `fetch_result_ref_data(...)`
    - `_materialize_downloaded_result(...)`
 
 因此：
 
 1. 你看到的是普通 dict/list/pandas/numpy
-2. 还是一个 `ResultRef`
+2. 还是一个 `DataRef`
 3. 还是落盘后的 parquet / npy
 
 都可以沿这条链路判断。
@@ -218,7 +218,7 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 1. payload inline 序列化失败
    - 先看 `_serialize_http_call_payload()` / `serialize_inline_payload()`
 2. Gateway 报 `no available route`
-   - 看 `GatewayConnect._validate_service_ready()` 或 route cache
+   - 看 `gateway caller._validate_service_ready()` 或 route cache
 3. 节点报 `service/method not found`
    - 看 `NodeControlService.CallService()` 和 `NodeControlState.call_service()`
 4. 函数签名不匹配
@@ -228,9 +228,9 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 
 ## 10. 备注
 
-如果你不是走 `GatewayConnect`，而是走 `DirectConnect`，前半段会变成：
+如果你不是走 `gateway caller`，而是走 `discovery caller`，前半段会变成：
 
-1. `DirectConnect.call_balanced()`
+1. `discovery caller.call_balanced()`
 2. route cache 直接选节点 route
 3. `_call_route_http(...)`
 4. 目标节点 service HTTP

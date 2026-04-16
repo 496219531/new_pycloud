@@ -8,10 +8,11 @@ import time
 import grpc
 from typing import Tuple
 
-from pycloud_parallel.controlplane.client import InfoCenterClient, ServiceGroup
+from pycloud_parallel.controlplane.client import InfoCenterClient, Service
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
+from pycloud_parallel.controlplane.infocenter.state import InfoCenterState
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -76,7 +77,7 @@ def test_multi_node_group_deploy_and_call(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
 
-        group = ServiceGroup.deploy_from_infocenter(
+        group = Service.deploy_from_infocenter(
             infocenter_target=info_target,
             owner_client_id="owner-multi-test",
             service_name="svc-multi-test",
@@ -146,7 +147,7 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
 
-        group = ServiceGroup.deploy_from_infocenter(
+        group = Service.deploy_from_infocenter(
             infocenter_target=info_target,
             owner_client_id="owner-cb-test",
             service_name="svc-cb-test",
@@ -258,7 +259,7 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
 
         blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
 
-        existing_group = ServiceGroup.deploy_from_infocenter(
+        existing_group = Service.deploy_from_infocenter(
             infocenter_target=info_target,
             owner_client_id="owner-existing",
             service_name="svc-existing",
@@ -291,7 +292,7 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
                 assert routes[0].node_id == "node-route-01"
                 assert routes[0].status == pb2.SERVICE_STATUS_RUNNING
 
-            ServiceGroup.deploy_from_infocenter(
+            Service.deploy_from_infocenter(
                 infocenter_target=info_target,
                 owner_client_id="owner-dup-check",
                 service_name="svc-existing",
@@ -337,7 +338,7 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
 
-        group1 = ServiceGroup.deploy_from_infocenter(
+        group1 = Service.deploy_from_infocenter(
             infocenter_target=info_target,
             owner_client_id="owner-reuse-test",
             service_name="svc-reuse-test",
@@ -361,7 +362,7 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
             first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
             group1.close(end_services=False)
 
-            group2 = ServiceGroup.deploy_from_infocenter(
+            group2 = Service.deploy_from_infocenter(
                 infocenter_target=info_target,
                 owner_client_id="owner-reuse-test",
                 service_name="svc-reuse-test",
@@ -415,7 +416,7 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
         blob_v1 = b"def run(**_kwargs):\n    return {'version': 1}\n"
         blob_v2 = b"def run(**_kwargs):\n    return {'version': 2}\n"
 
-        group1 = ServiceGroup.deploy_from_infocenter(
+        group1 = Service.deploy_from_infocenter(
             infocenter_target=info_target,
             owner_client_id="owner-replace-test",
             service_name="svc-replace-test",
@@ -436,7 +437,7 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
         _sync_node_services(info_target, node_id="node-replace-02", control_addr=n2_target, tags=["replace"], state=n2_state)
 
         try:
-            ServiceGroup.deploy_from_infocenter(
+            Service.deploy_from_infocenter(
                 infocenter_target=info_target,
                 owner_client_id="owner-replace-test",
                 service_name="svc-replace-test",
@@ -460,7 +461,7 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
             assert "still running" in str(exc)
 
         try:
-            ServiceGroup.deploy_from_infocenter(
+            Service.deploy_from_infocenter(
                 infocenter_target=info_target,
                 owner_client_id="owner-replace-test",
                 service_name="svc-replace-test",
@@ -488,7 +489,7 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
             _sync_node_services(info_target, node_id="node-replace-01", control_addr=n1_target, tags=["replace"], state=n1_state)
             _sync_node_services(info_target, node_id="node-replace-02", control_addr=n2_target, tags=["replace"], state=n2_state)
 
-            group2 = ServiceGroup.deploy_from_infocenter(
+            group2 = Service.deploy_from_infocenter(
                 infocenter_target=info_target,
                 owner_client_id="owner-replace-test",
                 service_name="svc-replace-test",
@@ -552,7 +553,7 @@ def test_service_group_deploy_from_infocenter_filters_nodes_by_runtime(tmp_path)
 
         blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
 
-        group = ServiceGroup.deploy_from_infocenter(
+        group = Service.deploy_from_infocenter(
             infocenter_target=info_target,
             owner_client_id="owner-runtime-test",
             service_name="svc-runtime-test",

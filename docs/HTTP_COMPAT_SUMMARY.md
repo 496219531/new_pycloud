@@ -11,7 +11,7 @@
 ## 识别逻辑
 
 ```python
-# state.py:357-361
+# node/execution.py:_invoke_user_callable
 if isinstance(payload, dict) and ("args" in payload or "kwargs" in payload):
     # 新格式：支持位置参数
     args = payload.get("args", [])
@@ -57,9 +57,9 @@ else:
 ### 场景 1: 模块化调用（自动使用新格式）
 
 ```python
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
-group = DeployedService.deploy_from_infocenter(...)
+group = Service.deploy_from_infocenter(...)
 
 # 位置参数 → {"args": [10, 20]}
 result = await group.add(10, 20)

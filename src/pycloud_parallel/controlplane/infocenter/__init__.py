@@ -1,0 +1,1 @@
+"""InfoCenter domain package."""

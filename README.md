@@ -20,7 +20,7 @@
 4. `External Web Layer`
    - 如果需要真正的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
    - 该层负责 HTTP API、鉴权、参数校验、编排与聚合
-   - 重计算下沉到 `JobQueue Mode + TaskPoolSession`，内部函数调用下沉到 `Service Mode`
+  - 重计算下沉到 `JobQueue Mode + TaskPool`，内部函数调用下沉到 `Service Mode`
 
 ## 安装
 
@@ -46,8 +46,8 @@ pip install pycloud-parallel
    - 内部常驻函数服务层
 3. `JobQueue Mode`
    - 大任务排队与单活调度层
-4. `TaskPoolSession / Task Mode`
-   - 子任务执行层（原生专属 pool）
+4. `TaskPool / Task Mode`
+   - 子任务执行层（唯一执行内核）
 
 ## Payload 序列化边界
 
@@ -123,9 +123,9 @@ TaskPool / Service 两条执行链路的结果返回当前是自动分流的：
    - 直接 inline 回传
 2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
    - 落到 node 本地 `objects/`
-   - 返回 `ResultRef`
+   - 返回 `DataRef`
 
-高层 Python API 会自动帮你下载并还原 `ResultRef` 指向的大结果。
+高层 Python API 会自动帮你下载并还原 `DataRef` 指向的大结果。
 
 如果你明确知道结果会很大，建议业务侧主动返回“小摘要 + 对象引用”，不要依赖超大 inline 返回。
 
@@ -192,43 +192,35 @@ pycloudctl gc --scope all --older-than-hours 168
 
 ## 顶层 Python API
 
-推荐从顶层包导入：
+V1 顶层公开面只保留：
 
 ```python
 from pycloud_parallel import (
-    configure,
-    foreach,
-    parallel_for,
-    pycloud_export,
-    DeployedService,
-    DedicatedTaskServiceSession,
-    JobQueueClient,
-    TaskPoolSession,
-    GatewayConnect,
-    DirectConnect,
+    Service,
+    TaskPool,
+    JobQueue,
+    DataRef,
+    export,
 )
 ```
 
 语义：
 
-1. `DeployedService`
+1. `Service`
    - owner 侧部署并持有服务
-2. `TaskPoolSession`
-   - 原生专属任务池会话
-3. `DedicatedTaskServiceSession`
-   - 复用 `ServiceGroup` 的兼容专属池实现
-   - 也支持 owner 侧 `update_globals(...)`
-4. `JobQueueClient`
+2. `TaskPool`
+   - 唯一执行内核，对应专属任务池会话
+3. `JobQueue`
    - 大任务排队客户端
-5. `GatewayConnect`
-   - 通过 Gateway 按 `service_name` 调用服务
-6. `DirectConnect`
-   - 客户端本地查路由后直连实例
+4. `DataRef`
+   - 唯一公开的大对象引用类型
+5. `export`
+   - 模块 / package 部署时的导出装饰器
 
-`pycloud_export` 也已经从顶层包重导出；如果你走模块 / package 部署，而不是直接传 `blob`，可以直接写：
+本地并行入口不再从顶层包导出，请改用：
 
 ```python
-from pycloud_parallel import pycloud_export
+from pycloud_parallel.local import configure, foreach, parallel_for
 ```
 
 如果你需要更底层的控制面类，请从 `pycloud_parallel.controlplane` 导入。
@@ -332,7 +324,7 @@ pycloudctl --local start
 ### 2. 服务模式
 
 ```python
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 blob = (
     b"def pycloud_export(fn):\n"
@@ -344,7 +336,7 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
@@ -363,7 +355,7 @@ print(group.square.sync(x=7))
 如果你的代码依赖节点上未预装的包，可以显式给白名单：
 
 ```python
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="dep-service",
     artifact_path="./service_src",
@@ -380,9 +372,9 @@ group = DeployedService.deploy_from_infocenter(
 
 ```python
 import my_job.main
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     entry_module=my_job.main,
     runtime="py3",
@@ -405,7 +397,7 @@ group = DeployedService.deploy_from_infocenter(
 ### 3. 任务模式
 
 ```python
-from pycloud_parallel import TaskPoolSession
+from pycloud_parallel import TaskPool
 
 blob = (
     b"def run(value=0, **_kwargs):\n"
@@ -413,7 +405,7 @@ blob = (
     b"    return {'value': value, 'square': value * value}\n"
 )
 
-with TaskPoolSession.from_infocenter(
+with TaskPool.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
     blob=blob,
@@ -444,7 +436,7 @@ with TaskPoolSession.from_infocenter(
 
 说明：
 
-1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
+1. `TaskPool` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
 2. `pool.methods` 会返回这个单一方法名
 3. 如果你手动传 `task_method=...`，它现在会做严格校验；方法名不匹配会直接报错，不再静默回退
 
@@ -455,7 +447,7 @@ with TaskPoolSession.from_infocenter(
 3. 在 Windows 上一次性并发提交很多这类大结果任务时，一旦开始走结果落盘，文件系统更容易出现瞬时 `PermissionError(13)`。
 4. 这类场景更推荐 `imap_unordered(...)` 或显式限制并发，例如把 `max_in_flight` 控制在 `8~32`，而不是一次性同时打满几十个任务。
 
-如果你希望先排队，再由调度器自动创建专属 pool，使用 `JobQueueClient`。
+如果你希望先排队，再由调度器自动创建专属 pool，使用 `JobQueue`。
 
 常见高层 helper：
 
@@ -532,7 +524,7 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 
 当前推荐调用路径：
 
-1. owner：`DeployedService.deploy_from_infocenter(...)`
+1. owner：`Service.deploy_from_infocenter(...)`
 2. caller：`GatewayConnect(...)`
 3. 调试直连：`DirectConnect(...)`
 
@@ -540,12 +532,12 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 
 任务模式当前已经收敛为：
 
-1. `TaskPoolSession`
+1. `TaskPool`
    - 原生专属任务池会话
    - pool 自己保活、提交、拉结果、取消和关闭
 2. `JobQueueMode`
    - 大任务排队与单活调度
-   - job 排到后，再自动创建 `TaskPoolSession`
+   - job 排到后，再自动创建 `TaskPool`
 
 ## Python Runtime 约束
 
@@ -606,7 +598,7 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 1. [快速开始](docs/QUICK_START.md)
 2. [架构总览](docs/ARCHITECTURE_OVERVIEW.md)
 3. [任务模式](docs/TASK_MODE.md)
-4. [DeployedService](docs/SERVICE_MODULE_GROUP.md)
+4. [Service](docs/SERVICE_MODULE_GROUP.md)
 5. [Gateway 客户端指南](docs/GATEWAY_CLIENT_GUIDE.md)
 6. [InfoCenter HTTP](docs/INFOCENTER_HTTP.md)
 7. [Runtime 参数说明](docs/RUNTIME_PARAMETER_ANALYSIS.md)

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
-from pycloud_parallel.controlplane.object_ref import ObjectRef
+from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
     serialize_arrow_compatible,
@@ -18,7 +18,7 @@ from pycloud_parallel.controlplane.serialization import (
 )
 
 EstimateInlineSize = Callable[[Any], int]
-PutPayloadData = Callable[..., ObjectRef]
+PutPayloadData = Callable[..., object]
 ResolveObjectRefs = Callable[[Any], Any]
 
 
@@ -28,11 +28,14 @@ def _put_prepared_value(
     policy: PayloadPolicy,
     put_data: PutPayloadData,
     format: str = "",
-) -> ObjectRef:
+) -> DataRef:
     prepared = put_data(value, format=format)
-    if policy.consume_on_read and isinstance(prepared, ObjectRef):
-        return replace(prepared, consume_on_read=True)
-    return prepared
+    data_ref = maybe_data_ref(prepared)
+    if data_ref is None:
+        raise TypeError(f"put_data must return DataRef-compatible value, got {type(prepared).__name__}")
+    if policy.consume_on_read:
+        return replace(data_ref, consume_on_read=True)
+    return data_ref
 
 
 def _prepare_value_for_transport(
@@ -43,8 +46,9 @@ def _prepare_value_for_transport(
     put_data: PutPayloadData,
     preserve_container: bool = False,
 ) -> Any:
-    if isinstance(value, ObjectRef):
-        return value
+    direct_ref = maybe_data_ref(value)
+    if direct_ref is not None:
+        return direct_ref
     if policy.objectify_pathlikes and isinstance(value, os.PathLike):
         return _put_prepared_value(value, policy=policy, put_data=put_data)
     if policy.objectify_strings_as_files and isinstance(value, str):
@@ -261,7 +265,7 @@ def normalize_inbound_payload(
     normalized = convert_dict_to_arrow(payload)
     resolver = resolve_object_refs
     if resolver is None:
-        from pycloud_parallel.controlplane.state import _resolve_object_refs_in_payload
+        from pycloud_parallel.controlplane.node.results import _resolve_object_refs_in_payload
 
         resolver = lambda value: _resolve_object_refs_in_payload(value, object_dir=object_dir)
     return resolver(normalized)

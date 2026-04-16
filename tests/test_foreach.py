@@ -2,7 +2,7 @@
 
 import time
 
-from pycloud_parallel import configure, foreach
+from pycloud_parallel.local import configure, foreach
 from pycloud_parallel.local_runtime.runtime import _deserialize_callable, _serialize_callable
 
 

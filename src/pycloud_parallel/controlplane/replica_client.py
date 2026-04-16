@@ -16,6 +16,7 @@ from pycloud_parallel.controlplane.client_transport import (
     _serialize_http_call_payload,
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.session_model import (
     ExecutionReplicaSnapshot,
     SessionBinding,
@@ -360,15 +361,13 @@ class ServiceSessionClient:
         if not method:
             raise ValueError("method is required")
 
-        from pycloud_parallel.controlplane.client import _prepare_remote_call_payload
-
         params = urlencode({"timeout_sec": f"{max(0.1, float(timeout_sec)):.3f}"})
         url = f"{self.http_base_url}/call/{quote(method, safe='')}?{params}"
         headers = {"Content-Type": "application/json"}
         auth_token = self.service_token if token is None else token
         if auth_token:
             headers["X-Service-Token"] = auth_token
-        prepared_payload = _prepare_remote_call_payload(
+        prepared_payload = prepare_remote_call_payload(
             [self._client],
             payload,
         )

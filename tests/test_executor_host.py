@@ -4,7 +4,8 @@ import hashlib
 import time
 
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
-from pycloud_parallel.controlplane.state import NodeControlState, _build_execute_spec
+from pycloud_parallel.controlplane.node.execution import _build_execute_spec
+from pycloud_parallel.controlplane.node.state import NodeControlState
 
 
 def _seed_artifact(tmp_path, *, blob: bytes, entry_module: str, entry_callable: str = "run"):

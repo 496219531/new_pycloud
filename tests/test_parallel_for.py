@@ -2,7 +2,7 @@
 
 import warnings
 
-from pycloud_parallel import configure, parallel_for
+from pycloud_parallel.local import configure, parallel_for
 
 @parallel_for()
 def _decorated_square(nums):

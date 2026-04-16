@@ -9,8 +9,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, Optional
 from importlib import metadata as importlib_metadata
 
-from pycloud_parallel.controlplane.client import InfoCenterClient
-from pycloud_parallel.controlplane.state import NodeControlState
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 

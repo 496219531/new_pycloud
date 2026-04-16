@@ -1,27 +1,21 @@
 from __future__ import annotations
 
-"""InfoCenter state backend extracted from state.py."""
+"""InfoCenter state backend extracted from the legacy state compatibility layer."""
 
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
+from pycloud_parallel.controlplane.infocenter.models import (
+    DataRegistryEntry,
+    NodeMetricsState,
+    NodeServiceState,
+    NodeState,
+    NodeTaskPoolInfo,
+)
+from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-import pycloud_parallel.controlplane.state as state_mod
-
-for _name in (
-    "DataRegistryEntry",
-    "NodeMetricsState",
-    "NodeServiceState",
-    "NodeState",
-    "NodeTaskPoolInfo",
-    "ts_to_dt",
-    "utc_now",
-):
-    globals()[_name] = getattr(state_mod, _name)
-
-del _name, state_mod
 
 
 class InfoCenterState:

@@ -17,27 +17,35 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from pycloud_parallel.controlplane.client import ServiceGroup, ServiceSessionClient
+from pycloud_parallel.controlplane.client import Service, ServiceSessionClient
 from pycloud_parallel.controlplane import serialization as serialization_mod
-from pycloud_parallel.controlplane.state import (
-    NodeControlState,
+from pycloud_parallel.controlplane.code_version import _code_version_from_digest
+from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
+from pycloud_parallel.controlplane.infocenter.state import InfoCenterState
+from pycloud_parallel.controlplane.node.execution import (
     _build_execute_spec,
+    _describe_artifact_error,
+    _execute_payload_in_subprocess,
+)
+from pycloud_parallel.controlplane.node.filesystem import (
     _code_content_dir,
-    _code_version_from_digest,
     _code_data_dir,
     _code_index_link_path,
     _code_pkg_dir,
     _code_variant_dir,
-    _describe_artifact_error,
+)
+from pycloud_parallel.controlplane.node.models import StoredResultArtifact
+from pycloud_parallel.controlplane.node.results import (
     _commit_result_file,
-    _execute_payload_in_subprocess,
     _normalize_user_return,
     _resolve_object_refs_in_payload,
+)
+from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.serialization import (
     dict_to_struct,
     struct_to_dict,
-    utc_now,
 )
-from pycloud_parallel.controlplane.state import InfoCenterState, NodeServiceState
+from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeypatch):
@@ -80,13 +88,12 @@ def test_normalize_user_return_inlines_dataframe_when_limit_allows(tmp_path, mon
 
 def test_normalize_user_return_spills_dataframe_when_limit_too_small(tmp_path, monkeypatch):
     pd = pytest.importorskip("pandas")
-    import pycloud_parallel.controlplane.state as state_mod
-    from pycloud_parallel.controlplane.state import StoredResultArtifact
+    import pycloud_parallel.controlplane.node.results as results_mod
 
     def _raise_inline_limit(*args, **kwargs):
         raise ValueError("inline result too large")
 
-    monkeypatch.setattr(state_mod, "serialize_inline_result", _raise_inline_limit)
+    monkeypatch.setattr(results_mod, "serialize_inline_result", _raise_inline_limit)
     frame = pd.DataFrame([{"x": idx, "y": "a" * 50} for idx in range(10)])
     status, result, _err_type, _err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
 
@@ -276,7 +283,7 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
 
     from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.controlplane.client import _materialize_downloaded_result
-    from pycloud_parallel.controlplane.result_ref import ResultRef
+    from pycloud_parallel.data.result_ref import NodeResultHandle
 
     index = pd.MultiIndex.from_tuples(
         [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
@@ -303,7 +310,7 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
 
         restored = _materialize_downloaded_result(
             Path(tmp_name),
-            result_ref=ResultRef(
+            result_ref=NodeResultHandle(
                 object_id="sha256:" + "b" * 64,
                 node_id="node-1",
                 format=fmt,
@@ -325,7 +332,7 @@ def test_series_object_upload_preserves_index_and_name():
 
     from pycloud_parallel.controlplane.client import _materialize_downloaded_result
     from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
-    from pycloud_parallel.controlplane.result_ref import ResultRef
+    from pycloud_parallel.data.result_ref import NodeResultHandle
 
     series = pd.Series(
         [1.1, 2.2],
@@ -348,7 +355,7 @@ def test_series_object_upload_preserves_index_and_name():
     try:
         restored = _materialize_downloaded_result(
             Path(tmp_name),
-            result_ref=ResultRef(
+            result_ref=NodeResultHandle(
                 object_id="sha256:" + "c" * 64,
                 node_id="node-1",
                 format=fmt,
@@ -390,9 +397,8 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pytest.importorskip("pyarrow")
 
     from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
-    from pycloud_parallel.controlplane.object_ref import object_storage_path
-    from pycloud_parallel.controlplane.state import _resolve_object_refs_in_payload
+    from pycloud_parallel.data.object_ref import NodeStoredRef
+    from pycloud_parallel.data.object_ref import object_storage_path
 
     frame = pd.DataFrame(
         [[1, 2], [3, 4]],
@@ -409,7 +415,7 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     path.write_bytes(blob)
 
     payload = {
-        "frame": ObjectRef(
+        "frame": NodeStoredRef(
             object_id=object_id,
             format=fmt,
             size_bytes=len(blob),
@@ -427,8 +433,7 @@ def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
 
     from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.controlplane.data_ref import DataRef
-    from pycloud_parallel.controlplane.object_ref import object_storage_path
-    from pycloud_parallel.controlplane.state import _resolve_object_refs_in_payload
+    from pycloud_parallel.data.object_ref import object_storage_path
 
     frame = pd.DataFrame(
         [[1, 2], [3, 4]],
@@ -820,7 +825,7 @@ def test_execute_payload_in_subprocess_uses_unified_inbound_normalizer(tmp_path,
             return {"value": 9}
 
         monkeypatch.setattr(
-            "pycloud_parallel.controlplane.state.normalize_inbound_payload",
+            "pycloud_parallel.controlplane.payload_transport.normalize_inbound_payload",
             _fake_normalize,
         )
 
@@ -845,10 +850,8 @@ def test_execute_payload_in_subprocess_uses_unified_inbound_normalizer(tmp_path,
 
 
 def test_put_object_from_uploaded_file_uses_segment_backend_for_medium_objects(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane import state as state_mod
-
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1024)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 4096)
     node_state = NodeControlState(
         node_id="node-object-segment-01",
         artifact_dir=str(tmp_path / "code_cache_object_segment"),
@@ -881,10 +884,8 @@ def test_put_object_from_uploaded_file_uses_segment_backend_for_medium_objects(t
 
 
 def test_release_object_removes_orphan_segment_file(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane import state as state_mod
-
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1024)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 4096)
     node_state = NodeControlState(
         node_id="node-release-segment-01",
         artifact_dir=str(tmp_path / "code_cache_release_segment"),
@@ -919,11 +920,10 @@ def test_release_object_removes_orphan_segment_file(tmp_path, monkeypatch):
 
 
 def test_resolve_object_refs_reads_segment_backend(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
-    from pycloud_parallel.controlplane import state as state_mod
+    from pycloud_parallel.data.object_ref import NodeStoredRef
 
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1024)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 4096)
     node_state = NodeControlState(
         node_id="node-object-resolve-01",
         artifact_dir=str(tmp_path / "code_cache_object_resolve"),
@@ -943,7 +943,7 @@ def test_resolve_object_refs_reads_segment_backend(tmp_path, monkeypatch):
             size_bytes=len(blob),
         )
         payload = {
-            "item": ObjectRef(
+            "item": NodeStoredRef(
                 object_id=object_id,
                 format="json",
                 size_bytes=len(blob),
@@ -962,11 +962,10 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
     pytest.importorskip("pyarrow")
 
     from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
-    from pycloud_parallel.controlplane import state as state_mod
+    from pycloud_parallel.data.object_ref import NodeStoredRef
 
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 10 * 1024 * 1024)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 10 * 1024 * 1024)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 10 * 1024 * 1024)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 10 * 1024 * 1024)
     node_state = NodeControlState(
         node_id="node-object-series-segment-01",
         artifact_dir=str(tmp_path / "code_cache_object_series_segment"),
@@ -1001,7 +1000,7 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
         assert artifact.storage_backend == "segment"
 
         payload = {
-            "item": ObjectRef(
+            "item": NodeStoredRef(
                 object_id=object_id,
                 format=fmt,
                 size_bytes=len(blob),
@@ -1017,10 +1016,8 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
 
 
 def test_put_object_from_uploaded_file_uses_file_backend_for_large_objects(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane import state as state_mod
-
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 128)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 128)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 4096)
     node_state = NodeControlState(
         node_id="node-object-file-01",
         artifact_dir=str(tmp_path / "code_cache_object_file"),
@@ -1047,10 +1044,8 @@ def test_put_object_from_uploaded_file_uses_file_backend_for_large_objects(tmp_p
 
 
 def test_release_object_removes_file_backend_object(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane import state as state_mod
-
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 1)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 1)
     node_state = NodeControlState(
         node_id="node-release-object-file-01",
         artifact_dir=str(tmp_path / "code_cache_release_object_file"),
@@ -1083,10 +1078,8 @@ def test_release_object_removes_file_backend_object(tmp_path, monkeypatch):
 
 
 def test_pin_and_release_object_refcount_keeps_file_until_last_ref(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane import state as state_mod
-
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", 1)
-    monkeypatch.setattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", 1)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 1)
     node_state = NodeControlState(
         node_id="node-pin-release-object-file-01",
         artifact_dir=str(tmp_path / "code_cache_pin_release_object_file"),
@@ -1450,13 +1443,13 @@ def test_managed_globals_validation_reuses_single_module_load(tmp_path, monkeypa
         enable_service_session=False,
     )
     calls = {"count": 0}
-    original = sys.modules["pycloud_parallel.controlplane.state"]._load_user_module
+    original = sys.modules["pycloud_parallel.controlplane.node.execution"]._load_user_module
 
     def wrapped(*args, **kwargs):
         calls["count"] += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr("pycloud_parallel.controlplane.state._load_user_module", wrapped)
+    monkeypatch.setattr("pycloud_parallel.controlplane.node.execution._load_user_module", wrapped)
     try:
         blob = (
             b"A = None\n"
@@ -2021,14 +2014,15 @@ def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp
 
 def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
     from pycloud_parallel.controlplane.client import _prepare_http_payload_for_call
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.object_ref import NodeStoredRef
 
     captured = {}
 
     def fake_put(clients, data, *, format="", chunk_size=0):
         captured["data"] = data
         captured["format"] = format
-        return ObjectRef(
+        return NodeStoredRef(
             object_id="sha256:" + ("f" * 64),
             format=format or "json",
             size_bytes=2048,
@@ -2045,7 +2039,7 @@ def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
     prepared = _prepare_http_payload_for_call([object()], payload, object_threshold_bytes=1024)
 
     assert prepared["small"] == 1
-    assert isinstance(prepared["big"], ObjectRef)
+    assert isinstance(prepared["big"], DataRef)
     assert prepared["big"].consume_on_read is True
     assert captured["format"] == "json"
 
@@ -2317,7 +2311,7 @@ def test_service_session_keepalive_fails_fast_after_consecutive_errors():
         status=pb2.SERVICE_STATUS_RUNNING,
         heartbeat_failure_threshold=2,
     )
-    group = ServiceGroup(
+    group = Service(
         owner_client_id="owner-x",
         service_name="svc-x",
         sessions={"node-1": session},

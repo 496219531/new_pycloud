@@ -6,13 +6,37 @@ import contextlib
 import http.client
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import uuid
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlencode, urlparse
 
-from pycloud_parallel.controlplane import client as client_mod
+from pycloud_parallel.controlplane.client_transport import (
+    _decode_http_response_body,
+    _serialize_http_call_payload,
+)
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
+from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
+from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
+from pycloud_parallel.controlplane.replica_client import _extract_result_ref
+from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_SOFT_LIMIT_BYTES, serialize_arrow_compatible
+from pycloud_parallel.execution.call_proxy import _CallProxy
+from pycloud_parallel.execution.support import _resolve_high_level_service_data
+
+client_mod = SimpleNamespace(
+    _target_to_base_url=target_to_base_url,
+    NodeControlClient=NodeControlClient,
+    _prepare_remote_call_payload=prepare_remote_call_payload,
+    INLINE_PAYLOAD_SOFT_LIMIT_BYTES=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    _serialize_http_call_payload=_serialize_http_call_payload,
+    _http_json_request=http_json_request,
+    _extract_result_ref=_extract_result_ref,
+    _resolve_high_level_service_data=_resolve_high_level_service_data,
+    serialize_arrow_compatible=serialize_arrow_compatible,
+    _decode_http_response_body=_decode_http_response_body,
+)
 
 
 class GatewayServiceClient:
@@ -217,7 +241,174 @@ class GatewayServiceClient:
             pass
 
 
-__all__ = ["GatewayServiceClient"]
+class GatewayCallerFacade(GatewayServiceClient):
+    """Module-like caller on top of ControlPlane Gateway."""
+
+    def __init__(
+        self,
+        target: str,
+        *,
+        service_name: str,
+        timeout_sec: float = 10.0,
+        service_token: str = "",
+        validate_on_init: bool = True,
+    ) -> None:
+        super().__init__(target, timeout_sec=timeout_sec, service_token=service_token)
+        self.service_name = str(service_name or "").strip()
+        if not self.service_name:
+            raise ValueError("service_name is required")
+        self._discovered_methods: Optional[List[str]] = None
+        self._last_status: Optional[Dict[str, object]] = None
+        if validate_on_init:
+            self._validate_service_ready()
+
+    def _validate_service_ready(self) -> Dict[str, object]:
+        try:
+            status = self.get_status(service_name=self.service_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to query gateway status for service_name={self.service_name!r} via {self.target}: {exc}"
+            ) from exc
+        if not isinstance(status, dict):
+            raise RuntimeError(
+                f"invalid gateway status for service_name={self.service_name!r} via {self.target}: {status!r}"
+            )
+        self._last_status = status
+        route_count = int(status.get("route_count", 0) or 0)
+        if route_count <= 0:
+            raise RuntimeError(
+                f"no available route for service_name={self.service_name!r} via gateway {self.target}"
+            )
+        return status
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        if self._discovered_methods is None:
+            self._ensure_methods_discovered()
+        if self._discovered_methods is not None and name not in self._discovered_methods:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no method '{name}'. "
+                f"Available methods: {self._discovered_methods}"
+            )
+        return _CallProxy(
+            method=name,
+            group=self,
+            timeout_sec=self.timeout_sec,
+            strategy="gateway",
+            refresh_status=False,
+        )
+
+    def _ensure_methods_discovered(self) -> None:
+        if self._discovered_methods is not None:
+            return
+        try:
+            methods = self.list_methods(include_docs=True)
+        except Exception as exc:
+            self._validate_service_ready()
+            raise RuntimeError(
+                f"failed to list methods for service_name={self.service_name!r} via gateway {self.target}: {exc}"
+            ) from exc
+        discovered = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
+        if not discovered:
+            self._validate_service_ready()
+            raise RuntimeError(
+                f"service_name={self.service_name!r} has active gateway routes via {self.target} but no exported methods"
+            )
+        self._discovered_methods = discovered
+
+    def refresh_methods(self) -> List[str]:
+        self._discovered_methods = None
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    def list_methods(self, *, include_docs: bool = False) -> List[Dict[str, object]]:  # type: ignore[override]
+        return list(super().list_methods(service_name=self.service_name, include_docs=include_docs))
+
+    @property
+    def methods(self) -> List[str]:
+        self._ensure_methods_discovered()
+        return list(self._discovered_methods or [])
+
+    def status(self) -> Dict[str, object]:
+        status = self.get_status(service_name=self.service_name)
+        if isinstance(status, dict):
+            self._last_status = status
+        return status
+
+    def call_balanced(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "gateway",
+        refresh_status: bool = False,
+        max_attempts: int = 0,
+    ):
+        del strategy, refresh_status, max_attempts
+        resp = super().call(
+            service_name=self.service_name,
+            method=method,
+            payload=payload,
+            timeout_sec=timeout_sec,
+        )
+        return "gateway", resp
+
+    async def acall_balanced(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "gateway",
+        refresh_status: bool = False,
+        max_attempts: int = 0,
+    ):
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.call_balanced(
+                method,
+                payload,
+                timeout_sec=timeout_sec,
+                strategy=strategy,
+                refresh_status=refresh_status,
+                max_attempts=max_attempts,
+            ),
+        )
+
+    async def call(self, method: str, **kwargs) -> Dict[str, object]:
+        node_id, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return client_mod._resolve_high_level_service_data(self, node_id=node_id, response=resp)
+
+    def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
+        node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
+        return client_mod._resolve_high_level_service_data(self, node_id=node_id, response=resp)
+
+    async def acall_all(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        max_concurrency: int = 100,
+    ):
+        del method, payload, timeout_sec, max_concurrency
+        raise NotImplementedError("gateway caller facade does not support broadcast; use single-route gateway calls")
+
+    def __repr__(self) -> str:
+        methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
+        return (
+            f"<GatewayCallerFacade "
+            f"service={self.service_name!r} "
+            f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
+        )
+
+
+__all__ = ["GatewayServiceClient", "GatewayCallerFacade"]
 
 
 def _multipart_part_header(*, boundary: str, name: str, filename: str = "", content_type: str = "") -> bytes:

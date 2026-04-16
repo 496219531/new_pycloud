@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 import threading
 from typing import Optional, Protocol, Sequence
 
-from pycloud_parallel.controlplane.client import InfoCenterClient, InfoCenterServiceRoute
-from pycloud_parallel.controlplane.state import InfoCenterState
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, InfoCenterServiceRoute
+from pycloud_parallel.controlplane.infocenter.state import InfoCenterState
 
 
 class RouteSource(Protocol):

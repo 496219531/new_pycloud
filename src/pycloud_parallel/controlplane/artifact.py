@@ -524,7 +524,7 @@ def _code_version_from_digest(
     dependency_policy_mode: str = "",
     dependency_allowlist: Sequence[str],
 ) -> str:
-    from pycloud_parallel.controlplane.state import _code_version_from_digest as state_code_version_from_digest
+    from pycloud_parallel.controlplane.code_version import _code_version_from_digest as state_code_version_from_digest
 
     return state_code_version_from_digest(
         digest,

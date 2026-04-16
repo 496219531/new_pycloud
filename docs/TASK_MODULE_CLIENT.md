@@ -4,22 +4,19 @@
 
 当前任务侧推荐入口：
 
-1. `TaskPoolSession`
+1. `TaskPool`
    - 原生专属任务池会话
    - 适合直接创建一组专属 worker 执行 subtasks
-2. `JobQueueClient`
+2. `JobQueue`
    - 大任务排队入口
-   - 大任务排到后，再自动创建 `TaskPoolSession`
-3. `DedicatedTaskServiceSession`
-   - 兼容专属池实现
-   - 底层复用 `ServiceGroup`
+   - 大任务排到后，再自动创建 `TaskPool`
 
 最小示例：
 
 ```python
-from pycloud_parallel import TaskPoolSession
+from pycloud_parallel import TaskPool
 
-with TaskPoolSession.from_infocenter(
+with TaskPool.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
     blob=blob,
@@ -34,16 +31,16 @@ with TaskPoolSession.from_infocenter(
 
 说明：
 
-1. `TaskPoolSession` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
+1. `TaskPool` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
 2. 如果手动传 `task_method=...`，它必须和这个入口名一致
 3. `runtime_key` 保留为 runtime 逻辑隔离键，但不再表示独立 runtime-slot
 
 排队执行示例：
 
 ```python
-from pycloud_parallel import JobQueueClient
+from pycloud_parallel import JobQueue
 
-client = JobQueueClient("127.0.0.1:50051", client_id="job-demo")
+client = JobQueue("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
     blob=job_blob,
     entry_module="job_demo",
@@ -53,8 +50,8 @@ client.submit_job_from_bytes(
 
 约定：
 
-1. `JobQueueClient` 的 target 应指向 `InfoCenter` 或内嵌 `InfoCenter` 的 `controlplane`
-2. `JobQueueClient` 会先发现 `job-orchestrator` route，再直连它自己的 HTTP 数据面
+1. `JobQueue` 的 target 应指向 `InfoCenter` 或内嵌 `InfoCenter` 的 `controlplane`
+2. `JobQueue` 会先发现 `job-orchestrator` route，再直连它自己的 HTTP 数据面
 3. job module 约定 6 个 hook 位：
 4. `run(payload...)`
    - 必选，子任务入口

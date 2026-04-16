@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 import math
 from typing import Dict, Optional, Sequence, Tuple
 
+from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
+from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
+from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
+
 
 @dataclass(frozen=True)
 class InfoCenterNodeService:
@@ -149,14 +153,28 @@ def _build_unique_node_id_map(nodes: Sequence[InfoCenterNode], *, requested_ids:
     return out
 
 
+def _filter_nodes_by_runtime(
+    nodes: Sequence[InfoCenterNode],
+    *,
+    runtime: str,
+) -> list[InfoCenterNode]:
+    normalized_runtime = normalize_python_runtime_spec(runtime)
+    if not normalized_runtime:
+        return list(nodes)
+    return [
+        node
+        for node in nodes
+        if not str(node.python_version or "").strip()
+        or matches_python_runtime(node.python_version, normalized_runtime)
+    ]
+
+
 class InfoCenterClient:
     """Thin HTTP + JSON client wrapper for InfoCenter service."""
 
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
-        from pycloud_parallel.controlplane.client import _target_to_base_url
-
         self.target = target
-        self.base_url = _target_to_base_url(target)
+        self.base_url = target_to_base_url(target)
         self.timeout_sec = max(0.1, float(timeout_sec))
 
     def close(self) -> None:
@@ -188,8 +206,7 @@ class InfoCenterClient:
         task_pool_worker_used: int = 0,
         python_version: str = "",
     ) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.client import _http_json_request
-
+        
         serialized_services = []
         for item in services or []:
             if isinstance(item, dict):
@@ -206,7 +223,7 @@ class InfoCenterClient:
                     "http_base_url": str(item.http_base_url),
                 }
             )
-        return _http_json_request(
+        return http_json_request(
             base_url=self.base_url,
             path="/nodes/register",
             method="POST",
@@ -248,8 +265,7 @@ class InfoCenterClient:
         task_pool_worker_used: int = 0,
         python_version: str = "",
     ) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.client import _http_json_request
-
+        
         serialized_services = []
         for item in services or []:
             if isinstance(item, dict):
@@ -266,7 +282,7 @@ class InfoCenterClient:
                     "http_base_url": str(item.http_base_url),
                 }
             )
-        return _http_json_request(
+        return http_json_request(
             base_url=self.base_url,
             path="/nodes/heartbeat",
             method="POST",
@@ -295,8 +311,7 @@ class InfoCenterClient:
         tags: Optional[Sequence[str]] = None,
         limit: int = 100,
     ) -> Sequence[InfoCenterNode]:
-        from pycloud_parallel.controlplane.client import _http_json_request
-
+        
         params = "&".join(
             [
                 f"healthy_only={'true' if healthy_only else 'false'}",
@@ -304,7 +319,7 @@ class InfoCenterClient:
                 f"limit={max(1, int(limit))}",
             ]
         )
-        resp = _http_json_request(
+        resp = http_json_request(
             base_url=self.base_url,
             path=f"/nodes?{params}",
             method="GET",
@@ -382,7 +397,6 @@ class InfoCenterClient:
         locator_token: str = "",
         replicas: Optional[Sequence[Dict[str, object]]] = None,
     ) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.client import _http_json_request
         from pycloud_parallel.controlplane.data_ref import coerce_data_ref, data_ref_to_payload
 
         data_ref = coerce_data_ref(ref)
@@ -396,7 +410,7 @@ class InfoCenterClient:
             "locator_token": str(locator_token or "").strip(),
             "replicas": [dict(item) for item in (replicas or ()) if isinstance(item, dict)],
         }
-        return _http_json_request(
+        return http_json_request(
             base_url=self.base_url,
             path="/data/register",
             method="POST",
@@ -405,13 +419,12 @@ class InfoCenterClient:
         )
 
     def resolve_data_ref(self, *, ref_id: str) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.client import _http_json_request
         from urllib.parse import quote
 
         normalized_ref_id = str(ref_id or "").strip()
         if not normalized_ref_id:
             raise ValueError("ref_id is required")
-        return _http_json_request(
+        return http_json_request(
             base_url=self.base_url,
             path=f"/data/resolve/{quote(normalized_ref_id, safe='')}",
             method="GET",
@@ -419,12 +432,11 @@ class InfoCenterClient:
         )
 
     def touch_data_ref(self, *, ref_id: str) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.client import _http_json_request
-
+        
         normalized_ref_id = str(ref_id or "").strip()
         if not normalized_ref_id:
             raise ValueError("ref_id is required")
-        return _http_json_request(
+        return http_json_request(
             base_url=self.base_url,
             path="/data/touch",
             method="POST",
@@ -433,12 +445,11 @@ class InfoCenterClient:
         )
 
     def release_data_ref(self, *, ref_id: str) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.client import _http_json_request
-
+        
         normalized_ref_id = str(ref_id or "").strip()
         if not normalized_ref_id:
             raise ValueError("ref_id is required")
-        return _http_json_request(
+        return http_json_request(
             base_url=self.base_url,
             path="/data/release",
             method="POST",
@@ -453,7 +464,6 @@ class InfoCenterClient:
         node_id: str = "",
         node_instance_id: str = "",
     ) -> Sequence[Dict[str, object]]:
-        from pycloud_parallel.controlplane.client import _http_json_request
         from urllib.parse import urlencode
 
         params = urlencode(
@@ -463,7 +473,7 @@ class InfoCenterClient:
                 "node_instance_id": str(node_instance_id or "").strip(),
             }
         )
-        resp = _http_json_request(
+        resp = http_json_request(
             base_url=self.base_url,
             path=f"/data/refs?{params}",
             method="GET",
@@ -481,8 +491,7 @@ class InfoCenterClient:
         healthy_only: bool = True,
         limit: int = 500,
     ) -> Sequence[InfoCenterServiceRoute]:
-        from pycloud_parallel.controlplane.client import _http_json_request
-
+        
         params = "&".join(
             [
                 f"service_name={service_name}",
@@ -490,7 +499,7 @@ class InfoCenterClient:
                 f"limit={max(1, int(limit))}",
             ]
         )
-        resp = _http_json_request(
+        resp = http_json_request(
             base_url=self.base_url,
             path=f"/services/routes?{params}",
             method="GET",
@@ -539,9 +548,7 @@ class InfoCenterClient:
         preferred_runtime_key: str = "",
         runtime: str = "",
     ) -> Sequence[InfoCenterNode]:
-        from pycloud_parallel.controlplane.client import _filter_nodes_by_runtime
-        from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
-
+                
         nodes = list(self.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit))
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
         requested_instance_ids = [str(node_id).strip() for node_id in (node_instance_ids or []) if str(node_id).strip()]
@@ -566,14 +573,18 @@ class InfoCenterClient:
             _ensure_control_addrs(selected, label="requested node_instance_ids")
             if normalized_runtime:
                 incompatible = [
-                    node.node_instance_id
+                    node
                     for node in selected
                     if str(node.python_version or "").strip()
                     and not matches_python_runtime(node.python_version, normalized_runtime)
                 ]
                 if incompatible:
                     raise RuntimeError(
-                        f"requested node_instance_ids do not satisfy runtime {normalized_runtime}: {incompatible}"
+                        runtime_mismatch_message_for_nodes(
+                            requested_runtime=normalized_runtime,
+                            nodes=incompatible,
+                            scope="requested_node_instance_ids",
+                        )
                     )
         elif requested_node_ids:
             discovered_node_map = _build_unique_node_id_map(nodes, requested_ids=requested_node_ids)
@@ -584,14 +595,18 @@ class InfoCenterClient:
             _ensure_control_addrs(selected, label="requested node_ids")
             if normalized_runtime:
                 incompatible = [
-                    node.node_id
+                    node
                     for node in selected
                     if str(node.python_version or "").strip()
                     and not matches_python_runtime(node.python_version, normalized_runtime)
                 ]
                 if incompatible:
                     raise RuntimeError(
-                        f"requested node_ids do not satisfy runtime {normalized_runtime}: {incompatible}"
+                        runtime_mismatch_message_for_nodes(
+                            requested_runtime=normalized_runtime,
+                            nodes=incompatible,
+                            scope="requested_node_ids",
+                        )
                     )
         else:
             candidates = [
@@ -608,7 +623,11 @@ class InfoCenterClient:
             if not candidates:
                 if normalized_runtime:
                     raise RuntimeError(
-                        f"no schedulable task nodes from InfoCenter for runtime {normalized_runtime}"
+                        runtime_mismatch_message_for_nodes(
+                            requested_runtime=normalized_runtime,
+                            nodes=nodes,
+                            scope="nodes",
+                        )
                     )
                 raise RuntimeError("no schedulable task nodes from InfoCenter")
             candidates.sort(

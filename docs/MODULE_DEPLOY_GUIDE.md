@@ -8,9 +8,9 @@
 
 ```python
 import my_job.main
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     entry_module=my_job.main,
     runtime="py3",
@@ -29,10 +29,10 @@ group = DeployedService.deploy_from_infocenter(
 
 推荐改成：
 
-1. `TaskPoolSession.from_infocenter(...)`
+1. `TaskPool.from_infocenter(...)`
    - 直接创建原生专属 pool 执行 subtasks
-2. `JobQueueClient.submit_job_from_bytes(...)`
-   - 大任务先排队，排到后再自动创建 `TaskPoolSession`
+2. `JobQueue.submit_job_from_bytes(...)`
+   - 大任务先排队，排到后再自动创建 `TaskPool`
 
 ## 3. 资源文件边界
 

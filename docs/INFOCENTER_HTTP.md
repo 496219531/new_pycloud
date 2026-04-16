@@ -169,7 +169,7 @@ http://127.0.0.1:50051/ops
    - node 侧一次服务调用从进入 `_invoke_service_call(...)` 到准备返回响应为止的累计平均墙钟时间
 2. `avg_child_decode_ms`
    - 子进程内部前半段的累计平均耗时
-   - 包含：artifact/router 加载、managed globals 应用、payload 里的 `ObjectRef` 解引用、方法查找
+   - 包含：artifact/router 加载、managed globals 应用、payload 里的 `DataRef` 解引用、方法查找
 3. `avg_child_invoke_ms`
    - 子进程里真正执行用户函数的累计平均耗时
    - 这是当前最接近“用户函数本体耗时”的指标

@@ -1,6 +1,6 @@
 # TaskPool 调试链路
 
-这份文档总结 `TaskPoolSession` 的任务从发出到结果返回的关键函数。
+这份文档总结 `TaskPool` 的任务从发出到结果返回的关键函数。
 
 适合排查：
 
@@ -16,14 +16,14 @@
 
 当前更常见的入口是：
 
-1. `TaskPoolSession`
+1. `TaskPool`
    - 原生 task pool 会话
 2. `NativeTaskPoolClient`
    - 单节点 pool 的低层 gRPC client
 
 当前语义先记住两点：
 
-1. 原生 `TaskPoolSession` 是单入口模式
+1. 原生 `TaskPool` 是单入口模式
    - `methods == [entry_callable]`
    - 不支持像 Service 那样在一个 pool 里导出多个方法再路由
 2. `runtime_key` 只是 runtime 逻辑隔离键
@@ -38,7 +38,7 @@
 关键位置：
 
 1. `src/pycloud_parallel/controlplane/client.py`
-2. `TaskPoolSession` 在 `2087` 左右
+2. `TaskPool` 在 `2087` 左右
 3. `NativeTaskPoolClient` 在 `1680` 左右
 
 ## 2. 创建 TaskPool
@@ -61,7 +61,7 @@
 关键位置：
 
 1. `client.py` 中 `create_task_pool_from_bytes()` 在 `3560` 左右
-2. `state.py` 中 `create_task_pool()` 在 `2788` 左右
+2. `nodecontrol_state.py` 中 `create_task_pool()`
 
 如果 pool 根本起不来，优先看这里。
 
@@ -69,9 +69,9 @@
 
 高层 caller 常走：
 
-1. `TaskPoolSession.submit_payloads()`
-2. `TaskPoolSession.submit_values()`
-3. `TaskPoolSession.map()`
+1. `TaskPool.submit_payloads()`
+2. `TaskPool.submit_values()`
+3. `TaskPool.map()`
 
 其中 `submit_payloads()` 做的事：
 
@@ -84,7 +84,7 @@
 
 关键位置：
 
-1. `TaskPoolSession.submit_payloads()` 在 `2155` 左右
+1. `TaskPool.submit_payloads()` 在 `2155` 左右
 2. `_select_pool_node()` 在 `2147` 左右
 
 这里最适合排查：
@@ -122,7 +122,7 @@
 关键位置：
 
 1. `client.py` 中 `submit_pool_tasks()` 在 `3620` 左右
-2. `state.py` 中 `submit_pool_tasks()` 在 `2854` 左右
+2. `nodecontrol_state.py` 中 `submit_pool_tasks()`
 
 常见故障：
 
@@ -154,8 +154,8 @@
 
 直接去看：
 
-1. `state.py` 中 `_execute_payload_in_subprocess()`
-2. `state.py` 中 `_invoke_user_callable()`
+1. `node/execution.py` 中 `_execute_payload_in_subprocess()`
+2. `node/execution.py` 中 `_invoke_user_callable()`
 
 如果问题出在 managed globals 更新后“第一次调用变慢”或“warmup 看起来没生效”，还可以看：
 
@@ -179,7 +179,7 @@
 
 关键位置：
 
-1. `state.py` 中 `_drain_executor_events()` 附近
+1. `nodecontrol_state.py` 中 `_drain_executor_events()` 附近
 
 如果“任务明明执行完成，但 caller 拉不到结果”，先看这里有没有 publish。
 
@@ -187,24 +187,24 @@
 
 高层 caller 拉结果一般走：
 
-1. `TaskPoolSession.wait_for_results()`
+1. `TaskPool.wait_for_results()`
 2. 内部轮询每个 `NativeTaskPoolClient.pull_results(...)`
 3. `NodeControlState.pull_pool_results()`
 4. `_pool_result_hook.pull(...)`
 
 高层返回 data 则是：
 
-1. `TaskPoolSession.wait_for_data()`
+1. `TaskPool.wait_for_data()`
 2. `_resolve_task_results_data(...)`
 
 关键位置：
 
-1. `TaskPoolSession.wait_for_results()` 在 `2194` 左右
-2. `TaskPoolSession.wait_for_data()` 在 `2220` 左右
+1. `TaskPool.wait_for_results()` 在 `2194` 左右
+2. `TaskPool.wait_for_data()` 在 `2220` 左右
 3. `NativeTaskPoolClient.pull_results()` 在 `1702` 左右
 4. `NodeControlState.pull_pool_results()` 在 `2921` 左右
 
-当前 `TaskPoolSession.wait_for_results()` 的特点：
+当前 `TaskPool.wait_for_results()` 的特点：
 
 1. 轮询所有 node pool
 2. 用 `seen` 去重 task_id
@@ -226,14 +226,14 @@ results = pool.map(values, timeout_sec=...)
 
 关键函数顺序就是：
 
-1. `TaskPoolSession.map()`
-2. `TaskPoolSession.submit_values()`
-3. `TaskPoolSession.submit_payloads()`
+1. `TaskPool.map()`
+2. `TaskPool.submit_values()`
+3. `TaskPool.submit_payloads()`
 4. `NativeTaskPoolClient.submit_tasks()`
 5. `NodeControlState.submit_pool_tasks()`
 6. executor host 执行
 7. `NodeControlState._drain_executor_events()`
-8. `TaskPoolSession.wait_for_data()`
+8. `TaskPool.wait_for_data()`
 
 这是最适合调试的一条主线。
 
@@ -241,13 +241,13 @@ results = pool.map(values, timeout_sec=...)
 
 排查一次 TaskPool，建议按这个顺序下断点：
 
-1. `TaskPoolSession.submit_payloads()`
+1. `TaskPool.submit_payloads()`
 2. `NativeTaskPoolClient.submit_tasks()`
 3. `NodeControlState.submit_pool_tasks()`
 4. `_execute_payload_in_subprocess()`
 5. `_invoke_user_callable()`
 6. `NodeControlState._drain_executor_events()`
-7. `TaskPoolSession.wait_for_results()`
+7. `TaskPool.wait_for_results()`
 8. `NodeControlState.pull_pool_results()`
 
 这样很快就能判断问题是在：
@@ -264,5 +264,5 @@ results = pool.map(values, timeout_sec=...)
 
 1. `submit_pool_tasks()` 会把任务塞进 `_pool_tasks`
 2. `pull_pool_results()` 走 `_pool_result_hook`
-3. 高层 `TaskPoolSession` 自己做多 pool 轮询和去重
+3. 高层 `TaskPool` 自己做多 pool 轮询和去重
 4. `runtime_key` 仍然存在，但它主要用于 runtime 逻辑隔离与活跃 runtime 聚合

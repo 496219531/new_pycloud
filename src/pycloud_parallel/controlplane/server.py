@@ -31,7 +31,8 @@ from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port, resolve_public_host, split_host_port
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import InfoCenterState, NodeControlState
+from pycloud_parallel.controlplane.infocenter.state import InfoCenterState
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)

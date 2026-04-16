@@ -3,24 +3,24 @@
 当前保留的主示例方向：
 
 1. `demo_task_pool_session.py`
-   - 原生 `TaskPoolSession` 演示
+   - 原生 `TaskPool` 演示
 2. `demo_job_queue.py`
-   - `JobQueueClient` 演示
+   - `JobQueue` 演示
 3. `demo_gateway_client.py`
    - Gateway smoke test
 4. `demo_gateway_module_client.py`
-   - `GatewayConnect` 调用示例
+   - `gateway caller facade` 调用示例
 5. `demo_service_module_group.py`
-   - `DeployedService` owner 侧示例
+   - `Service` owner 侧示例
 6. `demo_simple_deploy.py`
    - 简化部署示例
 
 当前约定：
 
-1. 任务模式优先展示 `TaskPoolSession`
-2. 大任务排队优先展示 `JobQueueClient`
-3. 服务模式优先展示 `DeployedService`
-4. Gateway 调用优先展示 `GatewayConnect`
+1. 任务模式优先展示 `TaskPool`
+2. 大任务排队优先展示 `JobQueue`
+3. 服务模式优先展示 `Service`
+4. Gateway 调用优先展示 `gateway caller facade`
 
 已移除：
 

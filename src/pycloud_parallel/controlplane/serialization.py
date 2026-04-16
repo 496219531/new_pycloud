@@ -17,21 +17,20 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.data_ref import (
     DataRef,
+    coerce_data_ref,
     data_ref_from_payload,
     data_ref_to_payload,
     is_data_ref_payload,
 )
-from pycloud_parallel.controlplane.object_ref import (
-    ObjectRef,
+from pycloud_parallel.data.object_ref import (
+    NodeStoredRef,
     is_object_ref_payload,
     object_ref_from_payload,
-    object_ref_to_payload,
 )
-from pycloud_parallel.controlplane.result_ref import (
-    ResultRef,
+from pycloud_parallel.data.result_ref import (
+    NodeResultHandle,
     is_result_ref_payload,
     result_ref_from_payload,
-    result_ref_to_payload,
 )
 
 payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
@@ -55,14 +54,14 @@ def summarize_payload_flow_value(value: Any) -> str:
             f"DataRef(logical_type={value.logical_type}, format={value.format}, "
             f"size_bytes={value.size_bytes}, materialize_as={value.materialize_as})"
         )
-    if isinstance(value, ObjectRef):
+    if isinstance(value, NodeStoredRef):
         return (
-            f"ObjectRef(format={value.format}, size_bytes={value.size_bytes}, "
+            f"LegacyObjectWrapper(format={value.format}, size_bytes={value.size_bytes}, "
             f"materialize_as={value.materialize_as})"
         )
-    if isinstance(value, ResultRef):
+    if isinstance(value, NodeResultHandle):
         return (
-            f"ResultRef(format={value.format}, size_bytes={value.size_bytes}, "
+            f"LegacyResultWrapper(format={value.format}, size_bytes={value.size_bytes}, "
             f"materialize_as={value.materialize_as}, node_id={value.node_id})"
         )
     if isinstance(value, dict):
@@ -128,7 +127,7 @@ def log_payload_flow(event: str, /, **fields: Any) -> None:
 def _inline_payload_limit_hint() -> str:
     return (
         "Use put_data()/put_dataframe()/put_ndarray()/put_json()/"
-        "put_object_from_file()/put_object_from_bytes() and pass ObjectRef instead."
+        "put_object_from_file()/put_object_from_bytes() and pass DataRef instead."
     )
 
 
@@ -468,12 +467,8 @@ def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
         return {"__type__": "time", "value": obj.isoformat()}
     if isinstance(obj, timedelta):
         return {"__type__": "timedelta", "seconds": obj.total_seconds()}
-    if isinstance(obj, ObjectRef):
-        return object_ref_to_payload(obj)
-    if isinstance(obj, ResultRef):
-        return result_ref_to_payload(obj)
-    if isinstance(obj, DataRef):
-        return data_ref_to_payload(obj)
+    if isinstance(obj, (NodeStoredRef, NodeResultHandle, DataRef)):
+        return data_ref_to_payload(coerce_data_ref(obj))
 
     try:
         import numpy as np
@@ -540,7 +535,7 @@ def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
     raise TypeError(
         f"{path} has unsupported type {type(obj).__name__}; "
         "supported values are JSON scalars, list/tuple, dict, "
-        "datetime/date/time/timedelta, pandas.DataFrame, pandas.Series, numpy.ndarray, and ObjectRef"
+        "datetime/date/time/timedelta, pandas.DataFrame, pandas.Series, numpy.ndarray, and DataRef"
     )
 
 
@@ -585,9 +580,9 @@ def _convert_dict_to_arrow(data: Any, *, depth: int) -> Any:
         if is_data_ref_payload(data):
             return data_ref_from_payload(data)
         if is_object_ref_payload(data):
-            return object_ref_from_payload(data)
+            return coerce_data_ref(data)
         if is_result_ref_payload(data):
-            return result_ref_from_payload(data)
+            return coerce_data_ref(data)
         obj_type = data.get("__type__")
         if obj_type == "datetime":
             return datetime.fromisoformat(str(data["value"]))

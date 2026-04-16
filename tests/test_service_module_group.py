@@ -1,4 +1,4 @@
-"""测试 DeployedService 的模块化调用功能。"""
+"""测试 OwnerServiceFacade 的模块化调用功能。"""
 
 import asyncio
 import importlib
@@ -186,16 +186,16 @@ class TestBroadcastProxy:
         asyncio.run(test())
 
 
-class TestDeployedService:
-    """测试 DeployedService 类。"""
+class TestOwnerServiceFacade:
+    """测试 OwnerServiceFacade 类。"""
 
     def test_deploy_from_bytes_defaults_replace_changed_code(self):
         """测试高层入口默认开启同名变更代码替换。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
-        with patch("pycloud_parallel.controlplane.client.ServiceGroup.deploy_from_infocenter", return_value=sentinel) as mocked:
-            result = DeployedService.deploy_from_bytes(
+        with patch("pycloud_parallel.controlplane.client.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
+            result = OwnerServiceFacade.deploy_from_bytes(
                 infocenter_target="127.0.0.1:50051",
                 blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
                 entry_module="demo_service",
@@ -207,11 +207,11 @@ class TestDeployedService:
 
     def test_deploy_from_bytes_can_disable_replace_changed_code(self):
         """测试高层入口允许显式关闭同名变更代码替换。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
-        with patch("pycloud_parallel.controlplane.client.ServiceGroup.deploy_from_infocenter", return_value=sentinel) as mocked:
-            result = DeployedService.deploy_from_bytes(
+        with patch("pycloud_parallel.controlplane.client.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
+            result = OwnerServiceFacade.deploy_from_bytes(
                 infocenter_target="127.0.0.1:50051",
                 blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
                 entry_module="demo_service",
@@ -222,12 +222,13 @@ class TestDeployedService:
         assert result is sentinel
         assert mocked.call_args.kwargs["replace_existing_if_code_changed"] is False
 
-    def test_managed_global_large_value_uses_object_ref_upload(self):
-        """测试超阈值 managed global 会强制转成 ObjectRef。"""
+    def test_managed_global_large_value_uses_dataref_upload(self):
+        """测试超阈值 managed global 会强制转成 DataRef。"""
         from pycloud_parallel.controlplane.client import _prepare_managed_global_value_for_upload
-        from pycloud_parallel.controlplane.object_ref import ObjectRef
+        from pycloud_parallel.controlplane.data_ref import DataRef
+        from pycloud_parallel.data.object_ref import NodeStoredRef
 
-        ref = ObjectRef(object_id="sha256:" + "a" * 64, format="parquet", size_bytes=123, materialize_as="dataframe")
+        ref = NodeStoredRef(object_id="sha256:" + "a" * 64, format="parquet", size_bytes=123, materialize_as="dataframe")
         with patch(
             "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
             return_value=1024,
@@ -242,7 +243,8 @@ class TestDeployedService:
                     object_threshold_bytes=128,
                 )
 
-        assert prepared is ref
+        assert isinstance(prepared, DataRef)
+        assert prepared.object_id == ref.object_id
         mocked.assert_called_once()
 
     def test_managed_global_large_value_upload_failure_raises(self):
@@ -257,7 +259,7 @@ class TestDeployedService:
                 "pycloud_parallel.controlplane.client._put_data_via_clients",
                 side_effect=RuntimeError("parquet engine missing"),
             ):
-                with pytest.raises(ValueError, match="ObjectRef upload failed"):
+                with pytest.raises(ValueError, match="large-object upload failed"):
                     _prepare_managed_global_value_for_upload(
                         [MagicMock()],
                         object(),
@@ -281,10 +283,8 @@ class TestDeployedService:
 
     def test_getattr_creates_proxy(self):
         """测试 __getattr__ 创建代理。"""
-        from pycloud_parallel.controlplane.client import (
-            DeployedService,
-            _CallProxy,
-        )
+        from pycloud_parallel import Service as OwnerServiceFacade
+        from pycloud_parallel.execution.call_proxy import _CallProxy
         from unittest.mock import MagicMock
 
         # 模拟有方法的 session
@@ -293,7 +293,7 @@ class TestDeployedService:
         mock_method_info.method = "square"
         mock_session.list_methods.return_value = [mock_method_info]
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={"node1": mock_session},
@@ -308,14 +308,14 @@ class TestDeployedService:
 
     def test_getattr_with_empty_methods_raises(self):
         """测试当方法列表为空时，访问任何方法都应该报错。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
         from unittest.mock import MagicMock
 
         # 模拟返回空方法列表的 session
         mock_session = MagicMock()
         mock_session.list_methods.return_value = []
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={"node1": mock_session},
@@ -329,9 +329,9 @@ class TestDeployedService:
 
     def test_getattr_with_discovered_methods(self):
         """测试已发现方法时的 __getattr__。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -344,9 +344,9 @@ class TestDeployedService:
 
     def test_getattr_unknown_method_raises(self):
         """测试访问已知列表中不存在的方法时抛出异常。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -361,9 +361,9 @@ class TestDeployedService:
 
     def test_getattr_private_raises(self):
         """测试访问私有属性时抛出异常。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -375,9 +375,9 @@ class TestDeployedService:
 
     def test_methods_property(self):
         """测试 methods 属性。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -389,9 +389,9 @@ class TestDeployedService:
 
     def test_repr(self):
         """测试 __repr__ 方法。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": MagicMock()},
@@ -406,9 +406,9 @@ class TestDeployedService:
 
     def test_repr_not_discovered(self):
         """测试未发现方法时的 __repr__。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="compute-service",
             sessions={},
@@ -422,9 +422,9 @@ class TestDeployedService:
 
     def test_async_call_interface(self):
         """测试异步 call 接口。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -440,9 +440,9 @@ class TestDeployedService:
 
     def test_sync_call_interface(self):
         """测试同步 call_sync 接口。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -454,14 +454,14 @@ class TestDeployedService:
         assert result == {"result": 100}
 
     def test_deploy_from_infocenter_emits_message_when_no_nodes(self, capsys):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
 
         with patch(
-            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
             return_value=((), []),
         ):
             with pytest.raises(RuntimeError, match="no available nodes from InfoCenter"):
-                ServiceGroup.deploy_from_infocenter(
+                Service.deploy_from_infocenter(
                     infocenter_target="127.0.0.1:50051",
                     owner_client_id="owner-demo",
                     service_name="demo-service",
@@ -471,12 +471,12 @@ class TestDeployedService:
                 )
 
         err = capsys.readouterr().err
-        assert "[DeployedService] deploy start" in err
-        assert "[DeployedService] deploy failed: no available nodes" in err
+        assert "[Service] deploy start" in err
+        assert "[Service] deploy failed: no available nodes" in err
         assert "127.0.0.1:50051" in err
 
     def test_deploy_from_infocenter_emits_success_message(self, tmp_path, capsys):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         fake_node = SimpleNamespace(
@@ -510,21 +510,21 @@ class TestDeployedService:
                 return None
 
         with patch(
-            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
             return_value=((), [fake_node]),
         ), patch(
-            "pycloud_parallel.controlplane.client.NodeControlClient",
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
             _FakeNodeControlClient,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_persist_session_cache",
             lambda self: None,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = ServiceGroup.deploy_from_infocenter(
+            group = Service.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-service",
@@ -535,13 +535,13 @@ class TestDeployedService:
             )
 
         err = capsys.readouterr().err
-        assert "[DeployedService] deploy start" in err
-        assert "[DeployedService] deploy success service_name=demo-service nodes=['node-1']" in err
+        assert "[Service] deploy start" in err
+        assert "[Service] deploy success service_name=demo-service nodes=['node-1']" in err
         for client in group._clients.values():  # noqa: SLF001
             client.close()
 
     def test_deploy_from_infocenter_packages_module_object_entry_module(self, tmp_path, monkeypatch):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module(tmp_path, monkeypatch)
@@ -578,21 +578,21 @@ class TestDeployedService:
                 return None
 
         with patch(
-            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
             return_value=((), [fake_node]),
         ), patch(
-            "pycloud_parallel.controlplane.client.NodeControlClient",
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
             _FakeNodeControlClient,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_persist_session_cache",
             lambda self: None,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = ServiceGroup.deploy_from_infocenter(
+            group = Service.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-module-service",
@@ -617,7 +617,7 @@ class TestDeployedService:
                 client.close()
 
     def test_deploy_from_infocenter_packages_callable_object_entry_callable(self, tmp_path, monkeypatch):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module(tmp_path, monkeypatch)
@@ -654,21 +654,21 @@ class TestDeployedService:
                 return None
 
         with patch(
-            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
             return_value=((), [fake_node]),
         ), patch(
-            "pycloud_parallel.controlplane.client.NodeControlClient",
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
             _FakeNodeControlClient,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_persist_session_cache",
             lambda self: None,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = ServiceGroup.deploy_from_infocenter(
+            group = Service.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-callable-service",
@@ -693,7 +693,7 @@ class TestDeployedService:
                 client.close()
 
     def test_join_emits_failure_summary(self, capsys):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
 
         failed_session = SimpleNamespace(
             failed=True,
@@ -701,7 +701,7 @@ class TestDeployedService:
             _hb_lock=threading.Lock(),
             _hb_thread=None,
         )
-        group = ServiceGroup(
+        group = Service(
             owner_client_id="owner-demo",
             service_name="demo-service",
             sessions={"node-1": failed_session},
@@ -710,11 +710,11 @@ class TestDeployedService:
 
         group.join(poll_interval_sec=0.01)
         err = capsys.readouterr().err
-        assert "[DeployedService] owner keepalive stopped service_name=demo-service" in err
+        assert "[Service] owner keepalive stopped service_name=demo-service" in err
         assert "node-1" in err
 
     def test_service_group_update_globals_prepares_values_once_for_all_nodes(self):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
@@ -723,7 +723,7 @@ class TestDeployedService:
 
         client_a = MagicMock()
         client_b = MagicMock()
-        group = ServiceGroup(
+        group = Service(
             owner_client_id="owner-demo",
             service_name="svc-demo",
             sessions={"node-a": session_a, "node-b": session_b},
@@ -732,7 +732,7 @@ class TestDeployedService:
         )
 
         with patch(
-            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
             return_value={"cfg": {"k": "v"}},
         ) as mocked_prepare:
             digest = group.update_globals({"cfg": {"k": "v"}})
@@ -744,7 +744,7 @@ class TestDeployedService:
         session_b.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
 
     def test_service_group_update_globals_prunes_failed_nodes(self):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
@@ -753,7 +753,7 @@ class TestDeployedService:
 
         client_a = MagicMock()
         client_b = MagicMock()
-        group = ServiceGroup(
+        group = Service(
             owner_client_id="owner-demo",
             service_name="svc-demo",
             sessions={"node-a": session_a, "node-b": session_b},
@@ -762,7 +762,7 @@ class TestDeployedService:
         )
 
         with patch(
-            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
             return_value={"cfg": {"k": "v"}},
         ):
             digest = group.update_globals({"cfg": {"k": "v"}})
@@ -775,7 +775,7 @@ class TestDeployedService:
         client_b.close.assert_called_once()
 
     def test_service_group_update_globals_allows_per_node_digests(self):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:a"))
@@ -783,7 +783,7 @@ class TestDeployedService:
         session_b.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:b"))
         client_a = MagicMock()
         client_b = MagicMock()
-        group = ServiceGroup(
+        group = Service(
             owner_client_id="owner-demo",
             service_name="svc-demo",
             sessions={"node-a": session_a, "node-b": session_b},
@@ -792,7 +792,7 @@ class TestDeployedService:
         )
 
         with patch(
-            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
             return_value={"cfg": {"k": "v"}},
         ):
             digest = group.update_globals({"cfg": {"k": "v"}})
@@ -801,12 +801,12 @@ class TestDeployedService:
         assert group.globals_digests == {"node-a": "sha256:a", "node-b": "sha256:b"}
 
     def test_service_group_update_globals_fails_when_all_nodes_fail(self):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(side_effect=RuntimeError("node-a unavailable"))
         client_a = MagicMock()
-        group = ServiceGroup(
+        group = Service(
             owner_client_id="owner-demo",
             service_name="svc-demo",
             sessions={"node-a": session_a},
@@ -815,14 +815,14 @@ class TestDeployedService:
         )
 
         with patch(
-            "pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload",
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
             return_value={"cfg": {"k": "v"}},
         ):
             with pytest.raises(RuntimeError, match="update_globals failed on all nodes"):
                 group.update_globals({"cfg": {"k": "v"}})
 
     def test_deploy_from_infocenter_clamps_worker_count_per_node_capacity(self, tmp_path):
-        from pycloud_parallel.controlplane.client import ServiceGroup
+        from pycloud_parallel.controlplane.client import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         node_a = SimpleNamespace(
@@ -869,21 +869,21 @@ class TestDeployedService:
                 return None
 
         with patch(
-            "pycloud_parallel.controlplane.client._retry_infocenter_request",
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
             return_value=((), [node_a, node_b]),
         ), patch(
-            "pycloud_parallel.controlplane.client.NodeControlClient",
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
             _FakeNodeControlClient,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_persist_session_cache",
             lambda self: None,
         ), patch.object(
-            ServiceGroup,
+            Service,
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = ServiceGroup.deploy_from_infocenter(
+            group = Service.deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="svc-clamp",
@@ -908,9 +908,9 @@ class TestDeployedService:
 
     def test_async_call_all_interface(self):
         """测试异步 call_all 接口。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="test-service",
             sessions={},
@@ -932,7 +932,7 @@ class TestIntegration:
 
     def test_full_async_flow(self):
         """测试完整的异步调用流程。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
         # 模拟 session
         mock_session = MagicMock()
@@ -941,7 +941,7 @@ class TestIntegration:
         mock_session.list_methods.return_value = [mock_method_info]
 
         # 模拟 group
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": mock_session, "node2": MagicMock()},
@@ -969,7 +969,7 @@ class TestIntegration:
 
     def test_full_sync_flow(self):
         """测试完整的同步调用流程。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
         # 模拟 session
         mock_session = MagicMock()
@@ -977,7 +977,7 @@ class TestIntegration:
         mock_method_info.method = "square"
         mock_session.list_methods.return_value = [mock_method_info]
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": mock_session},
@@ -998,7 +998,7 @@ class TestIntegration:
 
     def test_full_broadcast_flow(self):
         """测试完整的广播调用流程。"""
-        from pycloud_parallel.controlplane.client import DeployedService
+        from pycloud_parallel import Service as OwnerServiceFacade
 
         # 模拟 session
         mock_session = MagicMock()
@@ -1006,7 +1006,7 @@ class TestIntegration:
         mock_method_info.method = "square"
         mock_session.list_methods.return_value = [mock_method_info]
 
-        group = DeployedService(
+        group = OwnerServiceFacade(
             owner_client_id="test",
             service_name="compute-service",
             sessions={"node1": mock_session, "node2": MagicMock()},

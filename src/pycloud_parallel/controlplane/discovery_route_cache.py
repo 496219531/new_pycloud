@@ -8,6 +8,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, _node_instance_key_from_route, _route_sort_key
+
 
 @dataclass
 class _RouteLocalState:
@@ -79,8 +81,6 @@ class _DiscoveryRouteCache:
                     continue
 
     def refresh(self, service_name: str, *, force: bool = False) -> Sequence[object]:
-        from pycloud_parallel.controlplane.client import InfoCenterClient
-
         name = str(service_name or "").strip()
         if not name:
             raise ValueError("service_name is required")
@@ -131,7 +131,6 @@ class _DiscoveryRouteCache:
         force_refresh: bool = False,
         strategy: str = "predicted_busy",
     ):
-        from pycloud_parallel.controlplane.client import _node_instance_key_from_route, _route_sort_key
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         name = str(service_name or "").strip()

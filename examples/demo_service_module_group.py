@@ -6,7 +6,7 @@ PyCloud 模块化客户端示例
 """
 import asyncio
 import time
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 
 def main():
@@ -39,9 +39,9 @@ def main():
     print("=" * 60)
     print()
 
-    # 使用 DeployedService 代替 ServiceGroup
+    # V1 公开入口使用 Service。
     import time
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"module-demo-{int(time.time())}",
         service_name=f"compute-service-1",

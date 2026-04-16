@@ -43,33 +43,21 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 2. 想直接拿 HTTP 层返回
 3. 脚本或系统集成场景
 
-### 2.2 `GatewayConnect`
+### 2.2 V1 推荐
 
-这是模块化调用体验。
+V1 顶层不再暴露 gateway 专用 module-like caller。
 
-```python
-from pycloud_parallel import GatewayConnect
+当前推荐直接使用：
 
-client = GatewayConnect("127.0.0.1:50051", service_name="square-service")
-
-print(client.methods)
-print(client.square.sync(x=9))
-# 或
-# result = await client.square(x=9)
-```
-
-适合：
-
-1. 更喜欢 Python 模块式调用
-2. 希望像 `client.square.sync(...)` 一样使用
-3. 只是 caller，不是 owner
+1. `GatewayServiceClient`
+2. 如果确实需要更底层 facade，请从 `pycloud_parallel.controlplane` 使用内部 caller，而不要依赖顶层公开面
 
 ## 3. 典型流程
 
 ### 3.1 先部署服务
 
 ```python
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 blob = (
     b"def pycloud_export(fn):\n"
@@ -81,7 +69,7 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
@@ -95,10 +83,17 @@ group = DeployedService.deploy_from_infocenter(
 ### 3.2 再通过 Gateway 调用
 
 ```python
-from pycloud_parallel import GatewayConnect
+from pycloud_parallel.controlplane.client import GatewayServiceClient
 
-client = GatewayConnect("127.0.0.1:50051", service_name="square-service")
-print(client.square.sync(x=7))
+with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
+    print(
+        client.call(
+            service_name="square-service",
+            method="square",
+            payload={"x": 7},
+            timeout_sec=10.0,
+        )
+    )
 ```
 
 ## 4. HTTP 入口
@@ -117,15 +112,15 @@ curl -X POST 'http://127.0.0.1:50051/svc/square-service/call/square' \
   -d '{"x": 7}'
 ```
 
-## 5. 与 DirectConnect 的区别
+## 5. 与 discovery caller 的区别
 
-`GatewayConnect`：
+Gateway 路径：
 
 1. 通过 Gateway 代理
 2. 更稳定
 3. 更适合外部 caller
 
-`DirectConnect`：
+Discovery 路径：
 
 1. 客户端先查路由
 2. 直接打实例

@@ -8,7 +8,7 @@ PyCloud 部署服务示例：从多个文件/文件夹部署
     1. 确保 InfoCenter 和 NodeControl 已启动
     2. 运行脚本
 """
-from pycloud_parallel.controlplane.client import ServiceGroup
+from pycloud_parallel.controlplane.client import Service
 
 
 def demo_service_code():
@@ -244,7 +244,7 @@ def main():
         print("-" * 60)
         print()
 
-        group = ServiceGroup.deploy_from_infocenter(
+        group = Service.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             owner_client_id=owner_client_id,
             service_name=service_name,

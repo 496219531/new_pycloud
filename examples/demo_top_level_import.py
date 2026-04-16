@@ -2,50 +2,46 @@
 """
 顶层导入演示
 
-展示如何直接从 pycloud_parallel 导入模块化客户端。
+展示 V1 顶层公开面。
 """
 
-# 方式 1: 从 pycloud_parallel 直接导入（推荐）
-from pycloud_parallel import GatewayConnect, DeployedService, JobQueueClient, TaskPoolSession
-
-# 方式 2: 从子模块导入（仍然可用）
-# from pycloud_parallel.controlplane import GatewayConnect, DeployedService, JobQueueClient, TaskPoolSession
+from pycloud_parallel import DataRef, JobQueue, Service, TaskPool, export
 
 
 def main():
     print("=" * 60)
-    print("  顶层导入演示")
+    print("  V1 顶层导入演示")
     print("=" * 60)
     print()
 
-    print("✓ 成功从 pycloud_parallel 导入模块化客户端:")
-    print(f"  - GatewayConnect: {GatewayConnect}")
-    print(f"  - DeployedService: {DeployedService}")
-    print(f"  - JobQueueClient: {JobQueueClient}")
-    print(f"  - TaskPoolSession: {TaskPoolSession}")
+    print("✓ 成功从 pycloud_parallel 导入 V1 公开面:")
+    print(f"  - Service: {Service}")
+    print(f"  - TaskPool: {TaskPool}")
+    print(f"  - JobQueue: {JobQueue}")
+    print(f"  - DataRef: {DataRef}")
+    print(f"  - export: {export}")
     print()
 
     print("使用示例:")
     print()
-    print("  # Service Session 模式")
-    print("  from pycloud_parallel import DeployedService")
-    print("  group = DeployedService.deploy_from_infocenter(...)")
+    print("  # Service 模式")
+    print("  from pycloud_parallel import Service")
+    print("  group = Service.deploy_from_infocenter(...)")
     print("  result = await group.square(x=7)")
     print()
     print("  # JobQueue 模式")
-    print("  from pycloud_parallel import JobQueueClient")
-    print("  client = JobQueueClient(...)")
+    print("  from pycloud_parallel import JobQueue")
+    print("  client = JobQueue(...)")
     print("  client.submit_job_from_bytes(...)")
     print()
     print("  # TaskPool 模式")
-    print("  from pycloud_parallel import TaskPoolSession")
-    print("  pool = TaskPoolSession.from_infocenter(...)")
+    print("  from pycloud_parallel import TaskPool")
+    print("  pool = TaskPool.from_infocenter(...)")
     print("  results = pool.wait_for_data(...)")
     print()
-    print("  # Gateway 调用")
-    print("  from pycloud_parallel import GatewayConnect")
-    print("  client = GatewayConnect(..., service_name='my-service')")
-    print("  result = client.square.sync(x=7)")
+    print("  # 本地并行")
+    print("  from pycloud_parallel.local import foreach, parallel_for")
+    print("  print(foreach(lambda x: x * x, [1, 2, 3]))")
     print()
 
     print("=" * 60)

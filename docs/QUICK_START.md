@@ -9,7 +9,7 @@
    - 更适合 CPU 密集型子任务、批处理、高吞吐执行
 2. `JobQueue Mode`
    - 大任务排队与单活调度层
-   - `JobQueueClient` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
+   - `JobQueue` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
    - 大任务排到后，再展开成 subtasks 交给执行层
 3. `Service Mode`
    - 常驻函数服务层
@@ -70,42 +70,35 @@ http://127.0.0.1:50051/ops
 
 ## 2. 顶层 API
 
-推荐从顶层包导入：
+V1 顶层公开面只保留：
 
 ```python
 from pycloud_parallel import (
-    configure,
-    foreach,
-    parallel_for,
-    pycloud_export,
-    DeployedService,
-    DedicatedTaskServiceSession,
-    JobQueueClient,
-    TaskPoolSession,
-    GatewayConnect,
-    DirectConnect,
+    Service,
+    TaskPool,
+    JobQueue,
+    DataRef,
+    export,
 )
 ```
 
 含义：
 
-1. `DeployedService`
+1. `Service`
    - owner 侧部署内部函数服务
-2. `TaskPoolSession`
-   - 原生专属任务池会话
-3. `DedicatedTaskServiceSession`
-   - 复用 `ServiceGroup` 的兼容专属池实现
-4. `JobQueueClient`
+2. `TaskPool`
+   - 唯一执行内核，对应专属任务池会话
+3. `JobQueue`
    - 大任务排队客户端
-5. `GatewayConnect`
-   - 通过 Gateway 调用内部函数服务
-6. `DirectConnect`
-   - 客户端发现后直连实例
+4. `DataRef`
+   - 唯一公开的大对象引用类型
+5. `export`
+   - 模块 / package 部署时的导出装饰器
 
-如果你是模块 / package 部署，服务导出装饰器也可以直接从顶层包拿：
+本地多进程入口改到：
 
 ```python
-from pycloud_parallel import pycloud_export
+from pycloud_parallel.local import foreach, parallel_for
 ```
 
 ## 3. 本地多进程
@@ -122,19 +115,19 @@ print(parallel_for(range(5), lambda i: i + 10, max_workers=2))
 当前更建议把这里理解成“常驻函数服务层”，而不是直接对外的 Web 服务层。
 
 ```python
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service, export
 
 blob = (
-    b"def pycloud_export(fn):\n"
+    b"def export(fn):\n"
     b"    fn.__pycloud_export__ = True\n"
     b"    return fn\n\n"
-    b"@pycloud_export\n"
+    b"@export\n"
     b"def square(x=0, **_kwargs):\n"
     b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
@@ -152,7 +145,7 @@ print(group.square.sync(x=7))
 依赖缺失时可显式给补装白名单：
 
 ```python
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="dep-service",
     artifact_path="./service_src",
@@ -164,20 +157,17 @@ group = DeployedService.deploy_from_infocenter(
 
 ## 5. 任务模式
 
-当前任务层已经可以分成三种入口：
+当前任务层已经收敛为两种入口：
 
-1. `TaskPoolSession`
-   - 原生专属 pool，会自动 heartbeat
-2. `DedicatedTaskServiceSession`
-   - 兼容专属池实现，底层复用 `ServiceGroup`
-   - owner 侧也支持 `update_globals(...)`
-3. `JobQueueClient`
-   - 先提交大任务到队列，排到后再自动创建 `TaskPoolSession`
+1. `TaskPool`
+   - 唯一执行内核，会自动 heartbeat
+2. `JobQueue`
+   - 先提交大任务到队列，排到后再自动创建 `TaskPool`
 
 ### 5.1 原生专属 pool
 
 ```python
-from pycloud_parallel import TaskPoolSession
+from pycloud_parallel import TaskPool
 
 blob = (
     b"def run(value=0, **_kwargs):\n"
@@ -185,7 +175,7 @@ blob = (
     b"    return {'value': value, 'square': value * value}\n"
 )
 
-with TaskPoolSession.from_infocenter(
+with TaskPool.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
     blob=blob,
@@ -227,16 +217,16 @@ with TaskPoolSession.from_infocenter(
 
 说明：
 
-1. `TaskPoolSession` 当前是单入口模式，入口名就是 `entry_func / entry_callable`
+1. `TaskPool` 当前是单入口模式，入口名就是 `entry_func / entry_callable`
 2. `submit_payloads(..., task_method=...)` 只能传这个方法名
 3. `runtime_key` 仍可用于 runtime 逻辑隔离，但不再表示独立 runtime-slot
 
 如果你希望先排队，再由调度器自动创建专属 pool：
 
 ```python
-from pycloud_parallel import JobQueueClient
+from pycloud_parallel import JobQueue
 
-client = JobQueueClient("127.0.0.1:50051", client_id="job-demo")
+client = JobQueue("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
     blob=job_blob,
     entry_module="job_demo",
@@ -245,9 +235,9 @@ client.submit_job_from_bytes(
 )
 ```
 
-这里的目标地址应该指向 `InfoCenter` 或内嵌 `InfoCenter` 的 `controlplane`；`JobQueueClient` 会先发现 `job-orchestrator` route，再直连它自己的 HTTP 数据面。
+这里的目标地址应该指向 `InfoCenter` 或内嵌 `InfoCenter` 的 `controlplane`；`JobQueue` 会先发现 `job-orchestrator` route，再直连它自己的 HTTP 数据面。
 
-`JobQueueClient` 的 job module 约定如下：
+`JobQueue` 的 job module 约定如下：
 
 1. `run(payload...)`
    - 必选，子任务入口
@@ -294,30 +284,16 @@ final = client.wait_for_terminal(job_id, timeout_sec=30.0)
 print(final["job"]["status"])
 ```
 
-## 6. Gateway 调用
-
-`Gateway` 当前服务的是内部函数服务 caller，不承担任务模式，也不等同于标准 Web 应用入口。
+## 6. 本地并行
 
 ```python
-from pycloud_parallel import GatewayConnect
+from pycloud_parallel.local import foreach, parallel_for
 
-client = GatewayConnect("127.0.0.1:50051", service_name="square-service")
-
-print(client.square.sync(x=9))
-# 或
-# result = await client.square(x=9)
+print(foreach(lambda x: x * x, [1, 2, 3], max_workers=2))
+print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 ```
 
-## 7. Direct 直连
-
-```python
-from pycloud_parallel import DirectConnect
-
-client = DirectConnect("127.0.0.1:50051", service_name="square-service")
-print(client.square.sync(x=11))
-```
-
-## 8. 常用脚本
+## 7. 常用脚本
 
 ```bash
 python examples/demo_task_pool_session.py
@@ -328,7 +304,7 @@ python examples/demo_gateway_module_client.py
 python examples/demo_service_module_group.py
 ```
 
-## 9. Runtime 约束速记
+## 8. Runtime 约束速记
 
 `runtime` 当前表示 Python 版本约束：
 
@@ -341,15 +317,14 @@ python examples/demo_service_module_group.py
 
 普通示例优先写 `runtime="py3"`，更可移植。
 
-## 10. 下一步
+## 9. 下一步
 
 1. [TASK_MODE.md](TASK_MODE.md)
 2. [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-3. [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-4. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
-5. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
+3. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
+4. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
 
-## 11. 依赖补装约定
+## 10. 依赖补装约定
 
 1. 默认严格校验，缺依赖直接报错
 2. 显式传 `dependency_allowlist` 后，节点才会尝试补装

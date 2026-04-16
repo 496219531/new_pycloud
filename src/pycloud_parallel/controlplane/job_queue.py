@@ -17,21 +17,19 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
-from pycloud_parallel.controlplane.client import (
-    InfoCenterClient,
-    NodeControlClient,
-    TaskPoolSession,
-)
 from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
-from pycloud_parallel.controlplane.object_ref import ObjectRef
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
+from pycloud_parallel.data.object_ref import NodeStoredRef
 from pycloud_parallel.controlplane.payload_transport import normalize_inbound_payload
 from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
-from pycloud_parallel.controlplane.state import (
+from pycloud_parallel.controlplane.node.execution import (
     _invoke_user_callable,
     _load_user_module,
     _purge_loaded_artifact_modules,
 )
+from pycloud_parallel.execution.task_pool import TaskPool
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -48,6 +46,10 @@ def _artifact_suffix(package_format: str) -> str:
     if normalized == "whl":
         return ".whl"
     return ".py"
+
+
+def _create_job_task_pool(**kwargs: Any) -> TaskPool:
+    return TaskPool.from_infocenter(**kwargs)
 
 
 def _task_result_to_dict(item: pb2.TaskResult) -> Dict[str, object]:
@@ -76,8 +78,8 @@ def _task_result_to_dict(item: pb2.TaskResult) -> Dict[str, object]:
     }
 
 
-def _payload_object_ref(value: object) -> Optional[ObjectRef | DataRef]:
-    if isinstance(value, ObjectRef):
+def _payload_object_ref(value: object) -> Optional[NodeStoredRef | DataRef]:
+    if isinstance(value, NodeStoredRef):
         return value
     return maybe_data_ref(value)
 
@@ -132,7 +134,7 @@ def _validate_delayed_resolve_refs(value: object) -> None:
             control_addr = str(ref.control_addr or "").strip()
             if locator_kind == "node_local" and not locator_token and not control_addr:
                 raise ValueError(
-                    f"{path} contains an ObjectRef/DataRef without a resolvable locator; "
+                    f"{path} contains a large-data reference without a resolvable locator; "
                     "use controlplane staging for business payload data"
                 )
             if locator_kind == "node_control" and not locator_token and not control_addr:
@@ -994,7 +996,7 @@ class JobQueueManager:
 
         executor: Optional[Any] = None
         try:
-            executor = TaskPoolSession.from_infocenter(
+            executor = _create_job_task_pool(
                     infocenter_target=self._controlplane_target,
                     job_id=job_id_snapshot,
                     owner_client_id=kwargs.get("client_id") or client_id,
@@ -1195,7 +1197,7 @@ class JobQueueManager:
                 payload=payload,
             )
 
-            executor = TaskPoolSession.from_infocenter(
+            executor = _create_job_task_pool(
                 infocenter_target=self._controlplane_target,
                 job_id=job_id_snapshot,
                 owner_client_id=client_id,

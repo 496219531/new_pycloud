@@ -88,7 +88,7 @@ owner 推荐用法：
 如果不想经过 Gateway，也支持客户端自己做发现和选路：
 
 1. `DiscoveryServiceClient`
-2. `DirectConnect`
+2. `discovery caller`
 
 它们会：
 

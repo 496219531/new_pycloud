@@ -11,9 +11,10 @@
    - 内部常驻函数服务层
 3. `JobQueue Mode`
    - 大任务排队与单活调度层
-   - `JobQueueClient` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
+   - `JobQueue` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
 4. `TaskPool Mode`
    - 子任务执行层
+   - V1 唯一执行内核
 
 一句话概括：
 
@@ -33,7 +34,7 @@
 
 推荐入口：
 
-1. `DeployedService.deploy_from_infocenter(...)`
+1. `Service.deploy_from_infocenter(...)`
 
 ### 2.2 caller client
 
@@ -44,9 +45,8 @@
 
 推荐入口：
 
-1. `GatewayConnect`
-2. `GatewayServiceClient`
-3. `DirectConnect`
+1. V1 顶层不再暴露 caller 专用连接器
+2. 如需保留内部调用适配，暂时从 `pycloud_parallel.controlplane` 使用底层客户端
 
 ### 2.3 job client
 
@@ -58,7 +58,7 @@
 
 推荐入口：
 
-1. `JobQueueClient`
+1. `JobQueue`
 
 ### 2.4 task pool client
 
@@ -70,8 +70,7 @@
 
 推荐入口：
 
-1. `TaskPoolSession`
-2. `DedicatedTaskServiceSession`（兼容实现）
+1. `TaskPool`
 
 ## 3. Service Mode
 
@@ -94,17 +93,17 @@
 
 1. 大任务先入队
 2. 同一时刻只放行一个大任务进入 `RUNNING`
-3. 放行后再创建 `TaskPoolSession`
+3. 放行后再创建 `TaskPool`
 4. 由 job module 的 `task_generator` 生成 payloads，交给 pool 执行
 5. 可选通过 `update_globals` 先向 worker 广播共享全局数据
 
 当前推荐入口：
 
-1. `JobQueueClient`
+1. `JobQueue`
 
 ## 5. TaskPool Mode
 
-`TaskPool Mode` 当前已经是原生 pool 协议：
+`TaskPool Mode` 当前已经是唯一执行内核：
 
 1. `CreateTaskPool`
 2. `HeartbeatTaskPool`
@@ -119,7 +118,7 @@
 1. 每个 pool 是独立资源会话
 2. pool 自己 heartbeat 保活
 3. subtasks 不走旧共享任务池
-4. 更适合作为 `JobQueue Mode` 的执行层
+4. `Service` 与 `JobQueue` 最终都建立在这层之上
 5. 每个 pool 当前只暴露一个任务入口，也就是创建时的 `entry_callable`
 6. `task_method` 是高层单入口校验参数，不是多方法路由协议
 7. `runtime_key` 仍然保留，但它代表 runtime 逻辑隔离键，不再对应独立的 runtime-slot 资源

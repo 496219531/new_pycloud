@@ -3,7 +3,7 @@
 最小 Job Queue 演示。
 
 提交一个大任务到唯一的 job-orchestrator service。
-JobQueueClient 会先向 InfoCenter 查询 job-orchestrator route，再直连它自己的 HTTP 数据面。
+JobQueue 会先向 InfoCenter 查询 job-orchestrator route，再直连它自己的 HTTP 数据面。
 job module 里同时定义：
 1. `run`              子任务入口
 2. `task_generator`   生成 payloads（可直接返回 list 或迭代器）
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 
-from pycloud_parallel import JobQueueClient
+from pycloud_parallel import JobQueue
 
 
 def main() -> None:
@@ -55,7 +55,7 @@ def main() -> None:
     print("  2. submit_job_from_module(...) 适合直接提交模块对象")
     print()
 
-    with JobQueueClient(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
+    with JobQueue(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
         resp = client.submit_job_from_bytes(
             blob=job_blob,
             entry_module="job_demo",

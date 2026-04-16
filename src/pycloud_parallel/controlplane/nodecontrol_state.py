@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""NodeControl state backend extracted from state.py."""
+"""NodeControl state backend extracted from the legacy state compatibility layer."""
 
 import contextlib
 import hashlib
@@ -36,7 +36,66 @@ from pycloud_parallel.controlplane.data_store import DataStore
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
 from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
-from pycloud_parallel.controlplane.object_ref import (
+from pycloud_parallel.controlplane.code_version import _code_version_from_digest
+from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
+from pycloud_parallel.controlplane.node.helpers import (
+    _append_bytes_to_segment,
+    _artifact_exists,
+    _build_execute_spec,
+    _cleanup_orphan_segment_file,
+    _code_archive_path,
+    _code_artifact_exists,
+    _code_content_dir,
+    _code_content_storage_key,
+    _code_data_dir,
+    _code_dependency_dir,
+    _code_exec_path,
+    _code_globals_dir,
+    _code_variant_dir,
+    _describe_artifact_error,
+    _discover_callable_methods,
+    _install_dependency_allowlist,
+    _is_user_artifact_error,
+    _load_managed_globals_snapshot_serialized,
+    _load_object_meta,
+    _managed_globals_scope_dir,
+    _missing_import_name,
+    _normalize_dependency_allowlist,
+    _normalize_export_spec,
+    _normalize_managed_global_names,
+    _normalize_package_format,
+    _object_artifact_from_meta,
+    _object_meta_path,
+    _package_suffix,
+    _pin_object_meta,
+    _purge_loaded_artifact_modules,
+    _release_object_meta_pin,
+    _resolve_apply_managed_globals_hook,
+    _resolve_single_data_ref,
+    _segment_path_from_relpath,
+    _segment_relpath,
+    _store_result_dataframe,
+    _store_result_ndarray,
+    _store_result_path,
+    _store_result_series,
+    _validate_python_runtime_or_raise,
+    _write_code_meta,
+    _write_managed_globals_current,
+    _write_managed_globals_snapshot,
+    _write_object_meta,
+    service_timing_logger,
+    touch_code_last_at,
+)
+from pycloud_parallel.controlplane.node.models import (
+    CodeArtifact,
+    ManagedGlobalsState,
+    ObjectArtifact,
+    ServiceSession,
+    StoredResultArtifact,
+    TaskPoolState,
+    TaskState,
+)
+from pycloud_parallel.data.object_ref import (
     normalize_object_format,
     normalize_object_id,
     object_id_from_sha256_hex,
@@ -48,71 +107,8 @@ from pycloud_parallel.controlplane.serialization import (
     serialize_arrow_compatible,
     struct_to_dict,
 )
+from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-import pycloud_parallel.controlplane.state as state_mod
-
-for _name in (
-    "CodeArtifact",
-    "ManagedGlobalsState",
-    "NodeTaskPoolInfo",
-    "ObjectArtifact",
-    "ServiceSession",
-    "StoredResultArtifact",
-    "TaskPoolState",
-    "TaskState",
-    "_append_bytes_to_segment",
-    "_artifact_exists",
-    "_build_execute_spec",
-    "_cleanup_orphan_segment_file",
-    "_code_archive_path",
-    "_code_artifact_exists",
-    "_code_content_dir",
-    "_code_content_storage_key",
-    "_code_data_dir",
-    "_code_dependency_dir",
-    "_code_exec_path",
-    "_code_globals_dir",
-    "_code_variant_dir",
-    "_code_version_from_digest",
-    "_describe_artifact_error",
-    "_discover_callable_methods",
-    "_install_dependency_allowlist",
-    "_is_user_artifact_error",
-    "_load_managed_globals_snapshot_serialized",
-    "_load_object_meta",
-    "_managed_globals_scope_dir",
-    "_missing_import_name",
-    "_normalize_dependency_allowlist",
-    "_normalize_export_spec",
-    "_normalize_managed_global_names",
-    "_normalize_package_format",
-    "_object_artifact_from_meta",
-    "_object_meta_path",
-    "_package_suffix",
-    "_pin_object_meta",
-    "_purge_loaded_artifact_modules",
-    "_release_object_meta_pin",
-    "_resolve_apply_managed_globals_hook",
-    "_resolve_single_data_ref",
-    "_segment_path_from_relpath",
-    "_segment_relpath",
-    "_store_result_dataframe",
-    "_store_result_ndarray",
-    "_store_result_path",
-    "_store_result_series",
-    "_validate_python_runtime_or_raise",
-    "_write_code_meta",
-    "_write_managed_globals_current",
-    "_write_managed_globals_snapshot",
-    "_write_object_meta",
-    "dt_to_ts",
-    "service_timing_logger",
-    "touch_code_last_at",
-    "utc_now",
-):
-    globals()[_name] = getattr(state_mod, _name)
-
-del _name
 
 
 class NodeControlState:
@@ -192,8 +188,8 @@ class NodeControlState:
         self._runtime_managed_globals: Dict[Tuple[str, str, str], ManagedGlobalsState] = {}
         self._client_code_tokens: Dict[Tuple[str, str], str] = {}
         self._client_code_managed_globals: Dict[Tuple[str, str, str], Tuple[str, ...]] = {}
-        segment_max_bytes = max(0, int(getattr(state_mod, "OBJECT_SEGMENT_MAX_BYTES", OBJECT_SEGMENT_MAX_BYTES)))
-        segment_target_bytes = int(getattr(state_mod, "OBJECT_SEGMENT_TARGET_BYTES", OBJECT_SEGMENT_TARGET_BYTES))
+        segment_max_bytes = max(0, int(OBJECT_SEGMENT_MAX_BYTES))
+        segment_target_bytes = int(OBJECT_SEGMENT_TARGET_BYTES)
         self._object_segment_max_bytes = segment_max_bytes
         self._object_segment_target_bytes = max(segment_max_bytes, segment_target_bytes)
 

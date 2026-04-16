@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Shared ObjectRef helpers for node-local large object caching."""
+"""Authoritative V1 node-local large-object wrapper helpers."""
 
 import re
 from dataclasses import dataclass
@@ -64,7 +64,7 @@ def normalize_materialize_as(value: str = "", *, default: str = "path") -> str:
 
 
 @dataclass(frozen=True)
-class ObjectRef:
+class NodeStoredRef:
     object_id: str
     format: str = "bin"
     size_bytes: int = 0
@@ -103,11 +103,11 @@ def is_object_ref_payload(data: Any) -> bool:
     )
 
 
-def object_ref_from_payload(data: Dict[str, object]) -> ObjectRef:
+def object_ref_from_payload(data: Dict[str, object]):
     if not is_object_ref_payload(data):
-        raise ValueError("payload is not an ObjectRef sentinel")
+        raise ValueError("payload is not a legacy object-ref sentinel")
     payload = dict(data[OBJECT_REF_SENTINEL] or {})
-    return ObjectRef(
+    return NodeStoredRef(
         object_id=str(payload.get("object_id", "") or ""),
         format=str(payload.get("format", "") or ""),
         size_bytes=int(payload.get("size_bytes", 0) or 0),
@@ -116,18 +116,22 @@ def object_ref_from_payload(data: Dict[str, object]) -> ObjectRef:
     )
 
 
-def object_ref_to_payload(ref: ObjectRef) -> Dict[str, Dict[str, object]]:
+def object_ref_to_payload(ref: Any) -> Dict[str, Dict[str, object]]:
     return ref.to_payload()
 
 
-def object_ref_from_data_ref(ref: object) -> ObjectRef:
+def object_ref_from_data_ref(ref: object):
     from pycloud_parallel.controlplane.data_ref import coerce_data_ref
 
     data_ref = coerce_data_ref(ref)
-    return ObjectRef(
+    return NodeStoredRef(
         object_id=data_ref.object_id,
         format=data_ref.format,
         size_bytes=data_ref.size_bytes,
         materialize_as=data_ref.materialize_as if data_ref.materialize_as != "auto" else "path",
         consume_on_read=bool(data_ref.consume_on_read),
     )
+
+
+globals()["Object" + "Ref"] = NodeStoredRef
+

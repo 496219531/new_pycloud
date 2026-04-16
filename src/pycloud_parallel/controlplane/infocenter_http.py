@@ -20,14 +20,14 @@ from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
-from pycloud_parallel.controlplane.state import (
+from pycloud_parallel.controlplane.infocenter.state import (
     DataRegistryEntry,
     InfoCenterState,
     NodeMetricsState,
     NodeServiceState,
     NodeTaskPoolInfo,
-    utc_now,
 )
+from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 

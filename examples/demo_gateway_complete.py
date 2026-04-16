@@ -3,7 +3,7 @@
 PyCloud Gateway 完整演示
 
 演示完整的流程：
-1. 部署一个服务（使用 DeployedService）
+1. 部署一个服务（使用 Service）
 2. 通过 Gateway 按服务名调用
 3. 清理服务
 """
@@ -12,9 +12,7 @@ import asyncio
 import time
 from pycloud_parallel.controlplane.client import GatewayServiceClient
 from pycloud_parallel import (
-    DeployedService,
-    GatewayConnect,
-    pycloud_export,
+    Service,
 )
 
 
@@ -36,17 +34,17 @@ def main():
     print("-" * 60)
 
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def square(x):\n"
         b"    return {'x': x, 'y': x * x}\n"
         b"\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def cube(x):\n"
         b"    return {'x': x, 'y': x * x * x}\n"
     )
 
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,
@@ -68,7 +66,7 @@ def main():
 
     try:
         # 步骤 2: 使用 GatewayServiceClient 调用
-        print("[2] 使用 GatewayConnect（薄 HTTP 客户端）")
+        print("[2] 使用 GatewayServiceClient")
         print("-" * 60)
 
         with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
@@ -109,25 +107,20 @@ def main():
             print(f"  cube(3) = {result2}")
         print()
 
-        # 步骤 3: 使用 GatewayConnect 调用（module-like 语法）
-        print("[3] 使用 GatewayConnect（模块化调用）")
+        # 步骤 3: 继续使用 GatewayServiceClient 调用
+        print("[3] 继续使用 GatewayServiceClient")
         print("-" * 60)
-
-        module_client = GatewayConnect(
-            gateway_target,
-            service_name=service_name,
-            timeout_sec=10.0,
-        )
-
-        print(f"可用方法: {module_client.methods}")
+        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
+            methods = client.list_methods(service_name=service_name, include_docs=False)
+            print(f"可用方法: {[item['method'] for item in methods]}")
         print()
 
         # 同步调用
         print("同步调用:")
-        result3 = module_client.square.sync(x=9)
+        result3 = client.call(service_name=service_name, method="square", payload={"x": 9}, timeout_sec=10.0)
         print(f"  square(9) = {result3}")
 
-        result4 = module_client.cube.sync(x=2)
+        result4 = client.call(service_name=service_name, method="cube", payload={"x": 2}, timeout_sec=10.0)
         print(f"  cube(2) = {result4}")
         print()
 
@@ -135,18 +128,32 @@ def main():
         print("异步调用:")
 
         async def async_calls():
-            result5 = await module_client.square(x=11)
+            loop = asyncio.get_running_loop()
+            result5 = await loop.run_in_executor(
+                None,
+                lambda: client.call(service_name=service_name, method="square", payload={"x": 11}, timeout_sec=10.0),
+            )
             print(f"  square(11) = {result5}")
 
-            result6 = await module_client.cube(x=4)
+            result6 = await loop.run_in_executor(
+                None,
+                lambda: client.call(service_name=service_name, method="cube", payload={"x": 4}, timeout_sec=10.0),
+            )
             print(f"  cube(4) = {result6}")
 
             # 并发调用
-            results = await asyncio.gather(
-                module_client.square(x=1),
-                module_client.square(x=2),
-                module_client.square(x=3),
-            )
+            results = await asyncio.gather(*[
+                loop.run_in_executor(
+                    None,
+                    lambda x=value: client.call(
+                        service_name=service_name,
+                        method="square",
+                        payload={"x": x},
+                        timeout_sec=10.0,
+                    ),
+                )
+                for value in (1, 2, 3)
+            ])
             print(f"  并发调用 square(1,2,3) = {results}")
 
         asyncio.run(async_calls())

@@ -13,7 +13,6 @@ import grpc
 import pytest
 
 from pycloud_parallel.controlplane.client import (
-    DirectConnect,
     DiscoveryCallError,
     DiscoveryServiceClient,
     InfoCenterClient,
@@ -21,13 +20,14 @@ from pycloud_parallel.controlplane.client import (
     NodeControlClient,
     _DiscoveryRouteCache,
     _ServiceRouteSnapshot,
-    _CallProxy,
 )
+from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade
+from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.controlplane.data_ref import DataRef
-from pycloud_parallel.controlplane.object_ref import ObjectRef
+from pycloud_parallel.data.object_ref import NodeStoredRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import NodeControlState
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -187,9 +187,9 @@ def test_upload_object_from_file_can_disable_trusted_precheck(tmp_path):
         state.close()
 
 
-class TestDirectConnect:
+class TestDiscoveryCallerFacade:
     def test_getattr_creates_proxy(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             client._discovered_methods = ["square", "fibonacci"]
             proxy = client.square
@@ -200,7 +200,7 @@ class TestDirectConnect:
             client.close()
 
     def test_unknown_method_raises(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
             with pytest.raises(AttributeError, match="has no method 'unknown'"):
@@ -209,10 +209,10 @@ class TestDirectConnect:
             client.close()
 
     def test_methods_property_uses_discovery_list_methods(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             with patch.object(
-                DirectConnect,
+                DiscoveryCallerFacade,
                 "list_methods",
                 return_value=[{"method": "square"}, {"method": "fibonacci"}],
             ) as mocked:
@@ -224,10 +224,10 @@ class TestDirectConnect:
 
     def test_call_sync(self):
         route = _demo_route()
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0, validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0, validate_on_init=False)
         try:
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
-                "pycloud_parallel.controlplane.client._call_route_http",
+                "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
                 return_value={"ok": True, "data": {"y": 49}},
             ) as mocked:
                 result = client.call_sync("square", x=7)
@@ -238,11 +238,11 @@ class TestDirectConnect:
 
     def test_async_proxy_call(self):
         route = _demo_route()
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
-                "pycloud_parallel.controlplane.client._call_route_http",
+                "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
                 return_value={"ok": True, "data": {"y": 64}},
             ):
                 async def _run():
@@ -263,19 +263,19 @@ class TestDirectConnect:
 
         def fake_put(clients, data, *, format="", chunk_size=0):
             uploads.append([client.target for client in clients])
-            return ObjectRef(
+            return NodeStoredRef(
                 object_id="sha256:" + ("a" * 64),
                 format=format or "bin",
                 size_bytes=2048,
                 materialize_as="bytes",
             )
 
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
         try:
-            monkeypatch.setattr("pycloud_parallel.controlplane.client._estimate_managed_global_inline_size", fake_estimate)
-            monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+            monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._estimate_managed_global_inline_size", fake_estimate)
+            monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._put_data_via_clients", fake_put)
             with patch.object(client._route_cache, "select_route", return_value=primary), patch(
-                "pycloud_parallel.controlplane.client._call_route_http",
+                "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
                 return_value={"ok": True, "data": {"y": 81}},
             ):
                 result = client.call_sync("square", blob="x" * 2048)
@@ -302,7 +302,7 @@ class TestDirectConnect:
 
         def fake_put(clients, data, *, format="", chunk_size=0):
             uploads.append([client.target for client in clients])
-            return ObjectRef(
+            return NodeStoredRef(
                 object_id="sha256:" + ("b" * 64),
                 format=format or "bin",
                 size_bytes=2048,
@@ -314,16 +314,16 @@ class TestDirectConnect:
                 raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "primary failed"})
             return {"ok": True, "data": {"y": 100}}
 
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
         try:
-            monkeypatch.setattr("pycloud_parallel.controlplane.client._estimate_managed_global_inline_size", fake_estimate)
-            monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+            monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._estimate_managed_global_inline_size", fake_estimate)
+            monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._put_data_via_clients", fake_put)
             with patch.object(client._route_cache, "select_route", side_effect=[primary, retry]), patch.object(
                 client._route_cache,
                 "refresh",
                 return_value=[retry],
             ), patch(
-                "pycloud_parallel.controlplane.client._call_route_http",
+                "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
                 side_effect=fake_call,
             ):
                 result = client.call_sync("square", blob="x" * 2048)
@@ -333,7 +333,7 @@ class TestDirectConnect:
             client.close()
 
     def test_status(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             with patch.object(
                 DiscoveryServiceClient,
@@ -347,7 +347,7 @@ class TestDirectConnect:
             client.close()
 
     def test_broadcast_is_not_supported(self):
-        client = DirectConnect("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
 
@@ -366,7 +366,7 @@ class TestDirectConnect:
             return_value={"ok": True, "route_count": 0},
         ):
             with pytest.raises(RuntimeError, match="no available route"):
-                DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+                DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo")
 
     def test_methods_raise_clear_error_when_service_has_no_exported_methods(self):
         with patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[object()]), patch.object(
@@ -374,10 +374,10 @@ class TestDirectConnect:
             "get_status",
             return_value={"ok": True, "route_count": 1},
         ):
-            client = DirectConnect("127.0.0.1:50051", service_name="svc-demo")
+            client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo")
         try:
             with patch.object(
-                DirectConnect,
+                DiscoveryCallerFacade,
                 "list_methods",
                 return_value=[],
             ):
@@ -429,7 +429,7 @@ def test_discovery_client_direct_call_roundtrip(tmp_path):
             assert status["routes"][0]["service_id"] == service_id
             assert "predicted_busy" in status["routes"][0]
 
-        module_client = DirectConnect(controlplane.base_url, service_name="svc_discovery", timeout_sec=5.0)
+        module_client = DiscoveryCallerFacade(controlplane.base_url, service_name="svc_discovery", timeout_sec=5.0)
         try:
             assert module_client.methods == ["add", "mul"]
             assert module_client.call_sync("add", value=10) == {"value": 10, "plus_one": 11}
@@ -648,10 +648,10 @@ def test_discovery_service_client_call_uses_http_payload_policy(monkeypatch):
         captured["preserve_args_kwargs_container"] = policy.preserve_args_kwargs_container
         return dict(payload or {})
 
-    monkeypatch.setattr("pycloud_parallel.controlplane.client.NodeControlClient", _FakeNodeControlClient)
-    monkeypatch.setattr("pycloud_parallel.controlplane.client.prepare_outbound_payload", _fake_prepare)
+    monkeypatch.setattr("pycloud_parallel.controlplane.discovery_client.client_mod.NodeControlClient", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload.prepare_outbound_payload", _fake_prepare)
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._call_route_http",
+        "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
         lambda route, *, method, payload, timeout_sec, service_token: {"ok": True, "data": payload},
     )
 

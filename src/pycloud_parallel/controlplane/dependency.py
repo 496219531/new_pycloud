@@ -1069,9 +1069,8 @@ def auto_deploy_function(
         **kwargs: 其他部署参数
 
     Returns:
-        TaskPoolSession 或 DeployedService 实例
+        TaskPool 或 Service 实例
     """
-    from pycloud_parallel import TaskPoolSession
 
     # 打包函数和依赖
     packager = DependencyPackager()
@@ -1098,7 +1097,9 @@ def auto_deploy_function(
             blob = f.read()
 
         # 上传并部署
-        return TaskPoolSession.from_infocenter(
+        from pycloud_parallel.execution.task_pool import TaskPool
+
+        return TaskPool.from_infocenter(
             infocenter_target=infocenter_target,
             job_id=f"auto-{func.__name__}",
             blob=blob,

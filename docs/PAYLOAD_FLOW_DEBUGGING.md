@@ -3,7 +3,7 @@
 这份文档专门回答一个问题：
 
 1. 一次请求里的 payload 到底走了哪条路
-2. 是 inline 传输、ObjectRef 上传、ResultRef 返回，还是文件 materialize
+2. 是 inline 传输、DataRef 上传/返回，还是文件 materialize
 3. 调试时应该怎么打开日志
 
 当前已经接入一套专门的 debug logger：
@@ -18,8 +18,8 @@
 只看业务代码时，很多时候很难直观看出来：
 
 1. `DataFrame` / `Series` 这次到底是 inline 了，还是走了 bundle 对象上传
-2. 参数里的 `ObjectRef` 是否在节点侧被成功解引用
-3. 返回结果是 inline dict，还是 `ResultRef`
+2. 参数里的 `DataRef` 是否在节点侧被成功解引用
+3. 返回结果是 inline dict，还是 `DataRef`
 4. 用户函数最终收到的是：
    - `fn(*args, **kwargs)`
    - `fn(**payload)`
@@ -40,9 +40,9 @@
 4. `object_ref_upload`
    - 确认这次要走对象上传
 5. `object_ref_resolve`
-   - 节点侧开始解引用 `ObjectRef`
+   - 节点侧开始解引用 `DataRef`
 6. `object_ref_resolved`
-   - 节点侧成功把 `ObjectRef` 物化成真实对象
+   - 节点侧成功把 `DataRef` 物化成真实对象
 7. `user_invoke`
    - 用户函数调用前，记录最终参数模式
 8. `result_ref_store`
@@ -50,7 +50,7 @@
 9. `inline_result_ready`
    - 返回值已经确认会走 inline
 10. `result_ref_fetch`
-    - caller 侧开始下载 `ResultRef`
+    - caller 侧开始下载 `DataRef`
 11. `result_materialize`
     - caller 侧把结果文件 materialize 成 pandas / numpy / bytes / path
 12. `taskpool_create_grpc`
@@ -89,10 +89,10 @@
 ```text
 event=inline_payload_encode context=service call payload size_bytes=312 summary=DataFrame(shape=(10, 3), index=DatetimeIndex, columns=Index)
 event=object_ref_upload path_type=dataframe format=dfbundle summary=DataFrame(shape=(5000, 12), index=MultiIndex, columns=Index)
-event=object_ref_resolve materialize_as=dataframe summary=ObjectRef(format=dfbundle, size_bytes=123456, materialize_as=dataframe)
+event=object_ref_resolve materialize_as=dataframe summary=DataRef(format=dfbundle, size_bytes=123456, materialize_as=dataframe)
 event=user_invoke mode=args_kwargs args_summary=list(len=3) kwargs_summary=dict(len=0, keys=[])
 event=result_ref_store path_type=dataframe summary=DataFrame(shape=(80000, 20), index=RangeIndex, columns=Index)
-event=result_ref_fetch format=dfbundle materialize_as=dataframe target_path=<temp> summary=ResultRef(format=dfbundle, size_bytes=456789, materialize_as=dataframe, node_id=node-1)
+event=result_ref_fetch format=dfbundle materialize_as=dataframe target_path=<temp> summary=DataRef(format=dfbundle, size_bytes=456789, materialize_as=dataframe, node_id=node-1)
 event=result_materialize materialize_as=dataframe format=dfbundle path=/tmp/pycloud-result-xxx.zip
 event=taskpool_submit_grpc pool_id=pool-1 task_count=10 job_id=pool-job-1
 event=taskpool_submit_state_result pool_id=pool-1 accepted=10 rejected=0
@@ -109,7 +109,7 @@ event=taskpool_pull_results_grpc_result pool_id=pool-1 result_count=10 next_curs
 3. `summary`
    - 对象摘要，不是完整 payload
 4. `materialize_as`
-   - ObjectRef / ResultRef 最终按什么方式还原
+   - DataRef / DataRef 最终按什么方式还原
 5. `path_type`
    - 这次对象上传或结果落盘属于什么大类
 6. `mode`
@@ -180,13 +180,13 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 
 服务调用常见入口是：
 
-1. `GatewayConnect`
+1. `gateway caller`
 2. `GatewayServiceClient`
-3. `DirectConnect`
+3. `discovery caller`
 
 它们会经过 HTTP transport，所以你除了 payload path 事件，还能结合普通 HTTP debug 看。
 
-但 `TaskPoolSession` / `NativeTaskPoolClient` 走的是 gRPC，不会经过 `_http_json_request()`。
+但 `TaskPool` / `NativeTaskPoolClient` 走的是 gRPC，不会经过 `_http_json_request()`。
 
 因此 task/taskpool 调试时，更应该关注：
 
@@ -209,7 +209,7 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 这表示：
 
 1. payload 直接编码进 JSON / protobuf Struct
-2. 没有走 `ObjectRef`
+2. 没有走 `DataRef`
 
 ### 5.2 请求参数走对象上传
 
@@ -226,7 +226,7 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 这表示：
 
 1. caller 侧没有 inline 大对象
-2. 实际传的是 `ObjectRef`
+2. 实际传的是 `DataRef`
 3. 节点侧执行前再物化成真实对象
 
 ### 5.3 返回结果走 inline
@@ -239,9 +239,9 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 这表示：
 
 1. 结果直接塞进响应体
-2. caller 侧不会再下载 `ResultRef`
+2. caller 侧不会再下载 `DataRef`
 
-### 5.4 返回结果走 ResultRef
+### 5.4 返回结果走 DataRef
 
 你会看到：
 
@@ -252,12 +252,12 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 这表示：
 
 1. 结果先落成对象文件
-2. 返回的是 `ResultRef`
+2. 返回的是 `DataRef`
 3. caller 再按 `materialize_as` 下载并恢复
 
 补充：
 
-1. 如果返回结果是 `DataFrame / Series / ndarray`，框架会先尝试 inline；超出 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` 才会走本地落盘与 `ResultRef`。
+1. 如果返回结果是 `DataFrame / Series / ndarray`，框架会先尝试 inline；超出 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` 才会走本地落盘与 `DataRef`。
 2. Windows 上在高并发场景里，一旦进入落盘路径，这一步更容易受到杀毒软件、索引器或文件句柄竞争影响。
 3. 如果你观察到 `service_timing` 里 `error_type=PermissionError` 且 `executor_ms` 很高，优先怀疑结果落盘竞争。
 4. 这时可以优先：

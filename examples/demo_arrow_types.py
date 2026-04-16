@@ -7,7 +7,7 @@ Arrow 兼容类型序列化演示
 """
 
 import asyncio
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 
 def main():
@@ -23,8 +23,8 @@ def main():
 
     # 服务代码：直接使用 Arrow 类型
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def process_dataframe(df):\n"
         b"    import pandas as pd\n"
         b"    return {\n"
@@ -33,7 +33,7 @@ def main():
         b"        'columns': list(df.columns),\n"
         b"        'shape': df.shape\n"
         b"    }\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def process_series(series):\n"
         b"    import pandas as pd\n"
         b"    return {\n"
@@ -42,7 +42,7 @@ def main():
         b"        'name': series.name,\n"
         b"        'sum': float(series.sum())\n"
         b"    }\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def process_array(arr):\n"
         b"    import numpy as np\n"
         b"    return {\n"
@@ -57,7 +57,7 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,

@@ -10,10 +10,10 @@
 
 ## 当前推荐入口
 
-1. `DeployedService.deploy_from_infocenter(func=...)`
-2. `DeployedService.deploy_from_infocenter(entry_module=<module object>)`
-3. `TaskPoolSession.from_infocenter(...)`
-4. `JobQueueClient.submit_job_from_bytes(...)`
+1. `Service.deploy_from_infocenter(func=...)`
+2. `Service.deploy_from_infocenter(entry_module=<module object>)`
+3. `TaskPool.from_infocenter(...)`
+4. `JobQueue.submit_job_from_bytes(...)`
 
 ## 依赖策略
 
@@ -81,5 +81,5 @@ python scripts/debug_package_module.py calc_asset_ratio_job_module
 
 如果你需要任务执行：
 
-1. 直接执行一批 subtasks：使用 `TaskPoolSession`
-2. 先排队再执行：使用 `JobQueueClient`
+1. 直接执行一批 subtasks：使用 `TaskPool`
+2. 先排队再执行：使用 `JobQueue`

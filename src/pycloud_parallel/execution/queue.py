@@ -1,12 +1,42 @@
 from __future__ import annotations
 
-"""Job-queue client facade extracted from the legacy client module."""
+"""Authoritative V1 queue implementation."""
 
+import logging
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Set
 
-from pycloud_parallel.controlplane import client as client_mod
+from pycloud_parallel.controlplane.artifact import _default_entry_module_for_module, _resolve_package_format
+from pycloud_parallel.controlplane.client_transport import DiscoveryCallError, _call_route_http, _is_route_failure
+from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
+from pycloud_parallel.execution.support import (
+    _JOB_UPDATE_GLOBALS_AUTO,
+    _default_job_auth_ttl_sec,
+    _default_job_finalize_for_blob,
+    _default_job_finalize_for_module,
+    _default_job_handle_result_for_blob,
+    _default_job_handle_result_for_module,
+    _default_job_task_generator_for_blob,
+    _default_job_task_generator_for_module,
+    _default_job_update_globals_for_blob,
+    _load_job_client_session_cache,
+    _normalize_job_update_globals_arg,
+    _prepare_code_blob,
+    _prepare_job_blob_submit_fields,
+    _prepare_job_submit_payload_for_call,
+    _stage_job_submit_payload_for_transport,
+    _write_job_client_session_cache,
+)
+from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+logger = logging.getLogger(__name__)
+
+
+def _infocenter_client(*args, **kwargs):
+    from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+
+    return InfoCenterClient(*args, **kwargs)
 
 
 class _JobOrchestratorDiscoveryClient:
@@ -22,7 +52,7 @@ class _JobOrchestratorDiscoveryClient:
 
     def _list_routes(self, *, service_name: str) -> List[object]:
         try:
-            with client_mod.InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+            with _infocenter_client(self.target, timeout_sec=self.timeout_sec) as client:
                 routes = list(
                     client.list_service_routes(
                         service_name=str(service_name or "").strip(),
@@ -35,9 +65,9 @@ class _JobOrchestratorDiscoveryClient:
         candidates = [
             route
             for route in routes
-            if route.status == client_mod.pb2.SERVICE_STATUS_RUNNING and str(route.http_base_url or "").strip()
+            if route.status == pb2.SERVICE_STATUS_RUNNING and str(route.http_base_url or "").strip()
         ]
-        candidates.sort(key=lambda route: client_mod._route_sort_key(route, strategy="predicted_busy"))
+        candidates.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
         return candidates
 
     def call(
@@ -68,16 +98,16 @@ class _JobOrchestratorDiscoveryClient:
                 continue
             tried.add(route.service_id)
             try:
-                return client_mod._call_route_http(
+                return _call_route_http(
                     route,
                     method=method_name,
                     payload=payload or {},
                     timeout_sec=max(0.1, float(timeout_sec)),
                     service_token=token,
                 )
-            except client_mod.DiscoveryCallError as exc:
+            except DiscoveryCallError as exc:
                 last_exc = exc
-                if not client_mod._is_route_failure(exc):
+                if not _is_route_failure(exc):
                     raise RuntimeError(str(exc)) from exc
                 continue
 
@@ -86,7 +116,7 @@ class _JobOrchestratorDiscoveryClient:
         raise RuntimeError(f"no available route for service_name={name}")
 
 
-class JobQueueClient:
+class QueueServiceClient:
     """Thin client for the single job-orchestrator service resolved via InfoCenter."""
 
     def __init__(
@@ -103,13 +133,13 @@ class JobQueueClient:
         self._client_scope = self.client_id
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
-        self._auth_ttl_sec = client_mod._default_job_auth_ttl_sec()
+        self._auth_ttl_sec = _default_job_auth_ttl_sec()
         self._recent_job_ids: List[str] = []
 
         explicit_auth_token = str(auth_token or "").strip()
         cached_session = None
         if not explicit_auth_token:
-            cached_session = client_mod._load_job_client_session_cache(
+            cached_session = _load_job_client_session_cache(
                 target=self.target,
                 service_name=self.service_name,
                 client_scope=self._client_scope,
@@ -139,7 +169,7 @@ class JobQueueClient:
 
     def _persist_local_session(self) -> None:
         try:
-            client_mod._write_job_client_session_cache(
+            _write_job_client_session_cache(
                 target=self.target,
                 service_name=self.service_name,
                 client_scope=self._client_scope,
@@ -149,7 +179,7 @@ class JobQueueClient:
                 recent_job_ids=self._recent_job_ids,
             )
         except Exception:
-            client_mod.logger.debug("job client session cache persist failed", exc_info=True)
+            logger.debug("job client session cache persist failed", exc_info=True)
 
     def _record_job_id(self, job_id: str) -> None:
         normalized = str(job_id or "").strip()
@@ -160,21 +190,21 @@ class JobQueueClient:
         self._recent_job_ids = self._recent_job_ids[:20]
         self._persist_local_session()
 
-    def __enter__(self) -> "JobQueueClient":
+    def __enter__(self) -> "QueueServiceClient":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
     def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
-        prepared_payload = client_mod._stage_job_submit_payload_for_transport(
+        prepared_payload = _stage_job_submit_payload_for_transport(
             target=self.target,
             payload=dict(payload or {}),
             timeout_sec=self.timeout_sec,
         )
         if self.client_id and not str(prepared_payload.get("client_id", "") or "").strip():
             prepared_payload["client_id"] = self.client_id
-        prepared_payload = client_mod._prepare_job_submit_payload_for_call(
+        prepared_payload = _prepare_job_submit_payload_for_call(
             target=self.target,
             payload=prepared_payload,
             timeout_sec=self.timeout_sec,
@@ -222,27 +252,27 @@ class JobQueueClient:
         job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
         package_format: str = "py",
-        update_globals: Any = client_mod._JOB_UPDATE_GLOBALS_AUTO,
+        update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
     ) -> Dict[str, object]:
-        effective_package_format = client_mod._resolve_package_format(package_format, default="py")
-        normalized_update_globals = client_mod._normalize_job_update_globals_arg(
+        effective_package_format = _resolve_package_format(package_format, default="py")
+        normalized_update_globals = _normalize_job_update_globals_arg(
             update_globals,
-            auto_default=client_mod._default_job_update_globals_for_blob(blob, package_format=effective_package_format),
+            auto_default=_default_job_update_globals_for_blob(blob, package_format=effective_package_format),
         )
-        effective_task_generator_callable = client_mod._default_job_task_generator_for_blob(
+        effective_task_generator_callable = _default_job_task_generator_for_blob(
             blob,
             package_format=effective_package_format,
         )
         effective_handle_result_callable = str(
             handle_result_callable
-            or client_mod._default_job_handle_result_for_blob(blob, package_format=effective_package_format)
+            or _default_job_handle_result_for_blob(blob, package_format=effective_package_format)
             or ""
         ).strip()
         effective_finalize_callable = str(
             finalize_callable
-            or client_mod._default_job_finalize_for_blob(blob, package_format=effective_package_format)
+            or _default_job_finalize_for_blob(blob, package_format=effective_package_format)
             or ""
         ).strip()
         payload: Dict[str, object] = {
@@ -260,7 +290,7 @@ class JobQueueClient:
         if effective_finalize_callable:
             payload["finalize_callable"] = effective_finalize_callable
         payload.update(
-            client_mod._prepare_job_blob_submit_fields(
+            _prepare_job_blob_submit_fields(
                 target=self.target,
                 blob=blob,
                 package_format=effective_package_format,
@@ -280,29 +310,29 @@ class JobQueueClient:
         module: Any,
         job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
-        update_globals: Any = client_mod._JOB_UPDATE_GLOBALS_AUTO,
+        update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
     ) -> Dict[str, object]:
-        module_blob, module_filename = client_mod._prepare_code_blob(module=module)
-        module_name = client_mod._default_entry_module_for_module(module)
-        normalized_update_globals = client_mod._normalize_job_update_globals_arg(
+        module_blob, module_filename = _prepare_code_blob(module=module)
+        module_name = _default_entry_module_for_module(module)
+        normalized_update_globals = _normalize_job_update_globals_arg(
             update_globals,
             auto_default=getattr(module, "update_globals", None),
         )
-        client_mod._default_job_task_generator_for_module(module)
+        _default_job_task_generator_for_module(module)
         effective_handle_result_callable = str(
-            handle_result_callable or client_mod._default_job_handle_result_for_module(module) or ""
+            handle_result_callable or _default_job_handle_result_for_module(module) or ""
         ).strip()
         effective_finalize_callable = str(
-            finalize_callable or client_mod._default_job_finalize_for_module(module) or ""
+            finalize_callable or _default_job_finalize_for_module(module) or ""
         ).strip()
         return self.submit_job_from_bytes(
             blob=module_blob or b"",
             entry_module=module_name,
             job_payload=job_payload,
             runtime=runtime,
-            package_format=client_mod._resolve_package_format("", module_filename, default="py"),
+            package_format=_resolve_package_format("", module_filename, default="py"),
             update_globals=normalized_update_globals,
             handle_result_callable=effective_handle_result_callable,
             finalize_callable=effective_finalize_callable,
@@ -328,5 +358,8 @@ class JobQueueClient:
             time.sleep(max(0.05, float(poll_interval_sec)))
         raise TimeoutError(f"job did not reach terminal state before timeout: {normalized}")
 
+class JobQueue(QueueServiceClient):
+    """V1 public queue client."""
 
-__all__ = ["JobQueueClient", "_JobOrchestratorDiscoveryClient"]
+
+__all__ = ["QueueServiceClient", "JobQueue", "_JobOrchestratorDiscoveryClient"]

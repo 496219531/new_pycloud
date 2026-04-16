@@ -5,7 +5,7 @@ PyCloud Gateway 调用示例
 演示如何通过 controlplane 的 Gateway 按 service_name 调用服务。
 同一个脚本里同时展示：
 1. GatewayServiceClient：薄 HTTP helper
-2. GatewayConnect：module-like caller
+2. GatewayServiceClient：直接按方法名调用
 
 前置条件：
 - 需要先部署名为 "square-service" 的服务
@@ -13,17 +13,17 @@ PyCloud Gateway 调用示例
 
 或者手动部署：
 ```python
-from pycloud_parallel import DeployedService, pycloud_export
+from pycloud_parallel import Service, export
 
 blob = (
-    b"from pycloud_parallel import pycloud_export\n\n"
-    b"@pycloud_export\n"
+    b"from pycloud_parallel import export\n\n"
+    b"@export\n"
     b"def square(x=0, **_kwargs):\n"
     b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
@@ -35,7 +35,7 @@ group = DeployedService.deploy_from_infocenter(
 
 import asyncio
 import time
-from pycloud_parallel import DeployedService, GatewayConnect
+from pycloud_parallel import Service
 from pycloud_parallel.controlplane.client import GatewayServiceClient
 
 
@@ -76,13 +76,13 @@ def ensure_service(gateway_target: str, service_name: str):
         wait_for_service_ready(gateway_target, service_name)
         return None
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def square(x=0, **_kwargs):\n"
         b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x}\n"
     )
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target=gateway_target,
         owner_client_id=f"gateway-client-demo-{int(time.time())}",
         service_name=service_name,
@@ -144,27 +144,34 @@ def main() -> None:
             print(f"  square(7) = {resp}")
 
         print()
-        print("[GatewayConnect]")
+        print("[GatewayServiceClient - method calls]")
         print("-" * 60)
-        module_client = GatewayConnect(
-            gateway_target,
-            service_name=service_name,
-            timeout_sec=10.0,
-        )
-        print(f"可用方法: {module_client.methods}")
-        print()
+        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
+            status = client.get_status(service_name=service_name)
+            print(f"route_count={status.get('route_count')}")
+            print("同步调用:")
+            print(
+                "  square(9) = "
+                f"{client.call(service_name=service_name, method='square', payload={'x': 9}, timeout_sec=10.0)}"
+            )
+            print()
 
-        print("同步调用:")
-        print(f"  square(9) = {module_client.square.sync(x=9)}")
-        print()
+            print("异步示例:")
 
-        print("异步调用:")
+            async def _run() -> None:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: client.call(
+                        service_name=service_name,
+                        method="square",
+                        payload={"x": 11},
+                        timeout_sec=10.0,
+                    ),
+                )
+                print(f"  square(11) = {result}")
 
-        async def _run() -> None:
-            result = await module_client.square(x=11)
-            print(f"  square(11) = {result}")
-
-        asyncio.run(_run())
+            asyncio.run(_run())
     finally:
         if group is not None:
             group.close(end_services=True, reason="demo_gateway_client cleanup")

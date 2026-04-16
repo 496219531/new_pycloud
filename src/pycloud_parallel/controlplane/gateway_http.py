@@ -17,15 +17,13 @@ from pycloud_parallel.controlplane.config import (
     GATEWAY_MAX_UPLOAD_FILE_BYTES,
     GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
 )
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
-from pycloud_parallel.controlplane.client import (
-    InfoCenterServiceRoute,
-    NodeControlClient,
+from pycloud_parallel.controlplane.client_transport import (
     _decode_http_request_body,
     _decode_http_response_body,
     _encode_http_json_body,
     _serialize_http_call_payload,
 )
+from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_upload import (
@@ -37,7 +35,9 @@ from pycloud_parallel.controlplane.gateway_upload import (
     rewrite_payload_with_uploaded_refs,
     upload_staged_files_to_route,
 )
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
 from pycloud_parallel.controlplane.netutil import resolve_public_host
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 

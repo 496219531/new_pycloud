@@ -36,14 +36,14 @@
 - [TASK_MODE.md](TASK_MODE.md)
   - 子任务执行层、原生 task pool、单入口 `entry_callable`、`runtime_key` 的当前语义
 - [QUICK_START.md](QUICK_START.md)
-  - `TaskPoolSession` / `DedicatedTaskServiceSession` / `JobQueueClient` 最小入口
+  - `TaskPool` / `compat task facade` / `JobQueue` 最小入口
 
 ## 服务模式
 
 - [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-  - `DeployedService` 的 owner 侧用法与常驻函数服务定位
+  - `Service` 的 owner 侧用法与常驻函数服务定位
 - [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-  - `GatewayConnect` / `GatewayServiceClient`，面向内部函数服务 caller
+  - `gateway caller` / `GatewayServiceClient`，面向内部函数服务 caller
 - [CLASS_RENAMING.md](CLASS_RENAMING.md)
   - 当前统一命名说明
 
@@ -60,7 +60,7 @@
 - [PAYLOAD_FLOW_DEBUGGING.md](PAYLOAD_FLOW_DEBUGGING.md)
   - 如何通过 `pycloud_parallel.payload_flow` 判断 payload 走的是哪条路径
 - [RUNTIME_LIMITS.md](RUNTIME_LIMITS.md)
-  - inline / ObjectRef / gRPC 消息大小等运行时阈值的统一调参入口
+  - inline / DataRef / gRPC 消息大小等运行时阈值的统一调参入口
 - [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
   - `runtime` 作为 Python 版本约束的当前语义
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)

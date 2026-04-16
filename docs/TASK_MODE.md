@@ -9,19 +9,19 @@
    - 大任务排到后，再展开成 subtasks
 2. `TaskPool Mode`
    - 子任务执行层
-   - 通过原生 `TaskPoolSession` 创建专属 pool 执行 subtasks
+   - 通过 `TaskPool` 创建专属 pool 执行 subtasks
 
 `Gateway` 不参与任务模式。
 
 补充：
 
-1. `TaskPoolSession` 当前是单入口 task pool
+1. `TaskPool` 当前是单入口 task pool
 2. 模块对象自动打包当前只会收 `.py / .pyd / .so` 文件闭包，不会把整个仓库或 package 目录树原样上传
 3. `runtime_key` 仍然保留，但它表示 runtime 侧的逻辑隔离键，不再对应独立的 runtime-slot 调度器
 
 ## 2. 当前推荐入口
 
-### 2.1 `TaskPoolSession`
+### 2.1 `TaskPool`
 
 适合：
 
@@ -32,9 +32,9 @@
 最小示例：
 
 ```python
-from pycloud_parallel import TaskPoolSession
+from pycloud_parallel import TaskPool
 
-with TaskPoolSession.from_infocenter(
+with TaskPool.from_infocenter(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
     blob=blob,
@@ -59,21 +59,21 @@ with TaskPoolSession.from_infocenter(
 3. `submit_payloads(..., task_method=...)` 可以显式传方法名，但只能等于这个单一入口
 4. 如果传了别的方法名，现在会直接抛 `AttributeError`，不再静默回退到默认入口
 
-### 2.2 `JobQueueClient`
+### 2.2 `JobQueue`
 
 适合：
 
 1. 大任务先排队
 2. 同一时刻只允许一个大任务进入运行态
-3. `JobQueueClient` 会先向 `InfoCenter / controlplane` 查询 `job-orchestrator` route，再直连它自己的 HTTP 数据面
-4. job 排到后，再自动创建 `TaskPoolSession`
+3. `JobQueue` 会先向 `InfoCenter / controlplane` 查询 `job-orchestrator` route，再直连它自己的 HTTP 数据面
+4. job 排到后，再自动创建 `TaskPool`
 
 最小示例：
 
 ```python
-from pycloud_parallel import JobQueueClient
+from pycloud_parallel import JobQueue
 
-client = JobQueueClient("127.0.0.1:50051", client_id="job-demo")
+client = JobQueue("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
     blob=job_blob,
     entry_module="job_demo",
@@ -81,11 +81,11 @@ client.submit_job_from_bytes(
 )
 ```
 
-这里的 `target` 建议指向 `InfoCenter` 或带内嵌 `InfoCenter` 的 `controlplane`；`JobQueueClient` 会先发现唯一的 `job-orchestrator` route，再直连它。
+这里的 `target` 建议指向 `InfoCenter` 或带内嵌 `InfoCenter` 的 `controlplane`；`JobQueue` 会先发现唯一的 `job-orchestrator` route，再直连它。
 
 约定：
 
-1. `JobQueueClient` 的 job module 固定约定 5 个函数位：
+1. `JobQueue` 的 job module 固定约定 5 个函数位：
 2. `run(payload...)`
    - 必选
    - 子任务入口
@@ -127,7 +127,7 @@ client.submit_job_from_module(
 ```
 
 推荐优先使用 `submit_job_from_module(...)`。
-`JobQueueClient` 不再提供 `submit_job_from_func(...)`，避免把嵌套函数 / 闭包 / 局部依赖打包成不稳定的隐式模块。
+`JobQueue` 不再提供 `submit_job_from_func(...)`，避免把嵌套函数 / 闭包 / 局部依赖打包成不稳定的隐式模块。
 
 补充边界：
 
@@ -143,9 +143,9 @@ final = client.wait_for_terminal(job_id, timeout_sec=30.0)
 print(final["job"]["status"])
 ```
 
-## 3. TaskPoolSession 能力
+## 3. TaskPool 能力
 
-当前原生 `TaskPoolSession` 已支持：
+当前原生 `TaskPool` 已支持：
 
 1. 创建 pool
 2. pool heartbeat 保活
@@ -162,7 +162,7 @@ print(final["job"]["status"])
 
 补充说明：
 
-1. `TaskPoolSession` 不强调 `join()` 这类 owner 常驻语义
+1. `TaskPool` 不强调 `join()` 这类 owner 常驻语义
 2. 更推荐的使用方式是：
    - 用 `submit_payloads(...)` 持续发任务
    - 用 `wait_for_results(...)` / `wait_for_data(...)` 持续收结果
@@ -285,12 +285,12 @@ print(processed)
 1. 小结果 inline 返回
 2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
    - 落到 node 本地 `objects/`
-   - 返回 `ResultRef`
+   - 返回 `DataRef`
 
 高层接口：
 
-1. `TaskPoolSession.wait_for_data(...)`
-2. `JobQueueClient` 查询 job 结果
+1. `TaskPool.wait_for_data(...)`
+2. `JobQueue` 查询 job 结果
 
 会自动按当前高层约定返回可直接消费的数据结构。
 
@@ -304,12 +304,12 @@ print(processed)
 
 ## 6. 兼容入口
 
-`DedicatedTaskServiceSession`
+兼容专属池实现已经进入收尾迁移阶段。
 
-1. 是兼容专属池实现
-2. 底层复用 `ServiceGroup`
-3. 适合过渡期使用
-4. owner 侧也支持 `update_globals(...)`，复用 `ServiceGroup` 的 managed globals 更新链路
+最终目标保持：
+
+1. `TaskPool` 是唯一执行内核
+2. `Service` 与 `JobQueue` 都建立在 `TaskPool` 之上
 
 ## 7. 已移除
 

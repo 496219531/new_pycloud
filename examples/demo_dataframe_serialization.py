@@ -6,7 +6,7 @@ DataFrame 序列化演示
 """
 
 import asyncio
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 
 def main():
@@ -20,13 +20,13 @@ def main():
 
     # 服务代码：直接使用 DataFrame
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def process_dataframe(df):\n"
         b"    import pandas as pd\n"
         b"    return pd.DataFrame(columns=[1,3,4,5],index=range(100000))\n" 
         b"    \n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def process_series(series):\n"
         b"    import pandas as pd\n"
         b"    return {\n"
@@ -40,7 +40,7 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,
@@ -125,7 +125,7 @@ def main():
     print()
     print("说明：")
     print("  - 小对象：DataFrame/Series 会自动走 inline 传输")
-    print("  - 大对象：会自动转成 ObjectRef/ResultRef")
+    print("  - 大对象：会自动转成 DataRef")
     print("  - 对象路径：DataFrame/Series 使用 bundle(data.parquet + meta.json)")
     print("  - 服务端：调用前会自动还原成 DataFrame/Series")
     print()

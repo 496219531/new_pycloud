@@ -35,7 +35,7 @@ def _build_task_entry_module(tmp_path, monkeypatch):
 
 
 def test_native_task_pool_session_submit_and_wait() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
     fake_pool_client = SimpleNamespace(
@@ -67,12 +67,12 @@ def test_native_task_pool_session_submit_and_wait() -> None:
         _client=SimpleNamespace(close=lambda: None),
     )
 
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         return_value=fake_pool_client,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native",
             blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -93,7 +93,7 @@ def test_native_task_pool_session_submit_and_wait() -> None:
 
 
 def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
     fake_pool_client = SimpleNamespace(
@@ -110,12 +110,12 @@ def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None
         close=lambda reason="": None,
         _client=SimpleNamespace(close=lambda: None),
     )
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         return_value=fake_pool_client,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-cancel",
             blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -135,7 +135,7 @@ def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None
 
 
 def test_native_task_pool_session_submit_payloads_rejects_unknown_task_method() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     fake_pool = SimpleNamespace(
         owner_client_id="owner-demo",
@@ -148,7 +148,7 @@ def test_native_task_pool_session_submit_payloads_rejects_unknown_task_method() 
         close=lambda reason="": None,
         _client=SimpleNamespace(close=lambda: None),
     )
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": fake_pool},
         nodes={},
         task_method="run",
@@ -162,7 +162,7 @@ def test_native_task_pool_session_submit_payloads_rejects_unknown_task_method() 
 
 
 def test_native_task_pool_session_status_map() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
     fake_status = SimpleNamespace(status="RUNNING", worker_count=2, task_count=0)
@@ -181,12 +181,12 @@ def test_native_task_pool_session_status_map() -> None:
         close=lambda reason="": None,
         _client=SimpleNamespace(close=lambda: None),
     )
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         return_value=fake_pool_client,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-status",
             blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -203,7 +203,7 @@ def test_native_task_pool_session_status_map() -> None:
 
 
 def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     worker_module = _build_task_entry_module(tmp_path, monkeypatch)
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
@@ -226,12 +226,12 @@ def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeyp
         captured.update(kwargs)
         return fake_pool_client
 
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-module-entry",
             entry_module=worker_module,
@@ -254,7 +254,7 @@ def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeyp
 
 
 def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     worker_module = _build_task_entry_module(tmp_path, monkeypatch)
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
@@ -277,12 +277,12 @@ def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, mon
         captured.update(kwargs)
         return fake_pool_client
 
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-callable-entry",
             entry_callable=worker_module.run,
@@ -305,7 +305,7 @@ def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, mon
 
 
 def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     worker_module = _build_task_entry_module(tmp_path, monkeypatch)
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
@@ -328,12 +328,12 @@ def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> N
         captured.update(kwargs)
         return fake_pool_client
 
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-entry-func",
             entry_func=worker_module.run,
@@ -350,7 +350,7 @@ def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> N
 
 
 def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     prepared_values = {}
 
@@ -379,13 +379,13 @@ def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
             update_runtime_globals_prepared=lambda **kwargs: SimpleNamespace(globals_digest="sha256:same"),
         ),
     )
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-a": pool_a, "node-b": pool_b},
         nodes={},
         task_method="run",
         job_id="job-update-globals",
     )
-    with patch("pycloud_parallel.controlplane.client._prepare_managed_globals_values_for_upload", _fake_prepare):
+    with patch("pycloud_parallel.execution.task_pool._prepare_managed_globals_values_for_upload", _fake_prepare):
         digest = session.update_globals({"cfg": {"k": "v"}})
     assert digest == "sha256:same"
     assert session.globals_digests == {"node-a": "sha256:same", "node-b": "sha256:same"}
@@ -393,9 +393,9 @@ def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
 
 
 def test_native_task_pool_session_submit_values_delegates() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -414,9 +414,9 @@ def test_native_task_pool_session_submit_values_delegates() -> None:
 
 
 def test_native_task_pool_session_is_alive_tracks_remaining_nodes() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={
             "node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30),
             "node-2": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30),
@@ -434,7 +434,7 @@ def test_native_task_pool_session_is_alive_tracks_remaining_nodes() -> None:
 
 
 def test_native_task_pool_session_keepalive_degrades_per_node() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     calls: list[tuple[str, int]] = []
 
@@ -452,7 +452,7 @@ def test_native_task_pool_session_keepalive_degrades_per_node() -> None:
                 raise RuntimeError(f"{self.node_id} heartbeat failed")
             return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={
             "node-bad": _Pool("node-bad", should_fail=True),
             "node-good": _Pool("node-good", should_fail=False),
@@ -481,7 +481,7 @@ def test_native_task_pool_session_keepalive_degrades_per_node() -> None:
 
 
 def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _FailPool:
         owner_client_id = "owner"
@@ -491,7 +491,7 @@ def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:
         def heartbeat(self, *, seq: int = 0):
             raise RuntimeError(f"heartbeat failed seq={seq}")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _FailPool()},
         nodes={},
         task_method="run",
@@ -514,7 +514,7 @@ def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:
 
 
 def test_native_task_pool_session_iter_and_collect_results_consume_incrementally() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -535,7 +535,7 @@ def test_native_task_pool_session_iter_and_collect_results_consume_incrementally
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
     pool = _Pool()
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": pool},
         nodes={},
         task_method="run",
@@ -553,7 +553,7 @@ def test_native_task_pool_session_iter_and_collect_results_consume_incrementally
 
 
 def test_native_task_pool_session_iter_data_materializes_per_result() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     fetched: list[str] = []
 
@@ -576,7 +576,7 @@ def test_native_task_pool_session_iter_data_materializes_per_result() -> None:
             self._results = self._results[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -590,7 +590,7 @@ def test_native_task_pool_session_iter_data_materializes_per_result() -> None:
 
 
 def test_native_task_pool_session_collect_results_with_none_waits_pending_results() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -609,7 +609,7 @@ def test_native_task_pool_session_collect_results_with_none_waits_pending_result
             self._results = self._results[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -623,7 +623,7 @@ def test_native_task_pool_session_collect_results_with_none_waits_pending_result
 
 
 def test_native_task_pool_session_imap_unordered_streams_results() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     submitted: list[str] = []
     materialized: list[str] = []
@@ -661,7 +661,7 @@ def test_native_task_pool_session_imap_unordered_streams_results() -> None:
             self._ready = self._ready[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -685,7 +685,7 @@ def test_native_task_pool_session_imap_unordered_streams_results() -> None:
 
 
 def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_polling() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     submissions: dict[str, list[str]] = {"node-1": [], "node-2": []}
     pull_calls: list[str] = []
@@ -712,7 +712,7 @@ def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_poll
             pull_calls.append(self.node_id)
             return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool("node-1"), "node-2": _Pool("node-2")},
         nodes={},
         task_method="run",
@@ -729,7 +729,7 @@ def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_poll
 
 
 def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     pull_calls: list[str] = []
 
@@ -754,7 +754,7 @@ def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
             pull_calls.append(self.node_id)
             return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool("node-1"), "node-2": _Pool("node-2")},
         nodes={},
         task_method="run",
@@ -776,7 +776,7 @@ def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
 
 
 def test_native_task_pool_session_imap_unordered_refills_fast_node() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     submitted_by_node: dict[str, list[str]] = {"node-slow": [], "node-fast": []}
 
@@ -825,7 +825,7 @@ def test_native_task_pool_session_imap_unordered_refills_fast_node() -> None:
             self._inflight = kept
             return pb2.PullResultsResponse(ok=True, results=ready, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={
             "node-slow": _Pool("node-slow", ready_after_pulls=3),
             "node-fast": _Pool("node-fast", ready_after_pulls=1),
@@ -852,7 +852,7 @@ def test_native_task_pool_session_imap_unordered_refills_fast_node() -> None:
 
 
 def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_arrive() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -872,7 +872,7 @@ def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_a
         def pull_results(self, limit=100, wait_ms=0, cursor=""):
             return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -892,7 +892,7 @@ def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_a
 
 
 def test_native_task_pool_session_imap_unordered_cancels_outstanding_on_error() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     cancel_calls: list[tuple[str, str]] = []
 
@@ -931,7 +931,7 @@ def test_native_task_pool_session_imap_unordered_cancels_outstanding_on_error() 
             cancel_calls.append((job_id, reason))
             return pb2.CancelJobResponse(ok=True, queued_cancelled=1, running_marked=0, already_done=0, not_found=0)
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -954,9 +954,9 @@ def test_native_task_pool_session_imap_unordered_cancels_outstanding_on_error() 
 
 
 def test_native_task_pool_proxy_sync_requires_clean_session() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -969,9 +969,9 @@ def test_native_task_pool_proxy_sync_requires_clean_session() -> None:
 
 
 def test_native_task_pool_session_imap_unordered_requires_clean_session() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -984,9 +984,9 @@ def test_native_task_pool_session_imap_unordered_requires_clean_session() -> Non
 
 
 def test_native_task_pool_session_exclusive_mode_blocks_concurrent_submit_and_iter() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -1004,7 +1004,7 @@ def test_native_task_pool_session_exclusive_mode_blocks_concurrent_submit_and_it
 
 
 def test_native_task_pool_session_drops_late_results_for_non_pending_tasks() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -1022,7 +1022,7 @@ def test_native_task_pool_session_drops_late_results_for_non_pending_tasks() -> 
             self._results = self._results[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -1034,9 +1034,9 @@ def test_native_task_pool_session_drops_late_results_for_non_pending_tasks() -> 
 
 
 def test_native_task_pool_session_collect_results_calls_iter_results() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -1060,9 +1060,9 @@ def test_native_task_pool_session_collect_results_calls_iter_results() -> None:
 
 
 def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -1081,9 +1081,9 @@ def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
 
 
 def test_native_task_pool_session_unordered_delegates_to_imap_unordered() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -1124,9 +1124,9 @@ def test_native_task_pool_session_unordered_delegates_to_imap_unordered() -> Non
 
 
 def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -1168,7 +1168,7 @@ def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
 
 
 def test_native_task_pool_session_iter_items_includes_failures() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -1191,7 +1191,7 @@ def test_native_task_pool_session_iter_items_includes_failures() -> None:
             self._results = self._results[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -1211,7 +1211,7 @@ def test_native_task_pool_session_iter_items_includes_failures() -> None:
 
 
 def test_native_task_pool_session_collect_data_returns_none_on_failure_by_default() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -1233,7 +1233,7 @@ def test_native_task_pool_session_collect_data_returns_none_on_failure_by_defaul
             self._results = self._results[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -1246,7 +1246,7 @@ def test_native_task_pool_session_collect_data_returns_none_on_failure_by_defaul
 
 
 def test_native_task_pool_session_collect_data_raises_on_failure_when_enabled() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
     class _Pool:
         owner_client_id = "owner"
@@ -1268,7 +1268,7 @@ def test_native_task_pool_session_collect_data_raises_on_failure_when_enabled() 
             self._results = self._results[limit:]
             return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": _Pool()},
         nodes={},
         task_method="run",
@@ -1281,9 +1281,9 @@ def test_native_task_pool_session_collect_data_raises_on_failure_when_enabled() 
 
 
 def test_native_task_pool_proxy_submit_returns_task_id() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",
@@ -1306,9 +1306,9 @@ def test_native_task_pool_proxy_submit_returns_task_id() -> None:
 
 
 def test_native_task_pool_proxy_call_waits_for_own_task_id() -> None:
-    from pycloud_parallel.controlplane.client import TaskPoolSession
+    from pycloud_parallel import TaskPool
 
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
         nodes={},
         task_method="run",

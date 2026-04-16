@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 import grpc
 import pytest
 
-from pycloud_parallel.controlplane.client import GatewayConnect, GatewayServiceClient, InfoCenterClient, InfoCenterServiceRoute, NodeControlClient
+from pycloud_parallel.controlplane.client import GatewayServiceClient, InfoCenterClient, InfoCenterServiceRoute, NodeControlClient
 from pycloud_parallel.controlplane.gateway_http import GatewayCallError, GatewayHttpApp
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
@@ -26,7 +26,7 @@ from pycloud_parallel.controlplane.server import (
     build_job_orchestrator_server,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import NodeControlState
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -213,20 +213,10 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
             body = gateway.call(service_name="svc_gateway_controlplane", method="mul", payload={"value": 6}, timeout_sec=5.0)
             assert body["data"]["square"] == 36
 
-        module_client = GatewayConnect(
-            controlplane.base_url,
-            service_name="svc_gateway_controlplane",
-            timeout_sec=5.0,
-        )
-        assert module_client.methods == ["add", "mul"]
-        assert module_client.call_sync("add", value=10) == {"value": 10, "plus_one": 11}
-
-        async def _call_gateway_module():
-            return await module_client.mul(value=8)
-
-        import asyncio
-
-        assert asyncio.run(_call_gateway_module()) == {"value": 8, "square": 64}
+        with GatewayServiceClient(controlplane.base_url, timeout_sec=5.0) as module_client:
+            assert sorted(item["method"] for item in module_client.list_methods(service_name="svc_gateway_controlplane", include_docs=False)) == ["add", "mul"]
+            assert module_client.call(service_name="svc_gateway_controlplane", method="add", payload={"value": 10}, timeout_sec=5.0)["data"] == {"value": 10, "plus_one": 11}
+            assert module_client.call(service_name="svc_gateway_controlplane", method="mul", payload={"value": 8}, timeout_sec=5.0)["data"] == {"value": 8, "square": 64}
     finally:
         node_server.stop(grace=0)
         node_state.close()
@@ -571,7 +561,7 @@ def test_gateway_upload_call_reuses_stage_file_on_route_retry(tmp_path):
 def test_upload_staged_files_to_route_pins_request_scoped_refs(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane.gateway_upload import release_uploaded_refs_on_route, upload_staged_files_to_route
     from pycloud_parallel.controlplane.gateway_stage import GatewayStageRequest, GatewayStageFile
-    from pycloud_parallel.controlplane.object_ref import ObjectRef
+    from pycloud_parallel.data.object_ref import NodeStoredRef
 
     pinned = []
     released = []
@@ -589,7 +579,7 @@ def test_upload_staged_files_to_route_pins_request_scoped_refs(tmp_path, monkeyp
 
         def upload_object_from_file(self, *, file_path: str, format: str = "", trusted_precheck=None, transfer_mode: str = "", chunk_size: int = 0):
             del file_path, trusted_precheck, transfer_mode, chunk_size
-            return ObjectRef(
+            return NodeStoredRef(
                 object_id="sha256:" + ("a" * 64),
                 format=format or "txt",
                 size_bytes=32,
@@ -1069,7 +1059,7 @@ def test_gateway_service_client_call_uses_http_payload_policy(monkeypatch) -> No
             return None
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.NodeControlClient",
+        "pycloud_parallel.controlplane.gateway_client.client_mod.NodeControlClient",
         _FakeNodeControlClient,
     )
     monkeypatch.setattr(
@@ -1085,11 +1075,11 @@ def test_gateway_service_client_call_uses_http_payload_policy(monkeypatch) -> No
         return dict(payload or {})
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.prepare_outbound_payload",
+        "pycloud_parallel.controlplane.remote_payload.prepare_outbound_payload",
         _fake_prepare,
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._http_json_request",
+        "pycloud_parallel.controlplane.gateway_client.client_mod._http_json_request",
         lambda **kwargs: {"ok": True, "data": kwargs.get("payload", {})},
     )
 

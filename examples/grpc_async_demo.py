@@ -1,6 +1,6 @@
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import ServiceGroup
+from pycloud_parallel.controlplane.client import Service
 
 
 async def main():
@@ -20,7 +20,7 @@ async def main():
     )
 
     suffix = int(time.time())
-    group = ServiceGroup.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"client-owner-{suffix}",
         service_name=f"square-service-{suffix}",

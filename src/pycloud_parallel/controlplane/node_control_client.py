@@ -10,11 +10,19 @@ import tempfile
 from typing import Any, Dict, Iterator, Optional, Sequence, Union
 
 import grpc
+from google.protobuf import timestamp_pb2
 
-from pycloud_parallel.controlplane import client as client_mod
-from pycloud_parallel.controlplane.artifact import ArtifactDeps, _coerce_artifact_deps, _normalize_dependency_policy_mode
+from pycloud_parallel.controlplane.artifact import (
+    ArtifactDeps,
+    _coerce_artifact_deps,
+    _default_entry_module_for_package,
+    _normalize_dependency_policy_mode,
+    _normalize_entry_module_arg,
+    _resolve_package_format,
+)
 from pycloud_parallel.controlplane.client_transport import _materialize_downloaded_result
 from pycloud_parallel.controlplane.config import (
+    FILE_HASH_CHUNK_SIZE_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,
     get_object_transfer_mode,
     resolve_object_transfer_mode,
@@ -22,25 +30,75 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.object_digest_cache import invalidate_file_digest, lookup_file_digest, store_file_digest
-from pycloud_parallel.controlplane.object_ref import ObjectRef, normalize_object_format, object_id_from_sha256_hex
+from pycloud_parallel.data.object_ref import NodeStoredRef, normalize_object_format, object_id_from_sha256_hex
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient, ServiceSessionClient
-from pycloud_parallel.controlplane.result_ref import ResultRef
+from pycloud_parallel.data.result_ref import NodeResultHandle
 from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, serialize_inline_payload, struct_to_dict, summarize_payload_flow_value
+from pycloud_parallel.execution.support import _prepare_local_artifact_for_upload, _prepare_managed_globals_values_for_upload
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
-_prepare_local_artifact_for_upload = client_mod._prepare_local_artifact_for_upload
-_resolve_package_format = client_mod._resolve_package_format
-_default_entry_module_for_package = client_mod._default_entry_module_for_package
-_build_export_spec = client_mod._build_export_spec
-_sha256_file = client_mod._sha256_file
-_iter_file_chunks = client_mod._iter_file_chunks
-_err_msg = client_mod._err_msg
-_now_timestamp = client_mod._now_timestamp
-_prepare_managed_globals_values_for_upload = client_mod._prepare_managed_globals_values_for_upload
-_normalize_entry_module_arg = client_mod._normalize_entry_module_arg
-_package_paths_to_targz = client_mod._package_paths_to_targz
-_utc_now = client_mod._utc_now
+
+def _utc_now():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+def _now_timestamp() -> timestamp_pb2.Timestamp:
+    ts = timestamp_pb2.Timestamp()
+    ts.FromDatetime(_utc_now())
+    return ts
+
+
+def _err_msg(resp_error: pb2.Error, default_msg: str) -> str:
+    if resp_error and resp_error.message:
+        return resp_error.message
+    return default_msg
+
+
+def _sha256_file(path: Path, *, chunk_size: int = FILE_HASH_CHUNK_SIZE_BYTES) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fp:
+        while True:
+            chunk = fp.read(max(1, int(chunk_size)))
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _iter_file_chunks(path: Path, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES):
+    with path.open("rb") as fp:
+        while True:
+            chunk = fp.read(max(1, int(chunk_size)))
+            if not chunk:
+                break
+            yield chunk
+
+
+def _build_export_spec(
+    *,
+    export_mode: str,
+    export_methods: Optional[Sequence[str]],
+) -> pb2.ModuleExportSpec:
+    return pb2.ModuleExportSpec(
+        mode=str(export_mode or "").strip(),
+        methods=[x.strip() for x in (export_methods or []) if str(x).strip()],
+        decorator="pycloud_export",
+    )
+
+
+def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    return Path(
+        DependencyPackager().package_paths(
+            root_dir=root_dir,
+            paths=paths,
+            include_tests=False,
+        )
+    )
 
 
 def _normalize_object_transfer_mode(value: str) -> str:
@@ -227,7 +285,7 @@ class NodeControlClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         trusted_precheck: Optional[bool] = None,
         transfer_mode: str = "",
-    ) -> ObjectRef:
+    ) -> NodeStoredRef:
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"file_path not found: {file_path}")
@@ -264,7 +322,7 @@ class NodeControlClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         trusted_precheck: Optional[bool] = None,
         transfer_mode: str = "",
-    ) -> ObjectRef:
+    ) -> NodeStoredRef:
         effective_format = normalize_object_format(format, default="bin")
         effective_mode = _resolve_upload_object_transfer_mode(
             transfer_mode=transfer_mode or get_object_transfer_mode(),
@@ -294,7 +352,7 @@ class NodeControlClient:
         chunk_size: int,
         cached_object_id: str,
         precheck_enabled: bool,
-    ) -> ObjectRef:
+    ) -> NodeStoredRef:
         effective_format = normalize_object_format(format, source_name=file_path.name)
         object_id = str(cached_object_id or "").strip()
         if not object_id:
@@ -328,7 +386,7 @@ class NodeControlClient:
             if cached_object_id:
                 invalidate_file_digest(file_path, format=effective_format)
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        ref = ObjectRef(
+        ref = NodeStoredRef(
             object_id=resp.object_id or object_id,
             format=resp.format or effective_format,
             size_bytes=int(resp.size_bytes or file_path.stat().st_size),
@@ -342,7 +400,7 @@ class NodeControlClient:
         file_path: Path,
         format: str,
         chunk_size: int,
-    ) -> ObjectRef:
+    ) -> NodeStoredRef:
         effective_format = normalize_object_format(format, source_name=file_path.name)
         resp = self.stub.UploadObject(
             _serialize_upload_object_requests_from_file(
@@ -356,7 +414,7 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        ref = ObjectRef(
+        ref = NodeStoredRef(
             object_id=resp.object_id,
             format=resp.format or effective_format,
             size_bytes=int(resp.size_bytes or file_path.stat().st_size),
@@ -371,7 +429,7 @@ class NodeControlClient:
         format: str,
         chunk_size: int,
         precheck_enabled: bool,
-    ) -> ObjectRef:
+    ) -> NodeStoredRef:
         digest = hashlib.sha256(blob).hexdigest()
         object_id = object_id_from_sha256_hex(digest)
         effective_format = normalize_object_format(format, default="bin")
@@ -395,7 +453,7 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        return ObjectRef(
+        return NodeStoredRef(
             object_id=resp.object_id or object_id,
             format=resp.format or effective_format,
             size_bytes=int(resp.size_bytes or len(blob)),
@@ -407,7 +465,7 @@ class NodeControlClient:
         blob: bytes,
         format: str,
         chunk_size: int,
-    ) -> ObjectRef:
+    ) -> NodeStoredRef:
         effective_format = normalize_object_format(format, default="bin")
         resp = self.stub.UploadObject(
             _serialize_upload_object_requests_from_bytes(
@@ -421,7 +479,7 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        return ObjectRef(
+        return NodeStoredRef(
             object_id=resp.object_id,
             format=resp.format or effective_format,
             size_bytes=int(resp.size_bytes or len(blob)),
@@ -445,14 +503,14 @@ class NodeControlClient:
         object_id: str,
         fallback_format: str,
         fallback_size: int,
-    ) -> Optional[ObjectRef]:
+    ) -> Optional[NodeStoredRef]:
         try:
             meta = self.get_object_meta(object_id=object_id)
         except Exception:
             return None
         if not bool(meta.exists):
             return None
-        return ObjectRef(
+        return NodeStoredRef(
             object_id=str(meta.object_id or object_id),
             format=str(meta.format or fallback_format or "bin"),
             size_bytes=int(meta.size_bytes or fallback_size or 0),
@@ -576,7 +634,7 @@ class NodeControlClient:
             return False
         return bool(resp.released)
 
-    def download_result_to_file(self, result_ref: ResultRef | DataRef | object, *, target_path: str) -> Path:
+    def download_result_to_file(self, result_ref: NodeResultHandle | DataRef | object, *, target_path: str) -> Path:
         data_ref = maybe_data_ref(result_ref)
         if data_ref is None:
             raise TypeError("result_ref must be a DataRef-compatible value")
@@ -584,7 +642,7 @@ class NodeControlClient:
         self._release_data_ref_if_consumed(data_ref)
         return path
 
-    def fetch_result_ref_data(self, result_ref: ResultRef | DataRef | object, *, target_path: str = ""):
+    def fetch_result_ref_data(self, result_ref: NodeResultHandle | DataRef | object, *, target_path: str = ""):
         data_ref = maybe_data_ref(result_ref)
         if data_ref is None:
             raise TypeError("result_ref must be a DataRef-compatible value")

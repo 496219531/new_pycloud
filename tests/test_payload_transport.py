@@ -6,7 +6,7 @@ import json
 from pycloud_parallel.controlplane.client import _decode_http_request_body
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, data_ref_to_payload
-from pycloud_parallel.controlplane.object_ref import ObjectRef, object_ref_to_payload
+from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
     decode_payload_from_transport,
     encode_result_for_transport,
@@ -16,8 +16,8 @@ from pycloud_parallel.controlplane.payload_transport import (
 )
 
 
-def _fake_object_ref(*, object_id_suffix: str = "a", format: str = "bin", consume_on_read: bool = False) -> ObjectRef:
-    return ObjectRef(
+def _fake_object_ref(*, object_id_suffix: str = "a", format: str = "bin", consume_on_read: bool = False) -> NodeStoredRef:
+    return NodeStoredRef(
         object_id=f"sha256:{object_id_suffix * 64}",
         format=format,
         size_bytes=128,
@@ -64,10 +64,10 @@ def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:
 
     assert isinstance(prepared["args"], list)
     assert prepared["args"][0] == "small"
-    assert isinstance(prepared["args"][1], ObjectRef)
+    assert isinstance(prepared["args"][1], DataRef)
     assert prepared["args"][1].consume_on_read is True
     assert isinstance(prepared["kwargs"], dict)
-    assert isinstance(prepared["kwargs"]["blob"], ObjectRef)
+    assert isinstance(prepared["kwargs"]["blob"], DataRef)
     assert len(uploads) == 2
 
 
@@ -95,8 +95,8 @@ def test_prepare_outbound_payload_job_submit_applies_managed_globals_policy(tmp_
     )
 
     assert prepared["artifact_path"] == path
-    assert isinstance(prepared["update_globals"]["cfg_path"], ObjectRef)
-    assert isinstance(prepared["update_globals"]["raw_bytes"], ObjectRef)
+    assert isinstance(prepared["update_globals"]["cfg_path"], DataRef)
+    assert isinstance(prepared["update_globals"]["raw_bytes"], DataRef)
     assert uploads[0] == path
     assert uploads[1] == b"abc"
 
@@ -111,7 +111,7 @@ def test_normalize_inbound_payload_deserializes_before_object_resolution() -> No
     normalized = normalize_inbound_payload(
         {
             "blob": object_ref_to_payload(
-                ObjectRef(
+                NodeStoredRef(
                     object_id="sha256:" + ("c" * 64),
                     format="json",
                     size_bytes=42,
@@ -125,14 +125,14 @@ def test_normalize_inbound_payload_deserializes_before_object_resolution() -> No
     )
 
     assert normalized == {"resolved": True}
-    assert isinstance(captured["value"]["blob"], ObjectRef)
+    assert isinstance(captured["value"]["blob"], DataRef)
 
 
 def test_decode_payload_from_transport_keeps_payload_decoded_without_localizing() -> None:
     decoded = decode_payload_from_transport(
         {
             "blob": object_ref_to_payload(
-                ObjectRef(
+                NodeStoredRef(
                     object_id="sha256:" + ("d" * 64),
                     format="json",
                     size_bytes=99,
@@ -143,14 +143,14 @@ def test_decode_payload_from_transport_keeps_payload_decoded_without_localizing(
         policy=get_payload_policy("http_call"),
     )
 
-    assert isinstance(decoded["blob"], ObjectRef)
+    assert isinstance(decoded["blob"], DataRef)
 
 
 def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
     body = json.dumps(
         {
             "blob": object_ref_to_payload(
-                ObjectRef(
+                NodeStoredRef(
                     object_id="sha256:" + ("e" * 64),
                     format="json",
                     size_bytes=11,
@@ -165,7 +165,7 @@ def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
         context="service call payload",
     )
 
-    assert isinstance(decoded["blob"], ObjectRef)
+    assert isinstance(decoded["blob"], DataRef)
 
 
 def test_encode_result_for_transport_wraps_scalar_value() -> None:

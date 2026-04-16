@@ -17,7 +17,7 @@ if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
 try:
-    from pycloud_parallel import DeployedService
+    from pycloud_parallel import Service
 except ModuleNotFoundError as exc:
     missing = str(getattr(exc, "name", "") or "")
     message = str(exc)
@@ -75,7 +75,7 @@ def main():
     print("-" * 60)
 
     try:
-        group = DeployedService.deploy_from_infocenter(
+        group = Service.deploy_from_infocenter(
             infocenter_target=gateway_target,
             service_name=service_name,
             blob=blob,

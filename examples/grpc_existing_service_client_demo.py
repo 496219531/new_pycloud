@@ -9,7 +9,7 @@
 
 脚本里同时展示：
 1. `DiscoveryServiceClient`：薄封装
-2. `DirectConnect`：module-like caller
+2. `DiscoveryCallerFacade`：module-like caller
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import asyncio
 import time
 
 from pycloud_parallel.controlplane.client import (
-    DirectConnect,
+    DiscoveryCallerFacade,
     DiscoveryServiceClient,
     InfoCenterClient,
 )
@@ -102,8 +102,8 @@ def main() -> None:
         print(f"[+] sync call: {resp.get('data')}")
 
     print()
-    print("[DirectConnect]")
-    module_client = DirectConnect(
+    print("[DiscoveryCallerFacade]")
+    module_client = DiscoveryCallerFacade(
         infocenter_target,
         service_name=active_service_name,
         timeout_sec=10.0,

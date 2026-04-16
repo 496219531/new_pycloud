@@ -31,11 +31,12 @@ from pycloud_parallel.controlplane.config import (
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port as _net_format_host_port
 from pycloud_parallel.controlplane.netutil import resolve_public_host, split_host_port as _net_split_host_port
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref
-from pycloud_parallel.controlplane.object_ref import normalize_object_format, normalize_object_id, object_format_suffix, object_storage_path
-from pycloud_parallel.controlplane.state import (
+from pycloud_parallel.data.object_ref import normalize_object_format, normalize_object_id, object_format_suffix, object_storage_path
+from pycloud_parallel.controlplane.node.filesystem import (
     _code_index_link_path,
     _code_index_meta_path,
     _ensure_code_index_entry,
+    _managed_globals_scope_dir,
 )
 
 _LOCALHOST = "127.0.0.1"
@@ -1001,7 +1002,7 @@ def _start_standalone_node(
 
 def _query_loaded_services(target: str) -> List[str]:
     try:
-        from pycloud_parallel.controlplane.client import InfoCenterClient
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
         with InfoCenterClient(target, timeout_sec=3) as client:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1652,7 +1653,7 @@ def _collect_active_data_ref_object_ids(target: str) -> set[str]:
     if not normalized_target:
         return set()
     try:
-        from pycloud_parallel.controlplane.client import InfoCenterClient
+        from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
         with InfoCenterClient(normalized_target, timeout_sec=3.0) as client:
             refs = list(client.list_data_refs(limit=5000))

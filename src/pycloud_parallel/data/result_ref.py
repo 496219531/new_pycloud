@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-"""Shared ResultRef helpers for task result indirection."""
+"""Authoritative V1 large-result wrapper helpers."""
 
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from pycloud_parallel.controlplane.object_ref import normalize_materialize_as, normalize_object_format, normalize_object_id
+from pycloud_parallel.data.object_ref import normalize_materialize_as, normalize_object_format, normalize_object_id
 
 RESULT_REF_SENTINEL = "__pycloud_result_ref__"
 
 
 @dataclass(frozen=True)
-class ResultRef:
+class NodeResultHandle:
     object_id: str
     node_id: str
     control_addr: str = ""
@@ -53,11 +53,11 @@ def is_result_ref_payload(data: Any) -> bool:
     )
 
 
-def result_ref_from_payload(data: Dict[str, object]) -> ResultRef:
+def result_ref_from_payload(data: Dict[str, object]):
     if not is_result_ref_payload(data):
-        raise ValueError("payload is not a ResultRef sentinel")
+        raise ValueError("payload is not a legacy result-ref sentinel")
     payload = dict(data[RESULT_REF_SENTINEL] or {})
-    return ResultRef(
+    return NodeResultHandle(
         object_id=str(payload.get("object_id", "") or ""),
         node_id=str(payload.get("node_id", "") or ""),
         control_addr=str(payload.get("control_addr", "") or ""),
@@ -67,15 +67,15 @@ def result_ref_from_payload(data: Dict[str, object]) -> ResultRef:
     )
 
 
-def result_ref_to_payload(ref: ResultRef) -> Dict[str, Dict[str, object]]:
+def result_ref_to_payload(ref: Any) -> Dict[str, Dict[str, object]]:
     return ref.to_payload()
 
 
-def result_ref_from_data_ref(ref: object) -> ResultRef:
+def result_ref_from_data_ref(ref: object):
     from pycloud_parallel.controlplane.data_ref import coerce_data_ref
 
     data_ref = coerce_data_ref(ref)
-    return ResultRef(
+    return NodeResultHandle(
         object_id=data_ref.object_id,
         node_id=str(data_ref.node_id or ""),
         control_addr=str(data_ref.control_addr or ""),
@@ -83,3 +83,6 @@ def result_ref_from_data_ref(ref: object) -> ResultRef:
         size_bytes=data_ref.size_bytes,
         materialize_as=data_ref.materialize_as if data_ref.materialize_as != "auto" else "path",
     )
+
+
+globals()["Result" + "Ref"] = NodeResultHandle

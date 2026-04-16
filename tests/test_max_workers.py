@@ -3,7 +3,7 @@
 import os
 import time
 
-from pycloud_parallel import configure, foreach, parallel_for
+from pycloud_parallel.local import configure, foreach, parallel_for
 
 
 def _square(x):

@@ -15,7 +15,7 @@ from pycloud_parallel.controlplane.client_transport import _decode_http_request_
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageFile, GatewayStageManager, GatewayStageRequest
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.controlplane.object_ref import normalize_object_format
+from pycloud_parallel.data.object_ref import normalize_object_format
 
 
 _FILE_FIELD_RE = re.compile(r"^files?\[(?P<slot>[^\]]+)\]$")

@@ -49,7 +49,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
         return mp.get_context("spawn")
 
     def _submit_callable(executor: ProcessPoolExecutor, args: Dict[str, Any]):
-        from pycloud_parallel.controlplane.state import _execute_payload_in_subprocess
+        from pycloud_parallel.controlplane.node.execution import _execute_payload_in_subprocess
 
         return executor.submit(
             _execute_payload_in_subprocess,

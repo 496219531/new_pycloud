@@ -10,10 +10,10 @@
 
 | 环境变量 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES` | `524288` | inline payload 建议转 `ObjectRef` 阈值 |
+| `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES` | `524288` | inline payload 建议转 `DataRef` 阈值 |
 | `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES` | `2097152` | 单个 inline payload 硬限制 |
 | `PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES` | `8388608` | 单次请求所有 inline payload 总硬限制 |
-| `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES` | `1048576` | inline result 建议转 `ResultRef` 阈值 |
+| `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES` | `1048576` | inline result 建议转 `DataRef` 阈值 |
 | `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `4194304` | 单个 inline result 硬限制 |
 | `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES` | `262144` | 对象上传/下载默认分片大小 |
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
@@ -32,10 +32,10 @@
 常见调参场景：
 
 1. 希望 inline payload 更小
-   - 例如 1 MiB 内 inline，超过就走 `ObjectRef`
+   - 例如 1 MiB 内 inline，超过就走 `DataRef`
 2. 希望 gRPC 单条消息限制更大
 3. 希望对象上传分片更大或更小
-4. 希望 inline result 更保守，尽早走 `ResultRef`
+4. 希望 inline result 更保守，尽早走 `DataRef`
 
 ## 2. 当前支持的环境变量
 
@@ -43,7 +43,7 @@
 
 - `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
   - 默认：`524288` (`512 KiB`)
-  - 用于“建议转 ObjectRef”的阈值
+  - 用于“建议转 DataRef”的阈值
 
 - `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES`
   - 默认：`2097152` (`2 MiB`)
@@ -55,11 +55,11 @@
 
 - `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES`
   - 默认：`1048576` (`1 MiB`)
-  - 结果建议转 `ResultRef` 的阈值
+  - 结果建议转 `DataRef` 的阈值
 
 - `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`
   - 默认：`4194304` (`4 MiB`)
-  - 单个 inline result 的硬限制；超出后更容易走对象缓存 / `ResultRef`
+  - 单个 inline result 的硬限制；超出后更容易走对象缓存 / `DataRef`
 
 ### 2.2 object / file chunk
 
@@ -137,7 +137,7 @@ pycloudctl start-node
 pycloudctl start-infocenter
 ```
 
-### 3.1 把 inline payload 缩到 1 MiB 以下就转 ObjectRef
+### 3.1 把 inline payload 缩到 1 MiB 以下就转 DataRef
 
 如果你想更保守：
 
@@ -192,7 +192,7 @@ pycloudctl start-node \
 推荐优先调整顺序：
 
 1. 先调 `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
-   - 让大对象更早走 `ObjectRef`
+   - 让大对象更早走 `DataRef`
 2. 再考虑调 `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
 3. 最后才考虑直接放大 gRPC message limit
 
@@ -209,14 +209,14 @@ pycloudctl start-node \
 适合：
 
 1. payload 不算大
-2. 想少走 `ObjectRef`
+2. 想少走 `DataRef`
 
 ```bash
 export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
 export PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES=1048576
 ```
 
-### 组合 B：更激进地把大对象推到 `ObjectRef`
+### 组合 B：更激进地把大对象推到 `DataRef`
 
 适合：
 

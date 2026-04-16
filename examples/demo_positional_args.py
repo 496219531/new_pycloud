@@ -7,7 +7,7 @@
 
 import asyncio
 import time
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,

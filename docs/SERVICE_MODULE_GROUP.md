@@ -1,6 +1,6 @@
-# DeployedService
+# Service
 
-`DeployedService` 当前更适合被理解为“owner 侧部署内部常驻函数服务”的入口。
+`Service` 当前更适合被理解为“owner 侧部署内部常驻函数服务”的入口。
 
 它的定位是：
 
@@ -22,7 +22,7 @@
 ## 1. 基本用法
 
 ```python
-from pycloud_parallel import DeployedService
+from pycloud_parallel import Service
 
 blob = (
     b"def pycloud_export(fn):\n"
@@ -34,7 +34,7 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
@@ -52,7 +52,7 @@ print(group.square.sync(x=7))
 如果服务代码依赖节点未预装的包：
 
 ```python
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="viewer-service",
@@ -98,7 +98,7 @@ group = DeployedService.deploy_from_infocenter(
    - 一次 node 侧服务调用从进入 `_invoke_service_call(...)` 到准备返回响应为止的累计平均墙钟时间
 2. `child_decode / child_invoke / child_encode`
    - 发生在 executor 子进程
-   - `child_decode`：artifact/router 加载、managed globals 应用、payload/ObjectRef 解引用、方法查找
+   - `child_decode`：artifact/router 加载、managed globals 应用、payload/DataRef 解引用、方法查找
    - `child_invoke`：真正执行用户函数
    - `child_encode`：结果标准化，以及必要时转成 `StoredResultArtifact`
 3. `avg_*`
@@ -191,7 +191,7 @@ result = group.call_sync("square", x=7)
 2. `HTTP` / gRPC inline 数据面本质仍然是 `JSON/Struct`
 3. 框架会把这 3 种类型自动转成可传输结构再发送
 4. node 侧调用用户函数前再还原回 `DataFrame / Series / ndarray`
-5. 大 `DataFrame / Series / ndarray` 会自动转 `ObjectRef / ResultRef`
+5. 大 `DataFrame / Series / ndarray` 会自动转 `DataRef`
 6. 对于 `DataFrame / Series` 的对象路径，数据主体走 bundle：
    - `data.parquet`
    - `meta.json`
@@ -207,7 +207,7 @@ result = group.call_sync("square", x=7)
 2. 更复杂的对象数组、业务自定义类实例等，不做自动兼容
 3. 报错会尽量带字段路径，方便定位是哪一段 payload 不被支持
 
-### 4.2 大结果与 `ResultRef`
+### 4.2 大结果与 `DataRef`
 
 服务返回值当前也支持“大结果自动转引用”：
 
@@ -215,14 +215,14 @@ result = group.call_sync("square", x=7)
    - 直接 inline 返回
 2. 大结果 / 文件结果 / `DataFrame` / `ndarray`
    - 落到 node 本地 `objects/`
-   - 返回 `ResultRef`
+   - 返回 `DataRef`
 
 高层 API：
 
 1. `group.square.sync(...)`
 2. `group.call_sync(...)`
 
-会自动把 `ResultRef` 下载并还原。
+会自动把 `DataRef` 下载并还原。
 
 如果你明确知道返回值很大，建议服务函数返回：
 
@@ -232,7 +232,7 @@ result = group.call_sync("square", x=7)
 ## 5. 常用部署参数
 
 ```python
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
@@ -270,7 +270,7 @@ group = DeployedService.deploy_from_infocenter(
 服务模式现在支持声明可动态更新的全局变量：
 
 ```python
-group = DeployedService.deploy_from_infocenter(
+group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
@@ -345,9 +345,9 @@ pycloudctl gc --scope all --older-than-hours 168
 5. 如果指定了 `runtime`，先按节点 `python_version` 过滤
 6. 按 `service_worker_available` 选节点
 
-## 7. 与 GatewayConnect 的区别
+## 7. 与轻量 caller 的区别
 
-`DeployedService`：
+`Service`：
 
 1. 是 owner
 2. 会上传代码
@@ -355,20 +355,18 @@ pycloudctl gc --scope all --older-than-hours 168
 4. 会 keepalive
 5. 可以 `end()` 服务
 
-`GatewayConnect`：
+轻量 caller：
 
 1. 只是 caller
 2. 不上传代码
 3. 不持有 token
 4. 不管理服务生命周期
 
-## 8. 何时用 DirectConnect
+## 8. 何时用更底层 controlplane caller
 
-如果你只是想调已有服务，一般优先：
+如果你只是想调已有服务，优先用 V1 的 `Service` owner/caller 组合。
 
-1. `GatewayConnect`
-
-只有在这些场景才更适合 `DirectConnect`：
+只有在这些场景才更适合从 `pycloud_parallel.controlplane` 使用更底层客户端：
 
 1. 调试具体实例
 2. 旁路 Gateway

@@ -1,5 +1,5 @@
 import time
-from pycloud_parallel.controlplane.client import ServiceGroup
+from pycloud_parallel.controlplane.client import Service
 
 def main():
     # 你的业务代码（也可以用 artifact_path 指向本地 .py 文件）
@@ -13,7 +13,7 @@ def main():
     )
 
     suffix = int(time.time())
-    group = ServiceGroup.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"client-owner-{suffix}",
         service_name=f"square-service",

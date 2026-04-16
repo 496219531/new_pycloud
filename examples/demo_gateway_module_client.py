@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyCloud Gateway module-like caller 示例。
+PyCloud Gateway caller 示例。
 
 演示如何像本地模块一样，通过 controlplane Gateway 调用远程服务。
 """
@@ -8,7 +8,7 @@ PyCloud Gateway module-like caller 示例。
 import asyncio
 import time
 
-from pycloud_parallel import DeployedService, GatewayConnect
+from pycloud_parallel import Service
 
 
 def _service_exists(target: str, service_name: str) -> bool:
@@ -24,13 +24,13 @@ def _service_exists(target: str, service_name: str) -> bool:
 
 def _ensure_service(target: str, service_name: str):
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def square(x=0, **_kwargs):\n"
         b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x}\n"
     )
-    group = DeployedService.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target=target,
         owner_client_id=f"gateway-module-demo-{int(time.time())}",
         service_name=service_name,
@@ -53,31 +53,34 @@ def _ensure_service(target: str, service_name: str):
 def main() -> None:
     service_name = f"square-service-{int(time.time())}"
     group = _ensure_service("127.0.0.1:50051", service_name)
-    client = GatewayConnect(
-        "127.0.0.1:50051",
-        service_name=service_name,
-        timeout_sec=10.0,
-    )
+    from pycloud_parallel.controlplane.client import GatewayServiceClient
+
+    client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0)
 
     try:
         print("=" * 60)
-        print("  PyCloud Gateway Module Client Demo")
+        print("  PyCloud Gateway Client Demo")
         print("=" * 60)
         print()
-        print(f"  Service: {client.service_name}")
-        print(f"  Methods: {client.methods}")
+        print(f"  Service: {service_name}")
+        methods = client.list_methods(service_name=service_name, include_docs=False)
+        print(f"  Methods: {[item['method'] for item in methods]}")
         print()
 
         print("[+] sync call")
-        print(f"    square.sync(x=7) -> {client.square.sync(x=7)}")
+        print(
+            "    square(x=7) -> "
+            f"{client.call(service_name=service_name, method='square', payload={'x': 7}, timeout_sec=10.0)}"
+        )
         print()
 
         async def _run() -> None:
             print("[+] async call")
-            print(f"    await square(x=11) -> {await client.square(x=11)}")
-            print()
-            print("[+] generic async call")
-            print(f"    await call('square', x=13) -> {await client.call('square', x=13)}")
+            loop = asyncio.get_running_loop()
+            print(
+                "    await square(x=11) -> "
+                f"{await loop.run_in_executor(None, lambda: client.call(service_name=service_name, method='square', payload={'x': 11}, timeout_sec=10.0))}"
+            )
 
         asyncio.run(_run())
     finally:

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from pycloud_parallel.controlplane.client import InfoCenterServiceRoute
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
 from pycloud_parallel.controlplane.gateway_source import RouteSource
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 

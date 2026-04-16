@@ -6,7 +6,7 @@ PyCloud 异步客户端示例
 """
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import ServiceGroup
+from pycloud_parallel.controlplane.client import Service
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
     print("=" * 60)
     print()
 
-    group = ServiceGroup.deploy_from_infocenter(
+    group = Service.deploy_from_infocenter(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"async-demo-{suffix}",
         service_name=f"compute-service-{suffix}",

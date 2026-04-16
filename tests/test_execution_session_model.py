@@ -12,7 +12,7 @@ def _utc_now():
 
 
 def test_service_replica_state_snapshot_views() -> None:
-    from pycloud_parallel.controlplane.state import ServiceReplicaState
+    from pycloud_parallel.controlplane.node.models import ServiceReplicaState
 
     now = _utc_now()
     state = ServiceReplicaState(
@@ -46,7 +46,7 @@ def test_service_replica_state_snapshot_views() -> None:
 
 
 def test_task_pool_replica_state_snapshot_views() -> None:
-    from pycloud_parallel.controlplane.state import TaskPoolReplicaState
+    from pycloud_parallel.controlplane.node.models import TaskPoolReplicaState
 
     now = _utc_now()
     state = TaskPoolReplicaState(
@@ -135,7 +135,7 @@ def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() ->
 
 
 def test_service_group_exposes_replicas_and_snapshot() -> None:
-    from pycloud_parallel.controlplane.client import ServiceGroup, ServiceSessionClient
+    from pycloud_parallel.controlplane.client import Service, ServiceSessionClient
 
     now = _utc_now()
     replica = ServiceSessionClient(
@@ -153,7 +153,7 @@ def test_service_group_exposes_replicas_and_snapshot() -> None:
         last_heartbeat_at=now,
         lease_expire_at=now + timedelta(seconds=30),
     )
-    group = ServiceGroup(
+    group = Service(
         owner_client_id="owner-a",
         service_name="svc-demo",
         sessions={"node-inst-1": replica},
@@ -167,7 +167,8 @@ def test_service_group_exposes_replicas_and_snapshot() -> None:
 
 
 def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
-    from pycloud_parallel.controlplane.client import NativeTaskPoolClient, TaskPoolSession
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.controlplane.client import NativeTaskPoolClient
 
     now = _utc_now()
     pool = NativeTaskPoolClient(
@@ -184,7 +185,7 @@ def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
         last_heartbeat_at=now,
         lease_expire_at=now + timedelta(seconds=30),
     )
-    session = TaskPoolSession(
+    session = TaskPool(
         pools={"node-inst-1": pool},
         nodes={"node-inst-1": SimpleNamespace(node_id="node-1")},
         task_method="run",

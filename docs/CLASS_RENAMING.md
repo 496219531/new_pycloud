@@ -2,29 +2,29 @@
 
 当前任务与服务入口已经收敛为这些名字：
 
-1. `DeployedService`
-2. `TaskPoolSession`
-3. `DedicatedTaskServiceSession`
-4. `JobQueueClient`
-5. `GatewayConnect`
-6. `DirectConnect`
+1. `Service`
+2. `TaskPool`
+3. `compat task facade`
+4. `JobQueue`
+5. `gateway caller facade`
+6. `discovery caller facade`
 
 说明：
 
 1. 旧共享任务池入口已移除
 2. 共享任务池模式已废弃
-3. `TaskPoolSession` 是当前原生专属任务池入口
+3. `TaskPool` 是当前原生专属任务池入口
 
 最常用导入：
 
 ```python
 from pycloud_parallel import (
-    DeployedService,
-    TaskPoolSession,
-    DedicatedTaskServiceSession,
-    JobQueueClient,
-    GatewayConnect,
-    DirectConnect,
+    Service,
+    TaskPool,
+    compat task facade,
+    JobQueue,
+    gateway caller facade,
+    discovery caller facade,
 )
 ```
 

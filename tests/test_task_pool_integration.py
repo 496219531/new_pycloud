@@ -6,14 +6,15 @@ from typing import Tuple
 
 import grpc
 
-from pycloud_parallel.controlplane.client import InfoCenterClient, JobQueueClient, NodeControlClient, TaskPoolSession
+from pycloud_parallel import JobQueue, TaskPool
+from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient
 from pycloud_parallel.controlplane.server import (
     build_gateway_server,
     build_infocenter_server,
     build_job_orchestrator_server,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import NodeControlState
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 
@@ -59,7 +60,7 @@ def _register_node(info_target: str, *, node_id: str, control_addr: str, state: 
         )
 
 
-def test_native_task_pool_session_end_to_end(tmp_path):
+def test_native_task_pool_end_to_end(tmp_path):
     infocenter = build_infocenter_server("127.0.0.1:0")
     infocenter.start()
     node_server, node_target, node_state = _start_nodecontrol_server("node-pool-01", str(tmp_path / "node_pool_01"))
@@ -78,7 +79,7 @@ def test_native_task_pool_session_end_to_end(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
 
-        with TaskPoolSession.from_infocenter(
+        with TaskPool.from_infocenter(
             infocenter_target=infocenter.base_url,
             job_id="job-pool-e2e",
             blob=blob,
@@ -145,7 +146,7 @@ def test_job_queue_uses_native_task_pool_end_to_end(tmp_path):
             b"def finalize(state=None, **_kwargs):\n"
             b"    return {'count': len(state.get('items', []))}\n"
         )
-        client = JobQueueClient(infocenter.base_url, client_id="jobq-client", timeout_sec=10.0)
+        client = JobQueue(infocenter.base_url, client_id="jobq-client", timeout_sec=10.0)
         try:
             submit = client.submit_job_from_bytes(
                 blob=job_blob,

@@ -37,7 +37,7 @@ def test_prepare_artifact_applies_service_and_task_defaults() -> None:
 
 
 def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None:
-    from pycloud_parallel.controlplane.client import Artifact, ArtifactDeps, ArtifactExports, ServiceGroup
+    from pycloud_parallel.controlplane.client import Artifact, ArtifactDeps, ArtifactExports, Service
 
     fake_node = SimpleNamespace(
         node_id="node-1",
@@ -82,21 +82,21 @@ def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None
     )
 
     with patch(
-        "pycloud_parallel.controlplane.client._retry_infocenter_request",
+        "pycloud_parallel.execution.service_session._retry_infocenter_request",
         return_value=((), [fake_node]),
     ), patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient",
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
         _FakeNodeControlClient,
     ), patch.object(
-        ServiceGroup,
+        Service,
         "_persist_session_cache",
         lambda self: None,
     ), patch.object(
-        ServiceGroup,
+        Service,
         "_start_keepalive",
         lambda self, interval_sec=None: None,
     ):
-        group = ServiceGroup.deploy_from_infocenter(
+        group = Service.deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             owner_client_id="owner-demo",
             service_name="demo-artifact-service",
@@ -122,7 +122,8 @@ def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None
 
 
 def test_task_pool_session_from_infocenter_accepts_artifact() -> None:
-    from pycloud_parallel.controlplane.client import Artifact, ArtifactDeps, TaskPoolSession
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.controlplane.client import Artifact, ArtifactDeps
 
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
     create_calls = []
@@ -158,7 +159,7 @@ def test_task_pool_session_from_infocenter_accepts_artifact() -> None:
         side_effect=_fake_create_task_pool_from_bytes,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPoolSession.from_infocenter(
+        session = TaskPool.from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-artifact",
             artifact=artifact,

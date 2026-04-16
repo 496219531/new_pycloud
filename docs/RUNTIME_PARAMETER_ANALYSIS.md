@@ -30,18 +30,18 @@
 ### 3.1 Service Mode
 
 ```python
-DeployedService.deploy_from_infocenter(..., runtime="py3.11")
+Service.deploy_from_infocenter(..., runtime="py3.11")
 ```
 
 ### 3.2 TaskPool Mode
 
 ```python
-TaskPoolSession.from_infocenter(..., runtime=">=py3.11")
+TaskPool.from_infocenter(..., runtime=">=py3.11")
 ```
 
 ### 3.3 JobQueue Mode
 
-`JobQueueClient` 提交 job 时，如果 driver 后续要创建 `TaskPoolSession`，同样会把 `runtime` 透传到 pool 选点和节点校验链路。
+`JobQueue` 提交 job 时，如果 driver 后续要创建 `TaskPool`，同样会把 `runtime` 透传到 pool 选点和节点校验链路。
 
 ## 4. 与其他字段的区别
 
@@ -54,7 +54,7 @@ TaskPoolSession.from_infocenter(..., runtime=">=py3.11")
 - 用于 JobQueue 调度和状态查询
 
 ### `pool_id`
-- 原生 `TaskPoolSession` 的资源会话标识
+- 原生 `TaskPool` 的资源会话标识
 - 用于 pool 生命周期、heartbeat、结果拉取和关闭
 
 ## 5. 建议

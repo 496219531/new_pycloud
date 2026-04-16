@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-原生 TaskPoolSession 演示。
+原生 TaskPool 演示。
 
 创建专属 pool，提交一批 task，查看 pool 状态，拿结果并关闭。
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 
-from pycloud_parallel import TaskPoolSession
+from pycloud_parallel import TaskPool
 
 
 def main() -> None:
@@ -23,7 +23,7 @@ def main() -> None:
         b"    return {'value': value, 'square': value * value}\n"
     )
 
-    with TaskPoolSession.from_infocenter(
+    with TaskPool.from_infocenter(
         infocenter_target="127.0.0.1:50051",
         job_id=f"demo-pool-{int(time.time())}",
         blob=blob,

@@ -18,7 +18,7 @@ from pycloud_parallel.controlplane.config import (
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.object_digest_cache import lookup_file_digest
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.state import NodeControlState
+from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
