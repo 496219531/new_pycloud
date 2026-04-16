@@ -217,7 +217,7 @@ POST /ops/nodes/{node_id}/undrain
 ### 3.1 查看节点
 
 ```python
-from pycloud_parallel.controlplane.client import InfoCenterClient
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
 with InfoCenterClient("127.0.0.1:50051", timeout_sec=5.0) as client:
     nodes = client.list_nodes(healthy_only=False, tags=["compute"], limit=100)

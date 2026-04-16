@@ -9,7 +9,7 @@ from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMI
 
 class TestGatewayServiceClient:
     def test_call_sync_like_usage(self):
-        from pycloud_parallel.controlplane.client import GatewayServiceClient
+        from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
         client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=9.0)
         with patch(
@@ -22,7 +22,7 @@ class TestGatewayServiceClient:
         assert mocked.call_count == 2
 
     def test_list_methods(self):
-        from pycloud_parallel.controlplane.client import GatewayServiceClient
+        from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
         client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
         with patch(
@@ -39,7 +39,7 @@ class TestGatewayServiceClient:
             mocked.assert_called_once()
 
     def test_status(self):
-        from pycloud_parallel.controlplane.client import GatewayServiceClient
+        from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
         client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
         with patch(
@@ -53,7 +53,7 @@ class TestGatewayServiceClient:
 
 
 def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
-    from pycloud_parallel.controlplane.client import GatewayServiceClient
+    from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
     payload = {"blob": "x" * (INLINE_PAYLOAD_HARD_LIMIT_BYTES + 1024)}
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)

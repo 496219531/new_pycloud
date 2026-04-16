@@ -12,7 +12,7 @@ from pycloud_parallel import Service
 
 
 def _service_exists(target: str, service_name: str) -> bool:
-    from pycloud_parallel.controlplane.client import GatewayServiceClient
+    from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
     try:
         with GatewayServiceClient(target, timeout_sec=5.0) as client:
@@ -53,7 +53,7 @@ def _ensure_service(target: str, service_name: str):
 def main() -> None:
     service_name = f"square-service-{int(time.time())}"
     group = _ensure_service("127.0.0.1:50051", service_name)
-    from pycloud_parallel.controlplane.client import GatewayServiceClient
+    from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0)
 

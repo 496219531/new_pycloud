@@ -17,7 +17,6 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from pycloud_parallel.controlplane.client import Service, ServiceSessionClient
 from pycloud_parallel.controlplane import serialization as serialization_mod
 from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
@@ -41,12 +40,18 @@ from pycloud_parallel.controlplane.node.results import (
     _resolve_object_refs_in_payload,
 )
 from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.serialization import (
     dict_to_struct,
     struct_to_dict,
 )
 from pycloud_parallel.controlplane.state_time import utc_now
+from pycloud_parallel.controlplane import client_transport as client_transport_mod
+from pycloud_parallel.execution.service_session import Service
+from pycloud_parallel.execution.support import _prepare_http_payload_for_call, _serialize_data_for_object_ref
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+_materialize_downloaded_result = client_transport_mod._materialize_downloaded_result
 
 def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeypatch):
     source = tmp_path / "source.bin"
@@ -281,8 +286,6 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
-    from pycloud_parallel.controlplane.client import _materialize_downloaded_result
     from pycloud_parallel.data.result_ref import NodeResultHandle
 
     index = pd.MultiIndex.from_tuples(
@@ -330,8 +333,6 @@ def test_series_object_upload_preserves_index_and_name():
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.controlplane.client import _materialize_downloaded_result
-    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.data.result_ref import NodeResultHandle
 
     series = pd.Series(
@@ -374,7 +375,6 @@ def test_series_object_upload_preserves_index_and_name():
 def test_json_object_upload_roundtrip_supports_nested_series():
     pd = pytest.importorskip("pandas")
 
-    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
 
     payload = {
@@ -396,7 +396,6 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.data.object_ref import NodeStoredRef
     from pycloud_parallel.data.object_ref import object_storage_path
 
@@ -431,7 +430,6 @@ def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.controlplane.data_ref import DataRef
     from pycloud_parallel.data.object_ref import object_storage_path
 
@@ -961,7 +959,6 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.controlplane.client import _serialize_data_for_object_ref
     from pycloud_parallel.data.object_ref import NodeStoredRef
 
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 10 * 1024 * 1024)
@@ -2013,7 +2010,6 @@ def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp
 
 
 def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
-    from pycloud_parallel.controlplane.client import _prepare_http_payload_for_call
     from pycloud_parallel.controlplane.data_ref import DataRef
     from pycloud_parallel.data.object_ref import NodeStoredRef
 
@@ -2029,9 +2025,9 @@ def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
             materialize_as="json" if format == "json" else "bytes",
         )
 
-    monkeypatch.setattr("pycloud_parallel.controlplane.client._put_data_via_clients", fake_put)
+    monkeypatch.setattr("pycloud_parallel.execution.support._put_data_via_clients", fake_put)
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
+        "pycloud_parallel.execution.support._estimate_managed_global_inline_size",
         lambda value: 2048 if isinstance(value, (dict, list)) else 16,
     )
 

@@ -8,7 +8,7 @@ PyCloud 部署服务示例：从多个文件/文件夹部署
     1. 确保 InfoCenter 和 NodeControl 已启动
     2. 运行脚本
 """
-from pycloud_parallel.controlplane.client import Service
+from pycloud_parallel import Service
 
 
 def demo_service_code():

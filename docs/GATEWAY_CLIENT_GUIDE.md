@@ -24,7 +24,7 @@ Gateway 只服务于服务模式 caller：
 这是最薄的 HTTP client。
 
 ```python
-from pycloud_parallel.controlplane.client import GatewayServiceClient
+from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
 with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
     methods = client.list_methods(service_name="square-service")
@@ -83,7 +83,7 @@ group = Service.deploy_from_infocenter(
 ### 3.2 再通过 Gateway 调用
 
 ```python
-from pycloud_parallel.controlplane.client import GatewayServiceClient
+from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
 with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
     print(

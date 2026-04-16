@@ -51,7 +51,7 @@ service-{本机IP}-{时间戳}
 ### 3.1 使用本地文件
 
 ```python
-from pycloud_parallel.controlplane.client import Service
+from pycloud_parallel.execution.service_session import Service
 
 group = Service.deploy_from_infocenter(
     infocenter_target="127.0.0.1:50051",

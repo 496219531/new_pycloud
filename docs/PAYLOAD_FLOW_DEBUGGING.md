@@ -140,7 +140,7 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 如果你希望连普通 HTTP 请求 debug 也一起打开，可以再加：
 
 ```python
-logging.getLogger("pycloud_parallel.controlplane.client").setLevel(logging.DEBUG)
+logging.getLogger("pycloud_parallel.controlplane.gateway_client").setLevel(logging.DEBUG)
 ```
 
 ### 4.2 调试服务端 / Gateway / NodeControl

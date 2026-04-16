@@ -11,7 +11,7 @@ import uuid
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlencode, urlparse
 
-from pycloud_parallel.controlplane.client_transport import (
+from .client_transport import (
     _decode_http_response_body,
     _serialize_http_call_payload,
 )

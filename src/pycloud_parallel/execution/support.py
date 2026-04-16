@@ -519,7 +519,7 @@ def _prepare_managed_global_value_for_upload(
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
 ) -> Any:
-    inline_size = estimate_payload_inline_size(value)
+    inline_size = _estimate_managed_global_inline_size(value)
     if inline_size <= max(1, int(object_threshold_bytes)):
         log_payload_flow(
             "managed_global_inline",
@@ -585,6 +585,16 @@ def _prepare_task_payload_for_submit(
 ) -> Any:
     policy = _policy_with_soft_limit(get_payload_policy("task_submit"), object_threshold_bytes)
     return _prepare_payload_for_policy([client], payload, policy=policy)
+
+
+def _prepare_http_payload_for_call(
+    clients: Sequence[Any],
+    payload: Optional[Dict[str, object]],
+    *,
+    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+) -> Dict[str, object]:
+    policy = _policy_with_soft_limit(get_payload_policy("http_call"), object_threshold_bytes)
+    return _prepare_payload_for_policy(clients, payload, policy=policy)
 
 
 def _default_job_update_globals_for_blob(blob: bytes, *, package_format: str) -> Optional[object]:
@@ -1449,10 +1459,14 @@ __all__ = [
     "_load_job_client_session_cache",
     "_normalize_job_update_globals_arg",
     "_prepare_code_blob",
+    "_prepare_http_payload_for_call",
     "_prepare_job_blob_submit_fields",
     "_prepare_job_submit_payload_for_call",
+    "_prepare_managed_global_value_for_upload",
     "_prepare_managed_globals_values_for_upload",
+    "_prepare_local_artifact_for_upload",
     "_prepare_task_payload_for_submit",
+    "_package_paths_to_targz",
     "_put_data_via_clients",
     "_resolve_high_level_service_data",
     "_resolve_high_level_service_results",
@@ -1467,4 +1481,7 @@ __all__ = [
     "_timestamp_to_datetime",
     "_write_job_client_session_cache",
     "_write_private_json",
+    "_serialize_data_for_object_ref",
+    "_job_blob_requires_object_ref",
+    "_job_client_session_cache_file",
 ]

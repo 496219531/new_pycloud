@@ -14,7 +14,9 @@ from urllib.request import Request, urlopen
 import grpc
 import pytest
 
-from pycloud_parallel.controlplane.client import GatewayServiceClient, InfoCenterClient, InfoCenterServiceRoute, NodeControlClient
+from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, InfoCenterServiceRoute
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.gateway_http import GatewayCallError, GatewayHttpApp
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache

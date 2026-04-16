@@ -36,7 +36,7 @@ group = Service.deploy_from_infocenter(
 import asyncio
 import time
 from pycloud_parallel import Service
-from pycloud_parallel.controlplane.client import GatewayServiceClient
+from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
 
 def check_service_exists(gateway_target: str, service_name: str) -> bool:

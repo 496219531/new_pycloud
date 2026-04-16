@@ -11,7 +11,7 @@ import re
 from typing import Any, BinaryIO, Dict, Optional, Sequence, Tuple
 import uuid
 
-from pycloud_parallel.controlplane.client_transport import _decode_http_request_body
+from .client_transport import _decode_http_request_body
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageFile, GatewayStageManager, GatewayStageRequest
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient

@@ -8,14 +8,10 @@ from pycloud_parallel.api.common import export as ApiExport
 from pycloud_parallel.api.pool import TaskPool as ApiTaskPool
 from pycloud_parallel.api.queue import JobQueue as ApiJobQueue
 from pycloud_parallel.api.service import Service as ApiService
-from pycloud_parallel.controlplane import Artifact as ControlplaneArtifact
-from pycloud_parallel.controlplane import ArtifactDeps as ControlplaneArtifactDeps
-from pycloud_parallel.controlplane import ArtifactExports as ControlplaneArtifactExports
-from pycloud_parallel.controlplane import DataRef as ControlplaneDataRef
-from pycloud_parallel.controlplane.client import Artifact as ClientArtifact
-from pycloud_parallel.controlplane.client import ArtifactDeps as ClientArtifactDeps
-from pycloud_parallel.controlplane.client import ArtifactExports as ClientArtifactExports
-from pycloud_parallel.controlplane.client import DataRef as ClientDataRef
+from pycloud_parallel.controlplane.artifact import Artifact as ControlplaneArtifact
+from pycloud_parallel.controlplane.artifact import ArtifactDeps as ControlplaneArtifactDeps
+from pycloud_parallel.controlplane.artifact import ArtifactExports as ControlplaneArtifactExports
+from pycloud_parallel.data.ref import DataRef as ControlplaneDataRef
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -27,11 +23,11 @@ def test_top_level_v1_surface_reexports_api_classes():
     assert TopLevelExport is ApiExport
 
 
-def test_controlplane_artifact_reexports_client_class():
-    assert ControlplaneArtifact is ClientArtifact
-    assert ControlplaneArtifactDeps is ClientArtifactDeps
-    assert ControlplaneArtifactExports is ClientArtifactExports
-    assert ControlplaneDataRef is ClientDataRef
+def test_controlplane_artifact_and_data_modules_are_direct_authority():
+    assert ControlplaneArtifact.__module__ == "pycloud_parallel.controlplane.artifact"
+    assert ControlplaneArtifactDeps.__module__ == "pycloud_parallel.controlplane.artifact"
+    assert ControlplaneArtifactExports.__module__ == "pycloud_parallel.controlplane.artifact"
+    assert ControlplaneDataRef.__module__ == "pycloud_parallel.data.ref"
 
 
 def test_proto_messages_expose_node_instance_id_fields():

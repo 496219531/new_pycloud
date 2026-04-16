@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 
-from pycloud_parallel.controlplane.client import _decode_http_request_body
+from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, data_ref_to_payload
 from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
@@ -14,6 +14,8 @@ from pycloud_parallel.controlplane.payload_transport import (
     normalize_inbound_payload,
     prepare_outbound_payload,
 )
+
+_decode_http_request_body = client_transport_mod._decode_http_request_body
 
 
 def _fake_object_ref(*, object_id_suffix: str = "a", format: str = "bin", consume_on_read: bool = False) -> NodeStoredRef:

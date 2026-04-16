@@ -74,7 +74,7 @@ result = await group.add(10, b=20)
 ### 场景 2: HTTP 调用（自动使用 HTTP 风格）
 
 ```python
-from pycloud_parallel.controlplane.client import GatewayServiceClient
+from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
 # HTTP 客户端 → payload 直接传递
 with GatewayServiceClient("127.0.0.1:50051") as client:

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 
 def test_prepare_task_payload_for_submit_uses_task_submit_policy(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import _prepare_task_payload_for_submit
+    from pycloud_parallel.execution.support import _prepare_task_payload_for_submit
 
     captured = {}
 
@@ -16,7 +16,7 @@ def test_prepare_task_payload_for_submit_uses_task_submit_policy(monkeypatch) ->
         return dict(payload or {})
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.prepare_outbound_payload",
+        "pycloud_parallel.execution.support.prepare_outbound_payload",
         _fake_prepare,
     )
 

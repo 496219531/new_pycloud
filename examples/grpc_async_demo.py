@@ -1,6 +1,6 @@
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import Service
+from pycloud_parallel import Service
 
 
 async def main():

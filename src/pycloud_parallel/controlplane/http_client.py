@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.client_transport import _normalize_http_response_body
+from .client_transport import _normalize_http_response_body
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 logger = logging.getLogger(__name__)

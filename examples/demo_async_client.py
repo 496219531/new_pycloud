@@ -6,7 +6,7 @@ PyCloud 异步客户端示例
 """
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import Service
+from pycloud_parallel import Service
 
 
 def main():

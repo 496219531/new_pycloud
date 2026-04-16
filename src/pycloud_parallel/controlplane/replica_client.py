@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.client_transport import (
+from .client_transport import (
     _normalize_http_response_body,
     _serialize_http_call_payload,
 )

@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from pycloud_parallel.controlplane.client import InfoCenterClient
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec

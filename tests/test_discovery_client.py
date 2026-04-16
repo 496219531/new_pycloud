@@ -12,16 +12,11 @@ from unittest.mock import patch
 import grpc
 import pytest
 
-from pycloud_parallel.controlplane.client import (
-    DiscoveryCallError,
-    DiscoveryServiceClient,
-    InfoCenterClient,
-    InfoCenterServiceRoute,
-    NodeControlClient,
-    _DiscoveryRouteCache,
-    _ServiceRouteSnapshot,
-)
-from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade
+from pycloud_parallel.controlplane import client_transport as client_transport_mod
+from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade, DiscoveryServiceClient
+from pycloud_parallel.controlplane.discovery_route_cache import _DiscoveryRouteCache, _ServiceRouteSnapshot
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, InfoCenterServiceRoute
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.controlplane.data_ref import DataRef
 from pycloud_parallel.data.object_ref import NodeStoredRef
@@ -30,6 +25,8 @@ from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+
+DiscoveryCallError = client_transport_mod.DiscoveryCallError
 
 
 def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) -> bool:

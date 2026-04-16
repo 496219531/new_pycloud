@@ -10,7 +10,7 @@ PyCloud Gateway 完整演示
 
 import asyncio
 import time
-from pycloud_parallel.controlplane.client import GatewayServiceClient
+from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 from pycloud_parallel import (
     Service,
 )

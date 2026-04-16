@@ -17,11 +17,8 @@ from __future__ import annotations
 import asyncio
 import time
 
-from pycloud_parallel.controlplane.client import (
-    DiscoveryCallerFacade,
-    DiscoveryServiceClient,
-    InfoCenterClient,
-)
+from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade, DiscoveryServiceClient
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
 
 def _wait_for_service_name(

@@ -9,7 +9,7 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 def test_prepare_artifact_applies_service_and_task_defaults() -> None:
-    from pycloud_parallel.controlplane.client import Artifact, _normalize_artifact_input, _prepare_artifact
+    from pycloud_parallel.controlplane.artifact import Artifact, _normalize_artifact_input, _prepare_artifact
 
     artifact = Artifact.from_bytes(
         b"def run(**_kwargs):\n    return {'ok': True}\n",
@@ -37,7 +37,8 @@ def test_prepare_artifact_applies_service_and_task_defaults() -> None:
 
 
 def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None:
-    from pycloud_parallel.controlplane.client import Artifact, ArtifactDeps, ArtifactExports, Service
+    from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps, ArtifactExports
+    from pycloud_parallel.execution.service_session import Service
 
     fake_node = SimpleNamespace(
         node_id="node-1",
@@ -123,7 +124,7 @@ def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None
 
 def test_task_pool_session_from_infocenter_accepts_artifact() -> None:
     from pycloud_parallel import TaskPool
-    from pycloud_parallel.controlplane.client import Artifact, ArtifactDeps
+    from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
     create_calls = []
@@ -154,8 +155,8 @@ def test_task_pool_session_from_infocenter_accepts_artifact() -> None:
         deps=ArtifactDeps.allow_install(["numpy==2.1.0"]),
     )
 
-    with patch("pycloud_parallel.controlplane.client.InfoCenterClient") as mocked_infocenter, patch(
-        "pycloud_parallel.controlplane.client.NodeControlClient.create_task_pool_from_bytes",
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
         side_effect=_fake_create_task_pool_from_bytes,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
@@ -182,7 +183,7 @@ def test_task_pool_session_from_infocenter_accepts_artifact() -> None:
 
 
 def test_prepare_artifact_accepts_public_deps_override() -> None:
-    from pycloud_parallel.controlplane.client import ArtifactDeps, _normalize_artifact_input, _prepare_artifact
+    from pycloud_parallel.controlplane.artifact import ArtifactDeps, _normalize_artifact_input, _prepare_artifact
 
     normalized = _normalize_artifact_input(
         consumer_kind="task",
@@ -201,7 +202,7 @@ def test_prepare_artifact_accepts_public_deps_override() -> None:
 
 
 def test_artifact_from_path_packages_directory(tmp_path) -> None:
-    from pycloud_parallel.controlplane.client import Artifact, ArtifactExports, _prepare_artifact
+    from pycloud_parallel.controlplane.artifact import Artifact, ArtifactExports, _prepare_artifact
 
     pkg_dir = tmp_path / "demo_pkg"
     pkg_dir.mkdir()

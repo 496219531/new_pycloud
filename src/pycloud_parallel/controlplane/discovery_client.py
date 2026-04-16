@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Set
 
-from pycloud_parallel.controlplane.client_transport import (
+from .client_transport import (
     DiscoveryCallError,
     _call_route_http,
     _is_route_failure,

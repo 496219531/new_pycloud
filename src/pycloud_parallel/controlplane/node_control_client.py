@@ -20,7 +20,7 @@ from pycloud_parallel.controlplane.artifact import (
     _normalize_entry_module_arg,
     _resolve_package_format,
 )
-from pycloud_parallel.controlplane.client_transport import _materialize_downloaded_result
+from .client_transport import _materialize_downloaded_result
 from pycloud_parallel.controlplane.config import (
     FILE_HASH_CHUNK_SIZE_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,

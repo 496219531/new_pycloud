@@ -1,24 +1,19 @@
-"""PyCloud control-plane components.
-
-Imports are intentionally lazy to avoid side effects on module startup.
-"""
+"""PyCloud control-plane infrastructure package."""
 
 from __future__ import annotations
 
-import importlib
 from typing import TYPE_CHECKING, Any
 
-_CLIENT_EXPORTS = {
-    "Artifact",
-    "ArtifactDeps",
-    "ArtifactExports",
-    "DataRef",
-    "pycloud_export",
+_INFRA_EXPORTS = {
     "DiscoveryServiceClient",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
+    "InfoCenterNodeService",
+    "InfoCenterNodeTaskPool",
     "InfoCenterServiceRoute",
+    "NodeCircuitState",
+    "NodeControlClient",
 }
 
 _CONTROLPLANE_DEP_HINT = (
@@ -27,88 +22,78 @@ _CONTROLPLANE_DEP_HINT = (
 )
 
 
-def _import_client_module() -> Any:
-    try:
-        return importlib.import_module(".client", __name__)
-    except ModuleNotFoundError as exc:
-        missing = str(getattr(exc, "name", "") or "")
-        if missing == "grpc" or missing == "google" or missing.startswith("google."):
-            raise ModuleNotFoundError(_CONTROLPLANE_DEP_HINT) from exc
-        raise
-
-
 if TYPE_CHECKING:
-    from .client import (
-        Artifact,
-        ArtifactDeps,
-        ArtifactExports,
-        DataRef,
-        DiscoveryServiceClient,
-        GatewayServiceClient,
+    from .discovery_client import DiscoveryServiceClient
+    from .gateway_client import GatewayServiceClient
+    from .infocenter_client import (
         InfoCenterClient,
         InfoCenterNode,
+        InfoCenterNodeService,
+        InfoCenterNodeTaskPool,
         InfoCenterServiceRoute,
-        pycloud_export,
+        NodeCircuitState,
     )
+    from .node_control_client import NodeControlClient
 
 
-def _try_bind_client_exports() -> None:
+def _try_bind_infra_exports() -> None:
     try:
-        from .client import (
-            Artifact,
-            ArtifactDeps,
-            ArtifactExports,
-            DataRef,
-            DiscoveryServiceClient,
-            GatewayServiceClient,
+        from .discovery_client import DiscoveryServiceClient
+        from .gateway_client import GatewayServiceClient
+        from .infocenter_client import (
             InfoCenterClient,
             InfoCenterNode,
+            InfoCenterNodeService,
+            InfoCenterNodeTaskPool,
             InfoCenterServiceRoute,
-            pycloud_export,
+            NodeCircuitState,
         )
+        from .node_control_client import NodeControlClient
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
-        if missing == "grpc" or missing == "google" or missing.startswith("google."):
+        if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
             return
         raise
 
     globals().update(
         {
-            "Artifact": Artifact,
-            "ArtifactDeps": ArtifactDeps,
-            "ArtifactExports": ArtifactExports,
-            "DataRef": DataRef,
-            "pycloud_export": pycloud_export,
             "DiscoveryServiceClient": DiscoveryServiceClient,
             "GatewayServiceClient": GatewayServiceClient,
             "InfoCenterClient": InfoCenterClient,
             "InfoCenterNode": InfoCenterNode,
+            "InfoCenterNodeService": InfoCenterNodeService,
+            "InfoCenterNodeTaskPool": InfoCenterNodeTaskPool,
             "InfoCenterServiceRoute": InfoCenterServiceRoute,
+            "NodeCircuitState": NodeCircuitState,
+            "NodeControlClient": NodeControlClient,
         }
     )
 
-def __getattr__(name: str):
-    if name in _CLIENT_EXPORTS:
-        module = _import_client_module()
-        value = getattr(module, name)
-        globals()[name] = value
-        return value
+
+_try_bind_infra_exports()
+
+
+def __getattr__(name: str) -> Any:
+    if name in _INFRA_EXPORTS and name not in globals():
+        _try_bind_infra_exports()
+        if name in globals():
+            return globals()[name]
+        raise ModuleNotFoundError(_CONTROLPLANE_DEP_HINT)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals().keys()) | _CLIENT_EXPORTS)
+    return sorted(set(globals().keys()) | _INFRA_EXPORTS)
 
 
 __all__ = [
-    "Artifact",
-    "ArtifactDeps",
-    "ArtifactExports",
-    "DataRef",
-    "pycloud_export",
     "DiscoveryServiceClient",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
+    "InfoCenterNodeService",
+    "InfoCenterNodeTaskPool",
     "InfoCenterServiceRoute",
+    "NodeCircuitState",
+    "NodeControlClient",
 ]

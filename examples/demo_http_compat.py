@@ -127,7 +127,7 @@ def main():
 
         # === 方式 4: HTTP 风格 (使用 GatewayServiceClient) ===
         print("4️⃣  HTTP 风格 (直接传字典)")
-        from pycloud_parallel.controlplane.client import GatewayServiceClient
+        from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
         with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
             print("   调用: client.call(service_name='compat-demo', method='add', payload={'a': 100, 'b': 200})")

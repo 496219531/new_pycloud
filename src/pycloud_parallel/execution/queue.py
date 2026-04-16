@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set
 
 from pycloud_parallel.controlplane.artifact import _default_entry_module_for_module, _resolve_package_format
-from pycloud_parallel.controlplane.client_transport import DiscoveryCallError, _call_route_http, _is_route_failure
+from pycloud_parallel.controlplane import client_transport as _client_transport
 from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
 from pycloud_parallel.execution.support import (
     _JOB_UPDATE_GLOBALS_AUTO,
@@ -31,6 +31,10 @@ from pycloud_parallel.execution.support import (
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
+
+DiscoveryCallError = _client_transport.DiscoveryCallError
+_call_route_http = _client_transport._call_route_http
+_is_route_failure = _client_transport._is_route_failure
 
 
 def _infocenter_client(*args, **kwargs):

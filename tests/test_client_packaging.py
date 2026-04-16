@@ -61,7 +61,7 @@ def test_dependency_packager_function_is_deterministic_and_skips_bytecode(tmp_pa
 
 
 def test_prepare_code_blob_from_directory_is_deterministic_and_skips_bytecode(tmp_path):
-    from pycloud_parallel.controlplane.client import _prepare_code_blob
+    from pycloud_parallel.execution.support import _prepare_code_blob
 
     artifact_dir = tmp_path / "artifact_dir"
     artifact_dir.mkdir()
@@ -89,7 +89,7 @@ def test_prepare_code_blob_from_directory_is_deterministic_and_skips_bytecode(tm
 
 
 def test_prepare_code_blob_from_path_list_uses_deterministic_targz(tmp_path):
-    from pycloud_parallel.controlplane.client import _prepare_code_blob
+    from pycloud_parallel.execution.support import _prepare_code_blob
 
     pkg_dir = tmp_path / "bundle_pkg"
     pkg_dir.mkdir()
@@ -121,7 +121,7 @@ def test_prepare_code_blob_from_path_list_uses_deterministic_targz(tmp_path):
 
 
 def test_package_paths_to_targz_is_deterministic_and_relative(tmp_path):
-    from pycloud_parallel.controlplane.client import _package_paths_to_targz
+    from pycloud_parallel.execution.support import _package_paths_to_targz
 
     root_dir = tmp_path / "root"
     pkg_dir = root_dir / "pkg"
@@ -156,7 +156,7 @@ def test_package_paths_to_targz_is_deterministic_and_relative(tmp_path):
 
 
 def test_prepare_code_blob_from_loaded_module_uses_whitelisted_python_file_closure(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane.client import _prepare_code_blob
+    from pycloud_parallel.execution.support import _prepare_code_blob
 
     package_dir = tmp_path / "calc_asset_ratio"
     package_dir.mkdir()
@@ -201,7 +201,7 @@ def test_prepare_code_blob_from_loaded_module_uses_whitelisted_python_file_closu
 
 
 def test_prepare_local_artifact_for_upload_directory_uses_actual_targz_format(tmp_path):
-    from pycloud_parallel.controlplane.client import _prepare_local_artifact_for_upload
+    from pycloud_parallel.execution.support import _prepare_local_artifact_for_upload
 
     artifact_dir = tmp_path / "artifact_dir"
     artifact_dir.mkdir()
@@ -249,7 +249,8 @@ def test_package_module_for_debug_writes_local_tar_and_lists_entries(tmp_path, m
 
 
 def test_upload_code_from_file_directory_reuses_prepared_artifact(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane.client import ArtifactDeps, NodeControlClient
+    from pycloud_parallel.controlplane.artifact import ArtifactDeps
+    from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
     artifact_dir = tmp_path / "artifact_dir"
     artifact_dir.mkdir()
@@ -281,7 +282,8 @@ def test_upload_code_from_file_directory_reuses_prepared_artifact(tmp_path, monk
 
 
 def test_create_service_from_file_directory_reuses_prepared_artifact(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane.client import ArtifactDeps, NodeControlClient
+    from pycloud_parallel.controlplane.artifact import ArtifactDeps
+    from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
     artifact_dir = tmp_path / "artifact_dir"
     artifact_dir.mkdir()

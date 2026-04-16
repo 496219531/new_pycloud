@@ -8,7 +8,8 @@ import time
 import grpc
 from typing import Tuple
 
-from pycloud_parallel.controlplane.client import InfoCenterClient, Service
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+from pycloud_parallel.execution.service_session import Service
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.infocenter.state import InfoCenterState

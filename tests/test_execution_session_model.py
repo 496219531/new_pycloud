@@ -78,7 +78,7 @@ def test_task_pool_replica_state_snapshot_views() -> None:
 
 
 def test_service_session_client_identity_and_snapshot() -> None:
-    from pycloud_parallel.controlplane.client import ServiceSessionClient
+    from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 
     now = _utc_now()
     client = ServiceSessionClient(
@@ -108,7 +108,7 @@ def test_service_session_client_identity_and_snapshot() -> None:
 
 
 def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() -> None:
-    from pycloud_parallel.controlplane.client import NativeTaskPoolClient
+    from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 
     grpc_client = MagicMock()
     grpc_client.update_runtime_globals_prepared.return_value = SimpleNamespace(globals_digest="sha256:digest")
@@ -135,7 +135,8 @@ def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() ->
 
 
 def test_service_group_exposes_replicas_and_snapshot() -> None:
-    from pycloud_parallel.controlplane.client import Service, ServiceSessionClient
+    from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
+    from pycloud_parallel.execution.service_session import Service
 
     now = _utc_now()
     replica = ServiceSessionClient(
@@ -168,7 +169,7 @@ def test_service_group_exposes_replicas_and_snapshot() -> None:
 
 def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
     from pycloud_parallel import TaskPool
-    from pycloud_parallel.controlplane.client import NativeTaskPoolClient
+    from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 
     now = _utc_now()
     pool = NativeTaskPoolClient(

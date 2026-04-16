@@ -8,7 +8,7 @@ from unittest.mock import patch
 import grpc
 
 from pycloud_parallel import JobQueue
-from pycloud_parallel.controlplane.client import InfoCenterClient
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.server import (
     build_gateway_server,
     build_infocenter_server,

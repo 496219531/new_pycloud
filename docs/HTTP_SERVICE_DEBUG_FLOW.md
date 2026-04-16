@@ -30,7 +30,7 @@
 
 关键位置：
 
-1. `src/pycloud_parallel/controlplane/client.py`
+1. `src/pycloud_parallel/controlplane/gateway_client.py`
 2. gateway caller facade 从 caller facade 模块开始
 3. `GatewayServiceClient.call()` 在 `1365` 左右
 

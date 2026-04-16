@@ -1,5 +1,5 @@
 import time
-from pycloud_parallel.controlplane.client import Service
+from pycloud_parallel import Service
 
 def main():
     # 你的业务代码（也可以用 artifact_path 指向本地 .py 文件）

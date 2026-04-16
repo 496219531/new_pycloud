@@ -631,7 +631,7 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
 
 
 def test_job_queue_manager_submit_job_tracks_controlplane_data_ref_in_nested_business_blob_ref() -> None:
-    from pycloud_parallel.controlplane.client import DataRef
+    from pycloud_parallel.data.ref import DataRef
 
     queue = JobQueueManager()
 
@@ -663,7 +663,7 @@ def test_job_queue_manager_submit_job_tracks_controlplane_data_ref_in_nested_bus
 
 
 def test_resolve_payload_data_refs_falls_back_across_replicas(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
     from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs
 
@@ -763,7 +763,7 @@ def test_submit_job_rejects_nested_unresolvable_business_blob_ref() -> None:
 
 
 def test_job_queue_manager_close_releases_staged_refs(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import DataRef
+    from pycloud_parallel.data.ref import DataRef
 
     released = []
     queue = JobQueueManager()
@@ -957,19 +957,19 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_finalize_when_present
 
 
 def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import _prepare_job_blob_submit_fields
+    from pycloud_parallel.execution.support import _prepare_job_blob_submit_fields
     from pycloud_parallel.data.object_ref import NodeStoredRef
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._job_blob_requires_object_ref",
+        "pycloud_parallel.execution.support._job_blob_requires_object_ref",
         lambda blob: True,
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.InfoCenterClient.select_task_nodes",
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.select_task_nodes",
         lambda self, **kwargs: [SimpleNamespace(control_addr="127.0.0.1:50061")],
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.NodeControlClient.upload_object_from_bytes",
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.upload_object_from_bytes",
         lambda self, **kwargs: NodeStoredRef(
             object_id="sha256:" + ("a" * 64),
             format="tar.gz",
@@ -990,7 +990,8 @@ def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypat
 
 
 def test_prepare_job_submit_payload_for_call_preserves_staged_update_globals(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.client import DataRef, _prepare_job_submit_payload_for_call
+    from pycloud_parallel.data.ref import DataRef
+    from pycloud_parallel.execution.support import _prepare_job_submit_payload_for_call
 
     class _FakeUploadClient:
         def close(self) -> None:
@@ -1008,11 +1009,11 @@ def test_prepare_job_submit_payload_for_call_preserves_staged_update_globals(mon
     )
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._job_submit_upload_clients",
+        "pycloud_parallel.execution.support._job_submit_upload_clients",
         lambda **kwargs: [_FakeUploadClient()],
     )
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client.prepare_outbound_payload",
+        "pycloud_parallel.execution.support.prepare_outbound_payload",
         lambda payload, **kwargs: {**dict(payload or {}), "artifact_path": "prepared-object-ref"},
     )
 
@@ -1045,7 +1046,7 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
     captured = {}
 
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.client._job_submit_upload_clients",
+        "pycloud_parallel.execution.support._job_submit_upload_clients",
         lambda **kwargs: [],
     )
 
@@ -1068,7 +1069,7 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
 
 def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -> None:
     from pycloud_parallel import DataRef, JobQueue
-    import pycloud_parallel.controlplane.client as client_mod
+    import pycloud_parallel.execution.support as client_mod
     from pycloud_parallel.data.object_ref import NodeStoredRef
 
     monkeypatch.setattr("pycloud_parallel.execution.support.INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 32)
@@ -1226,7 +1227,7 @@ def test_job_queue_client_rotates_expired_cached_session(monkeypatch, tmp_path) 
     monkeypatch.setenv("PYCLOUD_JOB_CLIENT_SESSION_DIR", str(tmp_path))
 
     from pycloud_parallel import JobQueue
-    from pycloud_parallel.controlplane.client import _job_client_session_cache_file
+    from pycloud_parallel.execution.support import _job_client_session_cache_file
 
     first = JobQueue("127.0.0.1:50051", client_id="client-cache")
     cache_path = _job_client_session_cache_file(
@@ -1271,7 +1272,7 @@ def test_job_queue_client_recent_job_ids_tracks_and_restores(monkeypatch, tmp_pa
 
 def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch) -> None:
     from pycloud_parallel import JobQueue
-    from pycloud_parallel.controlplane.client import InfoCenterServiceRoute
+    from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
     from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
     route = InfoCenterServiceRoute(
@@ -1354,7 +1355,7 @@ def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
     module = types.ModuleType(module_name)
     exec(module_blob.decode("utf-8"), module.__dict__)
 
-    with patch("pycloud_parallel.controlplane.client._prepare_code_blob", return_value=(module_blob, f"{module_name}.tar.gz")):
+    with patch("pycloud_parallel.execution.support._prepare_code_blob", return_value=(module_blob, f"{module_name}.tar.gz")):
         resp = client.submit_job_from_module(module=module)
     assert resp == {"ok": True}
     assert captured["client_id"] == "client-module"
@@ -1397,7 +1398,7 @@ def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> 
     )
 
     with patch(
-        "pycloud_parallel.controlplane.client._prepare_code_blob",
+        "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_globals.tar.gz"),
     ):
         resp = client.submit_job_from_module(module=module)
@@ -1433,7 +1434,7 @@ def test_job_queue_client_submit_job_from_module_auto_binds_handle_data_alias() 
     )
 
     with patch(
-        "pycloud_parallel.controlplane.client._prepare_code_blob",
+        "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_handle_data.tar.gz"),
     ):
         resp = client.submit_job_from_module(module=module)
@@ -1470,7 +1471,7 @@ def test_job_queue_client_submit_job_from_module_auto_binds_finalize_when_presen
     )
 
     with patch(
-        "pycloud_parallel.controlplane.client._prepare_code_blob",
+        "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_finalize.tar.gz"),
     ):
         resp = client.submit_job_from_module(module=module)
@@ -1504,7 +1505,7 @@ def test_job_queue_client_submit_job_from_module_accepts_update_globals_dict() -
     )
 
     with patch(
-        "pycloud_parallel.controlplane.client._prepare_code_blob",
+        "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_explicit_globals.tar.gz"),
     ):
         resp = client.submit_job_from_module(module=module, update_globals={"cfg": {"mode": "manual"}})

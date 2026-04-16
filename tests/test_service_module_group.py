@@ -38,7 +38,7 @@ class TestCallProxy:
 
     def test_repr(self):
         """测试 __repr__ 方法。"""
-        from pycloud_parallel.controlplane.client import _CallProxy
+        from pycloud_parallel.execution.call_proxy import _CallProxy
 
         mock_group = MagicMock()
         proxy = _CallProxy("square", mock_group)
@@ -47,7 +47,7 @@ class TestCallProxy:
 
     def test_method_property(self):
         """测试 method 属性。"""
-        from pycloud_parallel.controlplane.client import _CallProxy
+        from pycloud_parallel.execution.call_proxy import _CallProxy
 
         mock_group = MagicMock()
         proxy = _CallProxy("fibonacci", mock_group)
@@ -56,7 +56,7 @@ class TestCallProxy:
 
     def test_sync_property(self):
         """测试 sync 属性。"""
-        from pycloud_parallel.controlplane.client import _CallProxy, _SyncCallProxy
+        from pycloud_parallel.execution.call_proxy import _CallProxy, _SyncCallProxy
 
         mock_group = MagicMock()
         proxy = _CallProxy("square", mock_group)
@@ -68,7 +68,7 @@ class TestCallProxy:
 
     def test_broadcast_property(self):
         """测试 broadcast 属性。"""
-        from pycloud_parallel.controlplane.client import _CallProxy, _BroadcastProxy
+        from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 
         mock_group = MagicMock()
         proxy = _CallProxy("square", mock_group)
@@ -80,7 +80,7 @@ class TestCallProxy:
 
     def test_with_options(self):
         """测试 with_options 方法。"""
-        from pycloud_parallel.controlplane.client import _CallProxy
+        from pycloud_parallel.execution.call_proxy import _CallProxy
 
         mock_group = MagicMock()
         proxy = _CallProxy("square", mock_group, timeout_sec=60.0)
@@ -93,7 +93,7 @@ class TestCallProxy:
 
     def test_async_call(self):
         """测试异步调用。"""
-        from pycloud_parallel.controlplane.client import _CallProxy
+        from pycloud_parallel.execution.call_proxy import _CallProxy
 
         mock_group = AsyncMock()
         mock_group.acall_balanced = AsyncMock(return_value=("node1", {"data": {"result": 49}}))
@@ -115,7 +115,7 @@ class TestCallProxy:
 
     def test_await_syntax(self):
         """测试 await 语法。"""
-        from pycloud_parallel.controlplane.client import _CallProxy
+        from pycloud_parallel.execution.call_proxy import _CallProxy
 
         mock_group = AsyncMock()
         mock_group.acall_balanced = AsyncMock(return_value=("node1", {"data": {"y": 100}}))
@@ -133,7 +133,7 @@ class TestSyncCallProxy:
 
     def test_repr(self):
         """测试 __repr__ 方法。"""
-        from pycloud_parallel.controlplane.client import _SyncCallProxy
+        from pycloud_parallel.execution.call_proxy import _SyncCallProxy
 
         mock_group = MagicMock()
         proxy = _SyncCallProxy("square", mock_group)
@@ -142,7 +142,7 @@ class TestSyncCallProxy:
 
     def test_sync_call(self):
         """测试同步调用。"""
-        from pycloud_parallel.controlplane.client import _SyncCallProxy
+        from pycloud_parallel.execution.call_proxy import _SyncCallProxy
 
         mock_group = MagicMock()
         mock_group.call_balanced = MagicMock(return_value=("node1", {"data": {"result": 64}}))
@@ -159,7 +159,7 @@ class TestBroadcastProxy:
 
     def test_repr(self):
         """测试 __repr__ 方法。"""
-        from pycloud_parallel.controlplane.client import _BroadcastProxy
+        from pycloud_parallel.execution.call_proxy import _BroadcastProxy
 
         mock_group = MagicMock()
         proxy = _BroadcastProxy("square", mock_group)
@@ -168,7 +168,7 @@ class TestBroadcastProxy:
 
     def test_async_broadcast(self):
         """测试异步广播调用。"""
-        from pycloud_parallel.controlplane.client import _BroadcastProxy
+        from pycloud_parallel.execution.call_proxy import _BroadcastProxy
 
         mock_group = AsyncMock()
         mock_results = [
@@ -194,7 +194,7 @@ class TestOwnerServiceFacade:
         from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
-        with patch("pycloud_parallel.controlplane.client.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
+        with patch("pycloud_parallel.execution.service_session.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
             result = OwnerServiceFacade.deploy_from_bytes(
                 infocenter_target="127.0.0.1:50051",
                 blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
@@ -210,7 +210,7 @@ class TestOwnerServiceFacade:
         from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
-        with patch("pycloud_parallel.controlplane.client.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
+        with patch("pycloud_parallel.execution.service_session.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
             result = OwnerServiceFacade.deploy_from_bytes(
                 infocenter_target="127.0.0.1:50051",
                 blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
@@ -224,17 +224,17 @@ class TestOwnerServiceFacade:
 
     def test_managed_global_large_value_uses_dataref_upload(self):
         """测试超阈值 managed global 会强制转成 DataRef。"""
-        from pycloud_parallel.controlplane.client import _prepare_managed_global_value_for_upload
+        from pycloud_parallel.execution.support import _prepare_managed_global_value_for_upload
         from pycloud_parallel.controlplane.data_ref import DataRef
         from pycloud_parallel.data.object_ref import NodeStoredRef
 
         ref = NodeStoredRef(object_id="sha256:" + "a" * 64, format="parquet", size_bytes=123, materialize_as="dataframe")
         with patch(
-            "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
+            "pycloud_parallel.execution.support._estimate_managed_global_inline_size",
             return_value=1024,
         ):
             with patch(
-                "pycloud_parallel.controlplane.client._put_data_via_clients",
+                "pycloud_parallel.execution.support._put_data_via_clients",
                 return_value=ref,
             ) as mocked:
                 prepared = _prepare_managed_global_value_for_upload(
@@ -249,14 +249,14 @@ class TestOwnerServiceFacade:
 
     def test_managed_global_large_value_upload_failure_raises(self):
         """测试超阈值 managed global 上传失败时不能静默回退 inline。"""
-        from pycloud_parallel.controlplane.client import _prepare_managed_global_value_for_upload
+        from pycloud_parallel.execution.support import _prepare_managed_global_value_for_upload
 
         with patch(
-            "pycloud_parallel.controlplane.client._estimate_managed_global_inline_size",
+            "pycloud_parallel.execution.support._estimate_managed_global_inline_size",
             return_value=1024,
         ):
             with patch(
-                "pycloud_parallel.controlplane.client._put_data_via_clients",
+                "pycloud_parallel.execution.support._put_data_via_clients",
                 side_effect=RuntimeError("parquet engine missing"),
             ):
                 with pytest.raises(ValueError, match="large-object upload failed"):
@@ -268,7 +268,7 @@ class TestOwnerServiceFacade:
 
     def test_service_session_cache_lock_rejects_second_local_owner(self, tmp_path):
         """测试同一个 session cache 文件不能被第二个本地 deploy 进程持有。"""
-        from pycloud_parallel.controlplane.client import _ServiceSessionFileLock
+        from pycloud_parallel.execution.service_session import _ServiceSessionFileLock
 
         path = tmp_path / "owner" / "svc.json"
         first = _ServiceSessionFileLock(path).acquire()
@@ -454,7 +454,7 @@ class TestOwnerServiceFacade:
         assert result == {"result": 100}
 
     def test_deploy_from_infocenter_emits_message_when_no_nodes(self, capsys):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
 
         with patch(
             "pycloud_parallel.execution.service_session._retry_infocenter_request",
@@ -476,7 +476,7 @@ class TestOwnerServiceFacade:
         assert "127.0.0.1:50051" in err
 
     def test_deploy_from_infocenter_emits_success_message(self, tmp_path, capsys):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         fake_node = SimpleNamespace(
@@ -541,7 +541,7 @@ class TestOwnerServiceFacade:
             client.close()
 
     def test_deploy_from_infocenter_packages_module_object_entry_module(self, tmp_path, monkeypatch):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module(tmp_path, monkeypatch)
@@ -617,7 +617,7 @@ class TestOwnerServiceFacade:
                 client.close()
 
     def test_deploy_from_infocenter_packages_callable_object_entry_callable(self, tmp_path, monkeypatch):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module(tmp_path, monkeypatch)
@@ -693,7 +693,7 @@ class TestOwnerServiceFacade:
                 client.close()
 
     def test_join_emits_failure_summary(self, capsys):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
 
         failed_session = SimpleNamespace(
             failed=True,
@@ -714,7 +714,7 @@ class TestOwnerServiceFacade:
         assert "node-1" in err
 
     def test_service_group_update_globals_prepares_values_once_for_all_nodes(self):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
@@ -744,7 +744,7 @@ class TestOwnerServiceFacade:
         session_b.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
 
     def test_service_group_update_globals_prunes_failed_nodes(self):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:same"))
@@ -775,7 +775,7 @@ class TestOwnerServiceFacade:
         client_b.close.assert_called_once()
 
     def test_service_group_update_globals_allows_per_node_digests(self):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(return_value=SimpleNamespace(globals_digest="sha256:a"))
@@ -801,7 +801,7 @@ class TestOwnerServiceFacade:
         assert group.globals_digests == {"node-a": "sha256:a", "node-b": "sha256:b"}
 
     def test_service_group_update_globals_fails_when_all_nodes_fail(self):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
 
         session_a = SimpleNamespace(failed=False, last_error="")
         session_a.update_globals_prepared = MagicMock(side_effect=RuntimeError("node-a unavailable"))
@@ -822,7 +822,7 @@ class TestOwnerServiceFacade:
                 group.update_globals({"cfg": {"k": "v"}})
 
     def test_deploy_from_infocenter_clamps_worker_count_per_node_capacity(self, tmp_path):
-        from pycloud_parallel.controlplane.client import Service
+        from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
         node_a = SimpleNamespace(

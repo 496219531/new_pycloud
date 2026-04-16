@@ -7,7 +7,8 @@ from typing import Tuple
 import grpc
 
 from pycloud_parallel import JobQueue, TaskPool
-from pycloud_parallel.controlplane.client import InfoCenterClient, NodeControlClient
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.server import (
     build_gateway_server,
     build_infocenter_server,
