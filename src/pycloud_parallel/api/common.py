@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Shared public API values for the V1 migration path."""
+"""Shared public API values."""
 
 from pycloud_parallel.artifact import export
 from pycloud_parallel.data.ref import DataRef

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Future public Service API facade."""
+"""Public Service API."""
 
 from pycloud_parallel.execution.service_session import Service
 

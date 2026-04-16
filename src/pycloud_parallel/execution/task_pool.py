@@ -44,8 +44,8 @@ def _resolve_task_results_data(batch: Any, results: Sequence[pb2.TaskResult]) ->
     return [batch.fetch_result_data(item) for item in results]
 
 
-class NativePoolSession(TaskExecutionSession):
-    """Native dedicated task pool session backed by NodeControl task pool RPCs."""
+class _TaskPoolSessionBase(TaskExecutionSession):
+    """Internal dedicated task-pool session backed by NodeControl task pool RPCs."""
 
     def __init__(
         self,
@@ -1112,7 +1112,7 @@ class NativePoolSession(TaskExecutionSession):
             with contextlib.suppress(Exception):
                 pool._client.close()  # noqa: SLF001
 
-    def __enter__(self) -> "NativePoolSession":
+    def __enter__(self) -> "_TaskPoolSessionBase":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1140,13 +1140,13 @@ class NativePoolSession(TaskExecutionSession):
 
     def __repr__(self) -> str:
         if isinstance(self._backend, NativeTaskBackend) or self._backend is None:
-            return f"<NativePoolSession methods={self.methods} nodes={len(self.node_ids)}>"
+            return f"<{type(self).__name__} methods={self.methods} nodes={len(self.node_ids)}>"
         if self._backend is not None:
             return repr(self._backend)
-        return f"<NativePoolSession methods={self.methods} nodes={len(self.node_ids)}>"
+        return f"<{type(self).__name__} methods={self.methods} nodes={len(self.node_ids)}>"
 
 
-def _task_pool_session_from_infocenter(
+def _build_task_pool_from_infocenter(
     cls,
     *,
     infocenter_target: str,
@@ -1176,7 +1176,7 @@ def _task_pool_session_from_infocenter(
     node_count: int = 0,
     node_limit: int = 100,
     timeout_sec: float = 10.0,
-) -> "NativePoolSession":
+) -> "TaskPool":
     source_func = entry_func if entry_func is not None else func
     normalized_artifact = _normalize_artifact_input(
         consumer_kind="task",
@@ -1255,9 +1255,6 @@ def _task_pool_session_from_infocenter(
     return session
 
 
-NativePoolSession.from_infocenter = classmethod(_task_pool_session_from_infocenter)
-
-
 class _NativePoolResultAdapter:
     def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
         del target_path
@@ -1268,12 +1265,73 @@ class _NativePoolResultAdapter:
 
 
 __all__ = [
-    "NativePoolSession",
-    "_task_pool_session_from_infocenter",
     "_NativePoolResultAdapter",
     "TaskPool",
 ]
 
 
-class TaskPool(NativePoolSession):
-    """V1 execution-core task-pool session."""
+class TaskPool(_TaskPoolSessionBase):
+    """V1 task-pool session."""
+
+    @classmethod
+    def from_infocenter(
+        cls,
+        *,
+        infocenter_target: str,
+        job_id: str = "",
+        owner_client_id: Optional[str] = None,
+        pool_name: Optional[str] = None,
+        artifact: Optional[Any] = None,
+        deps: Optional[Any] = None,
+        entry_func: Optional[Callable] = None,
+        func: Optional[Callable] = None,
+        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
+        blob: Optional[bytes] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: Any = "run",
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        worker_count: int = 1,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        timeout_sec: float = 10.0,
+    ) -> "TaskPool":
+        return _build_task_pool_from_infocenter(
+            cls,
+            infocenter_target=infocenter_target,
+            job_id=job_id,
+            owner_client_id=owner_client_id,
+            pool_name=pool_name,
+            artifact=artifact,
+            deps=deps,
+            entry_func=entry_func,
+            func=func,
+            artifact_path=artifact_path,
+            blob=blob,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            timeout_sec=timeout_sec,
+        )

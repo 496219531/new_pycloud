@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Future public TaskPool API facade."""
+"""Public TaskPool API."""
 
 from pycloud_parallel.execution.task_pool import TaskPool
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Future public JobQueue API facade."""
+"""Public JobQueue API."""
 
 from pycloud_parallel.execution.queue import JobQueue
 
