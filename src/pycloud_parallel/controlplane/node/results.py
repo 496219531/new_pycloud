@@ -46,7 +46,7 @@ from pycloud_parallel.controlplane.serialization import (
     summarize_payload_flow_value,
 )
 from pycloud_parallel.controlplane.state_time import utc_now
-from pycloud_parallel.data.object_ref import (
+from pycloud_parallel.data.ref import (
     normalize_materialize_as,
     normalize_object_format,
     normalize_object_id,
@@ -54,7 +54,6 @@ from pycloud_parallel.data.object_ref import (
     object_id_from_sha256_hex,
     object_storage_path,
 )
-from pycloud_parallel.data.result_ref import NodeResultHandle
 
 
 _SEGMENT_WRITER_STATE: Dict[Tuple[str, int], str] = {}
@@ -649,7 +648,7 @@ def _data_store_for_object_dir(
     )
 
 
-def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) -> NodeResultHandle:
+def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) -> DataRef:
     return _data_store_for_object_dir("", node_id=node_id).result_ref_from_stored_artifact(result)
 
 

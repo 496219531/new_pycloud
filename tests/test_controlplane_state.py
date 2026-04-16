@@ -286,7 +286,7 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.data.result_ref import NodeResultHandle
+    from pycloud_parallel.data.ref import DataRef
 
     index = pd.MultiIndex.from_tuples(
         [(pd.Timestamp("2024-01-02"), "a"), (pd.Timestamp("2024-01-03"), "b")],
@@ -313,9 +313,13 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
 
         restored = _materialize_downloaded_result(
             Path(tmp_name),
-            result_ref=NodeResultHandle(
-                object_id="sha256:" + "b" * 64,
+            result_ref=DataRef(
+                ref_id="sha256:" + "b" * 64,
+                storage_id="sha256:" + "b" * 64,
+                logical_type="dataframe",
                 node_id="node-1",
+                locator_kind="node_control",
+                locator_token="",
                 format=fmt,
                 size_bytes=len(blob),
                 materialize_as="dataframe",
@@ -333,7 +337,7 @@ def test_series_object_upload_preserves_index_and_name():
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.data.result_ref import NodeResultHandle
+    from pycloud_parallel.data.ref import DataRef
 
     series = pd.Series(
         [1.1, 2.2],
@@ -356,9 +360,13 @@ def test_series_object_upload_preserves_index_and_name():
     try:
         restored = _materialize_downloaded_result(
             Path(tmp_name),
-            result_ref=NodeResultHandle(
-                object_id="sha256:" + "c" * 64,
+            result_ref=DataRef(
+                ref_id="sha256:" + "c" * 64,
+                storage_id="sha256:" + "c" * 64,
+                logical_type="series",
                 node_id="node-1",
+                locator_kind="node_control",
+                locator_token="",
                 format=fmt,
                 size_bytes=len(blob),
                 materialize_as="series",
@@ -396,8 +404,7 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.data.object_ref import NodeStoredRef
-    from pycloud_parallel.data.object_ref import object_storage_path
+    from pycloud_parallel.data.ref import DataRef, object_storage_path
 
     frame = pd.DataFrame(
         [[1, 2], [3, 4]],
@@ -414,11 +421,15 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     path.write_bytes(blob)
 
     payload = {
-        "frame": NodeStoredRef(
-            object_id=object_id,
+        "frame": DataRef(
+            ref_id=object_id,
+            storage_id=object_id,
+            logical_type="dataframe",
             format=fmt,
             size_bytes=len(blob),
             materialize_as="dataframe",
+            locator_kind="node_local",
+            locator_token="",
         )
     }
 
@@ -431,7 +442,7 @@ def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pytest.importorskip("pyarrow")
 
     from pycloud_parallel.controlplane.data_ref import DataRef
-    from pycloud_parallel.data.object_ref import object_storage_path
+    from pycloud_parallel.data.ref import object_storage_path
 
     frame = pd.DataFrame(
         [[1, 2], [3, 4]],
@@ -918,7 +929,7 @@ def test_release_object_removes_orphan_segment_file(tmp_path, monkeypatch):
 
 
 def test_resolve_object_refs_reads_segment_backend(tmp_path, monkeypatch):
-    from pycloud_parallel.data.object_ref import NodeStoredRef
+    from pycloud_parallel.data.ref import DataRef
 
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1024)
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 4096)
@@ -941,11 +952,15 @@ def test_resolve_object_refs_reads_segment_backend(tmp_path, monkeypatch):
             size_bytes=len(blob),
         )
         payload = {
-            "item": NodeStoredRef(
-                object_id=object_id,
+            "item": DataRef(
+                ref_id=object_id,
+                storage_id=object_id,
+                logical_type="json",
                 format="json",
                 size_bytes=len(blob),
                 materialize_as="json",
+                locator_kind="node_local",
+                locator_token="",
                 consume_on_read=True,
             )
         }
@@ -959,7 +974,7 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.data.object_ref import NodeStoredRef
+    from pycloud_parallel.data.ref import DataRef
 
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 10 * 1024 * 1024)
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 10 * 1024 * 1024)
@@ -997,11 +1012,15 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
         assert artifact.storage_backend == "segment"
 
         payload = {
-            "item": NodeStoredRef(
-                object_id=object_id,
+            "item": DataRef(
+                ref_id=object_id,
+                storage_id=object_id,
+                logical_type="series",
                 format=fmt,
                 size_bytes=len(blob),
                 materialize_as="series",
+                locator_kind="node_local",
+                locator_token="",
                 consume_on_read=True,
             )
         }
@@ -2011,18 +2030,22 @@ def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp
 
 def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
     from pycloud_parallel.controlplane.data_ref import DataRef
-    from pycloud_parallel.data.object_ref import NodeStoredRef
+    from pycloud_parallel.data.ref import DataRef
 
     captured = {}
 
     def fake_put(clients, data, *, format="", chunk_size=0):
         captured["data"] = data
         captured["format"] = format
-        return NodeStoredRef(
-            object_id="sha256:" + ("f" * 64),
+        return DataRef(
+            ref_id="sha256:" + ("f" * 64),
+            storage_id="sha256:" + ("f" * 64),
+            logical_type="json" if format == "json" else "bytes",
             format=format or "json",
             size_bytes=2048,
             materialize_as="json" if format == "json" else "bytes",
+            locator_kind="node_local",
+            locator_token="",
         )
 
     monkeypatch.setattr("pycloud_parallel.execution.support._put_data_via_clients", fake_put)

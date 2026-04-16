@@ -6,7 +6,7 @@ import json
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, data_ref_to_payload
-from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
+from pycloud_parallel.data.ref import object_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
     decode_payload_from_transport,
     encode_result_for_transport,
@@ -18,12 +18,17 @@ from pycloud_parallel.controlplane.payload_transport import (
 _decode_http_request_body = client_transport_mod._decode_http_request_body
 
 
-def _fake_object_ref(*, object_id_suffix: str = "a", format: str = "bin", consume_on_read: bool = False) -> NodeStoredRef:
-    return NodeStoredRef(
-        object_id=f"sha256:{object_id_suffix * 64}",
+def _fake_object_ref(*, object_id_suffix: str = "a", format: str = "bin", consume_on_read: bool = False) -> DataRef:
+    object_id = f"sha256:{object_id_suffix * 64}"
+    return DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        logical_type="",
         format=format,
         size_bytes=128,
         materialize_as="bytes",
+        locator_kind="node_local",
+        locator_token="",
         consume_on_read=consume_on_read,
     )
 
@@ -113,11 +118,15 @@ def test_normalize_inbound_payload_deserializes_before_object_resolution() -> No
     normalized = normalize_inbound_payload(
         {
             "blob": object_ref_to_payload(
-                NodeStoredRef(
-                    object_id="sha256:" + ("c" * 64),
+                DataRef(
+                    ref_id="sha256:" + ("c" * 64),
+                    storage_id="sha256:" + ("c" * 64),
+                    logical_type="",
                     format="json",
                     size_bytes=42,
                     materialize_as="json",
+                    locator_kind="node_local",
+                    locator_token="",
                 )
             )
         },
@@ -134,11 +143,15 @@ def test_decode_payload_from_transport_keeps_payload_decoded_without_localizing(
     decoded = decode_payload_from_transport(
         {
             "blob": object_ref_to_payload(
-                NodeStoredRef(
-                    object_id="sha256:" + ("d" * 64),
+                DataRef(
+                    ref_id="sha256:" + ("d" * 64),
+                    storage_id="sha256:" + ("d" * 64),
+                    logical_type="",
                     format="json",
                     size_bytes=99,
                     materialize_as="json",
+                    locator_kind="node_local",
+                    locator_token="",
                 )
             )
         },
@@ -152,11 +165,15 @@ def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
     body = json.dumps(
         {
             "blob": object_ref_to_payload(
-                NodeStoredRef(
-                    object_id="sha256:" + ("e" * 64),
+                DataRef(
+                    ref_id="sha256:" + ("e" * 64),
+                    storage_id="sha256:" + ("e" * 64),
+                    logical_type="",
                     format="json",
                     size_bytes=11,
                     materialize_as="json",
+                    locator_kind="node_local",
+                    locator_token="",
                 )
             )
         }

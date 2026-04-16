@@ -93,7 +93,7 @@ def _normalize_object_integrity_mode(meta: pb2.UploadObjectMeta) -> str:
 
 def _expected_object_id(meta: pb2.UploadObjectMeta, actual_sha256: str) -> str:
     mode = _normalize_object_integrity_mode(meta)
-    from pycloud_parallel.data.object_ref import object_id_from_sha256_hex
+    from pycloud_parallel.data.ref import object_id_from_sha256_hex
 
     authoritative_object_id = object_id_from_sha256_hex(str(actual_sha256 or "").strip().lower())
     if mode == "server_authoritative":

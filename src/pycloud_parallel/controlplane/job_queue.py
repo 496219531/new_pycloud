@@ -21,7 +21,6 @@ from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_pay
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.data.object_ref import NodeStoredRef
 from pycloud_parallel.controlplane.payload_transport import normalize_inbound_payload
 from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
 from pycloud_parallel.controlplane.node.execution import (
@@ -78,9 +77,7 @@ def _task_result_to_dict(item: pb2.TaskResult) -> Dict[str, object]:
     }
 
 
-def _payload_object_ref(value: object) -> Optional[NodeStoredRef | DataRef]:
-    if isinstance(value, NodeStoredRef):
-        return value
+def _payload_object_ref(value: object) -> Optional[DataRef]:
     return maybe_data_ref(value)
 
 

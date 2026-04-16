@@ -226,9 +226,18 @@ class TestOwnerServiceFacade:
         """测试超阈值 managed global 会强制转成 DataRef。"""
         from pycloud_parallel.execution.support import _prepare_managed_global_value_for_upload
         from pycloud_parallel.controlplane.data_ref import DataRef
-        from pycloud_parallel.data.object_ref import NodeStoredRef
+        from pycloud_parallel.data.ref import DataRef
 
-        ref = NodeStoredRef(object_id="sha256:" + "a" * 64, format="parquet", size_bytes=123, materialize_as="dataframe")
+        ref = DataRef(
+            ref_id="sha256:" + "a" * 64,
+            storage_id="sha256:" + "a" * 64,
+            logical_type="dataframe",
+            format="parquet",
+            size_bytes=123,
+            materialize_as="dataframe",
+            locator_kind="node_local",
+            locator_token="",
+        )
         with patch(
             "pycloud_parallel.execution.support._estimate_managed_global_inline_size",
             return_value=1024,

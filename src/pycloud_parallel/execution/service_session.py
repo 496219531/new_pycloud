@@ -38,7 +38,7 @@ from pycloud_parallel.controlplane.infocenter_client import (
     _node_instance_key_from_route,
     _route_sort_key,
 )
-from pycloud_parallel.data.object_ref import NodeStoredRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
@@ -1312,7 +1312,7 @@ class Service(ServiceExecutionSession):
         *,
         format: str = "",
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         refs = [
             client.upload_object_from_file(
                 file_path=file_path,
@@ -1335,7 +1335,7 @@ class Service(ServiceExecutionSession):
         *,
         format: str = "",
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         refs = [
             client.upload_object_from_bytes(
                 blob=blob,
@@ -1358,7 +1358,7 @@ class Service(ServiceExecutionSession):
         *,
         format: str = "",
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         return _put_data_via_clients(
             list(self._clients.values()),
             data,
@@ -1366,13 +1366,13 @@ class Service(ServiceExecutionSession):
             chunk_size=chunk_size,
         )
 
-    def put_dataframe(self, dataframe: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> NodeStoredRef:
+    def put_dataframe(self, dataframe: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
         return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
 
-    def put_ndarray(self, array: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> NodeStoredRef:
+    def put_ndarray(self, array: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
         return self.put_data(array, format="npy", chunk_size=chunk_size)
 
-    def put_json(self, value: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> NodeStoredRef:
+    def put_json(self, value: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
         return self.put_data(value, format="json", chunk_size=chunk_size)
 
     def update_globals(self, values: Dict[str, object]) -> str:

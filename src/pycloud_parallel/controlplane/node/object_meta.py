@@ -15,7 +15,7 @@ from pycloud_parallel.controlplane.node.filesystem import (
     _segment_path_from_relpath,
 )
 from pycloud_parallel.controlplane.state_time import utc_now
-from pycloud_parallel.data.object_ref import normalize_object_format, normalize_object_id
+from pycloud_parallel.data.ref import normalize_object_format, normalize_object_id
 
 
 def _write_object_meta(

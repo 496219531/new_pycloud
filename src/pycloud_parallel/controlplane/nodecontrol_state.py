@@ -95,7 +95,7 @@ from pycloud_parallel.controlplane.node.models import (
     TaskPoolState,
     TaskState,
 )
-from pycloud_parallel.data.object_ref import (
+from pycloud_parallel.data.ref import (
     normalize_object_format,
     normalize_object_id,
     object_id_from_sha256_hex,

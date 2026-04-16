@@ -17,7 +17,7 @@ from pycloud_parallel.controlplane.artifact import _normalize_dependency_policy_
 from pycloud_parallel.controlplane.code_version import _sha256_text, _stable_json_bytes
 from pycloud_parallel.controlplane.node.models import CodeArtifact, ManagedGlobalsState
 from pycloud_parallel.controlplane.state_time import utc_now
-from pycloud_parallel.data.object_ref import normalize_object_id
+from pycloud_parallel.data.ref import normalize_object_id
 
 
 _SEGMENT_WRITER_LOCKS_LOCK = threading.Lock()

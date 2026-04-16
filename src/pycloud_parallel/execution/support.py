@@ -39,7 +39,7 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.netutil import detect_local_ip
-from pycloud_parallel.data.object_ref import NodeStoredRef, normalize_materialize_as, normalize_object_format
+from pycloud_parallel.data.ref import normalize_materialize_as, normalize_object_format
 from pycloud_parallel.controlplane.payload_transport import (
     estimate_payload_inline_size,
     prepare_outbound_payload,
@@ -318,7 +318,7 @@ def _serialize_data_for_object_ref(
         materialize_as=materialize_as,
         summary=summarize_payload_flow_value(data),
     )
-    if isinstance(data, NodeStoredRef):
+    if maybe_data_ref(data) is not None:
         raise ValueError("data is already uploaded; no need to serialize again")
 
     if isinstance(data, os.PathLike):
@@ -409,9 +409,10 @@ def _put_data_via_clients(
     *,
     format: str = "",
     chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-) -> NodeStoredRef:
-    if isinstance(data, NodeStoredRef):
-        return data
+) -> DataRef:
+    existing = maybe_data_ref(data)
+    if existing is not None:
+        return existing
     materialize_as, effective_format, blob = _serialize_data_for_object_ref(data, format=format)
     refs = [
         client.upload_object_from_bytes(
@@ -428,11 +429,19 @@ def _put_data_via_clients(
     if len(object_ids) != 1 or len(formats) != 1:
         raise RuntimeError(f"inconsistent object upload across nodes: {refs}")
     first = refs[0]
-    return NodeStoredRef(
-        object_id=first.object_id,
+    return DataRef(
+        ref_id=first.object_id,
+        storage_id=first.object_id,
+        logical_type="",
         format=first.format,
         size_bytes=first.size_bytes,
         materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        locator_kind="node_local",
+        locator_token="",
+        consume_on_read=bool(getattr(first, "consume_on_read", False)),
+        node_id=str(getattr(first, "node_id", "") or ""),
+        node_instance_id=str(getattr(first, "node_instance_id", "") or ""),
+        control_addr=str(getattr(first, "control_addr", "") or ""),
     )
 
 
@@ -736,7 +745,7 @@ def _select_job_staging_clients(
     return clients, replicas
 
 
-def _upload_text_data_via_clients(clients: Sequence[Any], text: str) -> NodeStoredRef:
+def _upload_text_data_via_clients(clients: Sequence[Any], text: str) -> DataRef:
     blob = str(text or "").encode("utf-8")
     refs = [
         client.upload_object_from_bytes(
@@ -752,12 +761,19 @@ def _upload_text_data_via_clients(clients: Sequence[Any], text: str) -> NodeStor
     if len(object_ids) != 1:
         raise RuntimeError(f"inconsistent text object upload across nodes: {refs}")
     first = refs[0]
-    return NodeStoredRef(
-        object_id=first.object_id,
+    return DataRef(
+        ref_id=first.object_id,
+        storage_id=first.object_id,
+        logical_type="text",
         format=first.format,
         size_bytes=first.size_bytes,
         materialize_as="text",
+        locator_kind="node_local",
+        locator_token="",
         consume_on_read=False,
+        node_id=str(getattr(first, "node_id", "") or ""),
+        node_instance_id=str(getattr(first, "node_instance_id", "") or ""),
+        control_addr=str(getattr(first, "control_addr", "") or ""),
     )
 
 

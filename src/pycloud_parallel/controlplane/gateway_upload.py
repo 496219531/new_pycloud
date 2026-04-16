@@ -15,7 +15,7 @@ from .client_transport import _decode_http_request_body
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageFile, GatewayStageManager, GatewayStageRequest
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.data.object_ref import normalize_object_format
+from pycloud_parallel.data.ref import normalize_object_format
 
 
 _FILE_FIELD_RE = re.compile(r"^files?\[(?P<slot>[^\]]+)\]$")
@@ -310,7 +310,17 @@ def upload_staged_files_to_route(
                     file_path=str(stage_file.path),
                     format=normalize_object_format("", source_name=stage_file.original_name, default="bin"),
                 )
-                base_ref = object_ref.to_data_ref()
+                base_ref = object_ref if isinstance(object_ref, DataRef) else DataRef(
+                    ref_id=str(object_ref.object_id or ""),
+                    storage_id=str(object_ref.object_id or ""),
+                    logical_type="",
+                    format=str(object_ref.format or "bin"),
+                    size_bytes=int(object_ref.size_bytes or 0),
+                    materialize_as=str(getattr(object_ref, "materialize_as", "") or "path"),
+                    locator_kind="node_local",
+                    locator_token="",
+                    consume_on_read=bool(getattr(object_ref, "consume_on_read", False)),
+                )
                 ref_id = f"gateway-upload:{request.request_id}:{str(getattr(route, 'service_id', '') or '').strip() or uuid.uuid4().hex}:{slot}"
                 if not client.pin_object(object_id=object_ref.object_id, ref_id=ref_id):
                     raise GatewayUploadError(f"failed to pin uploaded object for slot={slot}")

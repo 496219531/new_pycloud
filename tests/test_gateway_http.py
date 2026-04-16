@@ -563,7 +563,7 @@ def test_gateway_upload_call_reuses_stage_file_on_route_retry(tmp_path):
 def test_upload_staged_files_to_route_pins_request_scoped_refs(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane.gateway_upload import release_uploaded_refs_on_route, upload_staged_files_to_route
     from pycloud_parallel.controlplane.gateway_stage import GatewayStageRequest, GatewayStageFile
-    from pycloud_parallel.data.object_ref import NodeStoredRef
+    from pycloud_parallel.data.ref import DataRef
 
     pinned = []
     released = []
@@ -581,10 +581,15 @@ def test_upload_staged_files_to_route_pins_request_scoped_refs(tmp_path, monkeyp
 
         def upload_object_from_file(self, *, file_path: str, format: str = "", trusted_precheck=None, transfer_mode: str = "", chunk_size: int = 0):
             del file_path, trusted_precheck, transfer_mode, chunk_size
-            return NodeStoredRef(
-                object_id="sha256:" + ("a" * 64),
+            return DataRef(
+                ref_id="sha256:" + ("a" * 64),
+                storage_id="sha256:" + ("a" * 64),
+                logical_type="text",
                 format=format or "txt",
                 size_bytes=32,
+                materialize_as="text",
+                locator_kind="node_local",
+                locator_token="",
             )
 
         def pin_object(self, *, object_id: str, ref_id: str) -> bool:

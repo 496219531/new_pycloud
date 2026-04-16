@@ -21,16 +21,9 @@ from pycloud_parallel.controlplane.data_ref import (
     data_ref_from_payload,
     data_ref_to_payload,
     is_data_ref_payload,
-)
-from pycloud_parallel.data.object_ref import (
-    NodeStoredRef,
     is_object_ref_payload,
-    object_ref_from_payload,
-)
-from pycloud_parallel.data.result_ref import (
-    NodeResultHandle,
     is_result_ref_payload,
-    result_ref_from_payload,
+    maybe_data_ref,
 )
 
 payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
@@ -49,20 +42,11 @@ def _format_payload_bytes(size_bytes: int) -> str:
 def summarize_payload_flow_value(value: Any) -> str:
     if value is None:
         return "None"
-    if isinstance(value, DataRef):
+    data_ref = maybe_data_ref(value)
+    if data_ref is not None:
         return (
-            f"DataRef(logical_type={value.logical_type}, format={value.format}, "
-            f"size_bytes={value.size_bytes}, materialize_as={value.materialize_as})"
-        )
-    if isinstance(value, NodeStoredRef):
-        return (
-            f"LegacyObjectWrapper(format={value.format}, size_bytes={value.size_bytes}, "
-            f"materialize_as={value.materialize_as})"
-        )
-    if isinstance(value, NodeResultHandle):
-        return (
-            f"LegacyResultWrapper(format={value.format}, size_bytes={value.size_bytes}, "
-            f"materialize_as={value.materialize_as}, node_id={value.node_id})"
+            f"DataRef(logical_type={data_ref.logical_type}, format={data_ref.format}, "
+            f"size_bytes={data_ref.size_bytes}, materialize_as={data_ref.materialize_as})"
         )
     if isinstance(value, dict):
         keys = list(value.keys())
@@ -467,7 +451,7 @@ def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
         return {"__type__": "time", "value": obj.isoformat()}
     if isinstance(obj, timedelta):
         return {"__type__": "timedelta", "seconds": obj.total_seconds()}
-    if isinstance(obj, (NodeStoredRef, NodeResultHandle, DataRef)):
+    if maybe_data_ref(obj) is not None:
         return data_ref_to_payload(coerce_data_ref(obj))
 
     try:

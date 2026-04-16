@@ -19,7 +19,6 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, In
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.controlplane.data_ref import DataRef
-from pycloud_parallel.data.object_ref import NodeStoredRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.node.state import NodeControlState
@@ -260,11 +259,15 @@ class TestDiscoveryCallerFacade:
 
         def fake_put(clients, data, *, format="", chunk_size=0):
             uploads.append([client.target for client in clients])
-            return NodeStoredRef(
-                object_id="sha256:" + ("a" * 64),
+            return DataRef(
+                ref_id="sha256:" + ("a" * 64),
+                storage_id="sha256:" + ("a" * 64),
+                logical_type="bytes",
                 format=format or "bin",
                 size_bytes=2048,
                 materialize_as="bytes",
+                locator_kind="node_local",
+                locator_token="",
             )
 
         client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
@@ -299,11 +302,15 @@ class TestDiscoveryCallerFacade:
 
         def fake_put(clients, data, *, format="", chunk_size=0):
             uploads.append([client.target for client in clients])
-            return NodeStoredRef(
-                object_id="sha256:" + ("b" * 64),
+            return DataRef(
+                ref_id="sha256:" + ("b" * 64),
+                storage_id="sha256:" + ("b" * 64),
+                logical_type="bytes",
                 format=format or "bin",
                 size_bytes=2048,
                 materialize_as="bytes",
+                locator_kind="node_local",
+                locator_token="",
             )
 
         def fake_call(route, *, method, payload, timeout_sec, service_token):

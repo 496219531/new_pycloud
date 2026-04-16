@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
-from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
+from pycloud_parallel.data.ref import DataRef, object_ref_to_payload
 
 
 def test_submit_and_cancel_waiting_job() -> None:
@@ -80,11 +80,15 @@ def test_submit_job_rejects_unresolvable_object_ref_payloads() -> None:
                 "subtasks": [
                     {
                         "blob": object_ref_to_payload(
-                            NodeStoredRef(
-                                object_id="sha256:" + ("c" * 64),
+                            DataRef(
+                                ref_id="sha256:" + ("c" * 64),
+                                storage_id="sha256:" + ("c" * 64),
+                                logical_type="json",
                                 format="json",
                                 size_bytes=12,
                                 materialize_as="json",
+                                locator_kind="node_local",
+                                locator_token="",
                             )
                         )
                     }
@@ -553,7 +557,7 @@ def test_run_job_with_hooks_accepts_update_globals_dict() -> None:
 
 
 def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
-    from pycloud_parallel.data.object_ref import NodeStoredRef, object_ref_to_payload
+    from pycloud_parallel.data.ref import DataRef, object_ref_to_payload
 
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
@@ -575,10 +579,15 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
             "client_id": "client-a",
             "priority": 5,
             "blob_ref": object_ref_to_payload(
-                NodeStoredRef(
-                    object_id="sha256:" + ("b" * 64),
+                DataRef(
+                    ref_id="sha256:" + ("b" * 64),
+                    storage_id="sha256:" + ("b" * 64),
+                    logical_type="bytes",
                     format="py",
                     size_bytes=len(module_blob),
+                    materialize_as="bytes",
+                    locator_kind="node_local",
+                    locator_token="",
                 )
             ),
             "blob_control_addr": "127.0.0.1:50061",
@@ -750,11 +759,15 @@ def test_submit_job_rejects_nested_unresolvable_business_blob_ref() -> None:
                 "package_format": "py",
                 "job_payload": {
                     "blob_ref": object_ref_to_payload(
-                        NodeStoredRef(
-                            object_id="sha256:" + ("e" * 64),
+                        DataRef(
+                            ref_id="sha256:" + ("e" * 64),
+                            storage_id="sha256:" + ("e" * 64),
+                            logical_type="json",
                             format="json",
                             size_bytes=12,
                             materialize_as="json",
+                            locator_kind="node_local",
+                            locator_token="",
                         )
                     )
                 },
@@ -958,7 +971,7 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_finalize_when_present
 
 def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypatch) -> None:
     from pycloud_parallel.execution.support import _prepare_job_blob_submit_fields
-    from pycloud_parallel.data.object_ref import NodeStoredRef
+    from pycloud_parallel.data.ref import DataRef
 
     monkeypatch.setattr(
         "pycloud_parallel.execution.support._job_blob_requires_object_ref",
@@ -970,10 +983,15 @@ def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypat
     )
     monkeypatch.setattr(
         "pycloud_parallel.controlplane.node_control_client.NodeControlClient.upload_object_from_bytes",
-        lambda self, **kwargs: NodeStoredRef(
-            object_id="sha256:" + ("a" * 64),
+        lambda self, **kwargs: DataRef(
+            ref_id="sha256:" + ("a" * 64),
+            storage_id="sha256:" + ("a" * 64),
+            logical_type="archive",
             format="tar.gz",
             size_bytes=4096,
+            materialize_as="path",
+            locator_kind="node_local",
+            locator_token="",
         ),
     )
 
@@ -1070,7 +1088,6 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
 def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -> None:
     from pycloud_parallel import DataRef, JobQueue
     import pycloud_parallel.execution.support as client_mod
-    from pycloud_parallel.data.object_ref import NodeStoredRef
 
     monkeypatch.setattr("pycloud_parallel.execution.support.INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 32)
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1095,10 +1112,15 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -
 
         def upload_object_from_bytes(self, *, blob, format="", chunk_size=0):
             del blob, chunk_size
-            return NodeStoredRef(
-                object_id="sha256:" + ("d" * 64),
+            return DataRef(
+                ref_id="sha256:" + ("d" * 64),
+                storage_id="sha256:" + ("d" * 64),
+                logical_type="text",
                 format=format or "txt",
                 size_bytes=256,
+                materialize_as="text",
+                locator_kind="node_local",
+                locator_token="",
             )
 
         def close(self) -> None:

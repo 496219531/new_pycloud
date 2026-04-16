@@ -30,9 +30,8 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.object_digest_cache import invalidate_file_digest, lookup_file_digest, store_file_digest
-from pycloud_parallel.data.object_ref import NodeStoredRef, normalize_object_format, object_id_from_sha256_hex
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient, ServiceSessionClient
-from pycloud_parallel.data.result_ref import NodeResultHandle
+from pycloud_parallel.data.ref import normalize_object_format, object_id_from_sha256_hex
 from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, serialize_inline_payload, struct_to_dict, summarize_payload_flow_value
 from pycloud_parallel.execution.support import _prepare_local_artifact_for_upload, _prepare_managed_globals_values_for_upload
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -285,7 +284,7 @@ class NodeControlClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         trusted_precheck: Optional[bool] = None,
         transfer_mode: str = "",
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"file_path not found: {file_path}")
@@ -322,7 +321,7 @@ class NodeControlClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         trusted_precheck: Optional[bool] = None,
         transfer_mode: str = "",
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         effective_format = normalize_object_format(format, default="bin")
         effective_mode = _resolve_upload_object_transfer_mode(
             transfer_mode=transfer_mode or get_object_transfer_mode(),
@@ -352,7 +351,7 @@ class NodeControlClient:
         chunk_size: int,
         cached_object_id: str,
         precheck_enabled: bool,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         effective_format = normalize_object_format(format, source_name=file_path.name)
         object_id = str(cached_object_id or "").strip()
         if not object_id:
@@ -386,10 +385,15 @@ class NodeControlClient:
             if cached_object_id:
                 invalidate_file_digest(file_path, format=effective_format)
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        ref = NodeStoredRef(
-            object_id=resp.object_id or object_id,
-            format=resp.format or effective_format,
+        ref = DataRef(
+            ref_id=str(resp.object_id or object_id),
+            storage_id=str(resp.object_id or object_id),
+            logical_type="",
+            format=str(resp.format or effective_format),
             size_bytes=int(resp.size_bytes or file_path.stat().st_size),
+            materialize_as="path",
+            locator_kind="node_local",
+            locator_token="",
         )
         store_file_digest(file_path, format=effective_format, object_id=ref.object_id)
         return ref
@@ -400,7 +404,7 @@ class NodeControlClient:
         file_path: Path,
         format: str,
         chunk_size: int,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         effective_format = normalize_object_format(format, source_name=file_path.name)
         resp = self.stub.UploadObject(
             _serialize_upload_object_requests_from_file(
@@ -414,10 +418,15 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        ref = NodeStoredRef(
-            object_id=resp.object_id,
-            format=resp.format or effective_format,
+        ref = DataRef(
+            ref_id=str(resp.object_id or ""),
+            storage_id=str(resp.object_id or ""),
+            logical_type="",
+            format=str(resp.format or effective_format),
             size_bytes=int(resp.size_bytes or file_path.stat().st_size),
+            materialize_as="path",
+            locator_kind="node_local",
+            locator_token="",
         )
         store_file_digest(file_path, format=effective_format, object_id=ref.object_id)
         return ref
@@ -429,7 +438,7 @@ class NodeControlClient:
         format: str,
         chunk_size: int,
         precheck_enabled: bool,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         digest = hashlib.sha256(blob).hexdigest()
         object_id = object_id_from_sha256_hex(digest)
         effective_format = normalize_object_format(format, default="bin")
@@ -453,10 +462,15 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        return NodeStoredRef(
-            object_id=resp.object_id or object_id,
-            format=resp.format or effective_format,
+        return DataRef(
+            ref_id=str(resp.object_id or object_id),
+            storage_id=str(resp.object_id or object_id),
+            logical_type="",
+            format=str(resp.format or effective_format),
             size_bytes=int(resp.size_bytes or len(blob)),
+            materialize_as="path",
+            locator_kind="node_local",
+            locator_token="",
         )
 
     def _upload_object_from_bytes_single_pass(
@@ -465,7 +479,7 @@ class NodeControlClient:
         blob: bytes,
         format: str,
         chunk_size: int,
-    ) -> NodeStoredRef:
+    ) -> DataRef:
         effective_format = normalize_object_format(format, default="bin")
         resp = self.stub.UploadObject(
             _serialize_upload_object_requests_from_bytes(
@@ -479,10 +493,15 @@ class NodeControlClient:
         )
         if not resp.ok:
             raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        return NodeStoredRef(
-            object_id=resp.object_id,
-            format=resp.format or effective_format,
+        return DataRef(
+            ref_id=str(resp.object_id or ""),
+            storage_id=str(resp.object_id or ""),
+            logical_type="",
+            format=str(resp.format or effective_format),
             size_bytes=int(resp.size_bytes or len(blob)),
+            materialize_as="path",
+            locator_kind="node_local",
+            locator_token="",
         )
 
     def get_object_meta(self, *, object_id: str) -> pb2.GetObjectMetaResponse:
@@ -503,17 +522,22 @@ class NodeControlClient:
         object_id: str,
         fallback_format: str,
         fallback_size: int,
-    ) -> Optional[NodeStoredRef]:
+    ) -> Optional[DataRef]:
         try:
             meta = self.get_object_meta(object_id=object_id)
         except Exception:
             return None
         if not bool(meta.exists):
             return None
-        return NodeStoredRef(
-            object_id=str(meta.object_id or object_id),
+        return DataRef(
+            ref_id=str(meta.object_id or object_id),
+            storage_id=str(meta.object_id or object_id),
+            logical_type="",
             format=str(meta.format or fallback_format or "bin"),
             size_bytes=int(meta.size_bytes or fallback_size or 0),
+            materialize_as="path",
+            locator_kind="node_local",
+            locator_token="",
         )
 
     def _upload_code_from_local_file(
@@ -634,7 +658,7 @@ class NodeControlClient:
             return False
         return bool(resp.released)
 
-    def download_result_to_file(self, result_ref: NodeResultHandle | DataRef | object, *, target_path: str) -> Path:
+    def download_result_to_file(self, result_ref: DataRef | object, *, target_path: str) -> Path:
         data_ref = maybe_data_ref(result_ref)
         if data_ref is None:
             raise TypeError("result_ref must be a DataRef-compatible value")
@@ -642,7 +666,7 @@ class NodeControlClient:
         self._release_data_ref_if_consumed(data_ref)
         return path
 
-    def fetch_result_ref_data(self, result_ref: NodeResultHandle | DataRef | object, *, target_path: str = ""):
+    def fetch_result_ref_data(self, result_ref: DataRef | object, *, target_path: str = ""):
         data_ref = maybe_data_ref(result_ref)
         if data_ref is None:
             raise TypeError("result_ref must be a DataRef-compatible value")
