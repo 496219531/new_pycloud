@@ -21,20 +21,20 @@ def main():
 
     # 定义服务代码，展示不同参数风格的函数
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def square(x):\n"
         b"    return {'x': x, 'square': x * x}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def add(a, b):\n"
         b"    return {'a': a, 'b': b, 'sum': a + b}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def power(base, exponent=2):\n"
         b"    return {'base': base, 'exponent': exponent, 'result': base ** exponent}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def summarize(*values):\n"
         b"    return {'count': len(values), 'sum': sum(values), 'values': list(values)}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def compute(a, b, c=0, d=0):\n"
         b"    return {'a': a, 'b': b, 'c': c, 'd': d, 'total': a + b + c + d}\n"
     )

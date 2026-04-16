@@ -15,12 +15,12 @@ def main():
     # 否则高并发阶段会被大 payload 序列化成本淹没。
     dependency_allowlist = []
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def square(x=0, **_kwargs):\n"
         b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def fibonacci(n=0, **_kwargs):\n"
         b"    n = int(n)\n"
         b"    if n <= 1:\n"

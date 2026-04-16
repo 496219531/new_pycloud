@@ -17,24 +17,24 @@ def demo_service_code():
         "compute_service/__init__.py": '"""计算服务模块"""',
 
         "compute_service/main.py": '''
-from pycloud_parallel import pycloud_export
+from pycloud_parallel import export
 
 from .algorithms import sort, search
 
-@pycloud_export
+@export
 def quick_sort(data=None, **_kwargs):
     """快速排序"""
     data = list(data or [])
     return {"result": sort.quick_sort(data), "algorithm": "quick_sort"}
 
-@pycloud_export
+@export
 def binary_search(data=None, target=0, **_kwargs):
     """二分查找"""
     data = list(data or [])
     idx = search.binary_search(data, target)
     return {"result": idx, "target": target, "found": idx >= 0}
 
-@pycloud_export
+@export
 def process(action="", data=None, **_kwargs):
     """通用处理函数"""
     data = list(data or [])

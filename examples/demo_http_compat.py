@@ -61,11 +61,11 @@ def main():
 
     # 服务端代码：最自然的 Python 函数
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def add(a, b):\n"
         b"    return {'a': a, 'b': b, 'sum': a + b}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def greet(name, message='hello'):\n"
         b"    return {'greeting': f'{message}, {name}!'}\n"
     )

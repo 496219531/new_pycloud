@@ -550,70 +550,91 @@ class Service(ServiceExecutionSession):
             active_routes = cls._select_active_routes(existing_routes)
             if active_routes:
                 existing_infos = cls._inspect_existing_routes(active_routes=active_routes, timeout_sec=timeout_sec)
-                existing_owners = {info.owner_client_id for _, info in existing_infos}
-                existing_versions = {info.code_version for _, info in existing_infos}
-                if len(existing_owners) != 1 or len(existing_versions) != 1:
-                    raise RuntimeError(
-                        f"service_name already exists but active routes are inconsistent: {effective_service_name}"
+                existing_infos = [
+                    (route, info)
+                    for route, info in existing_infos
+                    if cls._is_active_service_status(getattr(info, "status", route.status))
+                ]
+                if not existing_infos:
+                    _emit_owner_notice(
+                        f"ignore stale existing routes service_name={effective_service_name}; redeploying fresh replicas"
                     )
-
-                existing_owner = next(iter(existing_owners))
-                existing_code_version = next(iter(existing_versions))
-                if existing_owner != effective_owner_client_id:
-                    raise RuntimeError(
-                        f"service_name already exists and belongs to another owner: "
-                        f"service_name={effective_service_name}; owner={existing_owner}"
-                    )
-
-                cached_session = _load_service_session_cache(
-                    owner_client_id=effective_owner_client_id,
-                    service_name=effective_service_name,
-                    cache_dir=session_cache_dir,
-                )
-
-                if existing_code_version == effective_code_version:
-                    if not reuse_existing_same_code:
+                else:
+                    existing_owners = {info.owner_client_id for _, info in existing_infos}
+                    existing_versions = {info.code_version for _, info in existing_infos}
+                    if len(existing_owners) != 1 or len(existing_versions) != 1:
                         raise RuntimeError(
-                            f"service_name already exists with same code_version: {effective_service_name}; "
-                            "set reuse_existing_same_code=True to reuse"
+                            f"service_name already exists but active routes are inconsistent: {effective_service_name}"
                         )
-                    if cached_session is None or cached_session.get("artifact_code_version") != effective_code_version:
+
+                    existing_owner = next(iter(existing_owners))
+                    existing_code_version = next(iter(existing_versions))
+                    if existing_owner != effective_owner_client_id:
                         raise RuntimeError(
-                            f"service_name already exists with same code_version but no reusable local token cache was found: "
-                            f"{effective_service_name}"
+                            f"service_name already exists and belongs to another owner: "
+                            f"service_name={effective_service_name}; owner={existing_owner}"
                         )
-                    try:
-                        session_cache_lock = _ServiceSessionFileLock(session_cache_file).acquire()
-                    except RuntimeError as exc:
-                        raise RuntimeError(
-                            f"another local deploy process is already active for owner_client_id={effective_owner_client_id!r} "
-                            f"service_name={effective_service_name!r}: {exc}"
-                        ) from exc
-                    group = cls._reuse_existing_group(
+
+                    cached_session = _load_service_session_cache(
                         owner_client_id=effective_owner_client_id,
                         service_name=effective_service_name,
-                        artifact_code_version=effective_code_version,
-                        cache_payload=cached_session,
-                        active_routes=existing_infos,
-                        discovered_node_map=discovered_instance_map,
-                        timeout_sec=timeout_sec,
-                        breaker_enabled=breaker_enabled,
-                        breaker_failure_threshold=breaker_failure_threshold,
-                        breaker_cooldown_sec=breaker_cooldown_sec,
-                        breaker_max_cooldown_sec=breaker_max_cooldown_sec,
-                        session_cache_file=session_cache_file,
-                        session_cache_lock=session_cache_lock,
+                        cache_dir=session_cache_dir,
                     )
-                    _emit_owner_notice(
-                        f"reuse existing service service_name={effective_service_name} nodes={list(group.sessions.keys())}"
-                    )
-                    return group
 
-                raise RuntimeError(
-                    f"service_name already exists with different code_version and is still running: "
-                    f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}; "
-                    "stop the active service first, then redeploy with the same service_name"
-                )
+                    if existing_code_version == effective_code_version:
+                        if not reuse_existing_same_code:
+                            raise RuntimeError(
+                                f"service_name already exists with same code_version: {effective_service_name}; "
+                                "set reuse_existing_same_code=True to reuse"
+                            )
+                        if cached_session is None or cached_session.get("artifact_code_version") != effective_code_version:
+                            raise RuntimeError(
+                                f"service_name already exists with same code_version but no reusable local token cache was found: "
+                                f"{effective_service_name}"
+                            )
+                        try:
+                            session_cache_lock = _ServiceSessionFileLock(session_cache_file).acquire()
+                        except RuntimeError as exc:
+                            raise RuntimeError(
+                                f"another local deploy process is already active for owner_client_id={effective_owner_client_id!r} "
+                                f"service_name={effective_service_name!r}: {exc}"
+                            ) from exc
+                        try:
+                            group = cls._reuse_existing_group(
+                                owner_client_id=effective_owner_client_id,
+                                service_name=effective_service_name,
+                                artifact_code_version=effective_code_version,
+                                cache_payload=cached_session,
+                                active_routes=existing_infos,
+                                discovered_node_map=discovered_instance_map,
+                                timeout_sec=timeout_sec,
+                                breaker_enabled=breaker_enabled,
+                                breaker_failure_threshold=breaker_failure_threshold,
+                                breaker_cooldown_sec=breaker_cooldown_sec,
+                                breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+                                session_cache_file=session_cache_file,
+                                session_cache_lock=session_cache_lock,
+                            )
+                        except RuntimeError as exc:
+                            if "service is stopped" not in str(exc):
+                                raise
+                            with contextlib.suppress(Exception):
+                                session_cache_file.unlink()
+                            _emit_owner_notice(
+                                f"reuse existing service skipped because cached route stopped: {effective_service_name}; redeploying"
+                            )
+                        else:
+                            _emit_owner_notice(
+                                f"reuse existing service service_name={effective_service_name} nodes={list(group.sessions.keys())}"
+                            )
+                            return group
+
+                    else:
+                        raise RuntimeError(
+                            f"service_name already exists with different code_version and is still running: "
+                            f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}; "
+                            "stop the active service first, then redeploy with the same service_name"
+                        )
 
         try:
             try:
@@ -710,7 +731,8 @@ class Service(ServiceExecutionSession):
                 )
             return group
         except Exception:
-            session_cache_lock.close()
+            if session_cache_lock is not None:
+                session_cache_lock.close()
             raise
 
     @classmethod
@@ -946,15 +968,19 @@ class Service(ServiceExecutionSession):
         )
 
     @staticmethod
+    def _is_active_service_status(status: int) -> bool:
+        return int(status or 0) in (
+            pb2.SERVICE_STATUS_STARTING,
+            pb2.SERVICE_STATUS_RUNNING,
+            pb2.SERVICE_STATUS_DRAINING,
+        )
+
+    @staticmethod
     def _select_active_routes(routes: Sequence[InfoCenterServiceRoute]) -> List[InfoCenterServiceRoute]:
         return [
             route
             for route in routes
-            if route.status in (
-                pb2.SERVICE_STATUS_STARTING,
-                pb2.SERVICE_STATUS_RUNNING,
-                pb2.SERVICE_STATUS_DRAINING,
-            )
+            if Service._is_active_service_status(route.status)
         ]
 
     @classmethod

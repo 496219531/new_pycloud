@@ -4,7 +4,7 @@
 该进程池会在函数执行完成后自动关闭。
 """
 
-from pycloud_parallel import foreach, parallel_for
+from pycloud_parallel.local import foreach, parallel_for
 
 
 def square(x):
@@ -53,7 +53,7 @@ def example_mixed_usage():
     print("示例 3: 混合使用全局 runtime 和临时 runtime")
     print("=" * 50)
 
-    from pycloud_parallel import configure
+    from pycloud_parallel.local import configure
 
     # 配置全局 runtime（2 个进程）
     configure(max_workers=2, reset=True)
@@ -101,7 +101,7 @@ def example_without_max_workers():
     print("示例 5: 不指定 max_workers（使用全局 runtime）")
     print("=" * 50)
 
-    from pycloud_parallel import configure
+    from pycloud_parallel.local import configure
 
     # 配置全局 runtime
     configure(max_workers=3, reset=True)

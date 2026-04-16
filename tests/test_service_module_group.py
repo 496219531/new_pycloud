@@ -915,6 +915,212 @@ class TestOwnerServiceFacade:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()
 
+    def test_deploy_from_infocenter_ignores_inspected_stopped_routes(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        fake_route = SimpleNamespace(
+            service_name="demo-stopped-service",
+            service_id="svc-old",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            http_base_url="http://127.0.0.1:18081/svc/svc-old",
+        )
+        stopped_info = SimpleNamespace(
+            owner_client_id="owner-demo",
+            code_version="sha256:old",
+            status=pb2.SERVICE_STATUS_STOPPED,
+            service_name="demo-stopped-service",
+            http_base_url=fake_route.http_base_url,
+            worker_count=1,
+            created_at=None,
+            last_heartbeat_at=None,
+            lease_expire_at=None,
+        )
+        create_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=([fake_route], [fake_node]),
+        ), patch.object(
+            Service,
+            "_inspect_existing_routes",
+            return_value=[(fake_route, stopped_info)],
+        ), patch(
+            "pycloud_parallel.execution.service_session._node_control_client",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-stopped-service",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                runtime="py3",
+                entry_module="demo_service",
+                entry_callable="run",
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert len(create_calls) == 1
+            assert create_calls[0]["service_name"] == "demo-stopped-service"
+        finally:
+            group.close(end_services=False)
+
+    def test_deploy_from_infocenter_redeploys_when_reuse_heartbeat_hits_stopped_service(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.execution.support import _artifact_code_version
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        effective_code_version = _artifact_code_version(
+            blob=blob,
+            runtime="py3",
+            entry_module="demo_service",
+            entry_callable="run",
+            package_format="py",
+            export_mode="decorator",
+        )
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        fake_route = SimpleNamespace(
+            service_name="demo-race-service",
+            service_id="svc-old",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_id="node-1",
+            node_instance_id="node-1-inst",
+            control_addr="127.0.0.1:50061",
+            http_base_url="http://127.0.0.1:18081/svc/svc-old",
+        )
+        running_info = SimpleNamespace(
+            owner_client_id="owner-demo",
+            code_version=effective_code_version,
+            status=pb2.SERVICE_STATUS_RUNNING,
+            service_name="demo-race-service",
+            http_base_url=fake_route.http_base_url,
+            worker_count=1,
+            created_at=None,
+            last_heartbeat_at=None,
+            lease_expire_at=None,
+        )
+        create_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def heartbeat_service(self, **kwargs):
+                del kwargs
+                raise RuntimeError("service is stopped")
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=([fake_route], [fake_node]),
+        ), patch.object(
+            Service,
+            "_inspect_existing_routes",
+            return_value=[(fake_route, running_info)],
+        ), patch(
+            "pycloud_parallel.execution.service_session._node_control_client",
+            _FakeNodeControlClient,
+        ), patch(
+            "pycloud_parallel.execution.service_session._load_service_session_cache",
+            return_value={
+                "artifact_code_version": effective_code_version,
+                "nodes": {
+                    "node-1-inst": {
+                        "service_id": "svc-old",
+                        "service_token": "token-old",
+                        "http_base_url": fake_route.http_base_url,
+                        "worker_count": 1,
+                        "heartbeat_timeout_sec": 30,
+                    }
+                },
+            },
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-race-service",
+                blob=blob,
+                runtime="py3",
+                entry_module="demo_service",
+                entry_callable="run",
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert len(create_calls) == 1
+            assert create_calls[0]["service_name"] == "demo-race-service"
+        finally:
+            group.close(end_services=False)
+
     def test_async_call_all_interface(self):
         """测试异步 call_all 接口。"""
         from pycloud_parallel import Service as OwnerServiceFacade

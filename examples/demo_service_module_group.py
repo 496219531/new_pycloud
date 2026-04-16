@@ -14,11 +14,11 @@ def main():
     # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
     dependency_allowlist = []
     blob = (
-        b"from pycloud_parallel import pycloud_export\n\n"
-        b"@pycloud_export\n"
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
         b"def square(x=0, **_kwargs):\n"
         b"    return {'x': x, 'y': x * x}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def fibonacci(n=0, **_kwargs):\n"
         b"    if n <= 1:\n"
         b"        return n\n"
@@ -26,7 +26,7 @@ def main():
         b"    for _ in range(n - 1):\n"
         b"        a, b = b, a + b\n"
         b"    return {'n': n, 'result': b}\n\n"
-        b"@pycloud_export\n"
+        b"@export\n"
         b"def slow_add(a=0, b=0, **_kwargs):\n"
         b"    import time\n"
         b"    time.sleep(0.1)\n"
