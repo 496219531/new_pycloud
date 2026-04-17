@@ -7,6 +7,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import time
 
 from pycloud_parallel import TaskPool
@@ -23,10 +30,10 @@ def main() -> None:
         b"    return {'value': value, 'square': value * value}\n"
     )
 
-    with TaskPool.from_infocenter(
+    with TaskPool.open(
         infocenter_target="127.0.0.1:50051",
         job_id=f"demo-pool-{int(time.time())}",
-        blob=blob,
+        source=blob,
         entry_module="task_pool_demo",
         entry_callable="run",
         worker_count=2,

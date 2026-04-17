@@ -16,7 +16,6 @@ Local-only parallel helpers remain available under `pycloud_parallel.local`, not
 
 These legacy categories are transitional and must not survive the V1 cleanup:
 
-- legacy object/result reference wrappers
 - legacy owner-side deploy facade
 - legacy gateway/direct caller facades
 - legacy queue client naming

@@ -5,8 +5,8 @@ import json
 
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.controlplane.config import get_payload_policy
-from pycloud_parallel.controlplane.data_ref import DataRef, data_ref_to_payload
-from pycloud_parallel.data.ref import object_ref_to_payload
+from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import data_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
     decode_payload_from_transport,
     encode_result_for_transport,
@@ -117,7 +117,7 @@ def test_normalize_inbound_payload_deserializes_before_object_resolution() -> No
 
     normalized = normalize_inbound_payload(
         {
-            "blob": object_ref_to_payload(
+            "blob": data_ref_to_payload(
                 DataRef(
                     ref_id="sha256:" + ("c" * 64),
                     storage_id="sha256:" + ("c" * 64),
@@ -142,7 +142,7 @@ def test_normalize_inbound_payload_deserializes_before_object_resolution() -> No
 def test_decode_payload_from_transport_keeps_payload_decoded_without_localizing() -> None:
     decoded = decode_payload_from_transport(
         {
-            "blob": object_ref_to_payload(
+            "blob": data_ref_to_payload(
                 DataRef(
                     ref_id="sha256:" + ("d" * 64),
                     storage_id="sha256:" + ("d" * 64),
@@ -164,7 +164,7 @@ def test_decode_payload_from_transport_keeps_payload_decoded_without_localizing(
 def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
     body = json.dumps(
         {
-            "blob": object_ref_to_payload(
+            "blob": data_ref_to_payload(
                 DataRef(
                     ref_id="sha256:" + ("e" * 64),
                     storage_id="sha256:" + ("e" * 64),

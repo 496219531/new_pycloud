@@ -4,6 +4,13 @@
 该进程池会在函数执行完成后自动关闭。
 """
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 from pycloud_parallel.local import foreach, parallel_for
 
 

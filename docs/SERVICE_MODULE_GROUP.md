@@ -34,7 +34,7 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
@@ -52,7 +52,7 @@ print(group.square.sync(x=7))
 如果服务代码依赖节点未预装的包：
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="viewer-service",
@@ -70,7 +70,7 @@ group = Service.deploy_from_infocenter(
 
 ## 2. 长驻与退出
 
-`deploy_from_infocenter(...)` 成功后会自动开始 keepalive。
+`deploy(...)` 成功后会自动开始 keepalive。
 
 当前 owner 侧还会默认向 `stderr` 输出几类提示：
 
@@ -232,7 +232,7 @@ result = group.call_sync("square", x=7)
 ## 5. 常用部署参数
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
@@ -270,7 +270,7 @@ group = Service.deploy_from_infocenter(
 服务模式现在支持声明可动态更新的全局变量：
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,

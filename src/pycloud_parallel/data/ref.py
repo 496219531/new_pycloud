@@ -7,9 +7,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from pycloud_parallel.runtime.errors import DataRefPayloadError, format_dataref_payload_error
+
 DATA_REF_SENTINEL = "__pycloud_data_ref__"
-OBJECT_REF_SENTINEL = "__pycloud_object_ref__"
-RESULT_REF_SENTINEL = "__pycloud_result_ref__"
 _MATERIALIZE_PREFS = {"auto", "path", "dataframe", "series", "ndarray", "json", "bytes", "text"}
 _OBJECT_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _OBJECT_FORMAT_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -194,7 +194,11 @@ def is_data_ref_payload(data: Any) -> bool:
 
 def data_ref_from_payload(data: Dict[str, object]) -> DataRef:
     if not is_data_ref_payload(data):
-        raise ValueError("payload is not a DataRef sentinel")
+        raise DataRefPayloadError(
+            format_dataref_payload_error(
+                detail="payload is not a canonical DataRef sentinel",
+            )
+        )
     payload = dict(data[DATA_REF_SENTINEL] or {})
     return DataRef(
         ref_id=str(payload.get("ref_id", "") or payload.get("storage_id", "") or ""),
@@ -216,135 +220,22 @@ def data_ref_to_payload(ref: DataRef) -> Dict[str, Dict[str, object]]:
     return ref.to_payload()
 
 
-def is_object_ref_payload(data: Any) -> bool:
-    return (
-        isinstance(data, dict)
-        and set(data.keys()) == {OBJECT_REF_SENTINEL}
-        and isinstance(data.get(OBJECT_REF_SENTINEL), dict)
-    )
-
-
-def object_ref_from_payload(data: Dict[str, object]) -> DataRef:
-    if not is_object_ref_payload(data):
-        raise ValueError("payload is not a legacy object-ref sentinel")
-    payload = dict(data[OBJECT_REF_SENTINEL] or {})
-    return DataRef(
-        ref_id=str(payload.get("object_id", "") or ""),
-        storage_id=str(payload.get("object_id", "") or ""),
-        logical_type="",
-        format=str(payload.get("format", "") or ""),
-        size_bytes=int(payload.get("size_bytes", 0) or 0),
-        materialize_as=str(payload.get("materialize_as", "") or "path"),
-        locator_kind="node_local",
-        locator_token="",
-        consume_on_read=bool(payload.get("consume_on_read", False)),
-    )
-
-
-def object_ref_to_payload(ref: Any) -> Dict[str, Dict[str, object]]:
-    data_ref = coerce_data_ref(ref)
-    return {
-        OBJECT_REF_SENTINEL: {
-            "object_id": data_ref.object_id,
-            "format": data_ref.format,
-            "size_bytes": data_ref.size_bytes,
-            "materialize_as": resolve_data_ref_materialize_as(data_ref, default="path"),
-            "consume_on_read": bool(data_ref.consume_on_read),
-        }
-    }
-
-
-def is_result_ref_payload(data: Any) -> bool:
-    return (
-        isinstance(data, dict)
-        and set(data.keys()) == {RESULT_REF_SENTINEL}
-        and isinstance(data.get(RESULT_REF_SENTINEL), dict)
-    )
-
-
-def result_ref_from_payload(data: Dict[str, object]) -> DataRef:
-    if not is_result_ref_payload(data):
-        raise ValueError("payload is not a legacy result-ref sentinel")
-    payload = dict(data[RESULT_REF_SENTINEL] or {})
-    control_addr = str(payload.get("control_addr", "") or "").strip()
-    return DataRef(
-        ref_id=str(payload.get("object_id", "") or ""),
-        storage_id=str(payload.get("object_id", "") or ""),
-        logical_type="",
-        format=str(payload.get("format", "") or ""),
-        size_bytes=int(payload.get("size_bytes", 0) or 0),
-        materialize_as=str(payload.get("materialize_as", "") or "path"),
-        locator_kind="node_control" if control_addr else "node_local",
-        locator_token=control_addr,
-        consume_on_read=False,
-        node_id=str(payload.get("node_id", "") or ""),
-        node_instance_id=str(payload.get("node_instance_id", "") or ""),
-        control_addr=control_addr,
-    )
-
-
-def result_ref_to_payload(ref: Any) -> Dict[str, Dict[str, object]]:
-    data_ref = coerce_data_ref(ref)
-    return {
-        RESULT_REF_SENTINEL: {
-            "object_id": data_ref.object_id,
-            "node_id": str(data_ref.node_id or ""),
-            "node_instance_id": str(data_ref.node_instance_id or ""),
-            "control_addr": str(data_ref.control_addr or ""),
-            "format": data_ref.format,
-            "size_bytes": data_ref.size_bytes,
-            "materialize_as": resolve_data_ref_materialize_as(data_ref, default="path"),
-        }
-    }
-
-
-def data_ref_from_object_ref(ref: Any) -> DataRef:
-    return DataRef(
-        ref_id=str(ref.object_id or ""),
-        storage_id=str(ref.object_id or ""),
-        logical_type=_infer_logical_type(logical_type="", fmt=str(ref.format or ""), materialize_as=str(ref.materialize_as or "")),
-        format=str(ref.format or "bin"),
-        size_bytes=int(ref.size_bytes or 0),
-        materialize_as=str(ref.materialize_as or "path"),
-        locator_kind="node_local",
-        locator_token="",
-        consume_on_read=bool(getattr(ref, "consume_on_read", False)),
-    )
-
-
-def data_ref_from_result_ref(ref: Any) -> DataRef:
-    control_addr = str(getattr(ref, "control_addr", "") or "").strip()
-    return DataRef(
-        ref_id=str(ref.object_id or ""),
-        storage_id=str(ref.object_id or ""),
-        logical_type=_infer_logical_type(logical_type="", fmt=str(ref.format or ""), materialize_as=str(ref.materialize_as or "")),
-        format=str(ref.format or "bin"),
-        size_bytes=int(ref.size_bytes or 0),
-        materialize_as=str(ref.materialize_as or "path"),
-        locator_kind="node_control" if control_addr else "node_local",
-        locator_token=control_addr,
-        consume_on_read=bool(getattr(ref, "consume_on_read", False)),
-        node_id=str(getattr(ref, "node_id", "") or ""),
-        node_instance_id=str(getattr(ref, "node_instance_id", "") or ""),
-        control_addr=control_addr,
-    )
-
-
 def coerce_data_ref(value: Any) -> DataRef:
     if isinstance(value, DataRef):
         return value
     if isinstance(value, dict):
         if is_data_ref_payload(value):
             return data_ref_from_payload(value)
-        if is_object_ref_payload(value):
-            return object_ref_from_payload(value)
-        if is_result_ref_payload(value):
-            return result_ref_from_payload(value)
-    if hasattr(value, "object_id") and hasattr(value, "format") and hasattr(value, "size_bytes"):
-        if hasattr(value, "node_id") or hasattr(value, "control_addr"):
-            return data_ref_from_result_ref(value)
-        return data_ref_from_object_ref(value)
-    raise TypeError(f"value is not a supported data ref: {type(value).__name__}")
+        raise DataRefPayloadError(
+            format_dataref_payload_error(
+                detail="legacy or non-DataRef payloads are no longer supported",
+            )
+        )
+    raise DataRefPayloadError(
+        format_dataref_payload_error(
+            detail=f"value is not a DataRef or DataRef payload: {type(value).__name__}",
+        )
+    )
 
 
 def maybe_data_ref(value: Any) -> Optional[DataRef]:
@@ -431,18 +322,12 @@ def get_data(value: Any) -> DataRef:
 
 __all__ = [
     "DATA_REF_SENTINEL",
-    "OBJECT_REF_SENTINEL",
-    "RESULT_REF_SENTINEL",
     "DataRef",
     "coerce_data_ref",
-    "data_ref_from_object_ref",
     "data_ref_from_payload",
-    "data_ref_from_result_ref",
     "data_ref_to_payload",
     "get_data",
     "is_data_ref_payload",
-    "is_object_ref_payload",
-    "is_result_ref_payload",
     "maybe_data_ref",
     "normalize_data_ref_id",
     "normalize_data_ref_materialize_as",
@@ -451,13 +336,9 @@ __all__ = [
     "normalize_object_id",
     "object_format_suffix",
     "object_id_from_sha256_hex",
-    "object_ref_from_payload",
-    "object_ref_to_payload",
     "object_storage_path",
     "put_data",
     "resolve_data_ref_materialize_as",
-    "result_ref_from_payload",
-    "result_ref_to_payload",
     "with_data_ref_control_addr",
     "with_data_ref_locator",
 ]

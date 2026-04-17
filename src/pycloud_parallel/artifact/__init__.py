@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps, ArtifactExports
+
 
 def export(fn):
     fn.__pycloud_export__ = True
@@ -10,4 +12,10 @@ def export(fn):
 
 pycloud_export = export
 
-__all__ = ["export", "pycloud_export"]
+__all__ = [
+    "Artifact",
+    "ArtifactDeps",
+    "ArtifactExports",
+    "export",
+    "pycloud_export",
+]

@@ -9,8 +9,10 @@
 import sys
 import os
 
-# 添加项目路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# 添加项目路径（优先使用仓库内 src）
+REPO_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+if REPO_SRC not in sys.path:
+    sys.path.insert(0, REPO_SRC)
 
 from pycloud_parallel.controlplane.dependency import (
     DependencyAnalyzer,

@@ -34,7 +34,7 @@
 
 推荐入口：
 
-1. `Service.deploy_from_infocenter(...)`
+1. `Service.deploy(...)`
 
 ### 2.2 caller client
 
@@ -59,6 +59,7 @@
 推荐入口：
 
 1. `JobQueue`
+2. 默认代码输入走 `submit(source=module)`
 
 ### 2.4 task pool client
 
@@ -80,6 +81,7 @@
 2. 注册时指定 `entry_module + export_spec`
 3. 导出模式支持 `decorator / explicit / all / single`
 4. 当前更适合作为内部函数服务层，而不是对外 Web 应用层
+5. 普通用户默认走 `Service.deploy(source=module)`；`Artifact(...)` 只保留给高级打包控制
 
 对外推荐入口：
 
@@ -100,6 +102,7 @@
 当前推荐入口：
 
 1. `JobQueue`
+2. 默认代码输入走 `submit(source=module)`
 
 ## 5. TaskPool Mode
 
@@ -122,6 +125,7 @@
 5. 每个 pool 当前只暴露一个任务入口，也就是创建时的 `entry_callable`
 6. `task_method` 是高层单入口校验参数，不是多方法路由协议
 7. `runtime_key` 仍然保留，但它代表 runtime 逻辑隔离键，不再对应独立的 runtime-slot 资源
+8. 普通用户默认走 `TaskPool.open(source=module)`；`Artifact(...)` 是高级能力
 
 ## 6. 已移除
 

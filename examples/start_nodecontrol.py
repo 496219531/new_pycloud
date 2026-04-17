@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """直接启动一个 NodeControl 节点。
 
 示例：
@@ -12,6 +10,15 @@ python examples/start_nodecontrol.py \
   --advertise-addr 127.0.0.1:50062 \
   --service-http-bind 127.0.0.1:18082
 """
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
 
 import argparse
 import logging

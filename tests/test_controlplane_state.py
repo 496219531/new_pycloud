@@ -86,7 +86,7 @@ def test_normalize_user_return_inlines_dataframe_when_limit_allows(tmp_path, mon
     assert status == "SUCCEEDED"
     assert err_type == ""
     assert err_message == ""
-    assert not isinstance(result, dict) or "__pycloud_result_ref__" not in result
+    assert not isinstance(result, dict) or "__pycloud_data_ref__" not in result
     restored = struct_to_dict(dict_to_struct({"frame": result}))
     pd.testing.assert_frame_equal(restored["frame"], frame)
 

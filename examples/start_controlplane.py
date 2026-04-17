@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """直接启动一个 ControlPlane（InfoCenter + Gateway）。
 
 默认只需要：
@@ -14,6 +12,15 @@ python examples/start_controlplane.py \
   --gateway-refresh-interval-sec 2.0 \
   --log-level DEBUG
 """
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
 
 import argparse
 import logging

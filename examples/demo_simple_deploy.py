@@ -4,6 +4,13 @@ PyCloud 简化部署示例
 
 展示使用默认值简化服务部署。
 """
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 from pycloud_parallel import Service
 
 
@@ -28,10 +35,10 @@ def main():
         # 方式 1：完全不提供 service_name 和 owner_client_id
         print("方式 1：使用所有默认值")
         print("-" * 60)
-        group1 = Service.deploy_from_infocenter(
+        group1 = Service.deploy(
             infocenter_target="127.0.0.1:50051",
             # service_name 和 owner_client_id 会自动生成
-            blob=blob,
+            source=blob,
             runtime="py3",
             entry_module="compute",
             dependency_allowlist=dependency_allowlist,
@@ -45,10 +52,10 @@ def main():
         # 方式 2：只提供 entry_module，自动生成 service_name
         print("方式 2：提供 entry_module")
         print("-" * 60)
-        group2 = Service.deploy_from_infocenter(
+        group2 = Service.deploy(
             infocenter_target="127.0.0.1:50051",
             # entry_module 会用于生成 service_name
-            blob=blob,
+            source=blob,
             entry_module="my_service",  # 指定 entry_module
             dependency_allowlist=dependency_allowlist,
             worker_count=1,
@@ -60,10 +67,10 @@ def main():
         # 方式 3：只提供 owner_client_id，使用默认 service_name
         print("方式 3：只提供 owner_client_id")
         print("-" * 60)
-        group3 = Service.deploy_from_infocenter(
+        group3 = Service.deploy(
             infocenter_target="127.0.0.1:50051",
             owner_client_id="my-custom-client",  # 自定义 owner
-            blob=blob,
+            source=blob,
             dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
@@ -77,10 +84,10 @@ def main():
         print("方式 4：只提供 service_name")
         print("-" * 60)
         custom_name = "my-custom-service"
-        group4 = Service.deploy_from_infocenter(
+        group4 = Service.deploy(
             infocenter_target="127.0.0.1:50051",
             service_name=custom_name,  # 自定义 service_name
-            blob=blob,
+            source=blob,
             dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )

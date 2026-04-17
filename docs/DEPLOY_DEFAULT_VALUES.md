@@ -1,4 +1,4 @@
-# deploy_from_infocenter 默认值与当前语义
+# Service.deploy 默认值与当前语义
 
 ## 1. 自动默认值
 
@@ -53,7 +53,7 @@ service-{本机IP}-{时间戳}
 ```python
 from pycloud_parallel.execution.service_session import Service
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     artifact_path="service.py",
 )
@@ -62,7 +62,7 @@ group = Service.deploy_from_infocenter(
 ### 3.2 使用 blob
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     entry_module="service",
@@ -88,7 +88,7 @@ group = Service.deploy_from_infocenter(
 ### 4.1 显式指定节点
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     entry_module="service",
@@ -99,7 +99,7 @@ group = Service.deploy_from_infocenter(
 ### 4.2 指定节点数
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     entry_module="service",
@@ -144,7 +144,7 @@ group = Service.deploy_from_infocenter(
 ## 7. 一个更贴近当前实现的示例
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     blob=blob,
     entry_module="square_service",
@@ -175,7 +175,7 @@ finally:
 
 也就是：
 
-1. `deploy_from_infocenter(...)` 成功后就会自动启动 keepalive
+1. `deploy(...)` 成功后就会自动启动 keepalive
 2. 不再推荐手写 `start_keepalive() + while True`
 3. `join()` 只负责长驻等待
 4. `Ctrl+C` 作为正常退出路径

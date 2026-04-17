@@ -5,6 +5,13 @@ DataFrame 序列化演示
 展示 PyCloud 如何自动处理 DataFrame 和 Series 的序列化/反序列化。
 """
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import asyncio
 from pycloud_parallel import Service
 
@@ -40,7 +47,7 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,

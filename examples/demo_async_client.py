@@ -4,6 +4,13 @@ PyCloud 异步客户端示例
 
 使用异步方式并发调用服务，适合高吞吐量场景。
 """
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import asyncio
 import time
 from pycloud_parallel import Service
@@ -36,7 +43,7 @@ def main():
     print("=" * 60)
     print()
 
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"async-demo-{suffix}",
         service_name=f"compute-service-{suffix}",
@@ -85,14 +92,14 @@ def main():
         # 示例 2: 批量并发调用
         # ================================================================
         print("-" * 60)
-        print("  示例 2: 批量并发调用 (100 次)")
+        print("  示例 2: 批量并发调用 (20 次)")
         print("-" * 60)
 
         async def demo_batch_calls():
             start = time.time()
             tasks = [
                 group.acall_balanced("square", {"x": i}, timeout_sec=10)
-                for i in range(100)
+                for i in range(20)
             ]
             results = await asyncio.gather(*tasks)
 
@@ -136,15 +143,15 @@ def main():
         # 示例 4: 高并发压测
         # ================================================================
         print("-" * 60)
-        print("  示例 4: 高并发压测 (1000 次)")
+        print("  示例 4: 高并发压测 (100 次)")
         print("-" * 60)
 
         async def demo_high_concurrency():
             start = time.time()
 
             # 分批执行，每批 100 个
-            batch_size = 100
-            total = 1000
+            batch_size = 20
+            total = 100
             success = 0
 
             for batch_num in range(total // batch_size):
@@ -171,13 +178,10 @@ def main():
         print("=" * 60)
         print("  Demo 完成!")
         print("=" * 60)
-        print("  服务进入长驻模式，按 Ctrl+C 自动回收")
+        print("  若需长驻，可手动调用 group.join(...)")
         print("=" * 60)
         print()
-        group.join(
-            end_services_on_interrupt=True,
-            end_reason="owner ctrl+c",
-        )
+        group.close(end_services=True, reason="demo_async_client cleanup")
         joined = True
 
     finally:

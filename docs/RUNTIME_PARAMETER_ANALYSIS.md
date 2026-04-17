@@ -30,13 +30,13 @@
 ### 3.1 Service Mode
 
 ```python
-Service.deploy_from_infocenter(..., runtime="py3.11")
+Service.deploy(..., runtime="py3.11")
 ```
 
 ### 3.2 TaskPool Mode
 
 ```python
-TaskPool.from_infocenter(..., runtime=">=py3.11")
+TaskPool.open(..., runtime=">=py3.11")
 ```
 
 ### 3.3 JobQueue Mode

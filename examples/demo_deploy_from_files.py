@@ -8,6 +8,13 @@ PyCloud 部署服务示例：从多个文件/文件夹部署
     1. 确保 InfoCenter 和 NodeControl 已启动
     2. 运行脚本
 """
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 from pycloud_parallel import Service
 
 
@@ -244,7 +251,7 @@ def main():
         print("-" * 60)
         print()
 
-        group = Service.deploy_from_infocenter(
+        group = Service.deploy(
             infocenter_target="127.0.0.1:50051",
             owner_client_id=owner_client_id,
             service_name=service_name,
@@ -319,13 +326,10 @@ def main():
         print("=" * 60)
         print("  示例完成")
         print("=" * 60)
-        print("  服务进入长驻模式，按 Ctrl+C 自动回收")
+        print("  若需长驻，可手动调用 group.join(...)")
         print("=" * 60)
         print()
-        group.join(
-            end_services_on_interrupt=True,
-            end_reason="owner ctrl+c",
-        )
+        group.close(end_services=True, reason="demo_deploy_from_files cleanup")
         joined = True
 
     finally:

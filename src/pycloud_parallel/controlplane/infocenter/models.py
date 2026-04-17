@@ -43,8 +43,13 @@ class NodeTaskPoolInfo:
     code_version: str
     status: str
     worker_count: int = 0
+    alive_workers: int = 0
     task_count: int = 0
     inflight: int = 0
+    received_count: int = 0
+    returned_count: int = 0
+    ema_child_invoke_ms: float = 0.0
+    ema_samples: int = 0
     created_at: datetime = field(default_factory=utc_now)
     last_heartbeat_at: datetime = field(default_factory=utc_now)
     lease_expire_at: datetime = field(default_factory=utc_now)

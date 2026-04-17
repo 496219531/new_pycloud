@@ -5,6 +5,9 @@ from pycloud_parallel import TaskPool as TopLevelTaskPool
 from pycloud_parallel import export as TopLevelExport
 from pycloud_parallel.api.common import DataRef as ApiDataRef
 from pycloud_parallel.api.common import export as ApiExport
+from pycloud_parallel.artifact import Artifact as PublicArtifact
+from pycloud_parallel.artifact import ArtifactDeps as PublicArtifactDeps
+from pycloud_parallel.artifact import ArtifactExports as PublicArtifactExports
 from pycloud_parallel.api.pool import TaskPool as ApiTaskPool
 from pycloud_parallel.api.queue import JobQueue as ApiJobQueue
 from pycloud_parallel.api.service import Service as ApiService
@@ -28,6 +31,12 @@ def test_controlplane_artifact_and_data_modules_are_direct_authority():
     assert ControlplaneArtifactDeps.__module__ == "pycloud_parallel.controlplane.artifact"
     assert ControlplaneArtifactExports.__module__ == "pycloud_parallel.controlplane.artifact"
     assert ControlplaneDataRef.__module__ == "pycloud_parallel.data.ref"
+
+
+def test_artifact_package_exposes_advanced_artifact_api_without_top_level_export():
+    assert PublicArtifact is ControlplaneArtifact
+    assert PublicArtifactDeps is ControlplaneArtifactDeps
+    assert PublicArtifactExports is ControlplaneArtifactExports
 
 
 def test_proto_messages_expose_node_instance_id_fields():

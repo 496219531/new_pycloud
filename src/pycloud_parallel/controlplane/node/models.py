@@ -12,6 +12,7 @@ from pycloud_parallel.controlplane.session_model import (
     SessionBinding,
     SessionIdentity,
     SessionLease,
+    WorkerResourceSnapshot,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.controlplane.serialization import dict_to_struct
@@ -127,6 +128,29 @@ class ServiceSession:
     request_count: int = 0
     returned_count: int = 0
 
+    def is_running(self) -> bool:
+        return int(self.status or 0) in {
+            int(pb2.SERVICE_STATUS_STARTING),
+            int(pb2.SERVICE_STATUS_RUNNING),
+            int(pb2.SERVICE_STATUS_DRAINING),
+        }
+
+    def resource_snapshot(self, *, in_flight: int | None = None) -> WorkerResourceSnapshot:
+        normalized_received = max(0, int(self.request_count or 0))
+        normalized_returned = max(0, int(self.returned_count or 0))
+        normalized_in_flight = (
+            max(0, int(in_flight))
+            if in_flight is not None
+            else max(0, normalized_received - normalized_returned)
+        )
+        return WorkerResourceSnapshot(
+            worker_count=max(0, int(self.worker_count or 0)),
+            alive_workers=max(0, int(self.alive_workers or 0)),
+            in_flight=normalized_in_flight,
+            received_count=normalized_received,
+            returned_count=normalized_returned,
+        )
+
     def identity(self) -> SessionIdentity:
         return SessionIdentity(
             kind="service",
@@ -203,9 +227,30 @@ class TaskPoolState:
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""
     executor_ready: bool = False
+    alive_workers: int = 0
     task_count: int = 0
     timing_metrics: Dict[str, object] = field(default_factory=dict)
     returned_count: int = 0
+
+    def is_running(self) -> bool:
+        return str(self.status or "").strip().upper() == "RUNNING"
+
+    def resource_snapshot(self, *, in_flight: int | None = None) -> WorkerResourceSnapshot:
+        normalized_received = max(0, int(self.task_count or 0))
+        normalized_returned = max(0, int(self.returned_count or 0))
+        normalized_in_flight = (
+            max(0, int(in_flight))
+            if in_flight is not None
+            else max(0, normalized_received - normalized_returned)
+        )
+        alive_workers = max(0, int(self.alive_workers or self.worker_count or 0)) if self.is_running() else 0
+        return WorkerResourceSnapshot(
+            worker_count=max(0, int(self.worker_count or 0)),
+            alive_workers=alive_workers,
+            in_flight=normalized_in_flight,
+            received_count=normalized_received,
+            returned_count=normalized_returned,
+        )
 
     def identity(self) -> SessionIdentity:
         return SessionIdentity(

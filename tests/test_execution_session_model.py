@@ -39,6 +39,12 @@ def test_service_replica_state_snapshot_views() -> None:
     assert state.identity().session_name == "svc-demo"
     assert state.lease().idle_ttl_sec == 15
     assert state.binding().executor_ready is True
+    resource = state.resource_snapshot()
+    assert resource.worker_count == 2
+    assert resource.alive_workers == 0
+    assert resource.in_flight == 0
+    assert resource.received_count == 0
+    assert resource.returned_count == 0
     snap = state.snapshot(node_instance_id="node-inst-1", node_id="node-1")
     assert snap.kind == "service"
     assert snap.alive is True
@@ -64,6 +70,7 @@ def test_task_pool_replica_state_snapshot_views() -> None:
         last_heartbeat_at=now,
         lease_expire_at=now + timedelta(seconds=20),
         executor_ready=True,
+        alive_workers=3,
         managed_global_names=("cfg",),
         managed_globals_scope_dir="/tmp/pool-globals",
         managed_globals_digest="sha256:pool-digest",
@@ -71,6 +78,12 @@ def test_task_pool_replica_state_snapshot_views() -> None:
 
     assert state.identity().session_token == "pool-token"
     assert state.binding().managed_globals_digest == "sha256:pool-digest"
+    resource = state.resource_snapshot()
+    assert resource.worker_count == 3
+    assert resource.alive_workers == 3
+    assert resource.in_flight == 0
+    assert resource.received_count == 0
+    assert resource.returned_count == 0
     snap = state.snapshot(node_instance_id="node-inst-1", node_id="node-1")
     assert snap.kind == "task_pool"
     assert snap.alive is True
@@ -165,6 +178,14 @@ def test_service_group_exposes_replicas_and_snapshot() -> None:
     snap = group.snapshot()["node-inst-1"]
     assert snap.node_id == "node-1"
     assert group.is_alive() is True
+    status = group.status()
+    assert status.kind == "service"
+    assert status.replica_count == 1
+    assert status.alive_replica_count == 1
+    assert status.failed is False
+    assert status.alive is True
+    assert status.last_heartbeat_at == now
+    assert status.lease_expire_at == now + timedelta(seconds=30)
 
 
 def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
@@ -197,3 +218,11 @@ def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
     snap = session.snapshot()["node-inst-1"]
     assert snap.session_name == "pool-demo"
     assert snap.node_id == "node-1"
+    status = session.status()
+    assert status.kind == "task_pool"
+    assert status.replica_count == 1
+    assert status.alive_replica_count == 1
+    assert status.failed is False
+    assert status.alive is True
+    assert status.last_heartbeat_at == now
+    assert status.lease_expire_at == now + timedelta(seconds=30)

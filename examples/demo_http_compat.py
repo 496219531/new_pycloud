@@ -75,13 +75,12 @@ def main():
     print("-" * 60)
 
     try:
-        group = Service.deploy_from_infocenter(
+        group = Service.deploy(
             infocenter_target=gateway_target,
             service_name=service_name,
-            blob=blob,
+            source=blob,
             runtime="py3",
             entry_module="compat_demo",
-            export_mode="decorator",
             dependency_allowlist=dependency_allowlist,
             worker_count=2,
             tags=["compute"],
@@ -125,20 +124,18 @@ def main():
         print(f"   内部 payload: {{'args': [10], 'kwargs': {{'b': 20}}}}")
         print()
 
-        # === 方式 4: HTTP 风格 (使用 GatewayServiceClient) ===
+        # === 方式 4: 通过 gateway transport 传普通 kwargs ===
         print("4️⃣  HTTP 风格 (直接传字典)")
-        from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
-
-        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
-            print("   调用: client.call(service_name='compat-demo', method='add', payload={'a': 100, 'b': 200})")
-            result = client.call(
-                service_name=service_name,
-                method="add",
-                payload={"a": 100, "b": 200},  # HTTP 风格：直接传字典
-                timeout_sec=10.0,
-            )
+        with Service.connect(
+            target=gateway_target,
+            service_name=service_name,
+            transport="gateway",
+            timeout_sec=10.0,
+        ) as client:
+            print("   调用: client.add.sync(a=100, b=200)")
+            result = client.add.sync(a=100, b=200)
             print(f"   结果: {result}")
-            print(f"   内部 payload: {{'a': 100, 'b': 200}} (当作 kwargs)")
+            print(f"   gateway transport 内部仍会把 {{'a': 100, 'b': 200}} 当作 kwargs 发送")
         print()
 
         # === 方式 5: 带默认值的位置参数 ===

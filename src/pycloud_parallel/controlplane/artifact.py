@@ -18,6 +18,7 @@ _DEFAULT_EXPORT_DECORATOR = "pycloud_export"
 _VALID_DEP_MODES = {"prebuilt", "node_preinstalled", "allow_install"}
 _VALID_EXPORT_MODES = {"decorator", "explicit", "all", "single"}
 _VALID_SOURCE_KINDS = {"module", "function", "path", "paths", "bytes"}
+_SOURCE_UNSET = object()
 
 
 def _normalize_names(values: Sequence[str]) -> Tuple[str, ...]:
@@ -180,6 +181,27 @@ def _infer_entry_module_from_artifact_path(
 
 def _normalize_dependency_policy(deps: "ArtifactDeps | None") -> "ArtifactDeps":
     return deps if deps is not None else ArtifactDeps.prebuilt()
+
+
+def _coerce_source_input(source: Any) -> Tuple[str, Any]:
+    if isinstance(source, Artifact):
+        return "artifact", source
+    if inspect.ismodule(source):
+        return "module", source
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        return "bytes", bytes(source)
+    if isinstance(source, (str, os.PathLike)):
+        return "path", str(source)
+    if isinstance(source, (list, tuple)):
+        normalized_paths = tuple(str(item) for item in source if str(item or "").strip())
+        if not normalized_paths:
+            raise ValueError("source path sequence must not be empty")
+        return "paths", normalized_paths
+    if callable(source):
+        return "function", source
+    raise TypeError(
+        "source must be a callable, module, bytes, path-like value, path sequence, or Artifact instance"
+    )
 
 
 def _coerce_artifact_deps(
@@ -348,21 +370,36 @@ class Artifact:
         return cls(source_kind="function", source_value=func, **normalized)
 
     @classmethod
-    def from_path(cls, path: Union[str, os.PathLike[str]], **kwargs) -> "Artifact":
-        return cls(source_kind="path", source_value=str(path), **kwargs)
-
-    @classmethod
     def from_paths(
         cls,
-        root_dir: Union[str, os.PathLike[str]],
-        paths: Sequence[Union[str, os.PathLike[str]]],
+        root_or_paths: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]],
+        paths: Optional[Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]]] = None,
         **kwargs,
     ) -> "Artifact":
-        source = _ArtifactPathsSource(
-            root_dir=str(root_dir),
-            paths=tuple(str(path) for path in (paths or ())),
-            mode="paths",
-        )
+        def _normalize_paths_input(value: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]]) -> Tuple[str, ...]:
+            if isinstance(value, (str, os.PathLike)):
+                normalized = (str(value),)
+            elif isinstance(value, (list, tuple)):
+                normalized = tuple(str(path) for path in value if str(path or "").strip())
+            else:
+                raise TypeError("artifact paths must be a path or a sequence of paths")
+            normalized = tuple(path for path in normalized if str(path or "").strip())
+            if not normalized:
+                raise ValueError("artifact paths source is empty")
+            return normalized
+
+        if paths is None:
+            source = _ArtifactPathsSource(
+                root_dir="",
+                paths=_normalize_paths_input(root_or_paths),
+                mode="roots",
+            )
+        else:
+            source = _ArtifactPathsSource(
+                root_dir=str(root_or_paths),
+                paths=_normalize_paths_input(paths),
+                mode="paths",
+            )
         return cls(source_kind="paths", source_value=source, **kwargs)
 
     @classmethod
@@ -465,7 +502,11 @@ def _prepare_artifact_blob(artifact: Artifact) -> Tuple[bytes, str]:
         if not path.exists():
             raise FileNotFoundError(f"artifact path not found: {path}")
         if path.is_dir():
-            tmp_path = DependencyPackager().package_directory(path, include_tests=False)
+            tmp_path = DependencyPackager().package_roots(
+                [path],
+                include_tests=False,
+                synthesize_missing_package_inits=True,
+            )
             try:
                 return _read_temp_file(tmp_path), f"{path.name}.tar.gz"
             finally:
@@ -554,7 +595,7 @@ def _legacy_exports_from_args(
     if not normalized_mode:
         if methods:
             normalized_mode = "explicit"
-        elif str(consumer_kind or "").strip() == "task":
+        elif str(consumer_kind or "").strip() in {"task", "job"}:
             normalized_mode = "single"
         else:
             normalized_mode = "decorator"
@@ -570,6 +611,7 @@ def _legacy_exports_from_args(
 def _normalize_artifact_input(
     *,
     consumer_kind: str,
+    source: Any = _SOURCE_UNSET,
     artifact: Optional[Artifact] = None,
     deps: Optional[ArtifactDeps] = None,
     func: Optional[Callable] = None,
@@ -585,8 +627,30 @@ def _normalize_artifact_input(
     managed_global_names: Optional[Sequence[str]] = None,
 ) -> Artifact:
     normalized_consumer = str(consumer_kind or "").strip().lower()
-    if normalized_consumer not in {"service", "task"}:
+    if normalized_consumer not in {"service", "task", "job"}:
         raise ValueError(f"unsupported artifact consumer kind: {consumer_kind!r}")
+
+    if source is not _SOURCE_UNSET and source is not None:
+        source_kind, source_value = _coerce_source_input(source)
+        if source_kind == "artifact":
+            if artifact is not None:
+                raise ValueError("source Artifact cannot be combined with artifact=")
+            artifact = source_value
+        else:
+            if artifact is not None or func is not None or blob is not None or artifact_path:
+                raise ValueError("source cannot be combined with artifact, func, blob, or artifact_path")
+            if inspect.ismodule(entry_module) or (not isinstance(entry_callable, str) and callable(entry_callable)):
+                raise ValueError("source cannot be combined with module/callable legacy entry inputs")
+            if source_kind == "function":
+                func = source_value
+            elif source_kind == "module":
+                entry_module = source_value
+            elif source_kind == "bytes":
+                blob = source_value
+            elif source_kind == "paths":
+                artifact_path = list(source_value)
+            else:
+                artifact_path = source_value
 
     raw_entry_module = entry_module
     raw_entry_callable = entry_callable
@@ -652,18 +716,7 @@ def _normalize_artifact_input(
         effective_format = _resolve_package_format(package_format, default="py")
         return Artifact.from_bytes(blob, package_format=effective_format, **{k: v for k, v in base_kwargs.items() if k != "package_format"})
     if artifact_path:
-        if isinstance(artifact_path, (list, tuple)):
-            source = _ArtifactPathsSource(
-                root_dir="",
-                paths=tuple(str(path) for path in artifact_path if str(path)),
-                mode="roots",
-            )
-            return Artifact(
-                source_kind="paths",
-                source_value=source,
-                **base_kwargs,
-            )
-        return Artifact.from_path(str(artifact_path), **base_kwargs)
+        return Artifact.from_paths(artifact_path, **base_kwargs)
     raise ValueError(
         "blob, func, artifact_path, module-object entry_module or callable-object entry_callable is required"
     )
@@ -675,13 +728,18 @@ def _prepare_artifact(
     consumer_kind: str,
 ) -> PreparedArtifact:
     normalized_consumer = str(consumer_kind or "").strip().lower()
-    if normalized_consumer not in {"service", "task"}:
+    if normalized_consumer not in {"service", "task", "job"}:
         raise ValueError(f"unsupported artifact consumer kind: {consumer_kind!r}")
     blob, filename = _prepare_artifact_blob(artifact)
     package_format = _resolve_package_format(artifact.package_format, filename, default="py")
     entry_module, entry_callable = _infer_entry_defaults(artifact, package_format=package_format, filename=filename)
     if not filename:
-        fallback_stem = "service_artifact" if normalized_consumer == "service" else "task_pool_artifact"
+        if normalized_consumer == "service":
+            fallback_stem = "service_artifact"
+        elif normalized_consumer == "job":
+            fallback_stem = "job_artifact"
+        else:
+            fallback_stem = "task_pool_artifact"
         filename = _default_artifact_filename(
             package_format=package_format,
             entry_module=entry_module,

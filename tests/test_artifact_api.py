@@ -201,7 +201,7 @@ def test_prepare_artifact_accepts_public_deps_override() -> None:
     assert prepared.dependency_allowlist == ()
 
 
-def test_artifact_from_path_packages_directory(tmp_path) -> None:
+def test_artifact_from_paths_packages_single_directory(tmp_path) -> None:
     from pycloud_parallel.controlplane.artifact import Artifact, ArtifactExports, _prepare_artifact
 
     pkg_dir = tmp_path / "demo_pkg"
@@ -211,7 +211,7 @@ def test_artifact_from_path_packages_directory(tmp_path) -> None:
         "def run(**_kwargs):\n    return {'ok': True}\n",
         encoding="utf-8",
     )
-    artifact = Artifact.from_path(
+    artifact = Artifact.from_paths(
         pkg_dir,
         entry_module="demo_pkg.worker",
         exports=ArtifactExports.use_decorator(),
@@ -222,5 +222,5 @@ def test_artifact_from_path_packages_directory(tmp_path) -> None:
     assert prepared.package_format == "tar.gz"
     with tarfile.open(fileobj=io.BytesIO(prepared.blob), mode="r:gz") as tf:
         names = set(tf.getnames())
-    assert "__init__.py" in names
-    assert "worker.py" in names
+    assert "demo_pkg/__init__.py" in names
+    assert "demo_pkg/worker.py" in names

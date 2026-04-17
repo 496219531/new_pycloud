@@ -327,22 +327,13 @@ pycloudctl --local start
 from pycloud_parallel import Service
 
 blob = (
-    b"def pycloud_export(fn):\n"
-    b"    fn.__pycloud_export__ = True\n"
-    b"    return fn\n\n"
-    b"@pycloud_export\n"
-    b"def square(x=0, **_kwargs):\n"
-    b"    x = int(x)\n"
-    b"    return {'x': x, 'y': x * x}\n"
-)
+import my_service_module
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
-    blob=blob,
+    source=my_service_module,
     runtime="py3",
-    entry_module="square_service",
-    export_mode="decorator",
     node_count=1,
 )
 
@@ -352,10 +343,11 @@ print(group.square.sync(x=7))
 # 同一台机器上，同一个 owner_client_id + service_name 只允许一个活跃 deployservice
 ```
 
-如果你的代码依赖节点上未预装的包，可以显式给白名单：
+默认推荐直接传模块对象 `source=my_service_module`。
+如果你的代码依赖节点上未预装的包，或你需要更细的打包/导出控制，再使用高级 `Artifact(...)` 或显式白名单：
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="dep-service",
     artifact_path="./service_src",
@@ -371,12 +363,12 @@ group = Service.deploy_from_infocenter(
 如果你直接传真实模块对象：
 
 ```python
-import my_job.main
+import my_service_module
 from pycloud_parallel import Service
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
-    entry_module=my_job.main,
+    source=my_service_module,
     runtime="py3",
 )
 ```
@@ -399,18 +391,13 @@ group = Service.deploy_from_infocenter(
 ```python
 from pycloud_parallel import TaskPool
 
-blob = (
-    b"def run(value=0, **_kwargs):\n"
-    b"    value = int(value)\n"
-    b"    return {'value': value, 'square': value * value}\n"
-)
+import my_task_module
 
-with TaskPool.from_infocenter(
+with TaskPool.open(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
-    blob=blob,
+    source=my_task_module,
     runtime="py3",
-    entry_module="task_demo",
 ) as pool:
     resp = pool.submit_payloads([{"value": 7}])
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
@@ -449,12 +436,11 @@ with TaskPool.from_infocenter(
 
 如果你希望先排队，再由调度器自动创建专属 pool，使用 `JobQueue`。
 
-常见高层 helper：
+常见高层入口：
 
-1. `submit_job_from_bytes(...)`
-2. `submit_job_from_module(...)`
-3. `get_job_status(...)`
-4. `wait_for_terminal(...)`
+1. `submit(source=...)`
+2. `get_job_status(...)`
+3. `wait_for_terminal(...)`
 
 job module 约定：
 
@@ -480,11 +466,11 @@ job module 约定：
 说明：
 
 1. `job_payload` 是可选 `dict`
-2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+2. `submit(source=my_job_module, ...)` 会自动发现并绑定 `task_generator`
 3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
 4. `apply_managed_globals` 不需要通过 payload 传，worker 固定按约定名在入口模块 A 里查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
-6. `submit_job_from_module(...)` 自动打包时只会收 `.py / .pyd / .so`
+6. 直接传模块对象时，会自动打包该模块及其本地 Python 依赖
 7. 如果 job 依赖非 Python 资源文件，请预先自行构建归档后再上传
 
 本地调试自动打包结果：
@@ -524,7 +510,7 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 
 当前推荐调用路径：
 
-1. owner：`Service.deploy_from_infocenter(...)`
+1. owner：`Service.deploy(...)`
 2. caller：`GatewayConnect(...)`
 3. 调试直连：`DirectConnect(...)`
 

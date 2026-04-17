@@ -5,6 +5,13 @@
 展示如何使用位置参数、命名参数或混合方式调用服务。
 """
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import asyncio
 import time
 from pycloud_parallel import Service
@@ -43,7 +50,7 @@ def main():
     print("[1] 部署服务...")
     print("-" * 60)
 
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target=gateway_target,
         service_name=service_name,
         blob=blob,

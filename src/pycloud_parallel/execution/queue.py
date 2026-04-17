@@ -2,12 +2,19 @@ from __future__ import annotations
 
 """Authoritative V1 queue implementation."""
 
+import inspect
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
-from pycloud_parallel.controlplane.artifact import _default_entry_module_for_module, _resolve_package_format
+from pycloud_parallel.controlplane.artifact import (
+    Artifact,
+    _default_entry_module_for_module,
+    _normalize_artifact_input,
+    _prepare_artifact,
+    _resolve_package_format,
+)
 from pycloud_parallel.controlplane import client_transport as _client_transport
 from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
 from pycloud_parallel.execution.support import (
@@ -223,6 +230,160 @@ class QueueServiceClient:
         self._record_job_id(str(job.get("job_id", "") or "").strip())
         return resp
 
+    def _prepare_submit_source_payload(
+        self,
+        *,
+        source: Any = None,
+        artifact: Optional[Any] = None,
+        deps: Optional[Any] = None,
+        job_payload: Optional[Dict[str, object]] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: Any = "run",
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
+        handle_result_callable: str = "",
+        finalize_callable: str = "",
+    ) -> Dict[str, object]:
+        module_source = None
+        if source is not None:
+            if inspect.ismodule(source):
+                module_source = source
+            elif callable(source) and not isinstance(source, (bytes, bytearray, memoryview)):
+                raise ValueError(
+                    "JobQueue.submit(source=callable) is not supported; use module/path/bytes or artifact="
+                )
+        elif isinstance(artifact, Artifact) and artifact.source_kind == "module" and inspect.ismodule(artifact.source_value):
+            module_source = artifact.source_value
+
+        normalize_kwargs = dict(
+            consumer_kind="job",
+            artifact=artifact,
+            deps=deps,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            dependency_allowlist=dependency_allowlist,
+        )
+        if source is not None:
+            normalized_artifact = _normalize_artifact_input(source=source, **normalize_kwargs)
+        else:
+            normalized_artifact = _normalize_artifact_input(**normalize_kwargs)
+        prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="job")
+
+        normalized_update_globals = _normalize_job_update_globals_arg(
+            update_globals,
+            auto_default=(
+                getattr(module_source, "update_globals", None)
+                if module_source is not None
+                else _default_job_update_globals_for_blob(
+                    prepared_artifact.blob,
+                    package_format=prepared_artifact.package_format,
+                )
+            ),
+        )
+        effective_task_generator_callable = (
+            _default_job_task_generator_for_module(module_source)
+            if module_source is not None
+            else _default_job_task_generator_for_blob(
+                prepared_artifact.blob,
+                package_format=prepared_artifact.package_format,
+            )
+        )
+        effective_handle_result_callable = str(
+            handle_result_callable
+            or (
+                _default_job_handle_result_for_module(module_source)
+                if module_source is not None
+                else _default_job_handle_result_for_blob(
+                    prepared_artifact.blob,
+                    package_format=prepared_artifact.package_format,
+                )
+            )
+            or ""
+        ).strip()
+        effective_finalize_callable = str(
+            finalize_callable
+            or (
+                _default_job_finalize_for_module(module_source)
+                if module_source is not None
+                else _default_job_finalize_for_blob(
+                    prepared_artifact.blob,
+                    package_format=prepared_artifact.package_format,
+                )
+            )
+            or ""
+        ).strip()
+
+        payload: Dict[str, object] = {
+            "job_mode": "hooks",
+            "runtime": str(prepared_artifact.runtime or "py3"),
+            "entry_module": str(prepared_artifact.entry_module or "").strip(),
+            "entry_callable": str(prepared_artifact.entry_callable or "run").strip() or "run",
+            "package_format": str(prepared_artifact.package_format or "py").strip() or "py",
+            "task_generator_callable": effective_task_generator_callable,
+            "job_payload": dict(job_payload or {}),
+            "timeout_sec": max(10.0, float(self.timeout_sec)),
+            "dependency_allowlist": list(prepared_artifact.dependency_allowlist),
+        }
+        if effective_handle_result_callable:
+            payload["handle_result_callable"] = effective_handle_result_callable
+        if effective_finalize_callable:
+            payload["finalize_callable"] = effective_finalize_callable
+        payload.update(
+            _prepare_job_blob_submit_fields(
+                target=self.target,
+                blob=prepared_artifact.blob,
+                package_format=prepared_artifact.package_format,
+                runtime=str(prepared_artifact.runtime or "py3"),
+                timeout_sec=self.timeout_sec,
+            )
+        )
+        if normalized_update_globals is not None:
+            payload["update_globals"] = normalized_update_globals
+        if self.client_id:
+            payload["client_id"] = self.client_id
+        return payload
+
+    def submit(
+        self,
+        *,
+        source: Any = None,
+        artifact: Optional[Any] = None,
+        deps: Optional[Any] = None,
+        job_payload: Optional[Dict[str, object]] = None,
+        runtime: str = "py3",
+        entry_module: Any = "",
+        entry_callable: Any = "run",
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
+        handle_result_callable: str = "",
+        finalize_callable: str = "",
+    ) -> Dict[str, object]:
+        """Submit a job from a product-facing code source.
+
+        Default path: ``submit(source=my_job_module, ...)``.
+        Advanced path: ``submit(artifact=Artifact(...), ...)``.
+        """
+        payload = self._prepare_submit_source_payload(
+            source=source,
+            artifact=artifact,
+            deps=deps,
+            job_payload=job_payload,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            dependency_allowlist=dependency_allowlist,
+            update_globals=update_globals,
+            handle_result_callable=handle_result_callable,
+            finalize_callable=finalize_callable,
+        )
+        return self.submit_job(payload)
+
     def recent_job_ids(self) -> List[str]:
         return list(self._recent_job_ids)
 
@@ -256,57 +417,23 @@ class QueueServiceClient:
         job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
         package_format: str = "py",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
     ) -> Dict[str, object]:
-        effective_package_format = _resolve_package_format(package_format, default="py")
-        normalized_update_globals = _normalize_job_update_globals_arg(
-            update_globals,
-            auto_default=_default_job_update_globals_for_blob(blob, package_format=effective_package_format),
+        return self.submit(
+            source=blob,
+            job_payload=job_payload,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable="run",
+            package_format=_resolve_package_format(package_format, default="py"),
+            dependency_allowlist=dependency_allowlist,
+            update_globals=update_globals,
+            handle_result_callable=handle_result_callable,
+            finalize_callable=finalize_callable,
         )
-        effective_task_generator_callable = _default_job_task_generator_for_blob(
-            blob,
-            package_format=effective_package_format,
-        )
-        effective_handle_result_callable = str(
-            handle_result_callable
-            or _default_job_handle_result_for_blob(blob, package_format=effective_package_format)
-            or ""
-        ).strip()
-        effective_finalize_callable = str(
-            finalize_callable
-            or _default_job_finalize_for_blob(blob, package_format=effective_package_format)
-            or ""
-        ).strip()
-        payload: Dict[str, object] = {
-            "job_mode": "hooks",
-            "runtime": str(runtime or "py3"),
-            "entry_module": str(entry_module or "").strip(),
-            "entry_callable": "run",
-            "package_format": effective_package_format,
-            "task_generator_callable": effective_task_generator_callable,
-            "job_payload": dict(job_payload or {}),
-            "timeout_sec": max(10.0, float(self.timeout_sec)),
-        }
-        if effective_handle_result_callable:
-            payload["handle_result_callable"] = effective_handle_result_callable
-        if effective_finalize_callable:
-            payload["finalize_callable"] = effective_finalize_callable
-        payload.update(
-            _prepare_job_blob_submit_fields(
-                target=self.target,
-                blob=blob,
-                package_format=effective_package_format,
-                runtime=str(runtime or "py3"),
-                timeout_sec=self.timeout_sec,
-            )
-        )
-        if normalized_update_globals is not None:
-            payload["update_globals"] = normalized_update_globals
-        if self.client_id:
-            payload["client_id"] = self.client_id
-        return self.submit_job(payload)
 
     def submit_job_from_module(
         self,
@@ -314,32 +441,23 @@ class QueueServiceClient:
         module: Any,
         job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
+        dependency_allowlist: Optional[Sequence[str]] = None,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
     ) -> Dict[str, object]:
-        module_blob, module_filename = _prepare_code_blob(module=module)
-        module_name = _default_entry_module_for_module(module)
-        normalized_update_globals = _normalize_job_update_globals_arg(
-            update_globals,
-            auto_default=getattr(module, "update_globals", None),
-        )
-        _default_job_task_generator_for_module(module)
-        effective_handle_result_callable = str(
-            handle_result_callable or _default_job_handle_result_for_module(module) or ""
-        ).strip()
-        effective_finalize_callable = str(
-            finalize_callable or _default_job_finalize_for_module(module) or ""
-        ).strip()
-        return self.submit_job_from_bytes(
-            blob=module_blob or b"",
-            entry_module=module_name,
+        _module_blob, module_filename = _prepare_code_blob(module=module)
+        return self.submit(
+            source=module,
             job_payload=job_payload,
             runtime=runtime,
+            entry_module=_default_entry_module_for_module(module),
+            entry_callable="run",
             package_format=_resolve_package_format("", module_filename, default="py"),
-            update_globals=normalized_update_globals,
-            handle_result_callable=effective_handle_result_callable,
-            finalize_callable=effective_finalize_callable,
+            dependency_allowlist=dependency_allowlist,
+            update_globals=update_globals,
+            handle_result_callable=handle_result_callable,
+            finalize_callable=finalize_callable,
         )
 
     def wait_for_terminal(
@@ -364,6 +482,11 @@ class QueueServiceClient:
 
 class JobQueue(QueueServiceClient):
     """V1 public queue client."""
+
+    @classmethod
+    def connect(cls, target: str, **kwargs: Any) -> "JobQueue":
+        """Product-facing connect action for the V1 job queue."""
+        return cls(target, **kwargs)
 
 
 __all__ = ["QueueServiceClient", "JobQueue", "_JobOrchestratorDiscoveryClient"]

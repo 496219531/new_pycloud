@@ -59,7 +59,7 @@ else:
 ```python
 from pycloud_parallel import Service
 
-group = Service.deploy_from_infocenter(...)
+group = Service.deploy(...)
 
 # 位置参数 → {"args": [10, 20]}
 result = await group.add(10, 20)

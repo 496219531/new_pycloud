@@ -549,6 +549,94 @@ class TestOwnerServiceFacade:
         for client in group._clients.values():  # noqa: SLF001
             client.close()
 
+    def test_deploy_from_infocenter_retries_briefly_until_nodes_register(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        discovery_calls = {"count": 0}
+
+        class _FakeInfoCenter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def list_service_routes(self, **_kwargs):
+                return []
+
+            def list_nodes(self, **_kwargs):
+                discovery_calls["count"] += 1
+                if discovery_calls["count"] == 1:
+                    return []
+                return [fake_node]
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **_kwargs):
+                return SimpleNamespace(
+                    service_id="svc-1",
+                    service_token="token-1",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-1",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._infocenter_client",
+            return_value=_FakeInfoCenter(),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ), patch(
+            "pycloud_parallel.execution.service_session.time.sleep",
+            return_value=None,
+        ) as mocked_sleep:
+            group = Service.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-retry-service",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                entry_callable="run",
+                timeout_sec=1.0,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert discovery_calls["count"] == 2
+            mocked_sleep.assert_called()
+            assert list(group.sessions.keys()) == ["node-1"]
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
     def test_deploy_from_infocenter_packages_module_object_entry_module(self, tmp_path, monkeypatch):
         from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2

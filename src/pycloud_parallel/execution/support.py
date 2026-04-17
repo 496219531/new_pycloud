@@ -68,6 +68,10 @@ _JOB_UPDATE_GLOBALS_AUTO = object()
 _DEFAULT_EXPORT_DECORATOR = "pycloud_export"
 
 
+class _RetryableReadyError(RuntimeError):
+    """Signals a transient not-ready state that should be retried briefly."""
+
+
 def _utc_now():
     from datetime import datetime, timezone
 
@@ -174,7 +178,7 @@ def _retry_infocenter_request(
         try:
             return fn()
         except Exception as exc:
-            if not _is_transient_infocenter_error(exc):
+            if not isinstance(exc, _RetryableReadyError) and not _is_transient_infocenter_error(exc):
                 raise
             last_exc = exc
             if time.monotonic() >= deadline:
@@ -1486,6 +1490,7 @@ __all__ = [
     "_put_data_via_clients",
     "_resolve_high_level_service_data",
     "_resolve_high_level_service_results",
+    "_RetryableReadyError",
     "_retry_infocenter_request",
     "_sanitize_session_cache_part",
     "_serialize_arrow_compatible",

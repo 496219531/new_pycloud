@@ -95,6 +95,22 @@ from pycloud_parallel.controlplane.node.models import (
     TaskPoolState,
     TaskState,
 )
+from pycloud_parallel.controlplane.node.session_views import (
+    build_service_report_payload as _build_service_report_payload,
+    build_service_route_report as _build_service_route_report,
+    build_service_status_info as _build_service_status_info,
+    build_task_pool_info as _build_task_pool_info,
+    build_task_pool_status_info as _build_task_pool_status_info,
+    execute_warmup as _execute_session_warmup,
+    log_warmup_result as _log_session_warmup_result,
+    normalize_warmup_result as _normalize_session_warmup_result,
+    warmup_fanout as _session_warmup_fanout,
+)
+from pycloud_parallel.controlplane.node.timing import (
+    ExecutionTimingSample,
+    build_execution_timing_event,
+    update_execution_timing_metrics,
+)
 from pycloud_parallel.data.ref import (
     normalize_object_format,
     normalize_object_id,
@@ -109,6 +125,7 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.runtime.errors import normalize_invoke_error
 
 
 class NodeControlState:
@@ -240,104 +257,38 @@ class NodeControlState:
         error_message: str = "",
     ) -> None:
         try:
-            metrics = dict(session.timing_metrics or {})
-            call_count = int(metrics.get("call_count", 0) or 0) + 1
-            error_count = int(metrics.get("error_count", 0) or 0) + (0 if ok else 1)
-            metrics["call_count"] = call_count
-            metrics["error_count"] = error_count
-            metrics["last_method"] = str(method or "")
-            metrics["last_ok"] = bool(ok)
-            metrics["last_http_status"] = int(http_status)
-            metrics["last_total_ms"] = round(float(total_ms), 3)
-            metrics["last_setup_ms"] = round(float(setup_ms), 3)
-            metrics["last_build_execute_spec_ms"] = round(float(build_execute_spec_ms), 3)
-            metrics["last_executor_ms"] = round(float(executor_ms), 3)
-            metrics["last_finalize_ms"] = round(float(finalize_ms), 3)
-            metrics["max_total_ms"] = round(max(float(metrics.get("max_total_ms", 0.0) or 0.0), float(total_ms)), 3)
-            metrics["avg_setup_ms"] = round(
-                ((float(metrics.get("avg_setup_ms", 0.0) or 0.0) * (call_count - 1)) + float(setup_ms)) / call_count,
-                3,
+            sample = ExecutionTimingSample(
+                method=str(method or ""),
+                ok=bool(ok),
+                http_status=int(http_status or 0),
+                setup_ms=float(setup_ms or 0.0),
+                build_execute_spec_ms=float(build_execute_spec_ms or 0.0),
+                executor_ms=float(executor_ms or 0.0),
+                finalize_ms=float(finalize_ms or 0.0),
+                total_ms=float(total_ms or 0.0),
+                subprocess_timings=dict(subprocess_timings or {}) or None,
+                error_type=str(error_type or ""),
+                error_message=str(error_message or ""),
             )
-            metrics["avg_build_execute_spec_ms"] = round(
-                (
-                    (float(metrics.get("avg_build_execute_spec_ms", 0.0) or 0.0) * (call_count - 1))
-                    + float(build_execute_spec_ms)
-                )
-                / call_count,
-                3,
+            metrics = update_execution_timing_metrics(
+                session.timing_metrics,
+                sample=sample,
+                include_http_status=True,
+                include_queue_wait=True,
             )
-            metrics["avg_executor_ms"] = round(
-                ((float(metrics.get("avg_executor_ms", 0.0) or 0.0) * (call_count - 1)) + float(executor_ms)) / call_count,
-                3,
-            )
-            metrics["avg_finalize_ms"] = round(
-                ((float(metrics.get("avg_finalize_ms", 0.0) or 0.0) * (call_count - 1)) + float(finalize_ms)) / call_count,
-                3,
-            )
-            metrics["avg_total_ms"] = round(
-                ((float(metrics.get("avg_total_ms", 0.0) or 0.0) * (call_count - 1)) + float(total_ms)) / call_count,
-                3,
-            )
-            if subprocess_timings:
-                decode_ms = float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
-                invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
-                encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
-                queue_wait_ms = max(0.0, float(executor_ms) - decode_ms - invoke_ms - encode_ms)
-                alpha = 0.2
-                prev_ema = float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0)
-                sample_count = int(metrics.get("ema_samples", 0) or 0) + 1
-                ema = invoke_ms if sample_count <= 1 else ((alpha * invoke_ms) + ((1.0 - alpha) * prev_ema))
-                metrics["last_child_decode_ms"] = round(decode_ms, 3)
-                metrics["last_invoke_ms"] = round(invoke_ms, 3)
-                metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
-                metrics["last_child_encode_ms"] = round(encode_ms, 3)
-                metrics["last_queue_wait_ms"] = round(queue_wait_ms, 3)
-                metrics["ema_child_invoke_ms"] = round(ema, 3)
-                metrics["ema_samples"] = sample_count
-                metrics["avg_child_decode_ms"] = round(
-                    ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
-                    3,
-                )
-                metrics["avg_invoke_ms"] = round(
-                    ((float(metrics.get("avg_invoke_ms", 0.0) or 0.0) * (call_count - 1)) + invoke_ms) / call_count,
-                    3,
-                )
-                metrics["avg_child_invoke_ms"] = metrics["avg_invoke_ms"]
-                metrics["avg_child_encode_ms"] = round(
-                    ((float(metrics.get("avg_child_encode_ms", 0.0) or 0.0) * (call_count - 1)) + encode_ms) / call_count,
-                    3,
-                )
-            else:
-                metrics.setdefault("last_child_decode_ms", 0.0)
-                metrics.setdefault("last_invoke_ms", 0.0)
-                metrics.setdefault("last_child_invoke_ms", metrics.get("last_invoke_ms", 0.0))
-                metrics.setdefault("last_child_encode_ms", 0.0)
-                metrics.setdefault("avg_child_decode_ms", 0.0)
-                metrics.setdefault("avg_invoke_ms", 0.0)
-                metrics.setdefault("avg_child_invoke_ms", metrics.get("avg_invoke_ms", 0.0))
-                metrics.setdefault("avg_child_encode_ms", 0.0)
-            metrics["last_error_type"] = str(error_type or "")
-            metrics["last_error_message"] = str(error_message or "")
             metrics["updated_at"] = utc_now().isoformat()
             session.timing_metrics = metrics
 
-            event = {
-                "event": "service_timing",
-                "service_id": session.service_id,
-                "service_name": session.service_name,
-                "method": str(method or ""),
-                "ok": bool(ok),
-                "http_status": int(http_status),
-                "setup_ms": round(float(setup_ms), 3),
-                "build_execute_spec_ms": round(float(build_execute_spec_ms), 3),
-                "executor_ms": round(float(executor_ms), 3),
-                "finalize_ms": round(float(finalize_ms), 3),
-                "total_ms": round(float(total_ms), 3),
-                "error_type": str(error_type or ""),
-                "error_message": str(error_message or ""),
-            }
-            if subprocess_timings:
-                event["subprocess"] = dict(subprocess_timings)
+            event = build_execution_timing_event(
+                event="service_timing",
+                id_key="service_id",
+                id_value=session.service_id,
+                name_key="service_name",
+                name_value=session.service_name,
+                sample=sample,
+                include_http_status=True,
+                include_queue_wait=False,
+            )
             service_timing_logger.info(json.dumps(event, ensure_ascii=False))
         except Exception as exc:
             logger = logging.getLogger(__name__)
@@ -359,120 +310,37 @@ class NodeControlState:
         error_message: str = "",
     ) -> None:
         try:
-            metrics = dict(pool.timing_metrics or {})
-            call_count = int(metrics.get("call_count", 0) or 0) + 1
-            error_count = int(metrics.get("error_count", 0) or 0) + (0 if ok else 1)
-            metrics["call_count"] = call_count
-            metrics["error_count"] = error_count
-            metrics["last_method"] = str(method or "")
-            metrics["last_ok"] = bool(ok)
-            metrics["last_total_ms"] = round(float(total_ms), 3)
-            metrics["last_setup_ms"] = round(float(setup_ms), 3)
-            metrics["last_build_execute_spec_ms"] = round(float(build_execute_spec_ms), 3)
-            metrics["last_executor_ms"] = round(float(executor_ms), 3)
-            metrics["last_finalize_ms"] = round(float(finalize_ms), 3)
-            metrics["max_total_ms"] = round(max(float(metrics.get("max_total_ms", 0.0) or 0.0), float(total_ms)), 3)
-            metrics["avg_setup_ms"] = round(
-                ((float(metrics.get("avg_setup_ms", 0.0) or 0.0) * (call_count - 1)) + float(setup_ms)) / call_count,
-                3,
+            sample = ExecutionTimingSample(
+                method=str(method or ""),
+                ok=bool(ok),
+                setup_ms=float(setup_ms or 0.0),
+                build_execute_spec_ms=float(build_execute_spec_ms or 0.0),
+                executor_ms=float(executor_ms or 0.0),
+                finalize_ms=float(finalize_ms or 0.0),
+                total_ms=float(total_ms or 0.0),
+                subprocess_timings=dict(subprocess_timings or {}) or None,
+                error_type=str(error_type or ""),
+                error_message=str(error_message or ""),
             )
-            metrics["avg_build_execute_spec_ms"] = round(
-                (
-                    (float(metrics.get("avg_build_execute_spec_ms", 0.0) or 0.0) * (call_count - 1))
-                    + float(build_execute_spec_ms)
-                )
-                / call_count,
-                3,
+            metrics = update_execution_timing_metrics(
+                pool.timing_metrics,
+                sample=sample,
+                include_http_status=False,
+                include_queue_wait=True,
             )
-            metrics["avg_executor_ms"] = round(
-                ((float(metrics.get("avg_executor_ms", 0.0) or 0.0) * (call_count - 1)) + float(executor_ms)) / call_count,
-                3,
-            )
-            metrics["avg_finalize_ms"] = round(
-                ((float(metrics.get("avg_finalize_ms", 0.0) or 0.0) * (call_count - 1)) + float(finalize_ms)) / call_count,
-                3,
-            )
-            metrics["avg_total_ms"] = round(
-                ((float(metrics.get("avg_total_ms", 0.0) or 0.0) * (call_count - 1)) + float(total_ms)) / call_count,
-                3,
-            )
-            if subprocess_timings:
-                decode_ms = float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
-                invoke_ms = float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
-                encode_ms = float(subprocess_timings.get("encode_ms", 0.0) or 0.0)
-                queue_wait_ms = max(0.0, float(executor_ms) - decode_ms - invoke_ms - encode_ms)
-                alpha = 0.2
-                prev_ema = float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0)
-                sample_count = int(metrics.get("ema_samples", 0) or 0) + 1
-                ema = invoke_ms if sample_count <= 1 else ((alpha * invoke_ms) + ((1.0 - alpha) * prev_ema))
-                metrics["last_child_decode_ms"] = round(decode_ms, 3)
-                metrics["last_invoke_ms"] = round(invoke_ms, 3)
-                metrics["last_child_invoke_ms"] = round(invoke_ms, 3)
-                metrics["last_child_encode_ms"] = round(encode_ms, 3)
-                metrics["last_queue_wait_ms"] = round(queue_wait_ms, 3)
-                metrics["ema_child_invoke_ms"] = round(ema, 3)
-                metrics["ema_samples"] = sample_count
-                metrics["avg_child_decode_ms"] = round(
-                    ((float(metrics.get("avg_child_decode_ms", 0.0) or 0.0) * (call_count - 1)) + decode_ms) / call_count,
-                    3,
-                )
-                metrics["avg_invoke_ms"] = round(
-                    ((float(metrics.get("avg_invoke_ms", 0.0) or 0.0) * (call_count - 1)) + invoke_ms) / call_count,
-                    3,
-                )
-                metrics["avg_child_invoke_ms"] = metrics["avg_invoke_ms"]
-                metrics["avg_child_encode_ms"] = round(
-                    ((float(metrics.get("avg_child_encode_ms", 0.0) or 0.0) * (call_count - 1)) + encode_ms) / call_count,
-                    3,
-                )
-                metrics["avg_queue_wait_ms"] = round(
-                    ((float(metrics.get("avg_queue_wait_ms", 0.0) or 0.0) * (call_count - 1)) + queue_wait_ms) / call_count,
-                    3,
-                )
-            else:
-                metrics.setdefault("last_child_decode_ms", 0.0)
-                metrics.setdefault("last_invoke_ms", 0.0)
-                metrics.setdefault("last_child_invoke_ms", metrics.get("last_invoke_ms", 0.0))
-                metrics.setdefault("last_child_encode_ms", 0.0)
-                metrics.setdefault("last_queue_wait_ms", 0.0)
-                metrics.setdefault("ema_child_invoke_ms", 0.0)
-                metrics.setdefault("ema_samples", 0)
-                metrics.setdefault("avg_child_decode_ms", 0.0)
-                metrics.setdefault("avg_invoke_ms", 0.0)
-                metrics.setdefault("avg_child_invoke_ms", metrics.get("avg_invoke_ms", 0.0))
-                metrics.setdefault("avg_child_encode_ms", 0.0)
-                metrics.setdefault("avg_queue_wait_ms", 0.0)
-            metrics["last_error_type"] = str(error_type or "")
-            metrics["last_error_message"] = str(error_message or "")
             metrics["updated_at"] = utc_now().isoformat()
             pool.timing_metrics = metrics
 
-            event = {
-                "event": "task_pool_timing",
-                "pool_id": pool.pool_id,
-                "pool_name": pool.pool_name,
-                "method": str(method or ""),
-                "ok": bool(ok),
-                "setup_ms": round(float(setup_ms), 3),
-                "build_execute_spec_ms": round(float(build_execute_spec_ms), 3),
-                "executor_ms": round(float(executor_ms), 3),
-                "finalize_ms": round(float(finalize_ms), 3),
-                "total_ms": round(float(total_ms), 3),
-                "error_type": str(error_type or ""),
-                "error_message": str(error_message or ""),
-            }
-            if subprocess_timings:
-                event["subprocess"] = dict(subprocess_timings)
-                event["queue_wait_ms"] = round(
-                    max(
-                        0.0,
-                        float(executor_ms)
-                        - float(subprocess_timings.get("decode_ms", 0.0) or 0.0)
-                        - float(subprocess_timings.get("invoke_ms", 0.0) or 0.0)
-                        - float(subprocess_timings.get("encode_ms", 0.0) or 0.0),
-                    ),
-                    3,
-                )
+            event = build_execution_timing_event(
+                event="task_pool_timing",
+                id_key="pool_id",
+                id_value=pool.pool_id,
+                name_key="pool_name",
+                name_value=pool.pool_name,
+                sample=sample,
+                include_http_status=False,
+                include_queue_wait=True,
+            )
             service_timing_logger.info(json.dumps(event, ensure_ascii=False))
         except Exception as exc:
             logger = logging.getLogger(__name__)
@@ -677,30 +545,46 @@ class NodeControlState:
 
     @staticmethod
     def _warmup_fanout(worker_count: int) -> int:
-        return max(1, int(worker_count or 1) * 2)
+        return _session_warmup_fanout(worker_count)
 
     @staticmethod
     def _normalize_warmup_result(result: object, *, fanout: int) -> Tuple[int, List[int]]:
-        if isinstance(result, tuple) and len(result) == 2:
-            submitted_count, worker_pids = result
-        elif isinstance(result, list):
-            submitted_count, worker_pids = fanout, result
-        else:
-            submitted_count, worker_pids = result, []
-        normalized_pids = [int(pid) for pid in (worker_pids or []) if int(pid or 0) > 0]
-        return max(0, int(submitted_count or 0)), normalized_pids
+        return _normalize_session_warmup_result(result, fanout=fanout)
 
     def _log_warmup_result(self, *, scope: str, key: str, worker_count: int, submitted_count: int, worker_pids: Sequence[int]) -> None:
-        unique_pids = sorted({int(pid) for pid in worker_pids if int(pid or 0) > 0})
-        logging.getLogger(__name__).info(
-            "[Warmup] scope=%s key=%s worker_count=%d submitted=%d warmed_workers=%d pids=%s",
-            scope,
-            key,
-            int(worker_count or 0),
-            int(submitted_count or 0),
-            len(unique_pids),
-            unique_pids,
+        _log_session_warmup_result(
+            logger=logging.getLogger(__name__),
+            scope=scope,
+            key=key,
+            worker_count=worker_count,
+            submitted_count=submitted_count,
+            worker_pids=worker_pids,
         )
+
+    def _execute_warmup(
+        self,
+        *,
+        executor_host: ExecutorHostClient,
+        scope: str,
+        key: str,
+        worker_count: int,
+        execute_spec: Dict[str, object],
+    ) -> Tuple[int, List[int]]:
+        submitted, worker_pids = _execute_session_warmup(
+            executor_host,
+            scope=scope,
+            key=key,
+            worker_count=worker_count,
+            execute_spec=execute_spec,
+        )
+        self._log_warmup_result(
+            scope=scope,
+            key=key,
+            worker_count=worker_count,
+            submitted_count=submitted,
+            worker_pids=worker_pids,
+        )
+        return submitted, worker_pids
 
     def get_client_code_token(self, *, client_id: str, code_version: str) -> str:
         normalized_client_id = str(client_id or "").strip()
@@ -832,6 +716,20 @@ class NodeControlState:
                 session.status = pb2.SERVICE_STATUS_STOPPED
                 session.stop_reason = "executor host restart failed"
                 session.lease_expire_at = current_time
+        for pool in self._task_pools.values():
+            if not pool.is_running() or not pool.executor_ready:
+                continue
+            try:
+                self._executor_host.create_task_pool(
+                    pool_id=pool.pool_id,
+                    worker_count=pool.worker_count,
+                )
+                pool.alive_workers = pool.worker_count
+            except Exception:
+                pool.executor_ready = False
+                pool.alive_workers = 0
+                pool.status = "STOPPED"
+                pool.lease_expire_at = current_time
 
         if old_host is not None:
             try:
@@ -1113,13 +1011,9 @@ class NodeControlState:
     def service_worker_used(self) -> int:
         with self._lock:
             active = sum(
-                max(0, int(session.worker_count))
+                session.resource_snapshot().worker_count
                 for session in self._services.values()
-                if session.status in (
-                    pb2.SERVICE_STATUS_STARTING,
-                    pb2.SERVICE_STATUS_RUNNING,
-                    pb2.SERVICE_STATUS_DRAINING,
-                )
+                if session.is_running()
             )
             return active + max(0, int(self._service_worker_reserved))
 
@@ -1128,18 +1022,18 @@ class NodeControlState:
 
     @staticmethod
     def _service_inflight_locked(session: ServiceSession) -> int:
-        return max(0, int(session.request_count or 0) - int(session.returned_count or 0))
+        return session.resource_snapshot().in_flight
 
     @staticmethod
     def _task_pool_inflight_locked(pool: TaskPoolState) -> int:
-        return max(0, int(pool.task_count or 0) - int(pool.returned_count or 0))
+        return pool.resource_snapshot().in_flight
 
     def task_pool_worker_used(self) -> int:
         with self._lock:
             active = sum(
-                max(0, int(pool.worker_count))
+                pool.resource_snapshot().worker_count
                 for pool in self._task_pools.values()
-                if str(pool.status or "").strip().upper() == "RUNNING"
+                if pool.is_running()
             )
             return active + max(0, int(self._task_pool_worker_reserved))
 
@@ -1156,23 +1050,15 @@ class NodeControlState:
                 if not pool_id:
                     continue
                 inflight_by_pool[pool_id] = inflight_by_pool.get(pool_id, 0) + 1
-            return {
-                pool.pool_id: NodeTaskPoolInfo(
-                    pool_id=pool.pool_id,
-                    owner_client_id=pool.owner_client_id,
-                    pool_name=pool.pool_name,
-                    code_version=pool.code_version,
-                    status=pool.status,
-                    worker_count=pool.worker_count,
-                    task_count=pool.task_count,
-                    inflight=self._task_pool_inflight_locked(pool),
-                    created_at=pool.created_at,
-                    last_heartbeat_at=pool.last_heartbeat_at,
-                    lease_expire_at=pool.lease_expire_at,
+            reports: Dict[str, NodeTaskPoolInfo] = {}
+            for pool in self._task_pools.values():
+                if not (pool.is_running() or bool(pool.timing_metrics)):
+                    continue
+                reports[pool.pool_id] = _build_task_pool_info(
+                    pool,
+                    in_flight=inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)),
                 )
-                for pool in self._task_pools.values()
-                if str(pool.status or "").strip().upper() == "RUNNING" or bool(pool.timing_metrics)
-            }
+            return reports
 
     def _get_code_write_lock(self, code_version: str) -> threading.Lock:
         key = str(code_version or "").strip()
@@ -1218,22 +1104,7 @@ class NodeControlState:
                     continue
                 if int(task.status) == int(pb2.TASK_STATUS_RUNNING):
                     inflight += 1
-        return {
-            "pool_id": pool.pool_id,
-            "owner_client_id": pool.owner_client_id,
-            "pool_name": pool.pool_name,
-            "code_version": pool.code_version,
-            "task_method": pool.task_method,
-            "worker_count": pool.worker_count,
-            "heartbeat_timeout_sec": pool.heartbeat_timeout_sec,
-            "status": str(pool.status),
-            "task_count": int(pool.task_count),
-            "inflight": int(inflight),
-            "created_at": pool.created_at,
-            "last_heartbeat_at": pool.last_heartbeat_at,
-            "lease_expire_at": pool.lease_expire_at,
-            "timing_metrics": dict(pool.timing_metrics or {}),
-        }
+        return _build_task_pool_status_info(pool, in_flight=inflight)
 
     def _extract_archive(self, *, archive_path: Path, package_format: str, out_dir: Path) -> None:
         if out_dir.exists():
@@ -1852,6 +1723,7 @@ class NodeControlState:
                 lease_expire_at=now + timedelta(seconds=max(5, int(heartbeat_timeout_sec or 30))),
                 managed_global_names=normalized_managed_global_names,
                 executor_ready=True,
+                alive_workers=actual_workers,
                 task_count=0,
             )
             managed_state = self._ensure_runtime_managed_globals_state_locked(
@@ -2019,6 +1891,7 @@ class NodeControlState:
             if self._executor_host is not None and pool.executor_ready:
                 self._executor_host.stop_task_pool(pool_id=pool.pool_id)
             pool.executor_ready = False
+            pool.alive_workers = 0
             pool.status = "STOPPED"
             pool.lease_expire_at = utc_now()
             return pool
@@ -2096,6 +1969,7 @@ class NodeControlState:
             now = utc_now()
             pool.last_heartbeat_at = now
             pool.lease_expire_at = now + timedelta(seconds=pool.heartbeat_timeout_sec)
+            pool.alive_workers = max(0, int(pool.worker_count or 0))
             return pool
 
     def heartbeat_service(self, *, owner_client_id: str, service_id: str, service_token: str) -> ServiceSession:
@@ -2308,6 +2182,13 @@ class NodeControlState:
                     )
             return 200, {"ok": True, "method": requested_method, "data": result or {}}
         if status_text == "FAILED_USER":
+            _ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
+                status_text,
+                error_type=err_type,
+                error_message=err_message,
+                user_fallback="user error",
+                infra_fallback="infra error",
+            )
             finalize_end = time.perf_counter()
             with self._lock:
                 session = self._services.get(service_id)
@@ -2323,15 +2204,22 @@ class NodeControlState:
                         finalize_ms=(finalize_end - finalize_start) * 1000.0,
                         total_ms=(finalize_end - total_start) * 1000.0,
                         subprocess_timings=subprocess_timings,
-                        error_type=err_type or "UserError",
-                        error_message=err_message or "user error",
+                        error_type=normalized_error_type,
+                        error_message=normalized_error_message,
                     )
             return 400, {
                 "ok": False,
                 "method": requested_method,
-                "error_type": err_type or "UserError",
-                "error": err_message or "user error",
+                "error_type": normalized_error_type,
+                "error": normalized_error_message,
             }
+        _ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
+            status_text,
+            error_type=err_type,
+            error_message=err_message,
+            user_fallback="user error",
+            infra_fallback="infra error",
+        )
         finalize_end = time.perf_counter()
         with self._lock:
             session = self._services.get(service_id)
@@ -2347,14 +2235,14 @@ class NodeControlState:
                     finalize_ms=(finalize_end - finalize_start) * 1000.0,
                     total_ms=(finalize_end - total_start) * 1000.0,
                     subprocess_timings=subprocess_timings,
-                    error_type=err_type or "InfraError",
-                    error_message=err_message or "infra error",
+                    error_type=normalized_error_type,
+                    error_message=normalized_error_message,
                 )
         return 503, {
             "ok": False,
             "method": requested_method,
-            "error_type": err_type or "InfraError",
-            "error": err_message or "infra error",
+            "error_type": normalized_error_type,
+            "error": normalized_error_message,
         }
 
     def _invoke_service_http(
@@ -2420,10 +2308,11 @@ class NodeControlState:
             worker_count = session.worker_count
         if artifact is None or executor_host is None:
             return globals_digest, updated_names
-        fanout = self._warmup_fanout(worker_count)
-        warmup_result = executor_host.warmup_service(
-            service_id=service_id,
-            fanout=fanout,
+        self._execute_warmup(
+            executor_host=executor_host,
+            scope="service",
+            key=service_id,
+            worker_count=worker_count,
             execute_spec=_build_execute_spec(
                 artifact,
                 object_dir=self._object_dir,
@@ -2435,14 +2324,6 @@ class NodeControlState:
                 managed_globals_digest=globals_digest,
                 warmup_only=True,
             ),
-        )
-        submitted, worker_pids = self._normalize_warmup_result(warmup_result, fanout=fanout)
-        self._log_warmup_result(
-            scope="service",
-            key=service_id,
-            worker_count=worker_count,
-            submitted_count=submitted,
-            worker_pids=worker_pids,
         )
         return globals_digest, updated_names
 
@@ -2499,34 +2380,21 @@ class NodeControlState:
             managed_globals_digest=globals_digest,
             warmup_only=True,
         )
-        fanout = self._warmup_fanout(worker_count)
         if pool is not None:
-            warmup_result = executor_host.warmup_pool(
-                pool_id=pool.pool_id,
-                fanout=fanout,
-                execute_spec=execute_spec,
-            )
-            submitted, worker_pids = self._normalize_warmup_result(warmup_result, fanout=fanout)
-            self._log_warmup_result(
+            self._execute_warmup(
+                executor_host=executor_host,
                 scope="pool",
                 key=pool.pool_id,
                 worker_count=worker_count,
-                submitted_count=submitted,
-                worker_pids=worker_pids,
-            )
-        else:
-            warmup_result = executor_host.warmup_runtime(
-                runtime_key=normalized_runtime_key,
-                fanout=fanout,
                 execute_spec=execute_spec,
             )
-            submitted, worker_pids = self._normalize_warmup_result(warmup_result, fanout=fanout)
-            self._log_warmup_result(
+        else:
+            self._execute_warmup(
+                executor_host=executor_host,
                 scope="runtime",
                 key=normalized_runtime_key,
                 worker_count=worker_count,
-                submitted_count=submitted,
-                worker_pids=worker_pids,
+                execute_spec=execute_spec,
             )
         return globals_digest, updated_names
 
@@ -2550,23 +2418,10 @@ class NodeControlState:
             session = self._services.get(service_id)
             if session is None:
                 raise KeyError("service not found")
-            return {
-                "service_id": session.service_id,
-                "owner_client_id": session.owner_client_id,
-                "service_name": session.service_name,
-                "code_version": session.code_version,
-                "status": int(session.status),
-                "worker_count": session.worker_count,
-                "alive_workers": session.alive_workers,
-                "in_flight": self._service_inflight_locked(session),
-                "queued": session.queued,
-                "created_at": session.created_at,
-                "last_heartbeat_at": session.last_heartbeat_at,
-                "lease_expire_at": session.lease_expire_at,
-                "http_base_url": session.http_base_url,
-                "methods": sorted(session.methods.keys()),
-                "timing_metrics": dict(session.timing_metrics or {}),
-            }
+            return _build_service_status_info(
+                session,
+                in_flight=self._service_inflight_locked(session),
+            )
 
     def metrics(self) -> Dict[str, int]:
         with self._lock:
@@ -2591,18 +2446,7 @@ class NodeControlState:
             for session in self._services.values():
                 if not include_stopped and session.status == pb2.SERVICE_STATUS_STOPPED:
                     continue
-                out.append(
-                    pb2.ServiceRouteReport(
-                        service_name=session.service_name,
-                        service_id=session.service_id,
-                        status=session.status,
-                        worker_count=session.worker_count,
-                        alive_workers=session.alive_workers,
-                        in_flight=self._service_inflight_locked(session),
-                        lease_expire_at=dt_to_ts(session.lease_expire_at),
-                        http_base_url=session.http_base_url,
-                    )
-                )
+                out.append(_build_service_route_report(session, in_flight=self._service_inflight_locked(session)))
             return out
 
     def service_report_payloads(self, *, include_stopped: bool = False) -> List[Dict[str, object]]:
@@ -2611,23 +2455,7 @@ class NodeControlState:
             for session in self._services.values():
                 if not include_stopped and session.status == pb2.SERVICE_STATUS_STOPPED:
                     continue
-                metrics = dict(session.timing_metrics or {})
-                out.append(
-                    {
-                        "service_name": session.service_name,
-                        "service_id": session.service_id,
-                        "status": int(session.status),
-                        "worker_count": int(session.worker_count),
-                        "alive_workers": int(session.alive_workers),
-                        "in_flight": int(self._service_inflight_locked(session)),
-                        "received_count": int(session.request_count or 0),
-                        "returned_count": int(session.returned_count or 0),
-                        "ema_child_invoke_ms": float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
-                        "ema_samples": int(metrics.get("ema_samples", 0) or 0),
-                        "lease_expire_at": session.lease_expire_at.isoformat(),
-                        "http_base_url": session.http_base_url,
-                    }
-                )
+                out.append(_build_service_report_payload(session, in_flight=self._service_inflight_locked(session)))
             return out
 
     def active_runtime_keys(self, *, limit: int = 10) -> List[str]:
@@ -2690,16 +2518,23 @@ class NodeControlState:
                     )
                     build_execute_spec_ms = float(getattr(task, "dispatch_build_execute_spec_ms", 0.0) or 0.0)
                     executor_ms = max(0.0, total_ms - build_execute_spec_ms)
+                    ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
+                        status_text,
+                        error_type=err_type,
+                        error_message=err_message,
+                        user_fallback="user function failed",
+                        infra_fallback="infra failure",
+                    )
                     if status_text == "FAILED_USER":
                         task.status = pb2.TASK_STATUS_FAILED_USER
                         task.result = None
-                        task.error_type = err_type or "UserError"
-                        task.error_message = err_message or "user function failed"
+                        task.error_type = normalized_error_type
+                        task.error_message = normalized_error_message
                     elif status_text == "FAILED_INFRA":
                         task.status = pb2.TASK_STATUS_FAILED_INFRA
                         task.result = None
-                        task.error_type = err_type or "InfraError"
-                        task.error_message = err_message or "infra failure"
+                        task.error_type = normalized_error_type
+                        task.error_message = normalized_error_message
                     else:
                         task.status = pb2.TASK_STATUS_SUCCEEDED
                         if isinstance(result, StoredResultArtifact):
@@ -2714,7 +2549,7 @@ class NodeControlState:
                         self._record_task_pool_timing_locked(
                             pool,
                             method=pool.task_method,
-                            ok=bool(status_text not in {"FAILED_USER", "FAILED_INFRA"}),
+                            ok=ok,
                             setup_ms=0.0,
                             build_execute_spec_ms=build_execute_spec_ms,
                             executor_ms=executor_ms,
@@ -2749,11 +2584,12 @@ class NodeControlState:
                     continue
                 self._stop_service_locked(session, reason="owner heartbeat timeout")
             for pool in self._task_pools.values():
-                if pool.status != "RUNNING":
+                if not pool.is_running():
                     continue
                 if now <= pool.lease_expire_at:
                     continue
                 if self._executor_host is not None and pool.executor_ready:
                     self._executor_host.stop_task_pool(pool_id=pool.pool_id)
                 pool.executor_ready = False
+                pool.alive_workers = 0
                 pool.status = "STOPPED"

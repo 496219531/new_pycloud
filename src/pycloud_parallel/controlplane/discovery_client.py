@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Discovery-based service caller client and module-style facade."""
+"""Discovery-based low-level service transport client."""
 
 import contextlib
 from pathlib import Path
@@ -22,8 +22,6 @@ from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
 from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
-from pycloud_parallel.execution.call_proxy import _CallProxy
-from pycloud_parallel.execution.support import _resolve_high_level_service_data
 
 client_mod = SimpleNamespace(
     _DiscoveryRouteCache=_DiscoveryRouteCache,
@@ -37,7 +35,6 @@ client_mod = SimpleNamespace(
     _is_route_failure=_is_route_failure,
     _list_route_methods_http=_list_route_methods_http,
     _node_instance_key_from_route=_node_instance_key_from_route,
-    _resolve_high_level_service_data=_resolve_high_level_service_data,
 )
 
 
@@ -283,230 +280,4 @@ class DiscoveryServiceClient:
             pass
 
 
-class DiscoveryCallerFacade(DiscoveryServiceClient):
-    """Module-like caller built on InfoCenter discovery + direct instance calls."""
-
-    def __init__(
-        self,
-        infocenter_target: str,
-        *,
-        service_name: str,
-        timeout_sec: float = 10.0,
-        service_token: str = "",
-        refresh_interval_sec: float = 3.0,
-        failure_threshold: int = 3,
-        open_sec: float = 5.0,
-        route_limit: int = 500,
-        validate_on_init: bool = True,
-    ) -> None:
-        super().__init__(
-            infocenter_target,
-            timeout_sec=timeout_sec,
-            service_token=service_token,
-            refresh_interval_sec=refresh_interval_sec,
-            failure_threshold=failure_threshold,
-            open_sec=open_sec,
-            route_limit=route_limit,
-        )
-        self.service_name = str(service_name or "").strip()
-        if not self.service_name:
-            raise ValueError("service_name is required")
-        self._discovered_methods: Optional[List[str]] = None
-        self._last_status: Optional[Dict[str, object]] = None
-        if validate_on_init:
-            self._validate_service_ready()
-
-    def _validate_service_ready(self) -> Dict[str, object]:
-        try:
-            self.refresh_routes(service_name=self.service_name, force=True)
-            status = self.get_status(service_name=self.service_name)
-        except Exception as exc:
-            raise RuntimeError(
-                f"failed to query discovery status for service_name={self.service_name!r} via {self.infocenter_target}: {exc}"
-            ) from exc
-        if not isinstance(status, dict):
-            raise RuntimeError(
-                f"invalid discovery status for service_name={self.service_name!r} via {self.infocenter_target}: {status!r}"
-            )
-        self._last_status = status
-        route_count = int(status.get("route_count", 0) or 0)
-        if route_count <= 0:
-            raise RuntimeError(
-                f"no available route for service_name={self.service_name!r} via infocenter {self.infocenter_target}"
-            )
-        return status
-
-    def __getattr__(self, name: str):
-        if name.startswith("_"):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-        if self._discovered_methods is None:
-            self._ensure_methods_discovered()
-        if self._discovered_methods is not None and name not in self._discovered_methods:
-            raise AttributeError(
-                f"'{type(self).__name__}' has no method '{name}'. "
-                f"Available methods: {self._discovered_methods}"
-            )
-        return _CallProxy(
-            method=name,
-            group=self,
-            timeout_sec=self.timeout_sec,
-            strategy="predicted_busy",
-            refresh_status=False,
-        )
-
-    def _ensure_methods_discovered(self) -> None:
-        if self._discovered_methods is not None:
-            return
-        try:
-            methods = self.list_methods(include_docs=True)
-        except Exception as exc:
-            self._validate_service_ready()
-            raise RuntimeError(
-                f"failed to list methods for service_name={self.service_name!r} via discovery {self.infocenter_target}: {exc}"
-            ) from exc
-        discovered = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
-        if not discovered:
-            self._validate_service_ready()
-            raise RuntimeError(
-                f"service_name={self.service_name!r} has active discovery routes via {self.infocenter_target} but no exported methods"
-            )
-        self._discovered_methods = discovered
-
-    def refresh_methods(self) -> List[str]:
-        self._discovered_methods = None
-        self._ensure_methods_discovered()
-        return list(self._discovered_methods or [])
-
-    def list_methods(self, *, include_docs: bool = False, strategy: str = "predicted_busy") -> List[Dict[str, object]]:  # type: ignore[override]
-        return list(
-            super().list_methods(
-                service_name=self.service_name,
-                include_docs=include_docs,
-                strategy=strategy,
-            )
-        )
-
-    @property
-    def methods(self) -> List[str]:
-        self._ensure_methods_discovered()
-        return list(self._discovered_methods or [])
-
-    def status(self) -> Dict[str, object]:
-        status = self.get_status(service_name=self.service_name)
-        if isinstance(status, dict):
-            self._last_status = status
-        return status
-
-    def call_balanced(
-        self,
-        method: str,
-        payload: Dict[str, object],
-        *,
-        timeout_sec: float = 60.0,
-        strategy: str = "predicted_busy",
-        refresh_status: bool = False,
-        max_attempts: int = 0,
-    ):
-        del refresh_status, max_attempts
-        route = self._route_cache.select_route(self.service_name, strategy=strategy)
-        tried = {route.service_id}
-        token = self.service_token
-
-        def _prepare_route_payload(selected_route) -> Dict[str, object]:
-            control_addr = str(getattr(selected_route, "control_addr", "") or "").strip()
-            if not control_addr:
-                return dict(payload or {})
-            with client_mod.NodeControlClient(control_addr, timeout_sec=self.timeout_sec) as route_client:
-                return client_mod._prepare_remote_call_payload(
-                    [route_client],
-                    payload,
-                    object_threshold_bytes=client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-                )
-
-        try:
-            prepared_payload = _prepare_route_payload(route)
-            resp = client_mod._call_route_http(
-                route,
-                method=method,
-                payload=prepared_payload,
-                timeout_sec=max(0.1, float(timeout_sec)),
-                service_token=token,
-            )
-            self._route_cache.mark_success(route)
-            return client_mod._node_instance_key_from_route(route), resp
-        except client_mod.DiscoveryCallError as exc:
-            if not client_mod._is_route_failure(exc):
-                raise RuntimeError(str(exc)) from exc
-            self._route_cache.mark_failure(route, str(exc))
-            self._route_cache.refresh(self.service_name, force=True)
-            retry_route = self._route_cache.select_route(self.service_name, exclude_service_ids=tried, strategy=strategy)
-            try:
-                retry_payload = _prepare_route_payload(retry_route)
-                resp = client_mod._call_route_http(
-                    retry_route,
-                    method=method,
-                    payload=retry_payload,
-                    timeout_sec=max(0.1, float(timeout_sec)),
-                    service_token=token,
-                )
-                self._route_cache.mark_success(retry_route)
-                return client_mod._node_instance_key_from_route(retry_route), resp
-            except client_mod.DiscoveryCallError as retry_exc:
-                if client_mod._is_route_failure(retry_exc):
-                    self._route_cache.mark_failure(retry_route, str(retry_exc))
-                raise RuntimeError(str(retry_exc)) from retry_exc
-
-    async def acall_balanced(
-        self,
-        method: str,
-        payload: Dict[str, object],
-        *,
-        timeout_sec: float = 60.0,
-        strategy: str = "predicted_busy",
-        refresh_status: bool = False,
-        max_attempts: int = 0,
-    ):
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.call_balanced(
-                method,
-                payload,
-                timeout_sec=timeout_sec,
-                strategy=strategy,
-                refresh_status=refresh_status,
-                max_attempts=max_attempts,
-            ),
-        )
-
-    async def call(self, method: str, **kwargs) -> Dict[str, object]:
-        node_id, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
-        return client_mod._resolve_high_level_service_data(self, node_id=node_id, response=resp)
-
-    def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
-        node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
-        return client_mod._resolve_high_level_service_data(self, node_id=node_id, response=resp)
-
-    async def acall_all(
-        self,
-        method: str,
-        payload: Dict[str, object],
-        *,
-        timeout_sec: float = 60.0,
-        max_concurrency: int = 100,
-    ):
-        del method, payload, timeout_sec, max_concurrency
-        raise NotImplementedError("discovery caller facade does not support broadcast; use direct discovery for single-route calls")
-
-    def __repr__(self) -> str:
-        methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
-        return (
-            f"<DiscoveryCallerFacade "
-            f"service={self.service_name!r} "
-            f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
-        )
-
-
-__all__ = ["DiscoveryServiceClient", "DiscoveryCallerFacade"]
+__all__ = ["DiscoveryServiceClient"]

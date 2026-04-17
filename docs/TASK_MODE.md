@@ -34,7 +34,7 @@
 ```python
 from pycloud_parallel import TaskPool
 
-with TaskPool.from_infocenter(
+with TaskPool.open(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
     blob=blob,
@@ -73,7 +73,7 @@ with TaskPool.from_infocenter(
 ```python
 from pycloud_parallel import JobQueue
 
-client = JobQueue("127.0.0.1:50051", client_id="job-demo")
+client = JobQueue.connect("127.0.0.1:50051", client_id="job-demo")
 client.submit_job_from_bytes(
     blob=job_blob,
     entry_module="job_demo",

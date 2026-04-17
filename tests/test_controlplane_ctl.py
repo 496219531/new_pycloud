@@ -8,7 +8,7 @@ import pytest
 
 from pycloud_parallel.controlplane import ctl
 from pycloud_parallel.controlplane import server as controlplane_server
-from pycloud_parallel.data.ref import DataRef, object_id_from_sha256_hex, object_ref_to_payload
+from pycloud_parallel.data.ref import DataRef, object_id_from_sha256_hex, data_ref_to_payload
 from pycloud_parallel.controlplane.node.filesystem import (
     _code_content_dir,
     _code_index_link_path,
@@ -466,7 +466,7 @@ def test_gc_objects_keeps_current_globals_refs_and_deletes_stale_others(tmp_path
     )
     _write_json(
         scope_dir / "values" / f"{value_digest}.json",
-        object_ref_to_payload(
+        data_ref_to_payload(
             DataRef(
                 ref_id=live_id,
                 storage_id=live_id,

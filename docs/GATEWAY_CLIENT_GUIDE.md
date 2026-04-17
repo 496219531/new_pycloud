@@ -69,7 +69,7 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,

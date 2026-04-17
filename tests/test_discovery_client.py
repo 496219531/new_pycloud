@@ -12,8 +12,9 @@ from unittest.mock import patch
 import grpc
 import pytest
 
+from pycloud_parallel import Service
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
-from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade, DiscoveryServiceClient
+from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
 from pycloud_parallel.controlplane.discovery_route_cache import _DiscoveryRouteCache, _ServiceRouteSnapshot
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, InfoCenterServiceRoute
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
@@ -122,6 +123,22 @@ def _demo_route(service_name: str = "svc-demo") -> InfoCenterServiceRoute:
     )
 
 
+def _connect_discovery_service(
+    target: str = "127.0.0.1:50051",
+    *,
+    service_name: str = "svc-demo",
+    timeout_sec: float = 10.0,
+    validate_on_init: bool = True,
+):
+    return Service.connect(
+        target=target,
+        service_name=service_name,
+        timeout_sec=timeout_sec,
+        transport="discovery",
+        validate_on_init=validate_on_init,
+    )
+
+
 def test_upload_object_recreates_missing_object_dir(tmp_path):
     server, target, state = _start_nodecontrol_server("node-object-01", str(tmp_path / "node_object_01"))
     try:
@@ -183,9 +200,9 @@ def test_upload_object_from_file_can_disable_trusted_precheck(tmp_path):
         state.close()
 
 
-class TestDiscoveryCallerFacade:
+class TestDiscoveryConnectedService:
     def test_getattr_creates_proxy(self):
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = _connect_discovery_service(validate_on_init=False)
         try:
             client._discovered_methods = ["square", "fibonacci"]
             proxy = client.square
@@ -196,7 +213,7 @@ class TestDiscoveryCallerFacade:
             client.close()
 
     def test_unknown_method_raises(self):
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = _connect_discovery_service(validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
             with pytest.raises(AttributeError, match="has no method 'unknown'"):
@@ -205,10 +222,10 @@ class TestDiscoveryCallerFacade:
             client.close()
 
     def test_methods_property_uses_discovery_list_methods(self):
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = _connect_discovery_service(validate_on_init=False)
         try:
             with patch.object(
-                DiscoveryCallerFacade,
+                type(client),
                 "list_methods",
                 return_value=[{"method": "square"}, {"method": "fibonacci"}],
             ) as mocked:
@@ -218,9 +235,32 @@ class TestDiscoveryCallerFacade:
         finally:
             client.close()
 
+    def test_methods_fail_over_to_retry_route_when_primary_route_is_stale(self):
+        primary = _demo_route()
+        retry = replace(
+            primary,
+            service_id="svc-id-2",
+            node_instance_id="node-2-inst",
+            node_id="node-2",
+            control_addr="127.0.0.1:50062",
+            http_base_url="http://127.0.0.1:18082/svc/svc-id-2",
+        )
+        client = _connect_discovery_service(validate_on_init=False)
+        try:
+            with (
+                patch.object(client._route_cache, "select_route", side_effect=[primary, retry]) as mocked_select,
+                patch.object(client._route_cache, "refresh", return_value=[retry]) as mocked_refresh,
+                patch.object(type(client), "_list_methods_via_route", side_effect=[RuntimeError("stale route"), [{"method": "square"}]]),
+            ):
+                assert client.methods == ["square"]
+            assert mocked_select.call_count == 2
+            mocked_refresh.assert_called_once_with("svc-demo", force=True)
+        finally:
+            client.close()
+
     def test_call_sync(self):
         route = _demo_route()
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=9.0, validate_on_init=False)
+        client = _connect_discovery_service(timeout_sec=9.0, validate_on_init=False)
         try:
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
                 "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
@@ -234,7 +274,7 @@ class TestDiscoveryCallerFacade:
 
     def test_async_proxy_call(self):
         route = _demo_route()
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        client = _connect_discovery_service(timeout_sec=8.0, validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
             with patch.object(client._route_cache, "select_route", return_value=route), patch(
@@ -270,7 +310,7 @@ class TestDiscoveryCallerFacade:
                 locator_token="",
             )
 
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        client = _connect_discovery_service(timeout_sec=8.0, validate_on_init=False)
         try:
             monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._estimate_managed_global_inline_size", fake_estimate)
             monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._put_data_via_clients", fake_put)
@@ -318,7 +358,7 @@ class TestDiscoveryCallerFacade:
                 raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "primary failed"})
             return {"ok": True, "data": {"y": 100}}
 
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", timeout_sec=8.0, validate_on_init=False)
+        client = _connect_discovery_service(timeout_sec=8.0, validate_on_init=False)
         try:
             monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._estimate_managed_global_inline_size", fake_estimate)
             monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._put_data_via_clients", fake_put)
@@ -337,7 +377,7 @@ class TestDiscoveryCallerFacade:
             client.close()
 
     def test_status(self):
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = _connect_discovery_service(validate_on_init=False)
         try:
             with patch.object(
                 DiscoveryServiceClient,
@@ -351,7 +391,7 @@ class TestDiscoveryCallerFacade:
             client.close()
 
     def test_broadcast_is_not_supported(self):
-        client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo", validate_on_init=False)
+        client = _connect_discovery_service(validate_on_init=False)
         try:
             client._discovered_methods = ["square"]
 
@@ -370,7 +410,7 @@ class TestDiscoveryCallerFacade:
             return_value={"ok": True, "route_count": 0},
         ):
             with pytest.raises(RuntimeError, match="no available route"):
-                DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo")
+                _connect_discovery_service()
 
     def test_methods_raise_clear_error_when_service_has_no_exported_methods(self):
         with patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[object()]), patch.object(
@@ -378,10 +418,10 @@ class TestDiscoveryCallerFacade:
             "get_status",
             return_value={"ok": True, "route_count": 1},
         ):
-            client = DiscoveryCallerFacade("127.0.0.1:50051", service_name="svc-demo")
+            client = _connect_discovery_service()
         try:
             with patch.object(
-                DiscoveryCallerFacade,
+                type(client),
                 "list_methods",
                 return_value=[],
             ):
@@ -433,7 +473,11 @@ def test_discovery_client_direct_call_roundtrip(tmp_path):
             assert status["routes"][0]["service_id"] == service_id
             assert "predicted_busy" in status["routes"][0]
 
-        module_client = DiscoveryCallerFacade(controlplane.base_url, service_name="svc_discovery", timeout_sec=5.0)
+        module_client = _connect_discovery_service(
+            controlplane.base_url,
+            service_name="svc_discovery",
+            timeout_sec=5.0,
+        )
         try:
             assert module_client.methods == ["add", "mul"]
             assert module_client.call_sync("add", value=10) == {"value": 10, "plus_one": 11}

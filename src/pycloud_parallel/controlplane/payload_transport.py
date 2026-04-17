@@ -19,7 +19,9 @@ from pycloud_parallel.controlplane.serialization import (
 
 EstimateInlineSize = Callable[[Any], int]
 PutPayloadData = Callable[..., object]
+# Legacy name retained for internal compatibility with older call sites.
 ResolveObjectRefs = Callable[[Any], Any]
+ResolveDataRefs = ResolveObjectRefs
 
 
 def _put_prepared_value(

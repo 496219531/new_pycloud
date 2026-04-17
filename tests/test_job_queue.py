@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
-from pycloud_parallel.data.ref import DataRef, object_ref_to_payload
+from pycloud_parallel.data.ref import DataRef, data_ref_to_payload
 
 
 def test_submit_and_cancel_waiting_job() -> None:
@@ -79,7 +79,7 @@ def test_submit_job_rejects_unresolvable_object_ref_payloads() -> None:
                 "entry_module": "task_demo",
                 "subtasks": [
                     {
-                        "blob": object_ref_to_payload(
+                        "blob": data_ref_to_payload(
                             DataRef(
                                 ref_id="sha256:" + ("c" * 64),
                                 storage_id="sha256:" + ("c" * 64),
@@ -557,7 +557,7 @@ def test_run_job_with_hooks_accepts_update_globals_dict() -> None:
 
 
 def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
-    from pycloud_parallel.data.ref import DataRef, object_ref_to_payload
+    from pycloud_parallel.data.ref import DataRef, data_ref_to_payload
 
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
@@ -578,7 +578,7 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
             "job_id": "job-hooks-ref-1",
             "client_id": "client-a",
             "priority": 5,
-            "blob_ref": object_ref_to_payload(
+            "blob_ref": data_ref_to_payload(
                 DataRef(
                     ref_id="sha256:" + ("b" * 64),
                     storage_id="sha256:" + ("b" * 64),
@@ -758,7 +758,7 @@ def test_submit_job_rejects_nested_unresolvable_business_blob_ref() -> None:
                 ).decode("utf-8"),
                 "package_format": "py",
                 "job_payload": {
-                    "blob_ref": object_ref_to_payload(
+                    "blob_ref": data_ref_to_payload(
                         DataRef(
                             ref_id="sha256:" + ("e" * 64),
                             storage_id="sha256:" + ("e" * 64),
@@ -897,6 +897,102 @@ def test_job_queue_client_submit_job_from_bytes_uses_minimal_payload() -> None:
     assert "finalize_callable" not in captured
     assert "pool_worker_count" not in captured
     assert "priority" not in captured
+
+
+def test_job_queue_client_submit_uses_source_bytes_as_default_product_path() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
+    captured = {}
+
+    def _fake_submit(payload):
+        captured.update(payload)
+        return {"ok": True}
+
+    client.submit_job = _fake_submit  # type: ignore[method-assign]
+    resp = client.submit(
+        source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
+        entry_module="job_demo",
+    )
+    assert resp == {"ok": True}
+    assert captured["entry_module"] == "job_demo"
+    assert captured["entry_callable"] == "run"
+    assert captured["task_generator_callable"] == "task_generator"
+    assert captured["package_format"] == "py"
+
+
+def test_job_queue_client_submit_accepts_advanced_artifact() -> None:
+    from pycloud_parallel import JobQueue
+    from pycloud_parallel.artifact import Artifact, ArtifactDeps
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
+    captured = {}
+
+    def _fake_submit(payload):
+        captured.update(payload)
+        return {"ok": True}
+
+    client.submit_job = _fake_submit  # type: ignore[method-assign]
+    resp = client.submit(
+        artifact=Artifact.from_bytes(
+            b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
+            package_format="py",
+            entry_module="job_demo",
+            deps=ArtifactDeps.allow_install(["orjson==3.10.18"]),
+        ),
+    )
+    assert resp == {"ok": True}
+    assert captured["entry_module"] == "job_demo"
+    assert captured["dependency_allowlist"] == ["orjson==3.10.18"]
+
+
+def test_job_queue_client_submit_accepts_module_source_via_unified_artifact_path() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
+    captured = {}
+
+    def _fake_submit(payload):
+        captured.update(payload)
+        return {"ok": True}
+
+    client.submit_job = _fake_submit  # type: ignore[method-assign]
+
+    import types
+
+    module = types.ModuleType("job_module_demo")
+    exec(
+        (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': value}\n\n"
+            b"def task_generator(value=0, **_kwargs):\n"
+            b"    return [{'value': value}]\n"
+        ).decode("utf-8"),
+        module.__dict__,
+    )
+
+    with patch(
+        "pycloud_parallel.controlplane.artifact._prepare_artifact_blob",
+        return_value=(b"blob", "job_module_demo.tar.gz"),
+    ):
+        resp = client.submit(source=module)
+
+    assert resp == {"ok": True}
+    assert captured["entry_module"] == "job_module_demo"
+    assert captured["task_generator_callable"] == "task_generator"
+    assert captured["package_format"] == "tar.gz"
+
+
+def test_job_queue_client_submit_rejects_callable_source() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
+
+    def _job_func(**_kwargs):
+        return {}
+
+    with pytest.raises(ValueError, match="JobQueue.submit\\(source=callable\\) is not supported"):
+        client.submit(source=_job_func)
 
 
 def test_job_queue_client_submit_job_from_bytes_auto_binds_update_globals() -> None:

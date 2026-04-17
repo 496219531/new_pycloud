@@ -117,23 +117,13 @@ print(parallel_for(range(5), lambda i: i + 10, max_workers=2))
 ```python
 from pycloud_parallel import Service, export
 
-blob = (
-    b"def export(fn):\n"
-    b"    fn.__pycloud_export__ = True\n"
-    b"    return fn\n\n"
-    b"@export\n"
-    b"def square(x=0, **_kwargs):\n"
-    b"    x = int(x)\n"
-    b"    return {'x': x, 'y': x * x}\n"
-)
+import my_service_module
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
-    blob=blob,
+    source=my_service_module,
     runtime="py3",
-    entry_module="square_service",
-    export_mode="decorator",
     node_count=1,
 )
 
@@ -142,10 +132,11 @@ print(group.square.sync(x=7))
 # 固定 service_name 重新部署时，如果代码变化需先结束旧服务
 ```
 
-依赖缺失时可显式给补装白名单：
+默认推荐直接传模块对象 `source=my_service_module`。
+如果你需要更细的打包、依赖或导出控制，再使用高级 `Artifact(...)` 或显式白名单：
 
 ```python
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="dep-service",
     artifact_path="./service_src",
@@ -169,18 +160,13 @@ group = Service.deploy_from_infocenter(
 ```python
 from pycloud_parallel import TaskPool
 
-blob = (
-    b"def run(value=0, **_kwargs):\n"
-    b"    value = int(value)\n"
-    b"    return {'value': value, 'square': value * value}\n"
-)
+import my_task_module
 
-with TaskPool.from_infocenter(
+with TaskPool.open(
     infocenter_target="127.0.0.1:50051",
     job_id="demo-job",
-    blob=blob,
+    source=my_task_module,
     runtime="py3",
-    entry_module="task_demo",
 ) as pool:
     resp = pool.submit_payloads([{"value": 7}])
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
@@ -226,10 +212,11 @@ with TaskPool.from_infocenter(
 ```python
 from pycloud_parallel import JobQueue
 
-client = JobQueue("127.0.0.1:50051", client_id="job-demo")
-client.submit_job_from_bytes(
-    blob=job_blob,
-    entry_module="job_demo",
+import my_job_module
+
+client = JobQueue.connect("127.0.0.1:50051", client_id="job-demo")
+client.submit(
+    source=my_job_module,
     runtime="py3",
     job_payload={"value": 10, "count": 6},
 )
@@ -261,16 +248,16 @@ client.submit_job_from_bytes(
 说明：
 
 1. `job_payload` 是可选 `dict`
-2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+2. `submit(source=my_job_module, ...)` 会自动发现并绑定 `task_generator`
 3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
 4. `apply_managed_globals` 不走 payload，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 
-如果你已有模块对象：
+这里默认推荐直接传模块对象：
 
 ```python
-client.submit_job_from_module(
-    module=job_module,
+client.submit(
+    source=job_module,
     job_payload={"value": 10, "count": 6},
 )
 ```

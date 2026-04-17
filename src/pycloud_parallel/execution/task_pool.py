@@ -1088,11 +1088,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def is_alive(self) -> bool:
         if self._backend is not None and hasattr(self._backend, "is_alive"):
             return bool(self._backend.is_alive())
-        if self._closed:
-            return False
-        if self.failed:
-            return False
-        return any(node_id in self._active_nodes for node_id in self._pools)
+        return super().is_alive()
 
     def close(self) -> None:
         if self._backend is not None:
@@ -1151,6 +1147,7 @@ def _build_task_pool_from_infocenter(
     *,
     infocenter_target: str,
     job_id: str = "",
+    source: Any = None,
     owner_client_id: Optional[str] = None,
     pool_name: Optional[str] = None,
     artifact: Optional[Any] = None,
@@ -1180,6 +1177,7 @@ def _build_task_pool_from_infocenter(
     source_func = entry_func if entry_func is not None else func
     normalized_artifact = _normalize_artifact_input(
         consumer_kind="task",
+        source=source,
         artifact=artifact,
         deps=deps,
         func=source_func,
@@ -1274,11 +1272,24 @@ class TaskPool(_TaskPoolSessionBase):
     """V1 task-pool session."""
 
     @classmethod
+    def open(
+        cls,
+        **kwargs: Any,
+    ) -> "TaskPool":
+        """Product-facing open action for V1 task pools.
+
+        Default path: ``TaskPool.open(source=my_module, ...)``.
+        Advanced path: ``TaskPool.open(artifact=Artifact(...), ...)``.
+        """
+        return cls.from_infocenter(**kwargs)
+
+    @classmethod
     def from_infocenter(
         cls,
         *,
         infocenter_target: str,
         job_id: str = "",
+        source: Any = None,
         owner_client_id: Optional[str] = None,
         pool_name: Optional[str] = None,
         artifact: Optional[Any] = None,
@@ -1309,6 +1320,7 @@ class TaskPool(_TaskPoolSessionBase):
             cls,
             infocenter_target=infocenter_target,
             job_id=job_id,
+            source=source,
             owner_client_id=owner_client_id,
             pool_name=pool_name,
             artifact=artifact,

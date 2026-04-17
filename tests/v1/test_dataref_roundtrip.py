@@ -22,15 +22,18 @@ def test_prepare_outbound_payload_converts_large_object_uploads_to_dataref():
     )
     prepared = prepare_outbound_payload(
         {"blob": "x" * 2048},
-        put_data=lambda value, *, format="": {
-            "__pycloud_object_ref__": {
-                "object_id": "sha256:" + ("a" * 64),
-                "format": format or "txt",
-                "size_bytes": 2048,
-                "materialize_as": "text",
-                "consume_on_read": False,
-            }
-        },
+        put_data=lambda value, *, format="": data_ref_to_payload(
+            DataRef(
+                ref_id="sha256:" + ("a" * 64),
+                storage_id="sha256:" + ("a" * 64),
+                logical_type="text",
+                format=format or "txt",
+                size_bytes=2048,
+                materialize_as="text",
+                locator_kind="node_local",
+                locator_token="",
+            )
+        ),
         estimate_inline_size=estimate_payload_inline_size,
         policy=policy,
     )
@@ -39,39 +42,24 @@ def test_prepare_outbound_payload_converts_large_object_uploads_to_dataref():
     assert prepared["blob"].logical_type == "text"
 
 
-def test_legacy_object_and_result_refs_serialize_as_dataref_payloads():
-    serialized_object = data_ref_to_payload(
+def test_dataref_payload_roundtrip_stays_canonical():
+    serialized = data_ref_to_payload(
         coerce_data_ref(
-            {
-                "__pycloud_object_ref__": {
-                    "object_id": "sha256:" + ("b" * 64),
-                    "format": "json",
-                    "size_bytes": 64,
-                    "materialize_as": "json",
-                    "consume_on_read": False,
-                }
-            }
-        )
-    )
-    serialized_result = data_ref_to_payload(
-        coerce_data_ref(
-            {
-                "__pycloud_result_ref__": {
-                    "object_id": "sha256:" + ("c" * 64),
-                    "node_id": "node-1",
-                    "control_addr": "127.0.0.1:50061",
-                    "format": "bin",
-                    "size_bytes": 128,
-                    "materialize_as": "bytes",
-                }
-            }
+            DataRef(
+                ref_id="sha256:" + ("b" * 64),
+                storage_id="sha256:" + ("b" * 64),
+                logical_type="json",
+                format="json",
+                size_bytes=64,
+                materialize_as="json",
+                locator_kind="node_local",
+                locator_token="",
+            )
         )
     )
 
-    assert list(serialized_object.keys()) == [DATA_REF_SENTINEL]
-    assert list(serialized_result.keys()) == [DATA_REF_SENTINEL]
-    assert isinstance(convert_dict_to_arrow(serialized_object), DataRef)
-    assert isinstance(convert_dict_to_arrow(serialized_result), DataRef)
+    assert list(serialized.keys()) == [DATA_REF_SENTINEL]
+    assert isinstance(convert_dict_to_arrow(serialized), DataRef)
 
 
 def test_data_store_large_results_now_return_dataref():
@@ -91,26 +79,18 @@ def test_data_store_large_results_now_return_dataref():
     assert ref.logical_type == "dataframe"
 
 
-def test_maybe_data_ref_accepts_legacy_refs():
-    object_ref = {
-        "__pycloud_object_ref__": {
-            "object_id": "sha256:" + ("e" * 64),
-            "format": "bin",
-            "size_bytes": 12,
-            "materialize_as": "bytes",
-            "consume_on_read": False,
-        }
-    }
-    result_ref = {
-        "__pycloud_result_ref__": {
-            "object_id": "sha256:" + ("f" * 64),
-            "node_id": "node-2",
-            "control_addr": "127.0.0.1:50062",
-            "format": "txt",
-            "size_bytes": 24,
-            "materialize_as": "text",
-        }
-    }
+def test_maybe_data_ref_accepts_canonical_payload_only():
+    canonical = data_ref_to_payload(
+        DataRef(
+            ref_id="sha256:" + ("e" * 64),
+            storage_id="sha256:" + ("e" * 64),
+            logical_type="bytes",
+            format="bin",
+            size_bytes=12,
+            materialize_as="bytes",
+            locator_kind="node_local",
+            locator_token="",
+        )
+    )
 
-    assert isinstance(maybe_data_ref(object_ref), DataRef)
-    assert isinstance(maybe_data_ref(result_ref), DataRef)
+    assert isinstance(maybe_data_ref(canonical), DataRef)

@@ -2,10 +2,11 @@
 """
 PyCloud Gateway 调用示例
 
-演示如何通过 controlplane 的 Gateway 按 service_name 调用服务。
+演示如何通过 `Service.connect(..., transport="gateway")`
+按 service_name 调用服务。
 同一个脚本里同时展示：
-1. GatewayServiceClient：薄 HTTP helper
-2. GatewayServiceClient：直接按方法名调用
+1. `Service.connect(..., transport="gateway")`
+2. 统一服务对象的 `methods / status / foo.sync(...)`
 
 前置条件：
 - 需要先部署名为 "square-service" 的服务
@@ -23,7 +24,7 @@ blob = (
     b"    return {'x': x, 'y': x * x}\n"
 )
 
-group = Service.deploy_from_infocenter(
+group = Service.deploy(
     infocenter_target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
@@ -33,17 +34,29 @@ group = Service.deploy_from_infocenter(
 ```
 """
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import asyncio
 import time
 from pycloud_parallel import Service
-from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
 
 def check_service_exists(gateway_target: str, service_name: str) -> bool:
     """检查服务是否存在。"""
     try:
-        with GatewayServiceClient(gateway_target, timeout_sec=5.0) as client:
-            status = client.get_status(service_name=service_name)
+        with Service.connect(
+            target=gateway_target,
+            service_name=service_name,
+            transport="gateway",
+            timeout_sec=5.0,
+            validate_on_init=False,
+        ) as client:
+            status = client.status()
             return status.get("route_count", 0) > 0
     except RuntimeError:
         return False
@@ -54,16 +67,17 @@ def wait_for_service_ready(gateway_target: str, service_name: str, *, timeout_se
     last_error = "service route not ready"
     while time.time() < deadline:
         try:
-            with GatewayServiceClient(gateway_target, timeout_sec=5.0) as client:
-                status = client.get_status(service_name=service_name)
+            with Service.connect(
+                target=gateway_target,
+                service_name=service_name,
+                transport="gateway",
+                timeout_sec=5.0,
+                validate_on_init=False,
+            ) as client:
+                status = client.status()
                 if status.get("route_count", 0) <= 0:
                     raise RuntimeError("route_count=0")
-                client.call(
-                    service_name=service_name,
-                    method="square",
-                    payload={"x": 1},
-                    timeout_sec=5.0,
-                )
+                client.square.sync(x=1)
             return
         except RuntimeError as exc:
             last_error = str(exc)
@@ -82,14 +96,13 @@ def ensure_service(gateway_target: str, service_name: str):
         b"    x = int(x)\n"
         b"    return {'x': x, 'y': x * x}\n"
     )
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target=gateway_target,
         owner_client_id=f"gateway-client-demo-{int(time.time())}",
         service_name=service_name,
-        blob=blob,
+        source=blob,
         runtime="py3",
         entry_module="square_service",
-        export_mode="decorator",
         worker_count=1,
         tags=["compute"],
         min_success_nodes=1,
@@ -113,17 +126,22 @@ def main() -> None:
     group = ensure_service(gateway_target, service_name)
 
     try:
-        print("[GatewayServiceClient]")
+        print("[Service.connect(gateway)]")
         print("-" * 60)
 
-        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
-            methods = client.list_methods(service_name=service_name, include_docs=False)
+        with Service.connect(
+            target=gateway_target,
+            service_name=service_name,
+            transport="gateway",
+            timeout_sec=10.0,
+        ) as client:
+            methods = client.methods
             print("可用方法:")
-            for item in methods:
-                print(f"  - {item.get('method')}")
+            for method_name in methods:
+                print(f"  - {method_name}")
             print()
 
-            status = client.get_status(service_name=service_name)
+            status = client.status()
             print(f"路由数量: {status.get('route_count')}")
             for route in status.get("routes", []):
                 print(
@@ -135,40 +153,28 @@ def main() -> None:
             print()
 
             print("调用服务:")
-            resp = client.call(
-                service_name=service_name,
-                method="square",
-                payload={"x": 7},
-                timeout_sec=10.0,
-            )
+            resp = client.square.sync(x=7)
             print(f"  square(7) = {resp}")
 
         print()
-        print("[GatewayServiceClient - method calls]")
+        print("[Service.connect(gateway) - method calls]")
         print("-" * 60)
-        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
-            status = client.get_status(service_name=service_name)
+        with Service.connect(
+            target=gateway_target,
+            service_name=service_name,
+            transport="gateway",
+            timeout_sec=10.0,
+        ) as client:
+            status = client.status()
             print(f"route_count={status.get('route_count')}")
             print("同步调用:")
-            print(
-                "  square(9) = "
-                f"{client.call(service_name=service_name, method='square', payload={'x': 9}, timeout_sec=10.0)}"
-            )
+            print(f"  square(9) = {client.square.sync(x=9)}")
             print()
 
             print("异步示例:")
 
             async def _run() -> None:
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: client.call(
-                        service_name=service_name,
-                        method="square",
-                        payload={"x": 11},
-                        timeout_sec=10.0,
-                    ),
-                )
+                result = await client.square(x=11)
                 print(f"  square(11) = {result}")
 
             asyncio.run(_run())

@@ -21,8 +21,6 @@ from pycloud_parallel.controlplane.data_ref import (
     data_ref_from_payload,
     data_ref_to_payload,
     is_data_ref_payload,
-    is_object_ref_payload,
-    is_result_ref_payload,
     maybe_data_ref,
 )
 
@@ -563,10 +561,6 @@ def _convert_dict_to_arrow(data: Any, *, depth: int) -> Any:
     if isinstance(data, dict):
         if is_data_ref_payload(data):
             return data_ref_from_payload(data)
-        if is_object_ref_payload(data):
-            return coerce_data_ref(data)
-        if is_result_ref_payload(data):
-            return coerce_data_ref(data)
         obj_type = data.get("__type__")
         if obj_type == "datetime":
             return datetime.fromisoformat(str(data["value"]))

@@ -4,13 +4,19 @@ PyCloud Gateway 完整演示
 
 演示完整的流程：
 1. 部署一个服务（使用 Service）
-2. 通过 Gateway 按服务名调用
+2. 通过 `Service.connect(..., transport="gateway")` 按服务名调用
 3. 清理服务
 """
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import asyncio
 import time
-from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 from pycloud_parallel import (
     Service,
 )
@@ -44,13 +50,12 @@ def main():
         b"    return {'x': x, 'y': x * x * x}\n"
     )
 
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target=gateway_target,
         service_name=service_name,
-        blob=blob,
+        source=blob,
         runtime="py3",
         entry_module="square_service",
-        export_mode="decorator",
         dependency_allowlist=dependency_allowlist,
         worker_count=4,
         tags=["compute"],
@@ -65,20 +70,25 @@ def main():
     time.sleep(5)  # 等待服务启动
 
     try:
-        # 步骤 2: 使用 GatewayServiceClient 调用
-        print("[2] 使用 GatewayServiceClient")
+        # 步骤 2: 使用 Service.connect(gateway) 调用
+        print("[2] 使用 Service.connect(gateway)")
         print("-" * 60)
 
-        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
+        with Service.connect(
+            target=gateway_target,
+            service_name=service_name,
+            transport="gateway",
+            timeout_sec=10.0,
+        ) as client:
             # 列出方法
-            methods = client.list_methods(service_name=service_name, include_docs=False)
+            methods = client.methods
             print("可用方法:")
-            for item in methods:
-                print(f"  - {item.get('method')}")
+            for method_name in methods:
+                print(f"  - {method_name}")
             print()
 
             # 获取状态
-            status = client.get_status(service_name=service_name)
+            status = client.status()
             print(f"路由数量: {status.get('route_count')}")
             for route in status.get("routes", []):
                 print(
@@ -90,37 +100,31 @@ def main():
 
             # 调用服务
             print("调用服务:")
-            result1 = client.call(
-                service_name=service_name,
-                method="square",
-                payload={"x": 7},
-                timeout_sec=10.0,
-            )
+            result1 = client.square.sync(x=7)
             print(f"  square(7) = {result1}")
 
-            result2 = client.call(
-                service_name=service_name,
-                method="cube",
-                payload={"x": 3},
-                timeout_sec=10.0,
-            )
+            result2 = client.cube.sync(x=3)
             print(f"  cube(3) = {result2}")
         print()
 
-        # 步骤 3: 继续使用 GatewayServiceClient 调用
-        print("[3] 继续使用 GatewayServiceClient")
+        # 步骤 3: 继续使用 Service.connect(gateway) 调用
+        print("[3] 继续使用 Service.connect(gateway)")
         print("-" * 60)
-        with GatewayServiceClient(gateway_target, timeout_sec=10.0) as client:
-            methods = client.list_methods(service_name=service_name, include_docs=False)
-            print(f"可用方法: {[item['method'] for item in methods]}")
+        with Service.connect(
+            target=gateway_target,
+            service_name=service_name,
+            transport="gateway",
+            timeout_sec=10.0,
+        ) as client:
+            print(f"可用方法: {client.methods}")
         print()
 
         # 同步调用
         print("同步调用:")
-        result3 = client.call(service_name=service_name, method="square", payload={"x": 9}, timeout_sec=10.0)
+        result3 = client.square.sync(x=9)
         print(f"  square(9) = {result3}")
 
-        result4 = client.call(service_name=service_name, method="cube", payload={"x": 2}, timeout_sec=10.0)
+        result4 = client.cube.sync(x=2)
         print(f"  cube(2) = {result4}")
         print()
 
@@ -128,32 +132,14 @@ def main():
         print("异步调用:")
 
         async def async_calls():
-            loop = asyncio.get_running_loop()
-            result5 = await loop.run_in_executor(
-                None,
-                lambda: client.call(service_name=service_name, method="square", payload={"x": 11}, timeout_sec=10.0),
-            )
+            result5 = await client.square(x=11)
             print(f"  square(11) = {result5}")
 
-            result6 = await loop.run_in_executor(
-                None,
-                lambda: client.call(service_name=service_name, method="cube", payload={"x": 4}, timeout_sec=10.0),
-            )
+            result6 = await client.cube(x=4)
             print(f"  cube(4) = {result6}")
 
             # 并发调用
-            results = await asyncio.gather(*[
-                loop.run_in_executor(
-                    None,
-                    lambda x=value: client.call(
-                        service_name=service_name,
-                        method="square",
-                        payload={"x": x},
-                        timeout_sec=10.0,
-                    ),
-                )
-                for value in (1, 2, 3)
-            ])
+            results = await asyncio.gather(*[client.square(x=value) for value in (1, 2, 3)])
             print(f"  并发调用 square(1,2,3) = {results}")
 
         asyncio.run(async_calls())

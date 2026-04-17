@@ -56,6 +56,31 @@ def test_api_service_module_exposes_only_service():
     assert dir(api_service_module) == ["Service"]
     assert not hasattr(api_service_module, "ServiceGroup")
     assert not hasattr(api_service_module, "deploy_service_from_infocenter")
+    assert callable(ApiService.deploy)
+    discovery = ApiService.connect(
+        target="127.0.0.1:50051",
+        service_name="svc-demo",
+        transport="discovery",
+        validate_on_init=False,
+    )
+    gateway = ApiService.connect(
+        target="127.0.0.1:50051",
+        service_name="svc-demo",
+        transport="gateway",
+        validate_on_init=False,
+    )
+    try:
+        assert discovery.service_name == "svc-demo"
+        assert discovery.transport == "discovery"
+        assert callable(discovery.status)
+        assert isinstance(getattr(type(discovery), "methods", None), property)
+        assert gateway.service_name == "svc-demo"
+        assert gateway.transport == "gateway"
+        assert callable(gateway.status)
+        assert isinstance(getattr(type(gateway), "methods", None), property)
+    finally:
+        discovery.close()
+        gateway.close()
 
 
 def test_api_pool_module_exposes_only_task_pool():
@@ -63,9 +88,15 @@ def test_api_pool_module_exposes_only_task_pool():
     assert dir(api_pool_module) == ["TaskPool"]
     assert not hasattr(api_pool_module, "TaskPoolSession")
     assert not hasattr(api_pool_module, "create_task_pool_from_infocenter")
+    assert callable(ApiTaskPool.open)
 
 
 def test_api_queue_module_exposes_only_job_queue():
     assert api_queue_module.__all__ == ["JobQueue"]
     assert dir(api_queue_module) == ["JobQueue"]
     assert not hasattr(api_queue_module, "JobQueueClient")
+    queue = ApiJobQueue.connect("127.0.0.1:50051", client_id="surface-client")
+    try:
+        assert isinstance(queue, ApiJobQueue)
+    finally:
+        queue.close()

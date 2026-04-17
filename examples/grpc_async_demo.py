@@ -1,3 +1,10 @@
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import asyncio
 import time
 from pycloud_parallel import Service
@@ -20,7 +27,7 @@ async def main():
     )
 
     suffix = int(time.time())
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"client-owner-{suffix}",
         service_name=f"square-service-{suffix}",
@@ -65,7 +72,7 @@ async def main():
         async def batch_call():
             tasks = [
                 group.acall_balanced("cube", {"x": i}, timeout_sec=10)
-                for i in range(1000)
+                for i in range(100)
             ]
             return await asyncio.gather(*tasks)
 
@@ -74,11 +81,8 @@ async def main():
             node_id, resp = result
             print(f"节点 {node_id}: {resp['data']}")
 
-        print("服务已进入长驻模式，按 Ctrl+C 会停止 owner；远端服务会在心跳超时后自动回收。")
-        group.join(
-            end_services_on_interrupt=False,
-            end_reason="owner ctrl+c",
-        )
+        print("若需长驻，可手动调用 group.join(...)")
+        group.close(end_services=True, reason="grpc_async_demo cleanup")
         joined = True
     finally:
         group.close(

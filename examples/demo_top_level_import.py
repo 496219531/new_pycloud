@@ -5,6 +5,13 @@
 展示 V1 顶层公开面。
 """
 
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 from pycloud_parallel import DataRef, JobQueue, Service, TaskPool, export
 
 
@@ -26,17 +33,17 @@ def main():
     print()
     print("  # Service 模式")
     print("  from pycloud_parallel import Service")
-    print("  group = Service.deploy_from_infocenter(...)")
+    print("  group = Service.deploy(...)")
     print("  result = await group.square(x=7)")
     print()
     print("  # JobQueue 模式")
     print("  from pycloud_parallel import JobQueue")
-    print("  client = JobQueue(...)")
+    print("  client = JobQueue.connect(...)")
     print("  client.submit_job_from_bytes(...)")
     print()
     print("  # TaskPool 模式")
     print("  from pycloud_parallel import TaskPool")
-    print("  pool = TaskPool.from_infocenter(...)")
+    print("  pool = TaskPool.open(...)")
     print("  results = pool.wait_for_data(...)")
     print()
     print("  # 本地并行")

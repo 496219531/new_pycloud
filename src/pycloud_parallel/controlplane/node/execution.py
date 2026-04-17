@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -43,6 +44,7 @@ from pycloud_parallel.controlplane.serialization import (
     summarize_payload_flow_value,
 )
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_current_node
+from pycloud_parallel.runtime.errors import RuntimeMismatchError
 
 _DEFAULT_EXPORT_DECORATOR = "pycloud_export"
 service_timing_logger = logging.getLogger("pycloud_parallel.service_timing")
@@ -53,6 +55,81 @@ _MANAGED_GLOBALS_CACHE_LOCK = threading.Lock()
 _MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
 _MANAGED_GLOBALS_APPLY_LOCKS_LOCK = threading.Lock()
 _MANAGED_GLOBALS_APPLY_LOCKS: Dict[str, threading.Lock] = {}
+
+
+@dataclass(frozen=True)
+class ExecuteSpec:
+    artifact_path: str
+    entry_module: str
+    package_format: str
+    dependency_path: str
+    dependency_policy_mode: str
+    object_dir: str
+    work_dir: str
+    export_mode: str
+    export_methods: Tuple[str, ...]
+    export_decorator: str
+    method_name: str
+    entry_callable: str
+    payload: Dict[str, Any]
+    payload_mode: str = "task_submit"
+    managed_globals_scope_dir: str = ""
+    managed_globals_digest: str = ""
+    warmup_only: bool = False
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "artifact_path": self.artifact_path,
+            "entry_module": self.entry_module,
+            "package_format": self.package_format,
+            "dependency_path": self.dependency_path,
+            "dependency_policy_mode": self.dependency_policy_mode,
+            "object_dir": self.object_dir,
+            "work_dir": self.work_dir,
+            "export_mode": self.export_mode,
+            "export_methods": list(self.export_methods),
+            "export_decorator": self.export_decorator,
+            "method_name": self.method_name,
+            "entry_callable": self.entry_callable,
+            "payload": dict(self.payload or {}),
+            "payload_mode": self.payload_mode,
+            "managed_globals_scope_dir": self.managed_globals_scope_dir,
+            "managed_globals_digest": self.managed_globals_digest,
+            "warmup_only": bool(self.warmup_only),
+        }
+
+
+def _build_execute_spec_model(
+    artifact: Any,
+    *,
+    object_dir: Path,
+    work_dir: Optional[Path] = None,
+    method_name: str,
+    payload: dict,
+    payload_mode: str = "task_submit",
+    managed_globals_scope_dir: str = "",
+    managed_globals_digest: str = "",
+    warmup_only: bool = False,
+) -> ExecuteSpec:
+    return ExecuteSpec(
+        artifact_path=str(artifact.path),
+        entry_module=str(artifact.entry_module),
+        package_format=str(artifact.package_format),
+        dependency_path=str(artifact.dependency_path),
+        dependency_policy_mode=str(artifact.dependency_policy_mode),
+        object_dir=str(object_dir),
+        work_dir=str(work_dir or ""),
+        export_mode=str(artifact.export_mode),
+        export_methods=tuple(str(item) for item in artifact.export_methods),
+        export_decorator=str(artifact.export_decorator),
+        method_name=str(method_name),
+        entry_callable=str(artifact.entry_callable),
+        payload=dict(payload or {}),
+        payload_mode=str(payload_mode or "task_submit"),
+        managed_globals_scope_dir=str(managed_globals_scope_dir or ""),
+        managed_globals_digest=str(managed_globals_digest or ""),
+        warmup_only=bool(warmup_only),
+    )
 
 
 def _build_execute_spec(
@@ -67,25 +144,17 @@ def _build_execute_spec(
     managed_globals_digest: str = "",
     warmup_only: bool = False,
 ) -> Dict[str, Any]:
-    return {
-        "artifact_path": artifact.path,
-        "entry_module": artifact.entry_module,
-        "package_format": artifact.package_format,
-        "dependency_path": artifact.dependency_path,
-        "dependency_policy_mode": artifact.dependency_policy_mode,
-        "object_dir": str(object_dir),
-        "work_dir": str(work_dir or ""),
-        "export_mode": artifact.export_mode,
-        "export_methods": list(artifact.export_methods),
-        "export_decorator": artifact.export_decorator,
-        "method_name": method_name,
-        "entry_callable": artifact.entry_callable,
-        "payload": payload or {},
-        "payload_mode": str(payload_mode or "task_submit"),
-        "managed_globals_scope_dir": str(managed_globals_scope_dir or ""),
-        "managed_globals_digest": str(managed_globals_digest or ""),
-        "warmup_only": bool(warmup_only),
-    }
+    return _build_execute_spec_model(
+        artifact,
+        object_dir=object_dir,
+        work_dir=work_dir,
+        method_name=method_name,
+        payload=payload,
+        payload_mode=payload_mode,
+        managed_globals_scope_dir=managed_globals_scope_dir,
+        managed_globals_digest=managed_globals_digest,
+        warmup_only=warmup_only,
+    ).to_payload()
 
 
 def _artifact_module_name(artifact_path: str) -> str:
@@ -161,7 +230,7 @@ def _validate_python_runtime_or_raise(*, node_python_version: str, runtime: str)
     if not normalized_runtime:
         return ""
     if not matches_python_runtime(node_python_version, normalized_runtime):
-        raise ValueError(
+        raise RuntimeMismatchError(
             runtime_mismatch_message_for_current_node(
                 requested_runtime=normalized_runtime,
                 node_python_version=node_python_version,
@@ -988,9 +1057,11 @@ def _execute_payload_in_subprocess(
 
 
 __all__ = [
+    "ExecuteSpec",
     "_artifact_module_name",
     "_build_callable_router",
     "_build_execute_spec",
+    "_build_execute_spec_model",
     "_describe_artifact_error",
     "_describe_user_execution_error",
     "_discover_callable_methods",

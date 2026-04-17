@@ -10,9 +10,9 @@
 
 ## 当前推荐入口
 
-1. `Service.deploy_from_infocenter(func=...)`
-2. `Service.deploy_from_infocenter(entry_module=<module object>)`
-3. `TaskPool.from_infocenter(...)`
+1. `Service.deploy(func=...)`
+2. `Service.deploy(entry_module=<module object>)`
+3. `TaskPool.open(...)`
 4. `JobQueue.submit_job_from_bytes(...)`
 
 ## 依赖策略

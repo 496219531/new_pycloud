@@ -95,10 +95,10 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
             b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
-        with TaskPool.from_infocenter(
+        with TaskPool.open(
             infocenter_target=infocenter.base_url,
             job_id="v1-smoke-pool",
-            blob=pool_blob,
+            source=pool_blob,
             runtime="py3",
             entry_module="v1_smoke_pool_demo",
             entry_callable="run",
@@ -119,11 +119,11 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
             b"    value = int(value)\n"
             b"    return {'value': value, 'square': value * value}\n"
         )
-        service = Service.deploy_from_infocenter(
+        service = Service.deploy(
             infocenter_target=infocenter.base_url,
             owner_client_id="v1-smoke-owner",
             service_name="v1-smoke-service",
-            blob=service_blob,
+            source=service_blob,
             runtime="py3",
             entry_module="v1_smoke_service_demo",
             entry_callable="mul",
@@ -151,15 +151,15 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
         )
         with patch(
             "pycloud_parallel.controlplane.job_queue._create_job_task_pool",
-            wraps=TaskPool.from_infocenter,
+            wraps=TaskPool.open,
         ) as mocked_create_pool:
-            client = JobQueue(infocenter.base_url, client_id="v1-smoke-job-client", timeout_sec=10.0)
+            client = JobQueue.connect(infocenter.base_url, client_id="v1-smoke-job-client", timeout_sec=10.0)
             try:
-                submit = client.submit_job_from_bytes(
-                    blob=job_blob,
-                    entry_module="v1_smoke_job_demo",
+                submit = client.submit(
+                    source=job_blob,
                     job_payload={"value": 6, "count": 2},
                     runtime="py3",
+                    entry_module="v1_smoke_job_demo",
                 )
                 final = client.wait_for_terminal(submit["job"]["job_id"], timeout_sec=15.0, poll_interval_sec=0.2)["job"]
             finally:

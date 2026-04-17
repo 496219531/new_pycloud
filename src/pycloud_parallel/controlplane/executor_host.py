@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 import logging
 import multiprocessing as mp
 import queue
@@ -71,6 +72,57 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             bool(args.get("warmup_only", False)),
             str(args.get("payload_mode", "task_submit") or "task_submit"),
         )
+
+    def _is_recoverable_pool_error(exc: BaseException) -> bool:
+        if isinstance(exc, BrokenProcessPool):
+            return True
+        text = repr(exc)
+        return "terminated abruptly while the future was running or pending" in text or "BrokenProcessPool" in text
+
+    def _submit_service_future(service_id: str, payload: Dict[str, Any]):
+        executor = service_executors.get(service_id)
+        if executor is None and service_id in service_workers:
+            executor = _rebuild_service_executor(service_id)
+        if executor is None:
+            raise RuntimeError("service executor missing")
+        try:
+            return _submit_callable(executor, payload)
+        except Exception as exc:
+            if not _is_recoverable_pool_error(exc):
+                raise
+            executor = _rebuild_service_executor(service_id)
+            if executor is None:
+                raise RuntimeError("service executor missing after rebuild") from exc
+            return _submit_callable(executor, payload)
+
+    def _submit_pool_future(pool_id: str, payload: Dict[str, Any]):
+        executor = pool_executors.get(pool_id)
+        if executor is None and pool_id in pool_workers:
+            executor = _rebuild_pool_executor(pool_id)
+        if executor is None:
+            raise RuntimeError("task pool missing")
+        try:
+            return _submit_callable(executor, payload)
+        except Exception as exc:
+            if not _is_recoverable_pool_error(exc):
+                raise
+            executor = _rebuild_pool_executor(pool_id)
+            if executor is None:
+                raise RuntimeError("task pool missing after rebuild") from exc
+            return _submit_callable(executor, payload)
+
+    def _submit_runtime_future(payload: Dict[str, Any]):
+        nonlocal task_executor
+        executor = _ensure_task_executor()
+        try:
+            return _submit_callable(executor, payload)
+        except Exception as exc:
+            if not _is_recoverable_pool_error(exc):
+                raise
+            _shutdown_executor(task_executor, wait=True)
+            task_executor = None
+            executor = _ensure_task_executor()
+            return _submit_callable(executor, payload)
 
     def _unpack_subprocess_result(value: Any) -> tuple[str, Any, str, str, Dict[str, Any]]:
         if isinstance(value, tuple):
@@ -177,19 +229,18 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
 
             if action == "call_service":
                 service_id = str(payload.get("service_id", "") or "")
-                executor = service_executors.get(service_id)
-                if executor is None and service_id in service_workers:
-                    executor = _rebuild_service_executor(service_id)
-                if executor is None:
+                if service_id not in service_workers:
                     _send_response(request_id, ok=False, error="service executor missing")
                     return True
-                future = _submit_callable(executor, payload)
+                future = _submit_service_future(service_id, payload)
                 inflight[future] = {
                     "kind": "service",
                     "service_id": service_id,
                     "request_id": request_id,
                     "start_at": time.monotonic(),
                     "timeout_sec": max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)),
+                    "payload": dict(payload),
+                    "recoveries": 0,
                 }
                 return True
 
@@ -207,13 +258,14 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                 return True
 
             if action == "submit_runtime_task":
-                executor = _ensure_task_executor()
-                future = _submit_callable(executor, payload)
+                future = _submit_runtime_future(payload)
                 inflight[future] = {
                     "kind": "runtime",
                     "runtime_key": str(payload.get("runtime_key", "") or ""),
                     "task_id": str(payload.get("task_id", "") or ""),
                     "attempt": int(payload.get("attempt", 0) or 0),
+                    "payload": dict(payload),
+                    "recoveries": 0,
                 }
                 _send_response(request_id, ok=True)
                 return True
@@ -227,19 +279,18 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
 
             if action == "submit_pool_task":
                 pool_id = str(payload.get("pool_id", "") or "")
-                executor = pool_executors.get(pool_id)
-                if executor is None and pool_id in pool_workers:
-                    executor = _rebuild_pool_executor(pool_id)
-                if executor is None:
+                if pool_id not in pool_workers:
                     _send_response(request_id, ok=False, error="task pool missing")
                     return True
-                future = _submit_callable(executor, payload)
+                future = _submit_pool_future(pool_id, payload)
                 inflight[future] = {
                     "kind": "pool",
                     "pool_id": pool_id,
                     "task_id": str(payload.get("task_id", "") or ""),
                     "attempt": int(payload.get("attempt", 0) or 0),
                     "start_at": time.monotonic(),
+                    "payload": dict(payload),
+                    "recoveries": 0,
                 }
                 _send_response(request_id, ok=True)
                 return True
@@ -279,6 +330,26 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             try:
                 status_text, result, err_type, err_message, timings = _unpack_subprocess_result(future.result())
             except Exception as exc:
+                kind = str(meta.get("kind", "") or "")
+                recoveries = int(meta.get("recoveries", 0) or 0)
+                if _is_recoverable_pool_error(exc) and recoveries < 1:
+                    retry_payload = dict(meta.get("payload") or {})
+                    try:
+                        if kind == "service":
+                            retry_future = _submit_service_future(str(meta.get("service_id", "") or ""), retry_payload)
+                        elif kind == "pool":
+                            retry_future = _submit_pool_future(str(meta.get("pool_id", "") or ""), retry_payload)
+                        elif kind == "runtime":
+                            retry_future = _submit_runtime_future(retry_payload)
+                        else:
+                            retry_future = None
+                    except Exception:
+                        retry_future = None
+                    if retry_future is not None:
+                        retry_meta = dict(meta)
+                        retry_meta["recoveries"] = recoveries + 1
+                        inflight[retry_future] = retry_meta
+                        continue
                 status_text = "FAILED_INFRA"
                 result = None
                 err_type = "InfraException"

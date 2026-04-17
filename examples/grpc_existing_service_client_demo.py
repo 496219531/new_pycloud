@@ -2,110 +2,64 @@
 """
 调用已部署服务示例。
 
-这个脚本演示“不通过 Gateway，而是像 Eureka client 一样”：
-1. 先通过 InfoCenter 发现 service route
-2. 客户端本地维护 route cache
-3. 直接调用节点内部 `/svc/{service_id}/call/{method}`
-
-脚本里同时展示：
-1. `DiscoveryServiceClient`：薄封装
-2. `DiscoveryCallerFacade`：module-like caller
+这个脚本演示通过 `Service.connect(..., transport="discovery")`
+直接按 discovery transport 调已有服务。
 """
 
 from __future__ import annotations
 
-import asyncio
+from pathlib import Path
+import sys
 import time
 
-from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade, DiscoveryServiceClient
-from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
 
+import asyncio
 
-def _wait_for_service_name(
-    *,
-    infocenter_target: str,
-    service_name: str = "",
-    service_name_prefix: str = "",
-    timeout_sec: float = 8.0,
-    poll_interval_sec: float = 1.0,
-) -> str:
-    deadline = time.time() + max(0.5, float(timeout_sec))
-    while True:
-        with InfoCenterClient(infocenter_target, timeout_sec=5.0) as client:
-            routes = list(
-                client.list_service_routes(
-                    service_name=service_name,
-                    healthy_only=True,
-                    limit=200,
-                )
-            )
-        if service_name:
-            if routes:
-                return service_name
-        else:
-            matched = sorted({route.service_name for route in routes if route.service_name.startswith(service_name_prefix)})
-            if matched:
-                return matched[0]
-        if time.time() >= deadline:
-            return ""
-        time.sleep(max(0.1, float(poll_interval_sec)))
+from pycloud_parallel import Service
 
 
 def main() -> None:
     infocenter_target = "127.0.0.1:50051"
-    service_name = ""
-    service_name_prefix = "square-service"
-
-    print("=" * 60)
-    print("  PyCloud Discovery Client Demo")
-    print("=" * 60)
-    print()
-    print(f"  InfoCenter: {infocenter_target}")
-
-    active_service_name = _wait_for_service_name(
-        infocenter_target=infocenter_target,
-        service_name=service_name,
-        service_name_prefix=service_name_prefix,
-        timeout_sec=8.0,
+    service_name = f"square-service-{int(time.time())}"
+    blob = (
+        b"from pycloud_parallel import export\n\n"
+        b"@export\n"
+        b"def square(x=0, **_kwargs):\n"
+        b"    x = int(x)\n"
+        b"    return {'x': x, 'y': x * x}\n"
     )
-    if not active_service_name:
-        print("[!] 未发现可用服务，请先部署一个服务")
-        return
 
-    print(f"  Service: {active_service_name}")
+    print("=" * 60)
+    print("  PyCloud Service.connect(discovery) Demo")
+    print("=" * 60)
+    print()
+    print(f"  Discovery Target: {infocenter_target}")
+    print(f"  Service: {service_name}")
     print()
 
-    with DiscoveryServiceClient(infocenter_target, timeout_sec=10.0) as client:
-        print("[DiscoveryServiceClient]")
-        methods = client.list_methods(service_name=active_service_name, include_docs=False)
-        print(f"[+] Methods: {[item.get('method') for item in methods]}")
+    group = Service.deploy(
+        infocenter_target=infocenter_target,
+        owner_client_id=f"discovery-demo-{int(time.time())}",
+        service_name=service_name,
+        source=blob,
+        runtime="py3",
+        entry_module="square_service",
+        worker_count=1,
+        tags=["compute"],
+        min_success_nodes=1,
+    )
 
-        status = client.get_status(service_name=active_service_name)
-        print(f"[+] Route count: {status.get('route_count')}")
-        for route in status.get("routes", []):
-            print(
-                "    - "
-                f"node={route.get('node_id')} "
-                f"service_id={route.get('service_id')} "
-                f"in_flight={route.get('in_flight')}"
-            )
-
-        resp = client.call(
-            service_name=active_service_name,
-            method="square",
-            payload={"x": 7},
-            timeout_sec=10.0,
-        )
-        print(f"[+] sync call: {resp.get('data')}")
-
-    print()
-    print("[DiscoveryCallerFacade]")
-    module_client = DiscoveryCallerFacade(
-        infocenter_target,
-        service_name=active_service_name,
+    module_client = Service.connect(
+        target=infocenter_target,
+        service_name=service_name,
         timeout_sec=10.0,
+        transport="discovery",
     )
     try:
+        print(f"[+] Status: {module_client.status()}")
         print(f"[+] Methods: {module_client.methods}")
         print(f"[+] sync call: {module_client.square.sync(x=9)}")
 
@@ -116,6 +70,7 @@ def main() -> None:
         asyncio.run(_run())
     finally:
         module_client.close()
+        group.close(end_services=True, reason="grpc_existing_service_client_demo cleanup")
 
 
 if __name__ == "__main__":

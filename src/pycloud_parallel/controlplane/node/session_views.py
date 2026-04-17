@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+"""Shared session view and warmup helpers for NodeControl service/task-pool state."""
+
+import logging
+from typing import Dict, List, Sequence, Tuple
+
+from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
+from pycloud_parallel.controlplane.node.models import ServiceSession, TaskPoolState
+from pycloud_parallel.controlplane.state_time import dt_to_ts
+from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+
+def warmup_fanout(worker_count: int) -> int:
+    return max(1, int(worker_count or 1) * 2)
+
+
+def normalize_warmup_result(result: object, *, fanout: int) -> Tuple[int, List[int]]:
+    if isinstance(result, tuple) and len(result) == 2:
+        submitted_count, worker_pids = result
+    elif isinstance(result, list):
+        submitted_count, worker_pids = fanout, result
+    else:
+        submitted_count, worker_pids = result, []
+    normalized_pids = [int(pid) for pid in (worker_pids or []) if int(pid or 0) > 0]
+    return max(0, int(submitted_count or 0)), normalized_pids
+
+
+def log_warmup_result(
+    *,
+    logger: logging.Logger,
+    scope: str,
+    key: str,
+    worker_count: int,
+    submitted_count: int,
+    worker_pids: Sequence[int],
+) -> None:
+    unique_pids = sorted({int(pid) for pid in worker_pids if int(pid or 0) > 0})
+    logger.info(
+        "[Warmup] scope=%s key=%s worker_count=%d submitted=%d warmed_workers=%d pids=%s",
+        scope,
+        key,
+        int(worker_count or 0),
+        int(submitted_count or 0),
+        len(unique_pids),
+        unique_pids,
+    )
+
+
+def execute_warmup(
+    executor_host,
+    *,
+    scope: str,
+    key: str,
+    worker_count: int,
+    execute_spec: Dict[str, object],
+) -> Tuple[int, List[int]]:
+    fanout = warmup_fanout(worker_count)
+    normalized_scope = str(scope or "").strip().lower()
+    if normalized_scope == "service":
+        raw_result = executor_host.warmup_service(
+            service_id=str(key or ""),
+            fanout=fanout,
+            execute_spec=execute_spec,
+        )
+    elif normalized_scope == "pool":
+        raw_result = executor_host.warmup_pool(
+            pool_id=str(key or ""),
+            fanout=fanout,
+            execute_spec=execute_spec,
+        )
+    elif normalized_scope == "runtime":
+        raw_result = executor_host.warmup_runtime(
+            runtime_key=str(key or ""),
+            fanout=fanout,
+            execute_spec=execute_spec,
+        )
+    else:
+        raise ValueError(f"unsupported warmup scope: {scope!r}")
+    return normalize_warmup_result(raw_result, fanout=fanout)
+
+
+def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
+    resource = session.resource_snapshot(in_flight=in_flight)
+    return {
+        "service_id": session.service_id,
+        "owner_client_id": session.owner_client_id,
+        "service_name": session.service_name,
+        "code_version": session.code_version,
+        "status": int(session.status),
+        "worker_count": resource.worker_count,
+        "alive_workers": resource.alive_workers,
+        "in_flight": resource.in_flight,
+        "queued": session.queued,
+        "received_count": resource.received_count,
+        "returned_count": resource.returned_count,
+        "created_at": session.created_at,
+        "last_heartbeat_at": session.last_heartbeat_at,
+        "lease_expire_at": session.lease_expire_at,
+        "http_base_url": session.http_base_url,
+        "methods": sorted(session.methods.keys()),
+        "timing_metrics": dict(session.timing_metrics or {}),
+    }
+
+
+def build_service_route_report(session: ServiceSession, *, in_flight: int) -> pb2.ServiceRouteReport:
+    resource = session.resource_snapshot(in_flight=in_flight)
+    return pb2.ServiceRouteReport(
+        service_name=session.service_name,
+        service_id=session.service_id,
+        status=session.status,
+        worker_count=resource.worker_count,
+        alive_workers=resource.alive_workers,
+        in_flight=resource.in_flight,
+        lease_expire_at=dt_to_ts(session.lease_expire_at),
+        http_base_url=session.http_base_url,
+    )
+
+
+def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
+    resource = session.resource_snapshot(in_flight=in_flight)
+    metrics = dict(session.timing_metrics or {})
+    return {
+        "service_name": session.service_name,
+        "service_id": session.service_id,
+        "status": int(session.status),
+        "worker_count": int(resource.worker_count),
+        "alive_workers": int(resource.alive_workers),
+        "in_flight": int(resource.in_flight),
+        "received_count": int(resource.received_count),
+        "returned_count": int(resource.returned_count),
+        "ema_child_invoke_ms": float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
+        "ema_samples": int(metrics.get("ema_samples", 0) or 0),
+        "lease_expire_at": session.lease_expire_at.isoformat(),
+        "http_base_url": session.http_base_url,
+    }
+
+
+def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPoolInfo:
+    resource = pool.resource_snapshot(in_flight=in_flight)
+    metrics = dict(pool.timing_metrics or {})
+    return NodeTaskPoolInfo(
+        pool_id=pool.pool_id,
+        owner_client_id=pool.owner_client_id,
+        pool_name=pool.pool_name,
+        code_version=pool.code_version,
+        status=pool.status,
+        worker_count=resource.worker_count,
+        alive_workers=resource.alive_workers,
+        task_count=pool.task_count,
+        inflight=resource.in_flight,
+        received_count=resource.received_count,
+        returned_count=resource.returned_count,
+        ema_child_invoke_ms=float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
+        ema_samples=int(metrics.get("ema_samples", 0) or 0),
+        created_at=pool.created_at,
+        last_heartbeat_at=pool.last_heartbeat_at,
+        lease_expire_at=pool.lease_expire_at,
+    )
+
+
+def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[str, object]:
+    resource = pool.resource_snapshot(in_flight=in_flight)
+    return {
+        "pool_id": pool.pool_id,
+        "owner_client_id": pool.owner_client_id,
+        "pool_name": pool.pool_name,
+        "code_version": pool.code_version,
+        "task_method": pool.task_method,
+        "worker_count": resource.worker_count,
+        "alive_workers": resource.alive_workers,
+        "heartbeat_timeout_sec": pool.heartbeat_timeout_sec,
+        "status": str(pool.status),
+        "task_count": int(resource.received_count),
+        "received_count": int(resource.received_count),
+        "returned_count": int(resource.returned_count),
+        "inflight": int(resource.in_flight),
+        "created_at": pool.created_at,
+        "last_heartbeat_at": pool.last_heartbeat_at,
+        "lease_expire_at": pool.lease_expire_at,
+        "timing_metrics": dict(pool.timing_metrics or {}),
+    }
+
+
+__all__ = [
+    "build_service_report_payload",
+    "build_service_route_report",
+    "build_service_status_info",
+    "build_task_pool_info",
+    "build_task_pool_status_info",
+    "execute_warmup",
+    "log_warmup_result",
+    "normalize_warmup_result",
+    "warmup_fanout",
+]

@@ -13,10 +13,8 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from pycloud_parallel import JobQueue, TaskPool
-from pycloud_parallel.controlplane.artifact import ArtifactDeps
-from pycloud_parallel.controlplane.discovery_client import DiscoveryCallerFacade
-from pycloud_parallel.controlplane.gateway_client import GatewayCallerFacade, GatewayServiceClient
+from pycloud_parallel import JobQueue, Service, TaskPool
+from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 
 from calc_asset_ratio import calc_asset_ratio
 import calc_asset_ratio_job_module
@@ -76,14 +74,29 @@ def _normalize_result_items(values):
     return [_normalize_result_item(value) for value in values]
 
 
-def _build_calc_task_pool_kwargs() -> dict[str, object]:
-    return {
-        "runtime": "py3",
-        "entry_module": calc_asset_ratio,
-        "entry_callable": "get_fund_asset_ratio",
-        "deps": ArtifactDeps.node_preinstalled(),
-        "managed_global_names": MANAGED_GLOBAL_NAMES,
-    }
+def _connect_service(*, transport: str):
+    return Service.connect(
+        target=CONTROLPLANE_TARGET,
+        service_name=SERVICE_NAME,
+        transport=transport,
+        timeout_sec=300.0,
+    )
+
+
+def _call_service(payload: dict[str, object], *, transport: str):
+    with _connect_service(transport=transport) as service:
+        return _normalize_result_item(service.call_sync("get_fund_asset_ratio", **payload))
+
+
+def _build_calc_task_artifact() -> Artifact:
+    return Artifact.from_paths(
+        ROOT_DIR / "calc_asset_ratio",
+        runtime="py3",
+        entry_module="calc_asset_ratio.calc_asset_ratio",
+        entry_callable="get_fund_asset_ratio",
+        deps=ArtifactDeps.node_preinstalled(),
+        managed_global_names=MANAGED_GLOBAL_NAMES,
+    )
 
 
 def calc_fund_list_asset_ratio(
@@ -94,9 +107,10 @@ def calc_fund_list_asset_ratio(
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
     async def async_calls():
-        with DiscoveryCallerFacade(
-            CONTROLPLANE_TARGET,
+        with Service.connect(
+            target=CONTROLPLANE_TARGET,
             service_name=SERVICE_NAME,
+            transport="discovery",
             timeout_sec=300.0,
         ) as client:
             tasks = [
@@ -104,7 +118,7 @@ def calc_fund_list_asset_ratio(
                 for _, fund_net_value_series in fund_net_value_pvt.items()
             ]
             return _normalize_result_items(await asyncio.gather(*tasks))
-
+            
     return asyncio.run(async_calls())
 
 
@@ -115,21 +129,23 @@ def calc_fund_list_asset_ratio_sync(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
-    with DiscoveryCallerFacade(
-        CONTROLPLANE_TARGET,
-        service_name=SERVICE_NAME,
-        timeout_sec=300.0,
-    ) as client:
-        ret = [
-            client.get_fund_asset_ratio.sync(fund_net_value_series.dropna().copy(), strategy_type, 0)
-            for _, fund_net_value_series in fund_net_value_pvt.items()
-        ]
-        ret = _normalize_result_items(ret)
-        print(ret)
-        return ret
+    ret = [
+        _call_service(
+            {
+                "fund_net_value_series": fund_net_value_series.dropna().copy(),
+                "strategy_type": strategy_type,
+                "frequency": 0,
+            },
+            transport="discovery",
+        )
+        for _, fund_net_value_series in fund_net_value_pvt.items()
+    ]
+    ret = _normalize_result_items(ret)
+    print(ret)
+    return ret
 
 
-def calc_fund_list_asset_ratio_gateway_facade(
+def calc_fund_list_asset_ratio_gateway_service(
     fund_list: Sequence[int] | None,
     strategy_type: int = 1,
     frequency: int = 1,
@@ -137,39 +153,44 @@ def calc_fund_list_asset_ratio_gateway_facade(
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
     async def async_calls():
-        with GatewayCallerFacade(
-            CONTROLPLANE_TARGET,
-            service_name=SERVICE_NAME,
-            timeout_sec=300.0,
-        ) as client:
-            tasks = [
-                client.get_fund_asset_ratio(fund_net_value_series.dropna().copy(), strategy_type, 0)
-                for _, fund_net_value_series in fund_net_value_pvt.items()
-            ]
-            return _normalize_result_items(await asyncio.gather(*tasks))
+        tasks = [
+            asyncio.to_thread(
+                _call_service,
+                {
+                    "fund_net_value_series": fund_net_value_series.dropna().copy(),
+                    "strategy_type": strategy_type,
+                    "frequency": 0,
+                },
+                transport="gateway",
+            )
+            for _, fund_net_value_series in fund_net_value_pvt.items()
+        ]
+        return _normalize_result_items(await asyncio.gather(*tasks))
 
     return asyncio.run(async_calls())
 
 
-def calc_fund_list_asset_ratio_gateway_facade_sync(
+def calc_fund_list_asset_ratio_gateway_service_sync(
     fund_list: Sequence[int] | None,
     strategy_type: int = 1,
     frequency: int = 1,
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
-    with GatewayCallerFacade(
-        CONTROLPLANE_TARGET,
-        service_name=SERVICE_NAME,
-        timeout_sec=300.0,
-    ) as client:
-        ret = [
-            client.get_fund_asset_ratio.sync(fund_net_value_series.dropna().copy(), strategy_type, 0)
-            for _, fund_net_value_series in fund_net_value_pvt.items()
-        ]
-        ret = _normalize_result_items(ret)
-        print(ret)
-        return ret
+    ret = [
+        _call_service(
+            {
+                "fund_net_value_series": fund_net_value_series.dropna().copy(),
+                "strategy_type": strategy_type,
+                "frequency": 0,
+            },
+            transport="gateway",
+        )
+        for _, fund_net_value_series in fund_net_value_pvt.items()
+    ]
+    ret = _normalize_result_items(ret)
+    print(ret)
+    return ret
 
 
 def calc_fund_list_asset_ratio_gateway(
@@ -179,32 +200,27 @@ def calc_fund_list_asset_ratio_gateway(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
-    with GatewayServiceClient(
-        CONTROLPLANE_TARGET,
-        timeout_sec=300.0,
-    ) as client:
-        status = client.get_status(service_name=SERVICE_NAME)
+    with _connect_service(transport="gateway") as service:
+        status = service.status()
         print("gateway route_count:", status.get("route_count"))
-        methods = {
-            str(item.get("method", "")).strip()
-            for item in client.list_methods(service_name=SERVICE_NAME, include_docs=False)
-        }
+        methods = set(service.methods)
         if "get_fund_asset_ratio" not in methods:
             raise RuntimeError(f"gateway service {SERVICE_NAME!r} has no method 'get_fund_asset_ratio': {sorted(methods)}")
 
         results = []
         for _, fund_net_value_series in fund_net_value_pvt.items():
-            resp = client.call(
-                service_name=SERVICE_NAME,
-                method="get_fund_asset_ratio",
-                payload={
-                    "fund_net_value_series": fund_net_value_series.dropna().copy(),
-                    "strategy_type": strategy_type,
-                    "frequency": 0,
-                },
-                timeout_sec=300.0,
+            results.append(
+                _normalize_result_item(
+                    service.call_sync(
+                        "get_fund_asset_ratio",
+                        **{
+                            "fund_net_value_series": fund_net_value_series.dropna().copy(),
+                            "strategy_type": strategy_type,
+                            "frequency": 0,
+                        },
+                    )
+                )
             )
-            results.append(_normalize_result_item(client.fetch_result_data(resp)))
         return results
 
 
@@ -215,16 +231,17 @@ def calc_fund_list_asset_ratio2(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
     payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
+    artifact = _build_calc_task_artifact()
 
     t0 = time.time()
     with TaskPool.from_infocenter(
         infocenter_target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
+        artifact=artifact,
         worker_count=5,
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
-        **_build_calc_task_pool_kwargs(),
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
@@ -246,16 +263,17 @@ def calc_fund_list_asset_ratio3(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
     payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
+    artifact = _build_calc_task_artifact()
 
     t0 = time.time()
     with TaskPool.from_infocenter(
         infocenter_target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
+        artifact=artifact,
         worker_count=7,
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
-        **_build_calc_task_pool_kwargs(),
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
@@ -394,15 +412,14 @@ if __name__ == "__main__":
         1652875,
     ]
     t1 = time.time()
-    result = calc_fund_list_asset_ratio(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway_facade(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway_facade_sync(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     t2 = time.time()
     print(result)
     print(t2 - t1)
-

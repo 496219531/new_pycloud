@@ -17,8 +17,14 @@ job module 里同时定义：
 
 from __future__ import annotations
 
-import time
+from pathlib import Path
+import sys
 
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
+import time
 from pycloud_parallel import JobQueue
 
 
@@ -51,11 +57,11 @@ def main() -> None:
     print(f"  InfoCenter: {target}")
     print()
     print("可选提交方式：")
-    print("  1. submit_job_from_bytes(...)  适合直接提交 job module blob")
-    print("  2. submit_job_from_module(...) 适合直接提交模块对象")
+    print("  1. submit(source=my_job_module)      推荐，直接提交模块对象")
+    print("  2. submit_job_from_bytes(...)        适合直接提交 job module blob")
     print()
 
-    with JobQueue(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
+    with JobQueue.connect(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
         resp = client.submit_job_from_bytes(
             blob=job_blob,
             entry_module="job_demo",
@@ -68,8 +74,8 @@ def main() -> None:
         print()
         print("模块对象写法：")
         print(
-            "client.submit_job_from_module("
-            "module=my_job_module, "
+            "client.submit("
+            "source=my_job_module, "
             "job_payload={'value': 10, 'count': 6})"
         )
         print()

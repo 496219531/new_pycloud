@@ -1,3 +1,10 @@
+from pathlib import Path
+import sys
+
+REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(REPO_SRC))
+
 import time
 from pycloud_parallel import Service
 
@@ -13,10 +20,10 @@ def main():
     )
 
     suffix = int(time.time())
-    group = Service.deploy_from_infocenter(
+    group = Service.deploy(
         infocenter_target="127.0.0.1:50051",
         owner_client_id=f"client-owner-{suffix}",
-        service_name=f"square-service",
+        service_name=f"square-service-{suffix}",
         blob=blob,
         runtime="py3",
         entry_module="square_service",
@@ -44,10 +51,10 @@ def main():
 
     node_id, resp = group.call_balanced("square", {"x": 7}, timeout_sec=10)
     print(f"预热调用成功 node={node_id} data={resp['data']}")
-    print("服务已进入常驻模式，按 Ctrl+C 结束并自动回收服务。")
+    print("若需常驻，可手动调用 group.join(...); 此 demo 默认执行后自动收尾。")
 
     try:
-        group.join(end_services_on_interrupt=True, end_reason="owner ctrl+c")
+        group.close(end_services=True, reason="grpc_register_service_client_demo cleanup")
         joined = True
     finally:
         group.close(
