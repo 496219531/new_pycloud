@@ -326,11 +326,10 @@ pycloudctl --local start
 ```python
 from pycloud_parallel import Service
 
-blob = (
 import my_service_module
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     service_name="square-service",
     source=my_service_module,
     runtime="py3",
@@ -348,7 +347,7 @@ print(group.square.sync(x=7))
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     service_name="dep-service",
     artifact_path="./service_src",
     runtime="py3",
@@ -367,7 +366,7 @@ import my_service_module
 from pycloud_parallel import Service
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     source=my_service_module,
     runtime="py3",
 )
@@ -394,11 +393,13 @@ from pycloud_parallel import TaskPool
 import my_task_module
 
 with TaskPool.open(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     job_id="demo-job",
     source=my_task_module,
     runtime="py3",
 ) as pool:
+    print(pool.status().alive)
+    # 详细分节点状态再看 pool.status_map()
     resp = pool.submit_payloads([{"value": 7}])
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
     print(results)
@@ -429,7 +430,7 @@ with TaskPool.open(
 
 说明：
 
-1. 如果子任务返回 `DataFrame / Series / ndarray`，框架会先尝试 inline 返回；只有超过 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` 才会落到 node 本地对象目录并返回 `ResultRef`。
+1. 如果子任务返回 `DataFrame / Series / ndarray`，框架会先尝试 inline 返回；只有超过 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` 才会落到 node 本地对象目录并返回 `DataRef`。
 2. 如果你希望更大的 `DataFrame / Series / ndarray` 继续走 inline，可以调大 `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`。
 3. 在 Windows 上一次性并发提交很多这类大结果任务时，一旦开始走结果落盘，文件系统更容易出现瞬时 `PermissionError(13)`。
 4. 这类场景更推荐 `imap_unordered(...)` 或显式限制并发，例如把 `max_in_flight` 控制在 `8~32`，而不是一次性同时打满几十个任务。
@@ -482,16 +483,20 @@ python scripts/debug_package_module.py calc_asset_ratio_job_module
 ### 4. Gateway 调用
 
 ```python
-from pycloud_parallel import GatewayConnect
+from pycloud_parallel import Service
 
-client = GatewayConnect("127.0.0.1:50051", service_name="square-service")
+client = Service.connect(
+    target="127.0.0.1:50051",
+    service_name="square-service",
+    transport="gateway",
+)
 print(client.square.sync(x=9))
 ```
 
 ### 5. 本地并行（辅助能力）
 
 ```python
-from pycloud_parallel import foreach, parallel_for
+from pycloud_parallel.local import foreach, parallel_for
 
 print(foreach(lambda x: x * x, [1, 2, 3], max_workers=2))
 print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
@@ -504,15 +509,15 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 1. 上传支持 `py / tar.gz / zip / whl`
 2. 注册时传 `entry_module + export_spec`
 3. 导出模式支持：`decorator / explicit / all / single`
-4. 推荐默认：`decorator + pycloud_export`
+4. 推荐默认：`decorator + export`
 5. 对外按 `service_name + method` 调用
 6. owner 权限依赖 `service_token`
 
 当前推荐调用路径：
 
 1. owner：`Service.deploy(...)`
-2. caller：`GatewayConnect(...)`
-3. 调试直连：`DirectConnect(...)`
+2. caller：`Service.connect(..., transport="gateway")`
+3. 调试直连：`Service.connect(..., transport="discovery")`
 
 ## 任务模式说明
 

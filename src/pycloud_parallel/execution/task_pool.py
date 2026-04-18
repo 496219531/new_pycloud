@@ -15,6 +15,7 @@ import uuid
 from pycloud_parallel.controlplane.artifact import _normalize_artifact_input, _prepare_artifact
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode, _node_instance_key_from_node
+from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.serialization import serialize_inline_payload, struct_to_dict
@@ -24,7 +25,10 @@ from pycloud_parallel.execution.support import (
     _get_local_ip,
     _prepare_managed_globals_values_for_upload,
     _prepare_task_payload_for_submit,
+    _put_data_via_clients,
+    _resolve_public_target_arg,
 )
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -1085,10 +1089,40 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return self._backend.status_map()
         return {node_id: pool.get_status() for node_id, pool in self._pools.items()}
 
+    def status(self) -> ExecutionSessionStatus:
+        return super().status()
+
     def is_alive(self) -> bool:
         if self._backend is not None and hasattr(self._backend, "is_alive"):
             return bool(self._backend.is_alive())
         return super().is_alive()
+
+    def put_data(
+        self,
+        data: Any,
+        *,
+        format: str = "",
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+    ) -> DataRef:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        pools_snapshot = list(self._pools.values())
+        active_clients = [pool._client for pool in pools_snapshot]  # noqa: SLF001
+        return _put_data_via_clients(
+            active_clients,
+            data,
+            format=format,
+            chunk_size=chunk_size,
+        )
+
+    def put_dataframe(self, dataframe: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
+        return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
+
+    def put_ndarray(self, array: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
+        return self.put_data(array, format="npy", chunk_size=chunk_size)
+
+    def put_json(self, value: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
+        return self.put_data(value, format="json", chunk_size=chunk_size)
 
     def close(self) -> None:
         if self._backend is not None:
@@ -1274,14 +1308,21 @@ class TaskPool(_TaskPoolSessionBase):
     @classmethod
     def open(
         cls,
+        *,
+        target: str = "",
         **kwargs: Any,
     ) -> "TaskPool":
         """Product-facing open action for V1 task pools.
 
-        Default path: ``TaskPool.open(source=my_module, ...)``.
+        Default path: ``TaskPool.open(target=\"127.0.0.1:50051\", source=my_module, ...)``.
         Advanced path: ``TaskPool.open(artifact=Artifact(...), ...)``.
         """
-        return cls.from_infocenter(**kwargs)
+        effective_target = _resolve_public_target_arg(
+            target=target,
+            kwargs=kwargs,
+            action_name="TaskPool.open()",
+        )
+        return cls.from_infocenter(infocenter_target=effective_target, **kwargs)
 
     @classmethod
     def from_infocenter(

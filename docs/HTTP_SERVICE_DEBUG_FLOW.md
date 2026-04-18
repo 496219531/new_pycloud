@@ -17,28 +17,29 @@
 
 当前常见 HTTP caller 有两类：
 
-1. gateway caller
-   - 模块化调用体验，如 `client.foo.sync(...)`
+1. gateway transport
+   - 统一 `Service.connect(..., transport="gateway")` 的模块化调用体验
 2. `GatewayServiceClient`
    - 显式 HTTP 调用体验，如 `client.call(service_name=..., method=..., payload=...)`
 
-如果你走 gateway caller：
+如果你走 gateway transport：
 
-1. caller facade 的 `__getattr__()` 动态返回 `_CallProxy`
-2. `_SyncCallProxy.__call__()` 或 `_CallProxy.__call__()` 进入 caller facade 的 `call_balanced()`
-3. 再调用父类 `GatewayServiceClient.call()`
+1. `Service.connect(..., transport="gateway")` 返回统一连接对象
+2. 连接对象的 `__getattr__()` 动态返回 `_CallProxy`
+3. `_SyncCallProxy.__call__()` 或 `_CallProxy.__call__()` 进入统一连接对象的 `call_balanced()`
+4. 再调用父类 `GatewayServiceClient.call()`
 
 关键位置：
 
 1. `src/pycloud_parallel/controlplane/gateway_client.py`
-2. gateway caller facade 从 caller facade 模块开始
+2. 统一连接对象从 `src/pycloud_parallel/execution/service_session.py` 开始
 3. `GatewayServiceClient.call()` 在 `1365` 左右
 
 ## 2. 客户端发请求
 
 HTTP 请求真正发出前，关键函数顺序是：
 
-1. gateway caller facade 的 `call_balanced()`
+1. 统一连接对象的 `call_balanced()`
 2. `GatewayServiceClient.call()`
 3. `_serialize_http_call_payload()`
 4. `_http_json_request()`
@@ -218,7 +219,7 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 1. payload inline 序列化失败
    - 先看 `_serialize_http_call_payload()` / `serialize_inline_payload()`
 2. Gateway 报 `no available route`
-   - 看 `gateway caller._validate_service_ready()` 或 route cache
+   - 看统一连接对象的 `_validate_service_ready()` 或 route cache
 3. 节点报 `service/method not found`
    - 看 `NodeControlService.CallService()` 和 `NodeControlState.call_service()`
 4. 函数签名不匹配
@@ -228,9 +229,9 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 
 ## 10. 备注
 
-如果你不是走 `gateway caller`，而是走 `discovery caller`，前半段会变成：
+如果你不是走 `gateway transport`，而是走 `discovery transport`，前半段会变成：
 
-1. `discovery caller.call_balanced()`
+1. 统一连接对象的 `call_balanced()`
 2. route cache 直接选节点 route
 3. `_call_route_http(...)`
 4. 目标节点 service HTTP

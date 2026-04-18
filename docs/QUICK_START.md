@@ -104,7 +104,7 @@ from pycloud_parallel.local import foreach, parallel_for
 ## 3. 本地多进程
 
 ```python
-from pycloud_parallel import foreach, parallel_for
+from pycloud_parallel.local import foreach, parallel_for
 
 print(foreach(lambda x: x * x, [1, 2, 3], max_workers=2))
 print(parallel_for(range(5), lambda i: i + 10, max_workers=2))
@@ -120,7 +120,7 @@ from pycloud_parallel import Service, export
 import my_service_module
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     service_name="square-service",
     source=my_service_module,
     runtime="py3",
@@ -137,7 +137,7 @@ print(group.square.sync(x=7))
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     service_name="dep-service",
     artifact_path="./service_src",
     runtime="py3",
@@ -163,11 +163,13 @@ from pycloud_parallel import TaskPool
 import my_task_module
 
 with TaskPool.open(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     job_id="demo-job",
     source=my_task_module,
     runtime="py3",
 ) as pool:
+    print(pool.status().alive)
+    # 详细分节点状态再看 pool.status_map()
     resp = pool.submit_payloads([{"value": 7}])
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
     print(results)

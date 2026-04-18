@@ -95,7 +95,7 @@ def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
         DependencyPackager().package_paths(
             root_dir=root_dir,
             paths=paths,
-            include_tests=False,
+            include_tests=True,
         )
     )
 

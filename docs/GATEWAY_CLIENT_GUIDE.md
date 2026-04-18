@@ -17,9 +17,31 @@ Gateway 只服务于服务模式 caller：
 2. 它不是标准 Web 应用入口层
 3. 如果你需要真正对外的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`
 
-## 2. 两层 Python 客户端
+## 2. 当前推荐入口
 
-### 2.1 `GatewayServiceClient`
+### 2.1 `Service.connect(..., transport="gateway")`
+
+V1 推荐直接把 gateway 当成 `Service` 的一种连接策略：
+
+```python
+from pycloud_parallel import Service
+
+client = Service.connect(
+    target="127.0.0.1:50051",
+    service_name="square-service",
+    transport="gateway",
+)
+
+print(client.square.sync(x=7))
+```
+
+适合：
+
+1. 业务侧只想要统一的 `Service` 心智
+2. 希望保留 gateway 代理、route cache 与失败切换
+3. 不想直接处理底层 `service_name + method + payload` 细节
+
+### 2.2 `GatewayServiceClient`
 
 这是最薄的 HTTP client。
 
@@ -43,34 +65,33 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 2. 想直接拿 HTTP 层返回
 3. 脚本或系统集成场景
 
-### 2.2 V1 推荐
+这是底层 transport client，不是 V1 主产品入口。
 
-V1 顶层不再暴露 gateway 专用 module-like caller。
+适合：
 
-当前推荐直接使用：
-
-1. `GatewayServiceClient`
-2. 如果确实需要更底层 facade，请从 `pycloud_parallel.controlplane` 使用内部 caller，而不要依赖顶层公开面
+1. 想明确传 `service_name + method + payload`
+2. 想直接拿 HTTP 层返回
+3. 脚本或系统集成场景
 
 ## 3. 典型流程
 
 ### 3.1 先部署服务
 
 ```python
-from pycloud_parallel import Service
+from pycloud_parallel import Service, export
 
 blob = (
-    b"def pycloud_export(fn):\n"
+    b"def export(fn):\n"
     b"    fn.__pycloud_export__ = True\n"
     b"    return fn\n\n"
-    b"@pycloud_export\n"
+    b"@export\n"
     b"def square(x=0, **_kwargs):\n"
     b"    x = int(x)\n"
     b"    return {'x': x, 'y': x * x}\n"
 )
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
     runtime="py3",
@@ -80,7 +101,21 @@ group = Service.deploy(
 )
 ```
 
-### 3.2 再通过 Gateway 调用
+### 3.2 再通过 `Service.connect(gateway)` 调用
+
+```python
+from pycloud_parallel import Service
+
+client = Service.connect(
+    target="127.0.0.1:50051",
+    service_name="square-service",
+    transport="gateway",
+)
+
+print(client.square.sync(x=7))
+```
+
+### 3.3 底层 `GatewayServiceClient` 调用
 
 ```python
 from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
@@ -112,7 +147,7 @@ curl -X POST 'http://127.0.0.1:50051/svc/square-service/call/square' \
   -d '{"x": 7}'
 ```
 
-## 5. 与 discovery caller 的区别
+## 5. 与 discovery transport 的区别
 
 Gateway 路径：
 

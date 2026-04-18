@@ -59,6 +59,7 @@ from pycloud_parallel.execution.support import (
     _prepare_code_blob,
     _prepare_managed_globals_values_for_upload,
     _put_data_via_clients,
+    _resolve_public_target_arg,
     _resolve_high_level_service_data,
     _resolve_high_level_service_results,
     _retry_infocenter_request,
@@ -227,7 +228,7 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-_SERVICE_READY_GRACE_SEC = max(0.0, _env_float("PYCLOUD_SERVICE_READY_GRACE_SEC", 15.0))
+_SERVICE_READY_GRACE_SEC = max(0.0, _env_float("PYCLOUD_SERVICE_READY_GRACE_SEC", 5.0))
 _SERVICE_READY_RETRY_INTERVAL_SEC = max(0.05, _env_float("PYCLOUD_SERVICE_READY_RETRY_INTERVAL_SEC", 0.25))
 _SERVICE_SESSION_LOCK_RETRY_SEC = max(0.0, _env_float("PYCLOUD_SERVICE_SESSION_LOCK_RETRY_SEC", 3.0))
 
@@ -763,7 +764,7 @@ class Service(ServiceExecutionSession):
     globals_digests: Dict[str, str] = field(default_factory=dict)
     breaker_enabled: bool = True
     breaker_failure_threshold: int = 3
-    breaker_cooldown_sec: float = 15.0
+    breaker_cooldown_sec: float = 5.0
     breaker_max_cooldown_sec: float = 120.0
     _clients: Dict[str, NodeControlClient] = field(default_factory=dict, repr=False)
     _session_cache_file: Optional[Path] = field(default=None, repr=False)
@@ -782,14 +783,21 @@ class Service(ServiceExecutionSession):
     @classmethod
     def deploy(
         cls,
+        *,
+        target: str = "",
         **kwargs: Any,
     ) -> "Service":
         """Product-facing deploy action for V1 service sessions.
 
-        Default path: ``Service.deploy(source=my_module, ...)``.
+        Default path: ``Service.deploy(target=\"127.0.0.1:50051\", source=my_module, ...)``.
         Advanced path: ``Service.deploy(artifact=Artifact(...), ...)``.
         """
-        return cls.deploy_from_infocenter(**kwargs)
+        effective_target = _resolve_public_target_arg(
+            target=target,
+            kwargs=kwargs,
+            action_name="Service.deploy()",
+        )
+        return cls.deploy_from_infocenter(infocenter_target=effective_target, **kwargs)
 
     @classmethod
     def connect(
@@ -875,7 +883,7 @@ class Service(ServiceExecutionSession):
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
-        breaker_cooldown_sec: float = 15.0,
+        breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
     ) -> "Service":
         """从 InfoCenter 发现节点并部署服务。
@@ -1405,7 +1413,7 @@ class Service(ServiceExecutionSession):
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
-        breaker_cooldown_sec: float = 15.0,
+        breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
     ) -> "Service":
         return cls.deploy_from_infocenter(
@@ -1482,7 +1490,7 @@ class Service(ServiceExecutionSession):
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
-        breaker_cooldown_sec: float = 15.0,
+        breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
     ) -> "Service":
         return cls.deploy_from_infocenter(
@@ -1560,7 +1568,7 @@ class Service(ServiceExecutionSession):
         session_cache_dir: str = "",
         breaker_enabled: bool = True,
         breaker_failure_threshold: int = 3,
-        breaker_cooldown_sec: float = 15.0,
+        breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
     ) -> "Service":
         return cls.deploy_from_infocenter(

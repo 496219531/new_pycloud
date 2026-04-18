@@ -47,7 +47,7 @@ def _normalized_file_mode(path: Path) -> int:
         return 0o644
 
 
-def _should_skip_packaged_path(path: Path, *, include_tests: bool = False) -> bool:
+def _should_skip_packaged_path(path: Path, *, include_tests: bool = True) -> bool:
     lowered_parts = {part.lower() for part in path.parts}
     if "__pycache__" in lowered_parts:
         return True
@@ -63,7 +63,7 @@ def _should_skip_packaged_path(path: Path, *, include_tests: bool = False) -> bo
     return False
 
 
-def _is_packaged_python_file(path: Path, *, include_tests: bool = False) -> bool:
+def _is_packaged_python_file(path: Path, *, include_tests: bool = True) -> bool:
     normalized = Path(path)
     if not normalized.exists() or not normalized.is_file():
         return False
@@ -83,7 +83,7 @@ def _new_temp_targz_path(*, prefix: str) -> str:
 def _iter_directory_entries(
     dir_path: Path,
     *,
-    include_tests: bool = False,
+    include_tests: bool = True,
     prefix: Path | None = None,
     synthesize_missing_package_inits: bool = False,
 ) -> List[_TarSourceEntry]:
@@ -97,8 +97,9 @@ def _iter_directory_entries(
     ]
 
     if synthesize_missing_package_inits:
-        dirs_to_check = {root}
-        dirs_to_check.update(path.parent for path in package_files)
+        dirs_to_check = {path.parent for path in package_files}
+        if prefix is not None:
+            dirs_to_check.add(root)
         for d in sorted(dirs_to_check, key=lambda item: str(item.relative_to(root))):
             synthetic_path = d / "__init__.py"
             if synthetic_path.exists():
@@ -117,7 +118,7 @@ def _iter_directory_entries(
 def _iter_roots_entries(
     roots: Iterable[Path],
     *,
-    include_tests: bool = False,
+    include_tests: bool = True,
     synthesize_missing_package_inits: bool = False,
 ) -> List[_TarSourceEntry]:
     entries: List[_TarSourceEntry] = []
@@ -144,7 +145,7 @@ def _iter_relative_path_entries(
     *,
     root_dir: Path,
     paths: Iterable[str | os.PathLike[str]],
-    include_tests: bool = False,
+    include_tests: bool = True,
     synthesize_missing_package_inits: bool = False,
 ) -> List[_TarSourceEntry]:
     root = Path(root_dir).resolve()
@@ -217,6 +218,29 @@ def _write_deterministic_targz(entries: Iterable[_TarSourceEntry], output_file: 
                     info.type = tarfile.REGTYPE
                     info.pax_headers = {}
                     tar.addfile(info, io.BytesIO(data))
+
+
+def _synthesize_package_init_entries(entries: Iterable[_TarSourceEntry]) -> List[_TarSourceEntry]:
+    deduped: Dict[str, _TarSourceEntry] = {}
+    for entry in entries:
+        arcname = _normalize_arcname(entry.arcname)
+        if not arcname:
+            continue
+        deduped[arcname] = _TarSourceEntry(arcname=arcname, source_path=entry.source_path, data=entry.data)
+
+    synthetic_names: Set[str] = set()
+    for arcname in list(deduped):
+        path = PurePosixPath(arcname)
+        for parent in path.parents:
+            if str(parent) in ("", "."):
+                continue
+            init_arcname = _normalize_arcname(parent / "__init__.py")
+            if init_arcname not in deduped:
+                synthetic_names.add(init_arcname)
+
+    for init_arcname in sorted(synthetic_names):
+        deduped[init_arcname] = _TarSourceEntry(arcname=init_arcname, data=b"")
+    return [deduped[key] for key in sorted(deduped)]
 
 
 class DependencyAnalyzer:
@@ -757,7 +781,7 @@ class DependencyPackager:
         func: Callable,
         *,
         output_file: Optional[str] = None,
-        include_tests: bool = False,
+        include_tests: bool = True,
     ) -> str:
         """打包函数及其所有依赖
 
@@ -788,7 +812,7 @@ class DependencyPackager:
         module_name: str | ModuleType,
         *,
         output_file: Optional[str] = None,
-        include_tests: bool = False,
+        include_tests: bool = True,
     ) -> str:
         """打包模块及其所有依赖
 
@@ -827,7 +851,7 @@ class DependencyPackager:
         roots: Iterable[Path],
         *,
         output_file: Optional[str] = None,
-        include_tests: bool = False,
+        include_tests: bool = True,
         synthesize_missing_package_inits: bool = False,
     ) -> str:
         if output_file is None:
@@ -845,7 +869,7 @@ class DependencyPackager:
         dir_path: str | os.PathLike[str],
         *,
         output_file: Optional[str] = None,
-        include_tests: bool = False,
+        include_tests: bool = True,
     ) -> str:
         root = Path(dir_path).resolve()
         if not root.exists():
@@ -854,7 +878,11 @@ class DependencyPackager:
             raise ValueError(f"artifact path must be a directory: {dir_path}")
         if output_file is None:
             output_file = _new_temp_targz_path(prefix="pycloud_dir_")
-        entries = _iter_directory_entries(root, include_tests=include_tests)
+        entries = _iter_directory_entries(
+            root,
+            include_tests=include_tests,
+            synthesize_missing_package_inits=True,
+        )
         _write_deterministic_targz(entries, output_file)
         return output_file
 
@@ -864,7 +892,7 @@ class DependencyPackager:
         root_dir: str | os.PathLike[str],
         paths: Iterable[str | os.PathLike[str]],
         output_file: Optional[str] = None,
-        include_tests: bool = False,
+        include_tests: bool = True,
         synthesize_missing_package_inits: bool = False,
     ) -> str:
         if output_file is None:
@@ -944,7 +972,7 @@ class DependencyPackager:
         roots: List[Path],
         output_file: str,
         *,
-        include_tests: bool = False,
+        include_tests: bool = True,
     ) -> None:
         """创建 tar.gz 包。"""
         self.package_roots(
@@ -954,7 +982,7 @@ class DependencyPackager:
         )
 
     def _should_skip_path(self, path: Path) -> bool:
-        return _should_skip_packaged_path(path, include_tests=False)
+        return _should_skip_packaged_path(path, include_tests=True)
 
     def _build_function_entries(
         self,
@@ -993,7 +1021,7 @@ class DependencyPackager:
             if not arcname:
                 continue
             entries[arcname] = _TarSourceEntry(arcname=arcname, source_path=path)
-        return [entries[key] for key in sorted(entries)]
+        return _synthesize_package_init_entries(entries.values())
 
     def _iter_dependency_module_files(
         self,
@@ -1054,7 +1082,7 @@ def auto_deploy_function(
     runtime: str,
     entry_module: Optional[str] = None,
     entry_callable: Optional[str] = None,
-    include_tests: bool = False,
+    include_tests: bool = True,
     **kwargs
 ):
     """自动部署函数（自动打包本地源码依赖）
@@ -1117,7 +1145,7 @@ def package_module_for_debug(
     module_name: str | ModuleType,
     *,
     output_file: Optional[str] = None,
-    include_tests: bool = False,
+    include_tests: bool = True,
 ) -> Dict[str, Any]:
     """本地打包模块并返回调试信息。"""
     packager = DependencyPackager()

@@ -12,11 +12,12 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.serialization import dict_to_struct
 
 
-def _build_task_entry_module(tmp_path, monkeypatch):
+def _build_task_entry_module(tmp_path, monkeypatch, *, with_init: bool = True):
     package_name = "demo_task_pkg_entry"
     package_dir = tmp_path / package_name
     package_dir.mkdir()
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    if with_init:
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "helper.py").write_text(
         "def normalize(value):\n"
         "    return int(value)\n",
@@ -300,6 +301,57 @@ def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, mon
         assert f"{worker_module.__package__}/worker.py" in names
         assert f"{worker_module.__package__}/helper.py" in names
         assert f"{worker_module.__package__}/ignored.csv" not in names
+    finally:
+        session.close()
+
+
+def test_task_pool_session_packages_namespace_module_with_synthetic_init(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    worker_module = _build_task_entry_module(tmp_path, monkeypatch, with_init=False)
+    fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
+    fake_pool_client = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-1",
+        pool_token="token-1",
+        code_version="sha256:test",
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+        pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+        heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    captured = {}
+
+    def _fake_create_task_pool(self, **kwargs):
+        captured.update(kwargs)
+        return fake_pool_client
+
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
+        _fake_create_task_pool,
+    ):
+        mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
+        session = TaskPool.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-native-namespace-module-entry",
+            entry_module=worker_module,
+            entry_callable="run",
+            worker_count=2,
+            node_count=1,
+        )
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(captured["blob"]), mode="r:gz") as tar:
+            names = set(tar.getnames())
+            synthetic_init = tar.extractfile(f"{worker_module.__package__}/__init__.py")
+            init_blob = synthetic_init.read() if synthetic_init is not None else None
+        assert f"{worker_module.__package__}/__init__.py" in names
+        assert init_blob == b""
+        assert f"{worker_module.__package__}/worker.py" in names
+        assert f"{worker_module.__package__}/helper.py" in names
     finally:
         session.close()
 

@@ -24,24 +24,14 @@
 ```python
 from pycloud_parallel import Service
 
-blob = (
-    b"def pycloud_export(fn):\n"
-    b"    fn.__pycloud_export__ = True\n"
-    b"    return fn\n\n"
-    b"@pycloud_export\n"
-    b"def square(x=0, **_kwargs):\n"
-    b"    x = int(x)\n"
-    b"    return {'x': x, 'y': x * x}\n"
-)
+import my_service_module
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
-    blob=blob,
+    source=my_service_module,
     runtime="py3",
-    entry_module="square_service",
-    export_mode="decorator",
     worker_count=1,
     node_count=1,
 )
@@ -53,7 +43,7 @@ print(group.square.sync(x=7))
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="viewer-service",
     artifact_path="./viewer_pkg",
@@ -169,7 +159,7 @@ result = group.call_sync("square", x=7)
 推荐默认：
 
 1. `export_mode="decorator"`
-2. 使用 `pycloud_export`
+2. 使用 `export`
 
 服务方法当前默认按 kwargs 调用：
 
@@ -233,7 +223,7 @@ result = group.call_sync("square", x=7)
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
     artifact_path="./service_dir",
@@ -271,7 +261,7 @@ group = Service.deploy(
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     service_name="square-service",
     blob=blob,
     entry_module="square_service",

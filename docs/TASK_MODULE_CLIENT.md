@@ -16,12 +16,12 @@
 ```python
 from pycloud_parallel import TaskPool
 
+import my_task_module
+
 with TaskPool.open(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     job_id="demo-job",
-    blob=blob,
-    entry_module="task_demo",
-    entry_callable="run",
+    source=my_task_module,
     worker_count=2,
 ) as pool:
     resp = pool.submit_payloads([{"value": 7}])
@@ -40,10 +40,11 @@ with TaskPool.open(
 ```python
 from pycloud_parallel import JobQueue
 
+import my_job_module
+
 client = JobQueue.connect("127.0.0.1:50051", client_id="job-demo")
-client.submit_job_from_bytes(
-    blob=job_blob,
-    entry_module="job_demo",
+client.submit(
+    source=my_job_module,
     job_payload={"value": 10, "count": 6},
 )
 ```
@@ -76,28 +77,35 @@ client.submit_job_from_bytes(
 说明：
 
 1. `job_payload` 是可选 `dict`
-2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+2. `submit(source=my_job_module, ...)` 会自动发现并绑定 `task_generator`
 3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
 4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 
-如果你直接持有模块对象：
+如果你直接持有模块对象，当前推荐直接走：
 
 ```python
-client.submit_job_from_module(
-    module=job_module,
+client.submit(
+    source=job_module,
     job_payload={"value": 10, "count": 6},
 )
 ```
 
 这里推荐直接提交模块对象；`submit_job_from_func(...)` 已移除，避免把函数对象临时拼模块带来的不稳定依赖。
 
+兼容 helper：
+
+1. `submit_job_from_module(...)`
+2. `submit_job_from_bytes(...)`
+
+仍然可用，但不再是文档主入口。
+
 模块对象自动打包当前有两个关键约束：
 
 1. 依赖分析基于“已加载 module object + 真实 `__file__`”
 2. 自动打包只收 `.py / .pyd / .so`
 3. `.csv / .json / README / docs` 等非 Python 文件不会自动带上
-4. 如果 job 依赖非 Python 资源，请预先自己构建 `zip / tar.gz / whl`，再走 `submit_job_from_bytes(...)`
+4. 如果 job 依赖非 Python 资源，请预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` 或 `submit_job_from_bytes(...)` 提交
 
 如果你想本地检查自动打包产物：
 

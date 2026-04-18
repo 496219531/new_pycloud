@@ -442,7 +442,7 @@ def _read_temp_file(path: str) -> bytes:
 
 
 def _package_module_blob(module: Any) -> Tuple[bytes, str]:
-    tmp_path = DependencyPackager().package_module(module, include_tests=False)
+    tmp_path = DependencyPackager().package_module(module, include_tests=True)
     try:
         return _read_temp_file(tmp_path), f"{_default_entry_module_for_module(module)}.tar.gz"
     finally:
@@ -450,7 +450,7 @@ def _package_module_blob(module: Any) -> Tuple[bytes, str]:
 
 
 def _package_function_blob(func: Callable) -> Tuple[bytes, str]:
-    tmp_path = DependencyPackager().package_function(func, include_tests=False)
+    tmp_path = DependencyPackager().package_function(func, include_tests=True)
     try:
         return _read_temp_file(tmp_path), f"{str(getattr(func, '__module__', '') or 'artifact')}_{str(getattr(func, '__name__', '') or 'run')}.tar.gz"
     finally:
@@ -460,7 +460,7 @@ def _package_function_blob(func: Callable) -> Tuple[bytes, str]:
 def _package_roots_blob(paths: Iterable[Path]) -> Tuple[bytes, str]:
     tmp_path = DependencyPackager().package_roots(
         paths,
-        include_tests=False,
+        include_tests=True,
         synthesize_missing_package_inits=True,
     )
     try:
@@ -473,7 +473,7 @@ def _package_relative_paths_blob(source: _ArtifactPathsSource) -> Tuple[bytes, s
     tmp_path = DependencyPackager().package_paths(
         root_dir=source.root_dir,
         paths=source.paths,
-        include_tests=False,
+        include_tests=True,
         synthesize_missing_package_inits=True,
     )
     try:
@@ -504,7 +504,7 @@ def _prepare_artifact_blob(artifact: Artifact) -> Tuple[bytes, str]:
         if path.is_dir():
             tmp_path = DependencyPackager().package_roots(
                 [path],
-                include_tests=False,
+                include_tests=True,
                 synthesize_missing_package_inits=True,
             )
             try:

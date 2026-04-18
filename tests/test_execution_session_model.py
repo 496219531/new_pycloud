@@ -226,3 +226,60 @@ def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
     assert status.alive is True
     assert status.last_heartbeat_at == now
     assert status.lease_expire_at == now + timedelta(seconds=30)
+
+
+def test_task_pool_session_put_data_uses_shared_client_upload_path(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
+    from pycloud_parallel.data.ref import DataRef
+    from pycloud_parallel.execution import task_pool as task_pool_module
+
+    now = _utc_now()
+    pool_client = MagicMock()
+    pool = NativeTaskPoolClient(
+        _client=pool_client,
+        owner_client_id="owner-a",
+        pool_id="pool-1",
+        pool_token="pool-token",
+        code_version="sha256:" + ("f" * 64),
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        pool_name="pool-demo",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+    )
+    session = TaskPool(
+        pools={"node-inst-1": pool},
+        nodes={"node-inst-1": SimpleNamespace(node_id="node-1")},
+        task_method="run",
+        job_id="job-1",
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        task_pool_module,
+        "_put_data_via_clients",
+        lambda clients, data, *, format="", chunk_size=0: captured.update(
+            {
+                "clients": list(clients),
+                "data": data,
+                "format": format,
+                "chunk_size": chunk_size,
+            }
+        )
+        or DataRef(
+            ref_id="sha256:" + ("1" * 64),
+            storage_id="sha256:" + ("1" * 64),
+            format=str(format or "json"),
+            locator_token="127.0.0.1:50051",
+        ),
+    )
+
+    ref = session.put_json({"ok": True})
+
+    assert ref.format == "json"
+    assert captured["clients"] == [pool_client]
+    assert captured["data"] == {"ok": True}
+    assert captured["format"] == "json"

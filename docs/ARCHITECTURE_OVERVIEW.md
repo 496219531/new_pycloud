@@ -14,7 +14,7 @@
    - `JobQueue` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
 4. `TaskPool Mode`
    - 子任务执行层
-   - V1 唯一执行内核
+   - 面向批量任务执行的核心产品对象
 
 一句话概括：
 
@@ -45,8 +45,9 @@
 
 推荐入口：
 
-1. V1 顶层不再暴露 caller 专用连接器
-2. 如需保留内部调用适配，暂时从 `pycloud_parallel.controlplane` 使用底层客户端
+1. `Service.connect(..., transport="gateway")`
+2. `Service.connect(..., transport="discovery")`
+3. 如需更底层 transport client，再从 `pycloud_parallel.controlplane` 使用内部客户端
 
 ### 2.3 job client
 
@@ -82,6 +83,7 @@
 3. 导出模式支持 `decorator / explicit / all / single`
 4. 当前更适合作为内部函数服务层，而不是对外 Web 应用层
 5. 普通用户默认走 `Service.deploy(source=module)`；`Artifact(...)` 只保留给高级打包控制
+6. `Service.connect(...)` 是当前 caller 侧主入口；gateway/discovery 是连接策略，不再是顶层产品类名
 
 对外推荐入口：
 
@@ -106,7 +108,7 @@
 
 ## 5. TaskPool Mode
 
-`TaskPool Mode` 当前已经是唯一执行内核：
+`TaskPool Mode` 当前是批量任务执行会话：
 
 1. `CreateTaskPool`
 2. `HeartbeatTaskPool`
@@ -121,7 +123,7 @@
 1. 每个 pool 是独立资源会话
 2. pool 自己 heartbeat 保活
 3. subtasks 不走旧共享任务池
-4. `Service` 与 `JobQueue` 最终都建立在这层之上
+4. `Service` 与 `TaskPool` 共享 `ExecutorHost + ExecutionSession` 底座，但保留两类兄弟会话类型
 5. 每个 pool 当前只暴露一个任务入口，也就是创建时的 `entry_callable`
 6. `task_method` 是高层单入口校验参数，不是多方法路由协议
 7. `runtime_key` 仍然保留，但它代表 runtime 逻辑隔离键，不再对应独立的 runtime-slot 资源

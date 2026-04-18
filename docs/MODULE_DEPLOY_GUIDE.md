@@ -11,7 +11,7 @@ import my_job.main
 from pycloud_parallel import Service
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     entry_module=my_job.main,
     runtime="py3",
 )
@@ -31,7 +31,7 @@ group = Service.deploy(
 
 1. `TaskPool.open(...)`
    - 直接创建原生专属 pool 执行 subtasks
-2. `JobQueue.submit_job_from_bytes(...)`
+2. `JobQueue.submit(source=...)`
    - 大任务先排队，排到后再自动创建 `TaskPool`
 
 ## 3. 资源文件边界

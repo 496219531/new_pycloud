@@ -96,7 +96,7 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
         with TaskPool.open(
-            infocenter_target=infocenter.base_url,
+            target=infocenter.base_url,
             job_id="v1-smoke-pool",
             source=pool_blob,
             runtime="py3",
@@ -109,6 +109,7 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
             submit = pool.submit_payloads([{"value": 2}, {"value": 3}])
             values = pool.wait_for_data(expected_count=len(submit.accepted), timeout_sec=10.0)
             assert sorted(item["square"] for item in values) == [4, 9]
+            assert pool.status().kind == "task_pool"
 
         service_blob = (
             b"def pycloud_export(fn):\n"
@@ -120,7 +121,7 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
         service = Service.deploy(
-            infocenter_target=infocenter.base_url,
+            target=infocenter.base_url,
             owner_client_id="v1-smoke-owner",
             service_name="v1-smoke-service",
             source=service_blob,
@@ -135,6 +136,7 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
         try:
             _node_id, response = service.call_balanced("mul", {"value": 4}, timeout_sec=10.0)
             assert response["data"]["square"] == 16
+            assert service.status().kind == "service"
         finally:
             service.close()
 

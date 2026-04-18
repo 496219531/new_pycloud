@@ -10,10 +10,9 @@
 
 ## 当前推荐入口
 
-1. `Service.deploy(func=...)`
-2. `Service.deploy(entry_module=<module object>)`
-3. `TaskPool.open(...)`
-4. `JobQueue.submit_job_from_bytes(...)`
+1. `Service.deploy(source=...)`
+2. `TaskPool.open(source=...)`
+3. `JobQueue.submit(source=...)`
 
 ## 依赖策略
 
@@ -47,7 +46,7 @@
 3. 最终按“精确文件集合”写入 `tar.gz`
 4. 不再按仓库根目录或 package 根目录粗暴递归整树打包
 
-这意味着 `submit_job_from_module(module=...)` / `entry_module=<module object>` 这类入口现在更适合做稳定的本地源码闭包打包。
+这意味着 `submit(source=<module object>)` / `source=<path>` 这类入口现在更适合做稳定的本地源码闭包打包。
 
 ## 非 Python 资源如何处理
 

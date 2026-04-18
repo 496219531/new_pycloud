@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -852,9 +853,11 @@ def test_cmd_stop_stops_all_pid_backed_processes(tmp_path, monkeypatch):
     args = parser.parse_args(["--runtime-root", str(tmp_path), "stop"])
     stopped: list[tuple[Path, str]] = []
     cleaned: list[tuple[str, str]] = []
+    machine_scan_calls: list[tuple[Path, str]] = []
 
     monkeypatch.setattr(ctl, "_stop_named_process", lambda root, name: stopped.append((root, name)))
     monkeypatch.setattr(ctl, "_best_effort_mark_node_lost", lambda target, name: cleaned.append((target, name)) or True)
+    monkeypatch.setattr(ctl, "_kill_machine_pycloud_processes", lambda *, root, target: machine_scan_calls.append((root, target)) or [])
     monkeypatch.setattr(ctl, "_log", lambda *_args: None)
 
     assert ctl._cmd_stop(args) == 0
@@ -863,6 +866,91 @@ def test_cmd_stop_stops_all_pid_backed_processes(tmp_path, monkeypatch):
         ("127.0.0.1:50051", "node-1"),
         ("127.0.0.1:50051", "node-2"),
         ("127.0.0.1:50051", "node-blue"),
+    ]
+    assert machine_scan_calls == [(tmp_path.resolve(), "127.0.0.1:50051")]
+
+
+def test_kill_machine_pycloud_processes_stops_discovered_server_processes(tmp_path, monkeypatch):
+    target = "127.0.0.1:50051"
+    killed: list[tuple[int, bool]] = []
+    cleaned: list[tuple[str, str]] = []
+    removed: list[Path] = []
+    logs: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        ctl,
+        "_inspect_machine_processes",
+        lambda: [
+            {
+                "pid": 301,
+                "command": "python -m pycloud_parallel.controlplane.server --role nodecontrol --node-id node-blue",
+                "matches_pycloud": True,
+                "matches_stoppable_server": True,
+                "role": "nodecontrol",
+                "node_name": "node-blue",
+            },
+            {
+                "pid": 302,
+                "command": "python -m pycloud_parallel.controlplane.server --role gateway",
+                "matches_pycloud": True,
+                "matches_stoppable_server": True,
+                "role": "gateway",
+                "node_name": "",
+            },
+            {
+                "pid": 303,
+                "command": "python -m pycloud_parallel.controlplane.server --role job-orchestrator",
+                "matches_pycloud": True,
+                "matches_stoppable_server": True,
+                "role": "joborchestrator",
+                "node_name": "",
+            },
+            {
+                "pid": 304,
+                "command": "python -m something_else",
+                "matches_pycloud": False,
+                "matches_stoppable_server": False,
+                "role": "",
+                "node_name": "",
+            },
+            {
+                "pid": 305,
+                "command": "python -m pycloud_parallel.controlplane.server --role weird",
+                "matches_pycloud": True,
+                "matches_stoppable_server": True,
+                "role": "weird",
+                "node_name": "",
+            },
+            {
+                "pid": 306,
+                "command": "python -m pycloudctl",
+                "matches_pycloud": True,
+                "matches_stoppable_server": False,
+                "role": "",
+                "node_name": "",
+            },
+        ],
+    )
+    monkeypatch.setattr(ctl, "_terminate_pid", lambda pid, *, force=False: killed.append((pid, force)))
+    monkeypatch.setattr(ctl, "_is_pid_running", lambda _pid: False)
+    monkeypatch.setattr(ctl, "_best_effort_mark_node_lost", lambda target, name: cleaned.append((target, name)) or True)
+    monkeypatch.setattr(ctl, "_remove_pid", lambda path: removed.append(path))
+    monkeypatch.setattr(ctl, "_log", lambda label, message: logs.append((label, message)))
+
+    rows = ctl._kill_machine_pycloud_processes(root=tmp_path.resolve(), target=target)
+
+    assert [int(item["pid"]) for item in rows] == [301, 303, 302]
+    assert killed == [(301, False), (303, False), (302, False)]
+    assert cleaned == [(target, "node-blue")]
+    assert removed == [
+        tmp_path.resolve() / "pids" / "node-blue.pid",
+        tmp_path.resolve() / "pids" / "job-orchestrator.pid",
+        tmp_path.resolve() / "pids" / "gateway.pid",
+    ]
+    assert logs == [
+        ("INFO", "Stopping discovered process PID 301 (node-blue)..."),
+        ("INFO", "Stopping discovered process PID 303 (job-orchestrator)..."),
+        ("INFO", "Stopping discovered process PID 302 (gateway)..."),
     ]
 
 
@@ -874,6 +962,7 @@ def test_cmd_stop_scan_ports_invokes_listener_cleanup(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ctl, "_managed_process_names", lambda _root: [])
     monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
+    monkeypatch.setattr(ctl, "_kill_machine_pycloud_processes", lambda *, root, target: [])
     monkeypatch.setattr(ctl, "_kill_scanned_port_processes", lambda *, target, ports: scanned.append((target, tuple(ports))) or [{"pid": 11, "port": 50051}])
     monkeypatch.setattr(ctl, "_log", lambda label, message: logs.append((label, message)))
 

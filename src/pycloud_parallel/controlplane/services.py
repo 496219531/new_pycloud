@@ -82,6 +82,11 @@ def _peer(context: grpc.ServicerContext) -> str:
         return "unknown-peer"
 
 
+def _format_exception_message(exc: BaseException) -> str:
+    message = str(exc) or repr(exc)
+    return f"{exc.__class__.__name__}: {message}"
+
+
 def _normalize_object_integrity_mode(meta: pb2.UploadObjectMeta) -> str:
     requested = str(getattr(meta, "integrity_mode", "") or "").strip().lower()
     if requested in {"client_declared", "server_authoritative"}:
@@ -664,9 +669,19 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 chunks=[blob],
             )
         except Exception as exc:
+            detail = _format_exception_message(exc)
+            logger.exception(
+                "[NodeControl] CreateTaskPool invalid request peer=%s owner_client_id=%s pool_name=%s entry_module=%s package_format=%s err=%s",
+                _peer(context),
+                str(meta.owner_client_id or "") if meta is not None else "",
+                str(meta.pool_name or "") if meta is not None else "",
+                str(meta.entry_module or "") if meta is not None else "",
+                str(meta.package_format or "") if meta is not None else "",
+                detail,
+            )
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(str(exc))
-            return pb2.CreateTaskPoolResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)))
+            context.set_details(detail)
+            return pb2.CreateTaskPoolResponse(ok=False, error=_err(pb2.ERROR_CODE_INVALID_REQUEST, detail))
         finally:
             if tmp_path:
                 try:

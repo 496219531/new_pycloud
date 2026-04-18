@@ -88,12 +88,27 @@ def test_prepare_code_blob_from_directory_is_deterministic_and_skips_bytecode(tm
     assert not any(name.endswith(".pyc") for name in names)
 
 
+def test_prepare_code_blob_from_directory_synthesizes_missing_package_init(tmp_path):
+    from pycloud_parallel.execution.support import _prepare_code_blob
+
+    artifact_dir = tmp_path / "artifact_dir"
+    nested_pkg = artifact_dir / "namespace_pkg"
+    nested_pkg.mkdir(parents=True)
+    (nested_pkg / "worker.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+
+    blob, filename = _prepare_code_blob(artifact_path=str(artifact_dir))
+
+    assert filename == "artifact_dir.tar.gz"
+    names = _tar_names(blob or b"")
+    assert "namespace_pkg/__init__.py" in names
+    assert "namespace_pkg/worker.py" in names
+
+
 def test_prepare_code_blob_from_path_list_uses_deterministic_targz(tmp_path):
     from pycloud_parallel.execution.support import _prepare_code_blob
 
     pkg_dir = tmp_path / "bundle_pkg"
     pkg_dir.mkdir()
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
     (pkg_dir / "worker.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     pycache_dir = pkg_dir / "__pycache__"
     pycache_dir.mkdir()
@@ -126,7 +141,6 @@ def test_package_paths_to_targz_is_deterministic_and_relative(tmp_path):
     root_dir = tmp_path / "root"
     pkg_dir = root_dir / "pkg"
     pkg_dir.mkdir(parents=True)
-    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
     (pkg_dir / "worker.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     pycache_dir = pkg_dir / "__pycache__"
     pycache_dir.mkdir()

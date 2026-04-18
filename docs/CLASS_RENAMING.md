@@ -1,19 +1,12 @@
-# 当前入口类
+# V1 公开命名
 
-当前任务与服务入口已经收敛为这些名字：
+V1 顶层公开面已经收敛为 5 个概念：
 
 1. `Service`
 2. `TaskPool`
-3. `compat task facade`
-4. `JobQueue`
-5. `gateway caller facade`
-6. `discovery caller facade`
-
-说明：
-
-1. 旧共享任务池入口已移除
-2. 共享任务池模式已废弃
-3. `TaskPool` 是当前原生专属任务池入口
+3. `JobQueue`
+4. `DataRef`
+5. `export`
 
 最常用导入：
 
@@ -21,16 +14,34 @@
 from pycloud_parallel import (
     Service,
     TaskPool,
-    compat task facade,
     JobQueue,
-    gateway caller facade,
-    discovery caller facade,
+    DataRef,
+    export,
 )
 ```
+
+本地并行入口单独放到：
+
+```python
+from pycloud_parallel.local import configure, foreach, parallel_for
+```
+
+## 不再作为 V1 公开概念的名字
+
+以下名字已经退出顶层公开面，不应再作为用户主心智：
+
+1. gateway caller facade
+2. discovery caller facade
+3. compat task facade
+4. 旧 queue client naming
+5. 旧 task-pool session naming
+6. `pycloud_export`
+7. `ObjectRef / ResultRef`
+
+如果你确实需要更底层 transport / controlplane client，请从 `pycloud_parallel.controlplane` 导入内部基础设施类，而不是从顶层公开面寻找这些旧名字。
 
 相关资料：
 
 - [QUICK_START.md](QUICK_START.md)
-- [TASK_MODE.md](TASK_MODE.md)
-- [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-- [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
+- [V1_ARCHITECTURE_TARGET.md](V1_ARCHITECTURE_TARGET.md)
+- [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)

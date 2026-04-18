@@ -54,7 +54,7 @@ service-{本机IP}-{时间戳}
 from pycloud_parallel.execution.service_session import Service
 
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     artifact_path="service.py",
 )
 ```
@@ -63,7 +63,7 @@ group = Service.deploy(
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     blob=blob,
     entry_module="service",
 )
@@ -89,7 +89,7 @@ group = Service.deploy(
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     blob=blob,
     entry_module="service",
     node_ids=["node-1", "node-3"],
@@ -100,7 +100,7 @@ group = Service.deploy(
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     blob=blob,
     entry_module="service",
     node_count=2,
@@ -145,7 +145,7 @@ group = Service.deploy(
 
 ```python
 group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     blob=blob,
     entry_module="square_service",
     worker_count=1,

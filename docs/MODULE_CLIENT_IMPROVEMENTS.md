@@ -4,9 +4,9 @@
 
 1. `Service`
 2. `TaskPool`
-3. `compat task facade`
-4. `JobQueue`
-5. `gateway caller facade`
+3. `JobQueue`
+4. `DataRef`
+5. `export`
 
 说明：
 
@@ -20,9 +20,9 @@
 |---|---|---|
 | `Service` | Service | 部署并拥有内部函数服务 |
 | `TaskPool` | TaskPool | 创建原生专属任务池并执行 subtasks |
-| `compat task facade` | Compat TaskPool | 兼容专属池实现，支持复用 `Service.update_globals(...)` |
 | `JobQueue` | JobQueue | 提交大任务、排队、单活调度 |
-| `gateway caller facade` | Gateway | 按服务名调用内部函数服务 |
+| `DataRef` | Data | 大对象 / 大结果 / 文件引用 |
+| `export` | Artifact | 模块 / package 导出装饰器 |
 
 推荐资料：
 

@@ -432,6 +432,18 @@ def _looks_like_pycloud_process(command: str) -> bool:
     return any(needle in text for needle in needles)
 
 
+def _looks_like_stoppable_pycloud_server_process(command: str) -> bool:
+    text = str(command or "").strip().lower()
+    if not text:
+        return False
+    if "--role" not in text:
+        return False
+    return (
+        "pycloud_parallel.controlplane.server" in text
+        or "pycloud-control" in text
+    )
+
+
 def _role_from_command(command: str) -> str:
     match = re.search(r"--role\s+([A-Za-z0-9_-]+)", str(command or ""))
     role = str(match.group(1) if match else "").strip().lower()
@@ -473,6 +485,138 @@ def _inspect_listening_ports(ports: Iterable[int]) -> List[Dict[str, object]]:
                 }
             )
     return rows
+
+
+def _inspect_machine_processes() -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    current_pid = int(os.getpid())
+    if os.name == "nt":
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        payload = str(result.stdout or "").strip()
+        if not payload:
+            return rows
+        try:
+            items = json.loads(payload)
+        except Exception:
+            return rows
+        if isinstance(items, dict):
+            items = [items]
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pid = int(item.get("ProcessId", 0) or 0)
+            except Exception:
+                continue
+            command = str(item.get("CommandLine", "") or "").strip()
+            if pid <= 0 or pid == current_pid or not command:
+                continue
+            rows.append(
+                {
+                    "pid": pid,
+                    "command": command,
+                    "matches_pycloud": _looks_like_pycloud_process(command),
+                    "matches_stoppable_server": _looks_like_stoppable_pycloud_server_process(command),
+                    "role": _role_from_command(command),
+                    "node_name": _node_name_from_command(command),
+                }
+            )
+        return rows
+
+    result = subprocess.run(
+        ["ps", "-ax", "-o", "pid=", "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for raw in (result.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except Exception:
+            continue
+        command = parts[1].strip() if len(parts) > 1 else ""
+        if pid <= 0 or pid == current_pid or not command:
+            continue
+        rows.append(
+            {
+                "pid": pid,
+                "command": command,
+                "matches_pycloud": _looks_like_pycloud_process(command),
+                "matches_stoppable_server": _looks_like_stoppable_pycloud_server_process(command),
+                "role": _role_from_command(command),
+                "node_name": _node_name_from_command(command),
+            }
+        )
+    return rows
+
+
+def _managed_name_from_process_row(row: Dict[str, object]) -> str:
+    role = str(row.get("role", "") or "").strip()
+    if role == "nodecontrol":
+        return str(row.get("node_name", "") or "").strip()
+    if role == "joborchestrator":
+        return "job-orchestrator"
+    if role in {"infocenter", "gateway", "controlplane"}:
+        return role
+    return ""
+
+
+def _kill_machine_pycloud_processes(*, root: Path, target: str) -> List[Dict[str, object]]:
+    killed: List[Dict[str, object]] = []
+    seen_pids: set[int] = set()
+    rows = []
+    for row in _inspect_machine_processes():
+        pid = int(row.get("pid", 0) or 0)
+        if pid <= 0 or pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        if not bool(row.get("matches_stoppable_server", False)):
+            continue
+        role = str(row.get("role", "") or "").strip()
+        if role not in {"infocenter", "controlplane", "gateway", "joborchestrator", "nodecontrol"}:
+            continue
+        rows.append(dict(row))
+
+    rows.sort(key=lambda item: _process_sort_key(_managed_name_from_process_row(item) or str(item.get("role", "") or "")))
+
+    for row in rows:
+        pid = int(row.get("pid", 0) or 0)
+        if pid <= 0:
+            continue
+        node_name = str(row.get("node_name", "") or "").strip()
+        role = str(row.get("role", "") or "").strip()
+        managed_name = _managed_name_from_process_row(row)
+        if role == "nodecontrol" and node_name:
+            _best_effort_mark_node_lost(target, node_name)
+        _log("INFO", f"Stopping discovered process PID {pid} ({managed_name or role})...")
+        _terminate_pid(pid, force=False)
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if not _is_pid_running(pid):
+                break
+            time.sleep(0.2)
+        if _is_pid_running(pid):
+            _terminate_pid(pid, force=True)
+        if managed_name:
+            _remove_pid(_pid_file(root, managed_name))
+        killed.append(dict(row))
+    return killed
 
 
 def _kill_scanned_port_processes(*, target: str, ports: Iterable[int]) -> List[Dict[str, object]]:
@@ -1124,11 +1268,14 @@ def _cmd_stop(args: argparse.Namespace) -> int:
         if name not in {"controlplane", "gateway", "infocenter", "job-orchestrator"}:
             _best_effort_mark_node_lost(target, name)
     _stop_all_managed_processes(root)
+    killed = _kill_machine_pycloud_processes(root=root, target=target)
+    if killed:
+        _log("OK", f"Stopped {len(killed)} additional machine-wide pycloud process(es)")
     if bool(getattr(args, "scan_ports", False)):
         scanned_ports = _collect_scan_ports(args)
-        killed = _kill_scanned_port_processes(target=target, ports=scanned_ports)
-        if killed:
-            _log("OK", f"Stopped {len(killed)} additional scanned listener process(es)")
+        scanned = _kill_scanned_port_processes(target=target, ports=scanned_ports)
+        if scanned:
+            _log("OK", f"Stopped {len(scanned)} additional scanned listener process(es)")
     _log("OK", "All services stopped")
     return 0
 

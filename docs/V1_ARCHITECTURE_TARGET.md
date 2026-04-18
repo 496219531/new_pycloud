@@ -24,9 +24,10 @@ These legacy categories are transitional and must not survive the V1 cleanup:
 
 ## Execution Target
 
-- `TaskPool` is the only execution core.
-- `Service` is a named/addressable facade on top of the shared task-pool execution session.
-- `JobQueue` only schedules and launches `TaskPool` work; it does not own a separate execution model.
+- `ExecutorHost` is the shared execution foundation.
+- `ExecutionSession` is the shared internal session model.
+- `Service` and `TaskPool` are sibling product-level session types built on that shared foundation.
+- `JobQueue` only schedules and launches `TaskPool` work; it does not own a separate execution worker model.
 
 ## Data Target
 
@@ -58,6 +59,6 @@ The current `controlplane/` package may continue to exist during migration, but 
 
 1. Freeze docs, validation rules, and V1 acceptance tests.
 2. Unify large payloads and large results under `DataRef`.
-3. Collapse execution onto `TaskPool`.
+3. Unify execution foundation under `ExecutorHost + ExecutionSession`.
 4. Switch the top-level package to the final public API.
 5. Remove legacy names and rewrite docs/examples to match the final surface.

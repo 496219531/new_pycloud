@@ -34,13 +34,13 @@
 ```python
 from pycloud_parallel import TaskPool
 
+import my_task_module
+
 with TaskPool.open(
-    infocenter_target="127.0.0.1:50051",
+    target="127.0.0.1:50051",
     job_id="demo-job",
-    blob=blob,
+    source=my_task_module,
     runtime="py3",
-    entry_module="task_demo",
-    entry_callable="run",
     worker_count=2,
     node_count=1,
 ) as pool:
@@ -73,10 +73,11 @@ with TaskPool.open(
 ```python
 from pycloud_parallel import JobQueue
 
+import my_job_module
+
 client = JobQueue.connect("127.0.0.1:50051", client_id="job-demo")
-client.submit_job_from_bytes(
-    blob=job_blob,
-    entry_module="job_demo",
+client.submit(
+    source=my_job_module,
     job_payload={"value": 10, "count": 6},
 )
 ```
@@ -112,7 +113,7 @@ client.submit_job_from_bytes(
 说明：
 
 1. `job_payload` 是可选 `dict`
-2. `submit_job_from_bytes(...)` / `submit_job_from_module(...)` 会自动发现并绑定 `task_generator`
+2. `submit(source=my_job_module, ...)` 会自动发现并绑定 `task_generator`
 3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
 4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
@@ -120,21 +121,28 @@ client.submit_job_from_bytes(
 模块对象写法：
 
 ```python
-client.submit_job_from_module(
-    module=job_module,
+client.submit(
+    source=job_module,
     job_payload={"value": 10, "count": 6},
 )
 ```
 
-推荐优先使用 `submit_job_from_module(...)`。
+推荐优先使用 `submit(source=job_module, ...)`。
 `JobQueue` 不再提供 `submit_job_from_func(...)`，避免把嵌套函数 / 闭包 / 局部依赖打包成不稳定的隐式模块。
 
 补充边界：
 
-1. `submit_job_from_module(module=...)` 当前按“已加载 module object + 真实文件”收集本地依赖
+1. `submit(source=module)` 当前按“已加载 module object + 真实文件”收集本地依赖
 2. 自动打包只收 `.py / .pyd / .so`
 3. 非 Python 资源文件不会自动进入包
 4. 如果 job 依赖 `.csv` 等静态资源，请自行构建归档后再上传
+
+兼容 helper：
+
+1. `submit_job_from_module(...)`
+2. `submit_job_from_bytes(...)`
+
+仍然可用，但不再是文档主入口。
 
 等待 job 终态：
 

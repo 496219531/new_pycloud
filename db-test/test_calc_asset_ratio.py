@@ -16,7 +16,7 @@ if str(SRC_DIR) not in sys.path:
 from pycloud_parallel import JobQueue, Service, TaskPool
 from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 
-from calc_asset_ratio.ok import calc_asset_ratio
+from calc_asset_ratio import calc_asset_ratio
 import calc_asset_ratio_job_module
 
 
@@ -234,15 +234,14 @@ def calc_fund_list_asset_ratio2(
     artifact = _build_calc_task_artifact()
 
     t0 = time.time()
-    with TaskPool.open(
+    with TaskPool.from_infocenter(
         infocenter_target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
-        source=calc_asset_ratio.get_fund_asset_ratio,
+        artifact=artifact,
         worker_count=5,
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
-        managed_global_names=MANAGED_GLOBAL_NAMES
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
@@ -267,15 +266,14 @@ def calc_fund_list_asset_ratio3(
     artifact = _build_calc_task_artifact()
 
     t0 = time.time()
-    with TaskPool.open(
+    with TaskPool.from_infocenter(
         infocenter_target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
-        source=calc_asset_ratio.get_fund_asset_ratio,
+        artifact=artifact,
         worker_count=7,
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
-        managed_global_names=MANAGED_GLOBAL_NAMES
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
@@ -307,6 +305,7 @@ def calc_fund_list_asset_ratio_job(
                 "fund_list": list(fund_list or ()),
                 "strategy_type": strategy_type,
                 "frequency": frequency,
+                "root_dir": str(ROOT_DIR),
             },
             runtime="py3",
         )

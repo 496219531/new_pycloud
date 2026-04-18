@@ -14,18 +14,21 @@
 ## 建议阅读顺序
 
 1. [QUICK_START.md](QUICK_START.md)
-2. [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
-3. [TASK_MODE.md](TASK_MODE.md)
-4. [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-5. [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
-6. [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-7. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
-8. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
+2. [V1_ARCHITECTURE_TARGET.md](V1_ARCHITECTURE_TARGET.md)
+3. [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
+4. [TASK_MODE.md](TASK_MODE.md)
+5. [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
+6. [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
+7. [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
+8. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
+9. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
 
 ## 入口文档
 
 - [QUICK_START.md](QUICK_START.md)
-  - 顶层 API、`pycloud_export`、启动方式、三层定位、最短示例
+  - 顶层 API、`Service/TaskPool/JobQueue/DataRef/export`、启动方式、三层定位、最短示例
+- [V1_ARCHITECTURE_TARGET.md](V1_ARCHITECTURE_TARGET.md)
+  - V1 最终公开面、执行基础模型、数据模型与迁移目标
 - [PYCLOUDCTL_USAGE.md](PYCLOUDCTL_USAGE.md)
   - `pycloudctl` 的完整命令说明、host 自动探测、显式 `--infocenter-addr`、日志、GC 与常见示例
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
@@ -36,16 +39,16 @@
 - [TASK_MODE.md](TASK_MODE.md)
   - 子任务执行层、原生 task pool、单入口 `entry_callable`、`runtime_key` 的当前语义
 - [QUICK_START.md](QUICK_START.md)
-  - `TaskPool` / `compat task facade` / `JobQueue` 最小入口
+  - `TaskPool.open(...)` / `JobQueue.connect(...).submit(source=...)` 最小入口
 
 ## 服务模式
 
 - [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
   - `Service` 的 owner 侧用法与常驻函数服务定位
 - [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
-  - `gateway caller` / `GatewayServiceClient`，面向内部函数服务 caller
+  - `Service.connect(..., transport="gateway")` 的推荐用法，以及 `GatewayServiceClient` 的底层定位
 - [CLASS_RENAMING.md](CLASS_RENAMING.md)
-  - 当前统一命名说明
+  - V1 最终公开面与不再推荐的旧概念
 
 ## 控制面与运维
 

@@ -91,6 +91,62 @@ def test_api_pool_module_exposes_only_task_pool():
     assert callable(ApiTaskPool.open)
 
 
+def test_service_deploy_public_api_uses_target_keyword(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        ApiService,
+        "deploy_from_infocenter",
+        classmethod(lambda cls, **kwargs: captured.update(kwargs) or "service-session"),
+    )
+
+    result = ApiService.deploy(target="127.0.0.1:50051", source=b"blob")
+
+    assert result == "service-session"
+    assert captured["infocenter_target"] == "127.0.0.1:50051"
+    assert captured["source"] == b"blob"
+
+
+def test_task_pool_open_public_api_uses_target_keyword(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        ApiTaskPool,
+        "from_infocenter",
+        classmethod(lambda cls, **kwargs: captured.update(kwargs) or "task-pool-session"),
+    )
+
+    result = ApiTaskPool.open(target="127.0.0.1:50051", source=b"blob")
+
+    assert result == "task-pool-session"
+    assert captured["infocenter_target"] == "127.0.0.1:50051"
+    assert captured["source"] == b"blob"
+
+
+def test_public_api_still_accepts_legacy_infocenter_target_keyword(monkeypatch):
+    captured_service = {}
+    captured_pool = {}
+
+    monkeypatch.setattr(
+        ApiService,
+        "deploy_from_infocenter",
+        classmethod(lambda cls, **kwargs: captured_service.update(kwargs) or "service-session"),
+    )
+    monkeypatch.setattr(
+        ApiTaskPool,
+        "from_infocenter",
+        classmethod(lambda cls, **kwargs: captured_pool.update(kwargs) or "task-pool-session"),
+    )
+
+    service_result = ApiService.deploy(infocenter_target="127.0.0.1:50051", source=b"svc")
+    pool_result = ApiTaskPool.open(infocenter_target="127.0.0.1:50051", source=b"pool")
+
+    assert service_result == "service-session"
+    assert pool_result == "task-pool-session"
+    assert captured_service["infocenter_target"] == "127.0.0.1:50051"
+    assert captured_pool["infocenter_target"] == "127.0.0.1:50051"
+
+
 def test_api_queue_module_exposes_only_job_queue():
     assert api_queue_module.__all__ == ["JobQueue"]
     assert dir(api_queue_module) == ["JobQueue"]
