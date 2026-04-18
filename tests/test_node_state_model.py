@@ -9,6 +9,7 @@ import os
 import sys
 import tarfile
 import time
+import types
 import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from pycloud_parallel.controlplane.node.execution import (
     _build_execute_spec,
     _describe_artifact_error,
     _execute_payload_in_subprocess,
+    _purge_loaded_artifact_modules,
 )
 from pycloud_parallel.controlplane.node.filesystem import (
     _code_content_dir,
@@ -262,6 +264,33 @@ def test_dict_to_struct_stringifies_scalar_dict_keys():
 def test_dict_to_struct_rejects_colliding_normalized_dict_keys():
     with pytest.raises(TypeError, match=r"normalize to '1'"):
         dict_to_struct({"payload": {1: "int-key", "1": "string-key"}})
+
+
+def test_purge_loaded_artifact_modules_tolerates_broken_namespace_paths(tmp_path, monkeypatch):
+    class _BrokenPaths:
+        def __iter__(self):
+            raise KeyError("broken_pkg")
+
+        def __len__(self):
+            raise KeyError("broken_pkg")
+
+    broken_parent = types.ModuleType("broken_pkg")
+    broken_child = types.ModuleType("broken_pkg.child")
+    broken_child.__path__ = _BrokenPaths()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "broken_pkg", broken_parent)
+    monkeypatch.setitem(sys.modules, "broken_pkg.child", broken_child)
+
+    artifact_path = tmp_path / "artifact.tar.gz"
+    artifact_path.write_bytes(b"")
+
+    _purge_loaded_artifact_modules(
+        str(artifact_path),
+        entry_module="demo_artifact",
+        package_format="tar.gz",
+    )
+
+    assert "broken_pkg.child" not in sys.modules
 
 
 def test_dict_to_struct_round_trips_temporal_scalars_and_series_index():

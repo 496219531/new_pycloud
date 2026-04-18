@@ -85,11 +85,11 @@ from pycloud_parallel import (
 含义：
 
 1. `Service`
-   - owner 侧部署内部函数服务
+   - owner 侧部署内部常驻服务会话
 2. `TaskPool`
-   - 唯一执行内核，对应专属任务池会话
+   - 批量任务执行会话，对应专属任务池
 3. `JobQueue`
-   - 大任务排队客户端
+   - 排队与单活编排入口
 4. `DataRef`
    - 唯一公开的大对象引用类型
 5. `export`
@@ -112,7 +112,7 @@ print(parallel_for(range(5), lambda i: i + 10, max_workers=2))
 
 ## 4. 服务模式
 
-当前更建议把这里理解成“常驻函数服务层”，而不是直接对外的 Web 服务层。
+当前更建议把这里理解成“常驻服务会话层”，而不是直接对外的 Web 服务层。
 
 ```python
 from pycloud_parallel import Service, export
@@ -131,6 +131,33 @@ print(group.square.sync(x=7))
 # owner 长驻时可调用 group.join()
 # 固定 service_name 重新部署时，如果代码变化需先结束旧服务
 ```
+
+如果你连接的是已部署好的服务，也可以直接做轻量批量 RPC：
+
+```python
+svc = Service.connect(
+    target="127.0.0.1:50051",
+    service_name="square-service",
+    transport="gateway",
+)
+
+results = svc.square.map([1, 2, 3], arg_name="x")
+print(results)
+
+for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in_flight=3):
+    print(index, result)
+
+# async 场景可选使用 amap(...) / aunordered(...)；
+# 当前更推荐把它们理解成进阶能力，而不是 service 主调用路径
+# results = await svc.square.amap([1, 2, 3], arg_name="x")
+# async for index, result in svc.square.aunordered([{"x": 1}, {"x": 2}], max_in_flight=2):
+#     ...
+
+# 需要完整错误信息时，使用 iter_items / collect_items
+# items = svc.square.collect_items([{"x": 1}, {"x": 2}], max_in_flight=2)
+```
+
+这是 `Service` 侧的轻量 RPC 批量调用辅助能力，不是 `TaskPool` 任务模型。
 
 默认推荐直接传模块对象 `source=my_service_module`。
 如果你需要更细的打包、依赖或导出控制，再使用高级 `Artifact(...)` 或显式白名单：
@@ -151,7 +178,7 @@ group = Service.deploy(
 当前任务层已经收敛为两种入口：
 
 1. `TaskPool`
-   - 唯一执行内核，会自动 heartbeat
+   - 批量任务执行会话，会自动 heartbeat
 2. `JobQueue`
    - 先提交大任务到队列，排到后再自动创建 `TaskPool`
 
@@ -183,17 +210,15 @@ with TaskPool.open(
     for task_id, data in pool.iter_data(max_count=1, timeout_sec=10.0):
         print(task_id, data)
 
-    for task_id, data in pool.unordered(
+    for index, data in pool.unordered(
         [{"value": 20}, {"value": 21}, {"value": 22}],
         max_in_flight=2,
-        receive_batch=1,
-        result_timeout_sec=10.0,
     ):
-        print(task_id, data)
+        print(index, data)
 
     pool.consume_unordered(
         [{"value": 30}, {"value": 31}],
-        handle=lambda task_id, data: print("handled", task_id, data),
+        handle=lambda index, data: print("handled", index, data),
         max_in_flight=2,
         receive_batch=1,
         result_timeout_sec=10.0,
@@ -208,6 +233,8 @@ with TaskPool.open(
 1. `TaskPool` 当前是单入口模式，入口名就是 `entry_func / entry_callable`
 2. `submit_payloads(..., task_method=...)` 只能传这个方法名
 3. `runtime_key` 仍可用于 runtime 逻辑隔离，但不再表示独立 runtime-slot
+4. `pool.unordered(...)` / `pool.aunordered(...)` 是统一批量接口，返回 `(index, result_or_none)`
+5. 如果你需要 `receive_batch / wait_ms / raise_on_error` 这类低层流控参数，请显式使用 `pool.imap_unordered(...)`
 
 如果你希望先排队，再由调度器自动创建专属 pool：
 
@@ -236,7 +263,7 @@ client.submit(
 3. `update_globals(...)`
    - 可选
    - 只负责在 job-orch 端生成共享数据 `dict`
-4. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+4. `handle_result(index, result, state=..., ...)` / `handle_data(...)`
    - 可选，增量聚合中间结果
 5. `finalize(state=..., ...)`
    - 可选，生成最终 `final_result`
@@ -285,12 +312,12 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 ## 7. 常用脚本
 
 ```bash
-python examples/demo_task_pool_session.py
-python examples/demo_job_queue.py
-python examples/grpc_register_service_client_demo.py
-python examples/demo_gateway_client.py --service-name square-service
-python examples/demo_gateway_module_client.py
-python examples/demo_service_module_group.py
+python examples/taskpool_basic.py
+python examples/jobqueue_basic.py
+python examples/service_deploy_register.py
+python examples/service_connect_gateway.py --service-name square-service
+python examples/gateway_transport_client.py
+python examples/service_deploy_basic.py
 ```
 
 ## 8. Runtime 约束速记
@@ -309,7 +336,7 @@ python examples/demo_service_module_group.py
 ## 9. 下一步
 
 1. [TASK_MODE.md](TASK_MODE.md)
-2. [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
+2. [SERVICE_GUIDE.md](SERVICE_GUIDE.md)
 3. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
 4. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
 

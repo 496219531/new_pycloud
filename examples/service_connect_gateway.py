@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-PyCloud Gateway 调用示例
+通过 `Service.connect(..., transport="gateway")` 调用已部署服务。
 
-演示如何通过 `Service.connect(..., transport="gateway")`
-按 service_name 调用服务。
-同一个脚本里同时展示：
+这个示例聚焦 gateway 连接主路径：
 1. `Service.connect(..., transport="gateway")`
 2. 统一服务对象的 `methods / status / foo.sync(...)`
 
 前置条件：
 - 需要先部署名为 "square-service" 的服务
-- 可以运行 demo_gateway_complete.py 来自动部署和演示
-
-或者手动部署：
-```python
-from pycloud_parallel import Service, export
-
-blob = (
-    b"from pycloud_parallel import export\n\n"
+- 可以运行 `service_gateway_end_to_end.py` 自动完成部署和调用演示
+"""
     b"@export\n"
     b"def square(x=0, **_kwargs):\n"
     b"    x = int(x)\n"

@@ -39,7 +39,7 @@ client_mod = SimpleNamespace(
 
 
 class DiscoveryServiceClient:
-    """Client-side service discovery caller."""
+    """Low-level discovery transport client for service calls."""
 
     def __init__(
         self,

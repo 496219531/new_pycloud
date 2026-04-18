@@ -287,7 +287,7 @@ def test_run_job_with_hooks_uses_generator_handler_and_finalize() -> None:
         b"def task_generator(value=0, count=1, **_kwargs):\n"
         b"    for i in range(count):\n"
         b"        yield {'value': value + i}\n\n"
-        b"def handle_result(task_id, result, state=None, **_kwargs):\n"
+        b"def handle_result(index, result, state=None, **_kwargs):\n"
         b"    state.setdefault('squares', []).append(result['square'])\n\n"
         b"def finalize(state=None, **_kwargs):\n"
         b"    return {'sum_square': sum(state.get('squares', []))}\n"
@@ -314,13 +314,13 @@ def test_run_job_with_hooks_uses_generator_handler_and_finalize() -> None:
             self.job_id = "job-hooks-1"
             self.updated_globals = []
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             assert kwargs["max_in_flight"] >= 1
             items = list(payloads)
             assert items == [{"value": 2}, {"value": 3}, {"value": 4}]
-            for idx, item in enumerate(items, start=1):
+            for idx, item in enumerate(items):
                 value = int(item["value"])
-                yield f"t-{idx}", {"value": value, "square": value * value}
+                yield idx, {"value": value, "square": value * value}
 
         def update_globals(self, values):
             self.updated_globals.append(dict(values))
@@ -375,10 +375,10 @@ def test_run_job_with_hooks_accepts_update_globals_callable_name() -> None:
             self.job_id = "job-hooks-globals-name"
             self.updated_globals = []
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             del kwargs
-            for idx, item in enumerate(list(payloads), start=1):
-                yield f"t-{idx}", {"value": int(item["value"])}
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
 
         def update_globals(self, values):
             self.updated_globals.append(dict(values))
@@ -428,10 +428,10 @@ def test_run_job_with_hooks_uses_entryfunc_for_taskpool() -> None:
         def __init__(self):
             self.job_id = "job-hooks-entryfunc"
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             del kwargs
-            for idx, item in enumerate(list(payloads), start=1):
-                yield f"t-{idx}", {"value": int(item["value"])}
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
 
         def update_globals(self, values):
             return values
@@ -476,12 +476,12 @@ def test_run_job_with_hooks_accepts_direct_payload_list_task_generator() -> None
         def __init__(self):
             self.job_id = "job-hooks-direct-payloads"
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             del kwargs
             items = list(payloads)
             assert items == [{"value": 7}, {"value": 8}]
-            for idx, item in enumerate(items, start=1):
-                yield f"t-{idx}", {"value": int(item["value"])}
+            for idx, item in enumerate(items):
+                yield idx, {"value": int(item["value"])}
 
         def update_globals(self, values):
             return values
@@ -531,10 +531,10 @@ def test_run_job_with_hooks_accepts_update_globals_dict() -> None:
             self.job_id = "job-hooks-globals-dict"
             self.updated_globals = []
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             del kwargs
-            for idx, item in enumerate(list(payloads), start=1):
-                yield f"t-{idx}", {"value": int(item["value"])}
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
 
         def update_globals(self, values):
             self.updated_globals.append(dict(values))
@@ -568,7 +568,7 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
         b"def task_generator(value=0, count=1, **_kwargs):\n"
         b"    for i in range(count):\n"
         b"        yield {'value': value + i}\n\n"
-        b"def handle_result(task_id, result, state=None, **_kwargs):\n"
+        b"def handle_result(index, result, state=None, **_kwargs):\n"
         b"    state.setdefault('items', []).append(result)\n\n"
         b"def finalize(state=None, **_kwargs):\n"
         b"    return {'count': len(state.get('items', []))}\n"
@@ -606,13 +606,13 @@ def test_run_job_with_hooks_accepts_blob_ref_payload() -> None:
         def __init__(self):
             self.job_id = "job-hooks-ref-1"
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             del kwargs
             items = list(payloads)
             assert items == [{"value": 2}, {"value": 3}, {"value": 4}]
-            for idx, item in enumerate(items, start=1):
+            for idx, item in enumerate(items):
                 value = int(item["value"])
-                yield f"t-{idx}", {"value": value, "square": value * value}
+                yield idx, {"value": value, "square": value * value}
 
         def update_globals(self, values):
             return values
@@ -841,10 +841,10 @@ def test_run_job_with_hooks_purges_loaded_modules() -> None:
         def __init__(self):
             self.job_id = "job-hooks-purge-1"
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             del kwargs
-            for idx, item in enumerate(list(payloads), start=1):
-                yield f"t-{idx}", {"value": int(item["value"])}
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
 
         def update_globals(self, values):
             return values
@@ -1033,7 +1033,7 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_handle_data_alias() -
         blob=(
             b"def run(**_kwargs):\n    return {}\n\n"
             b"def task_generator(**_kwargs):\n    return []\n\n"
-            b"def handle_data(task_id, result, state=None, **_kwargs):\n    return state\n"
+            b"def handle_data(index, result, state=None, **_kwargs):\n    return state\n"
         ),
         entry_module="job_demo",
     )
@@ -1463,8 +1463,8 @@ def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
         b"    return {'value': value}\n\n"
         b"def task_generator(value=0, **_kwargs):\n"
         b"    return [{'value': value}]\n\n"
-        b"def handle_result(task_id, result, state=None, **_kwargs):\n"
-        b"    state.setdefault('items', []).append((task_id, result))\n"
+        b"def handle_result(index, result, state=None, **_kwargs):\n"
+        b"    state.setdefault('items', []).append((index, result))\n"
     )
     module_name = "job_module_demo"
 
@@ -1507,8 +1507,8 @@ def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> 
             b"    return {'value': value}\n\n"
             b"def task_generator(value=0, **_kwargs):\n"
             b"    return [{'value': value}]\n\n"
-            b"def handle_result(task_id, result, state=None, **_kwargs):\n"
-            b"    state.setdefault('items', []).append((task_id, result))\n\n"
+            b"def handle_result(index, result, state=None, **_kwargs):\n"
+            b"    state.setdefault('items', []).append((index, result))\n\n"
             b"def update_globals(**_kwargs):\n"
             b"    return {'cfg': {'mode': 'auto'}}\n"
         ).decode("utf-8"),
@@ -1545,8 +1545,8 @@ def test_job_queue_client_submit_job_from_module_auto_binds_handle_data_alias() 
             b"    return {'value': value}\n\n"
             b"def task_generator(value=0, **_kwargs):\n"
             b"    return [{'value': value}]\n\n"
-            b"def handle_data(task_id, result, state=None, **_kwargs):\n"
-            b"    state.setdefault('items', []).append((task_id, result))\n"
+            b"def handle_data(index, result, state=None, **_kwargs):\n"
+            b"    state.setdefault('items', []).append((index, result))\n"
         ).decode("utf-8"),
         module.__dict__,
     )
@@ -1658,11 +1658,11 @@ def test_run_job_with_hooks_uses_larger_default_worker_node_and_inflight(monkeyp
     class _FakePool:
         job_id = "job-hooks-defaults"
 
-        def unordered(self, payloads, **kwargs):
+        def imap_unordered(self, payloads, **kwargs):
             assert kwargs["max_in_flight"] == 100
             assert kwargs["receive_batch"] == 10
-            for idx, item in enumerate(list(payloads), start=1):
-                yield f"t-{idx}", {"value": int(item["value"])}
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
 
         def update_globals(self, values):
             return values

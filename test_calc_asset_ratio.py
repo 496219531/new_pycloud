@@ -74,6 +74,19 @@ def _normalize_result_items(values):
     return [_normalize_result_item(value) for value in values]
 
 
+def _ordered_results_from_pairs(
+    items: Sequence[tuple[int, object]],
+    *,
+    expected_count: int,
+):
+    ordered = [None] * max(0, int(expected_count))
+    for index, value in items:
+        normalized_index = int(index)
+        if 0 <= normalized_index < len(ordered):
+            ordered[normalized_index] = _normalize_result_item(value)
+    return ordered
+
+
 def _connect_service(*, transport: str):
     return Service.connect(
         target=CONTROLPLANE_TARGET,
@@ -87,16 +100,6 @@ def _call_service(payload: dict[str, object], *, transport: str):
     with _connect_service(transport=transport) as service:
         return _normalize_result_item(service.call_sync("get_fund_asset_ratio", **payload))
 
-
-def _build_calc_task_artifact() -> Artifact:
-    return Artifact.from_paths(
-        ROOT_DIR / "calc_asset_ratio",
-        runtime="py3",
-        entry_module="calc_asset_ratio.calc_asset_ratio",
-        entry_callable="get_fund_asset_ratio",
-        deps=ArtifactDeps.node_preinstalled(),
-        managed_global_names=MANAGED_GLOBAL_NAMES,
-    )
 
 
 def calc_fund_list_asset_ratio(
@@ -224,6 +227,50 @@ def calc_fund_list_asset_ratio_gateway(
         return results
 
 
+def calc_fund_list_asset_ratio_service_unordered(
+    fund_list: Sequence[int] | None,
+    strategy_type: int = 1,
+    frequency: int = 1,
+    *,
+    transport: str = "discovery",
+):
+    fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
+    payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
+
+    with _connect_service(transport=transport) as service:
+        items = list(
+            service.get_fund_asset_ratio.unordered(
+                payloads,
+                max_in_flight=min(8, max(1, len(payloads))),
+            )
+        )
+    return _ordered_results_from_pairs(items, expected_count=len(payloads))
+
+
+def calc_fund_list_asset_ratio_service_aunordered(
+    fund_list: Sequence[int] | None,
+    strategy_type: int = 1,
+    frequency: int = 1,
+    *,
+    transport: str = "discovery",
+):
+    fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
+    payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
+
+    async def _collect():
+        with _connect_service(transport=transport) as service:
+            items = []
+            async for item in service.get_fund_asset_ratio.aunordered(
+                payloads,
+                max_in_flight=min(8, max(1, len(payloads))),
+            ):
+                items.append(item)
+            return items
+
+    items = asyncio.run(_collect())
+    return _ordered_results_from_pairs(items, expected_count=len(payloads))
+
+
 def calc_fund_list_asset_ratio2(
     fund_list: Sequence[int] | None,
     strategy_type: int = 1,
@@ -231,7 +278,7 @@ def calc_fund_list_asset_ratio2(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
     payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
-    artifact = _build_calc_task_artifact()
+
 
     t0 = time.time()
     with TaskPool.open(
@@ -250,11 +297,44 @@ def calc_fund_list_asset_ratio2(
         t1 = time.time()
         print(t1 - t0)
         results = []
-        for _task_id, data in pool.unordered(payloads, result_timeout_sec=300):
+        for _task_id, data in pool.unordered(payloads, timeout_sec=300):
             results.append(_normalize_result_item(data))
         t2 = time.time()
         print(t2 - t1)
         return results
+
+
+def calc_fund_list_asset_ratio_taskpool_aunordered(
+    fund_list: Sequence[int] | None,
+    strategy_type: int = 1,
+    frequency: int = 1,
+):
+    fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
+    payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
+
+    async def _collect():
+        with TaskPool.open(
+            target=CONTROLPLANE_TARGET,
+            job_id=f"demo-pool-async-{int(time.time())}",
+            source=calc_asset_ratio.get_fund_asset_ratio,
+            worker_count=5,
+            node_count=2,
+            tags=["compute"],
+            timeout_sec=300.0,
+            managed_global_names=MANAGED_GLOBAL_NAMES,
+        ) as pool:
+            pool.update_globals(calc_asset_ratio.update_globals())
+            items = []
+            async for item in pool.aunordered(
+                payloads,
+                max_in_flight=min(16, max(1, len(payloads))),
+                timeout_sec=300.0,
+            ):
+                items.append(item)
+            return items
+
+    items = asyncio.run(_collect())
+    return _ordered_results_from_pairs(items, expected_count=len(payloads))
 
 
 def calc_fund_list_asset_ratio3(
@@ -264,7 +344,6 @@ def calc_fund_list_asset_ratio3(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
     payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
-    artifact = _build_calc_task_artifact()
 
     t0 = time.time()
     with TaskPool.open(
@@ -413,14 +492,17 @@ if __name__ == "__main__":
         1652875,
     ]
     t1 = time.time()
-    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
+    # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
+    # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)
     t2 = time.time()
     print(result)
     print(t2 - t1)

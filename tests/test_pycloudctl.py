@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Tests for the pycloudctl CLI surface."""
+
 import json
 import os
 from datetime import datetime, timedelta, timezone

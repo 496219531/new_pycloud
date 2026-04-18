@@ -36,7 +36,7 @@ client_mod = SimpleNamespace(
 
 
 class GatewayServiceClient:
-    """Thin HTTP + JSON client wrapper for ControlPlane Gateway service calls."""
+    """Low-level HTTP transport client for Gateway-routed service calls."""
 
     def __init__(self, target: str, *, timeout_sec: float = 10.0, service_token: str = "") -> None:
         self.target = target

@@ -17,9 +17,9 @@
 2. [V1_ARCHITECTURE_TARGET.md](V1_ARCHITECTURE_TARGET.md)
 3. [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
 4. [TASK_MODE.md](TASK_MODE.md)
-5. [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
-6. [TASK_MODULE_CLIENT.md](TASK_MODULE_CLIENT.md)
-7. [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
+5. [SERVICE_GUIDE.md](SERVICE_GUIDE.md)
+6. [TASK_CLIENT_GUIDE.md](TASK_CLIENT_GUIDE.md)
+7. [SERVICE_GATEWAY_GUIDE.md](SERVICE_GATEWAY_GUIDE.md)
 8. [INFOCENTER_HTTP.md](INFOCENTER_HTTP.md)
 9. [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
 
@@ -43,11 +43,11 @@
 
 ## 服务模式
 
-- [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
+- [SERVICE_GUIDE.md](SERVICE_GUIDE.md)
   - `Service` 的 owner 侧用法与常驻函数服务定位
-- [GATEWAY_CLIENT_GUIDE.md](GATEWAY_CLIENT_GUIDE.md)
+- [SERVICE_GATEWAY_GUIDE.md](SERVICE_GATEWAY_GUIDE.md)
   - `Service.connect(..., transport="gateway")` 的推荐用法，以及 `GatewayServiceClient` 的底层定位
-- [CLASS_RENAMING.md](CLASS_RENAMING.md)
+- [V1_PUBLIC_API.md](V1_PUBLIC_API.md)
   - V1 最终公开面与不再推荐的旧概念
 
 ## 控制面与运维
@@ -78,9 +78,9 @@
 常用脚本：
 
 - [../scripts/start_services.sh](../scripts/start_services.sh)
-- [../examples/demo_task_pool_session.py](../examples/demo_task_pool_session.py)
-- [../examples/demo_job_queue.py](../examples/demo_job_queue.py)
-- [../examples/demo_gateway_client.py](../examples/demo_gateway_client.py)
-- [../examples/demo_gateway_module_client.py](../examples/demo_gateway_module_client.py)
-- [../examples/demo_service_module_group.py](../examples/demo_service_module_group.py)
-- [../examples/demo_simple_deploy.py](../examples/demo_simple_deploy.py)
+- [../examples/taskpool_basic.py](../examples/taskpool_basic.py)
+- [../examples/jobqueue_basic.py](../examples/jobqueue_basic.py)
+- [../examples/service_connect_gateway.py](../examples/service_connect_gateway.py)
+- [../examples/gateway_transport_client.py](../examples/gateway_transport_client.py)
+- [../examples/service_deploy_basic.py](../examples/service_deploy_basic.py)
+- [../examples/service_deploy_simple.py](../examples/service_deploy_simple.py)

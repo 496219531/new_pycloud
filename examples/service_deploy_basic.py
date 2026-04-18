@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-PyCloud 模块化客户端示例
+基础服务部署与调用示例。
 
-像使用 Python 模块一样调用远程服务，简单直观。
+演示 V1 主路径：
+1. `Service.deploy(...)`
+2. `group.foo.sync(...)`
+3. `group.foo.broadcast(...)`
 """
 from pathlib import Path
 import sys

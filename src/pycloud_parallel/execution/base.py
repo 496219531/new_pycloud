@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Shared execution session base classes for the authoritative V1 execution layer."""
 
+from dataclasses import dataclass
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
@@ -14,6 +15,24 @@ from pycloud_parallel.controlplane.session_model import (
     SessionLease,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+
+@dataclass(frozen=True)
+class ExecutionItem:
+    index: int = -1
+    ok: bool = False
+    result: Any = None
+    error_type: str = ""
+    error_message: str = ""
+    node_id: str = ""
+    key: Union[int, str] = -1
+    status: int = 0
+    task_id: str = ""
+    node_instance_id: str = ""
+
+    @property
+    def data(self) -> Any:
+        return self.result
 
 
 class ExecutionSessionBase:
@@ -230,4 +249,4 @@ class TaskExecutionSession(ExecutionSessionBase):
     kind = "task_pool"
 
 
-__all__ = ["ExecutionSessionBase", "ServiceExecutionSession", "TaskExecutionSession"]
+__all__ = ["ExecutionItem", "ExecutionSessionBase", "ServiceExecutionSession", "TaskExecutionSession"]

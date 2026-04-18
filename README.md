@@ -14,7 +14,7 @@
    - 面向大任务排队与单活调度
    - 大任务排到后，再展开成 subtasks 交给执行层
 3. `Service Mode`
-   - 面向可寻址、常驻的函数服务实例
+   - 面向可寻址、常驻的服务会话
    - 更适合内部 RPC、轻量状态服务、稳定路由的函数调用
    - 当前本质仍是“函数执行服务”，不是标准 ASGI/WSGI 网络服务运行时
 4. `External Web Layer`
@@ -43,11 +43,11 @@ pip install pycloud-parallel
 1. `uvicorn/gunicorn`
    - 对外轻网络入口层
 2. `Service Mode`
-   - 内部常驻函数服务层
+   - 常驻服务会话层
 3. `JobQueue Mode`
    - 大任务排队与单活调度层
 4. `TaskPool / Task Mode`
-   - 子任务执行层（唯一执行内核）
+   - 批量任务执行会话层
 
 ## Payload 序列化边界
 
@@ -207,11 +207,11 @@ from pycloud_parallel import (
 语义：
 
 1. `Service`
-   - owner 侧部署并持有服务
+   - owner 侧部署并持有常驻服务会话
 2. `TaskPool`
-   - 唯一执行内核，对应专属任务池会话
+   - 批量任务执行会话，对应专属任务池
 3. `JobQueue`
-   - 大任务排队客户端
+   - 排队与单活编排入口
 4. `DataRef`
    - 唯一公开的大对象引用类型
 5. `export`
@@ -342,6 +342,31 @@ print(group.square.sync(x=7))
 # 同一台机器上，同一个 owner_client_id + service_name 只允许一个活跃 deployservice
 ```
 
+如果你连接的是已经部署好的服务，也可以直接做轻量批量 RPC：
+
+```python
+svc = Service.connect(
+    target="127.0.0.1:50051",
+    service_name="square-service",
+    transport="gateway",
+)
+
+print(svc.square.map([1, 2, 3], arg_name="x"))
+for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in_flight=3):
+    print(index, result)
+
+# async 场景请显式使用 amap(...) / aunordered(...)
+# results = await svc.square.amap([1, 2, 3], arg_name="x")
+# async for index, result in svc.square.aunordered([{"x": 1}, {"x": 2}], max_in_flight=2):
+#     ...
+
+# 需要完整错误信息时，使用 iter_items / collect_items
+# for item in svc.square.iter_items([{"x": 1}, {"x": 2}], max_in_flight=2):
+#     print(item.index, item.ok, item.result, item.error_message)
+```
+
+这只是 service RPC 的批量辅助能力，不会引入 `TaskPool` 的 `task_id / result cursor / cancel_job` 语义。
+
 默认推荐直接传模块对象 `source=my_service_module`。
 如果你的代码依赖节点上未预装的包，或你需要更细的打包/导出控制，再使用高级 `Artifact(...)` 或显式白名单：
 
@@ -413,13 +438,13 @@ with TaskPool.open(
     items = pool.collect_data(max_count=1, timeout_sec=10.0)
     print(items)
 
-    for task_id, data in pool.imap_unordered(
+    for index, data in pool.imap_unordered(
         [{"value": 20}, {"value": 21}],
         max_in_flight=2,
         receive_batch=1,
         result_timeout_sec=10.0,
     ):
-        print(task_id, data)
+        print(index, data)
 ```
 
 说明：
@@ -453,7 +478,7 @@ job module 约定：
 3. `update_globals(...)`
    - 可选
    - 只负责在 job-orch 端生成共享数据 `dict`
-4. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+4. `handle_result(index, result, state=..., ...)` / `handle_data(...)`
    - 可选，增量聚合结果
 5. `finalize(state=..., ...)`
    - 可选，生成最终 `final_result`
@@ -589,7 +614,7 @@ print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
 1. [快速开始](docs/QUICK_START.md)
 2. [架构总览](docs/ARCHITECTURE_OVERVIEW.md)
 3. [任务模式](docs/TASK_MODE.md)
-4. [Service](docs/SERVICE_MODULE_GROUP.md)
-5. [Gateway 客户端指南](docs/GATEWAY_CLIENT_GUIDE.md)
+4. [Service](docs/SERVICE_GUIDE.md)
+5. [Gateway 客户端指南](docs/SERVICE_GATEWAY_GUIDE.md)
 6. [InfoCenter HTTP](docs/INFOCENTER_HTTP.md)
 7. [Runtime 参数说明](docs/RUNTIME_PARAMETER_ANALYSIS.md)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Integration tests for multi-node service deployment client helpers."""
+"""Integration tests for multi-node V1 service deployment helpers."""
 
 from concurrent import futures
 import time

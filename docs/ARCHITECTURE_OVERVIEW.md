@@ -8,7 +8,7 @@
    - 真正对外的轻网络入口层
    - 推荐独立使用 `FastAPI/Flask + uvicorn/gunicorn`
 2. `Service Mode`
-   - 内部常驻函数服务层
+   - 常驻服务会话层
 3. `JobQueue Mode`
    - 大任务排队与单活调度层
    - `JobQueue` 默认先查 `InfoCenter` 找到唯一 `job-orchestrator` route，再直连它的 HTTP 数据面
@@ -18,9 +18,9 @@
 
 一句话概括：
 
-1. `Service Mode = 常驻函数服务层`
+1. `Service Mode = 常驻服务会话层`
 2. `JobQueue Mode = 大任务排队与单活调度层`
-3. `TaskPool Mode = 专属子任务执行层`
+3. `TaskPool Mode = 批量任务执行会话层`
 
 ## 2. 角色
 

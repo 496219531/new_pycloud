@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+"""Execution-focused tests for the V1 TaskPool implementation."""
+
+import asyncio
 import importlib
 import io
 import tarfile
@@ -731,7 +734,7 @@ def test_native_task_pool_session_imap_unordered_streams_results() -> None:
     )
 
     assert submitted == ["job-stream-task-0001", "job-stream-task-0002", "job-stream-task-0003"]
-    assert [task_id for task_id, _ in items] == submitted
+    assert [index for index, _ in items] == [0, 1, 2]
     assert materialized == submitted
     assert session._pending_task_ids == set()  # noqa: SLF001
 
@@ -1132,7 +1135,7 @@ def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
     mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, wait_ms=500, limit=100, job_id="", raise_on_error=False, task_ids=None)
 
 
-def test_native_task_pool_session_unordered_delegates_to_imap_unordered() -> None:
+def test_native_task_pool_session_unordered_rejects_legacy_control_params() -> None:
     from pycloud_parallel import TaskPool
 
     session = TaskPool(
@@ -1143,36 +1146,14 @@ def test_native_task_pool_session_unordered_delegates_to_imap_unordered() -> Non
     )
     payloads = [{"value": 1}, {"value": 2}]
 
-    with patch.object(
-        session,
-        "imap_unordered",
-        return_value=iter([("task-1", {"value": 1}), ("task-2", {"value": 2})]),
-    ) as mocked:
-        out = list(
+    with pytest.raises(TypeError):
+        list(
             session.unordered(
                 payloads,
                 max_in_flight=4,
                 receive_batch=2,
-                submit_timeout_sec=2.0,
-                result_timeout_sec=3.0,
-                wait_ms=20,
-                raise_on_error=False,
-                node_window_factor=1.5,
             )
         )
-
-    assert out == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
-    mocked.assert_called_once_with(
-        payloads,
-        task_method="",
-        max_in_flight=4,
-        receive_batch=2,
-        submit_timeout_sec=2.0,
-        result_timeout_sec=3.0,
-        wait_ms=20,
-        raise_on_error=False,
-        node_window_factor=1.5,
-    )
 
 
 def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
@@ -1185,11 +1166,11 @@ def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
         job_id="job-consume-unordered",
     )
     payloads = [{"value": 1}, {"value": 2}]
-    handled: list[tuple[str, object]] = []
+    handled: list[tuple[object, object]] = []
 
     with patch.object(
         session,
-        "unordered",
+        "imap_unordered",
         return_value=iter([("task-1", {"value": 1}), ("task-2", {"value": 2})]),
     ) as mocked:
         processed = session.consume_unordered(
@@ -1205,7 +1186,7 @@ def test_native_task_pool_session_consume_unordered_calls_handle() -> None:
         )
 
     assert processed == 2
-    assert handled == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
+    assert handled == [(0, {"value": 1}), (1, {"value": 2})]
     mocked.assert_called_once_with(
         payloads,
         task_method="",
@@ -1297,6 +1278,79 @@ def test_native_task_pool_session_collect_data_returns_none_on_failure_by_defaul
     assert out == [("task-fail", None)]
 
 
+def test_native_task_pool_session_aiter_items_supports_receiving_existing_results() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+            self._results = [
+                pb2.TaskResult(task_id="task-a", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1})),
+                pb2.TaskResult(task_id="task-b", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 2})),
+            ]
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._results[:limit]
+            self._results = self._results[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    async def _collect(session):
+        items = []
+        async for item in session.aiter_items(timeout_sec=0.1):
+            items.append(item)
+        return items
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-aiter-items",
+    )
+    session._pending_task_ids = {"task-a", "task-b"}  # noqa: SLF001
+
+    items = asyncio.run(_collect(session))
+    assert [item.task_id for item in items] == ["task-a", "task-b"]
+
+
+def test_native_task_pool_session_acollect_items_supports_receiving_existing_results() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+            self._results = [
+                pb2.TaskResult(task_id="task-a", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1})),
+                pb2.TaskResult(task_id="task-b", status=pb2.TASK_STATUS_FAILED_USER, error=pb2.TaskError(type="UserError", message="boom")),
+            ]
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._results[:limit]
+            self._results = self._results[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-acollect-items",
+    )
+    session._pending_task_ids = {"task-a", "task-b"}  # noqa: SLF001
+
+    items = asyncio.run(session.acollect_items(timeout_sec=0.1))
+    assert len(items) == 2
+    assert items[0].task_id == "task-a"
+    assert items[1].task_id == "task-b"
+    assert items[1].ok is False
+
+
 def test_native_task_pool_session_collect_data_raises_on_failure_when_enabled() -> None:
     from pycloud_parallel import TaskPool
 
@@ -1386,3 +1440,185 @@ def test_native_task_pool_proxy_call_waits_for_own_task_id() -> None:
     assert task_id == "task-own-1"
     assert result == {"value": 49}
     mocked_collect.assert_called_once_with({"task-own-1"}, timeout_sec=30.0)
+
+
+def test_native_task_pool_map_returns_none_on_failure() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+            self._ready: list[pb2.TaskResult] = []
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                if "0002" in item.task_id:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_FAILED_USER,
+                            error=pb2.TaskError(type="UserError", message="boom"),
+                        )
+                    )
+                else:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"value": item.task_id}),
+                        )
+                    )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-map-none",
+    )
+
+    out = session.map([1, 2, 3], arg_name="value", timeout_sec=0.1)
+    assert out[0] == {"value": "job-map-none-task-0001"}
+    assert out[1] is None
+    assert out[2] == {"value": "job-map-none-task-0003"}
+
+
+def test_native_task_pool_unordered_returns_index_and_result_or_none() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+            self._ready: list[pb2.TaskResult] = []
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                if "0002" in item.task_id:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_FAILED_INFRA,
+                            error=pb2.TaskError(type="InfraError", message="node lost"),
+                        )
+                    )
+                else:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"value": item.task_id}),
+                        )
+                    )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-unordered-batch",
+    )
+
+    out = list(session.unordered([{"value": 1}, {"value": 2}, {"value": 3}], timeout_sec=0.1))
+    assert sorted(out) == [
+        (0, {"value": "job-unordered-batch-task-0001"}),
+        (1, None),
+        (2, {"value": "job-unordered-batch-task-0003"}),
+    ]
+
+
+def test_native_task_pool_collect_items_batch_returns_execution_items_in_input_order() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+            self._ready: list[pb2.TaskResult] = []
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                self._ready.append(
+                    pb2.TaskResult(
+                        task_id=item.task_id,
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"value": item.task_id}),
+                    )
+                )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = list(reversed(self._ready[:limit]))
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-collect-items",
+    )
+
+    items = session.collect_items([{"value": 1}, {"value": 2}, {"value": 3}], timeout_sec=0.1)
+    assert [item.index for item in items] == [0, 1, 2]
+    assert [item.result for item in items] == [
+        {"value": "job-collect-items-task-0001"},
+        {"value": "job-collect-items-task-0002"},
+        {"value": "job-collect-items-task-0003"},
+    ]
+
+
+def test_native_task_pool_async_batch_helpers_exist() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-async-batch",
+    )
+
+    with patch.object(session, "map", return_value=[{"value": 1}, None]) as mocked_map, patch.object(
+        session,
+        "collect_items",
+        return_value=[],
+    ) as mocked_collect:
+        out = asyncio.run(session.amap([1, 2], timeout_sec=0.1))
+        collected = asyncio.run(session.acollect_items([{"value": 1}], timeout_sec=0.1))
+
+    assert out == [{"value": 1}, None]
+    assert collected == []
+    mocked_map.assert_called_once()
+    mocked_collect.assert_called_once()

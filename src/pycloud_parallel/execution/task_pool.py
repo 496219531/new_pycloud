@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import contextlib
+from dataclasses import replace
 import math
 import os
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
 from pycloud_parallel.controlplane.artifact import _normalize_artifact_input, _prepare_artifact
@@ -19,8 +20,8 @@ from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.serialization import serialize_inline_payload, struct_to_dict
-from pycloud_parallel.controlplane.task_backend import NativeTaskBackend, TaskPoolItem, _TaskPoolCallProxy
-from pycloud_parallel.execution.base import TaskExecutionSession
+from pycloud_parallel.controlplane.task_backend import NativeTaskBackend, _TaskPoolCallProxy
+from pycloud_parallel.execution.base import ExecutionItem, TaskExecutionSession
 from pycloud_parallel.execution.support import (
     _get_local_ip,
     _prepare_managed_globals_values_for_upload,
@@ -48,8 +49,35 @@ def _resolve_task_results_data(batch: Any, results: Sequence[pb2.TaskResult]) ->
     return [batch.fetch_result_data(item) for item in results]
 
 
+async def _aiter_from_sync_iterator(iterator) -> AsyncIterator[Any]:
+    loop = asyncio.get_running_loop()
+    sentinel = object()
+
+    def _next_item():
+        try:
+            return next(iterator)
+        except StopIteration:
+            return sentinel
+
+    while True:
+        item = await loop.run_in_executor(None, _next_item)
+        if item is sentinel:
+            return
+        yield item
+
+
+_LEGACY_TASKPOOL_UNORDERED_KWARGS = {
+    "receive_batch",
+    "submit_timeout_sec",
+    "result_timeout_sec",
+    "wait_ms",
+    "raise_on_error",
+    "node_window_factor",
+}
+
+
 class _TaskPoolSessionBase(TaskExecutionSession):
-    """Internal dedicated task-pool session backed by NodeControl task pool RPCs."""
+    """Internal task-pool execution session backed by NodeControl task-pool RPCs."""
 
     def __init__(
         self,
@@ -348,41 +376,150 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             self._buffered_result_items = kept
             return matched
 
-    def _task_result_to_item(self, node_id: str, task_result: pb2.TaskResult) -> TaskPoolItem:
+    def _task_result_to_item(self, node_id: str, task_result: pb2.TaskResult) -> ExecutionItem:
         resolved_node_id = str(self.nodes.get(node_id).node_id if node_id in self.nodes else node_id)
         if int(task_result.status) != int(pb2.TASK_STATUS_SUCCEEDED):
             error = task_result.error
-            return TaskPoolItem(
-                task_id=str(task_result.task_id or ""),
-                node_id=resolved_node_id,
-                node_instance_id=str(node_id),
+            return ExecutionItem(
+                index=-1,
                 ok=False,
-                status=int(task_result.status),
-                data=None,
+                result=None,
                 error_type=str(error.type or ""),
                 error_message=str(error.message or f"task failed: {task_result.task_id}"),
+                node_id=resolved_node_id,
+                key=str(task_result.task_id or ""),
+                status=int(task_result.status),
+                task_id=str(task_result.task_id or ""),
+                node_instance_id=str(node_id),
             )
         try:
             data = self._pools[node_id]._client.fetch_result_data(task_result)  # noqa: SLF001
-            return TaskPoolItem(
-                task_id=str(task_result.task_id or ""),
-                node_id=resolved_node_id,
-                node_instance_id=str(node_id),
+            return ExecutionItem(
+                index=-1,
                 ok=True,
+                result=data,
+                node_id=resolved_node_id,
+                key=str(task_result.task_id or ""),
                 status=int(task_result.status),
-                data=data,
+                task_id=str(task_result.task_id or ""),
+                node_instance_id=str(node_id),
             )
         except Exception as exc:
-            return TaskPoolItem(
-                task_id=str(task_result.task_id or ""),
-                node_id=resolved_node_id,
-                node_instance_id=str(node_id),
+            return ExecutionItem(
+                index=-1,
                 ok=False,
-                status=int(task_result.status),
-                data=None,
+                result=None,
                 error_type=exc.__class__.__name__,
                 error_message=str(exc),
+                node_id=resolved_node_id,
+                key=str(task_result.task_id or ""),
+                status=int(task_result.status),
+                task_id=str(task_result.task_id or ""),
+                node_instance_id=str(node_id),
             )
+
+    def _merge_payloads_with_shared_kwargs(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        shared_kwargs: Optional[Dict[str, object]] = None,
+    ) -> List[Dict[str, object]]:
+        shared = dict(shared_kwargs or {})
+        merged: List[Dict[str, object]] = []
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                raise TypeError("payloads must be mapping payloads")
+            merged.append({**dict(payload), **shared})
+        return merged
+
+    def _item_with_index(self, item: ExecutionItem, *, index: int, key: Union[int, str]) -> ExecutionItem:
+        return replace(item, index=int(index), key=key)
+
+    def _submit_indexed_payloads(
+        self,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        task_method: str = "",
+    ) -> Tuple[Set[str], Dict[str, int], List[ExecutionItem]]:
+        if self._closed:
+            raise RuntimeError("task pool session is closed")
+        normalized_method = str(task_method or self._task_method).strip() or self._task_method
+        self._ensure_method(normalized_method)
+        grouped: Dict[str, List[Tuple[int, pb2.TaskSubmitItem]]] = {}
+        index_by_task_id: Dict[str, int] = {}
+        for idx, payload in enumerate(payloads):
+            target_node_id = self._select_pool_node()
+            item = self._build_task_submit_item(
+                node_id=target_node_id,
+                payload=dict(payload or {}),
+                timeout_hint_sec=0,
+                priority=1,
+            )
+            grouped.setdefault(target_node_id, []).append((idx, item))
+            index_by_task_id[str(item.task_id)] = idx
+
+        accepted_task_ids: Set[str] = set()
+        rejected_items: List[ExecutionItem] = []
+        for node_id, entries in grouped.items():
+            resp = self._submit_task_items_to_node(
+                node_id,
+                [item for _idx, item in entries],
+                job_id=self.job_id,
+            )
+            accepted_ids = {str(item.task_id) for item in resp.accepted if str(item.task_id).strip()}
+            accepted_task_ids.update(accepted_ids)
+            for rejected in resp.rejected:
+                task_id = str(rejected.task_id or "").strip()
+                index = int(index_by_task_id.get(task_id, -1))
+                rejected_items.append(
+                    ExecutionItem(
+                        index=index,
+                        ok=False,
+                        result=None,
+                        error_type="TaskRejected",
+                        error_message=str(rejected.message or "task rejected"),
+                        node_id="",
+                        key=task_id or index,
+                        task_id=task_id,
+                    )
+                )
+        return accepted_task_ids, index_by_task_id, rejected_items
+
+    def _iter_batch_items(
+        self,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        timeout_sec: float = 30.0,
+    ) -> Iterator[ExecutionItem]:
+        items = list(payloads)
+        if not items:
+            return iter(())
+
+        def _generator() -> Iterator[ExecutionItem]:
+            chunk_size = max(1, int(max_in_flight or 1))
+            for start in range(0, len(items), chunk_size):
+                chunk = items[start : start + chunk_size]
+                accepted_task_ids, index_by_task_id, rejected_items = self._submit_indexed_payloads(
+                    chunk,
+                    task_method=task_method,
+                )
+                for item in rejected_items:
+                    yield self._item_with_index(item, index=(start + int(item.index)), key=str(item.task_id or item.key))
+                if not accepted_task_ids:
+                    continue
+                for item in self._iter_received_items(
+                    max_count=len(accepted_task_ids),
+                    timeout_sec=timeout_sec,
+                    task_ids=set(accepted_task_ids),
+                ):
+                    task_id = str(item.task_id or "")
+                    local_index = int(index_by_task_id.get(task_id, -1))
+                    global_index = start + local_index if local_index >= 0 else -1
+                    yield self._item_with_index(item, index=global_index, key=task_id or global_index)
+
+        return _generator()
 
     def _iter_result_items(
         self,
@@ -569,7 +706,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         unique = {digest for digest in digests.values() if str(digest).strip()}
         return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()))
 
-    def iter_items(
+    def _iter_received_items(
         self,
         *,
         max_count: Optional[int] = None,
@@ -578,8 +715,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
-    ) -> Iterator[TaskPoolItem]:
-        self._assert_session_available("iter_items")
+    ) -> Iterator[ExecutionItem]:
         for node_id, task_result in self._iter_result_items(
             max_count=max_count,
             timeout_sec=timeout_sec,
@@ -590,24 +726,134 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         ):
             yield self._task_result_to_item(node_id, task_result)
 
-    def collect_items(
+    def iter_items(
         self,
+        payloads: Optional[Iterable[Dict[str, object]]] = None,
         *,
-        max_count: Optional[int] = None,
+        task_method: str = "",
+        max_in_flight: int = 32,
         timeout_sec: float = 30.0,
+        max_count: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
-    ) -> List[TaskPoolItem]:
-        return list(
-            self.iter_items(
+        **shared_kwargs,
+    ) -> Iterator[ExecutionItem]:
+        """Iterate task results as structured items.
+
+        When ``payloads is None``, this only consumes already-submitted results from the current
+        session. When ``payloads`` is provided, this submits that batch and yields `ExecutionItem`
+        objects for the batch.
+        """
+        self._assert_session_available("iter_items")
+        if payloads is None:
+            yield from self._iter_received_items(
                 max_count=max_count,
                 timeout_sec=timeout_sec,
                 wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
                 task_ids=task_ids,
+            )
+            return
+        normalized_payloads = self._merge_payloads_with_shared_kwargs(payloads, shared_kwargs=dict(shared_kwargs))
+        yield from self._iter_batch_items(
+            normalized_payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            timeout_sec=timeout_sec,
+        )
+
+    def collect_items(
+        self,
+        payloads: Optional[Iterable[Dict[str, object]]] = None,
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        timeout_sec: float = 30.0,
+        max_count: Optional[int] = None,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        task_ids: Optional[Set[str]] = None,
+        **shared_kwargs,
+    ) -> List[ExecutionItem]:
+        items = list(
+            self.iter_items(
+                payloads,
+                task_method=task_method,
+                max_in_flight=max_in_flight,
+                max_count=max_count,
+                timeout_sec=timeout_sec,
+                wait_ms=wait_ms,
+                limit=limit,
+                job_id=job_id,
+                task_ids=task_ids,
+                **shared_kwargs,
+            )
+        )
+        if payloads is None:
+            return items
+        return sorted(items, key=lambda item: int(item.index))
+
+    async def aiter_items(
+        self,
+        payloads: Optional[Iterable[Dict[str, object]]] = None,
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        timeout_sec: float = 30.0,
+        max_count: Optional[int] = None,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        task_ids: Optional[Set[str]] = None,
+        **shared_kwargs,
+    ) -> AsyncIterator[ExecutionItem]:
+        """Async counterpart of :meth:`iter_items` with the same dual-mode semantics."""
+        iterator = self.iter_items(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            timeout_sec=timeout_sec,
+            max_count=max_count,
+            wait_ms=wait_ms,
+            limit=limit,
+            job_id=job_id,
+            task_ids=task_ids,
+            **shared_kwargs,
+        )
+        async for item in _aiter_from_sync_iterator(iterator):
+            yield item
+
+    async def acollect_items(
+        self,
+        payloads: Optional[Iterable[Dict[str, object]]] = None,
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        timeout_sec: float = 30.0,
+        max_count: Optional[int] = None,
+        wait_ms: int = 500,
+        limit: int = 100,
+        job_id: str = "",
+        task_ids: Optional[Set[str]] = None,
+        **shared_kwargs,
+    ) -> List[ExecutionItem]:
+        """Async counterpart of :meth:`collect_items` with the same dual-mode semantics."""
+        return await asyncio.to_thread(
+            lambda: self.collect_items(
+                payloads,
+                task_method=task_method,
+                max_in_flight=max_in_flight,
+                timeout_sec=timeout_sec,
+                max_count=max_count,
+                wait_ms=wait_ms,
+                limit=limit,
+                job_id=job_id,
+                task_ids=task_ids,
+                **shared_kwargs,
             )
         )
 
@@ -694,7 +940,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         wait_ms: int = 500,
         raise_on_error: bool = True,
         node_window_factor: float = 2.0,
-    ) -> Iterator[Tuple[str, Any]]:
+    ) -> Iterator[Tuple[int, Any]]:
         if self._backend is not None:
             yield from self._backend.imap_unordered(
                 payloads,
@@ -717,9 +963,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             max_receive = max(1, int(receive_batch or 1))
             window_factor = max(0.1, float(node_window_factor or 0.0))
             payload_iter = iter(payloads)
-            retry_payloads: "deque[Dict[str, object]]" = deque()
+            retry_payloads: "deque[Tuple[int, Dict[str, object]]]" = deque()
             input_exhausted = False
-            ready_items: "deque[TaskPoolItem]" = deque()
+            ready_items: "deque[ExecutionItem]" = deque()
+            next_payload_index = 0
+            task_index_by_id: Dict[str, int] = {}
             node_ids = list(self._pools.keys())
             if not node_ids:
                 raise RuntimeError("task pool has no node pools")
@@ -771,21 +1019,25 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         break
                 return planned
 
-            def _next_payload() -> Optional[Dict[str, object]]:
-                nonlocal input_exhausted
+            def _next_payload() -> Optional[Tuple[int, Dict[str, object]]]:
+                nonlocal input_exhausted, next_payload_index
                 if retry_payloads:
-                    return dict(retry_payloads.popleft() or {})
+                    index, payload = retry_payloads.popleft()
+                    return int(index), dict(payload or {})
                 if input_exhausted:
                     return None
                 try:
-                    return dict(next(payload_iter) or {})
+                    payload = dict(next(payload_iter) or {})
+                    index = next_payload_index
+                    next_payload_index += 1
+                    return index, payload
                 except StopIteration:
                     input_exhausted = True
                     return None
 
-            def _requeue_payloads_front(items: Sequence[Tuple[Dict[str, object], pb2.TaskSubmitItem]]) -> None:
-                for payload, _item in reversed(list(items)):
-                    retry_payloads.appendleft(dict(payload or {}))
+            def _requeue_payloads_front(items: Sequence[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]) -> None:
+                for index, payload, _item in reversed(list(items)):
+                    retry_payloads.appendleft((int(index), dict(payload or {})))
 
             def _fill_from_quota(
                 available_by_node: Dict[str, int],
@@ -806,18 +1058,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 targets = _plan_targets(capped_by_node, node_order=node_order, max_new_tasks=available_global)
                 if not targets:
                     return 0
-                grouped: Dict[str, List[Tuple[Dict[str, object], pb2.TaskSubmitItem]]] = {}
+                grouped: Dict[str, List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]] = {}
                 for node_id in targets:
-                    payload = _next_payload()
-                    if payload is None:
+                    indexed_payload = _next_payload()
+                    if indexed_payload is None:
                         break
+                    index, payload = indexed_payload
                     item = self._build_task_submit_item(
                         node_id=node_id,
                         payload=payload,
                         timeout_hint_sec=0,
                         priority=1,
                     )
-                    grouped.setdefault(node_id, []).append((payload, item))
+                    task_index_by_id[str(item.task_id)] = int(index)
+                    grouped.setdefault(node_id, []).append((int(index), payload, item))
                 submitted = 0
                 for node_id in node_order:
                     entries = grouped.get(node_id, [])
@@ -826,7 +1080,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     try:
                         resp = self._submit_task_items_to_node(
                             node_id,
-                            [item for _payload, item in entries],
+                            [item for _index, _payload, item in entries],
                             job_id=self.job_id,
                         )
                     except Exception as exc:
@@ -839,9 +1093,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         _requeue_payloads_front(entries)
                         continue
                     accepted_count = 0
-                    rejected_entries: List[Tuple[Dict[str, object], pb2.TaskSubmitItem]] = []
+                    rejected_entries: List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]] = []
                     for entry in entries:
-                        if str(entry[1].task_id) in accepted_ids:
+                        if str(entry[2].task_id) in accepted_ids:
                             accepted_count += 1
                         else:
                             rejected_entries.append(entry)
@@ -867,9 +1121,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                                     self.cancel_job(reason="imap_unordered task failure", job_id=self.job_id)
                                 cancelled_for_error = True
                             raise RuntimeError(item.error_message or f"task failed: {item.task_id}")
-                        yield item.task_id, None
+                        yield item.index, None
                     else:
-                        yield item.task_id, item.data
+                        yield item.index, item.data
                     yielded += 1
                 if yielded > 0:
                     continue
@@ -893,7 +1147,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
                 ordered_node_ids = node_ids[poll_start_idx:] + node_ids[:poll_start_idx]
                 poll_start_idx = (poll_start_idx + 1) % len(node_ids)
-                completed_items: List[TaskPoolItem] = []
+                completed_items: List[ExecutionItem] = []
                 freed_by_node: Dict[str, int] = {}
                 completion_order: List[str] = []
                 for node_id in ordered_node_ids:
@@ -921,7 +1175,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                                 disabled_submit_nodes.add(node_id)
                         elif int(result.status) == int(pb2.TASK_STATUS_SUCCEEDED):
                             infra_failures_by_node.pop(node_id, None)
-                        completed_items.append(self._task_result_to_item(node_id, result))
+                        item = self._task_result_to_item(node_id, result)
+                        index = int(task_index_by_id.get(normalized, -1))
+                        completed_items.append(self._item_with_index(item, index=index, key=index if index >= 0 else normalized))
 
                 if completed_items:
                     wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
@@ -955,51 +1211,74 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         max_in_flight: int = 32,
-        receive_batch: int = 1,
-        submit_timeout_sec: float = 60.0,
-        result_timeout_sec: float = 30.0,
-        wait_ms: int = 500,
-        raise_on_error: bool = True,
-        node_window_factor: float = 2.0,
-    ) -> Iterator[Tuple[str, Any]]:
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> Iterator[Tuple[int, Any]]:
+        """Yield ``(index, result_or_none)`` in completion order for a submitted batch."""
+        forbidden = sorted(_LEGACY_TASKPOOL_UNORDERED_KWARGS.intersection(shared_kwargs))
+        if forbidden:
+            raise TypeError(
+                f"TaskPool.unordered() no longer accepts low-level control args: {', '.join(forbidden)}; "
+                "use TaskPool.imap_unordered() for low-level streaming controls"
+            )
         if self._backend is not None:
             yield from self._backend.unordered(
                 payloads,
                 task_method=task_method,
                 max_in_flight=max_in_flight,
-                receive_batch=receive_batch,
-                submit_timeout_sec=submit_timeout_sec,
-                result_timeout_sec=result_timeout_sec,
-                wait_ms=wait_ms,
-                raise_on_error=raise_on_error,
-                node_window_factor=node_window_factor,
+                timeout_sec=timeout_sec,
+                **shared_kwargs,
             )
             return
-        yield from self.imap_unordered(
+        for item in self.iter_items(
             payloads,
             task_method=task_method,
             max_in_flight=max_in_flight,
-            receive_batch=receive_batch,
-            submit_timeout_sec=submit_timeout_sec,
-            result_timeout_sec=result_timeout_sec,
-            wait_ms=wait_ms,
-            raise_on_error=raise_on_error,
-            node_window_factor=node_window_factor,
-        )
+            timeout_sec=timeout_sec,
+            **shared_kwargs,
+        ):
+            yield item.index, item.result if item.ok else None
+
+    async def aunordered(
+        self,
+        payloads: Iterable[Dict[str, object]],
+        *,
+        task_method: str = "",
+        max_in_flight: int = 32,
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> AsyncIterator[Tuple[int, Any]]:
+        """Async counterpart of :meth:`unordered` with the same return shape."""
+        forbidden = sorted(_LEGACY_TASKPOOL_UNORDERED_KWARGS.intersection(shared_kwargs))
+        if forbidden:
+            raise TypeError(
+                f"TaskPool.aunordered() no longer accepts low-level control args: {', '.join(forbidden)}; "
+                "use TaskPool.imap_unordered() for low-level streaming controls"
+            )
+        async for item in self.aiter_items(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max_in_flight,
+            timeout_sec=timeout_sec,
+            **shared_kwargs,
+        ):
+            yield item.index, item.result if item.ok else None
 
     def consume_unordered(
         self,
         payloads: Iterable[Dict[str, object]],
         *,
-        handle: Callable[[str, Any], Any],
+        handle: Callable[[int, Any], Any],
         task_method: str = "",
         max_in_flight: int = 32,
+        timeout_sec: float = 30.0,
         receive_batch: int = 1,
         submit_timeout_sec: float = 60.0,
         result_timeout_sec: float = 30.0,
         wait_ms: int = 500,
         raise_on_error: bool = True,
         node_window_factor: float = 2.0,
+        **shared_kwargs,
     ) -> int:
         if self._backend is not None:
             return int(
@@ -1008,18 +1287,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     handle=handle,
                     task_method=task_method,
                     max_in_flight=max_in_flight,
+                    timeout_sec=timeout_sec,
                     receive_batch=receive_batch,
                     submit_timeout_sec=submit_timeout_sec,
                     result_timeout_sec=result_timeout_sec,
                     wait_ms=wait_ms,
                     raise_on_error=raise_on_error,
                     node_window_factor=node_window_factor,
+                    **shared_kwargs,
                 )
             )
         if not callable(handle):
             raise TypeError("handle must be callable")
         processed = 0
-        for task_id, result in self.unordered(
+        for task_id, result in self.imap_unordered(
             payloads,
             task_method=task_method,
             max_in_flight=max_in_flight,
@@ -1030,7 +1311,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             raise_on_error=raise_on_error,
             node_window_factor=node_window_factor,
         ):
-            handle(task_id, result)
+            index: Union[int, str] = task_id
+            if isinstance(task_id, str) and task_id.rsplit("-", 1)[-1].isdigit():
+                index = max(0, int(task_id.rsplit("-", 1)[-1]) - 1)
+            handle(index, result)
             processed += 1
         return processed
 
@@ -1051,8 +1335,33 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 timeout_sec=timeout_sec,
                 **shared_kwargs,
             )
-        resp = self.submit_values(values, arg_name=arg_name, task_method=task_method, **shared_kwargs)
-        return self.wait_for_data(expected_count=len(resp.accepted), timeout_sec=timeout_sec)
+        payloads = [{str(arg_name or "value").strip() or "value": value, **dict(shared_kwargs)} for value in values]
+        items = self.collect_items(
+            payloads,
+            task_method=task_method,
+            max_in_flight=max(1, len(payloads) or 1),
+            timeout_sec=timeout_sec,
+        )
+        return [item.result if item.ok else None for item in items]
+
+    async def amap(
+        self,
+        values: Sequence[Any],
+        *,
+        arg_name: str = "value",
+        task_method: str = "",
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> Sequence[Any]:
+        return await asyncio.to_thread(
+            lambda: self.map(
+                values,
+                arg_name=arg_name,
+                task_method=task_method,
+                timeout_sec=timeout_sec,
+                **shared_kwargs,
+            )
+        )
 
     def cancel_job(
         self,
@@ -1357,6 +1666,7 @@ class TaskPool(_TaskPoolSessionBase):
         node_limit: int = 100,
         timeout_sec: float = 10.0,
     ) -> "TaskPool":
+        """Low-level entry; prefer ``TaskPool.open(...)``."""
         return _build_task_pool_from_infocenter(
             cls,
             infocenter_target=infocenter_target,

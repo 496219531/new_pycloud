@@ -68,6 +68,8 @@ with TaskPool.open(
 3. `JobQueue` 会先向 `InfoCenter / controlplane` 查询 `job-orchestrator` route，再直连它自己的 HTTP 数据面
 4. job 排到后，再自动创建 `TaskPool`
 
+这里更适合把 `JobQueue` 理解成“排队与单活编排入口”，而不是单纯的客户端 helper。
+
 最小示例：
 
 ```python
@@ -96,7 +98,7 @@ client.submit(
 4. `update_globals(...)`
    - 可选
    - 只负责在 job-orch 端生成共享数据 `dict`
-5. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+5. `handle_result(index, result, state=..., ...)` / `handle_data(...)`
    - 可选
    - 每个结果到达时增量更新状态
 6. `finalize(state=..., ...)`
@@ -249,23 +251,33 @@ for item in pool.iter_items(timeout_sec=10.0):
 4. `iter_data(...) / collect_data(...)` 遇到失败结果会抛异常
 5. `iter_items(...) / collect_items(...)` 会把成功/失败都显式返回给你
 
-如果你想边准备数据、边 submit、边接收结果，推荐直接用：
+如果你想边准备数据、边 submit、边接收结果，推荐直接用公开统一接口：
 
 ```python
-for task_id, data in pool.unordered(
+for index, data in pool.unordered(
+    payloads,
+    max_in_flight=32,
+):
+    print(index, data)
+```
+
+如果你需要低层流控参数，比如 `receive_batch / result_timeout_sec / wait_ms`，请显式使用：
+
+```python
+for index, data in pool.imap_unordered(
     payloads,
     max_in_flight=32,
     receive_batch=4,
     result_timeout_sec=30.0,
 ):
-    print(task_id, data)
+    print(index, data)
 ```
 
 如果你希望边收结果边执行收尾逻辑，也可以直接：
 
 ```python
-def handle(task_id, result):
-    print(task_id, result)
+def handle(index, result):
+    print(index, result)
 
 processed = pool.consume_unordered(
     payloads,
@@ -281,10 +293,14 @@ print(processed)
 
 1. `max_in_flight`
    - 最多同时保留多少个已提交但未返回的任务
-2. `receive_batch`
-   - 每轮最多接收多少条结果
-3. 结果一到就立即 yield，不需要等整批任务全部结束
-4. `unordered(...)` / `imap_unordered(...)` / `consume_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
+2. `unordered(...)` / `aunordered(...)`
+   - 返回 `(index, result_or_none)`
+   - 不再接受低层流控参数
+3. `imap_unordered(...)`
+   - 返回 `(index, result_or_none)`
+   - 但仍保留 `receive_batch / result_timeout_sec / wait_ms` 这类低层流控能力
+4. 结果一到就立即 yield，不需要等整批任务全部结束
+5. `unordered(...)` / `aunordered(...)` / `imap_unordered(...)` / `consume_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
 
 ## 4. 结果语义
 
@@ -316,8 +332,9 @@ print(processed)
 
 最终目标保持：
 
-1. `TaskPool` 是唯一执行内核
-2. `Service` 与 `JobQueue` 都建立在 `TaskPool` 之上
+1. `TaskPool` 是批量任务执行会话，不再单独宣称为“唯一执行内核”
+2. `Service` 与 `TaskPool` 共享 `ExecutorHost + ExecutionSession` 底座，但保留两类兄弟会话类型
+3. `JobQueue` 仍建立在 `TaskPool` 之上
 
 ## 7. 已移除
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""InfoCenter state backend extracted from the legacy state compatibility layer."""
+"""InfoCenter state backend."""
 
 import threading
 from datetime import datetime, timedelta

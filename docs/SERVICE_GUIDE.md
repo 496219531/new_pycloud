@@ -1,14 +1,14 @@
 # Service
 
-`Service` 当前更适合被理解为“owner 侧部署内部常驻函数服务”的入口。
+`Service` 当前更适合被理解为“owner 侧部署内部常驻服务会话”的入口。
 
 它的定位是：
 
-1. 内部 RPC / 内部函数服务层
+1. 内部 RPC / 内部服务会话层
 2. 稳定可寻址的常驻服务实例
 3. 不是标准 ASGI/WSGI Web 服务运行时
 
-如果你需要真正对外的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`，再在业务层调用这里的服务实例。
+如果你需要真正对外的轻网络服务，建议独立使用 `FastAPI/Flask + uvicorn/gunicorn`，再在业务层调用这里的服务会话。
 
 它面向 owner 侧，职责是：
 
@@ -147,6 +147,51 @@ results = await group.square.broadcast(x=7)
 result = await group.call("square", x=7)
 result = group.call_sync("square", x=7)
 ```
+
+### 3.5 轻量批量 RPC
+
+connected `Service` 现在支持轻量批量 RPC 辅助能力：
+
+```python
+svc = Service.connect(
+    target="127.0.0.1:50051",
+    service_name="square-service",
+    transport="gateway",
+)
+
+results = svc.square.map([1, 2, 3], arg_name="x")
+print(results)
+
+for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in_flight=3):
+    print(index, result)
+
+# async 场景可选使用 amap(...) / aunordered(...)；
+# 当前更推荐把它们理解成进阶能力，而不是 service 主调用路径
+# results = await svc.square.amap([1, 2, 3], arg_name="x")
+# async for index, result in svc.square.aunordered([{"x": 1}, {"x": 2}], max_in_flight=2):
+#     ...
+
+# 需要完整错误信息时，使用 iter_items / collect_items
+# for item in svc.square.iter_items([{"x": 1}, {"x": 2}], max_in_flight=2):
+#     print(item.index, item.ok, item.result, item.error_message)
+```
+
+说明：
+
+1. `map(...)`
+   - 并发发多个 RPC
+   - 返回顺序与输入顺序一致
+   - 某一项失败时该位置返回 `None`
+   - 异步场景可选使用 `amap(...)`
+2. `unordered(...)`
+   - 谁先返回谁先 yield
+   - yield 形状固定为 `(index, result_or_none)`
+   - 同步消费用 `unordered(...)`，异步消费可选 `aunordered(...)`
+3. `iter_items(...) / collect_items(...)`
+   - 返回完整 `ExecutionItem`
+   - 适合错误排查、重试和审计
+4. 这是 **RPC 批量调用辅助能力**
+5. 它不是 `TaskPool` 的任务模型，不会引入 `task_id / job_id / result cursor`
 
 ## 4. 当前导出模型
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Internal data-store facade for uploaded objects and spilled results."""
+"""Internal data-store interface for uploaded objects and spilled results."""
 
 from dataclasses import dataclass
 from pathlib import Path

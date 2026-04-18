@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""HTTP gateway for service-mode callers."""
+"""HTTP gateway for service-mode transport requests."""
 
 import errno
 import ipaddress

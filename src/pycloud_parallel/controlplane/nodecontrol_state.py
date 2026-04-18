@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""NodeControl state backend extracted from the legacy state compatibility layer."""
+"""NodeControl state backend."""
 
 import contextlib
 import hashlib

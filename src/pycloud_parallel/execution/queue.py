@@ -101,7 +101,9 @@ class _JobOrchestratorDiscoveryClient:
         tried: Set[str] = set()
         routes = self._list_routes(service_name=name)
         if not routes:
-            raise RuntimeError(f"no available route for service_name={name}")
+            raise RuntimeError(
+                f"JobQueue could not find a running job-orchestrator route for service_name={name!r}"
+            )
 
         last_exc: Optional[Exception] = None
         for route in routes:
@@ -124,7 +126,9 @@ class _JobOrchestratorDiscoveryClient:
 
         if last_exc is not None:
             raise RuntimeError(str(last_exc)) from last_exc
-        raise RuntimeError(f"no available route for service_name={name}")
+        raise RuntimeError(
+            f"JobQueue could not find a usable job-orchestrator route for service_name={name!r}"
+        )
 
 
 class QueueServiceClient:

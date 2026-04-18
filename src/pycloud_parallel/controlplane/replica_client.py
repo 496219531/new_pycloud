@@ -213,7 +213,7 @@ class NativeTaskPoolClient:
 
 @dataclass
 class ServiceSessionClient:
-    """Low-level client-side service session handle."""
+    """Low-level handle for one deployed service-session replica."""
 
     kind: str = field(init=False, default="service")
     _client: Any = field(repr=False)

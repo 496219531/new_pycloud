@@ -161,7 +161,7 @@ def _serialize_upload_object_requests_from_file(
 
 
 class NodeControlClient:
-    """Thin gRPC client wrapper for NodeControl service."""
+    """Low-level gRPC transport client for the NodeControl service."""
 
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
         self.target = target

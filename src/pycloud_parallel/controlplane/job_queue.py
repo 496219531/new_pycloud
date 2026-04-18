@@ -1243,7 +1243,7 @@ class JobQueueManager:
                 current_state = self._jobs.get(job_id)
                 if current_state is not None:
                     current_state.checkpoint["phase"] = "running_tasks"
-            stream = executor.unordered(
+            stream = executor.imap_unordered(
                 _payload_stream(),
                 max_in_flight=max(1, int(payload.get("max_in_flight", 100) or 100)),
                 receive_batch=max(1, int(payload.get("receive_batch", 10) or 10)),
@@ -1253,7 +1253,8 @@ class JobQueueManager:
                 raise_on_error=True,
                 node_window_factor=float(payload.get("node_window_factor", 2.0) or 2.0),
             )
-            for task_id, result in stream:
+            for task_index, result in stream:
+                result_index = int(task_index)
                 with self._lock:
                     current_state = self._jobs.get(job_id)
                     cancel_requested = bool(current_state.cancel_requested) if current_state is not None else False
@@ -1265,7 +1266,7 @@ class JobQueueManager:
                     break
                 rendered_results.append(
                     {
-                        "task_id": str(task_id),
+                        "index": result_index,
                         "job_id": job_id_snapshot,
                         "status": int(pb2.TASK_STATUS_SUCCEEDED),
                         "status_text": pb2.TaskStatus.Name(pb2.TASK_STATUS_SUCCEEDED),
@@ -1278,10 +1279,10 @@ class JobQueueManager:
                         state_obj.setdefault("results", [])
                         results_bucket = state_obj.get("results")
                         if isinstance(results_bucket, list):
-                            results_bucket.append({"task_id": str(task_id), "result": result})
+                            results_bucket.append({"index": result_index, "result": result})
                 else:
                     returned_state = handle_result(
-                        str(task_id),
+                        result_index,
                         result,
                         state=state_obj,
                         job_payload=dict(hook_kwargs),
@@ -1296,7 +1297,7 @@ class JobQueueManager:
                         current_state.results = list(rendered_results)
                         current_state.checkpoint = {
                             "processed": len(rendered_results),
-                            "current_task_id": str(task_id),
+                            "current_index": result_index,
                         }
 
             final_result = state_obj

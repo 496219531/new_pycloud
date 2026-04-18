@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Tests for the V1 task-pool-facing API helpers."""
+
 from types import SimpleNamespace
 
 

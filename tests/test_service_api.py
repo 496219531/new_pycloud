@@ -1,4 +1,4 @@
-"""测试 OwnerServiceFacade 的模块化调用功能。"""
+"""Tests for the V1 service-facing API surface."""
 
 import asyncio
 import importlib
@@ -90,6 +90,112 @@ class TestCallProxy:
         assert new_proxy._timeout_sec == 30.0
         assert new_proxy._strategy == "round_robin"
         assert new_proxy._method == "square"
+
+    def test_map_delegates_to_group_batch_map(self):
+        """测试 map 会委托给 group.map_calls。"""
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        mock_group.map_calls = MagicMock(return_value=[{"value": 1}, {"value": 4}])
+        proxy = _CallProxy("square", mock_group)
+
+        result = proxy.map([1, 2], arg_name="x")
+
+        assert result == [{"value": 1}, {"value": 4}]
+        mock_group.map_calls.assert_called_once()
+
+    def test_amap_delegates_to_group_async_batch_map(self):
+        """测试 amap 会委托给 group.amap_calls。"""
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = AsyncMock()
+        mock_group.amap_calls = AsyncMock(return_value=[{"value": 1}, {"value": 4}])
+        proxy = _CallProxy("square", mock_group)
+
+        async def _run():
+            return await proxy.amap([1, 2], arg_name="x")
+
+        result = asyncio.run(_run())
+
+        assert result == [{"value": 1}, {"value": 4}]
+        mock_group.amap_calls.assert_awaited_once()
+
+    def test_unordered_returns_stream_object(self):
+        """测试 unordered 返回同步可迭代流对象。"""
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        stream = proxy.unordered([{"x": 1}, {"x": 2}], max_in_flight=2)
+
+        assert hasattr(stream, "__iter__")
+        assert not hasattr(stream, "__aiter__")
+
+    def test_aunordered_returns_async_iterable_stream_object(self):
+        """测试 aunordered 返回异步可迭代流对象。"""
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        stream = proxy.aunordered([{"x": 1}, {"x": 2}], max_in_flight=2)
+
+        assert hasattr(stream, "__aiter__")
+        assert not hasattr(stream, "__iter__")
+
+    def test_iter_items_returns_sync_iterable_stream_object(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        stream = proxy.iter_items([{"x": 1}, {"x": 2}], max_in_flight=2)
+
+        assert hasattr(stream, "__iter__")
+        assert not hasattr(stream, "__aiter__")
+
+    def test_aiter_items_returns_async_iterable_stream_object(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+
+        stream = proxy.aiter_items([{"x": 1}, {"x": 2}], max_in_flight=2)
+
+        assert hasattr(stream, "__aiter__")
+        assert not hasattr(stream, "__iter__")
+
+    def test_collect_items_delegates_to_group_collect_item_calls(self):
+        from pycloud_parallel.execution.base import ExecutionItem
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        mock_group.collect_item_calls = MagicMock(return_value=[ExecutionItem(index=0, ok=True, result={"value": 1})])
+        proxy = _CallProxy("square", mock_group)
+
+        result = proxy.collect_items([{"x": 1}])
+
+        assert len(result) == 1
+        assert result[0].result == {"value": 1}
+        mock_group.collect_item_calls.assert_called_once()
+
+    def test_acollect_items_delegates_to_group_acollect_item_calls(self):
+        from pycloud_parallel.execution.base import ExecutionItem
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = AsyncMock()
+        mock_group.acollect_item_calls = AsyncMock(return_value=[ExecutionItem(index=0, ok=True, result={"value": 1})])
+        proxy = _CallProxy("square", mock_group)
+
+        async def _run():
+            return await proxy.acollect_items([{"x": 1}])
+
+        result = asyncio.run(_run())
+
+        assert len(result) == 1
+        assert result[0].result == {"value": 1}
+        mock_group.acollect_item_calls.assert_awaited_once()
 
     def test_async_call(self):
         """测试异步调用。"""

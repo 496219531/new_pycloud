@@ -196,14 +196,14 @@ def _resolve_public_target_arg(
 ) -> str:
     remaining_kwargs = kwargs if kwargs is not None else {}
     normalized_target = str(target or "").strip()
-    legacy_target = str(remaining_kwargs.pop("infocenter_target", "") or "").strip()
-    if normalized_target and legacy_target and normalized_target != legacy_target:
+    compatibility_target = str(remaining_kwargs.pop("infocenter_target", "") or "").strip()
+    if normalized_target and compatibility_target and normalized_target != compatibility_target:
         label = str(action_name or "public API").strip()
         raise ValueError(
             f"{label} received both target={normalized_target!r} and "
-            f"infocenter_target={legacy_target!r}; please pass only target"
+            f"infocenter_target={compatibility_target!r}; please pass only target"
         )
-    effective_target = normalized_target or legacy_target
+    effective_target = normalized_target or compatibility_target
     if effective_target:
         return effective_target
     label = str(action_name or "public API").strip()

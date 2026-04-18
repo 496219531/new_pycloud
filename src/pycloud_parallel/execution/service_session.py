@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 import json
 import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from pycloud_parallel.controlplane.artifact import (
     Artifact,
@@ -42,7 +43,7 @@ from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
-from pycloud_parallel.execution.base import ServiceExecutionSession
+from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.support import (
     _DEFAULT_EXPORT_DECORATOR,
@@ -286,6 +287,196 @@ def _acquire_service_session_lock_with_retry(
             if wait_timeout <= 0.0 or time.monotonic() >= deadline:
                 raise RuntimeError(f"{action}: {exc}") from exc
             time.sleep(min(_SERVICE_READY_RETRY_INTERVAL_SEC, max(0.05, deadline - time.monotonic())))
+
+
+def _call_service_payload_sync(
+    group: object,
+    *,
+    method: str,
+    payload: Dict[str, object],
+    timeout_sec: float,
+    strategy: str,
+    refresh_status: bool,
+) -> Tuple[str, object]:
+    node_id, response = group.call_balanced(
+        method,
+        payload,
+        timeout_sec=timeout_sec,
+        strategy=strategy,
+        refresh_status=refresh_status,
+    )
+    return node_id, _resolve_high_level_service_data(group, node_id=node_id, response=response)
+
+
+async def _call_service_payload_async(
+    group: object,
+    *,
+    method: str,
+    payload: Dict[str, object],
+    timeout_sec: float,
+    strategy: str,
+    refresh_status: bool,
+) -> Tuple[str, object]:
+    node_id, response = await group.acall_balanced(
+        method,
+        payload,
+        timeout_sec=timeout_sec,
+        strategy=strategy,
+        refresh_status=refresh_status,
+    )
+    return node_id, _resolve_high_level_service_data(group, node_id=node_id, response=response)
+
+
+def _service_item_success(index: int, result: object, *, node_id: str) -> ExecutionItem:
+    return ExecutionItem(
+        index=int(index),
+        ok=True,
+        result=result,
+        node_id=str(node_id or ""),
+        key=int(index),
+    )
+
+
+def _service_item_failure(index: int, exc: Exception) -> ExecutionItem:
+    return ExecutionItem(
+        index=int(index),
+        ok=False,
+        result=None,
+        error_type=exc.__class__.__name__,
+        error_message=str(exc),
+        node_id="",
+        key=int(index),
+    )
+
+
+def _service_iter_item_calls(
+    group: object,
+    *,
+    method: str,
+    payloads: Sequence[Dict[str, object]],
+    timeout_sec: float,
+    strategy: str,
+    refresh_status: bool,
+    max_in_flight: int,
+) -> Iterator[ExecutionItem]:
+    items = [dict(payload or {}) for payload in payloads]
+    if not items:
+        return iter(())
+    limit = max(1, min(int(max_in_flight or 1), len(items)))
+
+    def _generator() -> Iterator[ExecutionItem]:
+        with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="service-items") as executor:
+            future_to_index = {
+                executor.submit(
+                    _call_service_payload_sync,
+                    group,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=timeout_sec,
+                    strategy=strategy,
+                    refresh_status=refresh_status,
+                ): idx
+                for idx, payload in enumerate(items)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    node_id, result = future.result()
+                    yield _service_item_success(idx, result, node_id=node_id)
+                except Exception as exc:
+                    yield _service_item_failure(idx, exc)
+
+    return _generator()
+
+
+async def _service_aiter_item_calls(
+    group: object,
+    *,
+    method: str,
+    payloads: Sequence[Dict[str, object]],
+    timeout_sec: float,
+    strategy: str,
+    refresh_status: bool,
+    max_in_flight: int,
+) -> AsyncIterator[ExecutionItem]:
+    items = [dict(payload or {}) for payload in payloads]
+    if not items:
+        return
+    semaphore = asyncio.Semaphore(max(1, min(int(max_in_flight or 1), len(items))))
+
+    async def _run_one(idx: int, payload: Dict[str, object]) -> ExecutionItem:
+        async with semaphore:
+            try:
+                node_id, result = await _call_service_payload_async(
+                    group,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=timeout_sec,
+                    strategy=strategy,
+                    refresh_status=refresh_status,
+                )
+                return _service_item_success(idx, result, node_id=node_id)
+            except Exception as exc:
+                return _service_item_failure(idx, exc)
+
+    tasks = [asyncio.create_task(_run_one(idx, payload)) for idx, payload in enumerate(items)]
+    try:
+        for task in asyncio.as_completed(tasks):
+            yield await task
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
+def _service_collect_item_calls(
+    group: object,
+    *,
+    method: str,
+    payloads: Sequence[Dict[str, object]],
+    timeout_sec: float,
+    strategy: str,
+    refresh_status: bool,
+    max_in_flight: int,
+) -> List[ExecutionItem]:
+    return sorted(
+        list(
+            _service_iter_item_calls(
+                group,
+                method=method,
+                payloads=payloads,
+                timeout_sec=timeout_sec,
+                strategy=strategy,
+                refresh_status=refresh_status,
+                max_in_flight=max_in_flight,
+            )
+        ),
+        key=lambda item: int(item.index),
+    )
+
+
+async def _service_acollect_item_calls(
+    group: object,
+    *,
+    method: str,
+    payloads: Sequence[Dict[str, object]],
+    timeout_sec: float,
+    strategy: str,
+    refresh_status: bool,
+    max_in_flight: int,
+) -> List[ExecutionItem]:
+    items: List[ExecutionItem] = []
+    async for item in _service_aiter_item_calls(
+        group,
+        method=method,
+        payloads=payloads,
+        timeout_sec=timeout_sec,
+        strategy=strategy,
+        refresh_status=refresh_status,
+        max_in_flight=max_in_flight,
+    ):
+        items.append(item)
+    return sorted(items, key=lambda item: int(item.index))
 
 
 class _ConnectedService:
@@ -719,6 +910,173 @@ class _ConnectedService:
         node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
+    def map_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> List[Optional[object]]:
+        return [
+            item.result if item.ok else None
+            for item in _service_collect_item_calls(
+                self,
+                method=method,
+                payloads=payloads,
+                timeout_sec=timeout_sec,
+                strategy=strategy,
+                refresh_status=refresh_status,
+                max_in_flight=max_in_flight,
+            )
+        ]
+
+    async def amap_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> List[Optional[object]]:
+        items = await _service_acollect_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+        return [item.result if item.ok else None for item in items]
+
+    def unordered_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> Iterator[Tuple[int, Optional[object]]]:
+        for item in _service_iter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        ):
+            yield item.index, item.result if item.ok else None
+
+    async def aunordered_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> AsyncIterator[Tuple[int, Optional[object]]]:
+        async for item in _service_aiter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        ):
+            yield item.index, item.result if item.ok else None
+
+    def iter_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> Iterator[ExecutionItem]:
+        return _service_iter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+
+    async def aiter_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> AsyncIterator[ExecutionItem]:
+        async for item in _service_aiter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        ):
+            yield item
+
+    def collect_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> List[ExecutionItem]:
+        return _service_collect_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+
+    async def acollect_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = False,
+        max_in_flight: int = 32,
+    ) -> List[ExecutionItem]:
+        return await _service_acollect_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+
     async def call_all(self, method: str, **kwargs) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:
         results = await self.acall_all(method, kwargs)
         return _resolve_high_level_service_results(self, results=results)
@@ -753,7 +1111,7 @@ class _ConnectedService:
 
 @dataclass
 class Service(ServiceExecutionSession):
-    """A deployed service group spread across multiple NodeControl nodes."""
+    """A deployed service session spread across multiple NodeControl nodes."""
 
     owner_client_id: str
     service_name: str
@@ -840,7 +1198,9 @@ class Service(ServiceExecutionSession):
                 timeout_sec=timeout_sec,
                 validate_on_init=validate_on_init,
             )
-        raise ValueError("transport must be one of: discovery, gateway")
+        raise ValueError(
+            "Service.connect() transport must be one of: discovery, gateway"
+        )
 
     @classmethod
     def deploy_from_infocenter(
@@ -886,12 +1246,15 @@ class Service(ServiceExecutionSession):
         breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
     ) -> "Service":
-        """从 InfoCenter 发现节点并部署服务。
+        """Low-level entry; prefer ``Service.deploy(...)``.
+
+        This entry preserves the older control-plane-oriented naming for
+        callers that still pass ``infocenter_target=...`` directly.
 
         Args:
             infocenter_target: InfoCenter 地址
             source: 默认产品化代码输入；可传 callable / module / path / bytes
-            owner_client_id: 所有者客户端 ID
+            owner_client_id: 所有者 ID
             service_name: 服务名称
             artifact: 高级 Artifact 声明对象
             func: 函数对象（自动打包依赖，优先级最高）
@@ -2440,6 +2803,173 @@ class Service(ServiceExecutionSession):
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
         node_id, resp = self.call_balanced(method, kwargs)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
+
+    def map_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> List[Optional[object]]:
+        return [
+            item.result if item.ok else None
+            for item in _service_collect_item_calls(
+                self,
+                method=method,
+                payloads=payloads,
+                timeout_sec=timeout_sec,
+                strategy=strategy,
+                refresh_status=refresh_status,
+                max_in_flight=max_in_flight,
+            )
+        ]
+
+    async def amap_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> List[Optional[object]]:
+        items = await _service_acollect_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+        return [item.result if item.ok else None for item in items]
+
+    def unordered_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> Iterator[Tuple[int, Optional[object]]]:
+        for item in _service_iter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        ):
+            yield item.index, item.result if item.ok else None
+
+    async def aunordered_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> AsyncIterator[Tuple[int, Optional[object]]]:
+        async for item in _service_aiter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        ):
+            yield item.index, item.result if item.ok else None
+
+    def iter_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> Iterator[ExecutionItem]:
+        return _service_iter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+
+    async def aiter_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> AsyncIterator[ExecutionItem]:
+        async for item in _service_aiter_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        ):
+            yield item
+
+    def collect_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> List[ExecutionItem]:
+        return _service_collect_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
+
+    async def acollect_item_calls(
+        self,
+        method: str,
+        payloads: Sequence[Dict[str, object]],
+        *,
+        timeout_sec: float = 30.0,
+        strategy: str = "least_inflight",
+        refresh_status: bool = True,
+        max_in_flight: int = 32,
+    ) -> List[ExecutionItem]:
+        return await _service_acollect_item_calls(
+            self,
+            method=method,
+            payloads=payloads,
+            timeout_sec=timeout_sec,
+            strategy=strategy,
+            refresh_status=refresh_status,
+            max_in_flight=max_in_flight,
+        )
 
     async def call_all(self, method: str, **kwargs) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:
         results = await self.acall_all(method, kwargs)

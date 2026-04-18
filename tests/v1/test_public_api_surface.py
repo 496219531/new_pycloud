@@ -57,6 +57,7 @@ def test_api_service_module_exposes_only_service():
     assert not hasattr(api_service_module, "ServiceGroup")
     assert not hasattr(api_service_module, "deploy_service_from_infocenter")
     assert callable(ApiService.deploy)
+    assert callable(ApiService.connect)
     discovery = ApiService.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
@@ -121,6 +122,11 @@ def test_task_pool_open_public_api_uses_target_keyword(monkeypatch):
     assert result == "task-pool-session"
     assert captured["infocenter_target"] == "127.0.0.1:50051"
     assert captured["source"] == b"blob"
+
+
+def test_low_level_compat_entries_still_exist_but_are_not_api_module_surface():
+    assert hasattr(ApiService, "deploy_from_infocenter")
+    assert hasattr(ApiTaskPool, "from_infocenter")
 
 
 def test_public_api_still_accepts_legacy_infocenter_target_keyword(monkeypatch):

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PyCloud 简化部署示例
+最小服务部署示例。
 
-展示使用默认值简化服务部署。
+展示如何用尽量少的参数完成一次 `Service.deploy(...)`。
 """
 from pathlib import Path
 import sys

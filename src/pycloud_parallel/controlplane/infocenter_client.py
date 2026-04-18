@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""InfoCenter client and route/node models extracted from controlplane client."""
+"""InfoCenter route and node models plus the low-level HTTP transport client."""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -170,7 +170,7 @@ def _filter_nodes_by_runtime(
 
 
 class InfoCenterClient:
-    """Thin HTTP + JSON client wrapper for InfoCenter service."""
+    """Low-level HTTP transport client for InfoCenter."""
 
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
         self.target = target

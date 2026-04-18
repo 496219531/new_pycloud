@@ -18,6 +18,7 @@ from google.protobuf import timestamp_pb2
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.serialization import dict_to_struct, struct_to_dict
+from pycloud_parallel.execution.base import ExecutionItem
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -31,16 +32,7 @@ def _resolve_task_results_data(batch: Any, results: Sequence[pb2.TaskResult]) ->
     return [batch.fetch_result_data(item) for item in results]
 
 
-@dataclass(frozen=True)
-class TaskPoolItem:
-    task_id: str
-    node_id: str
-    ok: bool
-    status: int
-    node_instance_id: str = ""
-    data: Any = None
-    error_type: str = ""
-    error_message: str = ""
+TaskPoolItem = ExecutionItem
 
 
 @dataclass
@@ -170,13 +162,18 @@ class NativeTaskBackend:
             node_id in self._session._active_nodes for node_id in self._session._pools
         )
 
-    def imap_unordered(self, payloads: Iterable[Dict[str, object]], **kwargs) -> Iterator[Tuple[str, Any]]:
+    def imap_unordered(self, payloads: Iterable[Dict[str, object]], **kwargs) -> Iterator[Tuple[int, Any]]:
         with self._native():
             yield from self._session.imap_unordered(payloads, **kwargs)
 
-    def unordered(self, payloads: Iterable[Dict[str, object]], **kwargs) -> Iterator[Tuple[str, Any]]:
+    def unordered(self, payloads: Iterable[Dict[str, object]], **kwargs) -> Iterator[Tuple[int, Any]]:
         with self._native():
             yield from self._session.unordered(payloads, **kwargs)
+
+    async def aunordered(self, payloads: Iterable[Dict[str, object]], **kwargs):
+        with self._native():
+            async for item in self._session.aunordered(payloads, **kwargs):
+                yield item
 
     def consume_unordered(self, payloads: Iterable[Dict[str, object]], **kwargs) -> int:
         with self._native():
@@ -185,6 +182,27 @@ class NativeTaskBackend:
     def map(self, values: Sequence[Any], **kwargs) -> Sequence[Any]:
         with self._native():
             return self._session.map(values, **kwargs)
+
+    async def amap(self, values: Sequence[Any], **kwargs) -> Sequence[Any]:
+        with self._native():
+            return await self._session.amap(values, **kwargs)
+
+    def iter_items(self, *args, **kwargs):
+        with self._native():
+            yield from self._session.iter_items(*args, **kwargs)
+
+    async def aiter_items(self, *args, **kwargs):
+        with self._native():
+            async for item in self._session.aiter_items(*args, **kwargs):
+                yield item
+
+    def collect_items(self, *args, **kwargs):
+        with self._native():
+            return self._session.collect_items(*args, **kwargs)
+
+    async def acollect_items(self, *args, **kwargs):
+        with self._native():
+            return await self._session.acollect_items(*args, **kwargs)
 
     def cancel_job(self, **kwargs) -> pb2.CancelJobResponse:
         with self._native():

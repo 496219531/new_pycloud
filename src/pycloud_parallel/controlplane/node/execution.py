@@ -531,11 +531,23 @@ def _purge_loaded_artifact_modules(
             if any(resolved_file.startswith(prefix) for prefix in prefixes):
                 sys.modules.pop(name, None)
                 continue
-        module_paths = getattr(module, "__path__", None)
-        if module_paths:
-            resolved_paths = [str(Path(p).resolve()) for p in module_paths]
-            if any(any(path.startswith(prefix) for prefix in prefixes) for path in resolved_paths):
-                sys.modules.pop(name, None)
+        try:
+            module_paths = getattr(module, "__path__", None)
+        except Exception:
+            # Some stale namespace/package modules can no longer resolve their
+            # parent path during cleanup. They are already broken, so remove
+            # them instead of letting cleanup fail.
+            sys.modules.pop(name, None)
+            continue
+        if module_paths is None:
+            continue
+        try:
+            resolved_paths = [str(Path(p).resolve()) for p in list(module_paths)]
+        except Exception:
+            sys.modules.pop(name, None)
+            continue
+        if any(any(path.startswith(prefix) for prefix in prefixes) for path in resolved_paths):
+            sys.modules.pop(name, None)
 
 
 def _build_callable_router(

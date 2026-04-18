@@ -124,4 +124,4 @@ print(final["job"]["status"])
 
 - [QUICK_START.md](QUICK_START.md)
 - [TASK_MODE.md](TASK_MODE.md)
-- [SERVICE_MODULE_GROUP.md](SERVICE_MODULE_GROUP.md)
+- [SERVICE_GUIDE.md](SERVICE_GUIDE.md)

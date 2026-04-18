@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Execution host facade for the V1 execution package."""
+"""V1 execution-host entrypoint."""
 
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 

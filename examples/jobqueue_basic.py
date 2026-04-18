@@ -44,7 +44,7 @@ def main() -> None:
         b"def apply_managed_globals(values, **_context):\n"
         b"    global JOB_CFG\n"
         b"    JOB_CFG = values.get('job_cfg')\n\n"
-        b"def handle_result(task_id, result, state=None, **_kwargs):\n"
+        b"def handle_result(index, result, state=None, **_kwargs):\n"
         b"    state.setdefault('squares', []).append(result['square'])\n\n"
         b"def finalize(state=None, **_kwargs):\n"
         b"    values = state.get('squares', [])\n"
