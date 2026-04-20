@@ -138,6 +138,146 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /data/register:
+    post:
+      tags: [InfoCenter]
+      summary: Register a control-plane DataRef entry
+      operationId: registerDataRef
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DataRefRegisterRequest"
+      responses:
+        "200":
+          description: DataRef entry registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataRefEntryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /data/touch:
+    post:
+      tags: [InfoCenter]
+      summary: Refresh a staged DataRef TTL
+      operationId: touchDataRef
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ref_id]
+              properties:
+                ref_id:
+                  type: string
+      responses:
+        "200":
+          description: Ref TTL refreshed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataRefEntryResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /data/release:
+    post:
+      tags: [InfoCenter]
+      summary: Release a staged DataRef handle
+      operationId: releaseDataRef
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ref_id]
+              properties:
+                ref_id:
+                  type: string
+      responses:
+        "200":
+          description: Ref released
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, released]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  released:
+                    type: boolean
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /data/refs:
+    get:
+      tags: [InfoCenter]
+      summary: List registered DataRef entries
+      operationId: listDataRefs
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+            default: 1000
+        - in: query
+          name: node_id
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: node_instance_id
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: DataRef entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, refs]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  refs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DataRefEntry"
+
+  /data/resolve/{ref_id}:
+    get:
+      tags: [InfoCenter]
+      summary: Resolve a DataRef entry
+      operationId: resolveDataRef
+      parameters:
+        - in: path
+          name: ref_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Resolved DataRef entry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataRefEntryResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /jobs/submit:
     post:
       tags: [JobQueue]
@@ -636,6 +776,98 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ServiceRouteInfo"
+
+    DataRefReplica:
+      type: object
+      properties:
+        node_id:
+          type: string
+        node_instance_id:
+          type: string
+        control_addr:
+          type: string
+
+    DataRefEntry:
+      type: object
+      required: [ref_id, storage_id, format, materialize_as, ttl_sec]
+      properties:
+        ref_id:
+          type: string
+        storage_id:
+          type: string
+        logical_type:
+          type: string
+        format:
+          type: string
+        size_bytes:
+          type: integer
+        materialize_as:
+          type: string
+        locator_kind:
+          type: string
+        locator_token:
+          type: string
+        consume_on_read:
+          type: boolean
+        node_id:
+          type: string
+        node_instance_id:
+          type: string
+        control_addr:
+          type: string
+        replicas:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataRefReplica"
+        created_at:
+          type: string
+          format: date-time
+        last_at:
+          type: string
+          format: date-time
+        ttl_sec:
+          type: integer
+
+    DataRefPayload:
+      type: object
+      required: [__pycloud_data_ref__]
+      properties:
+        __pycloud_data_ref__:
+          type: object
+          additionalProperties: true
+
+    DataRefRegisterRequest:
+      type: object
+      required: [ref]
+      properties:
+        ref:
+          $ref: "#/components/schemas/DataRefPayload"
+        ttl_sec:
+          type: integer
+        node_id:
+          type: string
+        node_instance_id:
+          type: string
+        control_addr:
+          type: string
+        locator_kind:
+          type: string
+        locator_token:
+          type: string
+        replicas:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataRefReplica"
+
+    DataRefEntryResponse:
+      type: object
+      required: [ok, entry]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        entry:
+          $ref: "#/components/schemas/DataRefEntry"
 
     JobEnvelopeResponse:
       type: object

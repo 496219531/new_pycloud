@@ -6,12 +6,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .client_transport import (
+    _call_route_http,
     _normalize_http_response_body,
     _serialize_http_call_payload,
 )
@@ -355,6 +357,7 @@ class ServiceSessionClient:
         *,
         timeout_sec: float = 60.0,
         token: Optional[str] = None,
+        serialization_mode: str = "",
     ) -> Dict[str, object]:
         if not self.http_base_url:
             raise RuntimeError("service has no http_base_url; expose_http may be false")
@@ -367,27 +370,28 @@ class ServiceSessionClient:
         auth_token = self.service_token if token is None else token
         if auth_token:
             headers["X-Service-Token"] = auth_token
+        prepare_kwargs = {}
+        if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
+            prepare_kwargs["serialization_mode"] = serialization_mode
         prepared_payload = prepare_remote_call_payload(
             [self._client],
             payload,
-        )
-        serialized_payload = _serialize_http_call_payload(prepared_payload, context="service call payload")
-        req = Request(
-            url=url,
-            method="POST",
-            headers=headers,
-            data=json.dumps(serialized_payload).encode("utf-8"),
+            **prepare_kwargs,
         )
         try:
-            with urlopen(req, timeout=max(2.0, float(timeout_sec) + 1.0)) as resp:
-                body = _normalize_http_response_body(
-                    json.loads(resp.read().decode("utf-8") or "{}"),
-                    control_addr=self._client.target,
-                )
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8") if hasattr(exc, "read") else ""
-            msg = raw or str(exc)
-            raise RuntimeError(f"call failed: {msg}") from exc
+            body = _call_route_http(
+                SimpleNamespace(
+                    http_base_url=str(self.http_base_url or "").strip(),
+                    control_addr=str(self._client.target or "").strip(),
+                ),
+                method=method,
+                payload=prepared_payload,
+                timeout_sec=max(0.1, float(timeout_sec)),
+                service_token=str(auth_token or ""),
+                serialization_mode=serialization_mode,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"call failed: {exc}") from exc
         if not body.get("ok", False):
             raise RuntimeError(f"call failed: {body.get('error', 'unknown error')}")
         return body

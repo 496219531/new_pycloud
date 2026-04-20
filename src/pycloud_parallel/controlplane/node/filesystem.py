@@ -460,9 +460,12 @@ def _write_code_meta(base_dir: Path, artifact: CodeArtifact, *, last_at: Optiona
         "created_at": created_at,
         "last_at": effective_last_at,
     }
-    tmp_path = meta_path.with_suffix(".tmp")
-    tmp_path.write_bytes(_stable_json_bytes(payload))
-    os.replace(str(tmp_path), str(meta_path))
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{meta_path.stem}-", suffix=".tmp", dir=str(meta_path.parent))
+    try:
+        os.write(fd, _stable_json_bytes(payload))
+    finally:
+        os.close(fd)
+    os.replace(tmp_name, str(meta_path))
     _write_code_index(base_dir, artifact, created_at=created_at, last_at=effective_last_at)
 
 
@@ -472,9 +475,12 @@ def touch_code_last_at(base_dir: Path, *, code_version: str) -> None:
         return
     meta_path = _existing_code_meta_path(base_dir, code_version=code_version)
     meta["last_at"] = utc_now().astimezone(timezone.utc).isoformat()
-    tmp_path = meta_path.with_suffix(".tmp")
-    tmp_path.write_bytes(_stable_json_bytes(meta))
-    os.replace(str(tmp_path), str(meta_path))
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{meta_path.stem}-", suffix=".tmp", dir=str(meta_path.parent))
+    try:
+        os.write(fd, _stable_json_bytes(meta))
+    finally:
+        os.close(fd)
+    os.replace(tmp_name, str(meta_path))
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any], *, prefix: str = ".meta-") -> None:

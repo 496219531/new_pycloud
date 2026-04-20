@@ -291,6 +291,14 @@ class TestDiscoveryConnectedService:
 
     def test_large_payload_upload_targets_selected_route_only(self, monkeypatch):
         primary = _demo_route()
+        stale = replace(
+            primary,
+            service_id="svc-id-stale",
+            node_instance_id="node-stale-inst",
+            node_id="node-stale",
+            control_addr="127.0.0.1:59999",
+            http_base_url="http://127.0.0.1:19999/svc/svc-id-stale",
+        )
 
         uploads = []
 
@@ -314,9 +322,13 @@ class TestDiscoveryConnectedService:
         try:
             monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._estimate_managed_global_inline_size", fake_estimate)
             monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload._put_data_via_clients", fake_put)
-            with patch.object(client._route_cache, "select_route", return_value=primary), patch(
-                "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
-                return_value={"ok": True, "data": {"y": 81}},
+            with (
+                patch.object(client._route_cache, "select_route", return_value=primary),
+                patch.object(client._route_cache, "get_routes", return_value=[stale, primary]),
+                patch(
+                    "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
+                    return_value={"ok": True, "data": {"y": 81}},
+                ),
             ):
                 result = client.call_sync("square", blob="x" * 2048)
             assert result == {"y": 81}
@@ -409,7 +421,7 @@ class TestDiscoveryConnectedService:
             "get_status",
             return_value={"ok": True, "route_count": 0},
         ):
-            with pytest.raises(RuntimeError, match="no available route"):
+            with pytest.raises(RuntimeError, match="available route"):
                 _connect_discovery_service()
 
     def test_methods_raise_clear_error_when_service_has_no_exported_methods(self):

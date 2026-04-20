@@ -10,12 +10,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .client_transport import _decode_http_request_body, _encode_http_json_body
+from .client_transport import (
+    _decode_http_request_body_with_mode,
+    _decode_http_transport_request_body_with_mode,
+    _encode_http_json_body,
+    _encode_http_transport_response_body,
+    _is_http_transport_content_type,
+)
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 
-InvokeHandler = Callable[[str, str, dict, str, float], Tuple[int, Dict[str, object]]]
+InvokeHandler = Callable[[str, str, dict, str, float, str], Tuple[int, Dict[str, object]]]
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
 MethodsHandler = Callable[[str, bool], Tuple[int, Dict[str, object]]]
 ExtraGetHandler = Callable[[str, list[str], Dict[str, list[str]]], Optional[Tuple[Any, ...]]]
@@ -94,13 +100,52 @@ class ServiceHttpGateway:
                             return
                         body = self.rfile.read(max(0, length))
                         try:
-                            payload = _decode_http_request_body(body, context="service call payload")
+                            if _is_http_transport_content_type(str(self.headers.get("Content-Type", "") or "")):
+                                payload, serialization_mode = _decode_http_transport_request_body_with_mode(
+                                    body,
+                                    headers=self.headers,
+                                    context="service_internal",
+                                )
+                            else:
+                                payload, serialization_mode = _decode_http_request_body_with_mode(
+                                    body,
+                                    context="service_internal",
+                                )
                         except ValueError as exc:
                             self._send_json(400, {"ok": False, "error": str(exc)})
                             return
                         token = self._extract_token()
-                        code, resp = invoke_handler(service_id, method, payload, token, timeout_sec)
-                        self._send_json(code, resp)
+                        code, resp = invoke_handler(
+                            service_id,
+                            method,
+                            payload,
+                            token,
+                            timeout_sec,
+                            serialization_mode,
+                        )
+                        wants_transport_response = _is_http_transport_content_type(
+                            str(self.headers.get("Content-Type", "") or "")
+                        )
+                        if (
+                            wants_transport_response
+                            and int(code or 0) < 400
+                            and isinstance(resp, dict)
+                            and bool(resp.get("ok", False))
+                            and "data" in resp
+                        ):
+                            raw, response_headers = _encode_http_transport_response_body(
+                                resp.get("data"),
+                                context="service_result",
+                                mode=serialization_mode,
+                            )
+                            self._send_body(
+                                code,
+                                raw,
+                                content_type=response_headers.pop("Content-Type", "application/octet-stream"),
+                                extra_headers=response_headers,
+                            )
+                        else:
+                            self._send_json(code, resp)
                         return
 
                     self._send_json(404, {"ok": False, "error": "not found"})
@@ -179,11 +224,20 @@ class ServiceHttpGateway:
                 raw = _encode_http_json_body(data)
                 self._send_body(status_code, raw, content_type="application/json; charset=utf-8")
 
-            def _send_body(self, status_code: int, body: Any, *, content_type: str) -> None:
+            def _send_body(
+                self,
+                status_code: int,
+                body: Any,
+                *,
+                content_type: str,
+                extra_headers: Optional[Dict[str, str]] = None,
+            ) -> None:
                 raw = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
                 try:
                     self.send_response(status_code)
                     self.send_header("Content-Type", str(content_type or "application/octet-stream"))
+                    for key, value in dict(extra_headers or {}).items():
+                        self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)

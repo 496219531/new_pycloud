@@ -27,6 +27,9 @@ MANAGED_GLOBAL_NAMES = (
     "bench_mark_yield_df_weekly",
     "bench_mark_closeprice_df",
 )
+# pickle_stable_v1 currently uses the protobuf/gRPC bytes transport path.
+TASKPOOL_SERIALIZATION_MODE = "pickle_stable_v1"
+SERVICE_HTTP_BYTES_SERIALIZATION_MODE = "pickle_stable_v1"
 
 
 def get_fund_nav(fund_list: Sequence[int] | None = None, frequency: int = 1) -> pd.DataFrame:
@@ -115,6 +118,7 @@ def calc_fund_list_asset_ratio(
             service_name=SERVICE_NAME,
             transport="discovery",
             timeout_sec=300.0,
+            serialization_mode=SERVICE_HTTP_BYTES_SERIALIZATION_MODE,
         ) as client:
             tasks = [
                 client.get_fund_asset_ratio(fund_net_value_series.dropna().copy(), strategy_type, 0)
@@ -289,7 +293,8 @@ def calc_fund_list_asset_ratio2(
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
-        managed_global_names=MANAGED_GLOBAL_NAMES
+        managed_global_names=MANAGED_GLOBAL_NAMES,
+        serialization_mode=TASKPOOL_SERIALIZATION_MODE,
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
@@ -322,6 +327,7 @@ def calc_fund_list_asset_ratio_taskpool_aunordered(
             tags=["compute"],
             timeout_sec=300.0,
             managed_global_names=MANAGED_GLOBAL_NAMES,
+            # serialization_mode=TASKPOOL_SERIALIZATION_MODE,
         ) as pool:
             pool.update_globals(calc_asset_ratio.update_globals())
             items = []
@@ -354,7 +360,8 @@ def calc_fund_list_asset_ratio3(
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
-        managed_global_names=MANAGED_GLOBAL_NAMES
+        managed_global_names=MANAGED_GLOBAL_NAMES,
+        serialization_mode=TASKPOOL_SERIALIZATION_MODE,
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
@@ -362,7 +369,10 @@ def calc_fund_list_asset_ratio3(
         t1 = time.time()
         print(t1 - t0)
 
-        resp = pool.submit_payloads(payloads)
+        resp = pool.submit_payloads(
+            payloads,
+            serialization_mode=TASKPOOL_SERIALIZATION_MODE,
+        )
         results = _normalize_result_items(
             pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=300.0)
         )
@@ -379,7 +389,12 @@ def calc_fund_list_asset_ratio_job(
 ):
     t0 = time.time()
     client_id = f"asset-ratio-job-{int(t0)}"
-    with JobQueue(CONTROLPLANE_TARGET, client_id=client_id, timeout_sec=300.0) as client:
+    with JobQueue(
+        CONTROLPLANE_TARGET,
+        client_id=client_id,
+        timeout_sec=300.0,
+        serialization_mode=TASKPOOL_SERIALIZATION_MODE,
+    ) as client:
         resp = client.submit_job_from_module(
             module=calc_asset_ratio_job_module,
             job_payload={
@@ -492,14 +507,14 @@ if __name__ == "__main__":
         1652875,
     ]
     t1 = time.time()
-    result = calc_fund_list_asset_ratio(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)

@@ -36,14 +36,18 @@ from pycloud_parallel.controlplane.node.object_meta import (
     _write_object_meta,
 )
 from pycloud_parallel.controlplane.serialization import (
+    encode_transport_payload_bytes,
+    prefers_transport_payload_bytes,
     convert_dict_to_arrow,
     dataframe_bundle_parquet_frame,
+    deserialize_by_mode,
     log_payload_flow,
     serialize_arrow_compatible,
     serialize_dataframe_bundle,
-    serialize_inline_result,
     serialize_series_bundle,
     summarize_payload_flow_value,
+    validate_inline_result_size,
+    serialize_inline_result,
 )
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.data.ref import (
@@ -70,6 +74,8 @@ class ObjectResolutionError(RuntimeError):
 def _materialize_object_bytes(*, blob: bytes, fmt: str, materialize_as: str) -> Any:
     materialized = normalize_materialize_as(materialize_as, default="path")
     normalized_format = normalize_object_format(fmt, default="bin")
+    if normalized_format in {"structured_v1", "pickle_stable_v1"}:
+        return deserialize_by_mode(blob, mode=normalized_format)
     if materialized == "bytes":
         return bytes(blob)
     if materialized == "text":
@@ -277,6 +283,8 @@ def _materialize_object_artifact(
 ) -> Any:
     if artifact.storage_backend == "file":
         candidate = Path(artifact.path)
+        if str(artifact.format or "").strip().lower() in {"structured_v1", "pickle_stable_v1"}:
+            return deserialize_by_mode(candidate.read_bytes(), mode=str(artifact.format or "").strip().lower())
         if materialize_as == "path":
             return candidate
         if materialize_as == "bytes":
@@ -546,23 +554,34 @@ def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifac
         raise
 
 
-def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
+def _normalize_result_value(ret: Any, *, object_dir: str, serialization_mode: str = "") -> Any:
     data_store = _data_store_for_object_dir(object_dir)
 
-    def _try_inline_result(value: Any) -> Tuple[bool, Any]:
-        policy = get_payload_policy("result")
-        serialized = serialize_arrow_compatible(value)
-        wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
+    def _try_inline_result(value: Any) -> bool:
+        # This layer decides only whether a result may stay inline or must become a
+        # DataRef-backed artifact. It must not pre-wrap the result in a transport
+        # envelope; the outer response builder owns the single transport encode.
         try:
-            serialize_inline_result(
-                wrapped,
-                context="task result",
-                limit_bytes=policy.inline_result_hard_limit_bytes,
-            )
+            if prefers_transport_payload_bytes(serialization_mode):
+                transport = encode_transport_payload_bytes(
+                    value,
+                    mode=serialization_mode,
+                    context="task result",
+                )
+                validate_inline_result_size(
+                    len(bytes(transport.payload or b"")),
+                    context="task result",
+                )
+            else:
+                serialize_inline_result(
+                    value,
+                    context="task result",
+                    mode=serialization_mode,
+                )
         except ValueError:
-            return False, None
+            return False
         log_payload_flow("inline_result_ready", context="task result", summary=summarize_payload_flow_value(value))
-        return True, wrapped
+        return True
 
     if isinstance(ret, Path):
         log_payload_flow("result_ref_store", path_type="path", summary=summarize_payload_flow_value(ret))
@@ -572,15 +591,13 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
         import pandas as pd
 
         if isinstance(ret, pd.DataFrame):
-            inlined, wrapped = _try_inline_result(ret)
-            if inlined:
-                return wrapped
+            if _try_inline_result(ret):
+                return ret
             log_payload_flow("result_ref_store", path_type="dataframe", summary=summarize_payload_flow_value(ret))
             return data_store.store_dataframe(ret)
         if isinstance(ret, pd.Series):
-            inlined, wrapped = _try_inline_result(ret)
-            if inlined:
-                return wrapped
+            if _try_inline_result(ret):
+                return ret
             log_payload_flow("result_ref_store", path_type="series", summary=summarize_payload_flow_value(ret))
             return data_store.store_series(ret)
     except ImportError:
@@ -590,21 +607,24 @@ def _normalize_result_value(ret: Any, *, object_dir: str) -> Any:
         import numpy as np
 
         if isinstance(ret, np.ndarray):
-            inlined, wrapped = _try_inline_result(ret)
-            if inlined:
-                return wrapped
+            if _try_inline_result(ret):
+                return ret
             log_payload_flow("result_ref_store", path_type="ndarray", summary=summarize_payload_flow_value(ret))
             return data_store.store_ndarray(ret)
     except ImportError:
         pass
 
-    inlined, wrapped = _try_inline_result(ret)
-    if inlined:
-        return wrapped
-    raise LargeResultError("task result exceeds inline limit and must be returned as Path/DataFrame/Series/ndarray for DataRef storage")
+    if _try_inline_result(ret):
+        return ret
+        raise LargeResultError("task result exceeds inline limit and must be returned as Path/DataFrame/Series/ndarray for DataRef storage")
 
 
-def _normalize_user_return(ret: Any, *, object_dir: str) -> Tuple[str, Optional[Any], str, str]:
+def _normalize_user_return(
+    ret: Any,
+    *,
+    object_dir: str,
+    serialization_mode: str = "",
+) -> Tuple[str, Optional[Any], str, str]:
     def _normalize_status(v: Any) -> str:
         s = str(v or "SUCCEEDED").strip().upper()
         if s in ("SUCCESS", "OK"):
@@ -615,7 +635,11 @@ def _normalize_user_return(ret: Any, *, object_dir: str) -> Tuple[str, Optional[
 
     if isinstance(ret, tuple) and len(ret) == 4:
         status_text, result, err_type, err_message = ret
-        result = _normalize_result_value(result, object_dir=object_dir) if result is not None else None
+        result = (
+            _normalize_result_value(result, object_dir=object_dir, serialization_mode=serialization_mode)
+            if result is not None
+            else None
+        )
         return _normalize_status(status_text), result, str(err_type), str(err_message)
 
     if isinstance(ret, dict) and "status" in ret:
@@ -623,10 +647,14 @@ def _normalize_user_return(ret: Any, *, object_dir: str) -> Tuple[str, Optional[
         result = ret.get("result")
         err_type = str(ret.get("error_type", ""))
         err_message = str(ret.get("error_message", ""))
-        result = _normalize_result_value(result, object_dir=object_dir) if result is not None else None
+        result = (
+            _normalize_result_value(result, object_dir=object_dir, serialization_mode=serialization_mode)
+            if result is not None
+            else None
+        )
         return status_text, result, err_type, err_message
 
-    return "SUCCEEDED", _normalize_result_value(ret, object_dir=object_dir), "", ""
+    return "SUCCEEDED", _normalize_result_value(ret, object_dir=object_dir, serialization_mode=serialization_mode), "", ""
 
 
 def _data_store_for_object_dir(

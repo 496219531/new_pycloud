@@ -6,6 +6,7 @@ from concurrent import futures
 import time
 
 import grpc
+import pytest
 from typing import Tuple
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -243,6 +244,125 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             assert snap2["node-cb-01"]["consecutive_failures"] == 0
         finally:
             group.close(end_services=True, reason="cb test complete")
+    finally:
+        info_server.stop()
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()
+
+
+def test_service_group_user_error_does_not_failover(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-user-01", str(tmp_path / "user_n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-user-02", str(tmp_path / "user_n2_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-user-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["user"])
+            infocenter.register_node(node_id="node-user-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["user"])
+
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        group = Service.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-user-test",
+            service_name="svc-user-test",
+            blob=blob,
+            runtime="py3",
+            entry_module="svc_user_test",
+            entry_callable="run",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["user"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
+        )
+
+        try:
+            first = group.sessions["node-user-01"]
+
+            def user_error(method, payload, *, timeout_sec=60.0, token=None):
+                raise RuntimeError("UserError: synthetic bad input")
+
+            first.call = user_error  # type: ignore[assignment]
+
+            with pytest.raises(RuntimeError, match="UserError"):
+                group.call_balanced(
+                    "run",
+                    {"value": 4},
+                    timeout_sec=8.0,
+                    strategy="round_robin",
+                    refresh_status=False,
+                    max_attempts=2,
+                )
+        finally:
+            group.close(end_services=True, reason="user error test done")
+    finally:
+        info_server.stop()
+        n1_server.stop(grace=0)
+        n2_server.stop(grace=0)
+        n1_state.close()
+        n2_state.close()
+
+
+def test_service_group_infra_error_still_failsover(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-infra-01", str(tmp_path / "infra_n1_code"))
+    n2_server, n2_target, n2_state = _start_nodecontrol_server("node-infra-02", str(tmp_path / "infra_n2_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-infra-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["infra"])
+            infocenter.register_node(node_id="node-infra-02", control_addr=n2_target, capacity=16, queue_capacity=64, tags=["infra"])
+
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value), 'square': int(value) * int(value)}\n"
+        group = Service.deploy_from_infocenter(
+            infocenter_target=info_target,
+            owner_client_id="owner-infra-test",
+            service_name="svc-infra-test",
+            blob=blob,
+            runtime="py3",
+            entry_module="svc_infra_test",
+            entry_callable="run",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["infra"],
+            min_success_nodes=2,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
+        )
+
+        try:
+            first = group.sessions["node-infra-01"]
+            original = first.call
+            fault_once = {"count": 0}
+
+            def infra_error(method, payload, *, timeout_sec=60.0, token=None):
+                if fault_once["count"] == 0:
+                    fault_once["count"] += 1
+                    raise RuntimeError("InfraError: upstream unavailable")
+                return original(method, payload, timeout_sec=timeout_sec, token=token)
+
+            first.call = infra_error  # type: ignore[assignment]
+
+            node_id, resp = group.call_balanced(
+                "run",
+                {"value": 5},
+                timeout_sec=8.0,
+                strategy="round_robin",
+                refresh_status=False,
+                max_attempts=2,
+            )
+            assert node_id == "node-infra-02"
+            assert resp["ok"] is True
+            assert resp["data"]["square"] == 25
+        finally:
+            group.close(end_services=True, reason="infra error test done")
     finally:
         info_server.stop()
         n1_server.stop(grace=0)

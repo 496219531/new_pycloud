@@ -163,6 +163,70 @@ http://127.0.0.1:50051/ops
 
 `/ops` 页面上的 `Waiting Jobs` 区块还支持对非运行态 job 做上移 / 下移调序。
 
+### 2.6 `POST /data/register`
+
+注册一个 `DataRef` 逻辑句柄。
+
+主要用途：
+
+1. gateway 大对象 relay
+2. job staging / delayed resolve
+3. result handle 生命周期管理
+
+关键请求字段：
+
+1. `ref`
+2. `ttl_sec`
+3. `node_id`
+4. `node_instance_id`
+5. `control_addr`
+6. `locator_kind`
+7. `locator_token`
+8. `replicas`
+
+其中 `replicas` 是控制面 registry 的附加副本元数据。
+
+### 2.7 `GET /data/resolve/{ref_id}`
+
+解析某个 `DataRef` 条目。
+
+返回关键字段：
+
+1. `storage_id`
+2. `format`
+3. `materialize_as`
+4. `control_addr`
+5. `replicas`
+6. `ttl_sec`
+
+### 2.8 `POST /data/touch`
+
+延长某个 `DataRef` 的 TTL。
+
+请求字段：
+
+1. `ref_id`
+
+### 2.9 `POST /data/release`
+
+释放某个 `DataRef` 逻辑句柄。
+
+当前语义：
+
+1. 先释放 registry 条目
+2. 对 `consume_on_read` 引用 best-effort 通知 node 释放 pin
+3. 真正物理删除仍可能延后到 GC
+
+### 2.10 `GET /data/refs`
+
+列出当前 registry 中的 `DataRef` 条目。
+
+查询参数：
+
+1. `limit`
+2. `node_id`
+3. `node_instance_id`
+
 计时边界说明：
 
 1. `avg_total_ms`
@@ -203,7 +267,7 @@ http://127.0.0.1:50051/ops
    - `/ops` 不会再互相覆盖
    - 页面会同时显示相同的 `node_id` 和各自不同的 `instance_id`
 
-### 2.6 运维动作
+### 2.11 运维动作
 
 ```text
 POST /ops/nodes/{node_id}/cordon
@@ -247,11 +311,23 @@ with InfoCenterClient("127.0.0.1:50051", timeout_sec=5.0) as client:
     )
 ```
 
-排序思路：
+当前任务选点已经接入统一 scheduler 候选/评分框架：
 
-1. 命中 `preferred_runtime_key` 的热 node 优先
-2. 再按 `credit`
-3. 再按 `queued / inflight`
+1. 先做硬过滤
+   - `healthy`
+   - `schedulable`
+   - `drain`
+   - `control_addr`
+   - `runtime` 兼容
+2. 再走 `JOBQUEUE_DEFAULT` profile 评分
+   - `predicted_busy`
+   - `node_inflight`
+   - `alive_workers`
+   - `worker_capacity`
+   - `credit`
+3. 同分候选再做 round-robin 打散
+
+`preferred_runtime_key` 仍然会作为候选 metadata 进入选择过程，但不再是单独一套排序器。
 
 `runtime` 过滤规则：
 

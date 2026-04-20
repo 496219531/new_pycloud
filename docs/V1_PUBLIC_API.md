@@ -30,13 +30,12 @@ from pycloud_parallel.local import configure, foreach, parallel_for
 
 以下名字已经退出顶层公开面，不应再作为用户主心智：
 
-1. gateway caller facade
-2. discovery caller facade
-3. compat task facade
-4. 旧 queue client naming
-5. 旧 task-pool session naming
-6. `pycloud_export`
-7. `ObjectRef / ResultRef`
+1. 旧 transport facade 命名
+2. 旧兼容任务会话命名
+3. 旧 queue client 命名
+4. 旧 task-pool session 命名
+5. `pycloud_export`
+6. 旧 large-object wrapper 命名
 
 如果你确实需要更底层 transport / controlplane client，请从 `pycloud_parallel.controlplane` 导入内部基础设施类，而不是从顶层公开面寻找这些旧名字。
 

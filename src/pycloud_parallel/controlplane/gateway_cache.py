@@ -11,14 +11,22 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
 from pycloud_parallel.controlplane.gateway_source import RouteSource
+from pycloud_parallel.execution.failover import (
+    CandidateBreakerState,
+    ROUTE_UNAVAILABLE,
+    candidate_allowed,
+    before_probe,
+    mark_candidate_failure,
+    mark_candidate_success,
+)
+from pycloud_parallel.execution.scheduler import (
+    SERVICE_DEFAULT,
+    resolve_service_strategy,
+    SchedulerCandidate,
+    SchedulerState,
+    select_one_candidate,
+)
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-
-
-@dataclass
-class RouteLocalState:
-    consecutive_failures: int = 0
-    open_until_monotonic: float = 0.0
-    last_error: str = ""
 
 
 @dataclass
@@ -46,7 +54,7 @@ class GatewayRouteCache:
 
         self._lock = threading.Lock()
         self._snapshots: Dict[str, ServiceRouteSnapshot] = {}
-        self._local_state: Dict[Tuple[str, str], RouteLocalState] = {}
+        self._local_state: Dict[Tuple[str, str], CandidateBreakerState] = {}
         self._refresh_events: Dict[str, threading.Event] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -172,6 +180,7 @@ class GatewayRouteCache:
         *,
         exclude_service_ids: Optional[Set[str]] = None,
         force_refresh: bool = False,
+        strategy: str = "predicted_busy",
     ) -> InfoCenterServiceRoute:
         name = str(service_name or "").strip()
         if force_refresh:
@@ -190,11 +199,58 @@ class GatewayRouteCache:
         ]
         if not candidates:
             raise RuntimeError(f"no available route for service_name={name}")
-        # Sort by load first; use round-robin as final tiebreaker to spread
-        # traffic when metrics are equal (e.g. all nodes idle with in_flight=0).
+        normalized_strategy, profile = resolve_service_strategy(strategy)
+        if normalized_strategy == "round_robin":
+            with self._lock:
+                rr = self._round_robin_counter
+                self._round_robin_counter += 1
+            ordered = sorted(candidates, key=lambda route: (str(route.node_instance_id or route.node_id or route.control_addr or ""), str(route.service_id)))
+            return ordered[rr % len(ordered)]
+        if normalized_strategy == "least_inflight":
+            candidates.sort(key=self._route_sort_key)
+            best_key = self._route_sort_key(candidates[0])
+            top_tier = [route for route in candidates if self._route_sort_key(route) == best_key]
+            with self._lock:
+                rr = self._round_robin_counter
+                self._round_robin_counter += 1
+            return top_tier[rr % len(top_tier)]
+        recent_failures: Dict[str, int] = {}
+        scheduler_candidates: List[SchedulerCandidate] = []
+        for route in candidates:
+            local_state = self._local_state.get((name, route.service_id))
+            recent_failures[str(route.service_id)] = int(getattr(local_state, "consecutive_failures", 0) or 0)
+            scheduler_candidates.append(
+                SchedulerCandidate(
+                    id=str(route.service_id),
+                    kind="service",
+                    node_id=str(route.node_id or ""),
+                    node_instance_id=str(route.node_instance_id or route.node_id or route.control_addr or ""),
+                    healthy=bool(route.node_healthy),
+                    schedulable=bool(route.http_base_url),
+                    drain=False,
+                    breaker_state=(local_state.state if local_state is not None else "closed"),
+                    predicted_busy=float(getattr(route, "predicted_busy", 0.0) or 0.0),
+                    node_inflight=int(getattr(route, "in_flight", 0) or 0),
+                    alive_workers=max(1, int(getattr(route, "alive_workers", 0) or 1)),
+                    worker_capacity=max(1, int(getattr(route, "worker_count", 0) or 1)),
+                    credit=1,
+                    recent_failures=recent_failures[str(route.service_id)],
+                )
+            )
         with self._lock:
             rr = self._round_robin_counter
             self._round_robin_counter += 1
+        selected = select_one_candidate(
+            scheduler_candidates,
+            profile=profile or SERVICE_DEFAULT,
+            state=SchedulerState(recent_submit_failures=recent_failures),
+            round_robin_counter=rr,
+        )
+        for route in candidates:
+            if str(route.service_id) == str(selected.id):
+                if self.before_probe(route):
+                    return route
+                break
         candidates.sort(key=self._route_sort_key)
         best_key = self._route_sort_key(candidates[0])
         top_tier = [route for route in candidates if self._route_sort_key(route) == best_key]
@@ -221,12 +277,21 @@ class GatewayRouteCache:
 
     def _route_available(self, service_name: str, service_id: str) -> bool:
         key = (service_name, service_id)
-        now = time.monotonic()
         with self._lock:
             state = self._local_state.get(key)
             if state is None:
                 return True
-            return now >= state.open_until_monotonic
+            _state, allowed = candidate_allowed(state)
+            return allowed
+
+    def before_probe(self, route: InfoCenterServiceRoute) -> bool:
+        key = (route.service_name, route.service_id)
+        with self._lock:
+            state = self._local_state.get(key)
+            if state is None:
+                state = CandidateBreakerState()
+                self._local_state[key] = state
+            return before_probe(state)
 
     def mark_success(self, route: InfoCenterServiceRoute) -> None:
         key = (route.service_name, route.service_id)
@@ -234,18 +299,20 @@ class GatewayRouteCache:
             state = self._local_state.get(key)
             if state is None:
                 return
-            state.consecutive_failures = 0
-            state.open_until_monotonic = 0.0
-            state.last_error = ""
+            mark_candidate_success(state)
 
     def mark_failure(self, route: InfoCenterServiceRoute, error: str) -> None:
         key = (route.service_name, route.service_id)
         with self._lock:
             state = self._local_state.get(key)
             if state is None:
-                state = RouteLocalState()
+                state = CandidateBreakerState()
                 self._local_state[key] = state
-            state.consecutive_failures += 1
-            state.last_error = str(error or "")
-            if state.consecutive_failures >= self.failure_threshold:
-                state.open_until_monotonic = time.monotonic() + self.open_sec
+            mark_candidate_failure(
+                state,
+                failure_kind=ROUTE_UNAVAILABLE,
+                error=RuntimeError(str(error or "")),
+                failure_threshold=self.failure_threshold,
+                cooldown_sec=self.open_sec,
+                max_cooldown_sec=self.open_sec,
+            )

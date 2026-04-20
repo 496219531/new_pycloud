@@ -15,7 +15,12 @@ from pycloud_parallel.controlplane.session_model import (
     WorkerResourceSnapshot,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
-from pycloud_parallel.controlplane.serialization import dict_to_struct
+from pycloud_parallel.controlplane.serialization import (
+    TRANSPORT_ENVELOPE_SENTINEL,
+    dict_to_struct,
+    encode_transport_payload_bytes,
+    prefers_transport_payload_bytes,
+)
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 StoredResultArtifact = StoredDataArtifact
@@ -84,18 +89,32 @@ class TaskState:
     error_type: str = ""
     error_message: str = ""
     dispatch_build_execute_spec_ms: float = 0.0
+    serialization_mode: str = ""
 
     def as_result(self) -> pb2.TaskResult:
-        return pb2.TaskResult(
-            task_id=self.task_id,
-            job_id=self.job_id,
-            status=self.status,
-            attempt=self.attempt,
-            started_at=dt_to_ts(self.started_at or utc_now()),
-            finished_at=dt_to_ts(self.finished_at or utc_now()),
-            result=dict_to_struct(self.result),
-            error=pb2.TaskError(type=self.error_type, message=self.error_message),
-        )
+        result_kwargs = {
+            "task_id": self.task_id,
+            "job_id": self.job_id,
+            "status": self.status,
+            "attempt": self.attempt,
+            "started_at": dt_to_ts(self.started_at or utc_now()),
+            "finished_at": dt_to_ts(self.finished_at or utc_now()),
+            "error": pb2.TaskError(type=self.error_type, message=self.error_message),
+        }
+        if prefers_transport_payload_bytes(self.serialization_mode):
+            # Bytes transport must see the raw high-level result object exactly
+            # once. Receiving an already transport-wrapped payload here would
+            # double-encode the result and leak internal envelopes to clients.
+            if isinstance(self.result, dict) and TRANSPORT_ENVELOPE_SENTINEL in self.result:
+                raise RuntimeError("transport bytes lane received already-encoded result")
+            result_kwargs["transport_result"] = encode_transport_payload_bytes(
+                self.result,
+                mode=self.serialization_mode,
+                context="taskpool_session",
+            )
+        else:
+            result_kwargs["result"] = dict_to_struct(self.result, mode=self.serialization_mode or "legacy_v1")
+        return pb2.TaskResult(**result_kwargs)
 
 
 @dataclass

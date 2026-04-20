@@ -23,35 +23,133 @@ from pycloud_parallel.controlplane.payload_transport import (
     encode_payload_for_transport,
 )
 from pycloud_parallel.controlplane.serialization import (
+    decode_transport_payload_bytes,
+    encode_transport_payload_bytes,
+    detect_transport_mode,
     deserialize_dataframe_bundle,
     deserialize_series_bundle,
+    deserialize_by_mode,
     log_payload_flow,
+    prefers_transport_payload_bytes,
     serialize_arrow_compatible,
 )
+from pycloud_parallel.controlplane.serialization_mode import resolve_received_transport_mode
 
 
-def _serialize_http_call_payload(payload: Optional[Dict[str, object]], *, context: str) -> Dict[str, object]:
+HTTP_TRANSPORT_CONTENT_TYPE = "application/x-pycloud-transport"
+HTTP_CODEC_HEADER = "X-Pycloud-Codec"
+HTTP_TRANSPORT_VERSION_HEADER = "X-Pycloud-Transport-Version"
+
+
+def _normalize_content_type(value: str) -> str:
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
+def _header_get(headers: Any, name: str) -> str:
+    if headers is None:
+        return ""
+    direct = getattr(headers, "get", None)
+    if callable(direct):
+        value = direct(name, None)
+        if value is not None:
+            return str(value)
+        value = direct(name.lower(), None)
+        if value is not None:
+            return str(value)
+        value = direct(name.title(), None)
+        if value is not None:
+            return str(value)
+    items = getattr(headers, "items", None)
+    if callable(items):
+        lowered = str(name or "").strip().lower()
+        for key, value in items():
+            if str(key or "").strip().lower() == lowered:
+                return str(value)
+    return ""
+
+
+def _prefers_http_bytes_transport(mode: str = "") -> bool:
+    return prefers_transport_payload_bytes(mode)
+
+
+def _is_http_transport_content_type(value: str) -> bool:
+    return _normalize_content_type(value) == HTTP_TRANSPORT_CONTENT_TYPE
+
+
+def _serialize_http_call_payload(payload: Optional[Dict[str, object]], *, context: str, mode: str = "") -> Dict[str, object]:
     return encode_payload_for_transport(
         payload,
         policy=get_payload_policy("http_call"),
         context=context,
+        mode=mode,
     )
 
 
-def _decode_http_request_body(body: bytes, *, context: str) -> Dict[str, object]:
+def _encode_http_transport_body(payload: Optional[Dict[str, object]], *, context: str, mode: str = "") -> tuple[bytes, Dict[str, str], str]:
+    transport = encode_transport_payload_bytes(
+        payload or {},
+        mode=mode,
+        context=context,
+    )
+    headers = {
+        "Content-Type": HTTP_TRANSPORT_CONTENT_TYPE,
+        HTTP_CODEC_HEADER: str(transport.codec or ""),
+        HTTP_TRANSPORT_VERSION_HEADER: str(int(transport.version or 0)),
+    }
+    return (transport.payload or b""), headers, str(transport.codec or "")
+
+
+def _decode_http_request_body_with_mode(body: bytes, *, context: str) -> tuple[Dict[str, object], str]:
     try:
         payload = json.loads(body.decode("utf-8") if body else "{}")
     except Exception as exc:
         raise ValueError("invalid json body") from exc
     if not isinstance(payload, dict):
         raise ValueError("json body must be object")
-    serialized = _serialize_http_call_payload(payload, context=context)
+    transport_mode = detect_transport_mode(payload)
     decoded = decode_payload_from_transport(
-        serialized,
+        payload,
         policy=get_payload_policy("http_call"),
+        mode=transport_mode,
+        context=context,
     )
     if not isinstance(decoded, dict):
         raise ValueError("json body must decode to object")
+    return decoded, transport_mode
+
+
+def _decode_http_transport_request_body_with_mode(
+    body: bytes,
+    *,
+    headers,
+    context: str,
+) -> tuple[Dict[str, object], str]:
+    codec = _header_get(headers, HTTP_CODEC_HEADER).strip().lower()
+    if not codec:
+        raise ValueError("transport request is missing X-Pycloud-Codec")
+    raw_version = _header_get(headers, HTTP_TRANSPORT_VERSION_HEADER).strip()
+    try:
+        version = int(raw_version or 0)
+    except ValueError as exc:
+        raise ValueError("transport request has invalid X-Pycloud-Transport-Version") from exc
+    effective_mode = resolve_received_transport_mode(
+        declared_mode=codec,
+        default_mode="legacy_v1",
+        context=context,
+    )
+    decoded = decode_transport_payload_bytes(
+        codec,
+        version,
+        body,
+        context=context,
+    )
+    if not isinstance(decoded, dict):
+        raise ValueError("transport body must decode to object")
+    return decoded, effective_mode
+
+
+def _decode_http_request_body(body: bytes, *, context: str) -> Dict[str, object]:
+    decoded, _mode = _decode_http_request_body_with_mode(body, context=context)
     return decoded
 
 
@@ -65,6 +163,47 @@ def _decode_http_response_body(body: bytes, *, control_addr: str = "") -> Dict[s
     except Exception as exc:
         raise RuntimeError("invalid json response") from exc
     return _normalize_http_response_body(parsed, control_addr=control_addr)
+
+
+def _encode_http_transport_response_body(
+    value: Any,
+    *,
+    context: str,
+    mode: str,
+) -> tuple[bytes, Dict[str, str]]:
+    transport = encode_transport_payload_bytes(
+        value,
+        mode=mode,
+        context=context,
+    )
+    headers = {
+        "Content-Type": HTTP_TRANSPORT_CONTENT_TYPE,
+        HTTP_CODEC_HEADER: str(transport.codec or ""),
+        HTTP_TRANSPORT_VERSION_HEADER: str(int(transport.version or 0)),
+    }
+    return (transport.payload or b""), headers
+
+
+def _decode_http_response_with_headers(body: bytes, *, headers, control_addr: str = "") -> Dict[str, object]:
+    content_type = _normalize_content_type(_header_get(headers, "Content-Type"))
+    if _is_http_transport_content_type(content_type):
+        codec = _header_get(headers, HTTP_CODEC_HEADER).strip().lower()
+        if not codec:
+            raise RuntimeError("transport response is missing X-Pycloud-Codec")
+        raw_version = _header_get(headers, HTTP_TRANSPORT_VERSION_HEADER).strip()
+        try:
+            version = int(raw_version or 0)
+        except ValueError as exc:
+            raise RuntimeError("transport response has invalid X-Pycloud-Transport-Version") from exc
+        decoded = decode_transport_payload_bytes(
+            codec,
+            version,
+            body,
+            context="service_result",
+        )
+        decoded = _inject_result_ref_control_addr(decoded, control_addr=control_addr)
+        return {"ok": True, "data": decoded}
+    return _decode_http_response_body(body, control_addr=control_addr)
 
 
 def _is_bundle_format(fmt: str, *, expected: str) -> bool:
@@ -84,6 +223,9 @@ def _materialize_downloaded_result(path: Path, *, result_ref: object):
     )
     if materialized == "path":
         return path
+    normalized_format = str(data_ref.format or "").strip().lower()
+    if normalized_format in {"structured_v1", "pickle_stable_v1"}:
+        return deserialize_by_mode(path.read_bytes(), mode=normalized_format)
     if materialized == "bytes":
         return path.read_bytes()
     if materialized == "text":
@@ -137,14 +279,13 @@ def _inject_result_ref_control_addr(value: object, *, control_addr: str) -> obje
 def _normalize_http_response_body(body: object, *, control_addr: str = "") -> Dict[str, object]:
     if not isinstance(body, dict):
         raise RuntimeError("invalid json response")
-    converted = decode_result_from_transport(
-        body,
-        policy=get_payload_policy("result"),
-    )
-    if not isinstance(converted, dict):
-        raise RuntimeError("invalid json response")
+    converted = dict(body)
     if "data" in converted:
-        converted = dict(converted)
+        converted["data"] = decode_result_from_transport(
+            converted.get("data"),
+            policy=get_payload_policy("result"),
+            context="service_result",
+        )
         converted["data"] = _inject_result_ref_control_addr(converted.get("data"), control_addr=control_addr)
     return converted
 
@@ -188,27 +329,44 @@ def _call_route_http(
     payload: Dict[str, object],
     timeout_sec: float,
     service_token: str,
+    serialization_mode: str = "",
 ) -> Dict[str, object]:
     url = f"{route.http_base_url}/call/{quote(method, safe='')}?timeout_sec={max(0.1, timeout_sec):.3f}"
-    headers = {"Content-Type": "application/json"}
+    headers: Dict[str, str] = {}
     if service_token:
         headers["X-Service-Token"] = service_token
-    serialized_payload = _serialize_http_call_payload(payload, context="service call payload")
+    if _prefers_http_bytes_transport(serialization_mode):
+        request_body, transport_headers, _codec = _encode_http_transport_body(
+            payload,
+            context="service_internal",
+            mode=serialization_mode,
+        )
+        headers.update(transport_headers)
+    else:
+        headers["Content-Type"] = "application/json"
+        serialized_payload = _serialize_http_call_payload(payload, context="service call payload", mode=serialization_mode)
+        request_body = json.dumps(serialized_payload).encode("utf-8")
     req = Request(
         url=url,
         method="POST",
         headers=headers,
-        data=json.dumps(serialized_payload).encode("utf-8"),
+        data=request_body,
     )
     try:
         with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
-            data = _normalize_http_response_body(
-                json.loads(resp.read().decode("utf-8") or "{}"),
+            raw = resp.read()
+            data = _decode_http_response_with_headers(
+                raw,
+                headers=resp.headers,
                 control_addr=route.control_addr,
             )
     except HTTPError as exc:
         try:
-            data = _normalize_http_response_body(json.loads((exc.read() or b"{}").decode("utf-8") or "{}"))
+            raw = exc.read() or b"{}"
+            data = _decode_http_response_with_headers(
+                raw,
+                headers=getattr(exc, "headers", {}) or {},
+            )
         except Exception:
             data = {"ok": False, "error": exc.reason}
         raise DiscoveryCallError(status_code=exc.code, data=data) from exc

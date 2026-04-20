@@ -46,6 +46,13 @@ def _env_choice(name: str, default: str, choices: set[str]) -> str:
     return str(default or "").strip().lower()
 
 
+PYCLOUD_SYSTEM_MODE = "PYCLOUD_SYSTEM_MODE"
+PYCLOUD_TRUST_MODE = "PYCLOUD_TRUST_MODE"
+PYCLOUD_OBJECT_TRANSFER_MODE = "PYCLOUD_OBJECT_TRANSFER_MODE"
+PYCLOUD_SERIALIZATION_MODE = "PYCLOUD_SERIALIZATION_MODE"
+PYCLOUD_DEPENDENCY_POLICY_MODE = "PYCLOUD_DEPENDENCY_POLICY_MODE"
+
+
 INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
 INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024)
 INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024)
@@ -64,11 +71,22 @@ FILE_HASH_CHUNK_SIZE_BYTES = _env_int("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES", 1024
 OBJECT_SEGMENT_MAX_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024)
 OBJECT_SEGMENT_TARGET_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024)
 OBJECT_UPLOAD_TRUSTED_PRECHECK = _env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True)
-TRUST_MODE = _env_choice("PYCLOUD_TRUST_MODE", "trusted", {"trusted", "balanced", "strict"})
+SYSTEM_MODE = _env_choice(PYCLOUD_SYSTEM_MODE, "trusted_default", {"trusted_default"})
+TRUST_MODE = _env_choice(PYCLOUD_TRUST_MODE, "trusted", {"trusted", "balanced", "strict"})
 OBJECT_TRANSFER_MODE = _env_choice(
-    "PYCLOUD_OBJECT_TRANSFER_MODE",
+    PYCLOUD_OBJECT_TRANSFER_MODE,
     "auto",
     {"auto", "known_digest_precheck", "single_pass_authoritative"},
+)
+SERIALIZATION_MODE = _env_choice(
+    PYCLOUD_SERIALIZATION_MODE,
+    "legacy_v1",
+    {"legacy_v1", "structured_v1", "pickle_stable_v1"},
+)
+DEPENDENCY_POLICY_MODE = _env_choice(
+    PYCLOUD_DEPENDENCY_POLICY_MODE,
+    "legacy_v1",
+    {"legacy_v1", "prebuilt", "node_preinstalled", "allow_install"},
 )
 
 GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
@@ -84,6 +102,9 @@ SERVICE_HEARTBEAT_TIMEOUT_SEC = _env_int("PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC"
 PayloadMode = Literal["http_call", "job_submit", "task_submit", "managed_globals", "result"]
 TrustMode = Literal["trusted", "balanced", "strict"]
 ObjectTransferMode = Literal["auto", "known_digest_precheck", "single_pass_authoritative"]
+SystemMode = Literal["trusted_default"]
+SerializationMode = Literal["legacy_v1", "structured_v1", "pickle_stable_v1"]
+DependencyPolicyMode = Literal["legacy_v1", "prebuilt", "node_preinstalled", "allow_install"]
 
 
 @dataclass(frozen=True)
@@ -154,8 +175,24 @@ def get_trust_mode() -> TrustMode:
     return str(TRUST_MODE or "trusted").strip().lower()  # type: ignore[return-value]
 
 
+def get_system_mode() -> SystemMode:
+    return str(SYSTEM_MODE or "trusted_default").strip().lower()  # type: ignore[return-value]
+
+
 def get_object_transfer_mode() -> ObjectTransferMode:
     return str(OBJECT_TRANSFER_MODE or "auto").strip().lower()  # type: ignore[return-value]
+
+
+def get_serialization_mode() -> SerializationMode:
+    return _env_choice(
+        PYCLOUD_SERIALIZATION_MODE,
+        "legacy_v1",
+        {"legacy_v1", "structured_v1", "pickle_stable_v1"},
+    )  # type: ignore[return-value]
+
+
+def get_dependency_policy_mode() -> DependencyPolicyMode:
+    return str(DEPENDENCY_POLICY_MODE or "legacy_v1").strip().lower()  # type: ignore[return-value]
 
 
 def resolve_object_transfer_mode(*, source_kind: str, local_digest_known: bool) -> ObjectTransferMode:
@@ -237,11 +274,22 @@ def reload_config() -> None:
         OBJECT_SEGMENT_MAX_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024),
         OBJECT_SEGMENT_TARGET_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024),
         OBJECT_UPLOAD_TRUSTED_PRECHECK=_env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True),
-        TRUST_MODE=_env_choice("PYCLOUD_TRUST_MODE", "trusted", {"trusted", "balanced", "strict"}),
+        SYSTEM_MODE=_env_choice(PYCLOUD_SYSTEM_MODE, "trusted_default", {"trusted_default"}),
+        TRUST_MODE=_env_choice(PYCLOUD_TRUST_MODE, "trusted", {"trusted", "balanced", "strict"}),
         OBJECT_TRANSFER_MODE=_env_choice(
-            "PYCLOUD_OBJECT_TRANSFER_MODE",
+            PYCLOUD_OBJECT_TRANSFER_MODE,
             "auto",
             {"auto", "known_digest_precheck", "single_pass_authoritative"},
+        ),
+        SERIALIZATION_MODE=_env_choice(
+            PYCLOUD_SERIALIZATION_MODE,
+            "legacy_v1",
+            {"legacy_v1", "structured_v1", "pickle_stable_v1"},
+        ),
+        DEPENDENCY_POLICY_MODE=_env_choice(
+            PYCLOUD_DEPENDENCY_POLICY_MODE,
+            "legacy_v1",
+            {"legacy_v1", "prebuilt", "node_preinstalled", "allow_install"},
         ),
         GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
         GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
@@ -258,3 +306,60 @@ def grpc_channel_options() -> list[tuple[str, int]]:
         ("grpc.max_send_message_length", int(GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES)),
         ("grpc.max_receive_message_length", int(GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES)),
     ]
+
+
+__all__ = [
+    "DEPENDENCY_POLICY_MODE",
+    "DependencyPolicyMode",
+    "FILE_HASH_CHUNK_SIZE_BYTES",
+    "GATEWAY_MAX_UPLOAD_FILE_BYTES",
+    "GATEWAY_MAX_UPLOAD_TOTAL_BYTES",
+    "GATEWAY_STAGE_GC_INTERVAL_SEC",
+    "GATEWAY_STAGE_TTL_SEC",
+    "GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES",
+    "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES",
+    "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
+    "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",
+    "INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "INLINE_RESULT_HARD_LIMIT_BYTES",
+    "INLINE_RESULT_SOFT_LIMIT_BYTES",
+    "JOB_PAYLOAD_MAX_BYTES",
+    "JOB_STAGED_REF_TTL_SEC",
+    "JOB_STAGING_REPLICA_COUNT",
+    "NODE_MAX_WORKERS",
+    "NODE_QUEUE_CAPACITY",
+    "NODE_WORKER_CAPACITY",
+    "OBJECT_CHUNK_SIZE_BYTES",
+    "OBJECT_SEGMENT_MAX_BYTES",
+    "OBJECT_SEGMENT_TARGET_BYTES",
+    "OBJECT_TRANSFER_MODE",
+    "OBJECT_UPLOAD_TRUSTED_PRECHECK",
+    "ObjectTransferMode",
+    "PayloadLimits",
+    "PayloadMode",
+    "PayloadPolicy",
+    "PYCLOUD_DEPENDENCY_POLICY_MODE",
+    "PYCLOUD_OBJECT_TRANSFER_MODE",
+    "PYCLOUD_SERIALIZATION_MODE",
+    "PYCLOUD_SYSTEM_MODE",
+    "PYCLOUD_TRUST_MODE",
+    "SERIALIZATION_MODE",
+    "SERVICE_DEFAULT_WORKERS",
+    "SERVICE_HEARTBEAT_TIMEOUT_SEC",
+    "SYSTEM_MODE",
+    "SerializationMode",
+    "SystemMode",
+    "TRUST_MODE",
+    "TrustMode",
+    "env_int",
+    "get_dependency_policy_mode",
+    "get_object_transfer_mode",
+    "get_payload_policy",
+    "get_runtime_limits",
+    "get_serialization_mode",
+    "get_system_mode",
+    "get_trust_mode",
+    "grpc_channel_options",
+    "reload_config",
+    "resolve_object_transfer_mode",
+]

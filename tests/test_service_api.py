@@ -91,6 +91,17 @@ class TestCallProxy:
         assert new_proxy._strategy == "round_robin"
         assert new_proxy._method == "square"
 
+    def test_with_options_accepts_service_latency_profile(self):
+        """测试 with_options 支持显式 service profile 名称。"""
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group, timeout_sec=60.0)
+
+        new_proxy = proxy.with_options(strategy="service_latency_first")
+
+        assert new_proxy._strategy == "service_latency_first"
+
     def test_map_delegates_to_group_batch_map(self):
         """测试 map 会委托给 group.map_calls。"""
         from pycloud_parallel.execution.call_proxy import _CallProxy
@@ -213,7 +224,7 @@ class TestCallProxy:
                 "square",
                 {"x": 7},
                 timeout_sec=60.0,
-                strategy="least_inflight",
+                strategy="predicted_busy",
                 refresh_status=True,
             )
 
@@ -420,6 +431,7 @@ class TestOwnerServiceFacade:
 
         assert isinstance(proxy, _CallProxy)
         assert proxy._method == "square"
+        assert proxy._strategy == "predicted_busy"
 
     def test_getattr_with_empty_methods_raises(self):
         """测试当方法列表为空时，访问任何方法都应该报错。"""

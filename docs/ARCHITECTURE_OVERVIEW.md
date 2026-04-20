@@ -129,10 +129,186 @@
 7. `runtime_key` 仍然保留，但它代表 runtime 逻辑隔离键，不再对应独立的 runtime-slot 资源
 8. 普通用户默认走 `TaskPool.open(source=module)`；`Artifact(...)` 是高级能力
 
-## 6. 已移除
+## 6. 统一调度核心
+
+当前 `Service / TaskPool / JobQueue` 已经共享一套统一的“选谁”框架：
+
+1. 统一候选对象
+2. 统一硬过滤
+3. 统一特征集合
+4. 统一复合评分
+5. 同分候选再做 round-robin 打散
+
+默认 profile：
+
+1. `SERVICE_DEFAULT`
+   - `Service` owner / discovery / gateway 都默认走这套口径
+   - 核心特征是 `predicted_busy + node_inflight + alive_workers`
+2. `TASKPOOL_DEFAULT`
+   - `TaskPool` 单次提交和 refill 补位都走这套口径
+   - 额外考虑 `local_inflight`
+3. `JOBQUEUE_DEFAULT`
+   - `JobQueue` 建池选点用这套口径
+
+要注意分层：
+
+1. scheduler 只负责“选谁”
+2. `TaskPool` 自己仍负责：
+   - `max_in_flight`
+   - refill
+   - pull results
+3. `Service` 自己仍负责 RPC 调用与失败切换
+
+也就是：
+
+1. **统一选点**
+2. **不强行统一流控循环**
+
+## 7. 已移除
 
 以下旧共享任务池能力已经移除：
 
 1. 旧共享任务池客户端
 2. 旧共享任务池流式入口
 3. 旧共享任务结果拉取与取消链路
+
+## 8. Serialization Modes
+
+当前数据传输层定义了 3 个 serialization mode：
+
+1. `legacy_v1`
+   - 当前老兼容模式
+   - 默认仍是它
+2. `structured_v1`
+   - 结构化显式 codec
+   - transport body 可显式识别 codec
+3. `pickle_stable_v1`
+   - 受信环境高保真 Python codec
+   - 对 pandas/numpy 先做稳定 schema 规范化，再进入 pickle
+
+边界说明：
+
+1. `legacy_v1`
+   - 适合最小风险兼容
+2. `structured_v1`
+   - 适合长期安全结构化模式
+3. `pickle_stable_v1`
+   - 适合内网受信环境下的高保真传输
+   - 但不等于任意 Python 自定义对象都承诺稳定支持
+
+当前明确支持矩阵：
+
+1. `legacy_v1`
+   - JSON scalar
+   - dict/list/tuple
+   - datetime/date/time/timedelta
+   - DataFrame
+   - Series
+   - ndarray
+   - DataRef
+2. `structured_v1`
+   - `legacy_v1` 的结构化对象
+   - bytes/bytearray/memoryview
+   - tuple 在结构化层按 list 语义传输
+   - dict key 会收成 string
+3. `pickle_stable_v1`
+   - `structured_v1` 支持的对象
+   - pandas `DataFrame / Series / Index`
+   - numpy `ndarray`（非 `dtype=object`）
+   - `dtype=object` 明确报错
+
+## 9. Transport Codec Pipeline
+
+当前 3 个 serialization mode 不再只作用于 `put_data()` 这一条对象上传路径，而是统一进入了主传输层：
+
+1. payload encode
+2. request body
+3. response / result decode
+4. task submit / task result
+5. object upload / DataRef materialize
+
+统一规则：
+
+1. `legacy_v1`
+   - 继续走老的 Arrow-compatible / Struct-safe 语义
+   - 也是当前默认
+2. `structured_v1`
+   - transport body 使用显式 envelope 标明 codec
+   - bytes 通过结构化 sentinel 传输
+3. `pickle_stable_v1`
+   - transport body 同样显式标明 codec
+   - pandas / numpy 先做稳定 schema，再进入 pickle
+
+当前 transport decode 规则：
+
+1. 优先识别显式 transport envelope
+2. 只有 `legacy_v1` 允许裸 payload fallback
+3. `structured_v1` / `pickle_stable_v1` 不再依赖 decode 端猜测
+4. 接收端会按上下文重新校验 declared codec，不再无条件信任 envelope
+
+分层边界：
+
+1. object codec 层
+   - `legacy_v1`
+   - `structured_v1`
+   - `pickle_stable_v1`
+2. transport 容器层
+   - JSON / Struct
+   - gRPC bytes payload
+   - object upload blob
+
+当前 gRPC/protobuf 主链已经是并行双通道：
+
+1. 旧通道
+   - `google.protobuf.Struct`
+   - 继续兼容 `legacy_v1`
+2. 新通道
+   - `TransportPayload { codec, version, payload(bytes) }`
+   - `pickle_stable_v1` 优先走这条 bytes 通道
+   - 接收端优先读取这条通道
+
+当前 HTTP 主链也已经是并行双通道：
+
+1. 旧通道
+   - `application/json`
+   - 继续兼容 `legacy_v1`
+   - `structured_v1` 也可继续走这条路径
+2. 新通道
+   - `application/x-pycloud-transport`
+   - `X-Pycloud-Codec`
+   - `X-Pycloud-Transport-Version`
+   - `pickle_stable_v1` 优先走这条 bytes 通道
+
+HTTP 接收端规则：
+
+1. JSON body 继续走旧 JSON decode
+2. bytes body 先按 header 读 declared codec/version
+3. 再按上下文做权限校验
+4. `gateway_public` 默认仍然硬性禁止 `pickle_stable_v1`
+
+`pickle_stable_v1` 的对象层原则：
+
+1. 只负责稳定 schema
+2. ndarray schema 里的数据字段保留 raw bytes
+3. 不为了 JSON/Struct 预处理成 base64
+
+当前如果某条 transport 通道仍然是 JSON / Struct-only：
+
+1. 由 transport 层显式做 container adaptation
+2. 或显式拒绝该 codec 走该通道
+3. 不再把这个责任下推到 `pickle_stable_v1` codec 本身
+
+mode 选择权也已经固定在少数边界：
+
+1. 全局默认：system mode / env
+2. 会话级：`Service` / `TaskPool` / `JobQueue`
+3. 单次调用级：低层显式 call/submit API
+4. 对象上传级：`put_data(...)` 及其变体
+
+内部模块例如 transport client、payload helper、node execution helper 现在只接收/传递 mode，不再私自切换默认 mode。
+
+`pickle_stable_v1` 的边界：
+
+1. 适合 trusted session / object upload / owner-side service / taskpool
+2. `gateway_public` 和 `untrusted_transport` 默认硬性禁止
+3. 在受限上下文里会明确拒绝，而不是静默降级

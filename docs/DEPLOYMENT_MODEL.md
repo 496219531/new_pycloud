@@ -43,15 +43,25 @@
 
 ### 2.5 选点策略
 
-客户端当前只做简单选点：
+当前已经改成统一 scheduler 框架：
 
-1. 过滤 unhealthy
-2. 过滤 cordon
-3. 过滤 drain
-4. 按剩余 service worker 容量排序
-5. 选择前 N 个节点
+1. 统一候选对象
+2. 统一硬过滤
+3. 统一特征集合
+4. 统一复合评分
+5. 同分候选 round-robin 打散
 
-不做复杂调度器。
+默认 profile：
+
+1. `SERVICE_DEFAULT`
+2. `TASKPOOL_DEFAULT`
+3. `JOBQUEUE_DEFAULT`
+
+这里要注意分层：
+
+1. scheduler 只负责“选谁”
+2. `TaskPool` 自己仍负责 `max_in_flight / refill / pull_results`
+3. `Service` 自己仍负责 RPC 调用与失败切换
 
 ## 3. 当前部署路径
 

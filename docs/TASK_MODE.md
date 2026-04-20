@@ -206,6 +206,52 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
 2. 失败结果会返回 `(task_id, None)`
 3. 如果你希望遇到失败立即抛异常，可显式传 `raise_on_error=True`
 
+## 4. Task Serialization Mode
+
+`TaskPool` 当前也已经接入统一 transport codec pipeline。
+
+也就是说：
+
+1. task payload submit
+2. task result decode
+3. `put_data()` 生成的 `DataRef`
+
+三者已经按同一 `serialization_mode` 语义工作。
+
+当前支持：
+
+1. `legacy_v1`
+   - 默认兼容模式
+2. `structured_v1`
+   - 结构化显式 codec
+3. `pickle_stable_v1`
+   - 受信环境高保真 Python codec
+
+当前选择优先级：
+
+1. 单次提交显式 `serialization_mode=...`
+2. `TaskPool` session 自己的 `serialization_mode`
+3. system mode / env
+4. 最终回退 `legacy_v1`
+
+说明：
+
+1. `TaskPool.serialization_mode` 是当前 session 的主边界
+2. `submit_payloads(...)` 可以临时 override，但不会污染 session 默认值
+3. `put_data()/put_json()/put_ndarray()/put_dataframe()` 不显式传 mode 时，会继承当前 `TaskPool` session mode
+4. transport decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
+
+显式示例：
+
+```python
+with TaskPool.open(
+    target="127.0.0.1:50051",
+    source=my_task_module,
+    serialization_mode="structured_v1",
+) as pool:
+    pool.submit_payloads([{"value": 1, "blob": b"abc"}])
+```
+
 如果你只是想提交单个任务并拿到这次提交的 `task_id`：
 
 ```python
@@ -250,6 +296,24 @@ for item in pool.iter_items(timeout_sec=10.0):
 3. 如果传整数 `N`，表示“本次最多接收 `N` 条结果后就结束这次阻塞”
 4. `iter_data(...) / collect_data(...)` 遇到失败结果会抛异常
 5. `iter_items(...) / collect_items(...)` 会把成功/失败都显式返回给你
+6. 当前 `TaskPool` 的公开批量入口已经共享统一 scheduler 选点核心
+   - 先决定“下一条该发给谁”
+   - 再由 `TaskPool` 自己做 `max_in_flight / refill / pull_results`
+   - 也就是统一“选点”，不强行统一“流控循环”
+7. 当前默认 profile 是 `TASKPOOL_DEFAULT`
+   - 如果以后需要显式切策略，方向会是：
+     - `TASKPOOL_DEFAULT`
+     - `TASKPOOL_THROUGHPUT`
+   - 但公开接口名字本身不会再扩成新的产品概念
+
+例如，如果你更关心吞吐而不是尽量压低本地 inflight，可以显式传：
+
+```python
+results = pool.map(
+    values,
+    strategy="taskpool_throughput",
+)
+```
 
 如果你想边准备数据、边 submit、边接收结果，推荐直接用公开统一接口：
 
@@ -299,6 +363,9 @@ print(processed)
 3. `imap_unordered(...)`
    - 返回 `(index, result_or_none)`
    - 但仍保留 `receive_batch / result_timeout_sec / wait_ms` 这类低层流控能力
+   - 当前 submit/requeue/infra-failure 也已经接入统一 failover 状态机
+   - 局部失效节点会被禁用，后续 payload 会继续退化到健康节点
+   - 公开主路径不再建立在旧 `_iter_batch_items()` 的 chunk/barrier helper 之上
 4. 结果一到就立即 yield，不需要等整批任务全部结束
 5. `unordered(...)` / `aunordered(...)` / `imap_unordered(...)` / `consume_unordered(...)` 运行期间会独占当前 session，不允许并发混用其他 submit/取数接口
 

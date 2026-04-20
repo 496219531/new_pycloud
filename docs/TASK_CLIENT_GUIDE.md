@@ -34,6 +34,12 @@ with TaskPool.open(
 1. `TaskPool` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
 2. 如果手动传 `task_method=...`，它必须和这个入口名一致
 3. `runtime_key` 保留为 runtime 逻辑隔离键，但不再表示独立 runtime-slot
+4. `TaskPool` 当前默认走统一 scheduler 的 `TASKPOOL_DEFAULT` profile
+5. 如果你需要更偏吞吐的策略，可以显式传：
+
+```python
+results = pool.map(values, strategy="taskpool_throughput")
+```
 
 排队执行示例：
 
@@ -62,7 +68,7 @@ client.submit(
 6. `update_globals(...)`
    - 可选
    - 只负责在 job-orch 端生成共享数据 `dict`
-7. `handle_result(task_id, result, state=..., ...)` / `handle_data(...)`
+7. `handle_result(index, result, state=..., ...)` / `handle_data(...)`
    - 可选，增量更新聚合状态
 8. `finalize(state=..., ...)`
    - 可选，输出最终 `final_result`
@@ -73,6 +79,12 @@ client.submit(
    - `None` -> 不再默认 raw assign
    - `dict` -> 再把这个 dict 写回入口模块 A 的 globals
 10. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 负责，不再从 client helper 暴露
+11. `JobQueue` 在真正创建 `TaskPool` 时，会按统一 scheduler 的 `JOBQUEUE_DEFAULT` profile 选节点
+
+补充边界：
+
+1. `JobQueue` 高层 hook 现在统一以 `index` 标识子任务
+2. 只有低层直接任务提交/接收结果链路才继续强调 `task_id`
 
 说明：
 

@@ -119,9 +119,11 @@ from pycloud_parallel.data.ref import (
 )
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.serialization import (
+    decode_transport_payload_bytes,
+    detect_transport_mode,
     log_payload_flow,
     serialize_arrow_compatible,
-    struct_to_dict,
+    struct_to_python,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -1786,6 +1788,23 @@ class NodeControlState:
             if artifact is None:
                 raise RuntimeError("code artifact missing")
             for item in tasks:
+                if item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
+                    item_serialization_mode = str(item.transport_payload.codec or "").strip().lower()
+                    decoded_payload = decode_transport_payload_bytes(
+                        item.transport_payload.codec,
+                        item.transport_payload.version,
+                        item.transport_payload.payload,
+                        context="taskpool_session",
+                    )
+                else:
+                    raw_payload = struct_to_python(item.payload)
+                    item_serialization_mode = detect_transport_mode(raw_payload, default="legacy_v1")
+                    decoded_payload = decode_payload_from_transport(
+                        raw_payload,
+                        policy=get_payload_policy("task_submit"),
+                        mode=item_serialization_mode,
+                        context="taskpool_session",
+                    )
                 if item.task_id in self._pool_tasks:
                     rejected.append(
                         pb2.TaskRejected(
@@ -1802,10 +1821,7 @@ class NodeControlState:
                     code_version=pool.code_version,
                     runtime_key=str(item.runtime_key or "").strip(),
                     execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
-                    payload=decode_payload_from_transport(
-                        struct_to_dict(item.payload),
-                        policy=get_payload_policy("task_submit"),
-                    ),
+                    payload=decoded_payload,
                     timeout_hint_sec=max(0, item.timeout_hint_sec),
                     priority=max(1, item.priority or 1),
                     status=pb2.TASK_STATUS_RUNNING,
@@ -1814,6 +1830,7 @@ class NodeControlState:
                     lease_id=str(uuid.uuid4()),
                     started_at=now,
                     last_heartbeat_at=now,
+                    serialization_mode=item_serialization_mode,
                 )
                 self._pool_tasks[item.task_id] = record
                 build_start = time.perf_counter()
@@ -1824,6 +1841,7 @@ class NodeControlState:
                     method_name=artifact.entry_callable,
                     payload=self._resolve_memory_object_refs_in_payload_locked(record.payload),
                     payload_mode="task_submit",
+                    serialization_mode=item_serialization_mode,
                     managed_globals_scope_dir=pool.managed_globals_scope_dir,
                     managed_globals_digest=pool.managed_globals_digest,
                 )
@@ -2050,6 +2068,7 @@ class NodeControlState:
         payload: dict,
         service_token: str,
         timeout_sec: float,
+        serialization_mode: str = "",
     ) -> Tuple[int, Dict[str, object]]:
         total_start = time.perf_counter()
         requested_method = str(method or "").strip()
@@ -2088,6 +2107,7 @@ class NodeControlState:
                 method_name=requested_method,
                 payload=prepared_payload,
                 payload_mode="http_call",
+                serialization_mode=str(serialization_mode or "").strip().lower(),
                 managed_globals_scope_dir=session.managed_globals_scope_dir,
                 managed_globals_digest=session.managed_globals_digest,
             )
@@ -2180,7 +2200,7 @@ class NodeControlState:
                         total_ms=(finalize_end - total_start) * 1000.0,
                         subprocess_timings=subprocess_timings,
                     )
-            return 200, {"ok": True, "method": requested_method, "data": result or {}}
+            return 200, {"ok": True, "method": requested_method, "data": {} if result is None else result}
         if status_text == "FAILED_USER":
             _ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
                 status_text,
@@ -2252,6 +2272,7 @@ class NodeControlState:
         payload: dict,
         service_token: str,
         timeout_sec: float,
+        serialization_mode: str = "",
     ) -> Tuple[int, Dict[str, object]]:
         return self._invoke_service_call(
             service_id=service_id,
@@ -2259,6 +2280,7 @@ class NodeControlState:
             payload=payload,
             service_token=service_token,
             timeout_sec=timeout_sec,
+            serialization_mode=serialization_mode,
         )
 
     def call_service(
@@ -2269,6 +2291,7 @@ class NodeControlState:
         payload: dict,
         service_token: str,
         timeout_sec: float,
+        serialization_mode: str = "",
     ) -> Tuple[int, Dict[str, object]]:
         return self._invoke_service_call(
             service_id=service_id,
@@ -2276,6 +2299,7 @@ class NodeControlState:
             payload=payload,
             service_token=service_token,
             timeout_sec=timeout_sec,
+            serialization_mode=serialization_mode,
         )
 
     def update_service_globals(
@@ -2541,7 +2565,7 @@ class NodeControlState:
                             self.data_store.register_stored_result(result)
                             task.result = self.data_store.data_ref_from_stored_artifact(result)
                         else:
-                            task.result = result or {}
+                            task.result = {} if result is None else result
                         task.error_type = ""
                         task.error_message = ""
                     if pool is not None:

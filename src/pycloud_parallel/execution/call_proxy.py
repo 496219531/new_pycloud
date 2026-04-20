@@ -9,7 +9,6 @@ from pycloud_parallel.execution.base import ExecutionItem
 from pycloud_parallel.execution.support import (
     _resolve_high_level_service_data,
     _resolve_high_level_service_results,
-    _serialize_arrow_compatible,
 )
 
 
@@ -30,7 +29,9 @@ def _normalize_batch_call_payloads(
             payloads.append({**dict(item), **shared})
             continue
         if not normalized_arg_name:
-            raise TypeError("non-dict batch inputs require arg_name")
+            raise TypeError(
+                "map()/amap() non-dict batch inputs require arg_name"
+            )
         payloads.append({normalized_arg_name: item, **shared})
     return payloads
 
@@ -41,14 +42,17 @@ def _normalize_unordered_call_payloads(
     shared_kwargs: Optional[Mapping[str, object]] = None,
 ) -> List[Dict[str, object]]:
     if isinstance(values, Mapping):
-        raise TypeError("unordered inputs must be a sequence, not a single mapping payload")
+        raise TypeError(
+            "unordered()/aunordered()/iter_items() inputs must be a sequence, not a single mapping payload"
+        )
 
     shared = dict(shared_kwargs or {})
     payloads: List[Dict[str, object]] = []
     for item in values:
         if not isinstance(item, Mapping):
             raise TypeError(
-                "unordered inputs must be mapping payloads; use map(..., arg_name=...) for scalar batches"
+                "unordered()/aunordered()/iter_items() inputs must be mapping payloads; "
+                "use map(..., arg_name=...) for scalar batches"
             )
         payloads.append({**dict(item), **shared})
     return payloads
@@ -191,7 +195,7 @@ class _CallProxy:
         group,
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
     ) -> None:
         self._method = method
@@ -214,10 +218,9 @@ class _CallProxy:
         if args and kwargs:
             payload["kwargs"] = kwargs
         final_payload = payload if args else kwargs
-        serialized_payload = _serialize_arrow_compatible(final_payload)
         node_id, resp = await self._group.acall_balanced(
             self._method,
-            serialized_payload,
+            final_payload,
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
@@ -416,7 +419,7 @@ class _SyncCallProxy:
         group,
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
     ) -> None:
         self._method = method
@@ -435,10 +438,9 @@ class _SyncCallProxy:
         if args and kwargs:
             payload["kwargs"] = kwargs
         final_payload = payload if args else kwargs
-        serialized_payload = _serialize_arrow_compatible(final_payload)
         node_id, resp = self._group.call_balanced(
             self._method,
-            serialized_payload,
+            final_payload,
             timeout_sec=self._timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,

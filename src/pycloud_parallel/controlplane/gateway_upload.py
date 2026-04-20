@@ -11,8 +11,9 @@ import re
 from typing import Any, BinaryIO, Dict, Optional, Sequence, Tuple
 import uuid
 
-from .client_transport import _decode_http_request_body
+from .client_transport import _decode_http_request_body_with_mode
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref, with_data_ref_locator
+from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageFile, GatewayStageManager, GatewayStageRequest
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.data.ref import normalize_object_format
@@ -31,6 +32,7 @@ class GatewayUploadError(ValueError):
 class ParsedGatewayUploadCall:
     request: GatewayStageRequest
     payload: Dict[str, object]
+    serialization_mode: str
     file_map: Dict[str, str]
     files: Dict[str, GatewayStageFile]
     used_slots: Tuple[str, ...] = ()
@@ -207,6 +209,7 @@ def parse_gateway_upload_call(
             raise GatewayUploadError("invalid multipart preamble")
 
         payload: Optional[Dict[str, object]] = None
+        serialization_mode = ""
         file_map: Dict[str, str] = {}
         files: Dict[str, GatewayStageFile] = {}
         field_count = 0
@@ -261,7 +264,10 @@ def parse_gateway_upload_call(
                 )
                 text = bytes(collected).decode("utf-8")
                 if field_name == "payload":
-                    decoded = _decode_http_request_body(text.encode("utf-8"), context="gateway upload-call payload")
+                    decoded, serialization_mode = _decode_http_request_body_with_mode(
+                        text.encode("utf-8"),
+                        context="gateway_public",
+                    )
                     if not isinstance(decoded, dict):
                         raise GatewayUploadError("upload-call payload must decode to object")
                     payload = decoded
@@ -284,6 +290,7 @@ def parse_gateway_upload_call(
         return ParsedGatewayUploadCall(
             request=request,
             payload=payload,
+            serialization_mode=serialization_mode,
             file_map=file_map,
             files=files,
         )
@@ -464,3 +471,105 @@ def collect_used_upload_slots(
         file_map=file_map,
     )
     return used_slots
+
+
+def relay_data_ref_v1(
+    *,
+    route,
+    data_ref: DataRef | object,
+    registry_target: str,
+    timeout_sec: float,
+) -> DataRef:
+    normalized_ref = maybe_data_ref(data_ref)
+    if normalized_ref is None:
+        raise GatewayUploadError("relay_data_ref_v1 requires a DataRef-compatible value")
+    route_control_addr = str(getattr(route, "control_addr", "") or "").strip()
+    if not route_control_addr:
+        raise GatewayUploadError("route control_addr is required for DataRef relay")
+    if str(normalized_ref.control_addr or "").strip() == route_control_addr:
+        return normalized_ref
+    resolved = resolve_data_ref(normalized_ref, target=registry_target, timeout_sec=max(0.1, float(timeout_sec)))
+    source_addr = str(resolved.control_addr or "").strip()
+    if not source_addr:
+        raise GatewayUploadError(f"could not resolve data ref for relay: {normalized_ref.ref_id}")
+    with NodeControlClient(source_addr, timeout_sec=max(0.1, float(timeout_sec))) as source_client:
+        blob = source_client.download_object_bytes(object_id=normalized_ref.object_id)
+    with NodeControlClient(route_control_addr, timeout_sec=max(0.1, float(timeout_sec))) as target_client:
+        uploaded = target_client.upload_object_from_bytes(blob=blob, format=normalized_ref.format)
+    return DataRef(
+        ref_id=str(uploaded.ref_id or uploaded.object_id),
+        storage_id=str(uploaded.storage_id or uploaded.object_id),
+        logical_type=str(normalized_ref.logical_type or ""),
+        format=str(uploaded.format or normalized_ref.format or "bin"),
+        size_bytes=int(uploaded.size_bytes or normalized_ref.size_bytes or 0),
+        materialize_as=str(normalized_ref.materialize_as or "auto"),
+        locator_kind="node_control",
+        locator_token=route_control_addr,
+        node_id=str(getattr(route, "node_id", "") or ""),
+        node_instance_id=str(getattr(route, "node_instance_id", "") or ""),
+        control_addr=route_control_addr,
+        consume_on_read=bool(normalized_ref.consume_on_read),
+    )
+
+
+def ensure_data_ref_on_route(
+    *,
+    route,
+    value: object,
+    registry_target: str,
+    timeout_sec: float,
+) -> object:
+    normalized_ref = maybe_data_ref(value)
+    if normalized_ref is None:
+        return value
+    route_control_addr = str(getattr(route, "control_addr", "") or "").strip()
+    if route_control_addr and str(normalized_ref.control_addr or "").strip() == route_control_addr:
+        return normalized_ref
+    return relay_data_ref_v1(
+        route=route,
+        data_ref=normalized_ref,
+        registry_target=registry_target,
+        timeout_sec=timeout_sec,
+    )
+
+
+def relay_payload_data_refs_v1(
+    *,
+    route,
+    payload: Dict[str, object],
+    registry_target: str,
+    timeout_sec: float,
+) -> Dict[str, object]:
+    def _rewrite(value: object) -> object:
+        normalized_ref = maybe_data_ref(value)
+        if normalized_ref is not None:
+            return ensure_data_ref_on_route(
+                route=route,
+                value=normalized_ref,
+                registry_target=registry_target,
+                timeout_sec=timeout_sec,
+            )
+        if isinstance(value, dict):
+            return {str(key): _rewrite(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_rewrite(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_rewrite(item) for item in value)
+        return value
+
+    return dict(_rewrite(dict(payload or {})))
+
+
+__all__ = [
+    "GatewayUploadError",
+    "ParsedGatewayUploadCall",
+    "collect_used_upload_slots",
+    "ensure_data_ref_on_route",
+    "is_gateway_upload_call_path",
+    "parse_gateway_upload_call",
+    "relay_data_ref_v1",
+    "relay_payload_data_refs_v1",
+    "release_uploaded_refs_on_route",
+    "rewrite_payload_with_uploaded_refs",
+    "upload_staged_files_to_route",
+]

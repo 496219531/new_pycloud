@@ -84,6 +84,7 @@ class GatewayStageRequest:
     expires_at: Optional[datetime] = None
     status: str = "created"
     uploaded_files: Dict[str, GatewayStageFile] = field(default_factory=dict)
+    temp_files: Dict[str, GatewayStageFile] = field(default_factory=dict)
     resolved_refs: Dict[str, Dict[str, object]] = field(default_factory=dict)
     target_route: Dict[str, object] = field(default_factory=dict)
 
@@ -149,6 +150,17 @@ class GatewayStageManager:
         request.uploaded_files[file.slot] = file
         self._write_meta(request)
 
+    def allocate_temp_path(self, request: GatewayStageRequest, *, slot: str, original_name: str = "") -> Path:
+        safe_slot = _sanitize_part(slot, fallback="temp")
+        safe_name = _sanitize_part(Path(str(original_name or "")).name, fallback="temp.bin")
+        temp_dir = request.request_dir / "tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return temp_dir / f"{safe_slot}__{safe_name}"
+
+    def record_temp_file(self, request: GatewayStageRequest, file: GatewayStageFile) -> None:
+        request.temp_files[file.slot] = file
+        self._write_meta(request)
+
     def record_route(self, request: GatewayStageRequest, *, route: Dict[str, object]) -> None:
         request.target_route = dict(route or {})
         self._write_meta(request)
@@ -185,6 +197,7 @@ class GatewayStageManager:
             "expires_at": _dt_text(request.expires_at),
             "status": request.status,
             "uploaded_files": [item.as_dict() for item in request.uploaded_files.values()],
+            "temp_files": [item.as_dict() for item in request.temp_files.values()],
             "resolved_refs": dict(request.resolved_refs),
             "target_route": dict(request.target_route),
         }

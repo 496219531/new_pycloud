@@ -62,6 +62,12 @@ message TaskError {
   string message = 2;
 }
 
+message TransportPayload {
+  string codec = 1;
+  uint32 version = 2;
+  bytes payload = 3;
+}
+
 message NodeMetrics {
   int32 queued = 1;
   int32 inflight = 2;
@@ -317,6 +323,7 @@ message UpdateRuntimeGlobalsRequest {
   string runtime_key = 3;
   string code_token = 4;
   google.protobuf.Struct values = 5;
+  TransportPayload transport_values = 6;
 }
 
 message UpdateRuntimeGlobalsResponse {
@@ -334,6 +341,7 @@ message TaskSubmitItem {
   int32 timeout_hint_sec = 3;
   int32 priority = 4;
   string runtime_key = 5;
+  TransportPayload transport_payload = 6;
 }
 
 message TaskAccepted {
@@ -364,6 +372,7 @@ message TaskResult {
   google.protobuf.Struct result = 6;
   TaskError error = 7;
   string job_id = 8;
+  TransportPayload transport_result = 9;
 }
 
 message PullResultsResponse {
@@ -570,6 +579,7 @@ message CallServiceRequest {
   google.protobuf.Struct payload = 3;
   double timeout_sec = 4;
   string service_token = 5;
+  TransportPayload transport_payload = 6;
 }
 
 message CallServiceResponse {
@@ -579,6 +589,7 @@ message CallServiceResponse {
   google.protobuf.Struct data = 4;
   TaskError task_error = 5;
   Error error = 6;
+  TransportPayload transport_data = 7;
 }
 
 message UpdateServiceGlobalsRequest {
@@ -586,6 +597,7 @@ message UpdateServiceGlobalsRequest {
   string service_id = 2;
   string service_token = 3;
   google.protobuf.Struct values = 4;
+  TransportPayload transport_values = 5;
 }
 
 message UpdateServiceGlobalsResponse {

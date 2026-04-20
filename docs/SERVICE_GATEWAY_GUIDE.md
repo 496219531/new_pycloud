@@ -133,6 +133,24 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 
 ## 4. HTTP 入口
 
+当前 Gateway HTTP 已经支持两条并行 transport 通道：
+
+1. JSON 通道
+   - `Content-Type: application/json`
+   - 继续兼容 `legacy_v1`
+   - `structured_v1` 也可继续承载在这里
+2. bytes 通道
+   - `Content-Type: application/x-pycloud-transport`
+   - `X-Pycloud-Codec`
+   - `X-Pycloud-Transport-Version`
+   - 用于显式 `codec + raw bytes` 载荷
+
+注意：
+
+1. `gateway_public` 默认仍然禁止 `pickle_stable_v1`
+2. internal/discovery/owner HTTP 路径才允许 `pickle_stable_v1`
+3. route-aware staging / DataRef 语义不因 bytes 通道而改变
+
 Gateway 当前提供：
 
 1. `POST /svc/{service_name}/call/{method}`
@@ -160,6 +178,31 @@ Discovery 路径：
 1. 客户端先查路由
 2. 直接打实例
 3. 更适合调试、旁路或特殊性能场景
+
+两条路径当前的默认选路口径已经尽量统一：
+
+1. 默认都按 `predicted_busy` 选路
+2. 共同参考的核心指标是：
+   - `predicted_busy`
+   - `in_flight`
+   - `alive_workers`
+3. `round_robin` 只用于同分候选打散，不再是主策略
+
+大 payload staging 规则：
+
+1. discovery 只对当前选中 route staging
+2. retry route 时重新 staging
+3. gateway status lookup 失败时：
+   - 有最近缓存 routes，就继续 route-aware staging
+   - 没缓存且 payload 需要 staging，就明确报错
+
+也就是说：
+
+1. discovery route cache
+2. gateway route cache
+3. owner `Service`
+
+默认都在同一套“忙闲预测优先”的心智下工作。
 
 ## 6. 常见问题
 

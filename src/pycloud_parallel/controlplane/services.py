@@ -15,9 +15,18 @@ from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_pa
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
-from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, validate_inline_payload_structs
+from pycloud_parallel.controlplane.serialization import (
+    TRANSPORT_ENVELOPE_SENTINEL,
+    decode_transport_payload_bytes,
+    encode_transport_payload_bytes,
+    detect_transport_mode,
+    dict_to_struct,
+    log_payload_flow,
+    prefers_transport_payload_bytes,
+    struct_to_python,
+    validate_inline_payload_structs,
+)
 from pycloud_parallel.controlplane.state_time import dt_to_ts
-from pycloud_parallel.controlplane.serialization import struct_to_dict
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -536,15 +545,27 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.runtime_key,
         )
         try:
+            if request.HasField("transport_values") and str(request.transport_values.codec or "").strip():
+                decoded_values = decode_transport_payload_bytes(
+                    request.transport_values.codec,
+                    request.transport_values.version,
+                    request.transport_values.payload,
+                    context="taskpool_session",
+                )
+            else:
+                raw_values = struct_to_python(request.values)
+                decoded_values = decode_payload_from_transport(
+                    raw_values,
+                    policy=get_payload_policy("managed_globals"),
+                    mode=detect_transport_mode(raw_values, default="legacy_v1"),
+                    context="taskpool_session",
+                )
             globals_digest, updated_names = self._state.update_runtime_globals(
                 client_id=request.client_id,
                 code_version=request.code_version,
                 runtime_key=request.runtime_key,
                 code_token=request.code_token,
-                values=decode_payload_from_transport(
-                    struct_to_dict(request.values),
-                    policy=get_payload_policy("managed_globals"),
-                ),
+                values=decoded_values,
             )
             return pb2.UpdateRuntimeGlobalsResponse(
                 ok=True,
@@ -1066,13 +1087,14 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 service_id=request.service_id,
                 method=request.method,
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "service_id and method are required"),
-            )
+        )
         try:
-            validate_inline_payload_structs(
-                [request.payload],
-                item_context="service call payload",
-                request_context="call service request",
-            )
+            if not request.HasField("transport_payload") or not str(request.transport_payload.codec or "").strip():
+                validate_inline_payload_structs(
+                    [request.payload],
+                    item_context="service call payload",
+                    request_context="call service request",
+                )
         except ValueError as exc:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             context.set_details(str(exc))
@@ -1083,15 +1105,30 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
             )
 
+        if request.HasField("transport_payload") and str(request.transport_payload.codec or "").strip():
+            request_serialization_mode = str(request.transport_payload.codec or "").strip().lower()
+            decoded_payload = decode_transport_payload_bytes(
+                request.transport_payload.codec,
+                request.transport_payload.version,
+                request.transport_payload.payload,
+                context="service_owner",
+            )
+        else:
+            raw_payload = struct_to_python(request.payload)
+            request_serialization_mode = detect_transport_mode(raw_payload, default="legacy_v1")
+            decoded_payload = decode_payload_from_transport(
+                raw_payload,
+                policy=get_payload_policy("http_call"),
+                mode=request_serialization_mode,
+                context="service_owner",
+            )
         code, body = self._state.call_service(
             service_id=request.service_id,
             method=request.method,
-            payload=decode_payload_from_transport(
-                struct_to_dict(request.payload),
-                policy=get_payload_policy("http_call"),
-            ),
+            payload=decoded_payload,
             service_token=request.service_token,
             timeout_sec=max(0.1, float(request.timeout_sec or 60.0)),
+            serialization_mode=request_serialization_mode,
         )
         if code == 404:
             context.set_code(grpc.StatusCode.NOT_FOUND)
@@ -1133,12 +1170,22 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 ),
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(body.get("error", "call rejected"))),
             )
-        return pb2.CallServiceResponse(
-            ok=True,
-            service_id=request.service_id,
-            method=request.method,
-            data=dict_to_struct(body.get("data", {})),
-        )
+        response_kwargs = {
+            "ok": True,
+            "service_id": request.service_id,
+            "method": request.method,
+        }
+        if prefers_transport_payload_bytes(request_serialization_mode):
+            if isinstance(body.get("data"), dict) and TRANSPORT_ENVELOPE_SENTINEL in body.get("data", {}):
+                raise RuntimeError("transport bytes lane received already-encoded result")
+            response_kwargs["transport_data"] = encode_transport_payload_bytes(
+                body.get("data", {}),
+                mode=request_serialization_mode,
+                context="service_owner",
+            )
+        else:
+            response_kwargs["data"] = dict_to_struct(body.get("data", {}), mode=request_serialization_mode)
+        return pb2.CallServiceResponse(**response_kwargs)
 
     def UpdateServiceGlobals(
         self,
@@ -1152,14 +1199,26 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.owner_client_id,
         )
         try:
+            if request.HasField("transport_values") and str(request.transport_values.codec or "").strip():
+                decoded_values = decode_transport_payload_bytes(
+                    request.transport_values.codec,
+                    request.transport_values.version,
+                    request.transport_values.payload,
+                    context="service_owner",
+                )
+            else:
+                raw_values = struct_to_python(request.values)
+                decoded_values = decode_payload_from_transport(
+                    raw_values,
+                    policy=get_payload_policy("managed_globals"),
+                    mode=detect_transport_mode(raw_values, default="legacy_v1"),
+                    context="service_owner",
+                )
             globals_digest, updated_names = self._state.update_service_globals(
                 owner_client_id=request.owner_client_id,
                 service_id=request.service_id,
                 service_token=request.service_token,
-                values=decode_payload_from_transport(
-                    struct_to_dict(request.values),
-                    policy=get_payload_policy("managed_globals"),
-                ),
+                values=decoded_values,
             )
             return pb2.UpdateServiceGlobalsResponse(
                 ok=True,

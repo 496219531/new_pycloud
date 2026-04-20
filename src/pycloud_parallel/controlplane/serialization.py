@@ -2,12 +2,15 @@ from __future__ import annotations
 
 """Shared helpers for Arrow-compatible payload/result serialization."""
 
+import base64
 from datetime import date, datetime, time, timedelta
 import logging
+import json
 from typing import Any, Optional, Sequence
 
 from google.protobuf import struct_pb2
 
+from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.config import (
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     INLINE_PAYLOAD_REQUEST_LIMIT_BYTES,
@@ -23,9 +26,18 @@ from pycloud_parallel.controlplane.data_ref import (
     is_data_ref_payload,
     maybe_data_ref,
 )
+from pycloud_parallel.controlplane.pickle_stable_v1 import stable_pickle_dumps, stable_pickle_loads
+from pycloud_parallel.controlplane.serialization_mode import (
+    resolve_declared_transport_mode,
+    resolve_effective_serialization_mode,
+    resolve_received_transport_mode,
+)
+from pycloud_parallel.controlplane.structured_v1 import structured_dumps, structured_loads
 
 payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
 MAX_ARROW_RECURSION_DEPTH = 200
+TRANSPORT_ENVELOPE_SENTINEL = "__pycloud_transport__"
+TRANSPORT_PAYLOAD_VERSION = 1
 
 
 def _format_payload_bytes(size_bytes: int) -> str:
@@ -182,8 +194,10 @@ def serialize_inline_result(
     *,
     context: str = "result",
     limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES,
+    mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
-    serialized = serialize_arrow_compatible(data or {})
+    transport_value = data if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data) else encode_transport_value(data or {}, mode=mode, context=context)
+    serialized = serialize_arrow_compatible(transport_value)
     out = struct_pb2.Struct()
     out.update(serialized)
     size_bytes = validate_inline_result_struct(out, limit_bytes=limit_bytes, context=context)
@@ -194,6 +208,192 @@ def serialize_inline_result(
         summary=summarize_payload_flow_value(data or {}),
     )
     return serialized, out, size_bytes
+
+
+def serialize_by_mode(value: Any, *, mode: str = "") -> Any:
+    normalized = resolve_effective_serialization_mode(
+        request_mode=mode,
+        context="transport_encode",
+    )
+    if normalized == "structured_v1":
+        return structured_dumps(value)
+    if normalized == "pickle_stable_v1":
+        return stable_pickle_dumps(value)
+    return serialize_arrow_compatible(value)
+
+
+def deserialize_by_mode(value: Any, *, mode: str = "") -> Any:
+    normalized = resolve_effective_serialization_mode(
+        request_mode=mode,
+        context="transport_decode",
+    )
+    if normalized == "structured_v1":
+        return structured_loads(value)
+    if normalized == "pickle_stable_v1":
+        return stable_pickle_loads(value)
+    return convert_dict_to_arrow(value)
+
+
+def detect_transport_mode(value: Any, *, default: str = "") -> str:
+    normalized_default = resolve_declared_transport_mode(default_mode=default)
+    if isinstance(value, dict) and TRANSPORT_ENVELOPE_SENTINEL in value:
+        envelope = dict(value.get(TRANSPORT_ENVELOPE_SENTINEL) or {})
+        codec = str(envelope.get("codec", "") or "").strip().lower()
+        if codec:
+            return resolve_declared_transport_mode(declared_mode=codec)
+    return normalized_default
+
+
+def _adapt_blob_for_json_transport(blob: bytes | bytearray | memoryview) -> dict[str, str]:
+    """Adapt raw bytes for JSON/Struct transport containers.
+
+    This helper lives in the transport layer on purpose: codecs such as
+    ``pickle_stable_v1`` produce raw bytes and do not pre-encode them for
+    text-only containers.
+    """
+    raw = bytes(blob)
+    return {
+        "encoding": "base64",
+        "data": base64.b64encode(raw).decode("ascii"),
+    }
+
+
+def _restore_blob_from_json_transport(payload: Any) -> bytes:
+    normalized = dict(payload or {})
+    if str(normalized.get("encoding", "") or "").strip().lower() != "base64":
+        raise ValueError("unsupported transport byte encoding")
+    return base64.b64decode(str(normalized.get("data", "") or "").encode("ascii"))
+
+
+def encode_transport_value(value: Any, *, mode: str = "", context: str = "payload") -> Any:
+    normalized = resolve_effective_serialization_mode(
+        request_mode=mode,
+        context="transport_encode",
+    )
+    if normalized == "legacy_v1":
+        encoded = serialize_arrow_compatible(value)
+        log_payload_flow("transport_encode", context=context, codec=normalized, summary=summarize_payload_flow_value(value))
+        return encoded
+    if normalized == "structured_v1":
+        payload = json.loads(structured_dumps(value).decode("utf-8"))
+        log_payload_flow("transport_encode", context=context, codec=normalized, summary=summarize_payload_flow_value(value))
+        return {
+            TRANSPORT_ENVELOPE_SENTINEL: {
+                "codec": normalized,
+                "version": 1,
+                "payload": payload,
+            }
+        }
+    if normalized == "pickle_stable_v1":
+        blob = stable_pickle_dumps(value)
+        log_payload_flow("transport_encode", context=context, codec=normalized, summary=summarize_payload_flow_value(value))
+        return {
+            TRANSPORT_ENVELOPE_SENTINEL: {
+                "codec": normalized,
+                "version": 1,
+                "payload": _adapt_blob_for_json_transport(blob),
+            }
+        }
+    raise ValueError(f"unsupported serialization mode: {normalized!r}")
+
+
+def prefers_transport_payload_bytes(mode: str = "") -> bool:
+    normalized = resolve_effective_serialization_mode(
+        request_mode=mode,
+        context="transport_encode",
+    )
+    return normalized == "pickle_stable_v1"
+
+
+def encode_transport_payload_bytes(
+    value: Any,
+    *,
+    mode: str = "",
+    context: str = "payload",
+) -> pb2.TransportPayload:
+    normalized = resolve_effective_serialization_mode(
+        request_mode=mode,
+        context=context,
+    )
+    if normalized == "pickle_stable_v1":
+        payload = stable_pickle_dumps(value)
+    elif normalized == "structured_v1":
+        payload = structured_dumps(value)
+    else:
+        raise ValueError(f"{normalized!r} does not use bytes transport payloads")
+    log_payload_flow("transport_payload_encode", context=context, codec=normalized, summary=summarize_payload_flow_value(value))
+    return pb2.TransportPayload(
+        codec=normalized,
+        version=TRANSPORT_PAYLOAD_VERSION,
+        payload=payload,
+    )
+
+
+def decode_transport_payload_bytes(
+    codec: str,
+    version: int,
+    payload: bytes,
+    *,
+    context: str = "payload",
+    trust_mode: str = "",
+) -> Any:
+    normalized = resolve_received_transport_mode(
+        declared_mode=codec,
+        default_mode="legacy_v1",
+        context=context,
+        trust_mode=trust_mode,
+    )
+    if int(version or 0) != TRANSPORT_PAYLOAD_VERSION:
+        raise ValueError(f"unsupported transport payload version: {version!r}")
+    raw = payload if isinstance(payload, bytes) else bytes(payload or b"")
+    if normalized == "pickle_stable_v1":
+        decoded = stable_pickle_loads(raw)
+    elif normalized == "structured_v1":
+        decoded = structured_loads(raw)
+    else:
+        raise ValueError(f"{normalized!r} is not supported on protobuf bytes transport")
+    log_payload_flow("transport_payload_decode", context=context, codec=normalized, summary=summarize_payload_flow_value(decoded))
+    return decoded
+
+
+def decode_transport_value(
+    value: Any,
+    *,
+    mode: str = "",
+    context: str = "payload",
+    trust_mode: str = "",
+) -> Any:
+    normalized = resolve_received_transport_mode(
+        default_mode=mode,
+        context=context,
+        trust_mode=trust_mode,
+    )
+    if isinstance(value, dict) and TRANSPORT_ENVELOPE_SENTINEL in value:
+        envelope = dict(value.get(TRANSPORT_ENVELOPE_SENTINEL) or {})
+        declared_codec = str(envelope.get("codec", "") or "").strip().lower()
+        if not declared_codec:
+            raise ValueError("transport envelope is missing codec")
+        codec = resolve_received_transport_mode(
+            declared_mode=declared_codec,
+            default_mode=mode,
+            context=context,
+            trust_mode=trust_mode,
+        )
+        if codec == "legacy_v1":
+            decoded = convert_dict_to_arrow(envelope.get("payload"))
+        elif codec == "structured_v1":
+            decoded = structured_loads(json.dumps(envelope.get("payload"), ensure_ascii=False).encode("utf-8"))
+        elif codec == "pickle_stable_v1":
+            decoded = stable_pickle_loads(_restore_blob_from_json_transport(envelope.get("payload")))
+        else:
+            raise ValueError(f"unsupported transport codec: {codec!r}")
+        log_payload_flow("transport_decode", context=context, codec=codec, summary=summarize_payload_flow_value(decoded))
+        return decoded
+    if normalized != "legacy_v1":
+        raise ValueError(f"{context} missing transport envelope for serialization mode {normalized!r}")
+    decoded = convert_dict_to_arrow(value)
+    log_payload_flow("transport_decode", context=context, codec="legacy_v1", summary=summarize_payload_flow_value(decoded))
+    return decoded
 
 
 def validate_inline_payload_structs(
@@ -226,8 +426,10 @@ def serialize_inline_payload(
     *,
     context: str = "payload",
     limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
-    serialized = serialize_arrow_compatible(data or {})
+    transport_value = data if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data) else encode_transport_value(data or {}, mode=mode, context=context)
+    serialized = serialize_arrow_compatible(transport_value)
     out = struct_pb2.Struct()
     out.update(serialized)
     size_bytes = validate_inline_payload_struct(out, limit_bytes=limit_bytes, context=context)
@@ -629,11 +831,12 @@ def _convert_dict_to_arrow(data: Any, *, depth: int) -> Any:
     return data
 
 
-def dict_to_struct(data: Optional[dict]) -> struct_pb2.Struct:
+def dict_to_struct(data: Optional[dict], *, mode: str = "legacy_v1") -> struct_pb2.Struct:
     """Convert nested payload data into protobuf Struct."""
     out = struct_pb2.Struct()
     if data is not None:
-        out.update(serialize_arrow_compatible(data))
+        transport_value = data if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data) else encode_transport_value(data, mode=mode, context="protobuf payload")
+        out.update(serialize_arrow_compatible(transport_value))
     return out
 
 
@@ -654,7 +857,15 @@ def _value_to_python(value: struct_pb2.Value) -> Any:
     return None
 
 
-def struct_to_dict(data: struct_pb2.Struct) -> dict:
-    """Convert protobuf Struct into nested Python objects."""
-    result = {key: _value_to_python(item) for key, item in data.fields.items()}
-    return convert_dict_to_arrow(result)
+def struct_to_python(data: struct_pb2.Struct) -> dict:
+    """Convert protobuf Struct into nested Python objects without transport decode."""
+    return {key: _value_to_python(item) for key, item in data.fields.items()}
+
+
+def struct_to_dict(data: struct_pb2.Struct, *, mode: str = "legacy_v1") -> dict:
+    """Convert protobuf Struct into nested Python objects and decode transport envelopes."""
+    result = struct_to_python(data)
+    decoded = decode_transport_value(result, mode=mode, context="protobuf payload")
+    if isinstance(decoded, dict):
+        return decoded
+    return {"value": decoded}

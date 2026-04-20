@@ -42,9 +42,28 @@ from pycloud_parallel.controlplane.infocenter_client import (
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
+from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
+from pycloud_parallel.execution.failover import (
+    CandidateBreakerState,
+    CONTROLPLANE_UNAVAILABLE,
+    ROUTE_UNAVAILABLE,
+    before_probe,
+    candidate_allowed,
+    classify_service_error,
+    mark_candidate_failure,
+    mark_candidate_success,
+    should_failover,
+)
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
+from pycloud_parallel.execution.scheduler import (
+    SERVICE_DEFAULT,
+    SchedulerCandidate,
+    SchedulerState,
+    select_one_candidate,
+    resolve_service_strategy,
+)
 from pycloud_parallel.execution.support import (
     _DEFAULT_EXPORT_DECORATOR,
     _RetryableReadyError,
@@ -65,7 +84,6 @@ from pycloud_parallel.execution.support import (
     _resolve_high_level_service_results,
     _retry_infocenter_request,
     _sanitize_session_cache_part,
-    _serialize_arrow_compatible,
     _source_func_from_entry_callable_arg,
     _source_module_from_entry_module_arg,
     _summarize_discovered_nodes,
@@ -489,12 +507,17 @@ class _ConnectedService:
         service_name: str,
         transport: str,
         timeout_sec: float,
+        serialization_mode: str = "",
         validate_on_init: bool = True,
     ) -> None:
         self._transport_client = transport_client
         self.service_name = str(service_name or "").strip()
         self.transport = str(transport or "").strip().lower() or "discovery"
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self.serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="gateway_public" if self.transport == "gateway" else "service_connect",
+        )
         self.target = str(
             getattr(transport_client, "target", "") or getattr(transport_client, "infocenter_target", "") or ""
         ).strip()
@@ -511,7 +534,7 @@ class _ConnectedService:
         self._discovered_methods: Optional[List[str]] = None
         self._last_status: Optional[Dict[str, object]] = None
         if not self.service_name:
-            raise ValueError("service_name is required")
+            raise ValueError("Service.connect() requires service_name")
         if validate_on_init:
             self._validate_service_ready()
 
@@ -553,7 +576,8 @@ class _ConnectedService:
             route_count = int(status.get("route_count", 0) or 0)
             if route_count <= 0:
                 raise _RetryableReadyError(
-                    f"no available route for service_name={self.service_name!r} via {self.transport}"
+                    f"Service.connect() could not find an available route for "
+                    f"service_name={self.service_name!r} via {self.transport}"
                 )
             return status
 
@@ -609,7 +633,10 @@ class _ConnectedService:
                 else:
                     routes = self._discoverable_routes(force_refresh=True)
                     if not routes:
-                        raise RuntimeError(f"no available route for service_name={self.service_name!r}")
+                        raise RuntimeError(
+                            f"Service.list_methods() could not find an available route for "
+                            f"service_name={self.service_name!r}"
+                        )
                     route = sorted(routes, key=lambda item: _route_sort_key(item, strategy=strategy))[0]
                 tried.add(str(getattr(route, "service_id", "") or ""))
                 methods = self._list_methods_via_route(route, include_docs=include_docs)
@@ -704,10 +731,15 @@ class _ConnectedService:
         if not control_addr:
             return dict(payload or {})
         with _node_control_client(control_addr, timeout_sec=self.timeout_sec) as route_client:
+            prepare_kwargs = {
+                "object_threshold_bytes": self._client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+            }
+            if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
+                prepare_kwargs["serialization_mode"] = self.serialization_mode
             return prepare_remote_call_payload(
                 [route_client],
                 payload,
-                object_threshold_bytes=self._client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+                **prepare_kwargs,
             )
 
     def _discoverable_routes(self, *, force_refresh: bool = False) -> List[InfoCenterServiceRoute]:
@@ -787,14 +819,20 @@ class _ConnectedService:
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
+        serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         del refresh_status, max_attempts
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            session_mode=self.serialization_mode,
+            context="gateway_public" if self.transport == "gateway" else "service_call",
+        )
         if self.transport == "discovery":
             route_cache = self._route_cache
-            strategy_name = "predicted_busy" if strategy == "least_inflight" else strategy
+            strategy_name, _profile = resolve_service_strategy(strategy)
             if route_cache is not None:
                 route = route_cache.select_route(self.service_name, strategy=strategy_name)
             else:
@@ -807,13 +845,18 @@ class _ConnectedService:
 
             def _call_route(selected_route: object) -> Tuple[str, Dict[str, object]]:
                 prepared_payload = self._prepare_discovery_route_payload(selected_route, payload)
-                resp = self._client_mod._call_route_http(
-                    selected_route,
-                    method=method,
-                    payload=prepared_payload,
-                    timeout_sec=max(0.1, float(timeout_sec)),
-                    service_token=token,
-                )
+                route_call_kwargs = {
+                    "method": method,
+                    "payload": prepared_payload,
+                    "timeout_sec": max(0.1, float(timeout_sec)),
+                    "service_token": token,
+                }
+                if (
+                    str(effective_serialization_mode or "").strip()
+                    and effective_serialization_mode != "legacy_v1"
+                ):
+                    route_call_kwargs["serialization_mode"] = effective_serialization_mode
+                resp = self._client_mod._call_route_http(selected_route, **route_call_kwargs)
                 attach_locator = getattr(self._transport_client, "_attach_controlplane_locator", None)
                 if callable(attach_locator):
                     resp = attach_locator(resp, route=selected_route)
@@ -865,6 +908,7 @@ class _ConnectedService:
             method=method,
             payload=payload,
             timeout_sec=timeout_sec,
+            serialization_mode=effective_serialization_mode,
         )
         return self.transport, response
 
@@ -874,9 +918,10 @@ class _ConnectedService:
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
+        serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -888,6 +933,7 @@ class _ConnectedService:
                 strategy=strategy,
                 refresh_status=refresh_status,
                 max_attempts=max_attempts,
+                serialization_mode=serialization_mode,
             ),
         )
 
@@ -916,7 +962,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> List[Optional[object]]:
@@ -939,7 +985,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> List[Optional[object]]:
@@ -960,7 +1006,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> Iterator[Tuple[int, Optional[object]]]:
@@ -981,7 +1027,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> AsyncIterator[Tuple[int, Optional[object]]]:
@@ -1002,7 +1048,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> Iterator[ExecutionItem]:
@@ -1022,7 +1068,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> AsyncIterator[ExecutionItem]:
@@ -1043,7 +1089,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> List[ExecutionItem]:
@@ -1063,7 +1109,7 @@ class _ConnectedService:
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: int = 32,
     ) -> List[ExecutionItem]:
@@ -1090,7 +1136,7 @@ class _ConnectedService:
             raise AttributeError(
                 f"'{type(self).__name__}' has no method '{name}'. Available methods: {self._discovered_methods}"
             )
-        proxy_strategy = "predicted_busy" if self.transport == "discovery" else "gateway"
+        proxy_strategy = "predicted_busy"
         return _CallProxy(
             method=name,
             group=self,
@@ -1105,6 +1151,7 @@ class _ConnectedService:
             f"<ConnectedService "
             f"service={self.service_name!r} "
             f"transport={self.transport} "
+            f"serialization_mode={self.serialization_mode} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )
 
@@ -1131,9 +1178,10 @@ class Service(ServiceExecutionSession):
     _artifact_code_version: str = field(default="", repr=False)
     _route_index: int = field(default=0, repr=False)
     _route_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _breaker_states: Dict[str, NodeCircuitState] = field(default_factory=dict, repr=False)
+    _breaker_states: Dict[str, CandidateBreakerState] = field(default_factory=dict, repr=False)
     _discovered_methods: Optional[List[str]] = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
+    serialization_mode: str = ""
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
         return self.sessions
@@ -1166,6 +1214,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 10.0,
         service_token: str = "",
         transport: str = "discovery",
+        serialization_mode: str = "",
         validate_on_init: bool = False,
     ):
         """Product-facing connect action for an already deployed service."""
@@ -1182,6 +1231,7 @@ class Service(ServiceExecutionSession):
                 service_name=service_name,
                 transport=normalized_transport,
                 timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
                 validate_on_init=validate_on_init,
             )
         if normalized_transport == "discovery":
@@ -1196,6 +1246,7 @@ class Service(ServiceExecutionSession):
                 service_name=service_name,
                 transport=normalized_transport,
                 timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
                 validate_on_init=validate_on_init,
             )
         raise ValueError(
@@ -1221,6 +1272,7 @@ class Service(ServiceExecutionSession):
         package_format: str = "",
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
+        serialization_mode: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
@@ -1322,6 +1374,10 @@ class Service(ServiceExecutionSession):
         export_methods = list(prepared_artifact.export_methods)
         dependency_allowlist = list(prepared_artifact.dependency_allowlist)
         managed_global_names = list(prepared_artifact.managed_global_names)
+        normalized_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="service_owner",
+        )
 
         # 生成默认的 owner_client_id 和 service_name
         local_ip = _get_local_ip()
@@ -1721,6 +1777,7 @@ class Service(ServiceExecutionSession):
                 _session_cache_file=session_cache_file,
                 _session_cache_lock=session_cache_lock,
                 _artifact_code_version=effective_code_version,
+                serialization_mode=normalized_serialization_mode,
             )
             group._persist_session_cache()
             group._start_keepalive()
@@ -2239,94 +2296,63 @@ class Service(ServiceExecutionSession):
 
     def __post_init__(self) -> None:
         self._init_execution_session_state()
+        self.serialization_mode = resolve_effective_serialization_mode(
+            request_mode=self.serialization_mode,
+            context="service_owner",
+        )
         if self.breaker_max_cooldown_sec < self.breaker_cooldown_sec:
             self.breaker_max_cooldown_sec = self.breaker_cooldown_sec
         for node_id in self.sessions:
-            self._breaker_states.setdefault(node_id, NodeCircuitState())
+            self._breaker_states.setdefault(node_id, CandidateBreakerState())
 
-    def _breaker_state_locked(self, node_id: str) -> NodeCircuitState:
+    def _breaker_state_locked(self, node_id: str) -> CandidateBreakerState:
         state = self._breaker_states.get(node_id)
         if state is None:
-            state = NodeCircuitState()
+            state = CandidateBreakerState()
             self._breaker_states[node_id] = state
         return state
-
-    def _breaker_cooldown_locked(self, state: NodeCircuitState) -> float:
-        exp = max(0, state.open_count - 1)
-        cooldown = self.breaker_cooldown_sec * (2.0**exp)
-        return min(self.breaker_max_cooldown_sec, cooldown)
 
     def _breaker_mark_success(self, node_id: str) -> None:
         if not self.breaker_enabled:
             return
         with self._route_lock:
             state = self._breaker_state_locked(node_id)
-            state.state = "closed"
-            state.consecutive_failures = 0
-            state.open_until_monotonic = 0.0
-            state.open_count = 0
-            state.probe_in_flight = False
-            state.last_error = ""
+            mark_candidate_success(state)
 
-    def _breaker_mark_failure(self, node_id: str, exc: Exception) -> None:
+    def _breaker_mark_failure(self, node_id: str, exc: Exception, *, route_failure: bool = False) -> None:
         if not self.breaker_enabled:
             return
-        now = time.monotonic()
         with self._route_lock:
             state = self._breaker_state_locked(node_id)
-            state.last_error = repr(exc)
-            if state.state == "half_open":
-                state.consecutive_failures = max(state.consecutive_failures, self.breaker_failure_threshold)
-            elif state.state == "closed":
-                state.consecutive_failures += 1
-            state.probe_in_flight = False
-
-            if state.consecutive_failures < self.breaker_failure_threshold:
-                return
-
-            state.state = "open"
-            state.open_count += 1
-            state.open_until_monotonic = now + self._breaker_cooldown_locked(state)
+            mark_candidate_failure(
+                state,
+                failure_kind=classify_service_error(exc, route_failure=route_failure),
+                error=exc,
+                failure_threshold=self.breaker_failure_threshold,
+                cooldown_sec=self.breaker_cooldown_sec,
+                max_cooldown_sec=self.breaker_max_cooldown_sec,
+            )
 
     def _breaker_candidate_state(self, node_id: str) -> Tuple[str, bool]:
         if not self.breaker_enabled:
             return "closed", True
-        now = time.monotonic()
         with self._route_lock:
             state = self._breaker_state_locked(node_id)
-            if state.state == "open":
-                if now >= state.open_until_monotonic:
-                    state.state = "half_open"
-                    state.probe_in_flight = False
-                else:
-                    return state.state, False
-            if state.state == "half_open" and state.probe_in_flight:
-                return state.state, False
-            return state.state, True
+            return candidate_allowed(state)
 
     def _breaker_before_invoke(self, node_id: str) -> bool:
         if not self.breaker_enabled:
             return True
-        now = time.monotonic()
         with self._route_lock:
             state = self._breaker_state_locked(node_id)
-            if state.state == "open":
-                if now < state.open_until_monotonic:
-                    return False
-                state.state = "half_open"
-                state.probe_in_flight = False
-            if state.state == "half_open":
-                if state.probe_in_flight:
-                    return False
-                state.probe_in_flight = True
-            return True
+            return before_probe(state)
 
     def breaker_snapshot(self) -> Dict[str, Dict[str, object]]:
         now = time.monotonic()
         out: Dict[str, Dict[str, object]] = {}
         with self._route_lock:
             for node_id, state in self._breaker_states.items():
-                remain = max(0.0, state.open_until_monotonic - now) if state.state == "open" else 0.0
+                remain = max(0.0, state.disabled_until_monotonic - now) if state.state == "open" else 0.0
                 out[node_id] = {
                     "state": state.state,
                     "consecutive_failures": state.consecutive_failures,
@@ -2389,29 +2415,61 @@ class Service(ServiceExecutionSession):
         *,
         format: str = "",
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        serialization_mode: str = "",
     ) -> DataRef:
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            session_mode=self.serialization_mode,
+            context="object_upload",
+        )
         return _put_data_via_clients(
             list(self._clients.values()),
             data,
             format=format,
             chunk_size=chunk_size,
+            serialization_mode=effective_serialization_mode,
         )
 
-    def put_dataframe(self, dataframe: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
-        return self.put_data(dataframe, format="parquet", chunk_size=chunk_size)
+    def put_dataframe(
+        self,
+        dataframe: Any,
+        *,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        serialization_mode: str = "",
+    ) -> DataRef:
+        return self.put_data(dataframe, format="parquet", chunk_size=chunk_size, serialization_mode=serialization_mode)
 
-    def put_ndarray(self, array: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
-        return self.put_data(array, format="npy", chunk_size=chunk_size)
+    def put_ndarray(
+        self,
+        array: Any,
+        *,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        serialization_mode: str = "",
+    ) -> DataRef:
+        return self.put_data(array, format="npy", chunk_size=chunk_size, serialization_mode=serialization_mode)
 
-    def put_json(self, value: Any, *, chunk_size: int = OBJECT_CHUNK_SIZE_BYTES) -> DataRef:
-        return self.put_data(value, format="json", chunk_size=chunk_size)
+    def put_json(
+        self,
+        value: Any,
+        *,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        serialization_mode: str = "",
+    ) -> DataRef:
+        return self.put_data(value, format="json", chunk_size=chunk_size, serialization_mode=serialization_mode)
 
     def update_globals(self, values: Dict[str, object]) -> str:
         with self._route_lock:
             sessions_snapshot = list(self.sessions.items())
             clients_snapshot = dict(self._clients)
         active_clients = [clients_snapshot[node_id] for node_id, _ in sessions_snapshot if node_id in clients_snapshot]
-        prepared_values = _prepare_managed_globals_values_for_upload(active_clients, values)
+        prepare_kwargs: Dict[str, object] = {}
+        if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
+            prepare_kwargs["serialization_mode"] = self.serialization_mode
+        prepared_values = _prepare_managed_globals_values_for_upload(
+            active_clients,
+            values,
+            **prepare_kwargs,
+        )
         digests: Dict[str, str] = {}
         failed_nodes: Dict[str, str] = {}
         for node_id, session in sessions_snapshot:
@@ -2519,10 +2577,11 @@ class Service(ServiceExecutionSession):
         session = self.sessions.get(node_key)
         if session is None:
             raise KeyError(f"unknown node reference: {node_id}")
-        return session.call(method, payload, timeout_sec=timeout_sec)
+        return session.call(method, payload, timeout_sec=timeout_sec, serialization_mode=self.serialization_mode)
 
     def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
         excluded = exclude or set()
+        normalized_strategy, profile = resolve_service_strategy(strategy)
         all_candidates = [nid for nid in sorted(self.sessions.keys()) if nid not in excluded]
         candidates = []
         state_rank: Dict[str, int] = {}
@@ -2536,18 +2595,19 @@ class Service(ServiceExecutionSession):
         if not candidates:
             raise RuntimeError("no available service node (all candidates may be open-circuit)")
 
-        if strategy == "round_robin":
+        if normalized_strategy == "round_robin":
             ranked_candidates = sorted(candidates, key=lambda node_id: (state_rank.get(node_id, 0), node_id))
             with self._route_lock:
                 idx = self._route_index % len(ranked_candidates)
                 self._route_index += 1
             return ranked_candidates[idx]
 
-        if strategy != "least_inflight":
-            raise ValueError("strategy must be one of: least_inflight, round_robin")
+        if normalized_strategy not in {"predicted_busy", "least_inflight", "service_latency_first"}:
+            raise ValueError("strategy must be one of: predicted_busy, service_default, service_latency_first, least_inflight, round_robin")
 
         best_node_id = ""
-        best_key: Optional[Tuple[int, int, int, str]] = None
+        best_key: Optional[Tuple[object, ...]] = None
+        scheduler_candidates = []
         for node_id in candidates:
             session = self.sessions[node_id]
             info: Optional[pb2.ServiceStatusInfo] = None
@@ -2560,10 +2620,61 @@ class Service(ServiceExecutionSession):
                     continue
             in_flight = int(info.in_flight if info is not None else 0)
             alive_workers = int(info.alive_workers if info is not None else session.worker_count)
-            key = (state_rank.get(node_id, 0), in_flight, -alive_workers, node_id)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_node_id = node_id
+            predicted_busy = float(in_flight) / float(max(1, alive_workers))
+            scheduler_candidates.append(
+                (
+                    node_id,
+                    state_rank.get(node_id, 0),
+                    predicted_busy,
+                    in_flight,
+                    alive_workers,
+                )
+            )
+
+        if normalized_strategy == "least_inflight":
+            for node_id, state_score, _predicted_busy, in_flight, alive_workers in scheduler_candidates:
+                key = (float(state_score), float(in_flight), float(-alive_workers), node_id)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_node_id = node_id
+        else:
+            with self._route_lock:
+                rr = self._route_index
+                self._route_index += 1
+            scheduler_rows = []
+            for node_id, state_score, predicted_busy, in_flight, alive_workers in scheduler_candidates:
+                scheduler_rows.append(
+                    SchedulerCandidate(
+                        id=str(node_id),
+                        kind="service",
+                        node_id=str(node_id),
+                        node_instance_id=str(node_id),
+                        healthy=True,
+                        schedulable=True,
+                        drain=False,
+                        breaker_state="closed",
+                        predicted_busy=predicted_busy,
+                        node_inflight=in_flight,
+                        alive_workers=max(1, alive_workers),
+                        worker_capacity=max(1, int(self.sessions[node_id].worker_count or alive_workers or 1)),
+                        credit=1,
+                        recent_failures=int(self._breaker_states.get(node_id, NodeCircuitState()).consecutive_failures or 0),
+                        metadata={"state_rank": state_score},
+                    )
+                )
+            state = SchedulerState(
+                recent_submit_failures={
+                    str(node_id): int(self._breaker_states.get(node_id, NodeCircuitState()).consecutive_failures or 0)
+                    for node_id, *_rest in scheduler_candidates
+                }
+            )
+            chosen = select_one_candidate(
+                scheduler_rows,
+                profile=profile or SERVICE_DEFAULT,
+                state=state,
+                round_robin_counter=rr,
+            )
+            best_node_id = str(chosen.id)
 
         if best_node_id:
             return best_node_id
@@ -2579,15 +2690,18 @@ class Service(ServiceExecutionSession):
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
+        serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         if not self.sessions:
-            raise RuntimeError("no active service sessions")
-
-        # 序列化 Arrow 兼容对象
-        serialized_payload = _serialize_arrow_compatible(payload)
+            raise RuntimeError("Service session has no active replicas")
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            session_mode=self.serialization_mode,
+            context="service_owner",
+        )
 
         tries = max(1, int(max_attempts or len(self.sessions)))
         excluded: Set[str] = set()
@@ -2599,12 +2713,27 @@ class Service(ServiceExecutionSession):
             if not self._breaker_before_invoke(node_id):
                 continue
             try:
-                resp = self.sessions[node_id].call(method, serialized_payload, timeout_sec=timeout_sec)
+                call_kwargs = {
+                    "timeout_sec": timeout_sec,
+                }
+                if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
+                    call_kwargs["serialization_mode"] = effective_serialization_mode
+                resp = self.sessions[node_id].call(
+                    method,
+                    payload,
+                    **call_kwargs,
+                )
                 self._breaker_mark_success(node_id)
                 return node_id, resp
             except Exception as exc:
                 last_error = exc
+                failure_kind = classify_service_error(exc)
                 self._breaker_mark_failure(node_id, exc)
+                if not should_failover(
+                    failure_kind,
+                    has_alternative_candidate=(len(self.sessions) - len(excluded)) > 0,
+                ):
+                    raise RuntimeError(str(exc)) from exc
 
         raise RuntimeError(f"call failed on all candidate nodes: {last_error}")
 
@@ -2614,9 +2743,10 @@ class Service(ServiceExecutionSession):
         payload: Dict[str, object],
         *,
         timeout_sec: float = 60.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_attempts: int = 0,
+        serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         """异步版本的 call_balanced。
 
@@ -2626,7 +2756,7 @@ class Service(ServiceExecutionSession):
             method: 服务方法名
             payload: 调用参数
             timeout_sec: 超时时间
-            strategy: 节点选择策略（"least_inflight" 或 "round_robin"）
+            strategy: 节点选择策略（"predicted_busy"、"least_inflight" 或 "round_robin"）
             refresh_status: 是否在选择节点前刷新状态
             max_attempts: 最大尝试次数
         Returns:
@@ -2636,14 +2766,18 @@ class Service(ServiceExecutionSession):
             RuntimeError: 所有节点都调用失败时
         """
         if not self.sessions:
-            raise RuntimeError("no active service sessions")
+            raise RuntimeError("Service session has no active replicas")
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            session_mode=self.serialization_mode,
+            context="service_owner",
+        )
 
         tries = max(1, int(max_attempts or len(self.sessions)))
         excluded: Set[str] = set()
         last_error: Optional[Exception] = None
 
         loop = asyncio.get_running_loop()
-        serialized_payload = _serialize_arrow_compatible(payload)
         for _ in range(tries):
             node_id = self._select_node(strategy=strategy, refresh_status=refresh_status, exclude=excluded)
             excluded.add(node_id)
@@ -2651,15 +2785,30 @@ class Service(ServiceExecutionSession):
                 continue
             try:
                 # 在线程池中执行同步调用，不阻塞事件循环
+                call_kwargs = {
+                    "timeout_sec": timeout_sec,
+                }
+                if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
+                    call_kwargs["serialization_mode"] = effective_serialization_mode
                 resp = await loop.run_in_executor(
                     None,
-                    lambda nid=node_id: self.sessions[nid].call(method, serialized_payload, timeout_sec=timeout_sec),
+                    lambda nid=node_id, kwargs=call_kwargs: self.sessions[nid].call(
+                        method,
+                        payload,
+                        **kwargs,
+                    ),
                 )
                 self._breaker_mark_success(node_id)
                 return node_id, resp
             except Exception as exc:
                 last_error = exc
+                failure_kind = classify_service_error(exc)
                 self._breaker_mark_failure(node_id, exc)
+                if not should_failover(
+                    failure_kind,
+                    has_alternative_candidate=(len(self.sessions) - len(excluded)) > 0,
+                ):
+                    raise RuntimeError(str(exc)) from exc
 
         raise RuntimeError(f"call failed on all candidate nodes: {last_error}")
 
@@ -2685,17 +2834,16 @@ class Service(ServiceExecutionSession):
             List[Tuple[节点ID, 响应, 异常]]：所有节点的结果列表
         """
         if not self.sessions:
-            raise RuntimeError("no active service sessions")
+            raise RuntimeError("Service session has no active replicas")
 
         nodes = list(self.sessions.keys())
         # 如果是单个 payload，复制给所有节点
         if isinstance(payloads, dict):
-            shared_payload = _serialize_arrow_compatible(payloads)
-            payloads = [dict(shared_payload) for _ in nodes]
+            payloads = [dict(payloads) for _ in nodes]
         elif isinstance(payloads, list):
             if len(payloads) != len(nodes):
                 raise ValueError(f"payload list length ({len(payloads)}) must match node count ({len(nodes)})")
-            payloads = [_serialize_arrow_compatible(payload) for payload in payloads]
+            payloads = [dict(payload) for payload in payloads]
 
         loop = asyncio.get_running_loop()
         semaphore = asyncio.Semaphore(max_concurrency)
@@ -2707,7 +2855,12 @@ class Service(ServiceExecutionSession):
                 try:
                     resp = await loop.run_in_executor(
                         None,
-                        lambda nid=node_id: self.sessions[nid].call(method, payload, timeout_sec=timeout_sec),
+                        lambda nid=node_id: self.sessions[nid].call(
+                            method,
+                            payload,
+                            timeout_sec=timeout_sec,
+                            serialization_mode=self.serialization_mode,
+                        ),
                     )
                     self._breaker_mark_success(node_id)
                     return node_id, resp, None
@@ -2770,7 +2923,7 @@ class Service(ServiceExecutionSession):
             method=name,
             group=self,
             timeout_sec=60.0,
-            strategy="least_inflight",
+            strategy="predicted_busy",
             refresh_status=True,
         )
 
@@ -2810,7 +2963,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> List[Optional[object]]:
@@ -2833,7 +2986,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> List[Optional[object]]:
@@ -2854,7 +3007,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> Iterator[Tuple[int, Optional[object]]]:
@@ -2875,7 +3028,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> AsyncIterator[Tuple[int, Optional[object]]]:
@@ -2896,7 +3049,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> Iterator[ExecutionItem]:
@@ -2916,7 +3069,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> AsyncIterator[ExecutionItem]:
@@ -2937,7 +3090,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> List[ExecutionItem]:
@@ -2957,7 +3110,7 @@ class Service(ServiceExecutionSession):
         payloads: Sequence[Dict[str, object]],
         *,
         timeout_sec: float = 30.0,
-        strategy: str = "least_inflight",
+        strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: int = 32,
     ) -> List[ExecutionItem]:
@@ -2982,6 +3135,7 @@ class Service(ServiceExecutionSession):
             f"<Service "
             f"service={self.service_name!r} "
             f"nodes={len(node_ids)} "
+            f"serialization_mode={self.serialization_mode} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )
 

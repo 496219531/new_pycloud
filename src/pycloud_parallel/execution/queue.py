@@ -17,6 +17,8 @@ from pycloud_parallel.controlplane.artifact import (
 )
 from pycloud_parallel.controlplane import client_transport as _client_transport
 from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
+from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
+from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.execution.support import (
     _JOB_UPDATE_GLOBALS_AUTO,
     _default_job_auth_ttl_sec,
@@ -50,13 +52,32 @@ def _infocenter_client(*args, **kwargs):
     return InfoCenterClient(*args, **kwargs)
 
 
+def _decode_job_response_payload(response: Dict[str, object]) -> Dict[str, object]:
+    body = dict(response or {})
+    job = body.get("job")
+    if isinstance(job, dict):
+        body["job"] = convert_dict_to_arrow(job)
+    return body
+
+
 class _JobOrchestratorDiscoveryClient:
     """Resolve job-orchestrator via InfoCenter and call its HTTP endpoint directly."""
 
-    def __init__(self, target: str, *, timeout_sec: float = 10.0, service_token: str = "") -> None:
+    def __init__(
+        self,
+        target: str,
+        *,
+        timeout_sec: float = 10.0,
+        service_token: str = "",
+        serialization_mode: str = "",
+    ) -> None:
         self.target = str(target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_token = str(service_token or "").strip()
+        self.serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="jobqueue_session",
+        )
 
     def close(self) -> None:
         return None
@@ -89,14 +110,20 @@ class _JobOrchestratorDiscoveryClient:
         payload: Optional[Dict[str, object]] = None,
         timeout_sec: float = 60.0,
         service_token: Optional[str] = None,
+        serialization_mode: str = "",
     ) -> Dict[str, object]:
         name = str(service_name or "").strip()
         method_name = str(method or "").strip()
         if not name:
-            raise ValueError("service_name is required")
+            raise ValueError("JobQueue route lookup requires service_name")
         if not method_name:
-            raise ValueError("method is required")
+            raise ValueError("JobQueue route lookup requires method")
 
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            session_mode=self.serialization_mode,
+            context="jobqueue_session",
+        )
         token = self.service_token if service_token is None else str(service_token or "").strip()
         tried: Set[str] = set()
         routes = self._list_routes(service_name=name)
@@ -111,12 +138,20 @@ class _JobOrchestratorDiscoveryClient:
                 continue
             tried.add(route.service_id)
             try:
+                call_kwargs = {
+                    "method": method_name,
+                    "payload": payload or {},
+                    "timeout_sec": max(0.1, float(timeout_sec)),
+                    "service_token": token,
+                }
+                if (
+                    str(effective_serialization_mode or "").strip()
+                    and effective_serialization_mode != "legacy_v1"
+                ):
+                    call_kwargs["serialization_mode"] = effective_serialization_mode
                 return _call_route_http(
                     route,
-                    method=method_name,
-                    payload=payload or {},
-                    timeout_sec=max(0.1, float(timeout_sec)),
-                    service_token=token,
+                    **call_kwargs,
                 )
             except DiscoveryCallError as exc:
                 last_exc = exc
@@ -142,12 +177,17 @@ class QueueServiceClient:
         auth_token: str = "",
         timeout_sec: float = 10.0,
         service_name: str = "job-orchestrator",
+        serialization_mode: str = "",
     ) -> None:
         self.target = str(target or "").strip()
         self.client_id = str(client_id or "").strip()
         self._client_scope = self.client_id
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
+        self.serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="jobqueue_session",
+        )
         self._auth_ttl_sec = _default_job_auth_ttl_sec()
         self._recent_job_ids: List[str] = []
 
@@ -176,6 +216,7 @@ class QueueServiceClient:
             self.target,
             timeout_sec=self.timeout_sec,
             service_token=self.auth_token,
+            serialization_mode=self.serialization_mode,
         )
         self._persist_local_session()
 
@@ -211,11 +252,18 @@ class QueueServiceClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def __repr__(self) -> str:
+        return (
+            f"<JobQueue service_name={self.service_name!r} "
+            f"client_id={self.client_id!r} serialization_mode={self.serialization_mode}>"
+        )
+
     def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
         prepared_payload = _stage_job_submit_payload_for_transport(
             target=self.target,
             payload=dict(payload or {}),
             timeout_sec=self.timeout_sec,
+            serialization_mode=self.serialization_mode,
         )
         if self.client_id and not str(prepared_payload.get("client_id", "") or "").strip():
             prepared_payload["client_id"] = self.client_id
@@ -223,13 +271,20 @@ class QueueServiceClient:
             target=self.target,
             payload=prepared_payload,
             timeout_sec=self.timeout_sec,
+            serialization_mode=self.serialization_mode,
         )
+        call_kwargs = {
+            "service_name": self.service_name,
+            "method": "submit_job",
+            "payload": prepared_payload,
+            "timeout_sec": self.timeout_sec,
+        }
+        if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
+            call_kwargs["serialization_mode"] = self.serialization_mode
         resp = self._service_client.call(
-            service_name=self.service_name,
-            method="submit_job",
-            payload=prepared_payload,
-            timeout_sec=self.timeout_sec,
+            **call_kwargs,
         )
+        resp = _decode_job_response_payload(resp)
         job = dict(resp.get("job") or {})
         self._record_job_id(str(job.get("job_id", "") or "").strip())
         return resp
@@ -394,24 +449,30 @@ class QueueServiceClient:
     def get_job_status(self, job_id: str) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
-            raise ValueError("job_id is required")
-        return self._service_client.call(
-            service_name=self.service_name,
-            method="get_job_status",
-            payload={"job_id": normalized},
-            timeout_sec=self.timeout_sec,
-        )
+            raise ValueError("JobQueue.get_job_status() requires job_id")
+        call_kwargs = {
+            "service_name": self.service_name,
+            "method": "get_job_status",
+            "payload": {"job_id": normalized},
+            "timeout_sec": self.timeout_sec,
+        }
+        if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
+            call_kwargs["serialization_mode"] = self.serialization_mode
+        return _decode_job_response_payload(self._service_client.call(**call_kwargs))
 
     def cancel_job(self, job_id: str) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
-            raise ValueError("job_id is required")
-        return self._service_client.call(
-            service_name=self.service_name,
-            method="cancel_job",
-            payload={"job_id": normalized},
-            timeout_sec=self.timeout_sec,
-        )
+            raise ValueError("JobQueue.cancel_job() requires job_id")
+        call_kwargs = {
+            "service_name": self.service_name,
+            "method": "cancel_job",
+            "payload": {"job_id": normalized},
+            "timeout_sec": self.timeout_sec,
+        }
+        if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
+            call_kwargs["serialization_mode"] = self.serialization_mode
+        return _decode_job_response_payload(self._service_client.call(**call_kwargs))
 
     def submit_job_from_bytes(
         self,
@@ -473,7 +534,7 @@ class QueueServiceClient:
     ) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
-            raise ValueError("job_id is required")
+            raise ValueError("JobQueue.wait_for_terminal() requires job_id")
         deadline = time.time() + max(0.1, float(timeout_sec))
         while time.time() < deadline:
             payload = self.get_job_status(normalized)

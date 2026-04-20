@@ -18,7 +18,7 @@ _OBJECT_FORMAT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 def normalize_object_id(object_id: str) -> str:
     text = str(object_id or "").strip().lower()
     if not text:
-        raise ValueError("object_id must not be empty")
+        raise ValueError("DataRef object reference requires object_id")
     if not _OBJECT_ID_RE.match(text):
         raise ValueError(f"invalid object_id: {object_id!r}")
     return text
@@ -59,7 +59,7 @@ def object_storage_path(base_dir: Path, *, object_id: str, fmt: str) -> Path:
 def normalize_data_ref_id(ref_id: str) -> str:
     text = str(ref_id or "").strip()
     if not text:
-        raise ValueError("ref_id must not be empty")
+        raise ValueError("DataRef payload requires ref_id")
     return text
 
 
@@ -79,7 +79,7 @@ def normalize_materialize_as(value: str = "", *, default: str = "path") -> str:
 def _normalize_storage_id(storage_id: str, *, fallback: str) -> str:
     text = str(storage_id or fallback or "").strip()
     if not text:
-        raise ValueError("storage_id must not be empty")
+        raise ValueError("DataRef payload requires storage_id")
     if text.startswith("sha256:"):
         return normalize_object_id(text)
     return text

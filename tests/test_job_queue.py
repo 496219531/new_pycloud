@@ -6,9 +6,11 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
+from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.data.ref import DataRef, data_ref_to_payload
 
 
@@ -1760,3 +1762,40 @@ def test_job_queue_client_wait_for_terminal_polls_until_done() -> None:
     client.get_job_status = _fake_status  # type: ignore[method-assign]
     result = client.wait_for_terminal("job-1", timeout_sec=2.0, poll_interval_sec=0.01)
     assert result["job"]["status"] == "SUCCEEDED"
+
+
+def test_job_queue_client_decodes_dataframe_final_result_from_job_response() -> None:
+    from pycloud_parallel import JobQueue
+
+    frame = pd.DataFrame({"a": [1, 2], "b": [3.0, 4.0]})
+    client = JobQueue("127.0.0.1:50051", client_id="client-final-result")
+
+    def _fake_call(*, service_name, method, payload=None, timeout_sec=60.0, service_token=None):
+        del service_name, method, payload, timeout_sec, service_token
+        return {
+            "ok": True,
+            "job": {
+                "job_id": "job-1",
+                "status": "SUCCEEDED",
+                "final_result": [serialize_arrow_compatible(frame)],
+                "results": [
+                    {
+                        "index": 0,
+                        "result": serialize_arrow_compatible(frame),
+                    }
+                ],
+            },
+        }
+
+    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    try:
+        resp = client.get_job_status("job-1")
+    finally:
+        client.close()
+
+    final_result = resp["job"]["final_result"]
+    assert isinstance(final_result, list)
+    assert len(final_result) == 1
+    assert isinstance(final_result[0], pd.DataFrame)
+    assert final_result[0].equals(frame)
+    assert isinstance(resp["job"]["results"][0]["result"], pd.DataFrame)

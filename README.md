@@ -340,6 +340,9 @@ print(group.square.sync(x=7))
 # group.join() 适合 owner 长驻
 # 重新部署同名服务且代码变化时，需先结束旧服务
 # 同一台机器上，同一个 owner_client_id + service_name 只允许一个活跃 deployservice
+
+# 如果你希望显式切换调度 profile：
+# print(group.square.with_options(strategy="service_latency_first").sync(x=7))
 ```
 
 如果你连接的是已经部署好的服务，也可以直接做轻量批量 RPC：

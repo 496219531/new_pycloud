@@ -19,8 +19,14 @@ from pycloud_parallel.controlplane.config import (
 )
 from .client_transport import (
     _decode_http_request_body,
+    _decode_http_request_body_with_mode,
+    _decode_http_transport_request_body_with_mode,
+    _decode_http_response_with_headers,
     _decode_http_response_body,
     _encode_http_json_body,
+    _encode_http_transport_body,
+    _encode_http_transport_response_body,
+    _is_http_transport_content_type,
     _serialize_http_call_payload,
 )
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
@@ -108,7 +114,7 @@ class GatewayHttpApp:
         headers,
         stream: BinaryIO,
         content_length: int,
-    ) -> Optional[Tuple[int, Dict[str, object]]]:
+    ) -> Optional[Tuple[Any, ...]]:
         if self._stopped:
             return 503, {"ok": False, "error": "gateway stopping"}
         parsed = urlparse(path)
@@ -200,7 +206,7 @@ class GatewayHttpApp:
             self.stage_manager.preserve_failure(request, status="failed")
             return 502, {"ok": False, "error": f"gateway upload-call failed: {exc}"}
 
-    def handle_post(self, *, path: str, headers, body: bytes) -> Optional[Tuple[int, Dict[str, object]]]:
+    def handle_post(self, *, path: str, headers, body: bytes) -> Optional[Tuple[Any, ...]]:
         if self._stopped:
             return 503, {"ok": False, "error": "gateway stopping"}
         parsed = urlparse(path)
@@ -211,7 +217,17 @@ class GatewayHttpApp:
         service_name = parts[1]
         method = parts[3]
         try:
-            payload = _decode_http_request_body(body, context="service call payload")
+            if _is_http_transport_content_type(str(headers.get("Content-Type", "") or "")):
+                payload, serialization_mode = _decode_http_transport_request_body_with_mode(
+                    body,
+                    headers=headers,
+                    context="gateway_public",
+                )
+            else:
+                payload, serialization_mode = _decode_http_request_body_with_mode(
+                    body,
+                    context="gateway_public",
+                )
         except ValueError as exc:
             return 400, {"ok": False, "error": str(exc)}
 
@@ -228,8 +244,27 @@ class GatewayHttpApp:
         try:
             route = self.route_cache.select_route(service_name)
             tried.add(route.service_id)
-            resp = self._invoke_route(route, method=method, payload=payload, timeout_sec=timeout_sec, service_token=service_token)
+            resp = self._invoke_route(
+                route,
+                method=method,
+                payload=payload,
+                timeout_sec=timeout_sec,
+                service_token=service_token,
+                serialization_mode=serialization_mode,
+            )
             self.route_cache.mark_success(route)
+            if (
+                _is_http_transport_content_type(str(headers.get("Content-Type", "") or ""))
+                and isinstance(resp, dict)
+                and bool(resp.get("ok", False))
+                and "data" in resp
+            ):
+                raw, response_headers = _encode_http_transport_response_body(
+                    resp.get("data"),
+                    context="service_result",
+                    mode=serialization_mode,
+                )
+                return 200, raw, response_headers.pop("Content-Type", "application/octet-stream"), response_headers
             return 200, resp
         except GatewayCallError as exc:
             if not self._is_route_failure(exc):
@@ -238,8 +273,27 @@ class GatewayHttpApp:
             try:
                 self.route_cache.refresh(service_name, force=True)
                 retry_route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
-                resp = self._invoke_route(retry_route, method=method, payload=payload, timeout_sec=timeout_sec, service_token=service_token)
+                resp = self._invoke_route(
+                    retry_route,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=timeout_sec,
+                    service_token=service_token,
+                    serialization_mode=serialization_mode,
+                )
                 self.route_cache.mark_success(retry_route)
+                if (
+                    _is_http_transport_content_type(str(headers.get("Content-Type", "") or ""))
+                    and isinstance(resp, dict)
+                    and bool(resp.get("ok", False))
+                    and "data" in resp
+                ):
+                    raw, response_headers = _encode_http_transport_response_body(
+                        resp.get("data"),
+                        context="service_result",
+                        mode=serialization_mode,
+                    )
+                    return 200, raw, response_headers.pop("Content-Type", "application/octet-stream"), response_headers
                 return 200, resp
             except GatewayCallError as retry_exc:
                 if self._is_route_failure(retry_exc):
@@ -375,6 +429,7 @@ class GatewayHttpApp:
         payload: Dict[str, object],
         timeout_sec: float,
         service_token: str,
+        serialization_mode: str = "",
     ) -> Dict[str, object]:
         base_url = self._validate_route_url(route.http_base_url)
         if not base_url:
@@ -383,25 +438,40 @@ class GatewayHttpApp:
         headers = {"Content-Type": "application/json"}
         if service_token:
             headers["X-Service-Token"] = service_token
+        if str(serialization_mode or "").strip().lower() == "pickle_stable_v1":
+            request_body, transport_headers, _codec = _encode_http_transport_body(
+                payload,
+                context="service_internal",
+                mode=serialization_mode,
+            )
+            headers.update(transport_headers)
+        else:
+            request_body = _encode_http_json_body(
+                _serialize_http_call_payload(
+                    payload,
+                    context="service call payload",
+                    mode=serialization_mode,
+                )
+            )
         req = Request(
             url=url,
             method="POST",
             headers=headers,
-            data=_encode_http_json_body(_serialize_http_call_payload(payload, context="service call payload")),
+            data=request_body,
         )
         try:
             with urlopen(req, timeout=max(2.0, timeout_sec + 1.0)) as resp:
                 raw = resp.read(MAX_BODY_BYTES + 1)
                 if len(raw) > MAX_BODY_BYTES:
                     raise GatewayCallError(status_code=502, data={"ok": False, "error": "response too large"})
-                data = _decode_http_response_body(raw, control_addr=route.control_addr)
+                data = _decode_http_response_with_headers(raw, headers=resp.headers, control_addr=route.control_addr)
         except HTTPError as exc:
             try:
                 raw = exc.read() or b"{}"
                 if len(raw) > MAX_BODY_BYTES:
                     data = {"ok": False, "error": "response too large"}
                 else:
-                    data = _decode_http_response_body(raw)
+                    data = _decode_http_response_with_headers(raw, headers=getattr(exc, "headers", {}) or {})
             except Exception:
                 data = {"ok": False, "error": exc.reason}
             raise GatewayCallError(status_code=exc.code, data=data) from exc
@@ -464,12 +534,18 @@ class GatewayHttpApp:
                 file_map=parsed_upload.file_map,
             )
             self.stage_manager.mark_status(request, status="calling")
+            invoke_kwargs = {
+                "method": method,
+                "payload": rewritten_payload,
+                "timeout_sec": timeout_sec,
+                "service_token": service_token,
+            }
+            normalized_mode = str(parsed_upload.serialization_mode or "").strip().lower()
+            if normalized_mode and normalized_mode != "legacy_v1":
+                invoke_kwargs["serialization_mode"] = normalized_mode
             return self._invoke_route(
                 route,
-                method=method,
-                payload=rewritten_payload,
-                timeout_sec=timeout_sec,
-                service_token=service_token,
+                **invoke_kwargs,
             )
         finally:
             release_uploaded_refs_on_route(
@@ -584,8 +660,12 @@ class GatewayHttpServer:
                     content_length=length,
                 )
                 if handled is not None:
-                    code, resp = handled
-                    self._send_json(code, resp)
+                    if len(handled) == 4:
+                        code, resp, content_type, extra_headers = handled
+                        self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
+                    else:
+                        code, resp = handled
+                        self._send_json(code, resp)
                     return
                 if length > MAX_BODY_BYTES:
                     self._send_json(413, {"ok": False, "error": "payload too large"})
@@ -595,8 +675,12 @@ class GatewayHttpServer:
                 if handled is None:
                     self._send_json(404, {"ok": False, "error": "not found"})
                     return
-                code, resp = handled
-                self._send_json(code, resp)
+                if len(handled) == 4:
+                    code, resp, content_type, extra_headers = handled
+                    self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
+                else:
+                    code, resp = handled
+                    self._send_json(code, resp)
 
             def do_GET(self):  # noqa: N802
                 handled = app.handle_get(path=self.path, headers=self.headers)
@@ -611,9 +695,22 @@ class GatewayHttpServer:
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
                 raw = _encode_http_json_body(data)
+                self._send_body(status_code, raw, content_type="application/json; charset=utf-8")
+
+            def _send_body(
+                self,
+                status_code: int,
+                body: object,
+                *,
+                content_type: str,
+                extra_headers: Optional[Dict[str, str]] = None,
+            ) -> None:
+                raw = body if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
                 try:
                     self.send_response(status_code)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Type", str(content_type or "application/octet-stream"))
+                    for key, value in dict(extra_headers or {}).items():
+                        self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)

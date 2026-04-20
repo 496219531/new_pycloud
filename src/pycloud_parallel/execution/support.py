@@ -52,8 +52,10 @@ from pycloud_parallel.controlplane.serialization import (
     serialize_arrow_compatible,
     serialize_dataframe_bundle,
     serialize_series_bundle,
+    serialize_by_mode,
     summarize_payload_flow_value,
 )
+from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 if TYPE_CHECKING:
@@ -207,7 +209,7 @@ def _resolve_public_target_arg(
     if effective_target:
         return effective_target
     label = str(action_name or "public API").strip()
-    raise TypeError(f"{label} missing required keyword argument: 'target'")
+    raise TypeError(f"{label} requires target=...")
 
 
 def _artifact_code_version(
@@ -337,6 +339,8 @@ def _serialize_data_for_object_ref(
     *,
     format: str = "",
     materialize_as: str = "auto",
+    serialization_mode: str = "",
+    default_serialization_mode: str = "",
 ) -> Tuple[str, str, bytes]:
     log_payload_flow(
         "object_ref_upload_prepare",
@@ -346,6 +350,62 @@ def _serialize_data_for_object_ref(
     )
     if maybe_data_ref(data) is not None:
         raise ValueError("data is already uploaded; no need to serialize again")
+
+    normalized_mode = resolve_effective_serialization_mode(
+        request_mode=serialization_mode,
+        default_mode=default_serialization_mode,
+        context="object_upload",
+    )
+    if normalized_mode in {"structured_v1", "pickle_stable_v1"}:
+        if isinstance(data, os.PathLike):
+            path = Path(data).expanduser()
+            if not path.exists() or not path.is_file():
+                raise FileNotFoundError(f"path not found or not a file: {path}")
+            log_payload_flow(
+                "object_ref_upload",
+                path_type="file",
+                format=normalize_object_format(format, source_name=path.name),
+            )
+            return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+        if isinstance(data, str):
+            path = Path(data).expanduser()
+            if path.exists() and path.is_file():
+                log_payload_flow(
+                    "object_ref_upload",
+                    path_type="string-file",
+                    format=normalize_object_format(format, source_name=path.name),
+                )
+                return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+        blob = serialize_by_mode(data, mode=normalized_mode)
+        if not isinstance(blob, (bytes, bytearray, memoryview)):
+            blob = json.dumps(blob, ensure_ascii=False).encode("utf-8")
+        materialize_kind = "auto"
+        try:
+            import pandas as pd
+            import numpy as np
+
+            if isinstance(data, pd.DataFrame):
+                materialize_kind = "dataframe"
+            elif isinstance(data, pd.Series):
+                materialize_kind = "series"
+            elif isinstance(data, np.ndarray):
+                materialize_kind = "ndarray"
+            elif isinstance(data, (dict, list, tuple)):
+                materialize_kind = "json"
+            elif isinstance(data, (bytes, bytearray, memoryview)):
+                materialize_kind = "bytes"
+        except ImportError:
+            if isinstance(data, (dict, list, tuple)):
+                materialize_kind = "json"
+            elif isinstance(data, (bytes, bytearray, memoryview)):
+                materialize_kind = "bytes"
+        log_payload_flow(
+            "object_ref_upload",
+            path_type=f"serialization-{normalized_mode}",
+            format=normalized_mode,
+            summary=summarize_payload_flow_value(data),
+        )
+        return materialize_kind, normalized_mode, bytes(blob)
 
     if isinstance(data, os.PathLike):
         path = Path(data).expanduser()
@@ -435,11 +495,18 @@ def _put_data_via_clients(
     *,
     format: str = "",
     chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+    serialization_mode: str = "",
+    default_serialization_mode: str = "",
 ) -> DataRef:
     existing = maybe_data_ref(data)
     if existing is not None:
         return existing
-    materialize_as, effective_format, blob = _serialize_data_for_object_ref(data, format=format)
+    materialize_as, effective_format, blob = _serialize_data_for_object_ref(
+        data,
+        format=format,
+        serialization_mode=serialization_mode,
+        default_serialization_mode=default_serialization_mode,
+    )
     refs = [
         client.upload_object_from_bytes(
             blob=blob,
@@ -492,10 +559,14 @@ def _prepare_payload_for_policy(
     payload: Optional[Dict[str, object]],
     *,
     policy,
+    default_serialization_mode: str = "",
 ) -> Dict[str, object]:
+    put_kwargs = {}
+    if str(default_serialization_mode or "").strip() and str(default_serialization_mode).strip().lower() != "legacy_v1":
+        put_kwargs["default_serialization_mode"] = default_serialization_mode
     return prepare_outbound_payload(
         payload,
-        put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format),
+        put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format, **put_kwargs),
         estimate_inline_size=_estimate_managed_global_inline_size,
         policy=policy,
     )
@@ -507,10 +578,14 @@ def _prepare_value_for_policy(
     *,
     policy,
     preserve_container: bool = False,
+    default_serialization_mode: str = "",
 ) -> Any:
+    put_kwargs = {}
+    if str(default_serialization_mode or "").strip() and str(default_serialization_mode).strip().lower() != "legacy_v1":
+        put_kwargs["default_serialization_mode"] = default_serialization_mode
     return prepare_outbound_value(
         value,
-        put_data=lambda data, *, format="": _put_data_via_clients(clients, data, format=format),
+        put_data=lambda data, *, format="": _put_data_via_clients(clients, data, format=format, **put_kwargs),
         estimate_inline_size=_estimate_managed_global_inline_size,
         policy=policy,
         preserve_container=preserve_container,
@@ -528,6 +603,7 @@ def _prepare_payload_value_for_upload(
     upload_string_file: bool = False,
     upload_bytes: bool = False,
     consume_on_read: bool = False,
+    serialization_mode: str = "",
 ) -> Any:
     policy = _policy_with_soft_limit(
         replace(
@@ -545,6 +621,7 @@ def _prepare_payload_value_for_upload(
         value,
         policy=policy,
         preserve_container=preserve_container,
+        default_serialization_mode=serialization_mode,
     )
 
 
@@ -553,6 +630,7 @@ def _prepare_managed_global_value_for_upload(
     value: Any,
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    serialization_mode: str = "",
 ) -> Any:
     inline_size = _estimate_managed_global_inline_size(value)
     if inline_size <= max(1, int(object_threshold_bytes)):
@@ -573,6 +651,7 @@ def _prepare_managed_global_value_for_upload(
             upload_string_file=True,
             upload_bytes=True,
             consume_on_read=False,
+            serialization_mode=serialization_mode,
         )
         log_payload_flow(
             "managed_global_objectref_ready",
@@ -601,12 +680,14 @@ def _prepare_managed_globals_values_for_upload(
     values: Dict[str, object],
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    serialization_mode: str = "",
 ) -> Dict[str, object]:
     return {
         str(name): _prepare_managed_global_value_for_upload(
             clients,
             value,
             object_threshold_bytes=object_threshold_bytes,
+            serialization_mode=serialization_mode,
         )
         for name, value in (values or {}).items()
     }
@@ -617,9 +698,15 @@ def _prepare_task_payload_for_submit(
     payload: Dict[str, object],
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    serialization_mode: str = "",
 ) -> Any:
     policy = _policy_with_soft_limit(get_payload_policy("task_submit"), object_threshold_bytes)
-    return _prepare_payload_for_policy([client], payload, policy=policy)
+    return _prepare_payload_for_policy(
+        [client],
+        payload,
+        policy=policy,
+        default_serialization_mode=serialization_mode,
+    )
 
 
 def _prepare_http_payload_for_call(
@@ -627,9 +714,15 @@ def _prepare_http_payload_for_call(
     payload: Optional[Dict[str, object]],
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    serialization_mode: str = "",
 ) -> Dict[str, object]:
     policy = _policy_with_soft_limit(get_payload_policy("http_call"), object_threshold_bytes)
-    return _prepare_payload_for_policy(clients, payload, policy=policy)
+    return _prepare_payload_for_policy(
+        clients,
+        payload,
+        policy=policy,
+        default_serialization_mode=serialization_mode,
+    )
 
 
 def _default_job_update_globals_for_blob(blob: bytes, *, package_format: str) -> Optional[object]:
@@ -811,6 +904,7 @@ def _stage_job_value_as_data_ref(
     timeout_sec: float,
     replica_count: int,
     ttl_sec: int,
+    serialization_mode: str = "",
 ) -> DataRef:
     data_ref = maybe_data_ref(value)
     if data_ref is not None:
@@ -837,7 +931,11 @@ def _stage_job_value_as_data_ref(
             )
         else:
             upload_value = list(value) if isinstance(value, tuple) else value
-            object_ref = _put_data_via_clients(clients, upload_value)
+            object_ref = _put_data_via_clients(
+                clients,
+                upload_value,
+                default_serialization_mode=serialization_mode,
+            )
             staged_ref = DataRef(
                 ref_id=object_ref.object_id,
                 storage_id=object_ref.object_id,
@@ -873,6 +971,7 @@ def _stage_job_submit_value(
     timeout_sec: float,
     replica_count: int,
     ttl_sec: int,
+    serialization_mode: str = "",
 ) -> Any:
     def _path_is_file(path: Path) -> bool:
         try:
@@ -902,6 +1001,7 @@ def _stage_job_submit_value(
                 timeout_sec=timeout_sec,
                 replica_count=replica_count,
                 ttl_sec=ttl_sec,
+                serialization_mode=serialization_mode,
             )
         if estimate_payload_inline_size(value) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
             return value
@@ -912,6 +1012,7 @@ def _stage_job_submit_value(
             timeout_sec=timeout_sec,
             replica_count=replica_count,
             ttl_sec=ttl_sec,
+            serialization_mode=serialization_mode,
         )
     if isinstance(value, (bytes, bytearray, memoryview)):
         if len(bytes(value)) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
@@ -923,6 +1024,7 @@ def _stage_job_submit_value(
             timeout_sec=timeout_sec,
             replica_count=replica_count,
             ttl_sec=ttl_sec,
+            serialization_mode=serialization_mode,
         )
     if isinstance(value, os.PathLike):
         path = Path(value).expanduser()
@@ -936,6 +1038,7 @@ def _stage_job_submit_value(
             timeout_sec=timeout_sec,
             replica_count=replica_count,
             ttl_sec=ttl_sec,
+            serialization_mode=serialization_mode,
         )
     if isinstance(value, dict):
         try:
@@ -950,6 +1053,7 @@ def _stage_job_submit_value(
                 timeout_sec=timeout_sec,
                 replica_count=replica_count,
                 ttl_sec=ttl_sec,
+                serialization_mode=serialization_mode,
             )
         return {
             str(key): _stage_job_submit_value(
@@ -959,6 +1063,7 @@ def _stage_job_submit_value(
                 timeout_sec=timeout_sec,
                 replica_count=replica_count,
                 ttl_sec=ttl_sec,
+                serialization_mode=serialization_mode,
             )
             for key, item in value.items()
         }
@@ -975,6 +1080,7 @@ def _stage_job_submit_value(
                 timeout_sec=timeout_sec,
                 replica_count=replica_count,
                 ttl_sec=ttl_sec,
+                serialization_mode=serialization_mode,
             )
         return [
             _stage_job_submit_value(
@@ -984,6 +1090,7 @@ def _stage_job_submit_value(
                 timeout_sec=timeout_sec,
                 replica_count=replica_count,
                 ttl_sec=ttl_sec,
+                serialization_mode=serialization_mode,
             )
             for item in value
         ]
@@ -996,6 +1103,7 @@ def _stage_job_submit_value(
                 timeout_sec=timeout_sec,
                 replica_count=replica_count,
                 ttl_sec=ttl_sec,
+                serialization_mode=serialization_mode,
             )
             for item in value
         )
@@ -1011,6 +1119,7 @@ def _stage_job_submit_value(
         timeout_sec=timeout_sec,
         replica_count=replica_count,
         ttl_sec=ttl_sec,
+        serialization_mode=serialization_mode,
     )
 
 
@@ -1019,6 +1128,7 @@ def _stage_job_submit_payload_for_transport(
     target: str,
     payload: Dict[str, object],
     timeout_sec: float,
+    serialization_mode: str = "",
 ) -> Dict[str, object]:
     prepared = dict(payload or {})
     runtime = str(prepared.get("runtime", "py3") or "py3")
@@ -1039,6 +1149,7 @@ def _stage_job_submit_payload_for_transport(
             timeout_sec=timeout_sec,
             replica_count=replica_count,
             ttl_sec=ttl_sec,
+            serialization_mode=serialization_mode,
         )
     return prepared
 
@@ -1129,6 +1240,7 @@ def _prepare_job_submit_payload_for_call(
     target: str,
     payload: Dict[str, object],
     timeout_sec: float,
+    serialization_mode: str = "",
 ) -> Dict[str, object]:
     prepared = dict(payload or {})
     preserved_fields = {
@@ -1146,9 +1258,12 @@ def _prepare_job_submit_payload_for_call(
         if not clients:
             prepared.update(preserved_fields)
             return prepared
+        put_kwargs = {}
+        if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
+            put_kwargs["default_serialization_mode"] = serialization_mode
         outbound = prepare_outbound_payload(
             prepared,
-            put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format),
+            put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format, **put_kwargs),
             estimate_inline_size=_estimate_managed_global_inline_size,
             policy=get_payload_policy("job_submit"),
         )

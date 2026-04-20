@@ -12,6 +12,8 @@ from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_poli
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
+    decode_transport_value,
+    encode_transport_value,
     serialize_arrow_compatible,
     serialize_inline_payload,
     serialize_inline_result,
@@ -19,9 +21,9 @@ from pycloud_parallel.controlplane.serialization import (
 
 EstimateInlineSize = Callable[[Any], int]
 PutPayloadData = Callable[..., object]
-# Old alias retained for internal compatibility with earlier call sites.
-ResolveObjectRefs = Callable[[Any], Any]
-ResolveDataRefs = ResolveObjectRefs
+# Internal resolver hook retained for compatibility with earlier call sites.
+ResolveStoredData = Callable[[Any], Any]
+ResolveDataRefs = ResolveStoredData
 
 
 def _put_prepared_value(
@@ -207,9 +209,13 @@ def encode_payload_for_transport(
     *,
     policy: PayloadPolicy,
     context: str = "payload",
+    mode: str = "",
 ) -> Dict[str, object]:
+    transport_value = encode_transport_value(payload or {}, mode=mode, context=context)
+    if not isinstance(transport_value, dict):
+        raise TypeError(f"{context} transport payload must encode to dict, got {type(transport_value).__name__}")
     serialized, _, _ = serialize_inline_payload(
-        payload or {},
+        transport_value,
         context=context,
         limit_bytes=policy.inline_payload_hard_limit_bytes,
     )
@@ -221,9 +227,10 @@ def encode_result_for_transport(
     *,
     policy: PayloadPolicy,
     context: str = "result",
+    mode: str = "",
 ) -> Dict[str, object]:
-    serialized = serialize_arrow_compatible(value)
-    wrapped = serialized if isinstance(serialized, dict) else {"value": serialized}
+    transport_value = encode_transport_value(value, mode=mode, context=context)
+    wrapped = transport_value if isinstance(transport_value, dict) else {"value": transport_value}
     serialize_inline_result(
         wrapped,
         context=context,
@@ -236,9 +243,18 @@ def decode_payload_from_transport(
     payload: Any,
     *,
     policy: PayloadPolicy,
+    mode: str = "",
+    context: str = "payload",
+    trust_mode: str = "",
 ) -> Any:
-    return normalize_inbound_payload(
+    decoded = decode_transport_value(
         payload,
+        mode=mode,
+        context=context,
+        trust_mode=trust_mode,
+    )
+    return normalize_inbound_payload(
+        decoded,
         object_dir="",
         policy=policy,
         resolve_object_refs=lambda value: value,
@@ -249,10 +265,16 @@ def decode_result_from_transport(
     payload: Any,
     *,
     policy: Optional[PayloadPolicy] = None,
+    mode: str = "",
+    context: str = "result",
+    trust_mode: str = "",
 ) -> Any:
     return decode_payload_from_transport(
         payload,
         policy=policy or get_payload_policy("result"),
+        mode=mode,
+        context=context,
+        trust_mode=trust_mode,
     )
 
 
@@ -261,7 +283,7 @@ def normalize_inbound_payload(
     *,
     object_dir: str,
     policy: PayloadPolicy,
-    resolve_object_refs: Optional[ResolveObjectRefs] = None,
+    resolve_object_refs: Optional[ResolveStoredData] = None,
 ) -> Any:
     del policy
     normalized = convert_dict_to_arrow(payload)

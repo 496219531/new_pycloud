@@ -32,7 +32,18 @@ from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.object_digest_cache import invalidate_file_digest, lookup_file_digest, store_file_digest
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient, ServiceSessionClient
 from pycloud_parallel.data.ref import normalize_object_format, object_id_from_sha256_hex
-from pycloud_parallel.controlplane.serialization import dict_to_struct, log_payload_flow, serialize_inline_payload, struct_to_dict, summarize_payload_flow_value
+from pycloud_parallel.controlplane.serialization import (
+    encode_transport_payload_bytes,
+    detect_transport_mode,
+    dict_to_struct,
+    log_payload_flow,
+    prefers_transport_payload_bytes,
+    serialize_inline_payload,
+    struct_to_python,
+    summarize_payload_flow_value,
+)
+from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
+from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.execution.support import _prepare_local_artifact_for_upload, _prepare_managed_globals_values_for_upload
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
@@ -691,13 +702,43 @@ class NodeControlClient:
             raise
 
     def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
-        data = struct_to_dict(task_result.result)
+        if task_result.HasField("transport_result") and str(task_result.transport_result.codec or "").strip():
+            from pycloud_parallel.controlplane.serialization import decode_transport_payload_bytes
+
+            data = decode_transport_payload_bytes(
+                str(task_result.transport_result.codec or ""),
+                int(task_result.transport_result.version or 0),
+                task_result.transport_result.payload,
+                context="taskpool_session",
+            )
+        else:
+            raw = struct_to_python(task_result.result)
+            data = decode_result_from_transport(
+                raw,
+                mode=detect_transport_mode(raw, default="legacy_v1"),
+                context="taskpool_session",
+            )
         if maybe_data_ref(data) is None:
             return data
         return self.fetch_result_ref_data(data, target_path=target_path)
 
     def fetch_service_result_data(self, call_response: pb2.CallServiceResponse, *, target_path: str = ""):
-        data = struct_to_dict(call_response.data)
+        if call_response.HasField("transport_data") and str(call_response.transport_data.codec or "").strip():
+            from pycloud_parallel.controlplane.serialization import decode_transport_payload_bytes
+
+            data = decode_transport_payload_bytes(
+                str(call_response.transport_data.codec or ""),
+                int(call_response.transport_data.version or 0),
+                call_response.transport_data.payload,
+                context="service_owner",
+            )
+        else:
+            raw = struct_to_python(call_response.data)
+            data = decode_result_from_transport(
+                raw,
+                mode=detect_transport_mode(raw, default="legacy_v1"),
+                context="service_owner",
+            )
         if maybe_data_ref(data) is None:
             return data
         return self.fetch_result_ref_data(data, target_path=target_path)
@@ -743,15 +784,31 @@ class NodeControlClient:
         runtime_key: str,
         code_token: str,
         prepared_values: Dict[str, object],
+        serialization_mode: str = "",
     ) -> pb2.UpdateRuntimeGlobalsResponse:
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="taskpool_session",
+        )
+        request_kwargs = {
+            "client_id": str(client_id or "").strip(),
+            "code_version": str(code_version or "").strip(),
+            "runtime_key": str(runtime_key or "").strip(),
+            "code_token": str(code_token or "").strip(),
+        }
+        if prefers_transport_payload_bytes(effective_serialization_mode):
+            request_kwargs["transport_values"] = encode_transport_payload_bytes(
+                prepared_values,
+                mode=effective_serialization_mode,
+                context="taskpool_session",
+            )
+        else:
+            request_kwargs["values"] = dict_to_struct(
+                prepared_values,
+                mode=effective_serialization_mode,
+            )
         resp = self.stub.UpdateRuntimeGlobals(
-            pb2.UpdateRuntimeGlobalsRequest(
-                client_id=str(client_id or "").strip(),
-                code_version=str(code_version or "").strip(),
-                runtime_key=str(runtime_key or "").strip(),
-                code_token=str(code_token or "").strip(),
-                values=dict_to_struct(prepared_values),
-            ),
+            pb2.UpdateRuntimeGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,
         )
         if not resp.ok:
@@ -1268,16 +1325,33 @@ class NodeControlClient:
         payload: Dict[str, object],
         timeout_sec: float = 60.0,
         service_token: str = "",
+        serialization_mode: str = "",
     ) -> pb2.CallServiceResponse:
-        _, payload_struct, _ = serialize_inline_payload(payload or {}, context="service call payload")
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="service_owner",
+        )
+        request_kwargs = {
+            "service_id": service_id,
+            "method": method,
+            "timeout_sec": max(0.1, float(timeout_sec)),
+            "service_token": service_token or "",
+        }
+        if prefers_transport_payload_bytes(effective_serialization_mode):
+            request_kwargs["transport_payload"] = encode_transport_payload_bytes(
+                payload or {},
+                mode=effective_serialization_mode,
+                context="service_owner",
+            )
+        else:
+            _, payload_struct, _ = serialize_inline_payload(
+                payload or {},
+                context="service call payload",
+                mode=effective_serialization_mode,
+            )
+            request_kwargs["payload"] = payload_struct
         resp = self.stub.CallService(
-            pb2.CallServiceRequest(
-                service_id=service_id,
-                method=method,
-                payload=payload_struct,
-                timeout_sec=max(0.1, float(timeout_sec)),
-                service_token=service_token or "",
-            ),
+            pb2.CallServiceRequest(**request_kwargs),
             timeout=max(self.timeout_sec, max(0.1, float(timeout_sec)) + 1.0),
         )
         if not resp.ok:
@@ -1292,15 +1366,32 @@ class NodeControlClient:
         service_id: str,
         service_token: str,
         values: Dict[str, object],
+        serialization_mode: str = "",
     ) -> pb2.UpdateServiceGlobalsResponse:
-        prepared_values = _prepare_managed_globals_values_for_upload([self], values)
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="object_upload",
+        )
+        prepared_values = _prepare_managed_globals_values_for_upload(
+            [self],
+            values,
+            serialization_mode=effective_serialization_mode,
+        )
+        request_kwargs = {
+            "owner_client_id": str(owner_client_id or "").strip(),
+            "service_id": str(service_id or "").strip(),
+            "service_token": str(service_token or "").strip(),
+        }
+        if prefers_transport_payload_bytes(effective_serialization_mode):
+            request_kwargs["transport_values"] = encode_transport_payload_bytes(
+                prepared_values,
+                mode=effective_serialization_mode,
+                context="service_owner",
+            )
+        else:
+            request_kwargs["values"] = dict_to_struct(prepared_values, mode=effective_serialization_mode)
         resp = self.stub.UpdateServiceGlobals(
-            pb2.UpdateServiceGlobalsRequest(
-                owner_client_id=str(owner_client_id or "").strip(),
-                service_id=str(service_id or "").strip(),
-                service_token=str(service_token or "").strip(),
-                values=dict_to_struct(prepared_values),
-            ),
+            pb2.UpdateServiceGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,
         )
         if not resp.ok:

@@ -9,6 +9,12 @@ from typing import Dict, Optional, Sequence, Tuple
 
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
+from pycloud_parallel.execution.scheduler import (
+    JOBQUEUE_DEFAULT,
+    SchedulerCandidate,
+    SchedulerState,
+    select_one_candidate,
+)
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 
@@ -630,17 +636,59 @@ class InfoCenterClient:
                         )
                     )
                 raise RuntimeError("no schedulable task nodes from InfoCenter")
-            candidates.sort(
-                key=lambda node: (
-                    0 if preferred_runtime and preferred_runtime in node.active_runtimes else 1,
-                    -int(node.credit),
-                    int(node.queued),
-                    int(node.inflight),
-                    node.node_id,
-                )
-            )
             requested_count = int(node_count or 0)
-            selected = candidates if requested_count <= 0 else candidates[:requested_count]
+            selected: list[InfoCenterNode] = []
+            rr_counter = 0
+            pool_candidates = list(candidates)
+            while pool_candidates and (requested_count <= 0 or len(selected) < requested_count):
+                scheduler_candidates = [
+                    SchedulerCandidate(
+                        id=_node_instance_key_from_node(node),
+                        kind="jobqueue",
+                        node_id=str(node.node_id or ""),
+                        node_instance_id=_node_instance_key_from_node(node),
+                        healthy=bool(node.healthy),
+                        schedulable=bool(node.schedulable and not node.drain and str(node.control_addr or "").strip()),
+                        drain=bool(node.drain),
+                        breaker_state="closed",
+                        predicted_busy=float(node.inflight) / float(
+                            max(
+                                1,
+                                int(node.task_pool_worker_available or node.task_pool_worker_capacity or 1),
+                            )
+                        ),
+                        node_inflight=int(node.inflight or 0),
+                        alive_workers=max(
+                            1,
+                            int(node.task_pool_worker_available or node.task_pool_worker_capacity or 1),
+                        ),
+                        worker_capacity=max(1, int(node.task_pool_worker_capacity or node.capacity or 1)),
+                        credit=max(0, int(node.credit or 0)),
+                        recent_failures=0,
+                        metadata={
+                            "preferred_runtime": bool(preferred_runtime and preferred_runtime in node.active_runtimes),
+                        },
+                    )
+                    for node in pool_candidates
+                ]
+                selected_candidate = select_one_candidate(
+                    scheduler_candidates,
+                    profile=JOBQUEUE_DEFAULT,
+                    state=SchedulerState(),
+                    round_robin_counter=rr_counter,
+                )
+                rr_counter += 1
+                chosen = None
+                remaining: list[InfoCenterNode] = []
+                for node in pool_candidates:
+                    if _node_instance_key_from_node(node) == str(selected_candidate.id) and chosen is None:
+                        chosen = node
+                        continue
+                    remaining.append(node)
+                if chosen is None:
+                    break
+                selected.append(chosen)
+                pool_candidates = remaining
 
         if not selected:
             raise RuntimeError("no task nodes selected from InfoCenter")

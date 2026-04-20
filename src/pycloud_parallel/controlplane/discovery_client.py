@@ -22,6 +22,7 @@ from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
 from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
+from pycloud_parallel.execution.failover import STAGING_FAILED, classify_service_error, should_failover
 
 client_mod = SimpleNamespace(
     _DiscoveryRouteCache=_DiscoveryRouteCache,
@@ -149,6 +150,7 @@ class DiscoveryServiceClient:
         timeout_sec: float = 60.0,
         service_token: Optional[str] = None,
         strategy: str = "predicted_busy",
+        serialization_mode: str = "",
     ) -> Dict[str, object]:
         name = str(service_name or "").strip()
         method_name = str(method or "").strip()
@@ -160,51 +162,91 @@ class DiscoveryServiceClient:
         tried: Set[str] = set()
         route = self._route_cache.select_route(name, strategy=strategy)
         tried.add(route.service_id)
-        routes_snapshot = list(self._route_cache.get_routes(name))
-        clients: List[object] = []
-        try:
-            for item in routes_snapshot:
-                control_addr = str(getattr(item, "control_addr", "") or "").strip()
-                if not control_addr:
-                    continue
-                clients.append(client_mod.NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
-            prepared_payload = (
-                client_mod._prepare_remote_call_payload(
-                    clients,
+        remaining_routes = list(self._route_cache.get_routes(name))
+
+        def _prepare_payload_for_route(selected_route: object) -> Dict[str, object]:
+            control_addr = str(getattr(selected_route, "control_addr", "") or "").strip()
+            if not control_addr:
+                return dict(payload or {})
+            route_client = client_mod.NodeControlClient(control_addr, timeout_sec=self.timeout_sec)
+            try:
+                prepare_kwargs = {
+                    "object_threshold_bytes": client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+                }
+                if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
+                    prepare_kwargs["serialization_mode"] = serialization_mode
+                return client_mod._prepare_remote_call_payload(
+                    [route_client],
                     payload or {},
-                    object_threshold_bytes=client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+                    **prepare_kwargs,
                 )
-                if clients
-                else (payload or {})
-            )
-        finally:
-            for client in clients:
+            finally:
                 with contextlib.suppress(Exception):
-                    client.close()
+                    route_client.close()
+
         try:
+            prepared_payload = _prepare_payload_for_route(route)
+        except Exception as exc:
+            self._route_cache.mark_failure(route, str(exc))
+            retry_candidates = [
+                item
+                for item in remaining_routes
+                if str(getattr(item, "service_id", "") or "") not in tried
+            ]
+            if not should_failover(STAGING_FAILED, has_alternative_candidate=bool(retry_candidates)):
+                raise RuntimeError(str(exc)) from exc
+            self._route_cache.refresh(name, force=True)
+            retry_route = self._route_cache.select_route(name, exclude_service_ids=tried, strategy=strategy)
+            tried.add(retry_route.service_id)
+            retry_payload = _prepare_payload_for_route(retry_route)
             resp = client_mod._call_route_http(
-                route,
+                retry_route,
                 method=method_name,
-                payload=prepared_payload,
+                payload=retry_payload,
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=token,
             )
+            self._route_cache.mark_success(retry_route)
+            return self._attach_controlplane_locator(resp, route=retry_route)
+        try:
+            call_kwargs = {
+                "method": method_name,
+                "payload": prepared_payload,
+                "timeout_sec": max(0.1, float(timeout_sec)),
+                "service_token": token,
+            }
+            if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
+                call_kwargs["serialization_mode"] = serialization_mode
+            resp = client_mod._call_route_http(route, **call_kwargs)
             self._route_cache.mark_success(route)
             return self._attach_controlplane_locator(resp, route=route)
         except client_mod.DiscoveryCallError as exc:
-            if not client_mod._is_route_failure(exc):
+            failure_kind = classify_service_error(exc, route_failure=client_mod._is_route_failure(exc))
+            if not should_failover(
+                failure_kind,
+                has_alternative_candidate=bool(
+                    [
+                        item
+                        for item in remaining_routes
+                        if str(getattr(item, "service_id", "") or "") not in tried
+                    ]
+                ),
+            ):
                 raise RuntimeError(str(exc)) from exc
             self._route_cache.mark_failure(route, str(exc))
             self._route_cache.refresh(name, force=True)
             retry_route = self._route_cache.select_route(name, exclude_service_ids=tried, strategy=strategy)
             try:
-                resp = client_mod._call_route_http(
-                    retry_route,
-                    method=method_name,
-                    payload=prepared_payload,
-                    timeout_sec=max(0.1, float(timeout_sec)),
-                    service_token=token,
-                )
+                retry_payload = _prepare_payload_for_route(retry_route)
+                retry_kwargs = {
+                    "method": method_name,
+                    "payload": retry_payload,
+                    "timeout_sec": max(0.1, float(timeout_sec)),
+                    "service_token": token,
+                }
+                if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
+                    retry_kwargs["serialization_mode"] = serialization_mode
+                resp = client_mod._call_route_http(retry_route, **retry_kwargs)
                 self._route_cache.mark_success(retry_route)
                 return self._attach_controlplane_locator(resp, route=retry_route)
             except client_mod.DiscoveryCallError as retry_exc:

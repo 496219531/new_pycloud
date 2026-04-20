@@ -148,6 +148,30 @@ result = await group.call("square", x=7)
 result = group.call_sync("square", x=7)
 ```
 
+### 3.4.1 默认选路口径
+
+`Service` 当前默认已经统一到同一套 scheduler 主心智：
+
+1. owner `Service`
+2. `Service.connect(..., transport="discovery")`
+3. `Service.connect(..., transport="gateway")`
+
+默认都按 `predicted_busy / service_default` 这套口径选路。
+
+如果你想显式切到更偏延迟优先的策略，可以传：
+
+```python
+result = group.call_sync("square", x=7, strategy="service_latency_first")
+```
+
+兼容别名仍然支持：
+
+1. `predicted_busy`
+2. `service_default`
+3. `service_latency_first`
+4. `least_inflight`
+5. `round_robin`
+
 ### 3.5 轻量批量 RPC
 
 connected `Service` 现在支持轻量批量 RPC 辅助能力：
