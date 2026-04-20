@@ -1311,8 +1311,9 @@ def test_job_queue_client_submit_job_uses_unified_outbound_policy(monkeypatch) -
         lambda **kwargs: [_FakeUploadClient()],
     )
 
-    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy):
+    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy, managed_global_policy=None):
         del put_data, estimate_inline_size
+        del managed_global_policy
         captured["payload"] = dict(payload or {})
         captured["mode"] = policy.mode
         captured["managed_global_field_names"] = policy.managed_global_field_names
@@ -1417,12 +1418,13 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
         captured["limit"] = limit
         return [route]
 
-    def _fake_call_route_http(route_arg, *, method, payload, timeout_sec, service_token):
+    def _fake_call_route_http(route_arg, *, method, payload, timeout_sec, service_token, effective_policy=None):
         captured["route"] = route_arg
         captured["method"] = method
         captured["payload"] = dict(payload or {})
         captured["timeout_sec"] = timeout_sec
         captured["service_token"] = service_token
+        captured["effective_policy"] = effective_policy
         return {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}
 
     monkeypatch.setattr(

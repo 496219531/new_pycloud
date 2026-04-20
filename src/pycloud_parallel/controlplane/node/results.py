@@ -22,6 +22,7 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref, maybe_data_ref, resolve_data_ref_materialize_as
 from pycloud_parallel.controlplane.data_store import DataStore
+from pycloud_parallel.controlplane.effective_policy import should_use_transport_payload_bytes
 from pycloud_parallel.controlplane.node.filesystem import (
     _materialized_objects_dir,
     _segment_relpath,
@@ -37,7 +38,6 @@ from pycloud_parallel.controlplane.node.object_meta import (
 )
 from pycloud_parallel.controlplane.serialization import (
     encode_transport_payload_bytes,
-    prefers_transport_payload_bytes,
     convert_dict_to_arrow,
     dataframe_bundle_parquet_frame,
     deserialize_by_mode,
@@ -554,7 +554,13 @@ def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifac
         raise
 
 
-def _normalize_result_value(ret: Any, *, object_dir: str, serialization_mode: str = "") -> Any:
+def _normalize_result_value(
+    ret: Any,
+    *,
+    object_dir: str,
+    serialization_mode: str = "",
+    use_transport_result: Optional[bool] = None,
+) -> Any:
     data_store = _data_store_for_object_dir(object_dir)
 
     def _try_inline_result(value: Any) -> bool:
@@ -562,7 +568,11 @@ def _normalize_result_value(ret: Any, *, object_dir: str, serialization_mode: st
         # DataRef-backed artifact. It must not pre-wrap the result in a transport
         # envelope; the outer response builder owns the single transport encode.
         try:
-            if prefers_transport_payload_bytes(serialization_mode):
+            if (
+                should_use_transport_payload_bytes(mode=serialization_mode)
+                if use_transport_result is None
+                else bool(use_transport_result)
+            ):
                 transport = encode_transport_payload_bytes(
                     value,
                     mode=serialization_mode,
@@ -616,7 +626,10 @@ def _normalize_result_value(ret: Any, *, object_dir: str, serialization_mode: st
 
     if _try_inline_result(ret):
         return ret
-        raise LargeResultError("task result exceeds inline limit and must be returned as Path/DataFrame/Series/ndarray for DataRef storage")
+    raise LargeResultError(
+        "task result exceeds inline limit and must be returned as "
+        "Path/DataFrame/Series/ndarray for DataRef storage"
+    )
 
 
 def _normalize_user_return(
@@ -624,6 +637,7 @@ def _normalize_user_return(
     *,
     object_dir: str,
     serialization_mode: str = "",
+    use_transport_result: Optional[bool] = None,
 ) -> Tuple[str, Optional[Any], str, str]:
     def _normalize_status(v: Any) -> str:
         s = str(v or "SUCCEEDED").strip().upper()
@@ -636,7 +650,12 @@ def _normalize_user_return(
     if isinstance(ret, tuple) and len(ret) == 4:
         status_text, result, err_type, err_message = ret
         result = (
-            _normalize_result_value(result, object_dir=object_dir, serialization_mode=serialization_mode)
+            _normalize_result_value(
+                result,
+                object_dir=object_dir,
+                serialization_mode=serialization_mode,
+                use_transport_result=use_transport_result,
+            )
             if result is not None
             else None
         )
@@ -648,13 +667,28 @@ def _normalize_user_return(
         err_type = str(ret.get("error_type", ""))
         err_message = str(ret.get("error_message", ""))
         result = (
-            _normalize_result_value(result, object_dir=object_dir, serialization_mode=serialization_mode)
+            _normalize_result_value(
+                result,
+                object_dir=object_dir,
+                serialization_mode=serialization_mode,
+                use_transport_result=use_transport_result,
+            )
             if result is not None
             else None
         )
         return status_text, result, err_type, err_message
 
-    return "SUCCEEDED", _normalize_result_value(ret, object_dir=object_dir, serialization_mode=serialization_mode), "", ""
+    return (
+        "SUCCEEDED",
+        _normalize_result_value(
+            ret,
+            object_dir=object_dir,
+            serialization_mode=serialization_mode,
+            use_transport_result=use_transport_result,
+        ),
+        "",
+        "",
+    )
 
 
 def _data_store_for_object_dir(

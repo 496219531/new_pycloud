@@ -10,6 +10,7 @@ from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
 from pycloud_parallel.controlplane.infocenter.models import (
     DataRegistryEntry,
     NodeMetricsState,
+    NodeCapability,
     NodeServiceState,
     NodeState,
     NodeTaskPoolInfo,
@@ -124,6 +125,7 @@ class InfoCenterState:
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
         python_version: str = "",
+        capability: Optional[NodeCapability] = None,
     ) -> NodeState:
         now = utc_now()
         normalized_instance_id = str(node_instance_id or node_id or "").strip()
@@ -165,6 +167,8 @@ class InfoCenterState:
             state.service_worker_used = max(0, min(int(service_worker_used or 0), state.service_worker_capacity or int(service_worker_used or 0)))
             state.task_pool_worker_capacity = max(0, int(task_pool_worker_capacity or 0))
             state.task_pool_worker_used = max(0, min(int(task_pool_worker_used or 0), state.task_pool_worker_capacity or int(task_pool_worker_used or 0)))
+            if capability is not None:
+                state.capability = capability
             if state.metrics.credit == 0:
                 state.metrics.credit = state.queue_capacity
             return state
@@ -318,6 +322,16 @@ class InfoCenterState:
             task_pool_worker_capacity=int(metadata.get("task_pool_worker_capacity", "0") or 0),
             task_pool_worker_used=int(metadata.get("task_pool_worker_used", "0") or 0),
             python_version=metadata.get("python_version", ""),
+            capability=NodeCapability.from_dict(getattr(request, "capability", None) and {
+                "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
+                "supports_transport_payload_bytes": bool(getattr(request.capability, "supports_transport_payload_bytes", False)),
+                "supports_http_bytes_transport": bool(getattr(request.capability, "supports_http_bytes_transport", False)),
+                "max_grpc_send_bytes": int(getattr(request.capability, "max_grpc_send_bytes", 0) or 0),
+                "max_grpc_recv_bytes": int(getattr(request.capability, "max_grpc_recv_bytes", 0) or 0),
+                "max_http_body_bytes": int(getattr(request.capability, "max_http_body_bytes", 0) or 0),
+                "max_upload_file_bytes": int(getattr(request.capability, "max_upload_file_bytes", 0) or 0),
+                "max_upload_total_bytes": int(getattr(request.capability, "max_upload_total_bytes", 0) or 0),
+            }),
         )
 
     def heartbeat_record(
@@ -336,6 +350,7 @@ class InfoCenterState:
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
         python_version: str = "",
+        capability: Optional[NodeCapability] = None,
     ) -> Optional[NodeState]:
         now = utc_now()
         normalized_instance_id = str(node_instance_id or node_id or "").strip()
@@ -377,6 +392,8 @@ class InfoCenterState:
                     state.task_pool_worker_capacity or int(task_pool_worker_used or 0),
                 ),
             )
+            if capability is not None:
+                state.capability = capability
             return state
 
     def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
@@ -393,6 +410,16 @@ class InfoCenterState:
                 mem_percent=float(request.metrics.mem_percent),
             ),
             services=self._parse_services(request.services),
+            capability=NodeCapability.from_dict(getattr(request, "capability", None) and {
+                "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
+                "supports_transport_payload_bytes": bool(getattr(request.capability, "supports_transport_payload_bytes", False)),
+                "supports_http_bytes_transport": bool(getattr(request.capability, "supports_http_bytes_transport", False)),
+                "max_grpc_send_bytes": int(getattr(request.capability, "max_grpc_send_bytes", 0) or 0),
+                "max_grpc_recv_bytes": int(getattr(request.capability, "max_grpc_recv_bytes", 0) or 0),
+                "max_http_body_bytes": int(getattr(request.capability, "max_http_body_bytes", 0) or 0),
+                "max_upload_file_bytes": int(getattr(request.capability, "max_upload_file_bytes", 0) or 0),
+                "max_upload_total_bytes": int(getattr(request.capability, "max_upload_total_bytes", 0) or 0),
+            }),
         )
 
     def _parse_services(self, reports: Iterable[pb2.ServiceRouteReport]) -> Dict[str, NodeServiceState]:
@@ -458,6 +485,7 @@ class InfoCenterState:
                 schedulable=state.schedulable,
                 drain=state.drain,
                 reason=state.reason,
+                capability=NodeCapability.from_dict(state.capability.to_dict()),
             )
 
     def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> List[Dict[str, object]]:
@@ -513,6 +541,7 @@ class InfoCenterState:
                             "predicted_busy": predicted_busy,
                             "lease_expire_at": effective_lease_expire_at,
                             "http_base_url": svc.http_base_url,
+                            "capability": state.capability.to_dict(),
                         }
                     )
             out.sort(
@@ -564,6 +593,7 @@ class InfoCenterState:
                         schedulable=state.schedulable,
                         drain=state.drain,
                         reason=state.reason,
+                        capability=NodeCapability.from_dict(state.capability.to_dict()),
                     )
                 )
             out.sort(key=lambda n: (not n.healthy, not n.schedulable, n.drain, -(n.service_worker_available())))
@@ -610,4 +640,5 @@ class InfoCenterState:
                 schedulable=state.schedulable,
                 drain=state.drain,
                 reason=state.reason,
+                capability=NodeCapability.from_dict(state.capability.to_dict()),
             )

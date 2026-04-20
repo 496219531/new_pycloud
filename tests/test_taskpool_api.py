@@ -10,8 +10,9 @@ def test_prepare_task_payload_for_submit_uses_task_submit_policy(monkeypatch) ->
 
     captured = {}
 
-    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy):
+    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy, managed_global_policy=None):
         del put_data, estimate_inline_size
+        del managed_global_policy
         captured["payload"] = dict(payload or {})
         captured["mode"] = policy.mode
         captured["consume_on_read"] = policy.consume_on_read

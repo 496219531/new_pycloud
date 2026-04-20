@@ -702,8 +702,9 @@ def test_discovery_service_client_call_uses_http_payload_policy(monkeypatch):
         def close(self) -> None:
             return None
 
-    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy):
+    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy, managed_global_policy=None):
         del put_data, estimate_inline_size
+        del managed_global_policy
         captured["mode"] = policy.mode
         captured["preserve_args_kwargs_container"] = policy.preserve_args_kwargs_container
         return dict(payload or {})
@@ -712,7 +713,7 @@ def test_discovery_service_client_call_uses_http_payload_policy(monkeypatch):
     monkeypatch.setattr("pycloud_parallel.controlplane.remote_payload.prepare_outbound_payload", _fake_prepare)
     monkeypatch.setattr(
         "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
-        lambda route, *, method, payload, timeout_sec, service_token: {"ok": True, "data": payload},
+        lambda route, *, method, payload, timeout_sec, service_token, effective_policy=None: {"ok": True, "data": payload},
     )
 
     client = DiscoveryServiceClient("127.0.0.1:50051", timeout_sec=8.0)

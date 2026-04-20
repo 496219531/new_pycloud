@@ -18,13 +18,14 @@ from pycloud_parallel.controlplane.serialization import serialize_arrow_compatib
 def test_service_http_gateway_roundtrips_pickle_bytes_transport():
     captured = {}
 
-    def _invoke(service_id, method, payload, token, timeout_sec, serialization_mode):
+    def _invoke(service_id, method, payload, token, timeout_sec, serialization_mode, use_transport_result):
         captured["service_id"] = service_id
         captured["method"] = method
         captured["payload"] = dict(payload)
         captured["token"] = token
         captured["timeout_sec"] = timeout_sec
         captured["serialization_mode"] = serialization_mode
+        captured["use_transport_result"] = use_transport_result
         return 200, {"ok": True, "data": {"value": int(payload["value"]) + 1}}
 
     gateway = ServiceHttpGateway(
@@ -50,14 +51,15 @@ def test_service_http_gateway_roundtrips_pickle_bytes_transport():
             decoded = _decode_http_response_with_headers(raw, headers=resp.headers)
         assert captured["payload"] == {"value": 4}
         assert captured["serialization_mode"] == "pickle_stable_v1"
+        assert captured["use_transport_result"] is True
         assert decoded["data"] == {"value": 5}
     finally:
         gateway.stop()
 
 
 def test_service_http_gateway_keeps_json_transport_compatible():
-    def _invoke(service_id, method, payload, token, timeout_sec, serialization_mode):
-        del service_id, method, token, timeout_sec, serialization_mode
+    def _invoke(service_id, method, payload, token, timeout_sec, serialization_mode, use_transport_result):
+        del service_id, method, token, timeout_sec, serialization_mode, use_transport_result
         return 200, {"ok": True, "data": {"value": int(payload["value"]) * 2}}
 
     gateway = ServiceHttpGateway(

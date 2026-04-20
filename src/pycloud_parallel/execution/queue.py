@@ -16,7 +16,9 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane import client_transport as _client_transport
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
+from pycloud_parallel.controlplane.policy_profile import get_policy_profile
 from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.execution.support import (
@@ -70,13 +72,19 @@ class _JobOrchestratorDiscoveryClient:
         timeout_sec: float = 10.0,
         service_token: str = "",
         serialization_mode: str = "",
+        policy_id: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> None:
         self.target = str(target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_token = str(service_token or "").strip()
-        self.serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="jobqueue_session",
+        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
+        self._requested_serialization_mode = str(serialization_mode or "").strip()
+        self.effective_policy = effective_policy
+        self.serialization_mode = (
+            str(effective_policy.resolved_mode or "").strip()
+            if effective_policy is not None
+            else str(serialization_mode or "").strip()
         )
 
     def close(self) -> None:
@@ -102,6 +110,38 @@ class _JobOrchestratorDiscoveryClient:
         candidates.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
         return candidates
 
+    def _resolve_effective_policy_for_routes(
+        self,
+        routes: Sequence[object],
+        *,
+        requested_mode: str = "",
+    ) -> EffectivePolicy:
+        route_effective_policy = resolve_effective_policy(
+            get_policy_profile(self.policy_id),
+            list(routes),
+            requested_mode=str(requested_mode or "").strip() or self._requested_serialization_mode,
+            context="jobqueue_session",
+        )
+        self.effective_policy = route_effective_policy
+        self.serialization_mode = route_effective_policy.resolved_mode
+        return route_effective_policy
+
+    def resolve_effective_policy_for_service(
+        self,
+        *,
+        service_name: str,
+        requested_mode: str = "",
+    ) -> EffectivePolicy:
+        routes = self._list_routes(service_name=service_name)
+        if not routes:
+            raise RuntimeError(
+                f"JobQueue could not find a running job-orchestrator route for service_name={service_name!r}"
+            )
+        return self._resolve_effective_policy_for_routes(
+            routes,
+            requested_mode=requested_mode,
+        )
+
     def call(
         self,
         *,
@@ -111,6 +151,7 @@ class _JobOrchestratorDiscoveryClient:
         timeout_sec: float = 60.0,
         service_token: Optional[str] = None,
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> Dict[str, object]:
         name = str(service_name or "").strip()
         method_name = str(method or "").strip()
@@ -119,11 +160,6 @@ class _JobOrchestratorDiscoveryClient:
         if not method_name:
             raise ValueError("JobQueue route lookup requires method")
 
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            session_mode=self.serialization_mode,
-            context="jobqueue_session",
-        )
         token = self.service_token if service_token is None else str(service_token or "").strip()
         tried: Set[str] = set()
         routes = self._list_routes(service_name=name)
@@ -131,6 +167,16 @@ class _JobOrchestratorDiscoveryClient:
             raise RuntimeError(
                 f"JobQueue could not find a running job-orchestrator route for service_name={name!r}"
             )
+        route_effective_policy = self._resolve_effective_policy_for_routes(
+            routes,
+            requested_mode=serialization_mode,
+        )
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="jobqueue_session",
+            frozen_mode=route_effective_policy.resolved_mode,
+            allowed_modes=route_effective_policy.allowed_modes,
+        )
 
         last_exc: Optional[Exception] = None
         for route in routes:
@@ -149,6 +195,7 @@ class _JobOrchestratorDiscoveryClient:
                     and effective_serialization_mode != "legacy_v1"
                 ):
                     call_kwargs["serialization_mode"] = effective_serialization_mode
+                call_kwargs["effective_policy"] = route_effective_policy
                 return _call_route_http(
                     route,
                     **call_kwargs,
@@ -178,16 +225,34 @@ class QueueServiceClient:
         timeout_sec: float = 10.0,
         service_name: str = "job-orchestrator",
         serialization_mode: str = "",
+        policy_id: str = "",
     ) -> None:
         self.target = str(target or "").strip()
         self.client_id = str(client_id or "").strip()
         self._client_scope = self.client_id
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
-        self.serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
+        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
+        self._requested_serialization_mode = str(serialization_mode or "").strip()
+        candidate_routes = []
+        try:
+            with _infocenter_client(self.target, timeout_sec=self.timeout_sec) as infocenter:
+                candidate_routes = list(
+                    infocenter.list_service_routes(
+                        service_name=self.service_name,
+                        healthy_only=True,
+                        limit=32,
+                    )
+                )
+        except Exception:
+            candidate_routes = []
+        self.effective_policy = resolve_effective_policy(
+            get_policy_profile(self.policy_id),
+            candidate_routes,
+            requested_mode=self._requested_serialization_mode,
             context="jobqueue_session",
         )
+        self.serialization_mode = self.effective_policy.resolved_mode
         self._auth_ttl_sec = _default_job_auth_ttl_sec()
         self._recent_job_ids: List[str] = []
 
@@ -216,12 +281,39 @@ class QueueServiceClient:
             self.target,
             timeout_sec=self.timeout_sec,
             service_token=self.auth_token,
-            serialization_mode=self.serialization_mode,
+            serialization_mode=self._requested_serialization_mode,
+            policy_id=self.policy_id,
+            effective_policy=self.effective_policy,
         )
         self._persist_local_session()
 
+    def _refresh_effective_policy(self) -> EffectivePolicy:
+        effective_policy = self._service_client.resolve_effective_policy_for_service(
+            service_name=self.service_name,
+            requested_mode=self._requested_serialization_mode,
+        )
+        self.effective_policy = effective_policy
+        self.serialization_mode = effective_policy.resolved_mode
+        return effective_policy
+
     def close(self) -> None:
         self._service_client.close()
+
+    def _call_service_client(
+        self,
+        *,
+        effective_policy: EffectivePolicy,
+        **call_kwargs,
+    ) -> Dict[str, object]:
+        try:
+            return self._service_client.call(
+                effective_policy=effective_policy,
+                **call_kwargs,
+            )
+        except TypeError as exc:
+            if "effective_policy" not in str(exc):
+                raise
+            return self._service_client.call(**call_kwargs)
 
     def _persist_local_session(self) -> None:
         try:
@@ -259,6 +351,7 @@ class QueueServiceClient:
         )
 
     def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        effective_policy = self._refresh_effective_policy()
         prepared_payload = _stage_job_submit_payload_for_transport(
             target=self.target,
             payload=dict(payload or {}),
@@ -272,6 +365,7 @@ class QueueServiceClient:
             payload=prepared_payload,
             timeout_sec=self.timeout_sec,
             serialization_mode=self.serialization_mode,
+            effective_policy=effective_policy,
         )
         call_kwargs = {
             "service_name": self.service_name,
@@ -281,7 +375,8 @@ class QueueServiceClient:
         }
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             call_kwargs["serialization_mode"] = self.serialization_mode
-        resp = self._service_client.call(
+        resp = self._call_service_client(
+            effective_policy=effective_policy,
             **call_kwargs,
         )
         resp = _decode_job_response_payload(resp)
@@ -450,6 +545,7 @@ class QueueServiceClient:
         normalized = str(job_id or "").strip()
         if not normalized:
             raise ValueError("JobQueue.get_job_status() requires job_id")
+        effective_policy = self._refresh_effective_policy()
         call_kwargs = {
             "service_name": self.service_name,
             "method": "get_job_status",
@@ -458,12 +554,18 @@ class QueueServiceClient:
         }
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             call_kwargs["serialization_mode"] = self.serialization_mode
-        return _decode_job_response_payload(self._service_client.call(**call_kwargs))
+        return _decode_job_response_payload(
+            self._call_service_client(
+                effective_policy=effective_policy,
+                **call_kwargs,
+            )
+        )
 
     def cancel_job(self, job_id: str) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
             raise ValueError("JobQueue.cancel_job() requires job_id")
+        effective_policy = self._refresh_effective_policy()
         call_kwargs = {
             "service_name": self.service_name,
             "method": "cancel_job",
@@ -472,7 +574,12 @@ class QueueServiceClient:
         }
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             call_kwargs["serialization_mode"] = self.serialization_mode
-        return _decode_job_response_payload(self._service_client.call(**call_kwargs))
+        return _decode_job_response_payload(
+            self._call_service_client(
+                effective_policy=effective_policy,
+                **call_kwargs,
+            )
+        )
 
     def submit_job_from_bytes(
         self,

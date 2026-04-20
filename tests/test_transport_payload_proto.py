@@ -9,6 +9,7 @@ from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import (
     dict_to_struct,
     encode_transport_payload_bytes,
+    serialize_inline_payload,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.execution.task_pool import _NativePoolResultAdapter, TaskPool
@@ -138,6 +139,7 @@ def test_task_pool_pickle_submit_uses_transport_payload():
         nodes={},
         task_method="run",
         serialization_mode="pickle_stable_v1",
+        policy_id="pickle_internal_heavy",
     )
     try:
         captured = {}
@@ -184,3 +186,58 @@ def test_task_result_pickle_uses_transport_result_and_adapter_reads_it():
 
     restored = _NativePoolResultAdapter(serialization_mode="pickle_stable_v1").fetch_result_data(task_result)
     assert np.array_equal(restored["array"], np.array([1, 2, 3], dtype=np.int64))
+
+
+def test_service_pickle_struct_request_keeps_struct_response_lane():
+    captured = {}
+
+    class _State:
+        def call_service(self, **kwargs):
+            captured.update(kwargs)
+            return 200, {"ok": True, "data": {"value": 7}}
+
+    service = NodeControlService(_State())
+    context = _FakeContext()
+    _serialized, payload_struct, _size = serialize_inline_payload(
+        {"value": 1},
+        context="service call payload",
+        mode="pickle_stable_v1",
+    )
+    request = pb2.CallServiceRequest(
+        service_id="svc-1",
+        method="run",
+        payload=payload_struct,
+    )
+
+    response = service.CallService(request, context)
+    client = NodeControlClient.__new__(NodeControlClient)
+
+    assert context.code is None
+    assert captured["serialization_mode"] == "pickle_stable_v1"
+    assert response.ok is True
+    assert not response.HasField("transport_data")
+    assert client.fetch_service_result_data(response) == {"value": 7}
+
+
+def test_task_result_can_follow_struct_lane_even_for_pickle_mode():
+    state = TaskState(
+        task_id="task-struct-1",
+        client_id="client-1",
+        job_id="job-1",
+        code_version="cv",
+        runtime_key="rk",
+        execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+        payload={},
+        timeout_hint_sec=0,
+        priority=1,
+        status=pb2.TASK_STATUS_SUCCEEDED,
+        result={"value": 7},
+        serialization_mode="pickle_stable_v1",
+        use_transport_result=False,
+    )
+
+    task_result = state.as_result()
+    restored = _NativePoolResultAdapter(serialization_mode="pickle_stable_v1").fetch_result_data(task_result)
+
+    assert not task_result.HasField("transport_result")
+    assert restored == {"value": 7}

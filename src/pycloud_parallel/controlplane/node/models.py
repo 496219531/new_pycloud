@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, ClassVar, Dict, Optional, Tuple
 
 from pycloud_parallel.controlplane.data_store import StoredDataArtifact
+from pycloud_parallel.controlplane.effective_policy import should_use_transport_payload_bytes
 from pycloud_parallel.controlplane.session_model import (
     ExecutionReplicaSnapshot,
     SessionBinding,
@@ -19,7 +20,6 @@ from pycloud_parallel.controlplane.serialization import (
     TRANSPORT_ENVELOPE_SENTINEL,
     dict_to_struct,
     encode_transport_payload_bytes,
-    prefers_transport_payload_bytes,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -90,6 +90,7 @@ class TaskState:
     error_message: str = ""
     dispatch_build_execute_spec_ms: float = 0.0
     serialization_mode: str = ""
+    use_transport_result: Optional[bool] = None
 
     def as_result(self) -> pb2.TaskResult:
         result_kwargs = {
@@ -101,7 +102,12 @@ class TaskState:
             "finished_at": dt_to_ts(self.finished_at or utc_now()),
             "error": pb2.TaskError(type=self.error_type, message=self.error_message),
         }
-        if prefers_transport_payload_bytes(self.serialization_mode):
+        use_transport_result = (
+            should_use_transport_payload_bytes(mode=self.serialization_mode)
+            if self.use_transport_result is None
+            else bool(self.use_transport_result)
+        )
+        if use_transport_result:
             # Bytes transport must see the raw high-level result object exactly
             # once. Receiving an already transport-wrapped payload here would
             # double-encode the result and leak internal envelopes to clients.

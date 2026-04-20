@@ -1,0 +1,30 @@
+from __future__ import annotations
+
+import pytest
+
+from pycloud_parallel.controlplane.policy_profile import PolicyProfile, builtin_policy_profiles, get_policy_profile
+
+
+def test_builtin_policy_profiles_expose_expected_defaults():
+    profiles = builtin_policy_profiles()
+
+    assert {"default_safe", "trusted_internal", "pickle_internal_heavy"}.issubset(profiles)
+    assert get_policy_profile().policy_id == "default_safe"
+    assert get_policy_profile("trusted_internal").default_mode == "structured_v1"
+
+
+def test_policy_profile_normalizes_and_rejects_invalid_default_mode():
+    with pytest.raises(ValueError, match="default_mode"):
+        PolicyProfile(
+            policy_id="bad",
+            version=1,
+            allowed_modes=("legacy_v1",),
+            default_mode="structured_v1",
+            inline_payload_soft_limit_bytes=1,
+            inline_payload_hard_limit_bytes=2,
+            inline_result_hard_limit_bytes=3,
+            prefer_transport_payload_bytes=False,
+            allow_pickle_stable=False,
+            force_dataref_above_soft_limit=True,
+        )
+

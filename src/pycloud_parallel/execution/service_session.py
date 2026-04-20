@@ -30,6 +30,7 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import (
     InfoCenterNode,
     InfoCenterServiceRoute,
@@ -39,6 +40,7 @@ from pycloud_parallel.controlplane.infocenter_client import (
     _node_instance_key_from_route,
     _route_sort_key,
 )
+from pycloud_parallel.controlplane.policy_profile import get_policy_profile
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
@@ -260,6 +262,21 @@ def _ready_retry_timeout(timeout_sec: float, *, grace_sec: float) -> float:
     if effective_grace <= 0.0:
         return 0.0
     return min(effective_timeout, effective_grace)
+
+
+def _service_effective_policy_for_nodes(
+    nodes: Sequence[InfoCenterNode | InfoCenterServiceRoute],
+    *,
+    policy_id: str = "",
+    requested_mode: str = "",
+    context: str = "",
+) -> EffectivePolicy:
+    return resolve_effective_policy(
+        get_policy_profile(policy_id),
+        list(nodes),
+        requested_mode=requested_mode,
+        context=context,
+    )
 
 
 def _retry_ready_state(
@@ -508,16 +525,14 @@ class _ConnectedService:
         transport: str,
         timeout_sec: float,
         serialization_mode: str = "",
+        policy_id: str = "",
         validate_on_init: bool = True,
     ) -> None:
         self._transport_client = transport_client
         self.service_name = str(service_name or "").strip()
         self.transport = str(transport or "").strip().lower() or "discovery"
         self.timeout_sec = max(0.1, float(timeout_sec))
-        self.serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="gateway_public" if self.transport == "gateway" else "service_connect",
-        )
+        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
         self.target = str(
             getattr(transport_client, "target", "") or getattr(transport_client, "infocenter_target", "") or ""
         ).strip()
@@ -537,6 +552,21 @@ class _ConnectedService:
             raise ValueError("Service.connect() requires service_name")
         if validate_on_init:
             self._validate_service_ready()
+        capabilities = []
+        try:
+            if hasattr(self._transport_client, "list_routes"):
+                capabilities = list(self._transport_client.list_routes(service_name=self.service_name))
+            elif isinstance(self._last_status, dict):
+                capabilities = list(self._last_status.get("routes", []) or [])
+        except Exception:
+            capabilities = []
+        self.effective_policy = _service_effective_policy_for_nodes(
+            capabilities,
+            policy_id=self.policy_id,
+            requested_mode=serialization_mode,
+            context="gateway_public" if self.transport == "gateway" else "service_connect",
+        )
+        self.serialization_mode = self.effective_policy.resolved_mode
 
     def close(self) -> None:
         close = getattr(self._transport_client, "close", None)
@@ -739,6 +769,7 @@ class _ConnectedService:
             return prepare_remote_call_payload(
                 [route_client],
                 payload,
+                effective_policy=self.effective_policy,
                 **prepare_kwargs,
             )
 
@@ -827,8 +858,8 @@ class _ConnectedService:
         del refresh_status, max_attempts
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            session_mode=self.serialization_mode,
             context="gateway_public" if self.transport == "gateway" else "service_call",
+            frozen_mode=self.serialization_mode,
         )
         if self.transport == "discovery":
             route_cache = self._route_cache
@@ -909,6 +940,7 @@ class _ConnectedService:
             payload=payload,
             timeout_sec=timeout_sec,
             serialization_mode=effective_serialization_mode,
+            effective_policy=self.effective_policy,
         )
         return self.transport, response
 
@@ -1182,6 +1214,8 @@ class Service(ServiceExecutionSession):
     _discovered_methods: Optional[List[str]] = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     serialization_mode: str = ""
+    policy_id: str = "default_safe"
+    effective_policy: Optional[EffectivePolicy] = field(default=None, repr=False)
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
         return self.sessions
@@ -1215,6 +1249,7 @@ class Service(ServiceExecutionSession):
         service_token: str = "",
         transport: str = "discovery",
         serialization_mode: str = "",
+        policy_id: str = "",
         validate_on_init: bool = False,
     ):
         """Product-facing connect action for an already deployed service."""
@@ -1232,6 +1267,7 @@ class Service(ServiceExecutionSession):
                 transport=normalized_transport,
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
+                policy_id=policy_id,
                 validate_on_init=validate_on_init,
             )
         if normalized_transport == "discovery":
@@ -1247,6 +1283,7 @@ class Service(ServiceExecutionSession):
                 transport=normalized_transport,
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
+                policy_id=policy_id,
                 validate_on_init=validate_on_init,
             )
         raise ValueError(
@@ -1297,6 +1334,7 @@ class Service(ServiceExecutionSession):
         breaker_failure_threshold: int = 3,
         breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
+        policy_id: str = "",
     ) -> "Service":
         """Low-level entry; prefer ``Service.deploy(...)``.
 
@@ -1374,10 +1412,7 @@ class Service(ServiceExecutionSession):
         export_methods = list(prepared_artifact.export_methods)
         dependency_allowlist = list(prepared_artifact.dependency_allowlist)
         managed_global_names = list(prepared_artifact.managed_global_names)
-        normalized_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="service_owner",
-        )
+        normalized_policy_id = str(policy_id or "").strip().lower() or "default_safe"
 
         # 生成默认的 owner_client_id 和 service_name
         local_ip = _get_local_ip()
@@ -1598,6 +1633,12 @@ class Service(ServiceExecutionSession):
             raise
 
         discovered_instance_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
+        effective_policy = _service_effective_policy_for_nodes(
+            selected_nodes,
+            policy_id=normalized_policy_id,
+            requested_mode=serialization_mode,
+            context="service_owner",
+        )
 
         if ensure_unique_service_name:
             active_routes = cls._select_active_routes(existing_routes)
@@ -1671,6 +1712,7 @@ class Service(ServiceExecutionSession):
                                 breaker_max_cooldown_sec=breaker_max_cooldown_sec,
                                 session_cache_file=session_cache_file,
                                 session_cache_lock=session_cache_lock,
+                                policy_id=normalized_policy_id,
                             )
                         except RuntimeError as exc:
                             if "service is stopped" not in str(exc):
@@ -1777,7 +1819,9 @@ class Service(ServiceExecutionSession):
                 _session_cache_file=session_cache_file,
                 _session_cache_lock=session_cache_lock,
                 _artifact_code_version=effective_code_version,
-                serialization_mode=normalized_serialization_mode,
+                serialization_mode=effective_policy.resolved_mode,
+                policy_id=normalized_policy_id,
+                effective_policy=effective_policy,
             )
             group._persist_session_cache()
             group._start_keepalive()
@@ -2084,6 +2128,7 @@ class Service(ServiceExecutionSession):
         breaker_max_cooldown_sec: float,
         session_cache_file: Path,
         session_cache_lock: _ServiceSessionFileLock,
+        policy_id: str = "",
     ) -> "Service":
         cache_nodes = cache_payload.get("nodes")
         if not isinstance(cache_nodes, dict):
@@ -2182,6 +2227,7 @@ class Service(ServiceExecutionSession):
             _session_cache_file=session_cache_file,
             _session_cache_lock=session_cache_lock,
             _artifact_code_version=artifact_code_version,
+            policy_id=str(policy_id or "").strip().lower() or "default_safe",
         )
         group._persist_session_cache()
         group._start_keepalive()
@@ -2296,10 +2342,15 @@ class Service(ServiceExecutionSession):
 
     def __post_init__(self) -> None:
         self._init_execution_session_state()
-        self.serialization_mode = resolve_effective_serialization_mode(
-            request_mode=self.serialization_mode,
-            context="service_owner",
-        )
+        self.policy_id = str(self.policy_id or "").strip().lower() or "default_safe"
+        if self.effective_policy is None:
+            self.effective_policy = _service_effective_policy_for_nodes(
+                list(self.nodes.values()),
+                policy_id=self.policy_id,
+                requested_mode=self.serialization_mode,
+                context="service_owner",
+            )
+        self.serialization_mode = self.effective_policy.resolved_mode
         if self.breaker_max_cooldown_sec < self.breaker_cooldown_sec:
             self.breaker_max_cooldown_sec = self.breaker_cooldown_sec
         for node_id in self.sessions:
@@ -2419,8 +2470,8 @@ class Service(ServiceExecutionSession):
     ) -> DataRef:
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            session_mode=self.serialization_mode,
             context="object_upload",
+            frozen_mode=self.serialization_mode,
         )
         return _put_data_via_clients(
             list(self._clients.values()),
@@ -2468,6 +2519,7 @@ class Service(ServiceExecutionSession):
         prepared_values = _prepare_managed_globals_values_for_upload(
             active_clients,
             values,
+            effective_policy=self.effective_policy,
             **prepare_kwargs,
         )
         digests: Dict[str, str] = {}
@@ -2577,7 +2629,13 @@ class Service(ServiceExecutionSession):
         session = self.sessions.get(node_key)
         if session is None:
             raise KeyError(f"unknown node reference: {node_id}")
-        return session.call(method, payload, timeout_sec=timeout_sec, serialization_mode=self.serialization_mode)
+        return session.call(
+            method,
+            payload,
+            timeout_sec=timeout_sec,
+            serialization_mode=self.serialization_mode,
+            effective_policy=self.effective_policy,
+        )
 
     def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
         excluded = exclude or set()
@@ -2699,8 +2757,8 @@ class Service(ServiceExecutionSession):
             raise RuntimeError("Service session has no active replicas")
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            session_mode=self.serialization_mode,
             context="service_owner",
+            frozen_mode=self.serialization_mode,
         )
 
         tries = max(1, int(max_attempts or len(self.sessions)))
@@ -2769,8 +2827,8 @@ class Service(ServiceExecutionSession):
             raise RuntimeError("Service session has no active replicas")
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            session_mode=self.serialization_mode,
             context="service_owner",
+            frozen_mode=self.serialization_mode,
         )
 
         tries = max(1, int(max_attempts or len(self.sessions)))

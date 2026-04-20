@@ -1075,8 +1075,9 @@ def test_gateway_service_client_call_uses_http_payload_policy(monkeypatch) -> No
         lambda self, *, service_name: {"routes": [{"control_addr": "127.0.0.1:50061"}]},
     )
 
-    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy):
+    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy, managed_global_policy=None):
         del put_data, estimate_inline_size
+        del managed_global_policy
         captured["mode"] = policy.mode
         captured["preserve_args_kwargs_container"] = policy.preserve_args_kwargs_container
         return dict(payload or {})

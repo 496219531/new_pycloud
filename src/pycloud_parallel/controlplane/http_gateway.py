@@ -21,7 +21,7 @@ from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 
-InvokeHandler = Callable[[str, str, dict, str, float, str], Tuple[int, Dict[str, object]]]
+InvokeHandler = Callable[[str, str, dict, str, float, str, bool], Tuple[int, Dict[str, object]]]
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
 MethodsHandler = Callable[[str, bool], Tuple[int, Dict[str, object]]]
 ExtraGetHandler = Callable[[str, list[str], Dict[str, list[str]]], Optional[Tuple[Any, ...]]]
@@ -115,6 +115,9 @@ class ServiceHttpGateway:
                             self._send_json(400, {"ok": False, "error": str(exc)})
                             return
                         token = self._extract_token()
+                        wants_transport_response = _is_http_transport_content_type(
+                            str(self.headers.get("Content-Type", "") or "")
+                        )
                         code, resp = invoke_handler(
                             service_id,
                             method,
@@ -122,9 +125,7 @@ class ServiceHttpGateway:
                             token,
                             timeout_sec,
                             serialization_mode,
-                        )
-                        wants_transport_response = _is_http_transport_content_type(
-                            str(self.headers.get("Content-Type", "") or "")
+                            wants_transport_response,
                         )
                         if (
                             wants_transport_response

@@ -15,7 +15,13 @@ import uuid
 
 from pycloud_parallel.controlplane.artifact import _normalize_artifact_input, _prepare_artifact
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
+from pycloud_parallel.controlplane.effective_policy import (
+    EffectivePolicy,
+    resolve_effective_policy,
+    should_use_transport_payload_bytes,
+)
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode, _node_instance_key_from_node
+from pycloud_parallel.controlplane.policy_profile import get_policy_profile
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
@@ -24,7 +30,6 @@ from pycloud_parallel.controlplane.serialization import detect_transport_mode, s
 from pycloud_parallel.controlplane.serialization import (
     decode_transport_payload_bytes,
     encode_transport_payload_bytes,
-    prefers_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
 from pycloud_parallel.controlplane.task_backend import NativeTaskBackend, _TaskPoolCallProxy
@@ -110,6 +115,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_method: str,
         job_id: str = "",
         serialization_mode: str = "",
+        policy_id: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
         backend: Optional[Any] = None,
     ) -> None:
         self._pools = pools
@@ -117,10 +124,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._backend = backend
         self._task_method = str(task_method or "run").strip() or "run"
         self._job_id = str(job_id or f"pool-{uuid.uuid4().hex[:12]}").strip()
-        self._serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
+        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
+        self.effective_policy = effective_policy or resolve_effective_policy(
+            get_policy_profile(self.policy_id),
+            list(nodes.values()),
+            requested_mode=serialization_mode,
             context="taskpool_session",
         )
+        self._serialization_mode = self.effective_policy.resolved_mode
         self._closed = False
         self._submit_seq = 0
         self._submit_lock = threading.Lock()
@@ -348,6 +359,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             self._pools[node_id]._client,  # noqa: SLF001
             dict(payload or {}),
             serialization_mode=serialization_mode or self._serialization_mode,
+            effective_policy=self.effective_policy,
         )
         item_kwargs = {
             "task_id": task_id,
@@ -355,17 +367,22 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             "priority": max(1, int(priority)),
         }
         effective_mode = str(serialization_mode or self._serialization_mode or "").strip().lower() or "legacy_v1"
-        if prefers_transport_payload_bytes(effective_mode):
+        if should_use_transport_payload_bytes(
+            mode=effective_mode,
+            effective_policy=self.effective_policy,
+        ):
             item_kwargs["transport_payload"] = encode_transport_payload_bytes(
                 prepared_payload,
                 mode=effective_mode,
                 context="taskpool_session",
+                limit_bytes=self.effective_policy.inline_payload_hard_limit_bytes,
             )
         else:
             _, payload_struct, _ = serialize_inline_payload(
                 prepared_payload,
                 context="task pool payload",
                 mode=effective_mode,
+                limit_bytes=self.effective_policy.inline_payload_hard_limit_bytes,
             )
             item_kwargs["payload"] = payload_struct
         return pb2.TaskSubmitItem(**item_kwargs)
@@ -441,8 +458,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         del timeout_sec, runtime_key
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            session_mode=self._serialization_mode,
             context="taskpool_session",
+            frozen_mode=self._serialization_mode,
         )
         self._assert_session_available("submit_payloads")
         if self._closed:
@@ -904,6 +921,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         prepared_values = _prepare_managed_globals_values_for_upload(
             active_clients,
             values,
+            effective_policy=self.effective_policy,
             **prepare_kwargs,
         )
         digests: Dict[str, str] = {}
@@ -1722,8 +1740,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         active_clients = [pool._client for pool in pools_snapshot]  # noqa: SLF001
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            session_mode=self._serialization_mode,
             context="object_upload",
+            frozen_mode=self._serialization_mode,
         )
         return _put_data_via_clients(
             active_clients,
@@ -1850,6 +1868,7 @@ def _build_task_pool_from_infocenter(
     node_limit: int = 100,
     timeout_sec: float = 10.0,
     serialization_mode: str = "",
+    policy_id: str = "",
 ) -> "TaskPool":
     source_func = entry_func if entry_func is not None else func
     normalized_artifact = _normalize_artifact_input(
@@ -1900,6 +1919,12 @@ def _build_task_pool_from_infocenter(
         raise RuntimeError("no task pool nodes selected from InfoCenter")
     desired_nodes = selected_nodes[:requested_count] if requested_count > 0 else selected_nodes
     effective_pool_name = str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}").strip()
+    effective_policy = resolve_effective_policy(
+        get_policy_profile(policy_id),
+        desired_nodes,
+        requested_mode=serialization_mode,
+        context="taskpool_session",
+    )
 
     pools: Dict[str, NativeTaskPoolClient] = {}
     nodes: Dict[str, InfoCenterNode] = {}
@@ -1930,7 +1955,9 @@ def _build_task_pool_from_infocenter(
         nodes=nodes,
         task_method=entry_callable,
         job_id=job_id,
-        serialization_mode=serialization_mode,
+        serialization_mode=effective_policy.resolved_mode,
+        policy_id=policy_id,
+        effective_policy=effective_policy,
     )
     session._start_keepalive()
     return session
@@ -2024,6 +2051,7 @@ class TaskPool(_TaskPoolSessionBase):
         node_limit: int = 100,
         timeout_sec: float = 10.0,
         serialization_mode: str = "",
+        policy_id: str = "",
     ) -> "TaskPool":
         """Low-level entry; prefer ``TaskPool.open(...)``."""
         return _build_task_pool_from_infocenter(
@@ -2057,4 +2085,5 @@ class TaskPool(_TaskPoolSessionBase):
             node_limit=node_limit,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
+            policy_id=policy_id,
         )

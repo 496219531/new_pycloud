@@ -72,6 +72,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             bool(args.get("warmup_only", False)),
             str(args.get("payload_mode", "task_submit") or "task_submit"),
             str(args.get("serialization_mode", "") or "").strip().lower(),
+            args.get("use_transport_result", None),
         )
 
     def _is_recoverable_pool_error(exc: BaseException) -> bool:

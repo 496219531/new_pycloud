@@ -77,6 +77,17 @@ message NodeMetrics {
   double mem_percent = 6;
 }
 
+message NodeCapabilityInfo {
+  repeated string supported_modes = 1;
+  bool supports_transport_payload_bytes = 2;
+  bool supports_http_bytes_transport = 3;
+  int64 max_grpc_send_bytes = 4;
+  int64 max_grpc_recv_bytes = 5;
+  int64 max_http_body_bytes = 6;
+  int64 max_upload_file_bytes = 7;
+  int64 max_upload_total_bytes = 8;
+}
+
 message RegisterNodeRequest {
   string node_id = 1;
   string control_addr = 2;
@@ -87,6 +98,7 @@ message RegisterNodeRequest {
   map<string, string> metadata = 7;
   repeated ServiceRouteReport services = 8;
   string node_instance_id = 9;
+  NodeCapabilityInfo capability = 10;
 }
 
 message RegisterNodeResponse {
@@ -107,6 +119,7 @@ message HeartbeatNodeRequest {
   string reason = 5;
   repeated ServiceRouteReport services = 6;
   string node_instance_id = 7;
+  NodeCapabilityInfo capability = 8;
 }
 
 message HeartbeatNodeResponse {
@@ -135,6 +148,7 @@ message NodeInfo {
   int32 credit = 9;
   repeated string tags = 10;
   string node_instance_id = 11;
+  NodeCapabilityInfo capability = 12;
 }
 
 message ListNodesResponse {
@@ -173,6 +187,7 @@ message ServiceRouteInfo {
   google.protobuf.Timestamp lease_expire_at = 10;
   string http_base_url = 11;
   string node_instance_id = 12;
+  NodeCapabilityInfo capability = 13;
 }
 
 message ListServiceRoutesResponse {

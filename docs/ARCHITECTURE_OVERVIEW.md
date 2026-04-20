@@ -217,7 +217,124 @@
    - numpy `ndarray`（非 `dtype=object`）
    - `dtype=object` 明确报错
 
-## 9. Transport Codec Pipeline
+## 9. Policy / Capability / Effective Policy
+
+当前多节点执行面统一按三层模型收口：
+
+1. `Policy Profile`
+   - 由 controlplane/profile 中心统一定义
+   - 决定逻辑策略，而不是某台 node 的本地偏好
+2. `Node Capability`
+   - 由每个 node 启动后上报自身硬能力
+   - 只描述“我支持什么、我的硬上限是多少”
+3. `Effective Policy`
+   - 在 `Service / TaskPool / JobQueue` 会话创建时，由 controlplane 根据
+     `Policy Profile ∩ candidate node capabilities`
+     计算并冻结
+   - 同一 session 后续所有 node 都按这个冻结结果执行
+
+核心原则：
+
+1. node 不拥有 policy
+2. node 只上报 capability
+3. policy 由中心统一管理
+4. effective policy 在会话创建时冻结
+5. 执行期不允许同一 session 内 policy 漂移
+
+### 9.1 Policy Profile
+
+`Policy Profile` 当前主要定义：
+
+1. allowed modes
+2. default mode
+3. inline payload/result limits
+4. 是否 prefer bytes transport
+5. 是否允许 `pickle_stable_v1`
+6. soft limit 以上是否强制转 `DataRef`
+7. public gateway 是否允许 pickle
+
+当前内置 profile：
+
+1. `default_safe`
+2. `trusted_internal`
+3. `pickle_internal_heavy`
+
+### 9.2 Node Capability
+
+`Node Capability` 当前主要上报：
+
+1. supported serialization modes
+2. 是否支持 protobuf bytes transport
+3. 是否支持 HTTP bytes transport
+4. gRPC send/recv 最大字节数
+5. HTTP body 最大字节数
+6. upload file/total 最大字节数
+
+InfoCenter 现在会把 capability 连同 node/route 信息一起保存和返回，后续会话创建时不再靠本机 env 猜远端能力。
+
+### 9.3 Effective Policy
+
+`Effective Policy` 当前至少冻结：
+
+1. resolved mode
+2. allowed modes
+3. inline payload soft/hard limit
+4. inline result hard limit
+5. 是否启用 transport payload bytes
+6. 是否启用 HTTP bytes transport
+7. 是否允许 pickle
+
+这意味着：
+
+1. `Service.connect()` 建立后，不会因为某台 node 本地 env 改了就漂移 mode
+2. `TaskPool.open()` 建立后，同一 pool 内 task submit / managed globals / result decode 共用同一执行策略
+3. `JobQueue.connect()` 建立后，job submit 到 route call 也按同一冻结策略走
+
+这里要特别注意：
+
+1. codec 和 carrier 现在是两个层次
+2. serialization mode 决定“怎么编解码”
+3. carrier（Struct / protobuf bytes lane / HTTP bytes lane）优先由 `EffectivePolicy` 决定
+4. `prefers_transport_payload_bytes()` 这类 mode helper 只在“当前没有 effective policy”时才作为 fallback
+
+也就是说，`pickle_stable_v1` 不再天然等于“一定走 bytes lane”；
+如果 profile/capability 算出来的 effective policy 关闭了 bytes lane，运行时会继续用该 codec，但改走非 bytes carrier。
+
+`JobQueue` 还有一个额外约束：
+
+1. 初始化时允许先拿 profile/fallback policy 起步
+2. 真正发起 orchestrator route call 前，会基于当前 route snapshot 的 capability 重新 resolve effective policy
+3. 因此最终执行用的 mode/carrier 决策来自 `profile ∩ orchestrator capability`，而不是空 capability 默认值
+
+### 9.4 Payload Policy 的来源
+
+payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
+
+1. `Policy Profile` 给出逻辑目标值
+2. `Node Capability` 给出物理硬上限
+3. `Effective Policy` 给出会话实际采用值
+4. 具体 `PayloadPolicy` 再从 `Effective Policy` 派生
+
+当前已经接到的主链：
+
+1. `TaskPool` task submit
+2. `Service` service call
+3. `Gateway / Discovery` service call
+4. `JobQueue` submit call
+5. managed globals 上传准备
+
+也就是说，同一 session 下 JSON/Struct inline 和 transport bytes 都会受同一个 effective payload limit 约束；node 本地只保留硬上限拒绝权。
+
+另外，carrier 的运行时选择也已经收口到 effective policy：
+
+1. gRPC/protobuf 请求是否走 `transport_payload`
+2. HTTP/service call 是否走 bytes body
+3. `CallService` 响应是否回 `transport_data`
+4. `TaskResult` 是否回 `transport_result`
+
+这些都不再由 codec helper 单独拍板；有 effective policy 或明确请求 carrier 时，运行时优先遵守它。
+
+## 10. Transport Codec Pipeline
 
 当前 3 个 serialization mode 不再只作用于 `put_data()` 这一条对象上传路径，而是统一进入了主传输层：
 

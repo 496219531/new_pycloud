@@ -128,6 +128,7 @@ def prepare_outbound_payload(
     put_data: PutPayloadData,
     estimate_inline_size: EstimateInlineSize,
     policy: PayloadPolicy,
+    managed_global_policy: Optional[PayloadPolicy] = None,
 ) -> Dict[str, object]:
     raw_payload = dict(payload or {})
     prepared: Dict[str, object] = {}
@@ -161,7 +162,7 @@ def prepare_outbound_payload(
     if not policy.managed_global_field_names:
         return prepared
 
-    managed_global_policy = get_payload_policy("managed_globals")
+    managed_global_policy = managed_global_policy or get_payload_policy("managed_globals")
     for field_name in policy.managed_global_field_names:
         normalized = str(field_name or "").strip()
         if not normalized:

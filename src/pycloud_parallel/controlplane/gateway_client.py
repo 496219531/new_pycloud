@@ -11,6 +11,7 @@ import uuid
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlencode, urlparse
 
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
     _call_route_http,
     _decode_http_response_body,
@@ -68,6 +69,7 @@ class GatewayServiceClient:
         timeout_sec: float = 60.0,
         service_token: Optional[str] = None,
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> Dict[str, object]:
         name = str(service_name or "").strip()
         method_name = str(method or "").strip()
@@ -115,6 +117,7 @@ class GatewayServiceClient:
                 prepared_payload = client_mod._prepare_remote_call_payload(
                     clients,
                     payload,
+                    effective_policy=effective_policy,
                     **prepare_kwargs,
                 )
             else:
@@ -124,6 +127,7 @@ class GatewayServiceClient:
                         prepared_payload,
                         context="service call payload",
                         mode=serialization_mode,
+                        effective_policy=effective_policy,
                     )
                 except ValueError as exc:
                     if status_error is not None and not should_degrade(
@@ -141,12 +145,13 @@ class GatewayServiceClient:
                     prepared_payload,
                     context="service call payload",
                     mode=serialization_mode,
+                    effective_policy=effective_policy,
                 )
         finally:
             for client in clients:
                 with contextlib.suppress(Exception):
                     client.close()
-        if client_mod._prefers_http_bytes_transport(serialization_mode):
+        if client_mod._prefers_http_bytes_transport(serialization_mode, effective_policy=effective_policy):
             response = client_mod._call_route_http(
                 SimpleNamespace(
                     http_base_url=f"{self.base_url}/svc/{quote(name, safe='')}",
@@ -157,6 +162,7 @@ class GatewayServiceClient:
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=token,
                 serialization_mode=serialization_mode,
+                **({"effective_policy": effective_policy} if effective_policy is not None else {}),
             )
         else:
             response = client_mod._http_json_request(

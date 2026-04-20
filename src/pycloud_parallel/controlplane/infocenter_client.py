@@ -8,6 +8,7 @@ import math
 from typing import Dict, Optional, Sequence, Tuple
 
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
+from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.execution.scheduler import (
     JOBQUEUE_DEFAULT,
@@ -65,6 +66,7 @@ class InfoCenterNode:
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
+    capability: NodeCapability = NodeCapability()
     loaded_services: Tuple[str, ...] = ()
     services: Tuple[InfoCenterNodeService, ...] = ()
     task_pools: Tuple[InfoCenterNodeTaskPool, ...] = ()
@@ -90,6 +92,7 @@ class InfoCenterServiceRoute:
     ema_child_invoke_ms: float = 0.0
     ema_samples: int = 0
     predicted_busy: float = 0.0
+    capability: NodeCapability = NodeCapability()
 
 
 @dataclass
@@ -211,6 +214,7 @@ class InfoCenterClient:
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
         python_version: str = "",
+        capability: Optional[NodeCapability] = None,
     ) -> Dict[str, object]:
         
         serialized_services = []
@@ -251,6 +255,7 @@ class InfoCenterClient:
                 "service_worker_used": max(0, int(service_worker_used or 0)),
                 "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
                 "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
+                "capability": (capability or NodeCapability()).to_dict(),
             },
         )
 
@@ -270,6 +275,7 @@ class InfoCenterClient:
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
         python_version: str = "",
+        capability: Optional[NodeCapability] = None,
     ) -> Dict[str, object]:
         
         serialized_services = []
@@ -307,6 +313,7 @@ class InfoCenterClient:
                 "service_worker_used": max(0, int(service_worker_used or 0)),
                 "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
                 "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
+                "capability": (capability or NodeCapability()).to_dict(),
             },
         )
 
@@ -384,6 +391,7 @@ class InfoCenterClient:
                     schedulable=bool(item.get("schedulable", True)),
                     drain=bool(item.get("drain", False)),
                     reason=str(item.get("reason", "") or ""),
+                    capability=NodeCapability.from_dict(item.get("capability")),
                     loaded_services=tuple(item.get("loaded_services") or ()),
                     services=tuple(services),
                     task_pools=tuple(task_pools),
@@ -537,6 +545,7 @@ class InfoCenterClient:
                     ema_child_invoke_ms=float(item.get("ema_child_invoke_ms", 0.0) or 0.0),
                     ema_samples=int(item.get("ema_samples", 0) or 0),
                     predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
+                    capability=NodeCapability.from_dict(item.get("capability")),
                 )
             )
         return out
@@ -639,56 +648,68 @@ class InfoCenterClient:
             requested_count = int(node_count or 0)
             selected: list[InfoCenterNode] = []
             rr_counter = 0
-            pool_candidates = list(candidates)
-            while pool_candidates and (requested_count <= 0 or len(selected) < requested_count):
-                scheduler_candidates = [
-                    SchedulerCandidate(
-                        id=_node_instance_key_from_node(node),
-                        kind="jobqueue",
-                        node_id=str(node.node_id or ""),
-                        node_instance_id=_node_instance_key_from_node(node),
-                        healthy=bool(node.healthy),
-                        schedulable=bool(node.schedulable and not node.drain and str(node.control_addr or "").strip()),
-                        drain=bool(node.drain),
-                        breaker_state="closed",
-                        predicted_busy=float(node.inflight) / float(
-                            max(
+            candidate_groups: list[list[InfoCenterNode]]
+            if preferred_runtime:
+                hot_candidates = [
+                    node for node in candidates if preferred_runtime in tuple(str(x) for x in (node.active_runtimes or ()))
+                ]
+                cold_candidates = [
+                    node for node in candidates if preferred_runtime not in tuple(str(x) for x in (node.active_runtimes or ()))
+                ]
+                candidate_groups = [hot_candidates, cold_candidates]
+            else:
+                candidate_groups = [list(candidates)]
+
+            for pool_candidates in candidate_groups:
+                remaining_pool = list(pool_candidates)
+                while remaining_pool and (requested_count <= 0 or len(selected) < requested_count):
+                    scheduler_candidates = [
+                        SchedulerCandidate(
+                            id=_node_instance_key_from_node(node),
+                            kind="jobqueue",
+                            node_id=str(node.node_id or ""),
+                            node_instance_id=_node_instance_key_from_node(node),
+                            healthy=bool(node.healthy),
+                            schedulable=bool(node.schedulable and not node.drain and str(node.control_addr or "").strip()),
+                            drain=bool(node.drain),
+                            breaker_state="closed",
+                            predicted_busy=float(node.inflight) / float(
+                                max(
+                                    1,
+                                    int(node.task_pool_worker_available or node.task_pool_worker_capacity or 1),
+                                )
+                            ),
+                            node_inflight=int(node.inflight or 0),
+                            alive_workers=max(
                                 1,
                                 int(node.task_pool_worker_available or node.task_pool_worker_capacity or 1),
-                            )
-                        ),
-                        node_inflight=int(node.inflight or 0),
-                        alive_workers=max(
-                            1,
-                            int(node.task_pool_worker_available or node.task_pool_worker_capacity or 1),
-                        ),
-                        worker_capacity=max(1, int(node.task_pool_worker_capacity or node.capacity or 1)),
-                        credit=max(0, int(node.credit or 0)),
-                        recent_failures=0,
-                        metadata={
-                            "preferred_runtime": bool(preferred_runtime and preferred_runtime in node.active_runtimes),
-                        },
+                            ),
+                            worker_capacity=max(1, int(node.task_pool_worker_capacity or node.capacity or 1)),
+                            credit=max(0, int(node.credit or 0)),
+                            recent_failures=0,
+                        )
+                        for node in remaining_pool
+                    ]
+                    selected_candidate = select_one_candidate(
+                        scheduler_candidates,
+                        profile=JOBQUEUE_DEFAULT,
+                        state=SchedulerState(),
+                        round_robin_counter=rr_counter,
                     )
-                    for node in pool_candidates
-                ]
-                selected_candidate = select_one_candidate(
-                    scheduler_candidates,
-                    profile=JOBQUEUE_DEFAULT,
-                    state=SchedulerState(),
-                    round_robin_counter=rr_counter,
-                )
-                rr_counter += 1
-                chosen = None
-                remaining: list[InfoCenterNode] = []
-                for node in pool_candidates:
-                    if _node_instance_key_from_node(node) == str(selected_candidate.id) and chosen is None:
-                        chosen = node
-                        continue
-                    remaining.append(node)
-                if chosen is None:
+                    rr_counter += 1
+                    chosen = None
+                    next_remaining: list[InfoCenterNode] = []
+                    for node in remaining_pool:
+                        if _node_instance_key_from_node(node) == str(selected_candidate.id) and chosen is None:
+                            chosen = node
+                            continue
+                        next_remaining.append(node)
+                    if chosen is None:
+                        break
+                    selected.append(chosen)
+                    remaining_pool = next_remaining
+                if requested_count > 0 and len(selected) >= requested_count:
                     break
-                selected.append(chosen)
-                pool_candidates = remaining
 
         if not selected:
             raise RuntimeError("no task nodes selected from InfoCenter")

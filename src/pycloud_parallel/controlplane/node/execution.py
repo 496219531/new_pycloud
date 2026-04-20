@@ -74,6 +74,7 @@ class ExecuteSpec:
     payload: Dict[str, Any]
     payload_mode: str = "task_submit"
     serialization_mode: str = ""
+    use_transport_result: Optional[bool] = None
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""
     warmup_only: bool = False
@@ -95,6 +96,7 @@ class ExecuteSpec:
             "payload": dict(self.payload or {}),
             "payload_mode": self.payload_mode,
             "serialization_mode": self.serialization_mode,
+            "use_transport_result": self.use_transport_result,
             "managed_globals_scope_dir": self.managed_globals_scope_dir,
             "managed_globals_digest": self.managed_globals_digest,
             "warmup_only": bool(self.warmup_only),
@@ -110,6 +112,7 @@ def _build_execute_spec_model(
     payload: dict,
     payload_mode: str = "task_submit",
     serialization_mode: str = "",
+    use_transport_result: Optional[bool] = None,
     managed_globals_scope_dir: str = "",
     managed_globals_digest: str = "",
     warmup_only: bool = False,
@@ -130,6 +133,7 @@ def _build_execute_spec_model(
         payload=dict(payload or {}),
         payload_mode=str(payload_mode or "task_submit"),
         serialization_mode=str(serialization_mode or "").strip().lower(),
+        use_transport_result=use_transport_result,
         managed_globals_scope_dir=str(managed_globals_scope_dir or ""),
         managed_globals_digest=str(managed_globals_digest or ""),
         warmup_only=bool(warmup_only),
@@ -145,6 +149,7 @@ def _build_execute_spec(
     payload: dict,
     payload_mode: str = "task_submit",
     serialization_mode: str = "",
+    use_transport_result: Optional[bool] = None,
     managed_globals_scope_dir: str = "",
     managed_globals_digest: str = "",
     warmup_only: bool = False,
@@ -157,6 +162,7 @@ def _build_execute_spec(
         payload=payload,
         payload_mode=payload_mode,
         serialization_mode=serialization_mode,
+        use_transport_result=use_transport_result,
         managed_globals_scope_dir=managed_globals_scope_dir,
         managed_globals_digest=managed_globals_digest,
         warmup_only=warmup_only,
@@ -958,6 +964,7 @@ def _execute_payload_in_subprocess(
     warmup_only: bool = False,
     payload_mode: str = "task_submit",
     serialization_mode: str = "",
+    use_transport_result: Optional[bool] = None,
 ) -> Tuple[str, Optional[dict], str, str, Dict[str, float]]:
     decode_start = time.perf_counter()
     decode_end = decode_start
@@ -1042,6 +1049,7 @@ def _execute_payload_in_subprocess(
                     ret,
                     object_dir=object_dir,
                     serialization_mode=serialization_mode,
+                    use_transport_result=use_transport_result,
                 )
                 encode_end = time.perf_counter()
                 return (status_text, result, error_type, error_message, _timings())

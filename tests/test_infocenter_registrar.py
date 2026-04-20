@@ -130,6 +130,34 @@ def test_node_registrar_syncs_service_routes(tmp_path):
         info_server.stop()
 
 
+def test_infocenter_http_version_prefers_runtime_package_version(monkeypatch):
+    import pycloud_parallel
+    from pycloud_parallel.controlplane import infocenter_http
+
+    monkeypatch.setattr(pycloud_parallel, "__version__", "runtime-ops-version", raising=False)
+    monkeypatch.setattr(
+        infocenter_http.importlib_metadata,
+        "version",
+        lambda _dist_name: "dist-metadata-version",
+    )
+
+    assert infocenter_http._pycloud_version() == "runtime-ops-version"
+
+
+def test_registrar_version_prefers_runtime_package_version(monkeypatch):
+    import pycloud_parallel
+    from pycloud_parallel.controlplane import registrar
+
+    monkeypatch.setattr(pycloud_parallel, "__version__", "runtime-registrar-version", raising=False)
+    monkeypatch.setattr(
+        registrar.importlib_metadata,
+        "version",
+        lambda _dist_name: "dist-metadata-version",
+    )
+
+    assert registrar._pycloud_version() == "runtime-registrar-version"
+
+
 def test_ops_page_marks_lost_service_instances(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)

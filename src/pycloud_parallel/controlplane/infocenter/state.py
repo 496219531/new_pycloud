@@ -5,6 +5,7 @@ from __future__ import annotations
 from pycloud_parallel.controlplane.infocenter.models import (
     DataRegistryEntry,
     NodeMetricsState,
+    NodeCapability,
     NodeServiceState,
     NodeState,
     NodeTaskPoolInfo,
@@ -15,6 +16,7 @@ from pycloud_parallel.controlplane.state_time import dt_to_ts, ts_to_dt, utc_now
 __all__ = [
     "DataRegistryEntry",
     "InfoCenterState",
+    "NodeCapability",
     "NodeMetricsState",
     "NodeServiceState",
     "NodeState",

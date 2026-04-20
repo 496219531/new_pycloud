@@ -29,6 +29,7 @@ from pycloud_parallel.controlplane.config import (
     grpc_channel_options,
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, should_use_transport_payload_bytes
 from pycloud_parallel.controlplane.object_digest_cache import invalidate_file_digest, lookup_file_digest, store_file_digest
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient, ServiceSessionClient
 from pycloud_parallel.data.ref import normalize_object_format, object_id_from_sha256_hex
@@ -37,7 +38,6 @@ from pycloud_parallel.controlplane.serialization import (
     detect_transport_mode,
     dict_to_struct,
     log_payload_flow,
-    prefers_transport_payload_bytes,
     serialize_inline_payload,
     struct_to_python,
     summarize_payload_flow_value,
@@ -785,6 +785,7 @@ class NodeControlClient:
         code_token: str,
         prepared_values: Dict[str, object],
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> pb2.UpdateRuntimeGlobalsResponse:
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
@@ -796,7 +797,10 @@ class NodeControlClient:
             "runtime_key": str(runtime_key or "").strip(),
             "code_token": str(code_token or "").strip(),
         }
-        if prefers_transport_payload_bytes(effective_serialization_mode):
+        if should_use_transport_payload_bytes(
+            mode=effective_serialization_mode,
+            effective_policy=effective_policy,
+        ):
             request_kwargs["transport_values"] = encode_transport_payload_bytes(
                 prepared_values,
                 mode=effective_serialization_mode,
@@ -1326,6 +1330,7 @@ class NodeControlClient:
         timeout_sec: float = 60.0,
         service_token: str = "",
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> pb2.CallServiceResponse:
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
@@ -1337,7 +1342,10 @@ class NodeControlClient:
             "timeout_sec": max(0.1, float(timeout_sec)),
             "service_token": service_token or "",
         }
-        if prefers_transport_payload_bytes(effective_serialization_mode):
+        if should_use_transport_payload_bytes(
+            mode=effective_serialization_mode,
+            effective_policy=effective_policy,
+        ):
             request_kwargs["transport_payload"] = encode_transport_payload_bytes(
                 payload or {},
                 mode=effective_serialization_mode,
@@ -1367,6 +1375,7 @@ class NodeControlClient:
         service_token: str,
         values: Dict[str, object],
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> pb2.UpdateServiceGlobalsResponse:
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
@@ -1382,7 +1391,10 @@ class NodeControlClient:
             "service_id": str(service_id or "").strip(),
             "service_token": str(service_token or "").strip(),
         }
-        if prefers_transport_payload_bytes(effective_serialization_mode):
+        if should_use_transport_payload_bytes(
+            mode=effective_serialization_mode,
+            effective_policy=effective_policy,
+        ):
             request_kwargs["transport_values"] = encode_transport_payload_bytes(
                 prepared_values,
                 mode=effective_serialization_mode,

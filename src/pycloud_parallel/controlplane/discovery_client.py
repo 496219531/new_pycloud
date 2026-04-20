@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Set
 
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
     DiscoveryCallError,
     _call_route_http,
@@ -151,6 +152,7 @@ class DiscoveryServiceClient:
         service_token: Optional[str] = None,
         strategy: str = "predicted_busy",
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> Dict[str, object]:
         name = str(service_name or "").strip()
         method_name = str(method or "").strip()
@@ -178,6 +180,7 @@ class DiscoveryServiceClient:
                 return client_mod._prepare_remote_call_payload(
                     [route_client],
                     payload or {},
+                    effective_policy=effective_policy,
                     **prepare_kwargs,
                 )
             finally:
@@ -205,6 +208,7 @@ class DiscoveryServiceClient:
                 payload=retry_payload,
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=token,
+                **({"effective_policy": effective_policy} if effective_policy is not None else {}),
             )
             self._route_cache.mark_success(retry_route)
             return self._attach_controlplane_locator(resp, route=retry_route)
@@ -217,6 +221,8 @@ class DiscoveryServiceClient:
             }
             if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
                 call_kwargs["serialization_mode"] = serialization_mode
+            if effective_policy is not None:
+                call_kwargs["effective_policy"] = effective_policy
             resp = client_mod._call_route_http(route, **call_kwargs)
             self._route_cache.mark_success(route)
             return self._attach_controlplane_locator(resp, route=route)
@@ -246,6 +252,8 @@ class DiscoveryServiceClient:
                 }
                 if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
                     retry_kwargs["serialization_mode"] = serialization_mode
+                if effective_policy is not None:
+                    retry_kwargs["effective_policy"] = effective_policy
                 resp = client_mod._call_route_http(retry_route, **retry_kwargs)
                 self._route_cache.mark_success(retry_route)
                 return self._attach_controlplane_locator(resp, route=retry_route)

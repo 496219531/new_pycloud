@@ -33,6 +33,7 @@ from pycloud_parallel.controlplane.config import (
     get_payload_policy,
 )
 from pycloud_parallel.controlplane.data_store import DataStore
+from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
 from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
@@ -400,6 +401,9 @@ class NodeControlState:
             register_stored_result_impl=self._register_stored_result_artifact_locked,
             resolve_data_ref_impl=lambda ref: _resolve_single_data_ref(ref, object_dir=object_dir),
         )
+
+    def node_capability(self) -> NodeCapability:
+        return detect_local_node_capability()
 
     @property
     def artifact_dir(self) -> Path:
@@ -1790,6 +1794,7 @@ class NodeControlState:
             for item in tasks:
                 if item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
                     item_serialization_mode = str(item.transport_payload.codec or "").strip().lower()
+                    item_uses_transport_payload = True
                     decoded_payload = decode_transport_payload_bytes(
                         item.transport_payload.codec,
                         item.transport_payload.version,
@@ -1797,6 +1802,7 @@ class NodeControlState:
                         context="taskpool_session",
                     )
                 else:
+                    item_uses_transport_payload = False
                     raw_payload = struct_to_python(item.payload)
                     item_serialization_mode = detect_transport_mode(raw_payload, default="legacy_v1")
                     decoded_payload = decode_payload_from_transport(
@@ -1831,6 +1837,7 @@ class NodeControlState:
                     started_at=now,
                     last_heartbeat_at=now,
                     serialization_mode=item_serialization_mode,
+                    use_transport_result=item_uses_transport_payload,
                 )
                 self._pool_tasks[item.task_id] = record
                 build_start = time.perf_counter()
@@ -1842,6 +1849,7 @@ class NodeControlState:
                     payload=self._resolve_memory_object_refs_in_payload_locked(record.payload),
                     payload_mode="task_submit",
                     serialization_mode=item_serialization_mode,
+                    use_transport_result=item_uses_transport_payload,
                     managed_globals_scope_dir=pool.managed_globals_scope_dir,
                     managed_globals_digest=pool.managed_globals_digest,
                 )
@@ -2069,6 +2077,7 @@ class NodeControlState:
         service_token: str,
         timeout_sec: float,
         serialization_mode: str = "",
+        use_transport_result: Optional[bool] = None,
     ) -> Tuple[int, Dict[str, object]]:
         total_start = time.perf_counter()
         requested_method = str(method or "").strip()
@@ -2108,6 +2117,7 @@ class NodeControlState:
                 payload=prepared_payload,
                 payload_mode="http_call",
                 serialization_mode=str(serialization_mode or "").strip().lower(),
+                use_transport_result=use_transport_result,
                 managed_globals_scope_dir=session.managed_globals_scope_dir,
                 managed_globals_digest=session.managed_globals_digest,
             )
@@ -2273,6 +2283,7 @@ class NodeControlState:
         service_token: str,
         timeout_sec: float,
         serialization_mode: str = "",
+        use_transport_result: bool = False,
     ) -> Tuple[int, Dict[str, object]]:
         return self._invoke_service_call(
             service_id=service_id,
@@ -2281,6 +2292,7 @@ class NodeControlState:
             service_token=service_token,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
+            use_transport_result=use_transport_result,
         )
 
     def call_service(
@@ -2292,6 +2304,7 @@ class NodeControlState:
         service_token: str,
         timeout_sec: float,
         serialization_mode: str = "",
+        use_transport_result: Optional[bool] = None,
     ) -> Tuple[int, Dict[str, object]]:
         return self._invoke_service_call(
             service_id=service_id,
@@ -2300,6 +2313,7 @@ class NodeControlState:
             service_token=service_token,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
+            use_transport_result=use_transport_result,
         )
 
     def update_service_globals(

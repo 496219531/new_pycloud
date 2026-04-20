@@ -120,3 +120,55 @@
 3. 没有 envelope 时只按 `legacy_v1` 兜底，不再按全局 env 猜 mode
 4. 接收端会按当前边界上下文重新校验 declared mode，不是发送端声明什么就无条件接受什么
 5. `gateway_public` 默认硬性禁止 `pickle_stable_v1`
+
+## 会话级 Effective Policy
+
+当前 `Service / TaskPool / JobQueue` 的公开面已经开始统一走三层模型：
+
+1. `Policy Profile`
+   - 中心统一策略模板
+2. `Node Capability`
+   - node 上报的硬能力
+3. `Effective Policy`
+   - 会话创建时计算并冻结的实际执行策略
+
+对用户侧最重要的影响是：
+
+1. `policy_id=...` 代表“我要哪套中心策略模板”
+2. node 不会再各自凭本机 env 选默认 mode 或 payload limit
+3. 会话建成以后，`serialization_mode`、payload limits、protobuf bytes lane、HTTP bytes lane 都按冻结后的 `effective_policy` 走
+
+这些入口都可以带 `policy_id` 建会话：
+
+1. `Service.deploy(..., policy_id=...)`
+2. `Service.connect(..., policy_id=...)`
+3. `TaskPool.open(..., policy_id=...)`
+4. `JobQueue.connect(..., policy_id=...)`
+
+当前内置 profile：
+
+1. `default_safe`
+2. `trusted_internal`
+3. `pickle_internal_heavy`
+
+默认行为：
+
+1. profile 允许但 node capability 不支持的 mode，不会进入该 session 的 effective policy
+2. 某个候选 node 不支持 `pickle_stable_v1`，整个 session 就不会冻结到 pickle
+3. `gateway_public` 即使后端 node 支持 pickle，只要 profile 不允许，也会统一拒绝
+4. payload 准备链会优先遵守 session 的 effective payload limit，必要时转 `DataRef`
+
+carrier 选择也已经改成同一个原则：
+
+1. 主判断来自 `effective_policy.use_transport_payload_bytes`
+2. HTTP 主判断来自 `effective_policy.use_http_bytes_transport`
+3. 只有当前调用没有 effective policy 时，才 fallback 到 mode helper
+
+所以现在不要再把 “`pickle_stable_v1` 一定走 bytes” 当成固定规则；
+真正生效的是当前 session / route snapshot 解析出来的 effective policy。
+
+对 `JobQueue` 要再补一句：
+
+1. client 初始化时可以先拿 fallback policy
+2. 真正 submit/status/cancel 前，会根据当前发现到的 orchestrator routes capability 重新 resolve
+3. 因此实际 route call 使用的是“真实候选 orchestrator 能力交集”后的 effective policy

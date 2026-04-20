@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Tuple
 
+from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.state_time import utc_now
 
 
@@ -79,6 +80,7 @@ class NodeState:
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
+    capability: NodeCapability = field(default_factory=NodeCapability)
 
     def service_worker_available(self) -> int:
         capacity = max(0, int(self.service_worker_capacity or 0))
@@ -117,6 +119,7 @@ class DataRegistryEntry:
 __all__ = [
     "DataRegistryEntry",
     "NodeMetricsState",
+    "NodeCapability",
     "NodeServiceState",
     "NodeState",
     "NodeTaskPoolInfo",

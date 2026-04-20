@@ -6,6 +6,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -954,6 +955,27 @@ def test_kill_machine_pycloud_processes_stops_discovered_server_processes(tmp_pa
         ("INFO", "Stopping discovered process PID 303 (job-orchestrator)..."),
         ("INFO", "Stopping discovered process PID 302 (gateway)..."),
     ]
+
+
+def test_inspect_machine_processes_returns_empty_when_windows_shell_missing(monkeypatch):
+    monkeypatch.setattr(ctl.os, "name", "nt", raising=False)
+    monkeypatch.setattr(ctl, "_run_windows_shell", lambda _command: None)
+
+    assert ctl._inspect_machine_processes() == []
+
+
+def test_command_for_pid_on_windows_falls_back_to_tasklist_when_shell_missing(monkeypatch):
+    monkeypatch.setattr(ctl.os, "name", "nt", raising=False)
+    monkeypatch.setattr(ctl, "_run_windows_shell", lambda _command: None)
+    monkeypatch.setattr(
+        ctl.subprocess,
+        "run",
+        lambda cmd, capture_output, text, check: SimpleNamespace(stdout='"python.exe","4321","Console","1","12,000 K"\n')
+        if cmd[:3] == ["tasklist", "/FO", "CSV"]
+        else (_ for _ in ()).throw(AssertionError(f"unexpected command: {cmd!r}")),
+    )
+
+    assert '"python.exe","4321","Console","1","12,000 K"' in ctl._command_for_pid(4321)
 
 
 def test_cmd_stop_scan_ports_invokes_listener_cleanup(tmp_path, monkeypatch):

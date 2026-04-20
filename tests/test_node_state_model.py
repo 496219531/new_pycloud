@@ -37,6 +37,7 @@ from pycloud_parallel.controlplane.node.filesystem import (
 )
 from pycloud_parallel.controlplane.node.models import StoredResultArtifact
 from pycloud_parallel.controlplane.node.results import (
+    LargeResultError,
     _commit_result_file,
     _normalize_user_return,
     _resolve_object_refs_in_payload,
@@ -106,6 +107,48 @@ def test_normalize_user_return_spills_dataframe_when_limit_too_small(tmp_path, m
 
     assert status == "SUCCEEDED"
     assert isinstance(result, StoredResultArtifact)
+
+
+def test_normalize_user_return_pickle_struct_lane_spills_by_struct_limit(tmp_path, monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import pycloud_parallel.controlplane.node.results as results_mod
+
+    def _raise_inline_limit(*args, **kwargs):
+        raise ValueError("inline result too large")
+
+    def _unexpected_transport_encode(*args, **kwargs):
+        raise AssertionError("bytes lane should not be used when use_transport_result=False")
+
+    monkeypatch.setattr(results_mod, "serialize_inline_result", _raise_inline_limit)
+    monkeypatch.setattr(results_mod, "encode_transport_payload_bytes", _unexpected_transport_encode)
+    frame = pd.DataFrame([{"x": idx, "y": "a" * 50} for idx in range(10)])
+
+    status, result, _err_type, _err_message = _normalize_user_return(
+        frame,
+        object_dir=str(tmp_path),
+        serialization_mode="pickle_stable_v1",
+        use_transport_result=False,
+    )
+
+    assert status == "SUCCEEDED"
+    assert isinstance(result, StoredResultArtifact)
+
+
+def test_normalize_user_return_large_plain_value_raises_instead_of_silent_none(tmp_path, monkeypatch):
+    import pycloud_parallel.controlplane.node.results as results_mod
+
+    monkeypatch.setattr(
+        results_mod,
+        "serialize_inline_result",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("inline result too large")),
+    )
+
+    with pytest.raises(LargeResultError, match="exceeds inline limit"):
+        _normalize_user_return(
+            {"value": "x" * 1024},
+            object_dir=str(tmp_path),
+            serialization_mode="legacy_v1",
+        )
 
 
 def test_nested_arrow_payload_roundtrip():
@@ -827,9 +870,9 @@ def test_struct_to_dict_preserves_nan_in_dataframe_payload(tmp_path):
         "column_dtypes": ["float64"],
     }
     restored = struct_to_dict(dict_to_struct(payload))
-    assert isinstance(restored, pd.DataFrame)
-    assert restored.shape == (2, 1)
-    assert math.isnan(float(restored.iloc[1, 0]))
+    assert isinstance(restored["value"], pd.DataFrame)
+    assert restored["value"].shape == (2, 1)
+    assert math.isnan(float(restored["value"].iloc[1, 0]))
 
 
 def test_execute_payload_in_subprocess_uses_unified_inbound_normalizer(tmp_path, monkeypatch):

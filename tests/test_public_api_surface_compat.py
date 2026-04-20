@@ -45,3 +45,7 @@ def test_proto_messages_expose_node_instance_id_fields():
     assert "node_instance_id" in pb2.HeartbeatNodeRequest.DESCRIPTOR.fields_by_name
     assert "node_instance_id" in pb2.NodeInfo.DESCRIPTOR.fields_by_name
     assert "node_instance_id" in pb2.ServiceRouteInfo.DESCRIPTOR.fields_by_name
+    assert "capability" in pb2.RegisterNodeRequest.DESCRIPTOR.fields_by_name
+    assert "capability" in pb2.HeartbeatNodeRequest.DESCRIPTOR.fields_by_name
+    assert "capability" in pb2.NodeInfo.DESCRIPTOR.fields_by_name
+    assert "capability" in pb2.ServiceRouteInfo.DESCRIPTOR.fields_by_name

@@ -196,7 +196,12 @@ def serialize_inline_result(
     limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES,
     mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
-    transport_value = data if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data) else encode_transport_value(data or {}, mode=mode, context=context)
+    normalized_data = {} if data is None else data
+    transport_value = (
+        data
+        if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data)
+        else encode_transport_value(normalized_data, mode=mode, context=context)
+    )
     serialized = serialize_arrow_compatible(transport_value)
     out = struct_pb2.Struct()
     out.update(serialized)
@@ -205,7 +210,7 @@ def serialize_inline_result(
         "inline_result_encode",
         context=context,
         size_bytes=size_bytes,
-        summary=summarize_payload_flow_value(data or {}),
+        summary=summarize_payload_flow_value(normalized_data),
     )
     return serialized, out, size_bytes
 
@@ -310,6 +315,7 @@ def encode_transport_payload_bytes(
     *,
     mode: str = "",
     context: str = "payload",
+    limit_bytes: int = 0,
 ) -> pb2.TransportPayload:
     normalized = resolve_effective_serialization_mode(
         request_mode=mode,
@@ -321,6 +327,12 @@ def encode_transport_payload_bytes(
         payload = structured_dumps(value)
     else:
         raise ValueError(f"{normalized!r} does not use bytes transport payloads")
+    if int(limit_bytes or 0) > 0:
+        validate_inline_payload_size(
+            len(payload),
+            limit_bytes=max(1, int(limit_bytes)),
+            context=context,
+        )
     log_payload_flow("transport_payload_encode", context=context, codec=normalized, summary=summarize_payload_flow_value(value))
     return pb2.TransportPayload(
         codec=normalized,
@@ -428,7 +440,12 @@ def serialize_inline_payload(
     limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
-    transport_value = data if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data) else encode_transport_value(data or {}, mode=mode, context=context)
+    normalized_data = {} if data is None else data
+    transport_value = (
+        data
+        if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data)
+        else encode_transport_value(normalized_data, mode=mode, context=context)
+    )
     serialized = serialize_arrow_compatible(transport_value)
     out = struct_pb2.Struct()
     out.update(serialized)
@@ -437,7 +454,7 @@ def serialize_inline_payload(
         "inline_payload_encode",
         context=context,
         size_bytes=size_bytes,
-        summary=summarize_payload_flow_value(data or {}),
+        summary=summarize_payload_flow_value(normalized_data),
     )
     return serialized, out, size_bytes
 

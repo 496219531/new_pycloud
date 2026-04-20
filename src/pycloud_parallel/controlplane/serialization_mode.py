@@ -56,7 +56,28 @@ def resolve_effective_serialization_mode(
     default_mode: str = "",
     context: str = "",
     trust_mode: str = "",
+    allowed_modes: tuple[str, ...] | list[str] | None = None,
+    frozen_mode: str = "",
 ) -> str:
+    normalized_frozen_mode = normalize_serialization_mode(frozen_mode)
+    if normalized_frozen_mode:
+        normalized_request_mode = normalize_serialization_mode(request_mode)
+        if normalized_request_mode and normalized_request_mode != normalized_frozen_mode:
+            raise ValueError(
+                f"serialization_mode is frozen for this session: requested={normalized_request_mode!r}, "
+                f"resolved={normalized_frozen_mode!r}"
+            )
+        return validate_mode_for_context(
+            normalized_frozen_mode,
+            context=context,
+            trust_mode=trust_mode,
+        )
+
+    normalized_allowed_modes = {
+        normalize_serialization_mode(item)
+        for item in (allowed_modes or ())
+        if normalize_serialization_mode(item)
+    }
     for candidate in (
         request_mode,
         session_mode,
@@ -65,6 +86,12 @@ def resolve_effective_serialization_mode(
         "legacy_v1",
     ):
         normalized = normalize_serialization_mode(candidate)
+        if normalized_allowed_modes and normalized and normalized not in normalized_allowed_modes:
+            if candidate == request_mode and normalize_serialization_mode(request_mode):
+                raise ValueError(
+                    f"serialization_mode={normalized!r} is not allowed; allowed modes: {sorted(normalized_allowed_modes)}"
+                )
+            continue
         if normalized:
             return validate_mode_for_context(
                 normalized,

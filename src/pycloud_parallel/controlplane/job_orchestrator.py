@@ -89,8 +89,9 @@ class JobOrchestratorServer:
         token: str,
         timeout_sec: float,
         serialization_mode: str = "",
+        use_transport_result: bool = False,
     ) -> Tuple[int, Dict[str, object]]:
-        del timeout_sec, serialization_mode
+        del timeout_sec, serialization_mode, use_transport_result
         rejected = self._ensure_service(service_id)
         if rejected is not None:
             return rejected

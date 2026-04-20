@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 _INFRA_EXPORTS = {
     "DiscoveryServiceClient",
+    "EffectivePolicy",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
@@ -13,7 +14,9 @@ _INFRA_EXPORTS = {
     "InfoCenterNodeTaskPool",
     "InfoCenterServiceRoute",
     "NodeCircuitState",
+    "NodeCapability",
     "NodeControlClient",
+    "PolicyProfile",
 }
 
 _CONTROLPLANE_DEP_HINT = (
@@ -23,6 +26,7 @@ _CONTROLPLANE_DEP_HINT = (
 
 
 if TYPE_CHECKING:
+    from .effective_policy import EffectivePolicy
     from .discovery_client import DiscoveryServiceClient
     from .gateway_client import GatewayServiceClient
     from .infocenter_client import (
@@ -33,11 +37,14 @@ if TYPE_CHECKING:
         InfoCenterServiceRoute,
         NodeCircuitState,
     )
+    from .node_capability import NodeCapability
     from .node_control_client import NodeControlClient
+    from .policy_profile import PolicyProfile
 
 
 def _try_bind_infra_exports() -> None:
     try:
+        from .effective_policy import EffectivePolicy
         from .discovery_client import DiscoveryServiceClient
         from .gateway_client import GatewayServiceClient
         from .infocenter_client import (
@@ -48,7 +55,9 @@ def _try_bind_infra_exports() -> None:
             InfoCenterServiceRoute,
             NodeCircuitState,
         )
+        from .node_capability import NodeCapability
         from .node_control_client import NodeControlClient
+        from .policy_profile import PolicyProfile
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
         if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
@@ -58,6 +67,7 @@ def _try_bind_infra_exports() -> None:
     globals().update(
         {
             "DiscoveryServiceClient": DiscoveryServiceClient,
+            "EffectivePolicy": EffectivePolicy,
             "GatewayServiceClient": GatewayServiceClient,
             "InfoCenterClient": InfoCenterClient,
             "InfoCenterNode": InfoCenterNode,
@@ -65,7 +75,9 @@ def _try_bind_infra_exports() -> None:
             "InfoCenterNodeTaskPool": InfoCenterNodeTaskPool,
             "InfoCenterServiceRoute": InfoCenterServiceRoute,
             "NodeCircuitState": NodeCircuitState,
+            "NodeCapability": NodeCapability,
             "NodeControlClient": NodeControlClient,
+            "PolicyProfile": PolicyProfile,
         }
     )
 
@@ -88,6 +100,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "DiscoveryServiceClient",
+    "EffectivePolicy",
     "GatewayServiceClient",
     "InfoCenterClient",
     "InfoCenterNode",
@@ -95,5 +108,7 @@ __all__ = [
     "InfoCenterNodeTaskPool",
     "InfoCenterServiceRoute",
     "NodeCircuitState",
+    "NodeCapability",
     "NodeControlClient",
+    "PolicyProfile",
 ]

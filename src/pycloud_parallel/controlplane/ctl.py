@@ -382,30 +382,71 @@ def _listener_pids_for_port(port: int) -> List[int]:
     return sorted(set(pids))
 
 
+def _windows_shell_candidates() -> List[str]:
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        normalized = text.lower()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(text)
+
+    system_root = str(os.environ.get("SystemRoot", "") or os.environ.get("WINDIR", "")).strip()
+    if system_root:
+        _add(str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"))
+    for key in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        base = str(os.environ.get(key, "") or "").strip()
+        if base:
+            _add(str(Path(base) / "PowerShell" / "7" / "pwsh.exe"))
+    for name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        resolved = shutil.which(name)
+        if resolved:
+            _add(resolved)
+        _add(name)
+    return candidates
+
+
+def _run_windows_shell(command: str) -> subprocess.CompletedProcess[str] | None:
+    shell_command = str(command or "").strip()
+    if not shell_command:
+        return None
+    for executable in _windows_shell_candidates():
+        try:
+            return subprocess.run(
+                [executable, "-NoProfile", "-Command", shell_command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            continue
+    return None
+
+
 def _command_for_pid(pid: int) -> str:
     if pid <= 0:
         return ""
     if os.name == "nt":
-        ps_result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\").CommandLine",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        ps_result = _run_windows_shell(
+            f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\").CommandLine"
         )
-        text = str(ps_result.stdout or "").strip()
+        text = str(getattr(ps_result, "stdout", "") or "").strip()
         if text:
             return text
-        tasklist_result = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {int(pid)}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            tasklist_result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {int(pid)}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return ""
         return str(tasklist_result.stdout or "").strip()
     result = subprocess.run(
         ["ps", "-p", str(int(pid)), "-o", "command="],
@@ -491,18 +532,10 @@ def _inspect_machine_processes() -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     current_pid = int(os.getpid())
     if os.name == "nt":
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        result = _run_windows_shell(
+            "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
         )
-        payload = str(result.stdout or "").strip()
+        payload = str(getattr(result, "stdout", "") or "").strip()
         if not payload:
             return rows
         try:

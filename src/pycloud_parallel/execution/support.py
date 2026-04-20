@@ -35,9 +35,9 @@ from pycloud_parallel.controlplane.config import (
     JOB_STAGED_REF_TTL_SEC,
     JOB_STAGING_REPLICA_COUNT,
     OBJECT_CHUNK_SIZE_BYTES,
-    get_payload_policy,
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, payload_policy_from_effective_policy
 from pycloud_parallel.controlplane.netutil import detect_local_ip
 from pycloud_parallel.data.ref import normalize_materialize_as, normalize_object_format
 from pycloud_parallel.controlplane.payload_transport import (
@@ -554,21 +554,43 @@ def _policy_with_soft_limit(policy, object_threshold_bytes: int):
     )
 
 
+def _payload_policy_for_mode(
+    mode: str,
+    *,
+    effective_policy: Optional[EffectivePolicy] = None,
+    object_threshold_bytes: int = 0,
+):
+    policy = payload_policy_from_effective_policy(mode, effective_policy)
+    if int(object_threshold_bytes or 0) > 0:
+        threshold = min(
+            max(1, int(object_threshold_bytes)),
+            max(1, int(policy.inline_payload_soft_limit_bytes)),
+        )
+        policy = _policy_with_soft_limit(policy, threshold)
+    return policy
+
+
 def _prepare_payload_for_policy(
     clients: Sequence[Any],
     payload: Optional[Dict[str, object]],
     *,
     policy,
+    managed_global_policy=None,
     default_serialization_mode: str = "",
 ) -> Dict[str, object]:
     put_kwargs = {}
     if str(default_serialization_mode or "").strip() and str(default_serialization_mode).strip().lower() != "legacy_v1":
         put_kwargs["default_serialization_mode"] = default_serialization_mode
+    prepare_kwargs = {
+        "put_data": lambda value, *, format="": _put_data_via_clients(clients, value, format=format, **put_kwargs),
+        "estimate_inline_size": _estimate_managed_global_inline_size,
+        "policy": policy,
+    }
+    if managed_global_policy is not None:
+        prepare_kwargs["managed_global_policy"] = managed_global_policy
     return prepare_outbound_payload(
         payload,
-        put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format, **put_kwargs),
-        estimate_inline_size=_estimate_managed_global_inline_size,
-        policy=policy,
+        **prepare_kwargs,
     )
 
 
@@ -604,17 +626,20 @@ def _prepare_payload_value_for_upload(
     upload_bytes: bool = False,
     consume_on_read: bool = False,
     serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
 ) -> Any:
-    policy = _policy_with_soft_limit(
-        replace(
-            get_payload_policy("managed_globals"),
-            objectify_pathlikes=bool(upload_pathlike),
-            objectify_strings_as_files=bool(upload_string_file),
-            objectify_bytes=bool(upload_bytes),
-            recurse_containers=bool(recurse_containers),
-            consume_on_read=bool(consume_on_read),
-        ),
-        object_threshold_bytes,
+    base_policy = _payload_policy_for_mode(
+        "managed_globals",
+        effective_policy=effective_policy,
+        object_threshold_bytes=object_threshold_bytes,
+    )
+    policy = replace(
+        base_policy,
+        objectify_pathlikes=bool(upload_pathlike),
+        objectify_strings_as_files=bool(upload_string_file),
+        objectify_bytes=bool(upload_bytes),
+        recurse_containers=bool(recurse_containers),
+        consume_on_read=bool(consume_on_read),
     )
     return _prepare_value_for_policy(
         clients,
@@ -631,12 +656,19 @@ def _prepare_managed_global_value_for_upload(
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
 ) -> Any:
+    policy = _payload_policy_for_mode(
+        "managed_globals",
+        effective_policy=effective_policy,
+        object_threshold_bytes=object_threshold_bytes,
+    )
+    effective_threshold_bytes = max(1, int(policy.inline_payload_soft_limit_bytes))
     inline_size = _estimate_managed_global_inline_size(value)
-    if inline_size <= max(1, int(object_threshold_bytes)):
+    if inline_size <= effective_threshold_bytes:
         log_payload_flow(
             "managed_global_inline",
-            threshold_bytes=max(1, int(object_threshold_bytes)),
+            threshold_bytes=effective_threshold_bytes,
             size_bytes=inline_size,
             summary=summarize_payload_flow_value(value),
         )
@@ -646,16 +678,17 @@ def _prepare_managed_global_value_for_upload(
         prepared = _prepare_payload_value_for_upload(
             clients,
             value,
-            object_threshold_bytes=object_threshold_bytes,
+            object_threshold_bytes=effective_threshold_bytes,
             upload_pathlike=True,
             upload_string_file=True,
             upload_bytes=True,
             consume_on_read=False,
             serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
         )
         log_payload_flow(
             "managed_global_objectref_ready",
-            threshold_bytes=max(1, int(object_threshold_bytes)),
+            threshold_bytes=effective_threshold_bytes,
             size_bytes=inline_size,
             summary=summarize_payload_flow_value(prepared),
         )
@@ -663,14 +696,14 @@ def _prepare_managed_global_value_for_upload(
     except Exception as exc:
         log_payload_flow(
             "managed_global_objectref_failed",
-            threshold_bytes=max(1, int(object_threshold_bytes)),
+            threshold_bytes=effective_threshold_bytes,
             size_bytes=inline_size,
             summary=summarize_payload_flow_value(value),
             error=repr(exc),
         )
         raise ValueError(
             "managed global exceeds inline threshold and large-object upload failed: "
-            f"size_bytes={inline_size} threshold_bytes={max(1, int(object_threshold_bytes))}; "
+            f"size_bytes={inline_size} threshold_bytes={effective_threshold_bytes}; "
             f"error={exc}"
         ) from exc
 
@@ -681,6 +714,7 @@ def _prepare_managed_globals_values_for_upload(
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
 ) -> Dict[str, object]:
     return {
         str(name): _prepare_managed_global_value_for_upload(
@@ -688,6 +722,7 @@ def _prepare_managed_globals_values_for_upload(
             value,
             object_threshold_bytes=object_threshold_bytes,
             serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
         )
         for name, value in (values or {}).items()
     }
@@ -699,12 +734,22 @@ def _prepare_task_payload_for_submit(
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
 ) -> Any:
-    policy = _policy_with_soft_limit(get_payload_policy("task_submit"), object_threshold_bytes)
+    policy = _payload_policy_for_mode(
+        "task_submit",
+        effective_policy=effective_policy,
+        object_threshold_bytes=object_threshold_bytes,
+    )
     return _prepare_payload_for_policy(
         [client],
         payload,
         policy=policy,
+        managed_global_policy=(
+            _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)
+            if effective_policy is not None
+            else None
+        ),
         default_serialization_mode=serialization_mode,
     )
 
@@ -715,12 +760,22 @@ def _prepare_http_payload_for_call(
     *,
     object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
 ) -> Dict[str, object]:
-    policy = _policy_with_soft_limit(get_payload_policy("http_call"), object_threshold_bytes)
+    policy = _payload_policy_for_mode(
+        "http_call",
+        effective_policy=effective_policy,
+        object_threshold_bytes=object_threshold_bytes,
+    )
     return _prepare_payload_for_policy(
         clients,
         payload,
         policy=policy,
+        managed_global_policy=(
+            _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)
+            if effective_policy is not None
+            else None
+        ),
         default_serialization_mode=serialization_mode,
     )
 
@@ -1241,6 +1296,7 @@ def _prepare_job_submit_payload_for_call(
     payload: Dict[str, object],
     timeout_sec: float,
     serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
 ) -> Dict[str, object]:
     prepared = dict(payload or {})
     preserved_fields = {
@@ -1265,7 +1321,12 @@ def _prepare_job_submit_payload_for_call(
             prepared,
             put_data=lambda value, *, format="": _put_data_via_clients(clients, value, format=format, **put_kwargs),
             estimate_inline_size=_estimate_managed_global_inline_size,
-            policy=get_payload_policy("job_submit"),
+            policy=_payload_policy_for_mode("job_submit", effective_policy=effective_policy),
+            **(
+                {"managed_global_policy": _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)}
+                if effective_policy is not None
+                else {}
+            ),
         )
         outbound.update(preserved_fields)
         return outbound

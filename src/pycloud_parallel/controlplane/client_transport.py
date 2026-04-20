@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.config import get_payload_policy
+from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
 from pycloud_parallel.controlplane.data_ref import (
     DataRef,
     maybe_data_ref,
@@ -30,10 +30,12 @@ from pycloud_parallel.controlplane.serialization import (
     deserialize_series_bundle,
     deserialize_by_mode,
     log_payload_flow,
-    prefers_transport_payload_bytes,
     serialize_arrow_compatible,
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_received_transport_mode
+
+if TYPE_CHECKING:
+    from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 
 
 HTTP_TRANSPORT_CONTENT_TYPE = "application/x-pycloud-transport"
@@ -68,28 +70,75 @@ def _header_get(headers: Any, name: str) -> str:
     return ""
 
 
-def _prefers_http_bytes_transport(mode: str = "") -> bool:
-    return prefers_transport_payload_bytes(mode)
+def _prefers_http_bytes_transport(mode: str = "", effective_policy: Optional["EffectivePolicy"] = None) -> bool:
+    return _should_use_http_bytes_transport(mode=mode, effective_policy=effective_policy)
+
+
+def _should_use_http_bytes_transport(
+    *,
+    mode: str = "",
+    effective_policy: Optional["EffectivePolicy"] = None,
+) -> bool:
+    from pycloud_parallel.controlplane.effective_policy import should_use_http_bytes_transport
+
+    return should_use_http_bytes_transport(
+        mode=mode,
+        effective_policy=effective_policy,
+    )
 
 
 def _is_http_transport_content_type(value: str) -> bool:
     return _normalize_content_type(value) == HTTP_TRANSPORT_CONTENT_TYPE
 
 
-def _serialize_http_call_payload(payload: Optional[Dict[str, object]], *, context: str, mode: str = "") -> Dict[str, object]:
+def _resolve_http_call_payload_policy(
+    *,
+    payload_policy: Optional[PayloadPolicy] = None,
+    effective_policy: Optional["EffectivePolicy"] = None,
+) -> PayloadPolicy:
+    if payload_policy is not None:
+        return payload_policy
+    from pycloud_parallel.controlplane.effective_policy import payload_policy_from_effective_policy
+
+    return payload_policy_from_effective_policy("http_call", effective_policy)
+
+
+def _serialize_http_call_payload(
+    payload: Optional[Dict[str, object]],
+    *,
+    context: str,
+    mode: str = "",
+    payload_policy: Optional[PayloadPolicy] = None,
+    effective_policy: Optional["EffectivePolicy"] = None,
+) -> Dict[str, object]:
     return encode_payload_for_transport(
         payload,
-        policy=get_payload_policy("http_call"),
+        policy=_resolve_http_call_payload_policy(
+            payload_policy=payload_policy,
+            effective_policy=effective_policy,
+        ),
         context=context,
         mode=mode,
     )
 
 
-def _encode_http_transport_body(payload: Optional[Dict[str, object]], *, context: str, mode: str = "") -> tuple[bytes, Dict[str, str], str]:
+def _encode_http_transport_body(
+    payload: Optional[Dict[str, object]],
+    *,
+    context: str,
+    mode: str = "",
+    payload_policy: Optional[PayloadPolicy] = None,
+    effective_policy: Optional["EffectivePolicy"] = None,
+) -> tuple[bytes, Dict[str, str], str]:
+    policy = _resolve_http_call_payload_policy(
+        payload_policy=payload_policy,
+        effective_policy=effective_policy,
+    )
     transport = encode_transport_payload_bytes(
         payload or {},
         mode=mode,
         context=context,
+        limit_bytes=policy.inline_payload_hard_limit_bytes,
     )
     headers = {
         "Content-Type": HTTP_TRANSPORT_CONTENT_TYPE,
@@ -319,6 +368,7 @@ def _serialize_route(route: Any) -> Dict[str, object]:
         "http_base_url": route.http_base_url,
         "status": int(route.status),
         "lease_expire_at": route.lease_expire_at.isoformat(),
+        "capability": getattr(getattr(route, "capability", None), "to_dict", lambda: {})(),
     }
 
 
@@ -330,21 +380,34 @@ def _call_route_http(
     timeout_sec: float,
     service_token: str,
     serialization_mode: str = "",
+    payload_policy: Optional[PayloadPolicy] = None,
+    effective_policy: Optional["EffectivePolicy"] = None,
 ) -> Dict[str, object]:
     url = f"{route.http_base_url}/call/{quote(method, safe='')}?timeout_sec={max(0.1, timeout_sec):.3f}"
     headers: Dict[str, str] = {}
     if service_token:
         headers["X-Service-Token"] = service_token
-    if _prefers_http_bytes_transport(serialization_mode):
+    if _should_use_http_bytes_transport(
+        mode=serialization_mode,
+        effective_policy=effective_policy,
+    ):
         request_body, transport_headers, _codec = _encode_http_transport_body(
             payload,
             context="service_internal",
             mode=serialization_mode,
+            payload_policy=payload_policy,
+            effective_policy=effective_policy,
         )
         headers.update(transport_headers)
     else:
         headers["Content-Type"] = "application/json"
-        serialized_payload = _serialize_http_call_payload(payload, context="service call payload", mode=serialization_mode)
+        serialized_payload = _serialize_http_call_payload(
+            payload,
+            context="service call payload",
+            mode=serialization_mode,
+            payload_policy=payload_policy,
+            effective_policy=effective_policy,
+        )
         request_body = json.dumps(serialized_payload).encode("utf-8")
     req = Request(
         url=url,

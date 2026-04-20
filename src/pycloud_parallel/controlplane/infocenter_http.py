@@ -18,6 +18,7 @@ from pycloud_parallel.controlplane.data_ref import coerce_data_ref
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import resolve_public_host
+from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.controlplane.infocenter.state import (
@@ -177,6 +178,7 @@ def _serialize_node(state) -> Dict[str, object]:
         "schedulable": bool(state.schedulable),
         "drain": bool(state.drain),
         "reason": str(state.reason or ""),
+        "capability": state.capability.to_dict(),
         "capacity": int(state.capacity),
         "queue_capacity": int(state.queue_capacity),
         "queued": int(state.metrics.queued),
@@ -225,6 +227,10 @@ def _serialize_node(state) -> Dict[str, object]:
             for pool in task_pools
         ],
     }
+
+
+def _parse_node_capability(payload: object) -> NodeCapability:
+    return NodeCapability.from_dict(payload if isinstance(payload, dict) else None)
 
 
 def _serialize_data_registry_entry(entry: DataRegistryEntry) -> Dict[str, object]:
@@ -324,6 +330,14 @@ def _parse_job_waiting_entries(node_metadata: Dict[str, object]) -> List[Dict[st
 
 
 def _pycloud_version() -> str:
+    try:
+        import pycloud_parallel
+
+        runtime_version = str(getattr(pycloud_parallel, "__version__", "") or "").strip()
+        if runtime_version:
+            return runtime_version
+    except Exception:
+        pass
     try:
         return str(importlib_metadata.version("pycloud-parallel"))
     except Exception:
@@ -718,6 +732,7 @@ class InfoCenterHttpServer:
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                         task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
                         task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
+                        capability=_parse_node_capability(payload.get("capability")),
                     )
                     self._send_json(200, {"ok": True, "heartbeat_interval_sec": state.heartbeat_interval_sec, "node": _serialize_node(node)})
                     return
@@ -747,6 +762,7 @@ class InfoCenterHttpServer:
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                         task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
                         task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
+                        capability=_parse_node_capability(payload.get("capability")),
                     )
                     if node is None:
                         self._send_json(404, {"ok": False, "error": "unknown node"})

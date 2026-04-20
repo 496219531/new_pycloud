@@ -12,6 +12,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
     _call_route_http,
     _normalize_http_response_body,
@@ -358,6 +359,7 @@ class ServiceSessionClient:
         timeout_sec: float = 60.0,
         token: Optional[str] = None,
         serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
     ) -> Dict[str, object]:
         if not self.http_base_url:
             raise RuntimeError("service has no http_base_url; expose_http may be false")
@@ -376,6 +378,7 @@ class ServiceSessionClient:
         prepared_payload = prepare_remote_call_payload(
             [self._client],
             payload,
+            effective_policy=effective_policy,
             **prepare_kwargs,
         )
         try:
@@ -389,6 +392,7 @@ class ServiceSessionClient:
                 timeout_sec=max(0.1, float(timeout_sec)),
                 service_token=str(auth_token or ""),
                 serialization_mode=serialization_mode,
+                effective_policy=effective_policy,
             )
         except Exception as exc:
             raise RuntimeError(f"call failed: {exc}") from exc

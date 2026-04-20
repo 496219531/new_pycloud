@@ -12,9 +12,9 @@ from typing import Callable, Iterable, List, Optional
 import grpc
 
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_payload_policy
+from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.node.state import NodeControlState
-from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.serialization import (
     TRANSPORT_ENVELOPE_SENTINEL,
     decode_transport_payload_bytes,
@@ -22,7 +22,6 @@ from pycloud_parallel.controlplane.serialization import (
     detect_transport_mode,
     dict_to_struct,
     log_payload_flow,
-    prefers_transport_payload_bytes,
     struct_to_python,
     validate_inline_payload_structs,
 )
@@ -1105,7 +1104,10 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 error=_err(pb2.ERROR_CODE_INVALID_REQUEST, str(exc)),
             )
 
-        if request.HasField("transport_payload") and str(request.transport_payload.codec or "").strip():
+        request_uses_transport_payload = bool(
+            request.HasField("transport_payload") and str(request.transport_payload.codec or "").strip()
+        )
+        if request_uses_transport_payload:
             request_serialization_mode = str(request.transport_payload.codec or "").strip().lower()
             decoded_payload = decode_transport_payload_bytes(
                 request.transport_payload.codec,
@@ -1129,6 +1131,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             service_token=request.service_token,
             timeout_sec=max(0.1, float(request.timeout_sec or 60.0)),
             serialization_mode=request_serialization_mode,
+            use_transport_result=request_uses_transport_payload,
         )
         if code == 404:
             context.set_code(grpc.StatusCode.NOT_FOUND)
@@ -1175,7 +1178,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             "service_id": request.service_id,
             "method": request.method,
         }
-        if prefers_transport_payload_bytes(request_serialization_mode):
+        if request_uses_transport_payload:
             if isinstance(body.get("data"), dict) and TRANSPORT_ENVELOPE_SENTINEL in body.get("data", {}):
                 raise RuntimeError("transport bytes lane received already-encoded result")
             response_kwargs["transport_data"] = encode_transport_payload_bytes(

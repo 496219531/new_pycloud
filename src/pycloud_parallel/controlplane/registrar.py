@@ -10,11 +10,20 @@ from typing import Callable, Dict, Iterable, Optional
 from importlib import metadata as importlib_metadata
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
+from pycloud_parallel.controlplane.node_capability import detect_local_node_capability
 from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 def _pycloud_version() -> str:
+    try:
+        import pycloud_parallel
+
+        runtime_version = str(getattr(pycloud_parallel, "__version__", "") or "").strip()
+        if runtime_version:
+            return runtime_version
+    except Exception:
+        pass
     try:
         return str(importlib_metadata.version("pycloud-parallel"))
     except Exception:
@@ -130,6 +139,7 @@ class NodeInfoCenterRegistrar:
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
             task_pool_worker_used=self.state.task_pool_worker_used(),
             python_version=self.state.python_version,
+            capability=self.state.node_capability(),
         )
         with self._sync_lock:
             self._registered = True
@@ -178,6 +188,7 @@ class NodeInfoCenterRegistrar:
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
             task_pool_worker_used=self.state.task_pool_worker_used(),
             python_version=self.state.python_version,
+            capability=self.state.node_capability(),
         )
         with self._sync_lock:
             if not resp.get("accepted", False):
@@ -340,6 +351,7 @@ class JobOrchestratorInfoCenterRegistrar:
             service_worker_capacity=1,
             service_worker_used=1,
             python_version="py3",
+            capability=detect_local_node_capability(),
         )
         with self._sync_lock:
             self._registered = True
@@ -360,6 +372,7 @@ class JobOrchestratorInfoCenterRegistrar:
             service_worker_capacity=1,
             service_worker_used=1,
             python_version="py3",
+            capability=detect_local_node_capability(),
         )
         with self._sync_lock:
             if not resp.get("accepted", False):
