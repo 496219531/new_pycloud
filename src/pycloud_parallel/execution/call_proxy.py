@@ -278,7 +278,7 @@ class _CallProxy:
             timeout_sec=timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
-            max_in_flight=32,
+            max_in_flight=None,
         )
 
     async def amap(
@@ -296,14 +296,14 @@ class _CallProxy:
             timeout_sec=timeout_sec,
             strategy=self._strategy,
             refresh_status=self._refresh_status,
-            max_in_flight=32,
+            max_in_flight=None,
         )
 
     def unordered(
         self,
         payloads: Sequence[Mapping[str, object]],
         *,
-        max_in_flight: int = 32,
+        max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> _UnorderedCallProxyStream:
@@ -322,7 +322,7 @@ class _CallProxy:
         self,
         payloads: Sequence[Mapping[str, object]],
         *,
-        max_in_flight: int = 32,
+        max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> _AUnorderedCallProxyStream:
@@ -341,7 +341,7 @@ class _CallProxy:
         self,
         payloads: Sequence[Mapping[str, object]],
         *,
-        max_in_flight: int = 32,
+        max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> _IterItemsProxyStream:
@@ -360,7 +360,7 @@ class _CallProxy:
         self,
         payloads: Sequence[Mapping[str, object]],
         *,
-        max_in_flight: int = 32,
+        max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> _AIterItemsProxyStream:
@@ -379,7 +379,7 @@ class _CallProxy:
         self,
         payloads: Sequence[Mapping[str, object]],
         *,
-        max_in_flight: int = 32,
+        max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> List[ExecutionItem]:
@@ -397,7 +397,7 @@ class _CallProxy:
         self,
         payloads: Sequence[Mapping[str, object]],
         *,
-        max_in_flight: int = 32,
+        max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> List[ExecutionItem]:

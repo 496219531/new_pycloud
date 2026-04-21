@@ -202,6 +202,18 @@ class TestCallProxy:
         assert result[0].result == {"value": 1}
         mock_group.collect_item_calls.assert_called_once()
 
+    def test_map_uses_dynamic_default_max_in_flight_when_not_explicit(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        mock_group.map_calls = MagicMock(return_value=[{"value": 1}, {"value": 4}])
+        proxy = _CallProxy("square", mock_group)
+
+        result = proxy.map([1, 2], arg_name="x")
+
+        assert result == [{"value": 1}, {"value": 4}]
+        assert mock_group.map_calls.call_args.kwargs["max_in_flight"] is None
+
     def test_acollect_items_delegates_to_group_acollect_item_calls(self):
         from pycloud_parallel.execution.base import ExecutionItem
         from pycloud_parallel.execution.call_proxy import _CallProxy
@@ -218,6 +230,31 @@ class TestCallProxy:
         assert len(result) == 1
         assert result[0].result == {"value": 1}
         mock_group.acollect_item_calls.assert_awaited_once()
+
+
+def test_service_iter_item_calls_uses_group_dynamic_default_max_in_flight():
+    from pycloud_parallel.execution.service_session import _service_iter_item_calls
+
+    class _Group:
+        def _default_max_in_flight(self):
+            return 3
+
+        def call_balanced(self, method, payload, *, timeout_sec, strategy, refresh_status):  # noqa: ARG002
+            return "node-1", {"data": payload}
+
+    items = list(
+        _service_iter_item_calls(
+            _Group(),
+            method="square",
+            payloads=[{"x": 1}, {"x": 2}, {"x": 3}, {"x": 4}],
+            timeout_sec=30.0,
+            strategy="predicted_busy",
+            refresh_status=True,
+            max_in_flight=None,
+        )
+    )
+
+    assert len(items) == 4
 
     def test_async_call(self):
         """测试异步调用。"""

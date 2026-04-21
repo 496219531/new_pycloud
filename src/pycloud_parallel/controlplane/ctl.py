@@ -825,7 +825,14 @@ def _env_override_int(extra_env: Dict[str, str], key: str, default: int) -> int:
         raise ValueError(f"--env {key} must be int, got {raw!r}") from exc
 
 
-def _spawn_server(root: Path, log_path: Path, args: Iterable[str], *, extra_env: Dict[str, str] | None = None) -> int:
+def _spawn_server(
+    root: Path,
+    log_path: Path,
+    args: Iterable[str],
+    *,
+    extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
+) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     if extra_env:
@@ -834,23 +841,31 @@ def _spawn_server(root: Path, log_path: Path, args: Iterable[str], *, extra_env:
         creationflags = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
         proc = subprocess.Popen(
             _server_command(*args),
-            stdout=None,
-            stderr=None,
+            stdout=None if debug else None,
+            stderr=None if debug else None,
             cwd=str(root),
             env=env,
             close_fds=False,
             creationflags=creationflags,
         )
     else:
-        with log_path.open("ab") as fp:
+        if debug:
             proc = subprocess.Popen(
                 _server_command(*args),
-                stdout=fp,
-                stderr=subprocess.STDOUT,
                 cwd=str(root),
                 env=env,
                 close_fds=True,
             )
+        else:
+            with log_path.open("ab") as fp:
+                proc = subprocess.Popen(
+                    _server_command(*args),
+                    stdout=fp,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(root),
+                    env=env,
+                    close_fds=True,
+                )
     return int(proc.pid)
 
 
@@ -877,6 +892,7 @@ def _start_controlplane(
     bind_host: str = "0.0.0.0",
     remote_hint: str = "",
     extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
 ) -> None:
     effective_bind_host = resolve_public_host(str(bind_host or "").strip() or _default_bind_host(remote_hint=remote_hint), remote_hint=remote_hint)
     bind = _format_host_port(effective_bind_host, int(port))
@@ -885,8 +901,9 @@ def _start_controlplane(
     pid = _spawn_server(
         root,
         _logs_dir(root) / "controlplane.log",
-        ["--role", "controlplane", "--bind", bind, "--log-level", "INFO"],
+        ["--role", "controlplane", "--bind", bind, "--log-level", "DEBUG" if debug else "INFO"],
         extra_env=extra_env,
+        debug=debug,
     )
     ready_host = _probe_host(effective_bind_host)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_json_ok(ready_host, int(port), 0.5, path="/nodes?healthy_only=false&limit=1")):
@@ -896,15 +913,16 @@ def _start_controlplane(
     _log("OK", f"ControlPlane started (PID: {pid}, Bind: {bind})")
 
 
-def _start_infocenter(root: Path, *, bind: str, extra_env: Dict[str, str] | None = None) -> None:
+def _start_infocenter(root: Path, *, bind: str, extra_env: Dict[str, str] | None = None, debug: bool = False) -> None:
     host, port = _split_host_port(bind)
     _assert_bind_available(bind)
     _log("INFO", f"Starting InfoCenter on {bind}...")
     pid = _spawn_server(
         root,
         _logs_dir(root) / "infocenter.log",
-        ["--role", "infocenter", "--bind", bind, "--log-level", "INFO"],
+        ["--role", "infocenter", "--bind", bind, "--log-level", "DEBUG" if debug else "INFO"],
         extra_env=extra_env,
+        debug=debug,
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_json_ok(host, port, 0.2, path="/nodes?healthy_only=false&limit=1")):
         _remove_pid(_pid_file(root, "infocenter"))
@@ -921,6 +939,7 @@ def _start_standalone_controlplane(
     gateway_failure_threshold: int,
     gateway_open_sec: float,
     extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
 ) -> None:
     host, port = _split_host_port(bind)
     _assert_bind_available(bind)
@@ -940,9 +959,10 @@ def _start_standalone_controlplane(
             "--gateway-open-sec",
             f"{float(gateway_open_sec):.3f}",
             "--log-level",
-            "INFO",
+            "DEBUG" if debug else "INFO",
         ],
         extra_env=extra_env,
+        debug=debug,
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_json_ok(host, port, 0.2, path="/nodes?healthy_only=false&limit=1")):
         _remove_pid(_pid_file(root, "controlplane"))
@@ -960,6 +980,7 @@ def _start_gateway(
     gateway_failure_threshold: int,
     gateway_open_sec: float,
     extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
 ) -> None:
     _assert_bind_available(bind)
     _log("INFO", f"Starting Gateway on {bind} (InfoCenter: {infocenter_addr})...")
@@ -980,9 +1001,10 @@ def _start_gateway(
             "--gateway-open-sec",
             f"{float(gateway_open_sec):.3f}",
             "--log-level",
-            "INFO",
+            "DEBUG" if debug else "INFO",
         ],
         extra_env=extra_env,
+        debug=debug,
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_ready(bind, 0.2, path="/svc/__pycloudctl_probe__/status")):
         _remove_pid(_pid_file(root, "gateway"))
@@ -1002,6 +1024,7 @@ def _start_job_orchestrator(
     node_tags: str = "job",
     node_version: str = "v1",
     extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
 ) -> None:
     _assert_bind_available(bind)
     _log("INFO", f"Starting JobOrchestrator on {bind} (InfoCenter: {infocenter_addr}, service: {service_name})...")
@@ -1026,9 +1049,10 @@ def _start_job_orchestrator(
             "--node-version",
             node_version,
             "--log-level",
-            "INFO",
+            "DEBUG" if debug else "INFO",
         ],
         extra_env=extra_env,
+        debug=debug,
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_service_registered(infocenter_addr, service_name, 0.2)):
         _remove_pid(_pid_file(root, "job-orchestrator"))
@@ -1053,6 +1077,7 @@ def _start_node(
     service_default_workers: int = SERVICE_DEFAULT_WORKERS,
     service_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
     extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
 ) -> None:
     effective_bind_host = resolve_public_host(
         str(bind_host or "").strip() or _default_bind_host(remote_hint=infocenter_target),
@@ -1098,9 +1123,10 @@ def _start_node(
             "--node-tags",
             "compute",
             "--log-level",
-            "INFO",
+            "DEBUG" if debug else "INFO",
         ],
         extra_env=extra_env,
+        debug=debug,
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_node_registered(infocenter_target, name, 0.2)):
         _remove_pid(_pid_file(root, name))
@@ -1125,6 +1151,7 @@ def _start_standalone_node(
     node_tags: str,
     node_version: str,
     extra_env: Dict[str, str] | None = None,
+    debug: bool = False,
 ) -> None:
     _assert_bind_available(bind)
     _assert_bind_available(service_http_bind)
@@ -1157,13 +1184,13 @@ def _start_standalone_node(
         "--node-version",
         node_version,
         "--log-level",
-        "INFO",
+        "DEBUG" if debug else "INFO",
     ]
     if infocenter_addr:
         args.extend(["--infocenter-addr", infocenter_addr])
     if advertise_addr:
         args.extend(["--advertise-addr", advertise_addr])
-    pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=extra_env)
+    pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=extra_env, debug=debug)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_ready(service_http_bind, 0.2)):
         _remove_pid(_pid_file(root, node_id))
         raise RuntimeError(f"{node_id} service HTTP failed to become ready")
@@ -1224,12 +1251,24 @@ def _cmd_start(args: argparse.Namespace) -> int:
     time.sleep(1.0)
 
     infocenter_target = _format_host_port(controlplane_host, int(args.controlplane_port))
-    _start_controlplane(root, args.controlplane_port, bind_host=controlplane_host, remote_hint=infocenter_target, extra_env=extra_env)
+    debug = bool(getattr(args, "debug", False))
+    controlplane_kwargs = dict(
+        bind_host=controlplane_host,
+        remote_hint=infocenter_target,
+        extra_env=extra_env,
+    )
+    job_orchestrator_kwargs = dict(
+        infocenter_addr=infocenter_target,
+        extra_env=extra_env,
+    )
+    if debug:
+        controlplane_kwargs["debug"] = True
+        job_orchestrator_kwargs["debug"] = True
+    _start_controlplane(root, args.controlplane_port, **controlplane_kwargs)
     _start_job_orchestrator(
         root,
         bind=_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port)),
-        infocenter_addr=infocenter_target,
-        extra_env=extra_env,
+        **job_orchestrator_kwargs,
     )
     time.sleep(2.0)
     worker_capacity = int(args.node_worker_capacity or _env_override_int(extra_env, "PYCLOUD_NODE_WORKER_CAPACITY", _default_node_worker_capacity()))
@@ -1241,6 +1280,15 @@ def _cmd_start(args: argparse.Namespace) -> int:
         "PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC",
         SERVICE_HEARTBEAT_TIMEOUT_SEC,
     )
+    node_kwargs = dict(
+        queue_capacity=queue_capacity,
+        max_workers=max_workers,
+        service_default_workers=service_default_workers,
+        service_heartbeat_timeout_sec=service_heartbeat_timeout_sec,
+        extra_env=extra_env,
+    )
+    if debug:
+        node_kwargs["debug"] = True
     _start_node(
         root,
         "node-1",
@@ -1251,11 +1299,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         bind_host=node1_host,
         service_http_host=node1_http_host,
         advertise_host=node1_host,
-        queue_capacity=queue_capacity,
-        max_workers=max_workers,
-        service_default_workers=service_default_workers,
-        service_heartbeat_timeout_sec=service_heartbeat_timeout_sec,
-        extra_env=extra_env,
+        **node_kwargs,
     )
     _start_node(
         root,
@@ -1267,11 +1311,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         bind_host=node2_host,
         service_http_host=node2_http_host,
         advertise_host=node2_host,
-        queue_capacity=queue_capacity,
-        max_workers=max_workers,
-        service_default_workers=service_default_workers,
-        service_heartbeat_timeout_sec=service_heartbeat_timeout_sec,
-        extra_env=extra_env,
+        **node_kwargs,
     )
 
     print("============================================")
@@ -1334,7 +1374,12 @@ def _cmd_start_infocenter(args: argparse.Namespace) -> int:
         label="infocenter bind",
         prefer_local=bool(getattr(args, "local", False)),
     )
-    _start_infocenter(root, bind=bind, extra_env=_parse_env_overrides(getattr(args, "env", []) or []))
+    _start_infocenter(
+        root,
+        bind=bind,
+        extra_env=_parse_env_overrides(getattr(args, "env", []) or []),
+        **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
+    )
     return 0
 
 
@@ -1362,6 +1407,7 @@ def _cmd_start_gateway(args: argparse.Namespace) -> int:
         gateway_failure_threshold=int(args.gateway_failure_threshold),
         gateway_open_sec=float(args.gateway_open_sec),
         extra_env=extra_env,
+        **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0
 
@@ -1385,6 +1431,7 @@ def _cmd_start_controlplane(args: argparse.Namespace) -> int:
         gateway_failure_threshold=int(args.gateway_failure_threshold),
         gateway_open_sec=float(args.gateway_open_sec),
         extra_env=extra_env,
+        **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0
 
@@ -1415,6 +1462,7 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
         node_tags=str(getattr(args, "node_tags", "") or "job"),
         node_version=str(getattr(args, "node_version", "") or "v1"),
         extra_env=extra_env,
+        **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0
 
@@ -1478,6 +1526,7 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
         node_tags=str(args.node_tags),
         node_version=str(args.node_version),
         extra_env=extra_env,
+        **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0
 
@@ -2163,6 +2212,20 @@ def _add_local_argument(parser: argparse.ArgumentParser, *, dest: str = "local")
     )
 
 
+def _add_debug_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--debug",
+        "--dubug",
+        dest="debug",
+        action="store_true",
+        default=False,
+        help=(
+            "debug launch mode: spawned main service processes use DEBUG log level and attach stdio to a visible "
+            "console/terminal (Windows keeps dedicated process windows; POSIX inherits the current terminal)"
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _CtlArgumentParser(description="PyCloud local service manager")
     parser.set_defaults(local=False, _global_local=False)
@@ -2186,15 +2249,18 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser = subparsers.add_parser("start", help="start controlplane and two nodecontrol processes")
     _add_local_argument(start_parser)
     _add_env_argument(start_parser)
+    _add_debug_argument(start_parser)
     start_infocenter = subparsers.add_parser("start-infocenter", help="start one local infocenter process")
     _add_local_argument(start_infocenter)
     _add_env_argument(start_infocenter)
+    _add_debug_argument(start_infocenter)
     start_infocenter.add_argument("--bind", default="0.0.0.0:50051", help="full bind address in host:port form for start-infocenter; wildcard hosts auto-resolve to the local IP")
     start_infocenter.add_argument("--host", default="", help="optional bind host override for start-infocenter; default auto-detects local IP")
     start_infocenter.add_argument("--port", type=int, default=0, help="optional bind port override for start-infocenter")
     start_gateway = subparsers.add_parser("start-gateway", help="start one local gateway process")
     _add_local_argument(start_gateway)
     _add_env_argument(start_gateway)
+    _add_debug_argument(start_gateway)
     start_gateway.add_argument("--bind", default="0.0.0.0:50052", help="full bind address in host:port form for start-gateway; wildcard hosts auto-resolve to the local IP")
     start_gateway.add_argument("--host", default="", help="optional bind host override for start-gateway; default auto-detects local IP")
     start_gateway.add_argument("--port", type=int, default=0, help="optional bind port override for start-gateway")
@@ -2205,6 +2271,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_controlplane = subparsers.add_parser("start-controlplane", help="start one local controlplane process")
     _add_local_argument(start_controlplane)
     _add_env_argument(start_controlplane)
+    _add_debug_argument(start_controlplane)
     start_controlplane.add_argument("--bind", default="0.0.0.0:50051", help="full bind address in host:port form for start-controlplane; wildcard hosts auto-resolve to the local IP")
     start_controlplane.add_argument("--host", default="", help="optional bind host override for start-controlplane; default auto-detects local IP")
     start_controlplane.add_argument("--port", type=int, default=0, help="optional bind port override for start-controlplane")
@@ -2214,6 +2281,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_job_orchestrator = subparsers.add_parser("start-job-orchestrator", help="start one local job-orchestrator process")
     _add_local_argument(start_job_orchestrator)
     _add_env_argument(start_job_orchestrator)
+    _add_debug_argument(start_job_orchestrator)
     start_job_orchestrator.add_argument("--bind", default="0.0.0.0:50053", help="full bind address in host:port form for start-job-orchestrator; wildcard hosts auto-resolve to the local IP")
     start_job_orchestrator.add_argument("--host", default="", help="optional bind host override for start-job-orchestrator; default auto-detects local IP")
     start_job_orchestrator.add_argument("--port", type=int, default=0, help="optional bind port override for start-job-orchestrator")
@@ -2226,6 +2294,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_node = subparsers.add_parser("start-node", help="start one local nodecontrol process")
     _add_local_argument(start_node)
     _add_env_argument(start_node)
+    _add_debug_argument(start_node)
     start_node.add_argument("--node-id", default="node-local-01", type=_normalize_managed_name, help="managed node name used for pid/log files and registration")
     start_node.add_argument("--bind", default="0.0.0.0:50061", help="full gRPC bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
     start_node.add_argument("--node-host", default="", help="optional grpc bind host override for start-node; default auto-detects local IP")
@@ -2258,6 +2327,7 @@ def build_parser() -> argparse.ArgumentParser:
     restart_parser = subparsers.add_parser("restart", help="restart local services")
     _add_local_argument(restart_parser)
     _add_env_argument(restart_parser)
+    _add_debug_argument(restart_parser)
     status_parser = subparsers.add_parser("status", help="show local service status")
     status_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for node/service query (default: 127.0.0.1:<controlplane-port>)")
     doctor_parser = subparsers.add_parser("doctor", help="inspect runtime-root pid files and listener ports")

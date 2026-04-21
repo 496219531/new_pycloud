@@ -3,6 +3,7 @@ from __future__ import annotations
 """Background registrar for NodeControl -> InfoCenter heartbeats."""
 
 import json
+import logging
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,8 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.node_capability import detect_local_node_capability
 from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+logger = logging.getLogger(__name__)
 
 
 def _pycloud_version() -> str:
@@ -144,6 +147,15 @@ class NodeInfoCenterRegistrar:
         with self._sync_lock:
             self._registered = True
             self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
+        logger.info(
+            "[Registrar] node register node_id=%s node_instance_id=%s control_addr=%s hb=%s service_count=%d task_pool_count=%d",
+            self.node_id,
+            self.node_instance_id,
+            self.control_addr,
+            self._next_hb_sec,
+            len(self.state.service_report_payloads()),
+            len(self.state.task_pool_reports()),
+        )
         return True
 
     def _heartbeat_once(self) -> bool:
@@ -193,6 +205,11 @@ class NodeInfoCenterRegistrar:
         with self._sync_lock:
             if not resp.get("accepted", False):
                 self._registered = False
+                logger.warning(
+                    "[Registrar] node heartbeat rejected node_id=%s node_instance_id=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                )
                 return False
             self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
         return True
@@ -359,6 +376,14 @@ class JobOrchestratorInfoCenterRegistrar:
                 1,
                 int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec),
             )
+        logger.info(
+            "[Registrar] job-orch register node_id=%s node_instance_id=%s service_id=%s service_name=%s hb=%s",
+            self.node_id,
+            self.node_instance_id,
+            self.service_id,
+            self.service_name,
+            self._next_hb_sec,
+        )
         return True
 
     def _heartbeat_once(self) -> bool:
@@ -377,6 +402,12 @@ class JobOrchestratorInfoCenterRegistrar:
         with self._sync_lock:
             if not resp.get("accepted", False):
                 self._registered = False
+                logger.warning(
+                    "[Registrar] job-orch heartbeat rejected node_id=%s node_instance_id=%s service_id=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    self.service_id,
+                )
                 return False
             self._next_hb_sec = max(
                 1,

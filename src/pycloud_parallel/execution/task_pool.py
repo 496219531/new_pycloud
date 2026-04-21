@@ -8,6 +8,7 @@ import contextlib
 from dataclasses import replace
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -73,6 +74,7 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
 _TASK_POOL_CLOSE_RETRY_DELAYS_SEC = (0.0, 0.5, 1.0, 2.0)
+_DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR = 1.5
 
 
 def _infocenter_client(*args, **kwargs):
@@ -359,6 +361,36 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 )
             )
         return candidates, selected_state
+
+    def _effective_worker_count(self) -> int:
+        total_workers = 0
+        for node_id in self._available_pool_node_ids():
+            pool = self._pools.get(node_id)
+            node = self.nodes.get(node_id)
+            worker_capacity = max(0, int(getattr(pool, "worker_count", 0) or 0))
+            alive_workers = max(
+                0,
+                int(getattr(node, "task_pool_worker_available", 0) or 0),
+            )
+            if alive_workers <= 0 and pool is not None:
+                with contextlib.suppress(Exception):
+                    info = pool.get_status()
+                    alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
+            total_workers += max(alive_workers, worker_capacity, 0)
+        return max(1, total_workers)
+
+    def _default_max_in_flight(self) -> int:
+        return max(1, int(math.ceil(float(self._effective_worker_count()) * _DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR)))
+
+    def _resolve_max_in_flight(self, requested: Optional[int]) -> int:
+        if requested is not None:
+            try:
+                normalized = int(requested)
+            except Exception:
+                normalized = 0
+            if normalized > 0:
+                return normalized
+        return self._default_max_in_flight()
 
     def _select_pool_node(self, *, strategy: str = "taskpool_default") -> str:
         node_ids = self._available_pool_node_ids()
@@ -1007,7 +1039,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
         wait_ms: int = 500,
@@ -1034,12 +1066,13 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             )
             return
         normalized_payloads = self._merge_payloads_with_shared_kwargs(payloads, shared_kwargs=dict(shared_kwargs))
+        resolved_max_in_flight = self._resolve_max_in_flight(max_in_flight)
         for index, result in self.imap_unordered(
             normalized_payloads,
             task_method=task_method,
             strategy=strategy,
-            max_in_flight=max_in_flight,
-            receive_batch=max(1, min(max_in_flight, 32)),
+            max_in_flight=resolved_max_in_flight,
+            receive_batch=max(1, min(resolved_max_in_flight, 32)),
             submit_timeout_sec=max(0.1, float(timeout_sec)),
             result_timeout_sec=max(0.1, float(timeout_sec)),
             wait_ms=wait_ms,
@@ -1069,7 +1102,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
         wait_ms: int = 500,
@@ -1103,7 +1136,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
         wait_ms: int = 500,
@@ -1135,7 +1168,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
         wait_ms: int = 500,
@@ -1249,7 +1282,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> Iterator[Tuple[int, Any]]:
@@ -1268,7 +1301,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._enter_exclusive_mode("imap_unordered", require_clean=True)
         try:
             self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
-            max_pending = max(1, int(max_in_flight or 1))
+            max_pending = self._resolve_max_in_flight(max_in_flight)
             max_receive = max(1, int(shared_kwargs.pop("receive_batch", 1) or 1))
             submit_timeout_sec = float(shared_kwargs.pop("submit_timeout_sec", timeout_sec) or timeout_sec)
             result_timeout_sec = float(shared_kwargs.pop("result_timeout_sec", timeout_sec) or timeout_sec)
@@ -1528,7 +1561,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> Iterator[Tuple[int, Any]]:
@@ -1565,7 +1598,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> AsyncIterator[Tuple[int, Any]]:
@@ -1593,7 +1626,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         handle: Callable[[int, Any], Any],
         task_method: str = "",
         strategy: str = "taskpool_default",
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         receive_batch: int = 1,
         submit_timeout_sec: float = 60.0,

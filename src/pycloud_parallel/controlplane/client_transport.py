@@ -86,7 +86,6 @@ def _should_use_http_bytes_transport(
         effective_policy=effective_policy,
     )
 
-
 def _is_http_transport_content_type(value: str) -> bool:
     return _normalize_content_type(value) == HTTP_TRANSPORT_CONTENT_TYPE
 

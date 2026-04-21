@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import inspect
 import io
 import json
+import math
 import os
 from pathlib import Path
 import threading
@@ -256,6 +257,40 @@ def _env_float(name: str, default: float) -> float:
 _SERVICE_READY_GRACE_SEC = max(0.0, _env_float("PYCLOUD_SERVICE_READY_GRACE_SEC", 5.0))
 _SERVICE_READY_RETRY_INTERVAL_SEC = max(0.05, _env_float("PYCLOUD_SERVICE_READY_RETRY_INTERVAL_SEC", 0.25))
 _SERVICE_SESSION_LOCK_RETRY_SEC = max(0.0, _env_float("PYCLOUD_SERVICE_SESSION_LOCK_RETRY_SEC", 3.0))
+_DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR = 1.5
+
+
+def _scaled_default_max_in_flight(total_workers: int) -> int:
+    return max(1, int(math.ceil(float(max(1, int(total_workers or 0))) * _DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR)))
+
+
+def _service_route_worker_count(route: object) -> int:
+    if isinstance(route, dict):
+        alive_workers = max(0, int(route.get("alive_workers", 0) or 0))
+        worker_count = max(0, int(route.get("worker_count", 0) or 0))
+    else:
+        alive_workers = max(0, int(getattr(route, "alive_workers", 0) or 0))
+        worker_count = max(0, int(getattr(route, "worker_count", 0) or 0))
+    return max(alive_workers, worker_count, 0)
+
+
+def _resolve_group_max_in_flight(group: object, *, max_in_flight: Optional[int], item_count: int) -> int:
+    if max_in_flight is not None:
+        try:
+            normalized = int(max_in_flight)
+        except Exception:
+            normalized = 0
+        if normalized > 0:
+            return max(1, min(normalized, item_count))
+    default_resolver = getattr(group, "_default_max_in_flight", None)
+    if callable(default_resolver):
+        try:
+            resolved = int(default_resolver())
+        except Exception:
+            resolved = 1
+    else:
+        resolved = 1
+    return max(1, min(resolved, item_count))
 
 
 def _ready_retry_timeout(timeout_sec: float, *, grace_sec: float) -> float:
@@ -432,12 +467,12 @@ def _service_iter_item_calls(
     timeout_sec: float,
     strategy: str,
     refresh_status: bool,
-    max_in_flight: int,
+    max_in_flight: Optional[int],
 ) -> Iterator[ExecutionItem]:
     items = [dict(payload or {}) for payload in payloads]
     if not items:
         return iter(())
-    limit = max(1, min(int(max_in_flight or 1), len(items)))
+    limit = _resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=len(items))
 
     def _generator() -> Iterator[ExecutionItem]:
         with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="service-items") as executor:
@@ -472,12 +507,12 @@ async def _service_aiter_item_calls(
     timeout_sec: float,
     strategy: str,
     refresh_status: bool,
-    max_in_flight: int,
+    max_in_flight: Optional[int],
 ) -> AsyncIterator[ExecutionItem]:
     items = [dict(payload or {}) for payload in payloads]
     if not items:
         return
-    semaphore = asyncio.Semaphore(max(1, min(int(max_in_flight or 1), len(items))))
+    semaphore = asyncio.Semaphore(_resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=len(items)))
 
     async def _run_one(idx: int, payload: Dict[str, object]) -> ExecutionItem:
         async with semaphore:
@@ -512,7 +547,7 @@ def _service_collect_item_calls(
     timeout_sec: float,
     strategy: str,
     refresh_status: bool,
-    max_in_flight: int,
+    max_in_flight: Optional[int],
 ) -> List[ExecutionItem]:
     return sorted(
         list(
@@ -538,7 +573,7 @@ async def _service_acollect_item_calls(
     timeout_sec: float,
     strategy: str,
     refresh_status: bool,
-    max_in_flight: int,
+    max_in_flight: Optional[int],
 ) -> List[ExecutionItem]:
     items: List[ExecutionItem] = []
     async for item in _service_aiter_item_calls(
@@ -925,6 +960,27 @@ class _ConnectedService:
         routes.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
         return routes
 
+    def _effective_worker_count(self) -> int:
+        routes: List[object] = []
+        if self.transport == "discovery":
+            with contextlib.suppress(Exception):
+                routes = list(self._discoverable_routes(force_refresh=False))
+        else:
+            status = self._last_status if isinstance(self._last_status, dict) else None
+            if not status:
+                with contextlib.suppress(Exception):
+                    fetched = self._transport_client.get_status(service_name=self.service_name)
+                    if isinstance(fetched, dict):
+                        self._last_status = fetched
+                        status = fetched
+            if isinstance(status, dict):
+                routes = list(status.get("routes", []) or [])
+        total_workers = sum(_service_route_worker_count(route) for route in routes)
+        return max(1, total_workers)
+
+    def _default_max_in_flight(self) -> int:
+        return _scaled_default_max_in_flight(self._effective_worker_count())
+
     def call_balanced(
         self,
         method: str,
@@ -1078,7 +1134,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[Optional[object]]:
         return [
             item.result if item.ok else None
@@ -1101,7 +1157,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[Optional[object]]:
         items = await _service_acollect_item_calls(
             self,
@@ -1122,7 +1178,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> Iterator[Tuple[int, Optional[object]]]:
         for item in _service_iter_item_calls(
             self,
@@ -1143,7 +1199,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> AsyncIterator[Tuple[int, Optional[object]]]:
         async for item in _service_aiter_item_calls(
             self,
@@ -1164,7 +1220,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> Iterator[ExecutionItem]:
         return _service_iter_item_calls(
             self,
@@ -1184,7 +1240,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> AsyncIterator[ExecutionItem]:
         async for item in _service_aiter_item_calls(
             self,
@@ -1205,7 +1261,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[ExecutionItem]:
         return _service_collect_item_calls(
             self,
@@ -1225,7 +1281,7 @@ class _ConnectedService:
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[ExecutionItem]:
         return await _service_acollect_item_calls(
             self,
@@ -2741,6 +2797,20 @@ class Service(ServiceExecutionSession):
             out[node_key] = session.get_status()
         return out
 
+    def _effective_worker_count(self) -> int:
+        total_workers = 0
+        for session in self.sessions.values():
+            alive_workers = 0
+            with contextlib.suppress(Exception):
+                info = session.get_status()
+                alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
+            worker_count = max(0, int(getattr(session, "worker_count", 0) or 0))
+            total_workers += max(alive_workers, worker_count, 0)
+        return max(1, total_workers)
+
+    def _default_max_in_flight(self) -> int:
+        return _scaled_default_max_in_flight(self._effective_worker_count())
+
     def call_on_node(
         self,
         node_id: str,
@@ -3147,7 +3217,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[Optional[object]]:
         return [
             item.result if item.ok else None
@@ -3170,7 +3240,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[Optional[object]]:
         items = await _service_acollect_item_calls(
             self,
@@ -3191,7 +3261,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> Iterator[Tuple[int, Optional[object]]]:
         for item in _service_iter_item_calls(
             self,
@@ -3212,7 +3282,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> AsyncIterator[Tuple[int, Optional[object]]]:
         async for item in _service_aiter_item_calls(
             self,
@@ -3233,7 +3303,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> Iterator[ExecutionItem]:
         return _service_iter_item_calls(
             self,
@@ -3253,7 +3323,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> AsyncIterator[ExecutionItem]:
         async for item in _service_aiter_item_calls(
             self,
@@ -3274,7 +3344,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[ExecutionItem]:
         return _service_collect_item_calls(
             self,
@@ -3294,7 +3364,7 @@ class Service(ServiceExecutionSession):
         timeout_sec: float = 30.0,
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
-        max_in_flight: int = 32,
+        max_in_flight: Optional[int] = None,
     ) -> List[ExecutionItem]:
         return await _service_acollect_item_calls(
             self,

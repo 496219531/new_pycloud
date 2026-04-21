@@ -158,8 +158,8 @@
 4. `Service.connect(transport="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `structured_v1`
 5. `TaskPool.open(...)` / `TaskPool.from_infocenter(...)` 默认绑定 `trusted_internal`，默认 mode 是 `structured_v1`
 6. 重数据 task 场景建议显式切到 `pickle_internal_heavy`
-7. `JobQueue.connect()` 默认绑定 `trusted_internal`，但 queue 自己的 controlplane transport 仍固定默认 mode=`structured_v1`
-4. 节点差异由 `tags`、`healthy_only` 和 runtime 过滤表达，不再参与 effective policy 协商
+7. `JobQueue.connect()` 默认绑定 `jobqueue_controlplane_transport`，对应 profile=`default_safe`，默认 mode=`structured_v1`
+8. 节点差异由 `tags`、`healthy_only` 和 runtime 过滤表达，不再参与 effective policy 协商
 
 carrier 选择也已经改成同一个原则：
 
@@ -172,7 +172,8 @@ carrier 选择也已经改成同一个原则：
 
 对 `JobQueue` 要再补一句：
 
-1. `JobQueue` 自己的 transport/session 默认绑定 `jobqueue_controlplane_transport -> trusted_internal`
+1. `JobQueue` 自己的 transport/session 默认绑定 `jobqueue_controlplane_transport -> default_safe`
 2. 这个 binding 的默认 mode 仍然是 `structured_v1`
-2. 用户在 `JobQueue.submit(...)` 里传的 `serialization_mode / policy_id`，解释为未来 `TaskPool` 的执行策略
-3. 因此 job-orchestrator 的调用面和后续 task 执行面的策略边界是分开的
+3. 用户在 `JobQueue.submit(...)` 里传的 `serialization_mode`，解释为未来 `TaskPool` 的执行策略；`policy_id` 不再允许由 submit 传入
+4. `job-orchestrator` 运行期维护单共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先软切 mode 复用，软切失败再回退重建
+5. 因此 job-orchestrator 的调用面和后续 task 执行面的策略边界是分开的

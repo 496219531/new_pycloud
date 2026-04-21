@@ -154,6 +154,7 @@ def build_job_orchestrator_server(
     queue_capacity: int = NODE_QUEUE_CAPACITY,
     tags: Optional[list[str]] = None,
     version: str = "",
+    taskpool_policy_id: str = "",
 ) -> JobOrchestratorServer:
     if not infocenter_addr:
         raise ValueError("infocenter_addr is required for joborchestrator role")
@@ -165,6 +166,7 @@ def build_job_orchestrator_server(
         queue_capacity=queue_capacity,
         tags=tags,
         version=version,
+        taskpool_policy_id=taskpool_policy_id,
     )
 
 
@@ -265,6 +267,7 @@ def main() -> None:
     parser.add_argument("--advertise-addr", default="")
     parser.add_argument("--node-tags", default="compute")
     parser.add_argument("--node-version", default="v1")
+    parser.add_argument("--taskpool-policy-id", default="")
     parser.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0)
     parser.add_argument("--gateway-failure-threshold", type=int, default=3)
     parser.add_argument("--gateway-open-sec", type=float, default=5.0)
@@ -344,6 +347,7 @@ def main() -> None:
             queue_capacity=args.queue_capacity,
             tags=[x.strip() for x in args.node_tags.split(",") if x.strip()] or ["job"],
             version=args.node_version,
+            taskpool_policy_id=args.taskpool_policy_id,
         )
         _wait_until_stopped(server, on_stop=lambda: None)
         return

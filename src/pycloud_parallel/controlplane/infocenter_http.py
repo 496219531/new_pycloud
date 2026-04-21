@@ -6,6 +6,7 @@ import errno
 import os
 import html
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
@@ -33,6 +34,7 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
@@ -964,6 +966,13 @@ class InfoCenterHttpServer:
                     healthy_only = str((qs.get("healthy_only", ["true"]) or ["true"])[0]).lower() not in ("0", "false", "no")
                     limit = max(1, int((qs.get("limit", ["100"]) or ["100"])[0]))
                     nodes = [_serialize_node(item) for item in state.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit)]
+                    logger.info(
+                        "[InfoCenter] GET /nodes healthy_only=%s tags=%s limit=%d count=%d",
+                        healthy_only,
+                        tags,
+                        limit,
+                        len(nodes),
+                    )
                     self._send_json(200, {"ok": True, "nodes": nodes})
                     return
                 if parsed.path == "/services/routes":
@@ -972,6 +981,13 @@ class InfoCenterHttpServer:
                     healthy_only = str((qs.get("healthy_only", ["true"]) or ["true"])[0]).lower() not in ("0", "false", "no")
                     limit = max(1, int((qs.get("limit", ["500"]) or ["500"])[0]))
                     routes = state.list_service_routes(service_name=service_name, healthy_only=healthy_only, limit=limit)
+                    logger.info(
+                        "[InfoCenter] GET /services/routes service_name=%s healthy_only=%s limit=%d count=%d",
+                        service_name,
+                        healthy_only,
+                        limit,
+                        len(routes),
+                    )
                     serialized = []
                     for item in routes:
                         row = dict(item)

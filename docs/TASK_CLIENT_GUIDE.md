@@ -120,7 +120,10 @@ client.submit(
 4. 如果 service/taskpool/job 依赖非 Python 资源，默认不会自动打包；你可以显式传 `resource_paths=[...]`
 5. 对 `JobQueue.submit(source=module, ...)`，`resource_paths=[...]` 只影响 job-orchestrator 侧的 module artifact；如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
 6. 如果你不想逐个列文件，也可以预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` / `submit_job_from_bytes(...)` 提交
-7. `JobQueue` 自己固定使用 `structured_v1 + default_safe`；`submit(...)` 里传的 `serialization_mode / policy_id` 会解释为未来 `TaskPool` 的执行策略
+7. `JobQueue` 自己固定使用 `structured_v1 + default_safe`
+8. `job-orch` 的 `taskpool_policy_id` 固定于启动时，不接受 `submit(...)` 运行期覆盖
+9. `submit(...)` 里允许改的是 `serialization_mode`，它会作为后续 `TaskPool` 执行面的 mode 偏好，并在共享池的 job 边界软切；`submit(...)` 不再接受 `policy_id`
+10. `job-orch` 运行期维持单个共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先复用池，软切失败再回退重建池，空闲超过 idle TTL 后再主动关池
 
 如果你想本地检查自动打包产物：
 

@@ -83,6 +83,18 @@ def test_ctl_parser_accepts_env_overrides_for_start_commands():
     ]
 
 
+def test_ctl_parser_accepts_debug_flag_and_typo_alias():
+    parser = ctl.build_parser()
+
+    args = parser.parse_args(["start", "--debug"])
+    assert args.command == "start"
+    assert args.debug is True
+
+    alias_args = parser.parse_args(["start-node", "--dubug"])
+    assert alias_args.command == "start-node"
+    assert alias_args.debug is True
+
+
 def test_ctl_parser_accepts_stop_node_command():
     parser = ctl.build_parser()
     args = parser.parse_args(["stop-node", "node-1"])
@@ -1409,3 +1421,35 @@ def test_spawn_server_uses_new_console_on_windows(tmp_path, monkeypatch):
     assert captured["stderr"] is None
     assert captured["close_fds"] is False
     assert captured["creationflags"] == 16
+
+
+def test_spawn_server_debug_inherits_stdio_on_posix(tmp_path, monkeypatch):
+    captured = {}
+
+    class DummyProc:
+        pid = 34567
+
+    def fake_popen(cmd, stdout=None, stderr=None, cwd=None, env=None, close_fds=None, creationflags=0):
+        captured["stdout"] = stdout
+        captured["stderr"] = stderr
+        captured["cwd"] = cwd
+        captured["env"] = env
+        captured["close_fds"] = close_fds
+        captured["creationflags"] = creationflags
+        return DummyProc()
+
+    monkeypatch.setattr(ctl.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(ctl.os, "name", "posix", raising=False)
+
+    pid = ctl._spawn_server(
+        tmp_path,
+        tmp_path / "logs" / "service.log",
+        ["--role", "controlplane"],
+        debug=True,
+    )
+
+    assert pid == 34567
+    assert captured["stdout"] is None
+    assert captured["stderr"] is None
+    assert captured["close_fds"] is True
+    assert captured["creationflags"] == 0

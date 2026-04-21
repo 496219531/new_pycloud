@@ -107,6 +107,39 @@ def test_native_task_pool_session_submit_and_wait() -> None:
         session.close()
 
 
+def test_native_task_pool_session_dynamic_default_max_in_flight_uses_effective_workers() -> None:
+    from pycloud_parallel import TaskPool
+
+    fake_pool_1 = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=2,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    fake_pool_2 = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=3,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool_1, "node-2": fake_pool_2},
+        nodes={
+            "node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=2),
+            "node-2": SimpleNamespace(node_id="node-2", task_pool_worker_available=3),
+        },
+        task_method="run",
+    )
+    try:
+        assert session._resolve_max_in_flight(None) == 8  # noqa: SLF001
+    finally:
+        session.close()
+
+
 def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None:
     from pycloud_parallel import TaskPool
 

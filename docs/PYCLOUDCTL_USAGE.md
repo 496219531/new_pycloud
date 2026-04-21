@@ -177,6 +177,25 @@ pycloudctl --runtime-root /tmp/pycloud-dev start
 pycloudctl --local start
 ```
 
+如果你想让主进程直接把报错打到当前终端/窗口，而不是只看日志文件：
+
+```bash
+pycloudctl start --debug
+```
+
+`--local` 和 `--debug` 可以一起用：
+
+```bash
+pycloudctl --local start --debug
+```
+
+说明：
+
+1. `--debug` 会把主进程日志级别切到 `DEBUG`
+2. 主进程 stdout/stderr 会直连当前控制台/窗口
+3. 这主要用于排查启动失败、注册失败、控制面报错
+4. 默认行为不变；不加 `--debug` 时仍按原来的后台/log 文件方式运行
+
 自定义端口：
 
 ```bash
@@ -191,6 +210,11 @@ pycloudctl \
 ```
 
 这里 `--node1-http` 和 `--node1-http-port` 是同一参数的两个别名；`node2` 同理。
+
+兼容说明：
+
+1. CLI 也接受历史手误别名 `--dubug`
+2. 但文档和推荐写法统一使用 `--debug`
 
 如果还想指定 host，也可以直接写：
 

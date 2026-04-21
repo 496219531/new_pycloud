@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import warnings
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Set
@@ -215,22 +214,14 @@ class QueueServiceClient:
         auth_token: str = "",
         timeout_sec: float = 10.0,
         service_name: str = "job-orchestrator",
-        serialization_mode: str = "",
+        task_serialization_mode: str = "",
     ) -> None:
         self.target = str(target or "").strip()
         self.client_id = str(client_id or "").strip()
         self._client_scope = self.client_id
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
-        self._default_task_serialization_mode = str(serialization_mode or "").strip()
-        if self._default_task_serialization_mode:
-            warnings.warn(
-                "JobQueue(serialization_mode=...) is deprecated as a queue transport setting; "
-                "it now acts only as the default execution policy for future TaskPool creation. "
-                "Prefer passing serialization_mode to JobQueue.submit(...).",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        self._default_task_serialization_mode = str(task_serialization_mode or "").strip()
         self.effective_policy = _jobqueue_effective_policy()
         self.serialization_mode = self.effective_policy.resolved_mode
         self._auth_ttl_sec = _default_job_auth_ttl_sec()
@@ -383,8 +374,9 @@ class QueueServiceClient:
         dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
-        serialization_mode: str = "",
+        task_serialization_mode: str = "",
         policy_id: str = "",
+        reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -520,14 +512,13 @@ class QueueServiceClient:
             payload["update_globals"] = normalized_update_globals
         if normalized_task_resource_paths:
             payload["task_resource_paths"] = [str(item) for item in normalized_task_resource_paths]
-        requested_task_serialization_mode = str(serialization_mode or "").strip().lower() or str(
+        requested_task_serialization_mode = str(task_serialization_mode or "").strip().lower() or str(
             self._default_task_serialization_mode or ""
         ).strip().lower()
         if requested_task_serialization_mode:
-            payload["serialization_mode"] = requested_task_serialization_mode
-        requested_task_policy_id = str(policy_id or "").strip().lower()
-        if requested_task_policy_id:
-            payload["policy_id"] = requested_task_policy_id
+            payload["task_serialization_mode"] = requested_task_serialization_mode
+        if reset_pool:
+            payload["reset_pool"] = True
         if self.client_id:
             payload["client_id"] = self.client_id
         return payload
@@ -546,8 +537,9 @@ class QueueServiceClient:
         dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
-        serialization_mode: str = "",
+        task_serialization_mode: str = "",
         policy_id: str = "",
+        reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -557,6 +549,8 @@ class QueueServiceClient:
         Default path: ``submit(source=my_job_module, ...)``.
         Advanced path: ``submit(artifact=Artifact(...), ...)``.
         """
+        if str(policy_id or "").strip():
+            raise ValueError("JobQueue.submit() no longer accepts policy_id; only task_serialization_mode is allowed")
         payload = self._prepare_submit_source_payload(
             source=source,
             artifact=artifact,
@@ -569,8 +563,9 @@ class QueueServiceClient:
             dependency_allowlist=dependency_allowlist,
             resource_paths=resource_paths,
             task_resource_paths=task_resource_paths,
-            serialization_mode=serialization_mode,
+            task_serialization_mode=task_serialization_mode,
             policy_id=policy_id,
+            reset_pool=reset_pool,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
             finalize_callable=finalize_callable,
@@ -629,8 +624,9 @@ class QueueServiceClient:
         runtime: str = "py3",
         package_format: str = "py",
         dependency_allowlist: Optional[Sequence[str]] = None,
-        serialization_mode: str = "",
+        task_serialization_mode: str = "",
         policy_id: str = "",
+        reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -643,8 +639,9 @@ class QueueServiceClient:
             entry_callable="run",
             package_format=_resolve_package_format(package_format, default="py"),
             dependency_allowlist=dependency_allowlist,
-            serialization_mode=serialization_mode,
+            task_serialization_mode=task_serialization_mode,
             policy_id=policy_id,
+            reset_pool=reset_pool,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
             finalize_callable=finalize_callable,
@@ -659,8 +656,9 @@ class QueueServiceClient:
         dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
-        serialization_mode: str = "",
+        task_serialization_mode: str = "",
         policy_id: str = "",
+        reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -672,8 +670,9 @@ class QueueServiceClient:
             dependency_allowlist=dependency_allowlist,
             resource_paths=resource_paths,
             task_resource_paths=task_resource_paths,
-            serialization_mode=serialization_mode,
+            task_serialization_mode=task_serialization_mode,
             policy_id=policy_id,
+            reset_pool=reset_pool,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
             finalize_callable=finalize_callable,

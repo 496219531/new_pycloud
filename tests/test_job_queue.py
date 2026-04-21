@@ -456,7 +456,7 @@ def test_run_job_with_hooks_uses_entryfunc_for_taskpool() -> None:
     assert "entry_module" not in call_kwargs
 
 
-def test_run_job_with_hooks_forwards_requested_taskpool_policy() -> None:
+def test_run_job_with_hooks_forwards_requested_taskpool_mode_and_fixed_policy() -> None:
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
     module_blob = (
@@ -471,15 +471,14 @@ def test_run_job_with_hooks_forwards_requested_taskpool_policy() -> None:
             "client_id": "client-a",
             "priority": 5,
             "blob_b64": base64.b64encode(module_blob).decode("utf-8"),
-            "entry_module": "job_hooks_requested_policy_demo",
-            "entry_callable": "run",
-            "package_format": "py",
-            "task_generator_callable": "task_generator",
-            "serialization_mode": "pickle_stable_v1",
-            "policy_id": "pickle_internal_heavy",
-            "job_payload": {"value": 2, "count": 1},
-        }
-    )
+                "entry_module": "job_hooks_requested_policy_demo",
+                "entry_callable": "run",
+                "package_format": "py",
+                "task_generator_callable": "task_generator",
+                "task_serialization_mode": "pickle_stable_v1",
+                "job_payload": {"value": 2, "count": 1},
+            }
+        )
     state.status = "RUNNING"
 
     class _FakePool:
@@ -506,7 +505,7 @@ def test_run_job_with_hooks_forwards_requested_taskpool_policy() -> None:
 
     call_kwargs = mocked.call_args.kwargs
     assert call_kwargs["serialization_mode"] == "pickle_stable_v1"
-    assert call_kwargs["policy_id"] == "pickle_internal_heavy"
+    assert call_kwargs["policy_id"] == queue._taskpool_policy_id
 
 
 def test_run_job_with_hooks_defaults_taskpool_policy_when_submit_omits_execution_policy() -> None:
@@ -557,7 +556,7 @@ def test_run_job_with_hooks_defaults_taskpool_policy_when_submit_omits_execution
 
     call_kwargs = mocked.call_args.kwargs
     assert call_kwargs["serialization_mode"] == ""
-    assert call_kwargs["policy_id"] == ""
+    assert call_kwargs["policy_id"] == queue._taskpool_policy_id
 
 
 def test_run_job_with_hooks_uses_default_taskpool_policy_when_submit_omits_policy_fields() -> None:
@@ -608,7 +607,7 @@ def test_run_job_with_hooks_uses_default_taskpool_policy_when_submit_omits_polic
 
     call_kwargs = mocked.call_args.kwargs
     assert call_kwargs["serialization_mode"] == ""
-    assert call_kwargs["policy_id"] == ""
+    assert call_kwargs["policy_id"] == queue._taskpool_policy_id
 
 
 def test_run_job_with_hooks_forwards_task_resource_paths_to_task_pool() -> None:
@@ -631,8 +630,7 @@ def test_run_job_with_hooks_forwards_task_resource_paths_to_task_pool() -> None:
             "package_format": "py",
             "task_generator_callable": "task_generator",
             "task_resource_paths": ["worker/data.csv"],
-            "serialization_mode": "pickle_stable_v1",
-            "policy_id": "pickle_internal_heavy",
+            "task_serialization_mode": "pickle_stable_v1",
             "job_payload": {"value": 2, "count": 1},
         }
     )
@@ -665,7 +663,7 @@ def test_run_job_with_hooks_forwards_task_resource_paths_to_task_pool() -> None:
     assert call_kwargs["entry_callable"] == "run"
     assert call_kwargs["resource_paths"] == ["worker/data.csv"]
     assert call_kwargs["serialization_mode"] == "pickle_stable_v1"
-    assert call_kwargs["policy_id"] == "pickle_internal_heavy"
+    assert call_kwargs["policy_id"] == queue._taskpool_policy_id
     assert "entry_func" not in call_kwargs
 
 
@@ -1087,6 +1085,74 @@ def test_run_job_with_hooks_purges_loaded_modules() -> None:
     assert mocked.call_args.kwargs["package_format"] == "py"
 
 
+def test_run_job_with_hooks_cleans_extracted_dir_without_scheduler_crash(tmp_path) -> None:
+    queue = JobQueueManager()
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    extract_dir = tmp_path / "job_hooks_extract"
+    extract_dir.mkdir()
+    (extract_dir / "marker.txt").write_text("ok", encoding="utf-8")
+
+    fake_module = SimpleNamespace(
+        __pycloud_temp_extract_dir__=str(extract_dir),
+    )
+
+    def _run(value=0, **_kwargs):
+        return {"value": int(value)}
+
+    def _task_generator(value=0, count=1, **_kwargs):
+        return [{"value": value + idx} for idx in range(int(count))]
+
+    fake_module.run = _run
+    fake_module.task_generator = _task_generator
+
+    state = queue.submit_job(  # noqa: SLF001
+        {
+            "job_id": "job-hooks-cleanup-1",
+            "client_id": "client-a",
+            "priority": 5,
+            "blob_b64": base64.b64encode(b"placeholder").decode("utf-8"),
+            "entry_module": "job_hooks_cleanup_demo",
+            "entry_callable": "run",
+            "package_format": "py",
+            "task_generator_callable": "task_generator",
+            "job_payload": {"value": 1, "count": 2},
+        }
+    )
+    state.status = "RUNNING"
+
+    class _FakePool:
+        def __init__(self):
+            self.job_id = "job-hooks-cleanup-1"
+
+        def imap_unordered(self, payloads, **kwargs):
+            del kwargs
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
+
+        def update_globals(self, values):
+            return values
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            return None
+
+    fake_pool = _FakePool()
+    with (
+        patch("pycloud_parallel.controlplane.job_queue._load_user_module", return_value=fake_module),
+        patch("pycloud_parallel.controlplane.job_queue._purge_loaded_artifact_modules"),
+        patch("pycloud_parallel.controlplane.job_queue.gc.collect"),
+        patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool),
+    ):
+        queue._run_job("job-hooks-cleanup-1")  # noqa: SLF001
+
+    job = queue.get_job("job-hooks-cleanup-1")
+    assert job is not None
+    assert job.status == "SUCCEEDED"
+    assert not extract_dir.exists()
+
+
 def test_job_queue_client_submit_job_from_bytes_uses_minimal_payload() -> None:
     from pycloud_parallel import JobQueue
 
@@ -1198,7 +1264,7 @@ def test_job_queue_client_submit_accepts_module_source_via_unified_artifact_path
     assert captured["package_format"] == "tar.gz"
 
 
-def test_job_queue_submit_interprets_serialization_mode_and_policy_id_for_future_task_pool() -> None:
+def test_job_queue_submit_interprets_task_serialization_mode_for_future_task_pool() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1212,13 +1278,26 @@ def test_job_queue_submit_interprets_serialization_mode_and_policy_id_for_future
     resp = client.submit(
         source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
         entry_module="job_demo",
-        serialization_mode="pickle_stable_v1",
-        policy_id="pickle_internal_heavy",
+        task_serialization_mode="pickle_stable_v1",
     )
 
     assert resp == {"ok": True}
-    assert captured["serialization_mode"] == "pickle_stable_v1"
-    assert captured["policy_id"] == "pickle_internal_heavy"
+    assert captured["task_serialization_mode"] == "pickle_stable_v1"
+
+
+def test_job_queue_submit_rejects_policy_id() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
+    try:
+        with pytest.raises(ValueError, match="no longer accepts policy_id"):
+            client.submit(
+                source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
+                entry_module="job_demo",
+                policy_id="pickle_internal_heavy",
+            )
+    finally:
+        client.close()
 
 
 def test_job_queue_client_submit_rejects_callable_source() -> None:
@@ -2000,9 +2079,14 @@ def test_run_job_with_hooks_uses_larger_default_worker_node_and_inflight(monkeyp
 
     class _FakePool:
         job_id = "job-hooks-defaults"
+        worker_count = 10
+
+        def _resolve_max_in_flight(self, requested):
+            del requested
+            return 15
 
         def imap_unordered(self, payloads, **kwargs):
-            assert kwargs["max_in_flight"] == 100
+            assert kwargs["max_in_flight"] == 15
             assert kwargs["receive_batch"] == 10
             for idx, item in enumerate(list(payloads)):
                 yield idx, {"value": int(item["value"])}

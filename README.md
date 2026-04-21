@@ -321,6 +321,21 @@ pycloudctl \
 pycloudctl --local start
 ```
 
+如果你想直接看到主进程报错和更详细日志，可以加：
+
+```bash
+pycloudctl start --debug
+pycloudctl --local start --debug
+```
+
+说明：
+
+1. `--debug` 只影响主进程启动方式和日志级别
+2. 主进程会用 `DEBUG` 日志级别启动
+3. 主进程的 stdout/stderr 会直连当前控制台/窗口，方便直接看报错
+4. `--local` 和 `--debug` 可以同时生效
+5. 默认行为不变；只有显式加 `--debug` 才开启
+
 ### 2. 服务模式
 
 ```python

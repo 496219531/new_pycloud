@@ -6,8 +6,11 @@ import gc
 import hashlib
 import json
 import os
+import logging
+import shutil
 import threading
 import time
+import warnings
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -19,10 +22,25 @@ from typing import Any, Dict, List, Optional, Sequence
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.controlplane.payload_transport import normalize_inbound_payload
-from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
+from pycloud_parallel.controlplane.policy_profile import (
+    get_default_mode_for_binding,
+    get_default_policy_id_for_binding,
+    get_policy_profile,
+)
+from pycloud_parallel.controlplane.payload_transport import (
+    decode_result_from_transport,
+    normalize_inbound_payload,
+)
+from pycloud_parallel.controlplane.serialization import (
+    convert_dict_to_arrow,
+    decode_transport_payload_bytes,
+    detect_transport_mode,
+    struct_to_python,
+)
+from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.node.execution import (
     _invoke_user_callable,
     _load_user_module,
@@ -30,6 +48,8 @@ from pycloud_parallel.controlplane.node.execution import (
 )
 from pycloud_parallel.execution.task_pool import TaskPool
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -51,6 +71,18 @@ def _create_job_task_pool(**kwargs: Any) -> TaskPool:
     return TaskPool.from_infocenter(**kwargs)
 
 
+_JOB_ORCH_TASKPOOL_BINDING_ID = "taskpool_default"
+
+
+@dataclass
+class _SharedTaskPoolState:
+    pool: TaskPool
+    artifact_key: str = ""
+    policy_id: str = ""
+    current_mode: str = ""
+    last_used_at: datetime = field(default_factory=utc_now)
+
+
 def _close_executor_async(executor: Any) -> None:
     if executor is None:
         return
@@ -64,14 +96,43 @@ def _close_executor_async(executor: Any) -> None:
     threading.Thread(target=_worker, name="job-queue-executor-close", daemon=True).start()
 
 
-def _task_result_to_dict(item: pb2.TaskResult) -> Dict[str, object]:
+_TASKPOOL_SHARED_BINDING_ID = "taskpool_default"
+_TASKPOOL_SHARED_POLICY_ID = get_default_policy_id_for_binding(_TASKPOOL_SHARED_BINDING_ID)
+_TASKPOOL_SHARED_DEFAULT_MODE = get_default_mode_for_binding(_TASKPOOL_SHARED_BINDING_ID)
+
+
+@dataclass
+class _SharedPoolState:
+    executor: TaskPool
+    artifact_key: str
+    policy_id: str
+    current_mode: str
+    last_used_at: datetime
+
+
+def _task_result_to_dict(item: pb2.TaskResult, *, serialization_mode: str = "") -> Dict[str, object]:
     detail: Dict[str, object] = {}
-    if item.result:
+    if item.HasField("transport_result") and str(item.transport_result.codec or "").strip():
         detail = {
-            "result": {
-                key: value
-                for key, value in item.result.items()
-            }
+            "result": decode_transport_payload_bytes(
+                str(item.transport_result.codec or ""),
+                int(item.transport_result.version or 0),
+                item.transport_result.payload,
+                context="jobqueue_session",
+            )
+        }
+    elif item.result:
+        raw_result = struct_to_python(item.result)
+        try:
+            resolved_result = decode_result_from_transport(
+                raw_result,
+                mode=detect_transport_mode(raw_result, default=serialization_mode or "legacy_v1"),
+                context="jobqueue_session",
+            )
+        except Exception:
+            resolved_result = raw_result
+        detail = {
+            "result": resolved_result
         }
     elif item.error and (item.error.type or item.error.message):
         detail = {
@@ -347,6 +408,31 @@ def _preview_job_value(value: object, *, limit: int = 160) -> str:
     return normalized[: max(13, int(limit) - 3)] + "..."
 
 
+def _artifact_key_preview(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 24:
+        return text
+    return text[:24] + "..."
+
+
+def _resolve_job_executor_max_in_flight(executor: object, requested: object) -> int:
+    if requested is not None:
+        try:
+            normalized = int(requested)
+        except Exception:
+            normalized = 0
+        if normalized > 0:
+            return max(1, normalized)
+    resolver = getattr(executor, "_resolve_max_in_flight", None)
+    if callable(resolver):
+        try:
+            return max(1, int(resolver(None)))
+        except Exception:
+            pass
+    worker_count = max(0, int(getattr(executor, "worker_count", 0) or 0))
+    return max(1, int(worker_count or 1))
+
+
 def _uses_job_hooks(payload: Dict[str, object]) -> bool:
     if str(payload.get("job_mode", "") or "").strip().lower() == "hooks":
         return True
@@ -466,7 +552,12 @@ class JobState:
 
 
 class JobQueueManager:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        taskpool_policy_id: str = "",
+        pool_idle_ttl_sec: Optional[int] = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._jobs: Dict[str, JobState] = {}
@@ -474,10 +565,21 @@ class JobQueueManager:
         self._enqueue_seq = 0
         self._running_job_id = ""
         self._current_executor: Any = None
+        self._shared_pool: Optional[_SharedPoolState] = None
         self._controlplane_target = ""
         self._stop = False
         self._thread: Optional[threading.Thread] = None
         self._retention_sec = max(60, int(os.getenv("PYCLOUD_JOB_QUEUE_RETENTION_SEC", "3600") or 3600))
+        self._taskpool_policy_id = str(taskpool_policy_id or "").strip().lower() or _TASKPOOL_SHARED_POLICY_ID
+        self._taskpool_profile = get_policy_profile(self._taskpool_policy_id)
+        self._pool_idle_ttl_sec = max(
+            0,
+            int(
+                pool_idle_ttl_sec
+                if pool_idle_ttl_sec is not None
+                else (os.getenv("PYCLOUD_JOB_QUEUE_POOL_IDLE_TTL_SEC", "30") or 30)
+            ),
+        )
 
     def start(self, *, controlplane_target: str) -> None:
         with self._lock:
@@ -502,10 +604,120 @@ class JobQueueManager:
         self._thread = None
         with self._lock:
             executor = self._current_executor
+            shared_executor = self._shared_pool.executor if self._shared_pool is not None else None
+            self._shared_pool = None
             release_states = [state for state in self._jobs.values() if state.staged_ref_ids]
         _close_executor_async(executor)
+        if shared_executor is not None and shared_executor is not executor:
+            _close_executor_async(shared_executor)
         for state in release_states:
             self._release_job_refs(state)
+
+    def _resolve_requested_task_mode(self, payload: Dict[str, object]) -> str:
+        requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
+        effective = resolve_effective_policy(
+            self._taskpool_profile,
+            requested_mode=requested_mode or _TASKPOOL_SHARED_DEFAULT_MODE,
+            context="taskpool_session",
+        )
+        return effective.resolved_mode
+
+    def _shared_pool_artifact_key(
+        self,
+        *,
+        blob: Optional[bytes] = None,
+        artifact_path: str = "",
+        runtime: str = "",
+        entry_module: str = "",
+        entry_callable: str = "",
+        package_format: str = "",
+        dependency_allowlist: Sequence[str] = (),
+        managed_global_names: Sequence[str] = (),
+        task_resource_paths: Sequence[str] = (),
+    ) -> str:
+        if blob is not None:
+            code_key = hashlib.sha256(bytes(blob)).hexdigest()
+        elif artifact_path:
+            code_key = f"path:{str(artifact_path).strip()}"
+        else:
+            code_key = f"module:{str(entry_module).strip()}"
+        return "|".join(
+            [
+                code_key,
+                str(runtime or "").strip(),
+                str(entry_module or "").strip(),
+                str(entry_callable or "").strip(),
+                str(package_format or "").strip(),
+                ",".join(sorted(str(item).strip() for item in (dependency_allowlist or ()) if str(item).strip())),
+                ",".join(sorted(str(item).strip() for item in (managed_global_names or ()) if str(item).strip())),
+                ",".join(sorted(str(item).strip() for item in (task_resource_paths or ()) if str(item).strip())),
+            ]
+        )
+
+    def _artifact_key(
+        self,
+        *,
+        blob: bytes,
+        runtime: str,
+        entry_module: str,
+        entry_callable: str,
+        package_format: str,
+        dependency_allowlist: Sequence[str],
+        managed_global_names: Sequence[str],
+        task_resource_paths: Sequence[str],
+    ) -> str:
+        digest = hashlib.sha256(bytes(blob or b"")).hexdigest()
+        return "|".join(
+            [
+                digest,
+                str(runtime or "").strip(),
+                str(entry_module or "").strip(),
+                str(entry_callable or "").strip(),
+                str(package_format or "").strip(),
+                ",".join(sorted(str(item).strip() for item in (dependency_allowlist or ()) if str(item).strip())),
+                ",".join(sorted(str(item).strip() for item in (managed_global_names or ()) if str(item).strip())),
+                ",".join(sorted(str(item).strip() for item in (task_resource_paths or ()) if str(item).strip())),
+            ]
+        )
+
+    def _switch_pool_mode_for_job(self, requested_mode: str, *, reset_pool: bool = False) -> None:
+        shared = self._shared_pool
+        if shared is None:
+            raise RuntimeError("shared task pool is not initialized")
+        pool = shared.executor
+        pending = getattr(pool, "_pending_result_count", lambda: 0)()
+        if int(pending or 0) > 0:
+            raise RuntimeError("shared task pool still has pending results")
+        if reset_pool:
+            raise RuntimeError("shared task pool backend does not support reset_pool")
+        effective = resolve_effective_policy(
+            self._taskpool_profile,
+            requested_mode=requested_mode or _TASKPOOL_SHARED_DEFAULT_MODE,
+            context="taskpool_session",
+        )
+        pool._serialization_mode = effective.resolved_mode  # noqa: SLF001
+        pool.effective_policy = effective
+        pool.globals_digests = {}
+        shared.current_mode = effective.resolved_mode
+        shared.last_used_at = utc_now()
+        logger.info(
+            "[JobQueue] shared pool mode switch artifact_key=%s policy_id=%s mode=%s",
+            _artifact_key_preview(shared.artifact_key),
+            shared.policy_id,
+            shared.current_mode,
+        )
+
+    def _close_shared_pool_locked(self) -> Any:
+        shared = self._shared_pool
+        self._shared_pool = None
+        if shared is not None:
+            logger.info(
+                "[JobQueue] shared pool detached artifact_key=%s policy_id=%s mode=%s",
+                _artifact_key_preview(shared.artifact_key),
+                shared.policy_id,
+                shared.current_mode,
+            )
+        return shared.executor if shared is not None else None
 
     def _detach_stale_running_locked(self) -> Any:
         current = str(self._running_job_id or "").strip()
@@ -515,9 +727,12 @@ class JobQueueManager:
         if current_state is not None and current_state.status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
             return None
         executor = self._current_executor
+        shared_executor = self._shared_pool.executor if self._shared_pool is not None else None
         self._running_job_id = ""
         self._current_executor = None
         self._cv.notify_all()
+        if shared_executor is not None and executor is shared_executor:
+            return None
         return executor
 
     def _ensure_scheduler_thread_locked(self) -> None:
@@ -527,6 +742,86 @@ class JobQueueManager:
             return
         self._thread = threading.Thread(target=self._loop, name="job-queue-scheduler", daemon=True)
         self._thread.start()
+
+    def _shared_pool_idle_expired_locked(self, *, now: datetime) -> bool:
+        if self._shared_pool is None:
+            return False
+        if self._pool_idle_ttl_sec <= 0:
+            return False
+        return (now - self._shared_pool.last_used_at).total_seconds() >= float(self._pool_idle_ttl_sec)
+
+    def _get_or_create_shared_pool(
+        self,
+        *,
+        artifact_key: str,
+        requested_mode: str,
+        reset_pool: bool = False,
+        create_pool: Any,
+    ) -> TaskPool:
+        pool_to_close = None
+        with self._lock:
+            shared = self._shared_pool
+            if shared is not None and shared.artifact_key == artifact_key:
+                try:
+                    self._switch_pool_mode_for_job(requested_mode, reset_pool=reset_pool)
+                    shared.last_used_at = utc_now()
+                    logger.info(
+                        "[JobQueue] shared pool reuse artifact_key=%s policy_id=%s mode=%s",
+                        _artifact_key_preview(shared.artifact_key),
+                        shared.policy_id,
+                        shared.current_mode,
+                    )
+                    return shared.executor
+                except Exception as exc:
+                    logger.warning(
+                        "job-orch shared pool soft switch failed; rebuilding pool "
+                        "artifact_key=%s current_mode=%s requested_mode=%s policy_id=%s reset_pool=%s err=%r",
+                        artifact_key,
+                        shared.current_mode,
+                        requested_mode,
+                        shared.policy_id,
+                        bool(reset_pool),
+                        exc,
+                    )
+                    pool_to_close = self._close_shared_pool_locked()
+            elif shared is not None:
+                logger.info(
+                    "[JobQueue] shared pool rebuild due to artifact change old=%s new=%s",
+                    _artifact_key_preview(shared.artifact_key),
+                    _artifact_key_preview(artifact_key),
+                )
+                pool_to_close = self._close_shared_pool_locked()
+        if pool_to_close is not None:
+            _close_executor_async(pool_to_close)
+
+        pool = create_pool(requested_mode or _TASKPOOL_SHARED_DEFAULT_MODE)
+        if not hasattr(pool, "unordered") and hasattr(pool, "imap_unordered"):
+            try:
+                setattr(pool, "unordered", getattr(pool, "imap_unordered"))
+            except Exception:
+                pass
+        effective = resolve_effective_policy(
+            self._taskpool_profile,
+            requested_mode=requested_mode or _TASKPOOL_SHARED_DEFAULT_MODE,
+            context="taskpool_session",
+        )
+        pool._serialization_mode = effective.resolved_mode  # noqa: SLF001
+        pool.effective_policy = effective
+        with self._lock:
+            self._shared_pool = _SharedPoolState(
+                executor=pool,
+                artifact_key=artifact_key,
+                policy_id=self._taskpool_policy_id,
+                current_mode=effective.resolved_mode,
+                last_used_at=utc_now(),
+            )
+        logger.info(
+            "[JobQueue] shared pool create artifact_key=%s policy_id=%s mode=%s",
+            _artifact_key_preview(artifact_key),
+            self._taskpool_policy_id,
+            effective.resolved_mode,
+        )
+        return pool
 
     def submit_job(self, payload: Dict[str, object], *, auth_token: str = "") -> JobState:
         raw_payload = dict(payload or {})
@@ -538,6 +833,10 @@ class JobQueueManager:
         )
         if not isinstance(normalized_payload, dict):
             raise ValueError("job payload must resolve to a dict")
+        if str(normalized_payload.get("policy_id", "") or "").strip():
+            raise ValueError(
+                "job-orchestrator taskpool policy is fixed at startup; submit policy_id is not supported"
+            )
         _validate_delayed_resolve_refs(normalized_payload)
         job_id = str(normalized_payload.get("job_id", "") or "").strip() or f"jobq-{uuid.uuid4().hex}"
         client_id = str(normalized_payload.get("client_id", "") or "").strip() or f"job-client-{uuid.uuid4().hex[:8]}"
@@ -572,6 +871,18 @@ class JobQueueManager:
             self._insert_waiting_job_locked(state)
             self._ensure_scheduler_thread_locked()
             self._cv.notify_all()
+        logger.info(
+            "[JobQueue] submit job_id=%s client_id=%s status=%s entry_module=%s entry_callable=%s job_mode=%s task_mode=%s reset_pool=%s priority=%s",
+            job_id,
+            client_id,
+            state.status,
+            state.entry_module,
+            state.entry_callable,
+            str(normalized_payload.get("job_mode", "") or ""),
+            str(normalized_payload.get("task_serialization_mode", "") or ""),
+            bool(normalized_payload.get("reset_pool", False)),
+            priority,
+        )
         _close_executor_async(executor_to_close)
         return state
 
@@ -820,12 +1131,13 @@ class JobQueueManager:
             refs_to_touch: List[JobState] = []
             refs_to_release: List[JobState] = []
             next_job: Optional[JobState] = None
-            executor_to_close: Any = None
+            shared_pool_to_close: Any = None
             with self._cv:
                 while not self._stop and self._running_job_id:
                     current_state = self._jobs.get(self._running_job_id)
                     if current_state is None or current_state.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-                        executor_to_close = self._current_executor
+                        if self._shared_pool is not None:
+                            self._shared_pool.last_used_at = utc_now()
                         self._running_job_id = ""
                         self._current_executor = None
                         self._cv.notify_all()
@@ -837,6 +1149,14 @@ class JobQueueManager:
                 refs_to_touch = self._jobs_needing_ref_touch_locked(now=utc_now())
                 next_job = self._pick_next_job_locked()
                 if next_job is None:
+                    if not self._running_job_id and self._shared_pool_idle_expired_locked(now=utc_now()):
+                        if self._shared_pool is not None:
+                            logger.info(
+                                "[JobQueue] shared pool idle expiry artifact_key=%s idle_ttl_sec=%s",
+                                _artifact_key_preview(self._shared_pool.artifact_key),
+                                self._pool_idle_ttl_sec,
+                            )
+                        shared_pool_to_close = self._close_shared_pool_locked()
                     self._cv.wait(timeout=0.1)
                 else:
                     next_job.status = "RUNNING"
@@ -846,23 +1166,37 @@ class JobQueueManager:
                     next_job.checkpoint["phase"] = "preparing"
                     self._remove_waiting_job_locked(next_job.job_id)
                     self._running_job_id = next_job.job_id
+                    logger.info(
+                        "[JobQueue] start job_id=%s client_id=%s entry_module=%s job_mode=%s",
+                        next_job.job_id,
+                        next_job.client_id,
+                        next_job.entry_module,
+                        str(next_job.payload.get("job_mode", "") or ""),
+                    )
             for state in refs_to_release:
                 self._release_job_refs(state)
             for state in refs_to_touch:
                 self._touch_job_refs(state)
-            _close_executor_async(executor_to_close)
+            _close_executor_async(shared_pool_to_close)
             if next_job is None:
                 continue
             self._run_job(next_job.job_id)
             terminal_state = self.get_job(next_job.job_id)
             if terminal_state is not None and terminal_state.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                logger.info(
+                    "[JobQueue] terminal job_id=%s status=%s results=%d error=%s",
+                    terminal_state.job_id,
+                    terminal_state.status,
+                    len(list(terminal_state.results or ())),
+                    _preview_job_value(terminal_state.error),
+                )
                 self._release_job_refs(terminal_state)
             with self._cv:
-                executor_to_close = self._current_executor
+                if self._shared_pool is not None:
+                    self._shared_pool.last_used_at = utc_now()
                 self._running_job_id = ""
                 self._current_executor = None
                 self._cv.notify_all()
-            _close_executor_async(executor_to_close)
 
     def _expand_subtasks(self, payload: Dict[str, object]) -> List[Dict[str, object]]:
         subtasks = payload.get("subtasks") or []
@@ -1042,6 +1376,10 @@ class JobQueueManager:
                 return
             kwargs["blob"] = blob
         artifact_path = str(payload.get("artifact_path", "") or "").strip()
+        task_resource_paths = [str(item).strip() for item in list(payload.get("task_resource_paths") or ()) if str(item).strip()]
+        raw_requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
+        requested_mode = self._resolve_requested_task_mode(payload)
+        reset_pool = bool(payload.get("reset_pool", False))
         default_worker_count = _default_job_worker_count()
         default_node_count = _default_job_node_count(
             controlplane_target=self._controlplane_target,
@@ -1050,7 +1388,27 @@ class JobQueueManager:
 
         executor: Optional[Any] = None
         try:
-            executor = _create_job_task_pool(
+            logger.info(
+                "[JobQueue] run job_id=%s mode=plain subtasks=%d requested_mode=%s reset_pool=%s",
+                job_id_snapshot,
+                len(subtasks),
+                requested_mode,
+                reset_pool,
+            )
+            artifact_key = self._shared_pool_artifact_key(
+                blob=kwargs.get("blob"),
+                artifact_path=artifact_path,
+                runtime=str(kwargs.get("runtime", "py3") or "py3"),
+                entry_module=str(kwargs.get("entry_module", "") or ""),
+                entry_callable=str(kwargs.get("entry_callable", "run") or "run"),
+                package_format=str(kwargs.get("package_format", "") or ""),
+                dependency_allowlist=list(kwargs.get("dependency_allowlist") or ()),
+                managed_global_names=list(kwargs.get("managed_global_names") or ()),
+                task_resource_paths=task_resource_paths,
+            )
+
+            def _create_pool(mode: str) -> TaskPool:
+                return _create_job_task_pool(
                     infocenter_target=self._controlplane_target,
                     job_id=job_id_snapshot,
                     owner_client_id=kwargs.get("client_id") or client_id,
@@ -1061,8 +1419,8 @@ class JobQueueManager:
                     entry_module=kwargs.get("entry_module", ""),
                     entry_callable=kwargs.get("entry_callable", "run"),
                     package_format=kwargs.get("package_format", ""),
-                    serialization_mode=str(payload.get("serialization_mode", "") or "").strip(),
-                    policy_id=str(payload.get("policy_id", "") or "").strip(),
+                    serialization_mode=raw_requested_mode or "",
+                    policy_id=self._taskpool_policy_id,
                     dependency_allowlist=kwargs.get("dependency_allowlist"),
                     managed_global_names=kwargs.get("managed_global_names"),
                     worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
@@ -1075,6 +1433,14 @@ class JobQueueManager:
                     node_limit=kwargs.get("node_limit", 100),
                     timeout_sec=kwargs.get("timeout_sec", 10.0),
                 )
+
+            executor = self._get_or_create_shared_pool(
+                artifact_key=artifact_key,
+                requested_mode=requested_mode,
+                reset_pool=reset_pool,
+                create_pool=_create_pool,
+            )
+            executor._job_id = job_id_snapshot  # noqa: SLF001
             with self._lock:
                 self._current_executor = executor
             if prepared_update_globals:
@@ -1082,6 +1448,11 @@ class JobQueueManager:
                     state = self._jobs.get(job_id)
                     if state is not None:
                         state.checkpoint["phase"] = "fanout_globals"
+                logger.info(
+                    "[JobQueue] update_globals job_id=%s key_count=%d",
+                    job_id_snapshot,
+                    len(prepared_update_globals),
+                )
                 executor.update_globals(dict(prepared_update_globals))
             with self._lock:
                 state = self._jobs.get(job_id)
@@ -1093,6 +1464,12 @@ class JobQueueManager:
                 timeout_hint_sec=int(payload.get("timeout_hint_sec", 0) or 0),
                 priority=max(1, int(payload.get("task_priority", 1) or 1)),
                 runtime_key=str(payload.get("runtime_key", "") or "").strip(),
+            )
+            logger.info(
+                "[JobQueue] submit tasks job_id=%s accepted=%d rejected=%d",
+                job_id_snapshot,
+                len(list(submit_resp.accepted or ())),
+                len(list(submit_resp.rejected or ())),
             )
             pending = {str(item.task_id or "").strip() for item in submit_resp.accepted}
             results: List[pb2.TaskResult] = []
@@ -1135,7 +1512,7 @@ class JobQueueManager:
                     results.append(item)
                 if not batch:
                     time.sleep(0.05)
-            rendered_results = [_task_result_to_dict(item) for item in results]
+            rendered_results = [_task_result_to_dict(item, serialization_mode=requested_mode) for item in results]
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is None:
@@ -1150,6 +1527,7 @@ class JobQueueManager:
                 else:
                     state.status = "SUCCEEDED"
         except Exception as exc:
+            logger.exception("[JobQueue] run job failed job_id=%s", job_id_snapshot)
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
@@ -1185,6 +1563,9 @@ class JobQueueManager:
         task_entry_callable = str(payload.get("entry_callable", "run") or "run").strip() or "run"
         raw_task_generator = payload.get("task_generator_callable", "task_generator")
         task_resource_paths = [str(item).strip() for item in list(payload.get("task_resource_paths") or ()) if str(item).strip()]
+        raw_requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
+        requested_mode = self._resolve_requested_task_mode(payload)
+        reset_pool = bool(payload.get("reset_pool", False))
         handle_result_callable = (
             str(payload.get("handle_result_callable", "") or "").strip()
         )
@@ -1204,6 +1585,13 @@ class JobQueueManager:
         produced = None
         stream = None
         try:
+            logger.info(
+                "[JobQueue] run job_id=%s mode=hooks entry_module=%s requested_mode=%s reset_pool=%s",
+                job_id_snapshot,
+                entry_module,
+                requested_mode,
+                reset_pool,
+            )
             tmp_path.write_bytes(blob)
             module = _load_user_module(
                 str(tmp_path),
@@ -1248,35 +1636,55 @@ class JobQueueManager:
                 payload=payload,
             )
 
-            task_pool_kwargs = {
-                "infocenter_target": self._controlplane_target,
-                "job_id": job_id_snapshot,
-                "owner_client_id": client_id,
-                "pool_name": str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
-                "runtime": str(payload.get("runtime", "py3") or "py3"),
-                "serialization_mode": str(payload.get("serialization_mode", "") or "").strip(),
-                "policy_id": str(payload.get("policy_id", "") or "").strip(),
-                "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
-                "managed_global_names": effective_managed_global_names,
-                "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
-                "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
-                "idle_ttl_sec": max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
-                "healthy_only": bool(payload.get("healthy_only", True)),
-                "tags": list(payload.get("tags") or ()),
-                "node_ids": list(payload.get("node_ids") or ()),
-                "node_count": max(0, int(payload.get("pool_node_count", payload.get("node_count", default_node_count) or default_node_count) or 0)),
-                "node_limit": int(payload.get("node_limit", 100) or 100),
-                "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
-            }
-            if task_resource_paths:
-                task_pool_kwargs.update(
-                    source=module,
-                    entry_callable=task_entry_callable,
-                    resource_paths=task_resource_paths,
-                )
-            else:
-                task_pool_kwargs["entry_func"] = task_entry
-            executor = _create_job_task_pool(**task_pool_kwargs)
+            artifact_key = self._shared_pool_artifact_key(
+                blob=blob,
+                runtime=str(payload.get("runtime", "py3") or "py3"),
+                entry_module=entry_module,
+                entry_callable=task_entry_callable,
+                package_format=package_format,
+                dependency_allowlist=list(payload.get("dependency_allowlist") or ()),
+                managed_global_names=effective_managed_global_names,
+                task_resource_paths=task_resource_paths,
+            )
+
+            def _create_pool(mode: str) -> TaskPool:
+                task_pool_kwargs = {
+                    "infocenter_target": self._controlplane_target,
+                    "job_id": job_id_snapshot,
+                    "owner_client_id": client_id,
+                    "pool_name": str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
+                    "runtime": str(payload.get("runtime", "py3") or "py3"),
+                    "serialization_mode": raw_requested_mode or "",
+                    "policy_id": self._taskpool_policy_id,
+                    "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
+                    "managed_global_names": effective_managed_global_names,
+                    "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
+                    "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
+                    "idle_ttl_sec": max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
+                    "healthy_only": bool(payload.get("healthy_only", True)),
+                    "tags": list(payload.get("tags") or ()),
+                    "node_ids": list(payload.get("node_ids") or ()),
+                    "node_count": max(0, int(payload.get("pool_node_count", payload.get("node_count", default_node_count) or default_node_count) or 0)),
+                    "node_limit": int(payload.get("node_limit", 100) or 100),
+                    "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
+                }
+                if task_resource_paths:
+                    task_pool_kwargs.update(
+                        source=module,
+                        entry_callable=task_entry_callable,
+                        resource_paths=task_resource_paths,
+                    )
+                else:
+                    task_pool_kwargs["entry_func"] = task_entry
+                return _create_job_task_pool(**task_pool_kwargs)
+
+            executor = self._get_or_create_shared_pool(
+                artifact_key=artifact_key,
+                requested_mode=requested_mode,
+                reset_pool=reset_pool,
+                create_pool=_create_pool,
+            )
+            executor._job_id = job_id_snapshot  # noqa: SLF001
             with self._lock:
                 self._current_executor = executor
 
@@ -1285,13 +1693,27 @@ class JobQueueManager:
                     current_state = self._jobs.get(job_id)
                     if current_state is not None:
                         current_state.checkpoint["phase"] = "fanout_globals"
+                logger.info(
+                    "[JobQueue] phase=fanout_globals job_id=%s key_count=%d",
+                    job_id_snapshot,
+                    len(prepared_update_globals),
+                )
                 executor.update_globals(dict(prepared_update_globals))
+                logger.info(
+                    "[JobQueue] phase=fanout_globals_done job_id=%s key_count=%d",
+                    job_id_snapshot,
+                    len(prepared_update_globals),
+                )
 
             produced = _resolve_task_generator_output(
                 task_generator,
                 module=module,
                 payload=hook_kwargs,
             )
+            if isinstance(produced, list):
+                logger.info("[JobQueue] task_generator job_id=%s produced=%d", job_id_snapshot, len(produced))
+            else:
+                logger.info("[JobQueue] task_generator job_id=%s produced_type=%s", job_id_snapshot, type(produced).__name__)
 
             def _payload_stream() -> Any:
                 for item in produced:
@@ -1307,9 +1729,15 @@ class JobQueueManager:
                 current_state = self._jobs.get(job_id)
                 if current_state is not None:
                     current_state.checkpoint["phase"] = "running_tasks"
+            logger.info(
+                "[JobQueue] phase=running_tasks job_id=%s max_in_flight=%s receive_batch=%s",
+                job_id_snapshot,
+                _resolve_job_executor_max_in_flight(executor, payload.get("max_in_flight")),
+                max(1, int(payload.get("receive_batch", 10) or 10)),
+            )
             stream = executor.imap_unordered(
                 _payload_stream(),
-                max_in_flight=max(1, int(payload.get("max_in_flight", 32) or 100)),
+                max_in_flight=_resolve_job_executor_max_in_flight(executor, payload.get("max_in_flight")),
                 receive_batch=max(1, int(payload.get("receive_batch", 10) or 10)),
                 submit_timeout_sec=float(payload.get("submit_timeout_sec", 60.0) or 60.0),
                 result_timeout_sec=float(payload.get("result_timeout_sec", payload.get("wait_chunk_timeout_sec", 30.0)) or 30.0),
@@ -1355,17 +1783,23 @@ class JobQueueManager:
                     )
                     if returned_state is not None:
                         state_obj = returned_state
-                with self._lock:
-                    current_state = self._jobs.get(job_id)
-                    if current_state is not None:
-                        current_state.results = list(rendered_results)
-                        current_state.checkpoint = {
-                            "processed": len(rendered_results),
-                            "current_index": result_index,
-                        }
+            logger.info(
+                "[JobQueue] phase=running_tasks_done job_id=%s count=%d",
+                job_id_snapshot,
+                len(rendered_results),
+            )
 
             final_result = state_obj
             if finalize is not None:
+                with self._lock:
+                    current_state = self._jobs.get(job_id)
+                    if current_state is not None:
+                        current_state.checkpoint["phase"] = "finalize"
+                logger.info(
+                    "[JobQueue] phase=finalize job_id=%s callable=%s",
+                    job_id_snapshot,
+                    finalize_callable or getattr(finalize, "__name__", "finalize"),
+                )
                 finalized = finalize(
                     state=state_obj,
                     job_payload=dict(hook_kwargs),
@@ -1374,7 +1808,22 @@ class JobQueueManager:
                 )
                 if finalized is not None:
                     final_result = finalized
+                logger.info(
+                    "[JobQueue] phase=finalize_done job_id=%s final_type=%s",
+                    job_id_snapshot,
+                    type(final_result).__name__,
+                )
 
+            with self._lock:
+                current_state = self._jobs.get(job_id)
+                if current_state is not None:
+                    current_state.checkpoint["phase"] = "terminal_writeback"
+            logger.info(
+                "[JobQueue] phase=terminal_writeback job_id=%s results=%d final_type=%s",
+                job_id_snapshot,
+                len(rendered_results),
+                type(final_result).__name__,
+            )
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is None:
@@ -1386,7 +1835,15 @@ class JobQueueManager:
                     state.status = "CANCELLED"
                 else:
                     state.status = "SUCCEEDED"
+                state.checkpoint["phase"] = "terminal_done"
+            logger.info(
+                "[JobQueue] phase=terminal_done job_id=%s status=%s results=%d",
+                job_id_snapshot,
+                "SUCCEEDED" if not state.cancel_requested else "CANCELLED",
+                len(rendered_results),
+            )
         except Exception as exc:
+            logger.exception("[JobQueue] run hooks job failed job_id=%s", job_id_snapshot)
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:

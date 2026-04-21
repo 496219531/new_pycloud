@@ -26,12 +26,11 @@ def _fake_data_ref() -> DataRef:
 
 
 def test_job_queue_tracks_session_serialization_mode_and_propagates_submit():
-    with pytest.warns(DeprecationWarning, match="JobQueue\\(serialization_mode=.*\\) is deprecated"):
-        queue = JobQueue.connect(
-            "127.0.0.1:50051",
-            client_id="jobq-client",
-            serialization_mode="structured_v1",
-        )
+    queue = JobQueue.connect(
+        "127.0.0.1:50051",
+        client_id="jobq-client",
+        task_serialization_mode="structured_v1",
+    )
     try:
         with (
             patch(
@@ -54,12 +53,11 @@ def test_job_queue_tracks_session_serialization_mode_and_propagates_submit():
 
 
 def test_job_queue_transport_mode_stays_structured_even_when_constructor_requests_pickle():
-    with pytest.warns(DeprecationWarning, match="JobQueue\\(serialization_mode=.*\\) is deprecated"):
-        queue = JobQueue.connect(
-            "127.0.0.1:50051",
-            client_id="jobq-client",
-            serialization_mode="pickle_stable_v1",
-        )
+    queue = JobQueue.connect(
+        "127.0.0.1:50051",
+        client_id="jobq-client",
+        task_serialization_mode="pickle_stable_v1",
+    )
     try:
         assert queue.serialization_mode == "structured_v1"
         assert queue.effective_policy is not None

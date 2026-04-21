@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import threading
 import uuid
 from typing import Dict, List, Optional, Tuple
 
 from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
+from pycloud_parallel.controlplane.policy_profile import get_default_policy_id_for_binding
 from pycloud_parallel.controlplane.registrar import JobOrchestratorInfoCenterRegistrar
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME = "job-orchestrator"
+logger = logging.getLogger(__name__)
 
 
 class JobOrchestratorServer:
@@ -26,6 +29,7 @@ class JobOrchestratorServer:
         queue_capacity: int = 4000,
         tags: Optional[List[str]] = None,
         version: str = "",
+        taskpool_policy_id: str = "",
     ) -> None:
         self.bind = str(bind or "").strip()
         self.infocenter_addr = str(infocenter_addr or "").strip()
@@ -34,9 +38,13 @@ class JobOrchestratorServer:
         self.queue_capacity = max(1, int(queue_capacity or 1))
         self.tags = list(tags or ["job"])
         self.version = str(version or "")
+        self.taskpool_policy_id = (
+            str(taskpool_policy_id or "").strip().lower()
+            or get_default_policy_id_for_binding("taskpool_default")
+        )
 
         self.service_id = uuid.uuid4().hex
-        self.job_queue = JobQueueManager()
+        self.job_queue = JobQueueManager(taskpool_policy_id=self.taskpool_policy_id)
         self._http = ServiceHttpGateway(
             bind=self.bind,
             invoke_handler=self._invoke,
@@ -60,6 +68,15 @@ class JobOrchestratorServer:
 
     def start(self) -> None:
         self._stopped.clear()
+        logger.info(
+            "[JobOrch] start bind=%s infocenter=%s node_id=%s service_name=%s service_id=%s taskpool_policy_id=%s",
+            self.bind,
+            self.infocenter_addr,
+            self.node_id,
+            self.service_name,
+            self.service_id,
+            self.taskpool_policy_id,
+        )
         self._http.start()
         self.base_url = self._http.base_url
         self.job_queue.start(controlplane_target=self.infocenter_addr)
@@ -67,6 +84,12 @@ class JobOrchestratorServer:
 
     def stop(self, grace: int = 0) -> None:
         del grace
+        logger.info(
+            "[JobOrch] stop node_id=%s service_name=%s service_id=%s",
+            self.node_id,
+            self.service_name,
+            self.service_id,
+        )
         self._registrar.close()
         self.job_queue.close()
         self._http.stop()
@@ -97,6 +120,15 @@ class JobOrchestratorServer:
             return rejected
         requested_method = str(method or "").strip()
         if requested_method == "submit_job":
+            logger.info(
+                "[JobOrch] submit_job service_id=%s client_id=%s entry_module=%s job_mode=%s task_mode=%s reset_pool=%s",
+                service_id,
+                str((payload or {}).get("client_id", "") or ""),
+                str((payload or {}).get("entry_module", "") or ""),
+                str((payload or {}).get("job_mode", "") or ""),
+                str((payload or {}).get("task_serialization_mode", "") or ""),
+                bool((payload or {}).get("reset_pool", False)),
+            )
             state = self.job_queue.submit_job(dict(payload or {}), auth_token=token)
             return 200, {"ok": True, "job": state.as_dict()}
         if requested_method in {"get_job", "get_job_status"}:
@@ -125,6 +157,7 @@ class JobOrchestratorServer:
             job_id = str((payload or {}).get("job_id", "") or "").strip()
             if not job_id:
                 return 400, {"ok": False, "error": "job_id is required"}
+            logger.info("[JobOrch] cancel_job service_id=%s job_id=%s", service_id, job_id)
             try:
                 state = self.job_queue.cancel_job(job_id, auth_token=token)
             except PermissionError as exc:

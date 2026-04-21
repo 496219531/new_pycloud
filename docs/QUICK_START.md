@@ -68,6 +68,19 @@ Web 运维页：
 http://127.0.0.1:50051/ops
 ```
 
+如果你希望主进程直接在当前终端/窗口里打印详细报错，可以加：
+
+```bash
+pycloudctl start --debug
+pycloudctl --local start --debug
+```
+
+说明：
+
+1. `--debug` 会把主进程日志级别切到 `DEBUG`
+2. 主进程 stdout/stderr 会直连当前控制台/窗口
+3. `--local` 和 `--debug` 可以一起用
+
 ## 2. 顶层 API
 
 V1 顶层公开面只保留：
