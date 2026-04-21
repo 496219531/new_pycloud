@@ -17,6 +17,8 @@ import tempfile
 import threading
 import time
 import uuid
+import tarfile
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,6 +209,63 @@ def _package_suffix(package_format: str) -> str:
     if normalized == "py":
         return ".py"
     return ".bin"
+
+
+def _safe_extract_archive_to_temp(artifact_path: str, *, package_format: str) -> Path:
+    archive_path = Path(artifact_path)
+    normalized_format = _normalize_package_format(package_format, archive_path.name)
+    out_dir = Path(tempfile.mkdtemp(prefix="pycloud-artifact-"))
+
+    def _safe_join(member_name: str) -> Path:
+        target = (out_dir / member_name).resolve()
+        if out_dir.resolve() not in target.parents and target != out_dir.resolve():
+            raise ValueError(f"archive member escapes target dir: {member_name}")
+        return target
+
+    def _apply_mode(path: Path, mode: int) -> None:
+        with contextlib.suppress(Exception):
+            path.chmod(mode)
+
+    if normalized_format in {"zip", "whl"}:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                target = _safe_join(info.filename)
+                mode = (info.external_attr >> 16) & 0o777
+                is_symlink = ((info.external_attr >> 16) & 0o170000) == 0o120000
+                if is_symlink:
+                    raise ValueError(f"zip archive contains unsupported link entry: {info.filename}")
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    _apply_mode(target, mode or 0o755)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                _apply_mode(target, mode or 0o644)
+        return out_dir
+
+    if normalized_format == "tar.gz":
+        with tarfile.open(archive_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                target = _safe_join(member.name)
+                if member.issym() or member.islnk():
+                    raise ValueError(f"tar archive contains unsupported link entry: {member.name}")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    _apply_mode(target, member.mode)
+                    continue
+                if not member.isfile():
+                    raise ValueError(f"tar archive contains unsupported member type: {member.name}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                extracted = tf.extractfile(member)
+                if extracted is None:
+                    raise ValueError(f"tar archive member could not be read: {member.name}")
+                with extracted, target.open("wb") as dst:
+                    shutil.copyfileobj(extracted, dst)
+                _apply_mode(target, member.mode)
+        return out_dir
+
+    raise ValueError(f"unsupported package format for extraction: {package_format}")
 
 
 def _normalize_export_spec(
@@ -512,8 +571,16 @@ def _load_user_module(
     if root_module:
         _purge_module_tree(root_module)
     _purge_module_tree(entry_module)
-    with _temporary_import_paths(dependency_path, artifact_path):
-        return importlib.import_module(entry_module)
+    import_path = artifact_path
+    extract_dir: Optional[Path] = None
+    if path.is_file() and format_name in {"tar.gz", "zip", "whl"}:
+        extract_dir = _safe_extract_archive_to_temp(artifact_path, package_format=format_name)
+        import_path = str(extract_dir)
+    with _temporary_import_paths(dependency_path, import_path):
+        module = importlib.import_module(entry_module)
+    if extract_dir is not None:
+        setattr(module, "__pycloud_temp_extract_dir__", str(extract_dir))
+    return module
 
 
 def _purge_loaded_artifact_modules(

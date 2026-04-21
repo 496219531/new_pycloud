@@ -5,8 +5,7 @@ from unittest.mock import patch
 
 from pycloud_parallel.controlplane.client_transport import _encode_http_transport_body
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
-from pycloud_parallel.controlplane.node_capability import NodeCapability
-from pycloud_parallel.controlplane.policy_profile import get_policy_profile
+from pycloud_parallel.controlplane.policy_profile import PolicyProfile, get_policy_profile
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.execution.support import _prepare_task_payload_for_submit
 
@@ -46,61 +45,53 @@ def _fake_data_ref() -> DataRef:
     )
 
 
-def test_effective_policy_uses_intersection_of_profile_and_capabilities():
+def test_effective_policy_depends_only_on_profile_and_context():
     profile = get_policy_profile("trusted_internal")
-    caps = [
-        NodeCapability(
-            supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
-            supports_transport_payload_bytes=True,
-            supports_http_bytes_transport=True,
-            max_grpc_send_bytes=8 * 1024 * 1024,
-            max_grpc_recv_bytes=8 * 1024 * 1024,
-            max_http_body_bytes=8 * 1024 * 1024,
-            max_upload_file_bytes=64 * 1024 * 1024,
-            max_upload_total_bytes=128 * 1024 * 1024,
-        ),
-        NodeCapability(
-            supported_modes=("legacy_v1", "structured_v1"),
-            supports_transport_payload_bytes=True,
-            supports_http_bytes_transport=True,
-            max_grpc_send_bytes=1024 * 1024,
-            max_grpc_recv_bytes=1024 * 1024,
-            max_http_body_bytes=2 * 1024 * 1024,
-            max_upload_file_bytes=64 * 1024 * 1024,
-            max_upload_total_bytes=128 * 1024 * 1024,
-        ),
-    ]
 
-    effective = resolve_effective_policy(profile, caps, context="taskpool_session")
+    effective = resolve_effective_policy(profile, context="taskpool_session")
 
-    assert effective.allowed_modes == ("legacy_v1", "structured_v1")
+    assert effective.allowed_modes == ("legacy_v1", "structured_v1", "pickle_stable_v1")
     assert effective.resolved_mode == "structured_v1"
-    assert effective.inline_payload_hard_limit_bytes == 1024 * 1024
+    assert effective.inline_payload_hard_limit_bytes == profile.inline_payload_hard_limit_bytes
     assert effective.use_transport_payload_bytes is True
+    assert effective.use_http_bytes_transport is False
 
 
 def test_effective_policy_rejects_gateway_pickle_when_profile_disallows_it():
     profile = get_policy_profile("pickle_internal_heavy")
-    caps = [
-        NodeCapability(
-            supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
-            supports_transport_payload_bytes=True,
-            supports_http_bytes_transport=True,
-            max_grpc_send_bytes=8 * 1024 * 1024,
-            max_grpc_recv_bytes=8 * 1024 * 1024,
-            max_http_body_bytes=8 * 1024 * 1024,
-            max_upload_file_bytes=64 * 1024 * 1024,
-            max_upload_total_bytes=128 * 1024 * 1024,
-        )
-    ]
 
     with pytest.raises(ValueError, match="requested_mode"):
         resolve_effective_policy(
             profile,
-            caps,
             requested_mode="pickle_stable_v1",
             context="gateway_public",
         )
+
+
+def test_effective_policy_respects_requested_mode_without_capability_intersection():
+    profile = PolicyProfile(
+        policy_id="custom",
+        version=1,
+        allowed_modes=("pickle_stable_v1", "structured_v1", "legacy_v1"),
+        default_mode="pickle_stable_v1",
+        inline_payload_soft_limit_bytes=16,
+        inline_payload_hard_limit_bytes=32,
+        inline_result_hard_limit_bytes=48,
+        use_transport_payload_bytes=True,
+        use_http_bytes_transport=True,
+        allow_pickle_stable=True,
+        force_dataref_above_soft_limit=True,
+    )
+
+    effective = resolve_effective_policy(
+        profile,
+        requested_mode="structured_v1",
+        context="service_connect",
+    )
+
+    assert effective.resolved_mode == "structured_v1"
+    assert effective.use_transport_payload_bytes is True
+    assert effective.use_http_bytes_transport is True
 
 
 def test_task_submit_payload_preparation_clamps_to_effective_policy_soft_limit():

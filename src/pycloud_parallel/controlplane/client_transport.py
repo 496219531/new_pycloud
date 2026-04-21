@@ -352,6 +352,7 @@ def _serialize_route(route: Any) -> Dict[str, object]:
     return {
         "service_name": route.service_name,
         "service_id": route.service_id,
+        "policy_id": str(getattr(route, "policy_id", "") or "default_safe"),
         "node_instance_id": route.node_instance_id,
         "node_id": route.node_id,
         "control_addr": route.control_addr,

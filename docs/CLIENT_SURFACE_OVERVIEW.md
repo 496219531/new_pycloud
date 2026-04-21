@@ -127,23 +127,22 @@
 
 1. `Policy Profile`
    - 中心统一策略模板
-2. `Node Capability`
-   - node 上报的硬能力
+2. `Tags / Health / Runtime Filtering`
+   - 决定哪些 node 参与当前 session
 3. `Effective Policy`
    - 会话创建时计算并冻结的实际执行策略
 
 对用户侧最重要的影响是：
 
-1. `policy_id=...` 代表“我要哪套中心策略模板”
+1. 客户端可以表达 `serialization_mode` 偏好，但不能直接挑 `policy profile`
 2. node 不会再各自凭本机 env 选默认 mode 或 payload limit
 3. 会话建成以后，`serialization_mode`、payload limits、protobuf bytes lane、HTTP bytes lane 都按冻结后的 `effective_policy` 走
 
-这些入口都可以带 `policy_id` 建会话：
+`policy_id` 现在属于控制面/部署层输入，而不是普通客户端输入。
+普通用户在主路径上只会看到最终冻结的 `effective_policy`，不会被引导去直接选择 profile。
 
-1. `Service.deploy(..., policy_id=...)`
-2. `Service.connect(..., policy_id=...)`
-3. `TaskPool.open(..., policy_id=...)`
-4. `JobQueue.connect(..., policy_id=...)`
+`Service.connect(...)` 会通过 service route/status metadata 继承 deploy 时绑定的 profile，再按 connect 上下文冻结 `effective_policy`。
+如果同一个 service 的 routes 暴露出不一致的 `policy_id`，connect 会直接失败，而不是私自猜默认值。
 
 当前内置 profile：
 
@@ -153,10 +152,14 @@
 
 默认行为：
 
-1. profile 允许但 node capability 不支持的 mode，不会进入该 session 的 effective policy
-2. 某个候选 node 不支持 `pickle_stable_v1`，整个 session 就不会冻结到 pickle
-3. `gateway_public` 即使后端 node 支持 pickle，只要 profile 不允许，也会统一拒绝
-4. payload 准备链会优先遵守 session 的 effective payload limit，必要时转 `DataRef`
+1. `gateway_public` 即使后端节点支持 pickle，只要 profile 不允许，也会统一拒绝
+2. payload 准备链会优先遵守 session 的 effective payload limit，必要时转 `DataRef`
+3. `Service.connect(transport="gateway")` 默认绑定 `default_safe`，默认 mode 是 `legacy_v1`
+4. `Service.connect(transport="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `structured_v1`
+5. `TaskPool.open(...)` / `TaskPool.from_infocenter(...)` 默认绑定 `trusted_internal`，默认 mode 是 `structured_v1`
+6. 重数据 task 场景建议显式切到 `pickle_internal_heavy`
+7. `JobQueue.connect()` 默认绑定 `trusted_internal`，但 queue 自己的 controlplane transport 仍固定默认 mode=`structured_v1`
+4. 节点差异由 `tags`、`healthy_only` 和 runtime 过滤表达，不再参与 effective policy 协商
 
 carrier 选择也已经改成同一个原则：
 
@@ -169,6 +172,7 @@ carrier 选择也已经改成同一个原则：
 
 对 `JobQueue` 要再补一句：
 
-1. client 初始化时可以先拿 fallback policy
-2. 真正 submit/status/cancel 前，会根据当前发现到的 orchestrator routes capability 重新 resolve
-3. 因此实际 route call 使用的是“真实候选 orchestrator 能力交集”后的 effective policy
+1. `JobQueue` 自己的 transport/session 默认绑定 `jobqueue_controlplane_transport -> trusted_internal`
+2. 这个 binding 的默认 mode 仍然是 `structured_v1`
+2. 用户在 `JobQueue.submit(...)` 里传的 `serialization_mode / policy_id`，解释为未来 `TaskPool` 的执行策略
+3. 因此 job-orchestrator 的调用面和后续 task 执行面的策略边界是分开的

@@ -51,6 +51,19 @@ def _create_job_task_pool(**kwargs: Any) -> TaskPool:
     return TaskPool.from_infocenter(**kwargs)
 
 
+def _close_executor_async(executor: Any) -> None:
+    if executor is None:
+        return
+
+    def _worker() -> None:
+        try:
+            executor.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, name="job-queue-executor-close", daemon=True).start()
+
+
 def _task_result_to_dict(item: pb2.TaskResult) -> Dict[str, object]:
     detail: Dict[str, object] = {}
     if item.result:
@@ -469,8 +482,9 @@ class JobQueueManager:
     def start(self, *, controlplane_target: str) -> None:
         with self._lock:
             self._controlplane_target = str(controlplane_target or "").strip()
-            if self._thread is not None:
+            if self._thread is not None and self._thread.is_alive():
                 return
+            self._stop = False
             self._thread = threading.Thread(target=self._loop, name="job-queue-scheduler", daemon=True)
             self._thread.start()
 
@@ -485,16 +499,34 @@ class JobQueueManager:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=1.0)
+        self._thread = None
         with self._lock:
             executor = self._current_executor
             release_states = [state for state in self._jobs.values() if state.staged_ref_ids]
-        if executor is not None:
-            try:
-                executor.close()
-            except Exception:
-                pass
+        _close_executor_async(executor)
         for state in release_states:
             self._release_job_refs(state)
+
+    def _detach_stale_running_locked(self) -> Any:
+        current = str(self._running_job_id or "").strip()
+        if not current:
+            return None
+        current_state = self._jobs.get(current)
+        if current_state is not None and current_state.status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            return None
+        executor = self._current_executor
+        self._running_job_id = ""
+        self._current_executor = None
+        self._cv.notify_all()
+        return executor
+
+    def _ensure_scheduler_thread_locked(self) -> None:
+        if self._stop or not self._controlplane_target:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, name="job-queue-scheduler", daemon=True)
+        self._thread.start()
 
     def submit_job(self, payload: Dict[str, object], *, auth_token: str = "") -> JobState:
         raw_payload = dict(payload or {})
@@ -514,7 +546,9 @@ class JobQueueManager:
         submitted_at = utc_now()
         owner_token_expires_at = submitted_at + timedelta(seconds=_job_auth_ttl_sec()) if owner_token_digest else None
         staged_ref_ids = _collect_payload_data_ref_ids(normalized_payload)
+        executor_to_close = None
         with self._cv:
+            executor_to_close = self._detach_stale_running_locked()
             self._enqueue_seq += 1
             enqueue_seq = self._enqueue_seq
             state = JobState(
@@ -536,15 +570,25 @@ class JobQueueManager:
             )
             self._jobs[job_id] = state
             self._insert_waiting_job_locked(state)
+            self._ensure_scheduler_thread_locked()
             self._cv.notify_all()
+        _close_executor_async(executor_to_close)
         return state
 
     def get_job(self, job_id: str) -> Optional[JobState]:
         with self._lock:
-            return self._jobs.get(str(job_id or "").strip())
+            executor_to_close = self._detach_stale_running_locked()
+            if any(item.status == "WAITING" and not item.cancel_requested for item in self._jobs.values()):
+                self._ensure_scheduler_thread_locked()
+            state = self._jobs.get(str(job_id or "").strip())
+        _close_executor_async(executor_to_close)
+        return state
 
     def summary(self, *, recent_limit: int = 5, waiting_limit: int = 50) -> Dict[str, object]:
         with self._lock:
+            executor_to_close = self._detach_stale_running_locked()
+            if any(item.status == "WAITING" and not item.cancel_requested for item in self._jobs.values()):
+                self._ensure_scheduler_thread_locked()
             jobs = list(self._jobs.values())
             waiting = sum(1 for item in jobs if item.status == "WAITING" and not item.cancel_requested)
             running = sum(1 for item in jobs if item.status == "RUNNING")
@@ -575,7 +619,7 @@ class JobQueueManager:
                         "position": position,
                     }
                 )
-            return {
+            summary = {
                 "job_count": len(jobs),
                 "waiting": waiting,
                 "running": running,
@@ -598,6 +642,8 @@ class JobQueueManager:
                 ],
                 "waiting_jobs": waiting_jobs,
             }
+        _close_executor_async(executor_to_close)
+        return summary
 
     def cancel_job(self, job_id: str, *, auth_token: str = "") -> Optional[JobState]:
         normalized = str(job_id or "").strip()
@@ -774,8 +820,16 @@ class JobQueueManager:
             refs_to_touch: List[JobState] = []
             refs_to_release: List[JobState] = []
             next_job: Optional[JobState] = None
+            executor_to_close: Any = None
             with self._cv:
                 while not self._stop and self._running_job_id:
+                    current_state = self._jobs.get(self._running_job_id)
+                    if current_state is None or current_state.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                        executor_to_close = self._current_executor
+                        self._running_job_id = ""
+                        self._current_executor = None
+                        self._cv.notify_all()
+                        break
                     self._cv.wait(timeout=0.1)
                 if self._stop:
                     return
@@ -796,6 +850,7 @@ class JobQueueManager:
                 self._release_job_refs(state)
             for state in refs_to_touch:
                 self._touch_job_refs(state)
+            _close_executor_async(executor_to_close)
             if next_job is None:
                 continue
             self._run_job(next_job.job_id)
@@ -803,9 +858,11 @@ class JobQueueManager:
             if terminal_state is not None and terminal_state.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
                 self._release_job_refs(terminal_state)
             with self._cv:
+                executor_to_close = self._current_executor
                 self._running_job_id = ""
                 self._current_executor = None
                 self._cv.notify_all()
+            _close_executor_async(executor_to_close)
 
     def _expand_subtasks(self, payload: Dict[str, object]) -> List[Dict[str, object]]:
         subtasks = payload.get("subtasks") or []
@@ -1004,6 +1061,8 @@ class JobQueueManager:
                     entry_module=kwargs.get("entry_module", ""),
                     entry_callable=kwargs.get("entry_callable", "run"),
                     package_format=kwargs.get("package_format", ""),
+                    serialization_mode=str(payload.get("serialization_mode", "") or "").strip(),
+                    policy_id=str(payload.get("policy_id", "") or "").strip(),
                     dependency_allowlist=kwargs.get("dependency_allowlist"),
                     managed_global_names=kwargs.get("managed_global_names"),
                     worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
@@ -1097,12 +1156,6 @@ class JobQueueManager:
                     state.status = "FAILED"
                     state.finished_at = utc_now()
                     state.error = str(exc)
-        finally:
-            if executor is not None:
-                try:
-                    executor.close()
-                except Exception:
-                    pass
 
     def _run_job_with_hooks(
         self,
@@ -1131,6 +1184,7 @@ class JobQueueManager:
         entry_module = str(payload.get("entry_module", "") or "").strip()
         task_entry_callable = str(payload.get("entry_callable", "run") or "run").strip() or "run"
         raw_task_generator = payload.get("task_generator_callable", "task_generator")
+        task_resource_paths = [str(item).strip() for item in list(payload.get("task_resource_paths") or ()) if str(item).strip()]
         handle_result_callable = (
             str(payload.get("handle_result_callable", "") or "").strip()
         )
@@ -1194,25 +1248,35 @@ class JobQueueManager:
                 payload=payload,
             )
 
-            executor = _create_job_task_pool(
-                infocenter_target=self._controlplane_target,
-                job_id=job_id_snapshot,
-                owner_client_id=client_id,
-                pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
-                entry_func=task_entry,
-                runtime=str(payload.get("runtime", "py3") or "py3"),
-                dependency_allowlist=list(payload.get("dependency_allowlist") or ()),
-                managed_global_names=effective_managed_global_names,
-                worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
-                heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
-                idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
-                healthy_only=bool(payload.get("healthy_only", True)),
-                tags=list(payload.get("tags") or ()),
-                node_ids=list(payload.get("node_ids") or ()),
-                node_count=max(0, int(payload.get("pool_node_count", payload.get("node_count", default_node_count) or default_node_count) or 0)),
-                node_limit=int(payload.get("node_limit", 100) or 100),
-                timeout_sec=float(payload.get("timeout_sec", 10.0) or 10.0),
-            )
+            task_pool_kwargs = {
+                "infocenter_target": self._controlplane_target,
+                "job_id": job_id_snapshot,
+                "owner_client_id": client_id,
+                "pool_name": str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
+                "runtime": str(payload.get("runtime", "py3") or "py3"),
+                "serialization_mode": str(payload.get("serialization_mode", "") or "").strip(),
+                "policy_id": str(payload.get("policy_id", "") or "").strip(),
+                "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
+                "managed_global_names": effective_managed_global_names,
+                "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
+                "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
+                "idle_ttl_sec": max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
+                "healthy_only": bool(payload.get("healthy_only", True)),
+                "tags": list(payload.get("tags") or ()),
+                "node_ids": list(payload.get("node_ids") or ()),
+                "node_count": max(0, int(payload.get("pool_node_count", payload.get("node_count", default_node_count) or default_node_count) or 0)),
+                "node_limit": int(payload.get("node_limit", 100) or 100),
+                "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
+            }
+            if task_resource_paths:
+                task_pool_kwargs.update(
+                    source=module,
+                    entry_callable=task_entry_callable,
+                    resource_paths=task_resource_paths,
+                )
+            else:
+                task_pool_kwargs["entry_func"] = task_entry
+            executor = _create_job_task_pool(**task_pool_kwargs)
             with self._lock:
                 self._current_executor = executor
 
@@ -1245,7 +1309,7 @@ class JobQueueManager:
                     current_state.checkpoint["phase"] = "running_tasks"
             stream = executor.imap_unordered(
                 _payload_stream(),
-                max_in_flight=max(1, int(payload.get("max_in_flight", 100) or 100)),
+                max_in_flight=max(1, int(payload.get("max_in_flight", 32) or 100)),
                 receive_batch=max(1, int(payload.get("receive_batch", 10) or 10)),
                 submit_timeout_sec=float(payload.get("submit_timeout_sec", 60.0) or 60.0),
                 result_timeout_sec=float(payload.get("result_timeout_sec", payload.get("wait_chunk_timeout_sec", 30.0)) or 30.0),
@@ -1335,6 +1399,7 @@ class JobQueueManager:
             finalize = None
             handle_result = None
             task_generator = None
+            extracted_dir = str(getattr(module, "__pycloud_temp_extract_dir__", "") or "").strip() if module is not None else ""
             task_entry = None
             module = None
             try:
@@ -1347,9 +1412,6 @@ class JobQueueManager:
             except Exception:
                 pass
             tmp_path.unlink(missing_ok=True)
+            if extracted_dir:
+                shutil.rmtree(extracted_dir, ignore_errors=True)
             gc.collect()
-            if executor is not None:
-                try:
-                    executor.close()
-                except Exception:
-                    pass

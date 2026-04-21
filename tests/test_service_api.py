@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import io
+import sys
 import tarfile
 import threading
 from types import SimpleNamespace
@@ -13,6 +14,9 @@ import pytest
 
 def _build_service_entry_module(tmp_path, monkeypatch):
     package_name = "demo_service_pkg_entry"
+    sys.modules.pop(package_name, None)
+    sys.modules.pop(f"{package_name}.worker", None)
+    sys.modules.pop(f"{package_name}.helper", None)
     package_dir = tmp_path / package_name
     package_dir.mkdir()
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -31,6 +35,13 @@ def _build_service_entry_module(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
     return importlib.import_module(f"{package_name}.worker")
+
+
+def _build_service_entry_module_with_resource(tmp_path, monkeypatch):
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+    package_dir = tmp_path / worker_module.__package__
+    (package_dir / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    return worker_module
 
 
 class TestCallProxy:
@@ -831,6 +842,76 @@ class TestOwnerServiceFacade:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()
 
+    def test_deploy_from_infocenter_includes_only_explicit_resource_paths(self, tmp_path, monkeypatch):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        worker_module = _build_service_entry_module_with_resource(tmp_path, monkeypatch)
+        fake_node = SimpleNamespace(
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        create_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    service_id="svc-1",
+                    service_token="token-1",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-1",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=((), [fake_node]),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-module-service-resource",
+                source=worker_module,
+                resource_paths=["data.csv"],
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            create_call = create_calls[0]
+            with tarfile.open(fileobj=io.BytesIO(create_call["blob"]), mode="r:gz") as tar:
+                names = set(tar.getnames())
+            assert f"{worker_module.__package__}/data.csv" in names
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
     def test_deploy_from_infocenter_packages_callable_object_entry_callable(self, tmp_path, monkeypatch):
         from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -954,7 +1035,10 @@ class TestOwnerServiceFacade:
 
         assert digest == "sha256:same"
         assert group.globals_digests == {"node-a": "sha256:same", "node-b": "sha256:same"}
-        mocked_prepare.assert_called_once_with([client_a, client_b], {"cfg": {"k": "v"}})
+        mocked_prepare.assert_called_once()
+        prepare_args, prepare_kwargs = mocked_prepare.call_args
+        assert prepare_args == ([client_a, client_b], {"cfg": {"k": "v"}})
+        assert prepare_kwargs["effective_policy"] == group.effective_policy
         session_a.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
         session_b.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
 

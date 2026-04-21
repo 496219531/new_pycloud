@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import io
+import sys
 import tarfile
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,9 @@ from pycloud_parallel.controlplane.serialization import dict_to_struct
 
 def _build_task_entry_module(tmp_path, monkeypatch, *, with_init: bool = True):
     package_name = "demo_task_pkg_entry"
+    sys.modules.pop(package_name, None)
+    sys.modules.pop(f"{package_name}.worker", None)
+    sys.modules.pop(f"{package_name}.helper", None)
     package_dir = tmp_path / package_name
     package_dir.mkdir()
     if with_init:
@@ -36,6 +40,13 @@ def _build_task_entry_module(tmp_path, monkeypatch, *, with_init: bool = True):
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
     return importlib.import_module(f"{package_name}.worker")
+
+
+def _build_task_entry_module_with_resource(tmp_path, monkeypatch):
+    worker_module = _build_task_entry_module(tmp_path, monkeypatch)
+    package_dir = tmp_path / worker_module.__package__
+    (package_dir / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    return worker_module
 
 
 def test_native_task_pool_session_submit_and_wait() -> None:
@@ -134,6 +145,54 @@ def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None
         assert resp.running_marked == 2
         assert resp.already_done == 3
         assert session._pending_task_ids == set()  # noqa: SLF001
+    finally:
+        session.close()
+
+
+def test_task_pool_from_infocenter_includes_only_explicit_resource_paths(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    worker_module = _build_task_entry_module_with_resource(tmp_path, monkeypatch)
+    fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
+    create_calls = []
+    fake_pool_client = SimpleNamespace(
+        owner_client_id="owner-demo",
+        pool_id="pool-1",
+        pool_token="token-1",
+        code_version="sha256:test",
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+        pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+        heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+        cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True, queued_cancelled=0, running_marked=0, already_done=0, not_found=0),
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+
+    def _fake_create_task_pool(self, **kwargs):
+        del self
+        create_calls.append(dict(kwargs))
+        return fake_pool_client
+
+    with patch("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient") as mocked_infocenter, patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient.create_task_pool_from_bytes",
+        _fake_create_task_pool,
+    ):
+        mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
+        session = TaskPool.from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-native-resource",
+            source=worker_module,
+            resource_paths=["data.csv"],
+            worker_count=2,
+            node_count=1,
+        )
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(create_calls[0]["blob"]), mode="r:gz") as tar:
+            names = set(tar.getnames())
+        assert f"{worker_module.__package__}/data.csv" in names
     finally:
         session.close()
 
@@ -700,6 +759,36 @@ def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:
         session.close()
 
 
+def test_native_task_pool_session_close_retries_replica_close() -> None:
+    from pycloud_parallel import TaskPool
+
+    close_calls = {"count": 0}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        _client = SimpleNamespace(close=lambda: None)
+
+        def close(self, reason=""):
+            del reason
+            close_calls["count"] += 1
+            if close_calls["count"] == 1:
+                raise RuntimeError("temporary close failure")
+            return pb2.CloseTaskPoolResponse(ok=True, accepted=True)
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-close-retry",
+    )
+
+    session.close()
+
+    assert close_calls["count"] >= 2
+
+
 def test_native_task_pool_session_iter_and_collect_results_consume_incrementally() -> None:
     from pycloud_parallel import TaskPool
 
@@ -1037,6 +1126,67 @@ def test_native_task_pool_session_imap_unordered_refills_fast_node() -> None:
     assert len(submitted_by_node["node-fast"]) == 4
     assert len(submitted_by_node["node-slow"]) == 2
     assert {data["node_id"] for _task_id, data in items} == {"node-fast", "node-slow"}
+
+
+def test_native_task_pool_session_imap_unordered_uses_full_global_max_in_flight() -> None:
+    from pycloud_parallel import TaskPool
+
+    submit_batch_sizes: list[int] = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self) -> None:
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(
+                fetch_result_data=lambda task_result, target_path="": {
+                    "task_id": task_result.task_id,
+                }
+            )
+
+        def submit_tasks(self, tasks, job_id=""):
+            submit_batch_sizes.append(len(tasks))
+            for item in tasks:
+                self._ready.append(
+                    pb2.TaskResult(
+                        task_id=item.task_id,
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"task_id": item.task_id}),
+                    )
+                )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-global-window",
+    )
+
+    items = list(
+        session.imap_unordered(
+            [{"value": idx} for idx in range(8)],
+            max_in_flight=8,
+            receive_batch=8,
+            result_timeout_sec=0.5,
+            wait_ms=1,
+        )
+    )
+
+    assert len(items) == 8
+    assert submit_batch_sizes[0] == 8
 
 
 def test_native_task_pool_session_imap_unordered_times_out_when_results_do_not_arrive() -> None:

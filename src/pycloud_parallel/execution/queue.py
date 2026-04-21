@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import warnings
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Set
@@ -18,9 +19,12 @@ from pycloud_parallel.controlplane.artifact import (
 from pycloud_parallel.controlplane import client_transport as _client_transport
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
-from pycloud_parallel.controlplane.policy_profile import get_policy_profile
+from pycloud_parallel.controlplane.policy_profile import (
+    get_default_mode_for_binding,
+    get_default_policy_id_for_binding,
+    get_policy_profile,
+)
 from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
-from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.execution.support import (
     _JOB_UPDATE_GLOBALS_AUTO,
     _default_job_auth_ttl_sec,
@@ -43,6 +47,10 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
 
+_JOBQUEUE_BINDING_ID = "jobqueue_controlplane_transport"
+_JOBQUEUE_TRANSPORT_MODE = get_default_mode_for_binding(_JOBQUEUE_BINDING_ID)
+_JOBQUEUE_POLICY_ID = get_default_policy_id_for_binding(_JOBQUEUE_BINDING_ID)
+
 DiscoveryCallError = _client_transport.DiscoveryCallError
 _call_route_http = _client_transport._call_route_http
 _is_route_failure = _client_transport._is_route_failure
@@ -62,6 +70,14 @@ def _decode_job_response_payload(response: Dict[str, object]) -> Dict[str, objec
     return body
 
 
+def _jobqueue_effective_policy() -> EffectivePolicy:
+    return resolve_effective_policy(
+        get_policy_profile(_JOBQUEUE_POLICY_ID),
+        requested_mode=_JOBQUEUE_TRANSPORT_MODE,
+        context="jobqueue_session",
+    )
+
+
 class _JobOrchestratorDiscoveryClient:
     """Resolve job-orchestrator via InfoCenter and call its HTTP endpoint directly."""
 
@@ -72,20 +88,14 @@ class _JobOrchestratorDiscoveryClient:
         timeout_sec: float = 10.0,
         service_token: str = "",
         serialization_mode: str = "",
-        policy_id: str = "",
         effective_policy: Optional[EffectivePolicy] = None,
     ) -> None:
+        del serialization_mode
         self.target = str(target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_token = str(service_token or "").strip()
-        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
-        self._requested_serialization_mode = str(serialization_mode or "").strip()
-        self.effective_policy = effective_policy
-        self.serialization_mode = (
-            str(effective_policy.resolved_mode or "").strip()
-            if effective_policy is not None
-            else str(serialization_mode or "").strip()
-        )
+        self.effective_policy = effective_policy or _jobqueue_effective_policy()
+        self.serialization_mode = str(self.effective_policy.resolved_mode or _JOBQUEUE_TRANSPORT_MODE).strip() or _JOBQUEUE_TRANSPORT_MODE
 
     def close(self) -> None:
         return None
@@ -116,15 +126,10 @@ class _JobOrchestratorDiscoveryClient:
         *,
         requested_mode: str = "",
     ) -> EffectivePolicy:
-        route_effective_policy = resolve_effective_policy(
-            get_policy_profile(self.policy_id),
-            list(routes),
-            requested_mode=str(requested_mode or "").strip() or self._requested_serialization_mode,
-            context="jobqueue_session",
-        )
-        self.effective_policy = route_effective_policy
-        self.serialization_mode = route_effective_policy.resolved_mode
-        return route_effective_policy
+        del routes, requested_mode
+        self.effective_policy = _jobqueue_effective_policy()
+        self.serialization_mode = self.effective_policy.resolved_mode
+        return self.effective_policy
 
     def resolve_effective_policy_for_service(
         self,
@@ -132,15 +137,8 @@ class _JobOrchestratorDiscoveryClient:
         service_name: str,
         requested_mode: str = "",
     ) -> EffectivePolicy:
-        routes = self._list_routes(service_name=service_name)
-        if not routes:
-            raise RuntimeError(
-                f"JobQueue could not find a running job-orchestrator route for service_name={service_name!r}"
-            )
-        return self._resolve_effective_policy_for_routes(
-            routes,
-            requested_mode=requested_mode,
-        )
+        del service_name, requested_mode
+        return _jobqueue_effective_policy()
 
     def call(
         self,
@@ -167,16 +165,9 @@ class _JobOrchestratorDiscoveryClient:
             raise RuntimeError(
                 f"JobQueue could not find a running job-orchestrator route for service_name={name!r}"
             )
-        route_effective_policy = self._resolve_effective_policy_for_routes(
-            routes,
-            requested_mode=serialization_mode,
-        )
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="jobqueue_session",
-            frozen_mode=route_effective_policy.resolved_mode,
-            allowed_modes=route_effective_policy.allowed_modes,
-        )
+        del serialization_mode
+        route_effective_policy = _jobqueue_effective_policy()
+        effective_serialization_mode = route_effective_policy.resolved_mode
 
         last_exc: Optional[Exception] = None
         for route in routes:
@@ -225,33 +216,22 @@ class QueueServiceClient:
         timeout_sec: float = 10.0,
         service_name: str = "job-orchestrator",
         serialization_mode: str = "",
-        policy_id: str = "",
     ) -> None:
         self.target = str(target or "").strip()
         self.client_id = str(client_id or "").strip()
         self._client_scope = self.client_id
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
-        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
-        self._requested_serialization_mode = str(serialization_mode or "").strip()
-        candidate_routes = []
-        try:
-            with _infocenter_client(self.target, timeout_sec=self.timeout_sec) as infocenter:
-                candidate_routes = list(
-                    infocenter.list_service_routes(
-                        service_name=self.service_name,
-                        healthy_only=True,
-                        limit=32,
-                    )
-                )
-        except Exception:
-            candidate_routes = []
-        self.effective_policy = resolve_effective_policy(
-            get_policy_profile(self.policy_id),
-            candidate_routes,
-            requested_mode=self._requested_serialization_mode,
-            context="jobqueue_session",
-        )
+        self._default_task_serialization_mode = str(serialization_mode or "").strip()
+        if self._default_task_serialization_mode:
+            warnings.warn(
+                "JobQueue(serialization_mode=...) is deprecated as a queue transport setting; "
+                "it now acts only as the default execution policy for future TaskPool creation. "
+                "Prefer passing serialization_mode to JobQueue.submit(...).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.effective_policy = _jobqueue_effective_policy()
         self.serialization_mode = self.effective_policy.resolved_mode
         self._auth_ttl_sec = _default_job_auth_ttl_sec()
         self._recent_job_ids: List[str] = []
@@ -281,17 +261,13 @@ class QueueServiceClient:
             self.target,
             timeout_sec=self.timeout_sec,
             service_token=self.auth_token,
-            serialization_mode=self._requested_serialization_mode,
-            policy_id=self.policy_id,
+            serialization_mode=self.serialization_mode,
             effective_policy=self.effective_policy,
         )
         self._persist_local_session()
 
     def _refresh_effective_policy(self) -> EffectivePolicy:
-        effective_policy = self._service_client.resolve_effective_policy_for_service(
-            service_name=self.service_name,
-            requested_mode=self._requested_serialization_mode,
-        )
+        effective_policy = _jobqueue_effective_policy()
         self.effective_policy = effective_policy
         self.serialization_mode = effective_policy.resolved_mode
         return effective_policy
@@ -311,9 +287,12 @@ class QueueServiceClient:
                 **call_kwargs,
             )
         except TypeError as exc:
-            if "effective_policy" not in str(exc):
+            message = str(exc)
+            if "effective_policy" not in message and "serialization_mode" not in message:
                 raise
-            return self._service_client.call(**call_kwargs)
+            fallback_kwargs = dict(call_kwargs)
+            fallback_kwargs.pop("serialization_mode", None)
+            return self._service_client.call(**fallback_kwargs)
 
     def _persist_local_session(self) -> None:
         try:
@@ -345,9 +324,15 @@ class QueueServiceClient:
         self.close()
 
     def __repr__(self) -> str:
+        effective_policy_text = ""
+        if self.effective_policy is not None:
+            effective_policy_text = (
+                f" effective_policy={self.effective_policy.policy_id}@v{self.effective_policy.version}"
+            )
         return (
             f"<JobQueue service_name={self.service_name!r} "
-            f"client_id={self.client_id!r} serialization_mode={self.serialization_mode}>"
+            f"client_id={self.client_id!r} serialization_mode={self.serialization_mode}"
+            f"{effective_policy_text}>"
         )
 
     def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -396,6 +381,10 @@ class QueueServiceClient:
         entry_callable: Any = "run",
         package_format: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        resource_paths: Optional[Sequence[Any]] = None,
+        task_resource_paths: Optional[Sequence[Any]] = None,
+        serialization_mode: str = "",
+        policy_id: str = "",
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -411,6 +400,13 @@ class QueueServiceClient:
         elif isinstance(artifact, Artifact) and artifact.source_kind == "module" and inspect.ismodule(artifact.source_value):
             module_source = artifact.source_value
 
+        normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
+        normalized_task_resource_paths = [item for item in list(task_resource_paths or ()) if str(item or "").strip()]
+        if normalized_resource_paths and module_source is None:
+            raise ValueError("resource_paths requires a module source")
+        if normalized_task_resource_paths and module_source is None:
+            raise ValueError("task_resource_paths requires a module source")
+
         normalize_kwargs = dict(
             consumer_kind="job",
             artifact=artifact,
@@ -421,7 +417,32 @@ class QueueServiceClient:
             package_format=package_format,
             dependency_allowlist=dependency_allowlist,
         )
-        if source is not None:
+        bundled_module_resource_paths: list[Any] = []
+        if module_source is not None:
+            seen_resource_keys: set[str] = set()
+            for item in [*normalized_resource_paths, *normalized_task_resource_paths]:
+                key = str(item)
+                if key in seen_resource_keys:
+                    continue
+                seen_resource_keys.add(key)
+                bundled_module_resource_paths.append(item)
+
+        if bundled_module_resource_paths and module_source is not None:
+            module_blob, module_filename = _prepare_code_blob(
+                module=module_source,
+                resource_paths=bundled_module_resource_paths,
+            )
+            normalized_artifact = _normalize_artifact_input(
+                source=module_blob,
+                consumer_kind="job",
+                deps=deps,
+                runtime=runtime,
+                entry_module=_default_entry_module_for_module(module_source),
+                entry_callable=entry_callable,
+                package_format=_resolve_package_format(package_format, module_filename, default="py"),
+                dependency_allowlist=dependency_allowlist,
+            )
+        elif source is not None:
             normalized_artifact = _normalize_artifact_input(source=source, **normalize_kwargs)
         else:
             normalized_artifact = _normalize_artifact_input(**normalize_kwargs)
@@ -497,6 +518,16 @@ class QueueServiceClient:
         )
         if normalized_update_globals is not None:
             payload["update_globals"] = normalized_update_globals
+        if normalized_task_resource_paths:
+            payload["task_resource_paths"] = [str(item) for item in normalized_task_resource_paths]
+        requested_task_serialization_mode = str(serialization_mode or "").strip().lower() or str(
+            self._default_task_serialization_mode or ""
+        ).strip().lower()
+        if requested_task_serialization_mode:
+            payload["serialization_mode"] = requested_task_serialization_mode
+        requested_task_policy_id = str(policy_id or "").strip().lower()
+        if requested_task_policy_id:
+            payload["policy_id"] = requested_task_policy_id
         if self.client_id:
             payload["client_id"] = self.client_id
         return payload
@@ -513,6 +544,10 @@ class QueueServiceClient:
         entry_callable: Any = "run",
         package_format: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        resource_paths: Optional[Sequence[Any]] = None,
+        task_resource_paths: Optional[Sequence[Any]] = None,
+        serialization_mode: str = "",
+        policy_id: str = "",
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -532,6 +567,10 @@ class QueueServiceClient:
             entry_callable=entry_callable,
             package_format=package_format,
             dependency_allowlist=dependency_allowlist,
+            resource_paths=resource_paths,
+            task_resource_paths=task_resource_paths,
+            serialization_mode=serialization_mode,
+            policy_id=policy_id,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
             finalize_callable=finalize_callable,
@@ -590,6 +629,8 @@ class QueueServiceClient:
         runtime: str = "py3",
         package_format: str = "py",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        serialization_mode: str = "",
+        policy_id: str = "",
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
@@ -602,6 +643,8 @@ class QueueServiceClient:
             entry_callable="run",
             package_format=_resolve_package_format(package_format, default="py"),
             dependency_allowlist=dependency_allowlist,
+            serialization_mode=serialization_mode,
+            policy_id=policy_id,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
             finalize_callable=finalize_callable,
@@ -614,19 +657,23 @@ class QueueServiceClient:
         job_payload: Optional[Dict[str, object]] = None,
         runtime: str = "py3",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        resource_paths: Optional[Sequence[Any]] = None,
+        task_resource_paths: Optional[Sequence[Any]] = None,
+        serialization_mode: str = "",
+        policy_id: str = "",
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
         finalize_callable: str = "",
     ) -> Dict[str, object]:
-        _module_blob, module_filename = _prepare_code_blob(module=module)
         return self.submit(
             source=module,
             job_payload=job_payload,
             runtime=runtime,
-            entry_module=_default_entry_module_for_module(module),
-            entry_callable="run",
-            package_format=_resolve_package_format("", module_filename, default="py"),
             dependency_allowlist=dependency_allowlist,
+            resource_paths=resource_paths,
+            task_resource_paths=task_resource_paths,
+            serialization_mode=serialization_mode,
+            policy_id=policy_id,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
             finalize_callable=finalize_callable,

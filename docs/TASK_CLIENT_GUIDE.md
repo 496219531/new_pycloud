@@ -117,7 +117,10 @@ client.submit(
 1. 依赖分析基于“已加载 module object + 真实 `__file__`”
 2. 自动打包只收 `.py / .pyd / .so`
 3. `.csv / .json / README / docs` 等非 Python 文件不会自动带上
-4. 如果 job 依赖非 Python 资源，请预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` 或 `submit_job_from_bytes(...)` 提交
+4. 如果 service/taskpool/job 依赖非 Python 资源，默认不会自动打包；你可以显式传 `resource_paths=[...]`
+5. 对 `JobQueue.submit(source=module, ...)`，`resource_paths=[...]` 只影响 job-orchestrator 侧的 module artifact；如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
+6. 如果你不想逐个列文件，也可以预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` / `submit_job_from_bytes(...)` 提交
+7. `JobQueue` 自己固定使用 `structured_v1 + default_safe`；`submit(...)` 里传的 `serialization_mode / policy_id` 会解释为未来 `TaskPool` 的执行策略
 
 如果你想本地检查自动打包产物：
 

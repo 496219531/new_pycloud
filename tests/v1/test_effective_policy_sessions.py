@@ -63,5 +63,5 @@ def test_task_pool_session_computes_frozen_effective_policy():
         policy_id="trusted_internal",
     )
 
-    assert pool.effective_policy.resolved_mode == "legacy_v1"
-    assert pool.serialization_mode == "legacy_v1"
+    assert pool.effective_policy.resolved_mode == "structured_v1"
+    assert pool.serialization_mode == "structured_v1"

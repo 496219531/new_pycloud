@@ -34,7 +34,7 @@ SERVICE_HTTP_BYTES_SERIALIZATION_MODE = "pickle_stable_v1"
 
 def get_fund_nav(fund_list: Sequence[int] | None = None, frequency: int = 1) -> pd.DataFrame:
     del frequency
-    fund_nav_df = pd.read_csv(ROOT_DIR / "fund_nav_df.csv")
+    fund_nav_df = pd.read_csv("/Users/hkk/Documents/new_pycloud/fund_nav_df.csv")
     fund_nav_df["TradingDay"] = pd.to_datetime(fund_nav_df["TradingDay"])
     if fund_list:
         fund_nav_df = fund_nav_df[fund_nav_df["FundID"].isin(list(fund_list))]
@@ -302,7 +302,7 @@ def calc_fund_list_asset_ratio2(
         t1 = time.time()
         print(t1 - t0)
         results = []
-        for _task_id, data in pool.unordered(payloads, timeout_sec=300):
+        for _task_id, data in pool.unordered(payloads, timeout_sec=300,max_in_flight=32):
             results.append(_normalize_result_item(data))
         t2 = time.time()
         print(t2 - t1)
@@ -333,7 +333,7 @@ def calc_fund_list_asset_ratio_taskpool_aunordered(
             items = []
             async for item in pool.aunordered(
                 payloads,
-                max_in_flight=min(16, max(1, len(payloads))),
+                max_in_flight=32,
                 timeout_sec=300.0,
             ):
                 items.append(item)
@@ -393,16 +393,24 @@ def calc_fund_list_asset_ratio_job(
         CONTROLPLANE_TARGET,
         client_id=client_id,
         timeout_sec=300.0,
-        serialization_mode=TASKPOOL_SERIALIZATION_MODE,
+        # serialization_mode=TASKPOOL_SERIALIZATION_MODE,
     ) as client:
         resp = client.submit_job_from_module(
             module=calc_asset_ratio_job_module,
+            # resource_paths=["fund_nav_df.csv"],
+            # task_resource_paths=[
+            #     "bench_mark_closeprice_df.csv",
+            #     "bench_mark_yield_df_weekly.csv",
+            #     "bench_mark_yield_df.csv",
+            # ],
             job_payload={
                 "fund_list": list(fund_list or ()),
                 "strategy_type": strategy_type,
                 "frequency": frequency,
             },
             runtime="py3",
+            policy_id='pickle_internal_heavy',
+            serialization_mode=TASKPOOL_SERIALIZATION_MODE,                                    
         )
         job_id = resp["job"]["job_id"]
         print("submitted job:", job_id)
@@ -507,14 +515,14 @@ if __name__ == "__main__":
         1652875,
     ]
     t1 = time.time()
-    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)

@@ -31,6 +31,31 @@ class _FakeContext:
         return "test-peer"
 
 
+def test_node_control_service_close_task_pool_triggers_sync_callback():
+    calls = {"count": 0}
+
+    class _State:
+        def close_task_pool(self, **kwargs):
+            calls["kwargs"] = dict(kwargs)
+            return object()
+
+    service = NodeControlService(_State(), on_service_routes_changed=lambda: calls.__setitem__("count", calls["count"] + 1))
+    context = _FakeContext()
+    request = pb2.CloseTaskPoolRequest(
+        owner_client_id="owner-1",
+        pool_id="pool-1",
+        pool_token="token-1",
+        reason="done",
+    )
+
+    response = service.CloseTaskPool(request, context)
+
+    assert response.ok is True
+    assert response.accepted is True
+    assert calls["count"] == 1
+    assert calls["kwargs"]["pool_id"] == "pool-1"
+
+
 def test_node_control_client_call_service_uses_transport_payload_for_pickle():
     client = NodeControlClient.__new__(NodeControlClient)
     client.timeout_sec = 5.0

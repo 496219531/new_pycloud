@@ -26,11 +26,12 @@ def _fake_data_ref() -> DataRef:
 
 
 def test_job_queue_tracks_session_serialization_mode_and_propagates_submit():
-    queue = JobQueue.connect(
-        "127.0.0.1:50051",
-        client_id="jobq-client",
-        serialization_mode="structured_v1",
-    )
+    with pytest.warns(DeprecationWarning, match="JobQueue\\(serialization_mode=.*\\) is deprecated"):
+        queue = JobQueue.connect(
+            "127.0.0.1:50051",
+            client_id="jobq-client",
+            serialization_mode="structured_v1",
+        )
     try:
         with (
             patch(
@@ -48,6 +49,22 @@ def test_job_queue_tracks_session_serialization_mode_and_propagates_submit():
         assert queue.serialization_mode == "structured_v1"
         assert "serialization_mode=structured_v1" in repr(queue)
         assert mocked_call.call_args.kwargs["serialization_mode"] == "structured_v1"
+    finally:
+        queue.close()
+
+
+def test_job_queue_transport_mode_stays_structured_even_when_constructor_requests_pickle():
+    with pytest.warns(DeprecationWarning, match="JobQueue\\(serialization_mode=.*\\) is deprecated"):
+        queue = JobQueue.connect(
+            "127.0.0.1:50051",
+            client_id="jobq-client",
+            serialization_mode="pickle_stable_v1",
+        )
+    try:
+        assert queue.serialization_mode == "structured_v1"
+        assert queue.effective_policy is not None
+        assert queue.effective_policy.policy_id == "default_safe"
+        assert queue.effective_policy.resolved_mode == "structured_v1"
     finally:
         queue.close()
 
@@ -77,6 +94,27 @@ def test_task_pool_put_data_inherits_session_serialization_mode():
         session.close()
 
 
+def test_task_pool_defaults_to_trusted_internal_binding():
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool},
+        nodes={},
+        task_method="run",
+    )
+    try:
+        assert session.effective_policy is not None
+        assert session.effective_policy.policy_id == "trusted_internal"
+        assert session.serialization_mode == "structured_v1"
+    finally:
+        session.close()
+
+
 def test_service_put_data_inherits_session_serialization_mode():
     service = Service(
         owner_client_id="owner-demo",
@@ -95,6 +133,19 @@ def test_service_put_data_inherits_session_serialization_mode():
     assert service.serialization_mode == "structured_v1"
     assert "serialization_mode=structured_v1" in repr(service)
     assert mocked_put.call_args.kwargs["serialization_mode"] == "structured_v1"
+
+
+def test_service_defaults_to_trusted_internal_binding():
+    service = Service(
+        owner_client_id="owner-demo",
+        service_name="service-demo",
+        sessions={},
+        nodes={},
+        _clients={},
+    )
+    assert service.effective_policy is not None
+    assert service.effective_policy.policy_id == "trusted_internal"
+    assert service.serialization_mode == "structured_v1"
 
 
 def test_gateway_public_rejects_pickle_even_when_trusted(monkeypatch):

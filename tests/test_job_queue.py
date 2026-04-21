@@ -456,6 +456,219 @@ def test_run_job_with_hooks_uses_entryfunc_for_taskpool() -> None:
     assert "entry_module" not in call_kwargs
 
 
+def test_run_job_with_hooks_forwards_requested_taskpool_policy() -> None:
+    queue = JobQueueManager()
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    module_blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value)}\n\n"
+        b"def task_generator(value=0, count=1, **_kwargs):\n"
+        b"    return [{'value': value + i} for i in range(count)]\n"
+    )
+    state = queue.submit_job(  # noqa: SLF001
+        {
+            "job_id": "job-hooks-requested-policy",
+            "client_id": "client-a",
+            "priority": 5,
+            "blob_b64": base64.b64encode(module_blob).decode("utf-8"),
+            "entry_module": "job_hooks_requested_policy_demo",
+            "entry_callable": "run",
+            "package_format": "py",
+            "task_generator_callable": "task_generator",
+            "serialization_mode": "pickle_stable_v1",
+            "policy_id": "pickle_internal_heavy",
+            "job_payload": {"value": 2, "count": 1},
+        }
+    )
+    state.status = "RUNNING"
+
+    class _FakePool:
+        def __init__(self):
+            self.job_id = "job-hooks-requested-policy"
+
+        def imap_unordered(self, payloads, **kwargs):
+            del kwargs
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
+
+        def update_globals(self, values):
+            return values
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            return None
+
+    fake_pool = _FakePool()
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
+        queue._run_job("job-hooks-requested-policy")  # noqa: SLF001
+
+    call_kwargs = mocked.call_args.kwargs
+    assert call_kwargs["serialization_mode"] == "pickle_stable_v1"
+    assert call_kwargs["policy_id"] == "pickle_internal_heavy"
+
+
+def test_run_job_with_hooks_defaults_taskpool_policy_when_submit_omits_execution_policy() -> None:
+    queue = JobQueueManager()
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    module_blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value)}\n\n"
+        b"def task_generator(value=0, count=1, **_kwargs):\n"
+        b"    return [{'value': value + i} for i in range(count)]\n"
+    )
+    state = queue.submit_job(  # noqa: SLF001
+        {
+            "job_id": "job-hooks-default-policy",
+            "client_id": "client-a",
+            "priority": 5,
+            "blob_b64": base64.b64encode(module_blob).decode("utf-8"),
+            "entry_module": "job_hooks_default_policy_demo",
+            "entry_callable": "run",
+            "package_format": "py",
+            "task_generator_callable": "task_generator",
+            "job_payload": {"value": 2, "count": 1},
+        }
+    )
+    state.status = "RUNNING"
+
+    class _FakePool:
+        def __init__(self):
+            self.job_id = "job-hooks-default-policy"
+
+        def imap_unordered(self, payloads, **kwargs):
+            del kwargs
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
+
+        def update_globals(self, values):
+            return values
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            return None
+
+    fake_pool = _FakePool()
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
+        queue._run_job("job-hooks-default-policy")  # noqa: SLF001
+
+    call_kwargs = mocked.call_args.kwargs
+    assert call_kwargs["serialization_mode"] == ""
+    assert call_kwargs["policy_id"] == ""
+
+
+def test_run_job_with_hooks_uses_default_taskpool_policy_when_submit_omits_policy_fields() -> None:
+    queue = JobQueueManager()
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    module_blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value)}\n\n"
+        b"def task_generator(value=0, count=1, **_kwargs):\n"
+        b"    return [{'value': value + i} for i in range(count)]\n"
+    )
+    state = queue.submit_job(  # noqa: SLF001
+        {
+            "job_id": "job-hooks-default-policy",
+            "client_id": "client-a",
+            "priority": 5,
+            "blob_b64": base64.b64encode(module_blob).decode("utf-8"),
+            "entry_module": "job_hooks_default_policy_demo",
+            "entry_callable": "run",
+            "package_format": "py",
+            "task_generator_callable": "task_generator",
+            "job_payload": {"value": 2, "count": 1},
+        }
+    )
+    state.status = "RUNNING"
+
+    class _FakePool:
+        def __init__(self):
+            self.job_id = "job-hooks-default-policy"
+
+        def imap_unordered(self, payloads, **kwargs):
+            del kwargs
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
+
+        def update_globals(self, values):
+            return values
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            return None
+
+    fake_pool = _FakePool()
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
+        queue._run_job("job-hooks-default-policy")  # noqa: SLF001
+
+    call_kwargs = mocked.call_args.kwargs
+    assert call_kwargs["serialization_mode"] == ""
+    assert call_kwargs["policy_id"] == ""
+
+
+def test_run_job_with_hooks_forwards_task_resource_paths_to_task_pool() -> None:
+    queue = JobQueueManager()
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    module_blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value)}\n\n"
+        b"def task_generator(value=0, count=1, **_kwargs):\n"
+        b"    return [{'value': value + i} for i in range(count)]\n"
+    )
+    state = queue.submit_job(  # noqa: SLF001
+        {
+            "job_id": "job-hooks-task-resources",
+            "client_id": "client-a",
+            "priority": 5,
+            "blob_b64": base64.b64encode(module_blob).decode("utf-8"),
+            "entry_module": "job_hooks_task_resources_demo",
+            "entry_callable": "run",
+            "package_format": "py",
+            "task_generator_callable": "task_generator",
+            "task_resource_paths": ["worker/data.csv"],
+            "serialization_mode": "pickle_stable_v1",
+            "policy_id": "pickle_internal_heavy",
+            "job_payload": {"value": 2, "count": 1},
+        }
+    )
+    state.status = "RUNNING"
+
+    class _FakePool:
+        def __init__(self):
+            self.job_id = "job-hooks-task-resources"
+
+        def imap_unordered(self, payloads, **kwargs):
+            del kwargs
+            for idx, item in enumerate(list(payloads)):
+                yield idx, {"value": int(item["value"])}
+
+        def update_globals(self, values):
+            return values
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            return None
+
+    fake_pool = _FakePool()
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
+        queue._run_job("job-hooks-task-resources")  # noqa: SLF001
+
+    call_kwargs = mocked.call_args.kwargs
+    assert callable(getattr(call_kwargs["source"], "run", None))
+    assert call_kwargs["entry_callable"] == "run"
+    assert call_kwargs["resource_paths"] == ["worker/data.csv"]
+    assert call_kwargs["serialization_mode"] == "pickle_stable_v1"
+    assert call_kwargs["policy_id"] == "pickle_internal_heavy"
+    assert "entry_func" not in call_kwargs
+
+
 def test_run_job_with_hooks_accepts_direct_payload_list_task_generator() -> None:
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
@@ -985,6 +1198,29 @@ def test_job_queue_client_submit_accepts_module_source_via_unified_artifact_path
     assert captured["package_format"] == "tar.gz"
 
 
+def test_job_queue_submit_interprets_serialization_mode_and_policy_id_for_future_task_pool() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-a")
+    captured = {}
+
+    def _fake_submit(payload):
+        captured.update(payload)
+        return {"ok": True}
+
+    client.submit_job = _fake_submit  # type: ignore[method-assign]
+    resp = client.submit(
+        source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
+        entry_module="job_demo",
+        serialization_mode="pickle_stable_v1",
+        policy_id="pickle_internal_heavy",
+    )
+
+    assert resp == {"ok": True}
+    assert captured["serialization_mode"] == "pickle_stable_v1"
+    assert captured["policy_id"] == "pickle_internal_heavy"
+
+
 def test_job_queue_client_submit_rejects_callable_source() -> None:
     from pycloud_parallel import JobQueue
 
@@ -1418,12 +1654,22 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
         captured["limit"] = limit
         return [route]
 
-    def _fake_call_route_http(route_arg, *, method, payload, timeout_sec, service_token, effective_policy=None):
+    def _fake_call_route_http(
+        route_arg,
+        *,
+        method,
+        payload,
+        timeout_sec,
+        service_token,
+        serialization_mode="",
+        effective_policy=None,
+    ):
         captured["route"] = route_arg
         captured["method"] = method
         captured["payload"] = dict(payload or {})
         captured["timeout_sec"] = timeout_sec
         captured["service_token"] = service_token
+        captured["serialization_mode"] = serialization_mode
         captured["effective_policy"] = effective_policy
         return {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}
 
@@ -1447,6 +1693,7 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
     assert captured["method"] == "get_job_status"
     assert captured["payload"] == {"job_id": "job-1"}
     assert captured["service_token"] == "token-discovery"
+    assert captured["serialization_mode"] == "structured_v1"
     assert captured["route"].http_base_url == "http://127.0.0.1:18080/svc/job-orch-1"
 
 
@@ -1488,6 +1735,98 @@ def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
     assert "finalize_callable" not in captured
     assert captured["package_format"] == "tar.gz"
     assert captured["blob_b64"]
+
+
+def test_job_queue_client_submit_job_from_module_forwards_resource_paths() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
+
+    import types
+
+    module = types.ModuleType("job_module_demo")
+    exec(
+        (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': value}\n\n"
+            b"def task_generator(value=0, **_kwargs):\n"
+            b"    return [{'value': value}]\n"
+        ).decode("utf-8"),
+        module.__dict__,
+    )
+
+    with patch.object(client, "submit", return_value={"ok": True}) as mocked_submit:
+        resp = client.submit_job_from_module(module=module, resource_paths=["fund_nav_df.csv"])
+
+    assert resp == {"ok": True}
+    mocked_submit.assert_called_once()
+    assert mocked_submit.call_args.kwargs["source"] is module
+    assert mocked_submit.call_args.kwargs["resource_paths"] == ["fund_nav_df.csv"]
+
+
+def test_job_queue_client_submit_job_from_module_forwards_task_resource_paths() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
+
+    import types
+
+    module = types.ModuleType("job_module_demo")
+    exec(
+        (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': value}\n\n"
+            b"def task_generator(value=0, **_kwargs):\n"
+            b"    return [{'value': value}]\n"
+        ).decode("utf-8"),
+        module.__dict__,
+    )
+
+    with patch.object(client, "submit", return_value={"ok": True}) as mocked_submit:
+        resp = client.submit_job_from_module(module=module, task_resource_paths=["worker/data.csv"])
+
+    assert resp == {"ok": True}
+    mocked_submit.assert_called_once()
+    assert mocked_submit.call_args.kwargs["task_resource_paths"] == ["worker/data.csv"]
+
+
+def test_job_queue_client_submit_job_from_module_bundles_task_resources_into_job_blob() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-module")
+    captured = {}
+
+    import types
+
+    module = types.ModuleType("job_module_demo")
+    exec(
+        (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': value}\n\n"
+            b"def task_generator(value=0, **_kwargs):\n"
+            b"    return [{'value': value}]\n"
+        ).decode("utf-8"),
+        module.__dict__,
+    )
+
+    def _fake_submit(payload):
+        captured.update(payload)
+        return {"ok": True}
+
+    client.submit_job = _fake_submit  # type: ignore[method-assign]
+
+    with patch(
+        "pycloud_parallel.execution.queue._prepare_code_blob",
+        return_value=(b"blob", "job_module_demo.tar.gz"),
+    ) as mocked_blob:
+        resp = client.submit_job_from_module(
+            module=module,
+            task_resource_paths=["worker/data.csv"],
+        )
+
+    assert resp == {"ok": True}
+    mocked_blob.assert_called_once()
+    assert mocked_blob.call_args.kwargs["resource_paths"] == ["worker/data.csv"]
 
 
 def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> None:

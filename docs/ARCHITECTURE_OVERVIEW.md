@@ -217,26 +217,26 @@
    - numpy `ndarray`（非 `dtype=object`）
    - `dtype=object` 明确报错
 
-## 9. Policy / Capability / Effective Policy
+## 9. Policy / Tags / Effective Policy
 
 当前多节点执行面统一按三层模型收口：
 
 1. `Policy Profile`
    - 由 controlplane/profile 中心统一定义
    - 决定逻辑策略，而不是某台 node 的本地偏好
-2. `Node Capability`
-   - 由每个 node 启动后上报自身硬能力
-   - 只描述“我支持什么、我的硬上限是多少”
+2. `Node Tags / Runtime Filtering`
+   - 由 tags、healthy 状态、runtime 兼容决定哪些 node 参与 session
+   - 负责“选哪些节点”，不负责 policy 协商
 3. `Effective Policy`
    - 在 `Service / TaskPool / JobQueue` 会话创建时，由 controlplane 根据
-     `Policy Profile ∩ candidate node capabilities`
+     `Policy Profile + requested_mode + context`
      计算并冻结
    - 同一 session 后续所有 node 都按这个冻结结果执行
 
 核心原则：
 
 1. node 不拥有 policy
-2. node 只上报 capability
+2. 节点差异主要通过 tags / healthy / runtime 过滤表达
 3. policy 由中心统一管理
 4. effective policy 在会话创建时冻结
 5. 执行期不允许同一 session 内 policy 漂移
@@ -248,7 +248,8 @@
 1. allowed modes
 2. default mode
 3. inline payload/result limits
-4. 是否 prefer bytes transport
+4. 是否启用 protobuf/grpc bytes transport
+5. 是否启用 HTTP bytes transport
 5. 是否允许 `pickle_stable_v1`
 6. soft limit 以上是否强制转 `DataRef`
 7. public gateway 是否允许 pickle
@@ -259,18 +260,33 @@
 2. `trusted_internal`
 3. `pickle_internal_heavy`
 
-### 9.2 Node Capability
+当前内置默认绑定：
 
-`Node Capability` 当前主要上报：
+1. `gateway_public`
+   - profile=`default_safe`
+   - default mode=`legacy_v1`
+2. `service_internal`
+   - profile=`trusted_internal`
+   - default mode=`structured_v1`
+3. `taskpool_default`
+   - profile=`trusted_internal`
+   - default mode=`structured_v1`
+4. `taskpool_heavy_dataframe_numpy`
+   - profile=`pickle_internal_heavy`
+   - default mode=`pickle_stable_v1`
+5. `jobqueue_controlplane_transport`
+   - profile=`trusted_internal`
+   - default mode=`structured_v1`
 
-1. supported serialization modes
-2. 是否支持 protobuf bytes transport
-3. 是否支持 HTTP bytes transport
-4. gRPC send/recv 最大字节数
-5. HTTP body 最大字节数
-6. upload file/total 最大字节数
+### 9.2 Tags / Node Metadata
 
-InfoCenter 现在会把 capability 连同 node/route 信息一起保存和返回，后续会话创建时不再靠本机 env 猜远端能力。
+当前框架把节点差异主要收敛到：
+
+1. tags
+2. healthy_only
+3. runtime 兼容
+
+InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断使用；但运行时 `effective_policy` 不再与 candidate capability 做交集协商。
 
 ### 9.3 Effective Policy
 
@@ -290,6 +306,20 @@ InfoCenter 现在会把 capability 连同 node/route 信息一起保存和返回
 2. `TaskPool.open()` 建立后，同一 pool 内 task submit / managed globals / result decode 共用同一执行策略
 3. `JobQueue.connect()` 建立后，job submit 到 route call 也按同一冻结策略走
 
+其中 `Service.connect()` 有一个额外约束：
+
+1. caller 不再显式传 `policy_id`
+2. connect 会从 deploy 后的 service route/status metadata 继承绑定的 profile
+3. 然后按 route 绑定的 profile 和 connect 上下文冻结出自己的 `effective_policy`
+4. 如果同名 service routes 的 `policy_id` 不一致，connect 会直接失败，避免普通调用面继续“选 profile”
+
+`JobQueue.connect()` 也遵循同样的边界：
+
+1. queue 自己的 controlplane transport 默认绑定 `jobqueue_controlplane_transport`
+2. 这个 binding 当前固定落到 `trusted_internal + structured_v1`
+3. 用户在 `submit(...)` 上传的 `serialization_mode / policy_id`，解释为未来 `TaskPool` 的执行策略
+4. session 对外可见的是 queue 自己冻结后的 `effective_policy`
+
 这里要特别注意：
 
 1. codec 和 carrier 现在是两个层次
@@ -298,22 +328,21 @@ InfoCenter 现在会把 capability 连同 node/route 信息一起保存和返回
 4. `prefers_transport_payload_bytes()` 这类 mode helper 只在“当前没有 effective policy”时才作为 fallback
 
 也就是说，`pickle_stable_v1` 不再天然等于“一定走 bytes lane”；
-如果 profile/capability 算出来的 effective policy 关闭了 bytes lane，运行时会继续用该 codec，但改走非 bytes carrier。
+如果当前 effective policy 关闭了 bytes lane，运行时会继续用该 codec，但改走非 bytes carrier。
 
 `JobQueue` 还有一个额外约束：
 
-1. 初始化时允许先拿 profile/fallback policy 起步
-2. 真正发起 orchestrator route call 前，会基于当前 route snapshot 的 capability 重新 resolve effective policy
-3. 因此最终执行用的 mode/carrier 决策来自 `profile ∩ orchestrator capability`，而不是空 capability 默认值
+1. 初始化后 queue 自己就固定到 `structured_v1 + default_safe`
+2. orchestrator route 只负责发现和路由，不再决定 queue 自己的 effective policy
+3. 真正给 task 执行面用的 `serialization_mode / policy_id` 来自 `submit(...)`，并在创建 `TaskPool` 时生效
 
 ### 9.4 Payload Policy 的来源
 
 payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
 
 1. `Policy Profile` 给出逻辑目标值
-2. `Node Capability` 给出物理硬上限
-3. `Effective Policy` 给出会话实际采用值
-4. 具体 `PayloadPolicy` 再从 `Effective Policy` 派生
+2. `Effective Policy` 给出会话实际采用值
+3. 具体 `PayloadPolicy` 再从 `Effective Policy` 派生
 
 当前已经接到的主链：
 
@@ -323,7 +352,7 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
 4. `JobQueue` submit call
 5. managed globals 上传准备
 
-也就是说，同一 session 下 JSON/Struct inline 和 transport bytes 都会受同一个 effective payload limit 约束；node 本地只保留硬上限拒绝权。
+也就是说，同一 session 下 JSON/Struct inline 和 transport bytes 都会受同一个 effective payload limit 约束；节点差异主要通过 tags / healthy / runtime 过滤来表达，而不是再参与 policy 协商。
 
 另外，carrier 的运行时选择也已经收口到 effective policy：
 

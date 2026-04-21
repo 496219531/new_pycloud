@@ -834,6 +834,7 @@ class NodeControlClient:
         deps: Optional[ArtifactDeps] = None,
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        policy_id: str = "",
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -856,6 +857,7 @@ class NodeControlClient:
                 dependency_policy_mode=resolved_deps.mode,
                 dependency_allowlist=resolved_deps.dependency_allowlist,
                 managed_global_names=managed_global_names,
+                policy_id=policy_id,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -880,6 +882,7 @@ class NodeControlClient:
         deps: Optional[ArtifactDeps] = None,
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        policy_id: str = "",
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -902,6 +905,7 @@ class NodeControlClient:
                 dependency_policy_mode=resolved_deps.mode,
                 dependency_allowlist=resolved_deps.dependency_allowlist,
                 managed_global_names=managed_global_names,
+                policy_id=policy_id,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -926,6 +930,7 @@ class NodeControlClient:
         dependency_policy_mode: str,
         dependency_allowlist: Optional[Sequence[str]],
         managed_global_names: Optional[Sequence[str]],
+        policy_id: str,
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -964,6 +969,7 @@ class NodeControlClient:
                     dependency_allowlist=list(dependency_allowlist or ()),
                     managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
                     dependency_policy_mode=normalized_dependency_policy_mode,
+                    policy_id=str(policy_id or "").strip().lower() or "default_safe",
                 )
             )
             yield from (pb2.CreateServiceRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
@@ -1003,6 +1009,7 @@ class NodeControlClient:
         deps: Optional[ArtifactDeps] = None,
         dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        policy_id: str = "",
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -1046,6 +1053,7 @@ class NodeControlClient:
                     dependency_allowlist=list(resolved_deps.dependency_allowlist),
                     managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
                     dependency_policy_mode=normalized_dependency_policy_mode,
+                    policy_id=str(policy_id or "").strip().lower() or "default_safe",
                 )
             )
             for i in range(0, len(blob), max(1, int(chunk_size))):

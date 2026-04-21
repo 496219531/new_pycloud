@@ -6,14 +6,20 @@ import asyncio
 from collections import deque
 import contextlib
 from dataclasses import replace
-import math
+import inspect
+import logging
 import os
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
-from pycloud_parallel.controlplane.artifact import _normalize_artifact_input, _prepare_artifact
+from pycloud_parallel.controlplane.artifact import (
+    _default_entry_module_for_module,
+    _normalize_artifact_input,
+    _prepare_artifact,
+    _resolve_package_format,
+)
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
@@ -21,7 +27,10 @@ from pycloud_parallel.controlplane.effective_policy import (
     should_use_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode, _node_instance_key_from_node
-from pycloud_parallel.controlplane.policy_profile import get_policy_profile
+from pycloud_parallel.controlplane.policy_profile import (
+    get_default_policy_id_for_binding,
+    get_policy_profile,
+)
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
@@ -52,6 +61,7 @@ from pycloud_parallel.execution.scheduler import (
 )
 from pycloud_parallel.execution.support import (
     _get_local_ip,
+    _prepare_code_blob,
     _prepare_managed_globals_values_for_upload,
     _prepare_task_payload_for_submit,
     _put_data_via_clients,
@@ -59,6 +69,10 @@ from pycloud_parallel.execution.support import (
 )
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+
+logger = logging.getLogger(__name__)
+_TASK_POOL_CLOSE_RETRY_DELAYS_SEC = (0.0, 0.5, 1.0, 2.0)
 
 
 def _infocenter_client(*args, **kwargs):
@@ -75,6 +89,26 @@ def _node_control_client(*args, **kwargs):
 
 def _resolve_task_results_data(batch: Any, results: Sequence[pb2.TaskResult]) -> List[Any]:
     return [batch.fetch_result_data(item) for item in results]
+
+
+def _close_task_pool_replica(pool: Any, *, reason: str) -> None:
+    last_exc: Optional[Exception] = None
+    for delay_sec in _TASK_POOL_CLOSE_RETRY_DELAYS_SEC:
+        if delay_sec > 0.0:
+            time.sleep(delay_sec)
+        try:
+            pool.close(reason=reason)
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        logger.warning(
+            "task pool replica close failed after retries pool_id=%s node_id=%s err=%r",
+            getattr(pool, "pool_id", ""),
+            getattr(pool, "node_id", ""),
+            last_exc,
+        )
 
 
 async def _aiter_from_sync_iterator(iterator) -> AsyncIterator[Any]:
@@ -124,10 +158,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._backend = backend
         self._task_method = str(task_method or "run").strip() or "run"
         self._job_id = str(job_id or f"pool-{uuid.uuid4().hex[:12]}").strip()
-        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
+        self._policy_id = (
+            str(policy_id or "").strip().lower()
+            or get_default_policy_id_for_binding("taskpool_default")
+        )
         self.effective_policy = effective_policy or resolve_effective_policy(
-            get_policy_profile(self.policy_id),
-            list(nodes.values()),
+            get_policy_profile(self._policy_id),
             requested_mode=serialization_mode,
             context="taskpool_session",
         )
@@ -1238,12 +1274,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             result_timeout_sec = float(shared_kwargs.pop("result_timeout_sec", timeout_sec) or timeout_sec)
             wait_ms = int(shared_kwargs.pop("wait_ms", 500) or 500)
             raise_on_error = bool(shared_kwargs.pop("raise_on_error", True))
-            node_window_factor = float(shared_kwargs.pop("node_window_factor", 2.0) or 2.0)
+            _node_window_factor = float(shared_kwargs.pop("node_window_factor", 2.0) or 2.0)
             if shared_kwargs:
                 unexpected = ", ".join(sorted(shared_kwargs))
                 raise TypeError(f"unexpected keyword arguments for imap_unordered(): {unexpected}")
             profile = resolve_taskpool_strategy(strategy)
-            window_factor = max(0.1, float(node_window_factor or 0.0))
             payload_iter = iter(payloads)
             retry_payloads: "deque[Tuple[int, Dict[str, object]]]" = deque()
             input_exhausted = False
@@ -1253,17 +1288,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             node_ids = self._available_pool_node_ids()
             if not node_ids:
                 raise RuntimeError("task pool has no active node pools")
-            window_by_node = {
-                node_id: max(
-                    1,
-                    int(
-                        math.ceil(
-                            max(1, int(getattr(self._pools[node_id], "worker_count", 1) or 1)) * window_factor
-                        )
-                    ),
-                )
-                for node_id in node_ids
-            }
             inflight_by_node = {node_id: 0 for node_id in node_ids}
             disabled_submit_nodes: set[str] = set()
             scheduler_failures: Dict[str, str] = {}
@@ -1341,10 +1365,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 if available_global <= 0:
                     return 0
                 capped_by_node = {
-                    node_id: min(
-                        max(0, int(available_by_node.get(node_id, 0) or 0)),
-                        max(0, int(window_by_node.get(node_id, 0) or 0) - int(inflight_by_node.get(node_id, 0) or 0)),
-                    )
+                    node_id: max(0, int(available_by_node.get(node_id, 0) or 0))
                     for node_id in node_order
                     if node_id not in disabled_submit_nodes
                 }
@@ -1405,7 +1426,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     submitted += accepted_count
                 return submitted
 
-            initial_quota = {node_id: window_by_node[node_id] for node_id in node_ids}
+            initial_quota = {node_id: max_pending for node_id in node_ids}
             _fill_from_quota(initial_quota, node_order=node_ids)
             if self._pending_result_count() <= 0 and not retry_payloads and input_exhausted:
                 return
@@ -1432,10 +1453,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     return
 
                 if self._pending_result_count() <= 0:
-                    idle_quota = {
-                        node_id: max(0, int(window_by_node.get(node_id, 0) or 0) - int(inflight_by_node.get(node_id, 0) or 0))
-                        for node_id in node_ids
-                    }
+                    idle_quota = {node_id: max_pending for node_id in node_ids}
                     submitted_now = _fill_from_quota(idle_quota, node_order=node_ids)
                     if submitted_now > 0:
                         wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
@@ -1490,18 +1508,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
                     ready_items.extend(completed_items)
                     if not (raise_on_error and any(not item.ok for item in completed_items)):
-                        refill_quota = {
-                            node_id: min(
-                                int(freed_by_node.get(node_id, 0) or 0),
-                                max(
-                                    0,
-                                    int(window_by_node.get(node_id, 0) or 0)
-                                    - int(inflight_by_node.get(node_id, 0) or 0),
-                                ),
-                            )
-                            for node_id in completion_order
-                        }
-                        _fill_from_quota(refill_quota, node_order=completion_order)
+                        freed_total = max(0, sum(int(value or 0) for value in freed_by_node.values()))
+                        if freed_total > 0:
+                            refill_quota = {node_id: freed_total for node_id in node_ids}
+                            _fill_from_quota(refill_quota, node_order=node_ids)
                     continue
 
                 if time.time() >= wait_deadline:
@@ -1779,20 +1789,15 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         return self.put_data(value, format="json", chunk_size=chunk_size, serialization_mode=serialization_mode)
 
     def close(self) -> None:
-        if self._backend is not None:
-            if self._closed:
-                return
-            self._closed = True
-            self._stop_keepalive()
-            self._backend.close()
-            return
         if self._closed:
             return
         self._closed = True
         self._stop_keepalive()
+        if self._backend is not None and not isinstance(self._backend, NativeTaskBackend):
+            self._backend.close()
+            return
         for pool in self._pools.values():
-            with contextlib.suppress(Exception):
-                pool.close(reason="task pool session close")
+            _close_task_pool_replica(pool, reason="task pool session close")
             with contextlib.suppress(Exception):
                 pool._client.close()  # noqa: SLF001
 
@@ -1823,16 +1828,23 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         return await loop.run_in_executor(None, lambda: getattr(self, normalized).sync(**kwargs))
 
     def __repr__(self) -> str:
+        effective_policy_text = ""
+        if self.effective_policy is not None:
+            effective_policy_text = (
+                f" effective_policy={self.effective_policy.policy_id}@v{self.effective_policy.version}"
+            )
         if isinstance(self._backend, NativeTaskBackend) or self._backend is None:
             return (
                 f"<{type(self).__name__} methods={self.methods} "
-                f"nodes={len(self.node_ids)} serialization_mode={self._serialization_mode}>"
+                f"nodes={len(self.node_ids)} serialization_mode={self._serialization_mode}"
+                f"{effective_policy_text}>"
             )
         if self._backend is not None:
             return repr(self._backend)
         return (
             f"<{type(self).__name__} methods={self.methods} "
-            f"nodes={len(self.node_ids)} serialization_mode={self._serialization_mode}>"
+            f"nodes={len(self.node_ids)} serialization_mode={self._serialization_mode}"
+            f"{effective_policy_text}>"
         )
 
 
@@ -1855,6 +1867,7 @@ def _build_task_pool_from_infocenter(
     entry_callable: Any = "run",
     package_format: str = "",
     dependency_allowlist: Optional[Sequence[str]] = None,
+    resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
     worker_count: int = 1,
     heartbeat_timeout_sec: int = 30,
@@ -1870,6 +1883,27 @@ def _build_task_pool_from_infocenter(
     serialization_mode: str = "",
     policy_id: str = "",
 ) -> "TaskPool":
+    module_source = source if inspect.ismodule(source) else None
+    if (
+        module_source is None
+        and inspect.ismodule(entry_module)
+        and source is None
+        and artifact is None
+        and entry_func is None
+        and func is None
+        and not artifact_path
+        and blob is None
+    ):
+        module_source = entry_module
+    normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
+    if normalized_resource_paths and module_source is None:
+        raise ValueError("resource_paths requires a module source")
+    if normalized_resource_paths and module_source is not None:
+        module_blob, module_filename = _prepare_code_blob(module=module_source, resource_paths=normalized_resource_paths)
+        source = module_blob
+        entry_module = _default_entry_module_for_module(module_source)
+        package_format = _resolve_package_format(package_format, module_filename, default="py")
+
     source_func = entry_func if entry_func is not None else func
     normalized_artifact = _normalize_artifact_input(
         consumer_kind="task",
@@ -1920,8 +1954,7 @@ def _build_task_pool_from_infocenter(
     desired_nodes = selected_nodes[:requested_count] if requested_count > 0 else selected_nodes
     effective_pool_name = str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}").strip()
     effective_policy = resolve_effective_policy(
-        get_policy_profile(policy_id),
-        desired_nodes,
+        get_policy_profile(policy_id or get_default_policy_id_for_binding("taskpool_default")),
         requested_mode=serialization_mode,
         context="taskpool_session",
     )
@@ -1956,7 +1989,7 @@ def _build_task_pool_from_infocenter(
         task_method=entry_callable,
         job_id=job_id,
         serialization_mode=effective_policy.resolved_mode,
-        policy_id=policy_id,
+        policy_id=policy_id or get_default_policy_id_for_binding("taskpool_default"),
         effective_policy=effective_policy,
     )
     session._start_keepalive()
@@ -2038,6 +2071,7 @@ class TaskPool(_TaskPoolSessionBase):
         entry_callable: Any = "run",
         package_format: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
@@ -2053,7 +2087,12 @@ class TaskPool(_TaskPoolSessionBase):
         serialization_mode: str = "",
         policy_id: str = "",
     ) -> "TaskPool":
-        """Low-level entry; prefer ``TaskPool.open(...)``."""
+        """Low-level entry; prefer ``TaskPool.open(...)``.
+
+        `policy_id` here is a deployment/control-plane input. Product callers
+        should normally express only `serialization_mode`; the session will
+        expose the frozen `effective_policy` that actually took effect.
+        """
         return _build_task_pool_from_infocenter(
             cls,
             infocenter_target=infocenter_target,
@@ -2072,6 +2111,7 @@ class TaskPool(_TaskPoolSessionBase):
             entry_callable=entry_callable,
             package_format=package_format,
             dependency_allowlist=dependency_allowlist,
+            resource_paths=resource_paths,
             managed_global_names=managed_global_names,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,

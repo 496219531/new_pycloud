@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from pycloud_parallel.controlplane.policy_profile import PolicyProfile, builtin_policy_profiles, get_policy_profile
+from pycloud_parallel.controlplane.policy_profile import (
+    PolicyProfile,
+    builtin_policy_bindings,
+    builtin_policy_profiles,
+    get_default_mode_for_binding,
+    get_default_policy_id_for_binding,
+    get_policy_profile,
+)
 
 
 def test_builtin_policy_profiles_expose_expected_defaults():
@@ -11,6 +18,28 @@ def test_builtin_policy_profiles_expose_expected_defaults():
     assert {"default_safe", "trusted_internal", "pickle_internal_heavy"}.issubset(profiles)
     assert get_policy_profile().policy_id == "default_safe"
     assert get_policy_profile("trusted_internal").default_mode == "structured_v1"
+
+
+def test_builtin_policy_bindings_expose_expected_type_defaults():
+    bindings = builtin_policy_bindings()
+
+    assert {
+        "gateway_public",
+        "service_internal",
+        "taskpool_default",
+        "taskpool_heavy_dataframe_numpy",
+        "jobqueue_controlplane_transport",
+    }.issubset(bindings)
+    assert get_default_policy_id_for_binding("gateway_public") == "default_safe"
+    assert get_default_mode_for_binding("gateway_public") == "legacy_v1"
+    assert get_default_policy_id_for_binding("service_internal") == "trusted_internal"
+    assert get_default_mode_for_binding("service_internal") == "structured_v1"
+    assert get_default_policy_id_for_binding("taskpool_default") == "trusted_internal"
+    assert get_default_mode_for_binding("taskpool_default") == "structured_v1"
+    assert get_default_policy_id_for_binding("taskpool_heavy_dataframe_numpy") == "pickle_internal_heavy"
+    assert get_default_mode_for_binding("taskpool_heavy_dataframe_numpy") == "pickle_stable_v1"
+    assert get_default_policy_id_for_binding("jobqueue_controlplane_transport") == "default_safe"
+    assert get_default_mode_for_binding("jobqueue_controlplane_transport") == "structured_v1"
 
 
 def test_policy_profile_normalizes_and_rejects_invalid_default_mode():
@@ -23,8 +52,8 @@ def test_policy_profile_normalizes_and_rejects_invalid_default_mode():
             inline_payload_soft_limit_bytes=1,
             inline_payload_hard_limit_bytes=2,
             inline_result_hard_limit_bytes=3,
-            prefer_transport_payload_bytes=False,
+            use_transport_payload_bytes=False,
+            use_http_bytes_transport=False,
             allow_pickle_stable=False,
             force_dataref_above_soft_limit=True,
         )
-

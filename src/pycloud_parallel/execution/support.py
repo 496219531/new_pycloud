@@ -1451,8 +1451,14 @@ def _prepare_code_blob(
     module: Optional[Any] = None,
     artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
     blob: Optional[bytes] = None,
+    resource_paths: Optional[Sequence[Union[str, os.PathLike[str]]]] = None,
 ) -> Tuple[Optional[bytes], str]:
-    from pycloud_parallel.controlplane.dependency import DependencyPackager
+    from pycloud_parallel.controlplane.dependency import (
+        DependencyPackager,
+        _TarSourceEntry,
+        _normalize_arcname,
+        _write_deterministic_targz,
+    )
 
     packager = DependencyPackager()
     if module is not None:
@@ -1461,7 +1467,53 @@ def _prepare_code_blob(
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            packager.package_module(module, output_file=tmp_path, include_tests=True)
+            normalized_resource_paths = [str(item) for item in list(resource_paths or ()) if str(item or "").strip()]
+            if not normalized_resource_paths:
+                packager.package_module(module, output_file=tmp_path, include_tests=True)
+            else:
+                loaded_module = module
+                deps = packager.analyzer.analyze_module(loaded_module)
+                if deps.get("error"):
+                    raise RuntimeError(deps["error"])
+
+                module_name = str(getattr(loaded_module, "__name__", "") or deps.get("module_name") or "").strip()
+                module_file = str(deps.get("file") or "").strip()
+                if not module_file:
+                    raise RuntimeError(f"cannot determine source file for module {module_name!r}")
+                module_file_path = Path(module_file).resolve()
+                module_dir = module_file_path.parent
+                module_parts = [part for part in module_name.split(".") if part]
+                if module_file_path.name == "__init__.py":
+                    base_arc_dir = Path(*module_parts)
+                elif len(module_parts) <= 1:
+                    base_arc_dir = Path()
+                else:
+                    base_arc_dir = Path(*module_parts[:-1])
+
+                entries = list(
+                    packager._build_module_entries(
+                        module_name=module_name,
+                        module_file=module_file,
+                        deps=deps,
+                        include_tests=True,
+                    )
+                )
+                for raw in normalized_resource_paths:
+                    candidate = Path(raw).expanduser()
+                    resource_path = candidate.resolve() if candidate.is_absolute() else (module_dir / candidate).resolve()
+                    if not resource_path.exists():
+                        raise FileNotFoundError(f"resource path not found for module package: {resource_path}")
+                    if not resource_path.is_file():
+                        raise ValueError(f"resource_paths only accepts files: {resource_path}")
+                    try:
+                        rel = resource_path.relative_to(module_dir)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"resource path must stay under the module directory: {resource_path}"
+                        ) from exc
+                    arcname = _normalize_arcname(base_arc_dir / rel)
+                    entries.append(_TarSourceEntry(arcname=arcname, source_path=resource_path))
+                _write_deterministic_targz(entries, tmp_path)
             with open(tmp_path, "rb") as f:
                 blob = f.read()
             filename = f"{module.__name__}.tar.gz"

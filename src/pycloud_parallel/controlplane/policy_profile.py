@@ -31,7 +31,8 @@ class PolicyProfile:
     inline_payload_soft_limit_bytes: int
     inline_payload_hard_limit_bytes: int
     inline_result_hard_limit_bytes: int
-    prefer_transport_payload_bytes: bool
+    use_transport_payload_bytes: bool
+    use_http_bytes_transport: bool
     allow_pickle_stable: bool
     force_dataref_above_soft_limit: bool
     public_gateway_allow_pickle: bool = False
@@ -59,10 +60,30 @@ class PolicyProfile:
         object.__setattr__(self, "inline_payload_soft_limit_bytes", max(1, int(self.inline_payload_soft_limit_bytes or 1)))
         object.__setattr__(self, "inline_payload_hard_limit_bytes", max(1, int(self.inline_payload_hard_limit_bytes or 1)))
         object.__setattr__(self, "inline_result_hard_limit_bytes", max(1, int(self.inline_result_hard_limit_bytes or 1)))
-        object.__setattr__(self, "prefer_transport_payload_bytes", bool(self.prefer_transport_payload_bytes))
+        object.__setattr__(self, "use_transport_payload_bytes", bool(self.use_transport_payload_bytes))
+        object.__setattr__(self, "use_http_bytes_transport", bool(self.use_http_bytes_transport))
         object.__setattr__(self, "allow_pickle_stable", bool(self.allow_pickle_stable))
         object.__setattr__(self, "force_dataref_above_soft_limit", bool(self.force_dataref_above_soft_limit))
         object.__setattr__(self, "public_gateway_allow_pickle", bool(self.public_gateway_allow_pickle))
+
+
+@dataclass(frozen=True)
+class PolicyBinding:
+    binding_id: str
+    policy_id: str
+    default_mode: str
+
+    def __post_init__(self) -> None:
+        normalized_binding_id = str(self.binding_id or "").strip().lower()
+        normalized_policy_id = str(self.policy_id or "").strip().lower()
+        normalized_default_mode = normalize_serialization_mode(self.default_mode) or "legacy_v1"
+        if not normalized_binding_id:
+            raise ValueError("binding_id is required")
+        if not normalized_policy_id:
+            raise ValueError("policy_id is required")
+        object.__setattr__(self, "binding_id", normalized_binding_id)
+        object.__setattr__(self, "policy_id", normalized_policy_id)
+        object.__setattr__(self, "default_mode", normalized_default_mode)
 
 
 _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
@@ -74,7 +95,8 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         inline_payload_soft_limit_bytes=512 * 1024,
         inline_payload_hard_limit_bytes=2 * 1024 * 1024,
         inline_result_hard_limit_bytes=4 * 1024 * 1024,
-        prefer_transport_payload_bytes=False,
+        use_transport_payload_bytes=False,
+        use_http_bytes_transport=False,
         allow_pickle_stable=False,
         force_dataref_above_soft_limit=True,
         public_gateway_allow_pickle=False,
@@ -87,7 +109,8 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         inline_payload_soft_limit_bytes=512 * 1024,
         inline_payload_hard_limit_bytes=2 * 1024 * 1024,
         inline_result_hard_limit_bytes=4 * 1024 * 1024,
-        prefer_transport_payload_bytes=True,
+        use_transport_payload_bytes=True,
+        use_http_bytes_transport=True,
         allow_pickle_stable=True,
         force_dataref_above_soft_limit=True,
         public_gateway_allow_pickle=False,
@@ -100,7 +123,8 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         inline_payload_soft_limit_bytes=1024 * 1024,
         inline_payload_hard_limit_bytes=4 * 1024 * 1024,
         inline_result_hard_limit_bytes=8 * 1024 * 1024,
-        prefer_transport_payload_bytes=True,
+        use_transport_payload_bytes=True,
+        use_http_bytes_transport=True,
         allow_pickle_stable=True,
         force_dataref_above_soft_limit=True,
         public_gateway_allow_pickle=False,
@@ -108,8 +132,41 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
 }
 
 
+_BUILTIN_POLICY_BINDINGS: Dict[str, PolicyBinding] = {
+    "gateway_public": PolicyBinding(
+        binding_id="gateway_public",
+        policy_id="default_safe",
+        default_mode="legacy_v1",
+    ),
+    "service_internal": PolicyBinding(
+        binding_id="service_internal",
+        policy_id="trusted_internal",
+        default_mode="structured_v1",
+    ),
+    "taskpool_default": PolicyBinding(
+        binding_id="taskpool_default",
+        policy_id="trusted_internal",
+        default_mode="structured_v1",
+    ),
+    "taskpool_heavy_dataframe_numpy": PolicyBinding(
+        binding_id="taskpool_heavy_dataframe_numpy",
+        policy_id="pickle_internal_heavy",
+        default_mode="pickle_stable_v1",
+    ),
+    "jobqueue_controlplane_transport": PolicyBinding(
+        binding_id="jobqueue_controlplane_transport",
+        policy_id="default_safe",
+        default_mode="structured_v1",
+    ),
+}
+
+
 def builtin_policy_profiles() -> Dict[str, PolicyProfile]:
     return dict(_BUILTIN_POLICY_PROFILES)
+
+
+def builtin_policy_bindings() -> Dict[str, PolicyBinding]:
+    return dict(_BUILTIN_POLICY_BINDINGS)
 
 
 def get_policy_profile(policy_id: str = "") -> PolicyProfile:
@@ -120,8 +177,29 @@ def get_policy_profile(policy_id: str = "") -> PolicyProfile:
         raise KeyError(f"unknown policy profile: {policy_id!r}") from exc
 
 
+def get_policy_binding(binding_id: str) -> PolicyBinding:
+    normalized = str(binding_id or "").strip().lower()
+    try:
+        return _BUILTIN_POLICY_BINDINGS[normalized]
+    except KeyError as exc:
+        raise KeyError(f"unknown policy binding: {binding_id!r}") from exc
+
+
+def get_default_policy_id_for_binding(binding_id: str) -> str:
+    return get_policy_binding(binding_id).policy_id
+
+
+def get_default_mode_for_binding(binding_id: str) -> str:
+    return get_policy_binding(binding_id).default_mode
+
+
 __all__ = [
+    "PolicyBinding",
     "PolicyProfile",
+    "builtin_policy_bindings",
     "builtin_policy_profiles",
+    "get_default_mode_for_binding",
+    "get_default_policy_id_for_binding",
+    "get_policy_binding",
     "get_policy_profile",
 ]

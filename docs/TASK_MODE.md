@@ -111,6 +111,7 @@ client.submit(
    - `None` -> 不再默认 raw assign
    - `dict` -> 再把这个 dict 写回入口模块 A 的 globals
 8. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 决定，不再从 client helper 暴露
+9. 节点差异靠 `tags` / healthy / runtime 过滤表达；一旦 session 建成，`effective_policy` 只由中央 profile + session context 冻结，不再和 node capability 做交集
 
 说明：
 
@@ -119,6 +120,7 @@ client.submit(
 3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
 4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
+6. `JobQueue` 自己固定使用 `structured_v1 + default_safe`；如果你在 `submit(...)` 里传 `serialization_mode / policy_id`，它们会解释为未来 `TaskPool` 的执行策略
 
 模块对象写法：
 
@@ -137,7 +139,9 @@ client.submit(
 1. `submit(source=module)` 当前按“已加载 module object + 真实文件”收集本地依赖
 2. 自动打包只收 `.py / .pyd / .so`
 3. 非 Python 资源文件不会自动进入包
-4. 如果 job 依赖 `.csv` 等静态资源，请自行构建归档后再上传
+4. 如果 service/taskpool/job 依赖 `.csv` 等静态资源，默认不会自动打包；可以显式传 `resource_paths=[...]`
+5. 对 `JobQueue.submit(source=module, ...)`，如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
+6. 如果不想逐个列文件，也可以自行构建归档后再上传
 
 兼容 helper：
 

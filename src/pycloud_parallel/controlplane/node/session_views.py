@@ -86,6 +86,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "service_id": session.service_id,
         "owner_client_id": session.owner_client_id,
         "service_name": session.service_name,
+        "policy_id": str(session.policy_id or "").strip().lower() or "default_safe",
         "code_version": session.code_version,
         "status": int(session.status),
         "worker_count": resource.worker_count,
@@ -114,6 +115,7 @@ def build_service_route_report(session: ServiceSession, *, in_flight: int) -> pb
         in_flight=resource.in_flight,
         lease_expire_at=dt_to_ts(session.lease_expire_at),
         http_base_url=session.http_base_url,
+        policy_id=str(session.policy_id or "").strip().lower() or "default_safe",
     )
 
 
@@ -123,6 +125,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
     return {
         "service_name": session.service_name,
         "service_id": session.service_id,
+        "policy_id": str(session.policy_id or "").strip().lower() or "default_safe",
         "status": int(session.status),
         "worker_count": int(resource.worker_count),
         "alive_workers": int(resource.alive_workers),

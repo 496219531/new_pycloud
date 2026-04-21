@@ -2,11 +2,12 @@ from __future__ import annotations
 
 """Authoritative V1 service execution implementation."""
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone, timedelta
 import asyncio
 import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import inspect
 import io
 import json
 import os
@@ -40,7 +41,10 @@ from pycloud_parallel.controlplane.infocenter_client import (
     _node_instance_key_from_route,
     _route_sort_key,
 )
-from pycloud_parallel.controlplane.policy_profile import get_policy_profile
+from pycloud_parallel.controlplane.policy_profile import (
+    get_default_policy_id_for_binding,
+    get_policy_profile,
+)
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
@@ -271,12 +275,48 @@ def _service_effective_policy_for_nodes(
     requested_mode: str = "",
     context: str = "",
 ) -> EffectivePolicy:
+    del nodes
     return resolve_effective_policy(
         get_policy_profile(policy_id),
-        list(nodes),
         requested_mode=requested_mode,
         context=context,
     )
+
+
+def _candidate_policy_id(candidate: object) -> str:
+    if isinstance(candidate, dict):
+        return str(candidate.get("policy_id", "") or "").strip().lower()
+    return str(getattr(candidate, "policy_id", "") or "").strip().lower()
+
+
+def _resolve_bound_service_policy_id(
+    candidates: Sequence[object],
+    *,
+    default_policy_id: str = "",
+    context: str = "service",
+) -> str:
+    normalized_default = (
+        str(default_policy_id or "").strip().lower()
+        or get_default_policy_id_for_binding("service_internal")
+    )
+    discovered: List[str] = []
+    missing = 0
+    for candidate in candidates:
+        policy_id = _candidate_policy_id(candidate)
+        if policy_id:
+            discovered.append(policy_id)
+        else:
+            missing += 1
+    unique = sorted(set(discovered))
+    if not unique:
+        return normalized_default
+    if len(unique) > 1:
+        raise RuntimeError(f"{context} exposes inconsistent deploy-bound policy_id values: {unique}")
+    if missing > 0:
+        raise RuntimeError(
+            f"{context} exposes mixed policy metadata: discovered={unique[0]!r} but {missing} route(s) are missing policy_id"
+        )
+    return unique[0]
 
 
 def _retry_ready_state(
@@ -525,14 +565,16 @@ class _ConnectedService:
         transport: str,
         timeout_sec: float,
         serialization_mode: str = "",
-        policy_id: str = "",
         validate_on_init: bool = True,
     ) -> None:
         self._transport_client = transport_client
         self.service_name = str(service_name or "").strip()
         self.transport = str(transport or "").strip().lower() or "discovery"
         self.timeout_sec = max(0.1, float(timeout_sec))
-        self.policy_id = str(policy_id or "").strip().lower() or "default_safe"
+        self._requested_serialization_mode = str(serialization_mode or "").strip()
+        self._default_policy_id = get_default_policy_id_for_binding(
+            "gateway_public" if self.transport == "gateway" else "service_internal"
+        )
         self.target = str(
             getattr(transport_client, "target", "") or getattr(transport_client, "infocenter_target", "") or ""
         ).strip()
@@ -548,25 +590,13 @@ class _ConnectedService:
             self._client_mod = gateway_client_mod.client_mod
         self._discovered_methods: Optional[List[str]] = None
         self._last_status: Optional[Dict[str, object]] = None
+        self.effective_policy: Optional[EffectivePolicy] = None
+        self.serialization_mode = str(serialization_mode or "").strip()
         if not self.service_name:
             raise ValueError("Service.connect() requires service_name")
         if validate_on_init:
             self._validate_service_ready()
-        capabilities = []
-        try:
-            if hasattr(self._transport_client, "list_routes"):
-                capabilities = list(self._transport_client.list_routes(service_name=self.service_name))
-            elif isinstance(self._last_status, dict):
-                capabilities = list(self._last_status.get("routes", []) or [])
-        except Exception:
-            capabilities = []
-        self.effective_policy = _service_effective_policy_for_nodes(
-            capabilities,
-            policy_id=self.policy_id,
-            requested_mode=serialization_mode,
-            context="gateway_public" if self.transport == "gateway" else "service_connect",
-        )
-        self.serialization_mode = self.effective_policy.resolved_mode
+            self._refresh_effective_policy_from_routes()
 
     def close(self) -> None:
         close = getattr(self._transport_client, "close", None)
@@ -609,6 +639,7 @@ class _ConnectedService:
                     f"Service.connect() could not find an available route for "
                     f"service_name={self.service_name!r} via {self.transport}"
                 )
+            self._refresh_effective_policy_from_routes(status.get("routes", []) or [])
             return status
 
         return _retry_ready_state(
@@ -618,6 +649,50 @@ class _ConnectedService:
             target=self.target or self.transport,
             action=f"service connect {self.service_name!r}",
         )
+
+    def _policy_context(self) -> str:
+        return "gateway_public" if self.transport == "gateway" else "service_connect"
+
+    def _refresh_effective_policy_from_routes(self, routes: Optional[Sequence[object]] = None) -> None:
+        candidates = list(routes or [])
+        if not candidates:
+            try:
+                if self.transport == "discovery":
+                    candidates = list(self._discoverable_routes(force_refresh=False))
+                elif isinstance(self._last_status, dict):
+                    candidates = list(self._last_status.get("routes", []) or [])
+            except Exception:
+                candidates = []
+        if not candidates:
+            return
+        bound_policy_id = _resolve_bound_service_policy_id(
+            candidates,
+            default_policy_id=self._default_policy_id,
+            context=f"service_name={self.service_name!r}",
+        )
+        self.effective_policy = _service_effective_policy_for_nodes(
+            candidates,
+            policy_id=bound_policy_id,
+            requested_mode=self._requested_serialization_mode,
+            context=self._policy_context(),
+        )
+        self._default_policy_id = bound_policy_id
+        self.serialization_mode = self.effective_policy.resolved_mode
+
+    def _ensure_effective_policy_loaded(self, *, force_refresh: bool = False) -> None:
+        if self.transport == "discovery":
+            routes = self._discoverable_routes(force_refresh=force_refresh)
+        else:
+            try:
+                status = self._transport_client.get_status(service_name=self.service_name)
+            except Exception:
+                status = self._last_status or {}
+            if isinstance(status, dict):
+                self._last_status = status
+                routes = list(status.get("routes", []) or [])
+            else:
+                routes = []
+        self._refresh_effective_policy_from_routes(routes)
 
     def _ensure_methods_discovered(self) -> None:
         if self._discovered_methods is not None:
@@ -734,6 +809,7 @@ class _ConnectedService:
                 status = {}
             if isinstance(status, dict) and int(status.get("route_count", 0) or 0) > 0:
                 self._last_status = status
+                self._refresh_effective_policy_from_routes(status.get("routes", []) or [])
                 return status
             routes = self._discoverable_routes()
             status = {
@@ -746,6 +822,7 @@ class _ConnectedService:
             status = self._transport_client.get_status(service_name=self.service_name)
         if isinstance(status, dict):
             self._last_status = status
+            self._refresh_effective_policy_from_routes(status.get("routes", []) or [])
         return status
 
     def fetch_result_data(self, response_or_data: object, *, target_path: str = ""):
@@ -786,8 +863,11 @@ class _ConnectedService:
                 routes = list(route_cache.get_routes(self.service_name))
         routes = [route for route in routes if str(getattr(route, "service_name", "") or "").strip() == self.service_name]
         if routes:
+            self._refresh_effective_policy_from_routes(routes)
             return routes
-        return self._discover_routes_from_nodes()
+        routes = self._discover_routes_from_nodes()
+        self._refresh_effective_policy_from_routes(routes)
+        return routes
 
     def _discover_routes_from_nodes(self) -> List[InfoCenterServiceRoute]:
         try:
@@ -839,6 +919,7 @@ class _ConnectedService:
                         ema_child_invoke_ms=0.0,
                         ema_samples=0,
                         predicted_busy=float(in_flight) / float(alive_workers),
+                        policy_id=str(getattr(svc, "policy_id", "") or get_default_policy_id_for_binding("service_internal")),
                     )
                 )
         routes.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
@@ -856,6 +937,7 @@ class _ConnectedService:
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         del refresh_status, max_attempts
+        self._ensure_effective_policy_loaded(force_refresh=(self.transport == "discovery"))
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
             context="gateway_public" if self.transport == "gateway" else "service_call",
@@ -1179,11 +1261,17 @@ class _ConnectedService:
 
     def __repr__(self) -> str:
         methods = self.methods if self._discovered_methods is not None else ["<not discovered>"]
+        effective_policy_text = ""
+        if self.effective_policy is not None:
+            effective_policy_text = (
+                f" effective_policy={self.effective_policy.policy_id}@v{self.effective_policy.version}"
+            )
         return (
             f"<ConnectedService "
             f"service={self.service_name!r} "
             f"transport={self.transport} "
             f"serialization_mode={self.serialization_mode} "
+            f"{effective_policy_text} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
         )
 
@@ -1214,7 +1302,8 @@ class Service(ServiceExecutionSession):
     _discovered_methods: Optional[List[str]] = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
     serialization_mode: str = ""
-    policy_id: str = "default_safe"
+    policy_id: InitVar[str] = ""
+    _policy_id: str = field(default="", repr=False)
     effective_policy: Optional[EffectivePolicy] = field(default=None, repr=False)
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
@@ -1249,7 +1338,6 @@ class Service(ServiceExecutionSession):
         service_token: str = "",
         transport: str = "discovery",
         serialization_mode: str = "",
-        policy_id: str = "",
         validate_on_init: bool = False,
     ):
         """Product-facing connect action for an already deployed service."""
@@ -1267,7 +1355,6 @@ class Service(ServiceExecutionSession):
                 transport=normalized_transport,
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
-                policy_id=policy_id,
                 validate_on_init=validate_on_init,
             )
         if normalized_transport == "discovery":
@@ -1283,7 +1370,6 @@ class Service(ServiceExecutionSession):
                 transport=normalized_transport,
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
-                policy_id=policy_id,
                 validate_on_init=validate_on_init,
             )
         raise ValueError(
@@ -1311,6 +1397,7 @@ class Service(ServiceExecutionSession):
         export_methods: Optional[Sequence[str]] = None,
         serialization_mode: str = "",
         dependency_allowlist: Optional[Sequence[str]] = None,
+        resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
@@ -1340,6 +1427,10 @@ class Service(ServiceExecutionSession):
 
         This entry preserves the older control-plane-oriented naming for
         callers that still pass ``infocenter_target=...`` directly.
+
+        `policy_id` here is a deployment/control-plane input. Product callers
+        should normally express only `serialization_mode`; the session will
+        expose the frozen `effective_policy` that actually took effect.
 
         Args:
             infocenter_target: InfoCenter 地址
@@ -1381,6 +1472,26 @@ class Service(ServiceExecutionSession):
         Returns:
             Service: 部署的服务组
         """
+        module_source = source if inspect.ismodule(source) else None
+        if (
+            module_source is None
+            and inspect.ismodule(entry_module)
+            and source is None
+            and artifact is None
+            and func is None
+            and not artifact_path
+            and blob is None
+        ):
+            module_source = entry_module
+        normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
+        if normalized_resource_paths and module_source is None:
+            raise ValueError("resource_paths requires a module source")
+        if normalized_resource_paths and module_source is not None:
+            module_blob, module_filename = _prepare_code_blob(module=module_source, resource_paths=normalized_resource_paths)
+            source = module_blob
+            entry_module = _default_entry_module_for_module(module_source)
+            package_format = _resolve_package_format(package_format, module_filename, default="py")
+
         normalized_artifact = _normalize_artifact_input(
             consumer_kind="service",
             source=source,
@@ -1412,7 +1523,8 @@ class Service(ServiceExecutionSession):
         export_methods = list(prepared_artifact.export_methods)
         dependency_allowlist = list(prepared_artifact.dependency_allowlist)
         managed_global_names = list(prepared_artifact.managed_global_names)
-        normalized_policy_id = str(policy_id or "").strip().lower() or "default_safe"
+        requested_policy_id = str(policy_id or "").strip().lower()
+        normalized_policy_id = requested_policy_id or get_default_policy_id_for_binding("service_internal")
 
         # 生成默认的 owner_client_id 和 service_name
         local_ip = _get_local_ip()
@@ -1660,6 +1772,16 @@ class Service(ServiceExecutionSession):
                         raise RuntimeError(
                             f"service_name already exists but active routes are inconsistent: {effective_service_name}"
                         )
+                    existing_bound_policy_id = _resolve_bound_service_policy_id(
+                        [route for route, _ in existing_infos],
+                        default_policy_id=normalized_policy_id,
+                        context=f"service_name={effective_service_name!r}",
+                    )
+                    if requested_policy_id and requested_policy_id != existing_bound_policy_id:
+                        raise RuntimeError(
+                            f"service_name already exists with deploy-bound policy_id={existing_bound_policy_id!r}; "
+                            f"requested policy_id={requested_policy_id!r} does not match"
+                        )
 
                     existing_owner = next(iter(existing_owners))
                     existing_code_version = next(iter(existing_versions))
@@ -1712,7 +1834,7 @@ class Service(ServiceExecutionSession):
                                 breaker_max_cooldown_sec=breaker_max_cooldown_sec,
                                 session_cache_file=session_cache_file,
                                 session_cache_lock=session_cache_lock,
-                                policy_id=normalized_policy_id,
+                                policy_id=existing_bound_policy_id,
                             )
                         except RuntimeError as exc:
                             if "service is stopped" not in str(exc):
@@ -1770,6 +1892,7 @@ class Service(ServiceExecutionSession):
                         export_methods=export_methods,
                         deps=prepared_artifact.dependency_policy,
                         managed_global_names=managed_global_names,
+                        policy_id=normalized_policy_id,
                         worker_count=node_worker_count,
                         heartbeat_timeout_sec=heartbeat_timeout_sec,
                         idle_ttl_sec=idle_ttl_sec,
@@ -2227,7 +2350,7 @@ class Service(ServiceExecutionSession):
             _session_cache_file=session_cache_file,
             _session_cache_lock=session_cache_lock,
             _artifact_code_version=artifact_code_version,
-            policy_id=str(policy_id or "").strip().lower() or "default_safe",
+            policy_id=str(policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal"),
         )
         group._persist_session_cache()
         group._start_keepalive()
@@ -2303,6 +2426,7 @@ class Service(ServiceExecutionSession):
             "owner_client_id": self.owner_client_id,
             "service_name": self.service_name,
             "artifact_code_version": self._artifact_code_version,
+            "policy_id": str(self._policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal"),
             "nodes": {},
         }
         nodes_payload: Dict[str, object] = {}
@@ -2340,13 +2464,13 @@ class Service(ServiceExecutionSession):
         except FileNotFoundError:
             pass
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, policy_id: str = "") -> None:
         self._init_execution_session_state()
-        self.policy_id = str(self.policy_id or "").strip().lower() or "default_safe"
+        self._policy_id = str(policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal")
         if self.effective_policy is None:
             self.effective_policy = _service_effective_policy_for_nodes(
                 list(self.nodes.values()),
-                policy_id=self.policy_id,
+                policy_id=self._policy_id,
                 requested_mode=self.serialization_mode,
                 context="service_owner",
             )

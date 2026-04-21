@@ -24,6 +24,7 @@ class InfoCenterNodeService:
     service_name: str
     service_id: str
     status: int
+    policy_id: str = "default_safe"
     status_text: str = ""
     worker_count: int = 0
     alive_workers: int = 0
@@ -93,6 +94,7 @@ class InfoCenterServiceRoute:
     ema_samples: int = 0
     predicted_busy: float = 0.0
     capability: NodeCapability = NodeCapability()
+    policy_id: str = "default_safe"
 
 
 @dataclass
@@ -227,6 +229,7 @@ class InfoCenterClient:
                     "service_name": str(item.service_name),
                     "service_id": str(item.service_id),
                     "status": int(item.status),
+                    "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
                     "worker_count": int(item.worker_count),
                     "alive_workers": int(item.alive_workers),
                     "in_flight": int(item.in_flight),
@@ -288,6 +291,7 @@ class InfoCenterClient:
                     "service_name": str(item.service_name),
                     "service_id": str(item.service_id),
                     "status": int(item.status),
+                    "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
                     "worker_count": int(item.worker_count),
                     "alive_workers": int(item.alive_workers),
                     "in_flight": int(item.in_flight),
@@ -347,6 +351,7 @@ class InfoCenterClient:
                         service_name=str(svc.get("service_name", "") or ""),
                         service_id=str(svc.get("service_id", "") or ""),
                         status=int(svc.get("status", 0) or 0),
+                        policy_id=str(svc.get("policy_id", "") or "default_safe"),
                         status_text=str(svc.get("status_text", "") or ""),
                         worker_count=int(svc.get("worker_count", 0) or 0),
                         alive_workers=int(svc.get("alive_workers", 0) or 0),
@@ -546,6 +551,7 @@ class InfoCenterClient:
                     ema_samples=int(item.get("ema_samples", 0) or 0),
                     predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
                     capability=NodeCapability.from_dict(item.get("capability")),
+                    policy_id=str(item.get("policy_id", "") or "default_safe"),
                 )
             )
         return out

@@ -177,10 +177,11 @@ class DiscoveryServiceClient:
                 }
                 if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
                     prepare_kwargs["serialization_mode"] = serialization_mode
+                if effective_policy is not None:
+                    prepare_kwargs["effective_policy"] = effective_policy
                 return client_mod._prepare_remote_call_payload(
                     [route_client],
                     payload or {},
-                    effective_policy=effective_policy,
                     **prepare_kwargs,
                 )
             finally:

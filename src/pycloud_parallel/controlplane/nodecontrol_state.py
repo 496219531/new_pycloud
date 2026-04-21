@@ -131,6 +131,9 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.errors import normalize_invoke_error
 
 
+logger = logging.getLogger(__name__)
+
+
 class NodeControlState:
     """NodeControl 状态管理。
 
@@ -1541,6 +1544,7 @@ class NodeControlState:
         dependency_policy_mode: str = "",
         dependency_allowlist: Sequence[str] = (),
         managed_global_names: Sequence[str] = (),
+        policy_id: str = "",
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -1621,6 +1625,7 @@ class NodeControlState:
                 created_at=now,
                 last_heartbeat_at=now,
                 lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
+                policy_id=str(policy_id or "").strip().lower() or "default_safe",
                 executor_ready=True,
                 alive_workers=actual_workers,
                 methods=method_info,
@@ -1906,6 +1911,7 @@ class NodeControlState:
     ) -> TaskPoolState:
         del reason
         normalized = str(pool_id or "").strip()
+        stop_executor = None
         with self._lock:
             pool = self._task_pools.get(normalized)
             if pool is None:
@@ -1915,12 +1921,28 @@ class NodeControlState:
             if pool.pool_token != str(pool_token or "").strip():
                 raise PermissionError("pool_token mismatch")
             if self._executor_host is not None and pool.executor_ready:
-                self._executor_host.stop_task_pool(pool_id=pool.pool_id)
+                stop_executor = (self._executor_host, str(pool.pool_id))
             pool.executor_ready = False
             pool.alive_workers = 0
             pool.status = "STOPPED"
             pool.lease_expire_at = utc_now()
-            return pool
+            closed_pool = pool
+
+        if stop_executor is not None:
+            executor_host, closed_pool_id = stop_executor
+
+            def _stop_pool_executor_async() -> None:
+                try:
+                    executor_host.stop_task_pool(pool_id=closed_pool_id)
+                except Exception:
+                    logger.exception("[NodeControl] async stop_task_pool failed pool_id=%s", closed_pool_id)
+
+            threading.Thread(
+                target=_stop_pool_executor_async,
+                name=f"node-stop-task-pool-{closed_pool_id[:8]}",
+                daemon=True,
+            ).start()
+        return closed_pool
 
     def cancel_pool_job(
         self,

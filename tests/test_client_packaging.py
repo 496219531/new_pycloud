@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import sys
 import tarfile
 from pathlib import Path
 
@@ -212,6 +213,41 @@ def test_prepare_code_blob_from_loaded_module_uses_whitelisted_python_file_closu
     assert "calc_asset_ratio/fund_nav_df.csv" not in names
     assert "calc_asset_ratio/README.md" not in names
     assert "workspace_notes.md" not in names
+
+
+def test_prepare_code_blob_from_loaded_module_includes_only_explicit_resource_paths(tmp_path, monkeypatch):
+    from pycloud_parallel.execution.support import _prepare_code_blob
+
+    package_dir = tmp_path / "calc_asset_ratio"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from . import calc_asset_ratio\n", encoding="utf-8")
+    (package_dir / "calc_asset_ratio.py").write_text(
+        "def get_fund_asset_ratio(value=0, **_kwargs):\n"
+        "    return {'value': value}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "calc_asset_ratio_job_module.py").write_text(
+        "from pathlib import Path\n"
+        "import pandas as pd\n"
+        "def task_generator(**_kwargs):\n"
+        "    return pd.read_csv(Path(__file__).resolve().parent / 'fund_nav_df.csv').to_dict('records')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "fund_nav_df.csv").write_text("FundID,AdjustedNav\n1,1.0\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("keep out\n", encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("calc_asset_ratio_job_module", None)
+    importlib.invalidate_caches()
+    module = importlib.import_module("calc_asset_ratio_job_module")
+
+    blob, filename = _prepare_code_blob(module=module, resource_paths=["fund_nav_df.csv"])
+
+    assert filename == "calc_asset_ratio_job_module.tar.gz"
+    names = _tar_names(blob or b"")
+    assert "calc_asset_ratio_job_module.py" in names
+    assert "fund_nav_df.csv" in names
+    assert "notes.txt" not in names
 
 
 def test_prepare_local_artifact_for_upload_directory_uses_actual_targz_format(tmp_path):

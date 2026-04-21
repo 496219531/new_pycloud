@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pycloud_parallel.api as api_pkg
 import pycloud_parallel.api.pool as api_pool_module
 import pycloud_parallel.api.queue as api_queue_module
@@ -84,6 +86,11 @@ def test_api_service_module_exposes_only_service():
         gateway.close()
 
 
+def test_api_service_connect_no_longer_exposes_policy_id():
+    assert "policy_id" not in inspect.signature(ApiService.connect).parameters
+    assert "policy_id" in inspect.signature(ApiService.deploy_from_infocenter).parameters
+
+
 def test_api_pool_module_exposes_only_task_pool():
     assert api_pool_module.__all__ == ["TaskPool"]
     assert dir(api_pool_module) == ["TaskPool"]
@@ -108,6 +115,25 @@ def test_service_deploy_public_api_uses_target_keyword(monkeypatch):
     assert captured["source"] == b"blob"
 
 
+def test_service_deploy_public_api_forwards_resource_paths(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        ApiService,
+        "deploy_from_infocenter",
+        classmethod(lambda cls, **kwargs: captured.update(kwargs) or "service-session"),
+    )
+
+    result = ApiService.deploy(
+        target="127.0.0.1:50051",
+        source=object(),
+        resource_paths=["data/demo.csv"],
+    )
+
+    assert result == "service-session"
+    assert captured["resource_paths"] == ["data/demo.csv"]
+
+
 def test_task_pool_open_public_api_uses_target_keyword(monkeypatch):
     captured = {}
 
@@ -122,6 +148,25 @@ def test_task_pool_open_public_api_uses_target_keyword(monkeypatch):
     assert result == "task-pool-session"
     assert captured["infocenter_target"] == "127.0.0.1:50051"
     assert captured["source"] == b"blob"
+
+
+def test_task_pool_open_public_api_forwards_resource_paths(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        ApiTaskPool,
+        "from_infocenter",
+        classmethod(lambda cls, **kwargs: captured.update(kwargs) or "task-pool-session"),
+    )
+
+    result = ApiTaskPool.open(
+        target="127.0.0.1:50051",
+        source=object(),
+        resource_paths=["data/demo.csv"],
+    )
+
+    assert result == "task-pool-session"
+    assert captured["resource_paths"] == ["data/demo.csv"]
 
 
 def test_low_level_compat_entries_still_exist_but_are_not_api_module_surface():

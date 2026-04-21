@@ -54,6 +54,7 @@ def _service_info_to_pb(info: dict) -> pb2.ServiceStatusInfo:
         service_id=str(info.get("service_id", "")),
         owner_client_id=str(info.get("owner_client_id", "")),
         service_name=str(info.get("service_name", "")),
+        policy_id=str(info.get("policy_id", "") or "default_safe"),
         code_version=str(info.get("code_version", "")),
         status=int(info.get("status", pb2.SERVICE_STATUS_UNSPECIFIED)),
         worker_count=int(info.get("worker_count", 0)),
@@ -71,6 +72,7 @@ def _service_route_to_pb(info: dict) -> pb2.ServiceRouteInfo:
     return pb2.ServiceRouteInfo(
         service_name=str(info.get("service_name", "")),
         service_id=str(info.get("service_id", "")),
+        policy_id=str(info.get("policy_id", "") or "default_safe"),
         status=int(info.get("status", pb2.SERVICE_STATUS_UNSPECIFIED)),
         node_id=str(info.get("node_id", "")),
         control_addr=str(info.get("control_addr", "")),
@@ -709,6 +711,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 except FileNotFoundError:
                     pass
 
+        self._notify_service_routes_changed()
         return pb2.CreateTaskPoolResponse(
             ok=True,
             pool_id=pool.pool_id,
@@ -881,6 +884,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 pool_token=request.pool_token,
                 reason=request.reason,
             )
+            self._notify_service_routes_changed()
             return pb2.CloseTaskPoolResponse(ok=True, accepted=True)
         except KeyError as exc:
             context.set_code(grpc.StatusCode.NOT_FOUND)
@@ -989,6 +993,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 dependency_policy_mode=meta.dependency_policy_mode,
                 dependency_allowlist=list(meta.dependency_allowlist),
                 managed_global_names=list(meta.managed_global_names),
+                policy_id=str(meta.policy_id or "").strip().lower() or "default_safe",
                 worker_count=meta.worker_count,
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
                 idle_ttl_sec=meta.idle_ttl_sec,
@@ -1031,6 +1036,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             owner_client_id=session.owner_client_id,
             service_token=session.service_token,
             http_base_url=session.http_base_url,
+            policy_id=str(session.policy_id or "").strip().lower() or "default_safe",
         )
 
     def ListServiceMethods(

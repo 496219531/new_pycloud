@@ -281,6 +281,8 @@ client.submit(
 3. `handle_result` / `handle_data` / `finalize` / `update_globals` 都是可选，发现到才会写进 payload
 4. `apply_managed_globals` 不走 payload，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
+6. 如果 service/taskpool/job module 依赖 `.csv` 等非 Python 资源，默认不会自动打包；可以显式传 `resource_paths=[...]`
+7. `JobQueue.submit(source=module, ...)` 如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
 
 这里默认推荐直接传模块对象：
 

@@ -56,6 +56,7 @@ class InProcessInfoCenterSource:
                     ema_child_invoke_ms=float(item.get("ema_child_invoke_ms", 0.0) or 0.0),
                     ema_samples=int(item.get("ema_samples", 0) or 0),
                     predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
+                    policy_id=str(item.get("policy_id", "") or "default_safe"),
                 )
             )
         return out

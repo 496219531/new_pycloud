@@ -5,11 +5,10 @@ from unittest.mock import patch
 
 from pycloud_parallel.api import JobQueue
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
-from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
-def _route(*, capability: NodeCapability) -> InfoCenterServiceRoute:
+def _route(*, policy_id: str = "trusted_internal") -> InfoCenterServiceRoute:
     return InfoCenterServiceRoute(
         service_name="job-orchestrator",
         service_id="job-orch-1",
@@ -23,31 +22,18 @@ def _route(*, capability: NodeCapability) -> InfoCenterServiceRoute:
         in_flight=0,
         lease_expire_at=datetime.now(timezone.utc),
         http_base_url="http://127.0.0.1:18080/svc/job-orch-1",
-        capability=capability,
+        policy_id=policy_id,
     )
 
 
-def test_jobqueue_submit_refreshes_effective_policy_from_orchestrator_routes(monkeypatch):
-    calls = {"count": 0}
+def test_jobqueue_transport_policy_stays_fixed_even_when_orchestrator_route_policy_differs(monkeypatch):
     route = _route(
-        capability=NodeCapability(
-            supported_modes=("legacy_v1", "structured_v1"),
-            supports_transport_payload_bytes=False,
-            supports_http_bytes_transport=False,
-            max_grpc_send_bytes=4 * 1024 * 1024,
-            max_grpc_recv_bytes=4 * 1024 * 1024,
-            max_http_body_bytes=4 * 1024 * 1024,
-            max_upload_file_bytes=64 * 1024 * 1024,
-            max_upload_total_bytes=128 * 1024 * 1024,
-        )
+        policy_id="pickle_internal_heavy",
     )
 
     def _fake_list_service_routes(self, *, service_name="", healthy_only=True, limit=32):
         del self, healthy_only, limit
-        calls["count"] += 1
         assert service_name == "job-orchestrator"
-        if calls["count"] == 1:
-            return []
         return [route]
 
     captured = {}
@@ -61,7 +47,6 @@ def test_jobqueue_submit_refreshes_effective_policy_from_orchestrator_routes(mon
         "127.0.0.1:50051",
         client_id="client-refresh",
         auth_token="token-refresh",
-        policy_id="pickle_internal_heavy",
     )
     try:
         def _capture_prepared_payload(**kwargs):
@@ -92,6 +77,9 @@ def test_jobqueue_submit_refreshes_effective_policy_from_orchestrator_routes(mon
 
     assert resp["job"]["job_id"] == "job-1"
     assert captured["prepare_policy"].resolved_mode == "structured_v1"
+    assert captured["prepare_policy"].policy_id == "default_safe"
     assert captured["prepare_policy"].use_transport_payload_bytes is False
     assert captured["call_policy"].resolved_mode == "structured_v1"
+    assert captured["call_policy"].policy_id == "default_safe"
     assert client.effective_policy.resolved_mode == "structured_v1"
+    assert client.effective_policy.policy_id == "default_safe"

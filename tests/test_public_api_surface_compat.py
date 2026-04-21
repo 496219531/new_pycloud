@@ -49,3 +49,8 @@ def test_proto_messages_expose_node_instance_id_fields():
     assert "capability" in pb2.HeartbeatNodeRequest.DESCRIPTOR.fields_by_name
     assert "capability" in pb2.NodeInfo.DESCRIPTOR.fields_by_name
     assert "capability" in pb2.ServiceRouteInfo.DESCRIPTOR.fields_by_name
+    assert "policy_id" in pb2.ServiceRouteReport.DESCRIPTOR.fields_by_name
+    assert "policy_id" in pb2.ServiceRouteInfo.DESCRIPTOR.fields_by_name
+    assert "policy_id" in pb2.CreateServiceMeta.DESCRIPTOR.fields_by_name
+    assert "policy_id" in pb2.CreateServiceResponse.DESCRIPTOR.fields_by_name
+    assert "policy_id" in pb2.ServiceStatusInfo.DESCRIPTOR.fields_by_name

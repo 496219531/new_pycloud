@@ -166,6 +166,7 @@ message ServiceRouteReport {
   int32 in_flight = 6;
   google.protobuf.Timestamp lease_expire_at = 7;
   string http_base_url = 8;
+  string policy_id = 9;
 }
 
 message ListServiceRoutesRequest {
@@ -188,6 +189,7 @@ message ServiceRouteInfo {
   string http_base_url = 11;
   string node_instance_id = 12;
   NodeCapabilityInfo capability = 13;
+  string policy_id = 14;
 }
 
 message ListServiceRoutesResponse {
@@ -548,6 +550,7 @@ message CreateServiceMeta {
   repeated string dependency_allowlist = 13;
   repeated string managed_global_names = 14;
   string dependency_policy_mode = 15; // prebuilt | node_preinstalled | allow_install
+  string policy_id = 16;
 }
 
 message CreateServiceRequest {
@@ -568,6 +571,7 @@ message CreateServiceResponse {
   string service_token = 8;
   string http_base_url = 9;
   Error error = 10;
+  string policy_id = 11;
 }
 
 message ServiceMethodInfo {
@@ -671,6 +675,7 @@ message ServiceStatusInfo {
   google.protobuf.Timestamp last_heartbeat_at = 11;
   google.protobuf.Timestamp lease_expire_at = 12;
   string http_base_url = 13;
+  string policy_id = 14;
 }
 
 message GetServiceStatusResponse {

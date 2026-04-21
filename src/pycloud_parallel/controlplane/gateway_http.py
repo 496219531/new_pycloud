@@ -356,6 +356,7 @@ class GatewayHttpApp:
                 {
                     "service_name": route.service_name,
                     "service_id": route.service_id,
+                    "policy_id": str(getattr(route, "policy_id", "") or "default_safe"),
                     "node_instance_id": route.node_instance_id,
                     "node_id": route.node_id,
                     "control_addr": route.control_addr,
@@ -372,6 +373,7 @@ class GatewayHttpApp:
                     "http_base_url": route.http_base_url,
                     "status": int(route.status),
                     "lease_expire_at": route.lease_expire_at.isoformat(),
+                    "capability": route.capability.to_dict(),
                 }
             )
         return 200, {

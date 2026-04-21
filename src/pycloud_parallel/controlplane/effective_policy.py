@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-"""Effective-policy resolution from centralized profiles and node capabilities."""
+"""Effective-policy resolution from centralized profiles and session context."""
 
 from dataclasses import dataclass, replace
-from math import inf
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
-from pycloud_parallel.controlplane.node_capability import NodeCapability, capability_from_candidate
 from pycloud_parallel.controlplane.policy_profile import PolicyProfile
 from pycloud_parallel.controlplane.serialization_mode import normalize_serialization_mode
 
@@ -55,24 +53,6 @@ class EffectivePolicy:
         return self.resolved_mode
 
 
-def _iter_capabilities(values: Iterable[NodeCapability | object]) -> Tuple[NodeCapability, ...]:
-    out = []
-    for item in values:
-        capability = capability_from_candidate(item)
-        if capability is not None:
-            out.append(capability)
-    return tuple(out)
-
-
-def _context_transport_limit(capabilities: Sequence[NodeCapability], *, context: str) -> float:
-    normalized_context = str(context or "").strip().lower()
-    if not capabilities:
-        return inf
-    if normalized_context in {"gateway_public", "service_connect", "http_call", "jobqueue_session"}:
-        return min(cap.http_payload_limit_bytes() for cap in capabilities)
-    return min(cap.grpc_payload_limit_bytes() for cap in capabilities)
-
-
 def _allowed_modes_for_context(profile: PolicyProfile, *, context: str) -> Tuple[str, ...]:
     normalized_context = str(context or "").strip().lower()
     allowed = list(profile.allowed_modes)
@@ -87,23 +67,13 @@ def _allowed_modes_for_context(profile: PolicyProfile, *, context: str) -> Tuple
 
 def resolve_effective_policy(
     profile: PolicyProfile,
-    candidate_capabilities: Sequence[NodeCapability | object],
     requested_mode: str = "",
     context: str = "",
 ) -> EffectivePolicy:
-    capabilities = _iter_capabilities(candidate_capabilities)
-    allowed_by_profile = set(_allowed_modes_for_context(profile, context=context))
-    if capabilities:
-        supported_by_all = set(capabilities[0].supported_modes)
-        for capability in capabilities[1:]:
-            supported_by_all &= set(capability.supported_modes)
-        allowed_modes = tuple(mode for mode in profile.allowed_modes if mode in allowed_by_profile and mode in supported_by_all)
-    else:
-        allowed_modes = tuple(mode for mode in profile.allowed_modes if mode in allowed_by_profile)
+    allowed_modes = _allowed_modes_for_context(profile, context=context)
     if not allowed_modes:
         raise ValueError(
-            f"no common serialization mode for profile={profile.policy_id!r} context={context!r} "
-            f"across candidate node capabilities"
+            f"policy profile {profile.policy_id!r} does not allow any serialization modes for context={context!r}"
         )
 
     normalized_request_mode = normalize_serialization_mode(requested_mode)
@@ -119,22 +89,13 @@ def resolve_effective_policy(
     else:
         resolved_mode = allowed_modes[0]
 
-    transport_limit = _context_transport_limit(capabilities, context=context)
-    inline_payload_hard_limit_bytes = min(
-        int(profile.inline_payload_hard_limit_bytes),
-        int(transport_limit) if transport_limit != inf else int(profile.inline_payload_hard_limit_bytes),
-    )
+    inline_payload_hard_limit_bytes = int(profile.inline_payload_hard_limit_bytes)
     inline_payload_soft_limit_bytes = min(int(profile.inline_payload_soft_limit_bytes), inline_payload_hard_limit_bytes)
-    inline_result_hard_limit_bytes = min(
-        int(profile.inline_result_hard_limit_bytes),
-        int(transport_limit) if transport_limit != inf else int(profile.inline_result_hard_limit_bytes),
-    )
-    use_transport_payload_bytes = bool(profile.prefer_transport_payload_bytes) and (
-        (not capabilities) or all(cap.supports_transport_payload_bytes for cap in capabilities)
-    )
-    use_http_bytes_transport = use_transport_payload_bytes and (
+    inline_result_hard_limit_bytes = int(profile.inline_result_hard_limit_bytes)
+    use_transport_payload_bytes = bool(profile.use_transport_payload_bytes)
+    use_http_bytes_transport = bool(profile.use_http_bytes_transport) and (
         str(context or "").strip().lower() in {"gateway_public", "service_connect", "http_call", "jobqueue_session"}
-    ) and ((not capabilities) or all(cap.supports_http_bytes_transport for cap in capabilities))
+    )
     allow_pickle_stable = "pickle_stable_v1" in allowed_modes and bool(profile.allow_pickle_stable)
 
     return EffectivePolicy(
@@ -179,6 +140,9 @@ def should_use_transport_payload_bytes(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> bool:
     if effective_policy is not None:
+        normalized_mode = str(mode or "").strip().lower() or "legacy_v1"
+        if normalized_mode == "legacy_v1":
+            return False
         return bool(effective_policy.use_transport_payload_bytes)
     from pycloud_parallel.controlplane.serialization import prefers_transport_payload_bytes
 
@@ -191,6 +155,9 @@ def should_use_http_bytes_transport(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> bool:
     if effective_policy is not None:
+        normalized_mode = str(mode or "").strip().lower() or "legacy_v1"
+        if normalized_mode == "legacy_v1":
+            return False
         return bool(effective_policy.use_http_bytes_transport)
     return should_use_transport_payload_bytes(
         mode=mode,

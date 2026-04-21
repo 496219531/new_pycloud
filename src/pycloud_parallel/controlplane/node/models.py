@@ -140,6 +140,7 @@ class ServiceSession:
     created_at: datetime
     last_heartbeat_at: datetime
     lease_expire_at: datetime
+    policy_id: str = "default_safe"
     executor_ready: bool = False
     in_flight: int = 0
     queued: int = 0

@@ -25,6 +25,7 @@ class NodeServiceState:
     service_name: str
     service_id: str
     status: int
+    policy_id: str = "default_safe"
     worker_count: int = 0
     alive_workers: int = 0
     in_flight: int = 0
