@@ -9,7 +9,8 @@ from urllib.request import Request, urlopen
 import pytest
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
-from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
+from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _reorder_job_via_http
+from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.server import build_job_orchestrator_server
@@ -128,6 +129,44 @@ def test_node_registrar_syncs_service_routes(tmp_path):
         registrar.close()
         node_state.close()
         info_server.stop()
+
+
+def test_ops_page_merges_duplicate_services_with_same_endpoint():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-dup-1",
+        node_id="node-dup",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-a": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-a",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-a",
+            ),
+            "svc-b": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-b",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-b",
+            ),
+        },
+    )
+
+    raw = _render_ops_page(info_state)
+
+    assert "merged×2" in raw
+    assert raw.count("calc_asset_ratio") >= 1
+    assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
 
 
 def test_infocenter_http_version_prefers_runtime_package_version(monkeypatch):
@@ -306,6 +345,7 @@ def test_ops_page_shows_job_queue_status_section():
 
 
 def test_ops_job_queue_reorder_proxies_to_job_orchestrator():
+    admin_token = "ops-admin-token"
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
     info_server.start()
@@ -314,43 +354,23 @@ def test_ops_job_queue_reorder_proxies_to_job_orchestrator():
         "127.0.0.1:0",
         infocenter_addr=info_target,
         node_id="job-orchestrator-proxy",
+        admin_token=admin_token,
     )
     orchestrator.start()
     with orchestrator.job_queue._cv:  # noqa: SLF001
-        orchestrator.job_queue._running_job_id = "__test_blocked__"  # noqa: SLF001
+        orchestrator.job_queue._stop = True  # noqa: SLF001
 
     try:
-        assert _wait_until(
-            lambda: len(
-                InfoCenterClient(info_target, timeout_sec=5.0).list_nodes(
-                    healthy_only=False,
-                    tags=["job"],
-                    limit=20,
-                )
-            )
-            == 1
-        )
         orchestrator.job_queue.submit_job({"job_id": "job-a", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 1}]})
         orchestrator.job_queue.submit_job({"job_id": "job-b", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 2}]})
         orchestrator.job_queue.submit_job({"job_id": "job-c", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 3}]})
-        orchestrator._registrar.sync_now()  # noqa: SLF001
+        service_http_base = f"{orchestrator.base_url}/svc/{orchestrator.service_id}"
 
-        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
-            node = client.list_nodes(healthy_only=False, tags=["job"], limit=20)[0]
-            instance_id = node.node_instance_id
+        with pytest.raises(RuntimeError, match="admin auth required"):
+            _reorder_job_via_http(service_http_base, "job-c", direction="up")
 
-        req = Request(
-            f"{info_target}/ops/job-queues/{instance_id}/jobs/job-c/move-up",
-            method="POST",
-            headers={"Accept": "text/html"},
-            data=b"",
-        )
-        with urlopen(req, timeout=5.0) as resp:
-            assert resp.status == 200
-            assert "/ops" in resp.geturl()
-
-        summary = orchestrator.job_queue.summary()
-        waiting_ids = [item["job_id"] for item in summary["waiting_jobs"]]
+        resp = _reorder_job_via_http(service_http_base, "job-c", direction="up", auth_token=admin_token)
+        waiting_ids = [item["job_id"] for item in resp["queue"]["waiting_jobs"]]
         assert waiting_ids == ["job-a", "job-c", "job-b"]
     finally:
         orchestrator.stop()

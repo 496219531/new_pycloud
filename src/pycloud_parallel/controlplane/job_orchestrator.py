@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import threading
 import uuid
 from typing import Dict, List, Optional, Tuple
@@ -30,6 +31,7 @@ class JobOrchestratorServer:
         tags: Optional[List[str]] = None,
         version: str = "",
         taskpool_policy_id: str = "",
+        admin_token: str = "",
     ) -> None:
         self.bind = str(bind or "").strip()
         self.infocenter_addr = str(infocenter_addr or "").strip()
@@ -42,6 +44,9 @@ class JobOrchestratorServer:
             str(taskpool_policy_id or "").strip().lower()
             or get_default_policy_id_for_binding("taskpool_default")
         )
+        env_admin_token = str(os.getenv("PYCLOUD_JOB_ORCHESTRATOR_ADMIN_TOKEN", "") or "").strip()
+        fallback_admin_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
+        self.admin_token = str(admin_token or env_admin_token or fallback_admin_token or "").strip()
 
         self.service_id = uuid.uuid4().hex
         self.job_queue = JobQueueManager(taskpool_policy_id=self.taskpool_policy_id)
@@ -65,6 +70,12 @@ class JobOrchestratorServer:
         )
         self.base_url = ""
         self._stopped = threading.Event()
+
+    def _check_admin_token(self, token: str) -> bool:
+        expected = str(self.admin_token or "").strip()
+        if not expected:
+            return False
+        return str(token or "").strip() == expected
 
     def start(self) -> None:
         self._stopped.clear()
@@ -144,6 +155,8 @@ class JobOrchestratorServer:
             direction = str((payload or {}).get("direction", "") or "").strip().lower()
             if not job_id:
                 return 400, {"ok": False, "error": "job_id is required"}
+            if not self._check_admin_token(token):
+                return 403, {"ok": False, "error": "admin auth required"}
             try:
                 state = self.job_queue.reorder_job(job_id, direction=direction)
             except ValueError as exc:

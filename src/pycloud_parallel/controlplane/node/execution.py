@@ -589,6 +589,7 @@ def _purge_loaded_artifact_modules(
     entry_module: str,
     package_format: str,
     dependency_path: str = "",
+    extra_prefixes: Sequence[str] = (),
 ) -> None:
     format_name = _normalize_package_format(package_format, Path(artifact_path).name)
     if format_name == "py":
@@ -602,6 +603,12 @@ def _purge_loaded_artifact_modules(
     prefixes = [str(Path(artifact_path).resolve())]
     if dependency_path:
         prefixes.append(str(Path(dependency_path).resolve()))
+    for raw_prefix in list(extra_prefixes or ()):
+        normalized = str(raw_prefix or "").strip()
+        if not normalized:
+            continue
+        with contextlib.suppress(Exception):
+            prefixes.append(str(Path(normalized).resolve()))
 
     for name, module in list(sys.modules.items()):
         module_file = getattr(module, "__file__", None)
@@ -793,11 +800,13 @@ def _discover_callable_methods(
         )
         return module, method_info
     except Exception:
+        extracted_dir = str(getattr(module, "__pycloud_temp_extract_dir__", "") or "").strip()
         _purge_loaded_artifact_modules(
             artifact_path,
             entry_module=entry_module,
             package_format=package_format,
             dependency_path=dependency_path,
+            extra_prefixes=([extracted_dir] if extracted_dir else []),
         )
         raise
 

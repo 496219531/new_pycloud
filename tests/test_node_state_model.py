@@ -1,6 +1,7 @@
 """中文说明：验证 gRPC 控制面的核心状态流转（内存后端）。"""
 
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -26,6 +27,7 @@ from pycloud_parallel.controlplane.node.execution import (
     _build_execute_spec,
     _describe_artifact_error,
     _execute_payload_in_subprocess,
+    _load_user_module,
     _purge_loaded_artifact_modules,
 )
 from pycloud_parallel.controlplane.node.filesystem import (
@@ -52,6 +54,7 @@ from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.execution.service_session import Service
 from pycloud_parallel.execution.support import _prepare_http_payload_for_call, _serialize_data_for_object_ref
+from pycloud_parallel.execution.support import _prepare_code_blob
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 _materialize_downloaded_result = client_transport_mod._materialize_downloaded_result
@@ -334,6 +337,58 @@ def test_purge_loaded_artifact_modules_tolerates_broken_namespace_paths(tmp_path
     )
 
     assert "broken_pkg.child" not in sys.modules
+
+
+def test_purge_loaded_artifact_modules_removes_temp_extracted_local_packages(tmp_path, monkeypatch):
+    package_dir = tmp_path / "calc_asset_ratio"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("from . import calc_asset_ratio\n", encoding="utf-8")
+    (package_dir / "calc_asset_ratio.py").write_text(
+        "def get_fund_asset_ratio(value=0, **_kwargs):\n"
+        "    return {'value': value}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "calc_asset_ratio_job_module.py").write_text(
+        "from calc_asset_ratio import calc_asset_ratio\n\n"
+        "def task_generator(**_kwargs):\n"
+        "    return [{'value': 1}]\n\n"
+        "def run(value=0, **_kwargs):\n"
+        "    return calc_asset_ratio.get_fund_asset_ratio(value=value)\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    for name in ("calc_asset_ratio", "calc_asset_ratio.calc_asset_ratio", "calc_asset_ratio_job_module"):
+        sys.modules.pop(name, None)
+    module = importlib.import_module("calc_asset_ratio_job_module")
+    blob, _filename = _prepare_code_blob(module=module)
+    artifact_path = tmp_path / "artifact.tar.gz"
+    artifact_path.write_bytes(blob or b"")
+    for name in ("calc_asset_ratio", "calc_asset_ratio.calc_asset_ratio", "calc_asset_ratio_job_module"):
+        sys.modules.pop(name, None)
+
+    loaded = _load_user_module(
+        str(artifact_path),
+        entry_module="calc_asset_ratio_job_module",
+        package_format="tar.gz",
+        dependency_path="",
+    )
+    extracted_dir = str(getattr(loaded, "__pycloud_temp_extract_dir__", "") or "").strip()
+
+    assert extracted_dir
+    assert "calc_asset_ratio" in sys.modules
+    assert "calc_asset_ratio.calc_asset_ratio" in sys.modules
+
+    _purge_loaded_artifact_modules(
+        str(artifact_path),
+        entry_module="calc_asset_ratio_job_module",
+        package_format="tar.gz",
+        extra_prefixes=[extracted_dir],
+    )
+
+    assert "calc_asset_ratio" not in sys.modules
+    assert "calc_asset_ratio.calc_asset_ratio" not in sys.modules
 
 
 def test_dict_to_struct_round_trips_temporal_scalars_and_series_index():

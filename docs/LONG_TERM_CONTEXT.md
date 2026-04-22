@@ -1,0 +1,169 @@
+# 长期上下文（Long-Term Context）
+
+最后更新：2026-04-22（Asia/Shanghai）
+适用范围：`new_pycloud` 主仓库（V1 公开面与控制面实现）
+
+## 1. 这份文件的目的
+
+这份文件是项目的长期记忆基线，给后续维护者回答 4 个问题：
+
+1. 这个项目当前“长期稳定”的边界是什么
+2. 哪些决策已经定稿，不能被局部实现悄悄改掉
+3. 发生行为偏移时，先查哪里、测哪里
+4. 新需求进来时，怎么改才不会破坏既有共识
+
+## 2. 当前架构基线（对外心智）
+
+V1 公开概念固定为：
+
+1. `Service`
+2. `TaskPool`
+3. `JobQueue`
+4. `DataRef`
+5. `export`
+
+三层执行模型：
+
+1. `Service Mode`：常驻函数服务会话
+2. `JobQueue Mode`：大任务排队与单活编排
+3. `TaskPool / Task Mode`：子任务执行层
+
+## 3. 序列化与策略基线
+
+### 3.1 mode 与 policy 的职责
+
+1. `serialization_mode` 负责“对象如何编解码”（codec 语义）
+2. `policy profile` 负责“是否允许该 mode + payload/transport 限制”
+3. `effective_policy` 是会话冻结后的最终执行策略
+
+### 3.2 当前默认绑定（重要）
+
+1. `jobqueue_controlplane_transport` -> `default_safe`，默认 mode=`structured_v1`
+2. `taskpool_default` -> `trusted_internal`，默认 mode=`structured_v1`
+3. `gateway_public` 走对外保守边界（默认不允许 pickle）
+
+### 3.3 变更约束
+
+1. 客户端可以表达 `serialization_mode` 偏好，但不能在普通调用面随意改 `policy_id`
+2. 不再把 node capability 交集引入 effective policy 协商
+3. 节点差异通过 `tags` / `healthy_only` / runtime 过滤处理
+
+## 4. JobQueue / job-orch 长期约束（关键）
+
+### 4.1 调用面约束
+
+1. `JobQueue` 自身 transport 固定：`structured_v1 + default_safe`
+2. `JobQueue.submit(...)` 允许传 `serialization_mode`
+3. `JobQueue.submit(...)` 不再接受 `policy_id`（应直接报错）
+
+### 4.2 orch 侧约束
+
+1. `job-orch` 的 `taskpool_policy_id` 在启动时确定
+2. 运行期不支持 submit 覆盖该 policy
+3. 管理员如需改 policy，应通过部署/启动参数变更后重启生效
+
+### 4.3 共享池约束
+
+1. `job-orch` 运行期维护单个共享 `TaskPool`（串行 job）
+2. 新 job 与当前池同 artifact/codeversion 时，优先在 job 边界软切 mode 并复用池
+3. 软切失败时，回退为“关闭旧池 + 重建新池”
+4. 共享池空闲超过 `idle_ttl` 后才主动回收，不是每个 job 结束都关池
+
+## 5. 安全与会话边界基线
+
+1. TaskPool 相关操作需要 `owner_client_id + pool_token` 双重校验
+2. keepalive 不是纯本地状态刷新，会触发远端心跳与租约续期
+3. 任何绕过接收端上下文校验的“声明式 mode 信任”都应视为高风险设计
+
+## 6. 回归测试最小集合（改动前后必看）
+
+建议至少覆盖：
+
+1. `tests/v1/test_jobqueue_shared_pool_mode_switch.py`
+   - 软切复用
+   - 软切失败回退重建
+   - idle 过期回收
+2. `tests/test_job_queue.py`
+   - submit 参数解释
+   - `policy_id` 禁止路径
+3. `tests/test_effective_policy.py` / `tests/test_policy_profile.py`
+   - 绑定与有效策略解析
+
+## 7. 新需求进入时的决策流程
+
+1. 先判断是“codec 问题”还是“policy 问题”
+2. 若涉及默认行为，优先改 binding/profile，不在业务调用链硬编码分支
+3. 若涉及 JobQueue 与 TaskPool 边界，优先保持“queue transport policy”与“task execution policy”分离
+4. 所有默认值变更，必须同步：
+   - `src/pycloud_parallel/controlplane/policy_profile.py`
+   - 对应文档（本文件 + `ARCHITECTURE_OVERVIEW.md` + `CLIENT_SURFACE_OVERVIEW.md`）
+   - 对应测试
+
+## 8. 文档维护规则
+
+1. 只有“会影响默认行为/边界”的决策才写入本文件
+2. 每次更新请改“最后更新”日期，并附一句变化摘要
+3. 如果与其他文档冲突，以本文件为优先修正源，再回补其他文档
+
+## 9. 更新准入规则（多人/多线程协作）
+
+### 9.1 谁可以改
+
+1. 任何有仓库写权限的维护者都可以修改本文件
+2. 但修改应遵循“明确指令 + 可验证依据 + 同步测试/文档”的最小流程
+
+### 9.2 何时允许改
+
+满足任一条件可更新：
+
+1. 默认行为发生变化（默认 mode、默认 policy、默认 limits、默认路由策略）
+2. 边界约束发生变化（例如 submit 参数权限、共享池生命周期、安全校验）
+3. 已有条目与代码事实不一致，需要纠偏
+
+### 9.3 何时不该改
+
+1. 仅是临时排障结论、尚未定稿的讨论
+2. 仅当前线程上下文、不会影响全局行为的局部细节
+3. 尚无代码/测试佐证的猜测性结论
+
+### 9.4 自动化与触发方式
+
+1. 本文件不会被系统自动追加或自动改写
+2. 必须由维护者在对应线程中明确执行编辑动作（人工或 coder）
+3. 未经明确编辑动作，不应假设“对话内容已经自动沉淀到本文件”
+
+### 9.5 提交前检查清单（建议）
+
+1. 是否更新“最后更新”日期与“本次更新摘要”
+2. 是否给出可核对的代码/测试依据
+3. 是否同步了受影响文档：
+   - `docs/ARCHITECTURE_OVERVIEW.md`
+   - `docs/CLIENT_SURFACE_OVERVIEW.md`
+   - `docs/TASK_MODE.md` / `docs/TASK_CLIENT_GUIDE.md`（按需）
+4. 是否补充或更新了对应回归测试（至少最小集合）
+
+### 9.6 并发修改冲突处理
+
+1. 以“更晚且有代码依据”的版本为主
+2. 冲突合并时优先保留约束性条款，删去重复叙述
+3. 若两条规则冲突，先在 PR/评审中做显式裁决，再落文档，不做隐式覆盖
+
+### 9.7 自动守卫（CI）
+
+仓库已配置：
+
+1. `.github/PULL_REQUEST_TEMPLATE.md`
+   - 强制 PR 作者显式勾选是否涉及长期边界变更
+2. `.github/workflows/long-term-context-guard.yml`
+   - 当关键边界文件发生改动时，若未同步修改 `docs/LONG_TERM_CONTEXT.md`，CI 直接失败
+
+若后续新增关键边界文件，请同步维护 workflow 里的关键文件列表。
+
+---
+
+本次更新摘要（2026-04-22）：
+
+1. 固化 JobQueue/job-orch 的长期边界：policy 启动时固定、submit 仅允许 mode、共享池串行复用、软切失败回退重建
+2. 明确三层模型里 mode/policy 的职责分离与 node 过滤边界
+3. 增加多人协作更新准入规则：明确“非自动写入、需显式编辑触发”的机制与提交流程
+4. 新增 PR 模板与 CI 守卫，强制关键边界改动同步更新长期上下文文档

@@ -155,6 +155,7 @@ def build_job_orchestrator_server(
     tags: Optional[list[str]] = None,
     version: str = "",
     taskpool_policy_id: str = "",
+    admin_token: str = "",
 ) -> JobOrchestratorServer:
     if not infocenter_addr:
         raise ValueError("infocenter_addr is required for joborchestrator role")
@@ -167,6 +168,7 @@ def build_job_orchestrator_server(
         tags=tags,
         version=version,
         taskpool_policy_id=taskpool_policy_id,
+        admin_token=admin_token,
     )
 
 
@@ -348,6 +350,7 @@ def main() -> None:
             tags=[x.strip() for x in args.node_tags.split(",") if x.strip()] or ["job"],
             version=args.node_version,
             taskpool_policy_id=args.taskpool_policy_id,
+            admin_token=str(getattr(args, "admin_token", "") or ""),
         )
         _wait_until_stopped(server, on_stop=lambda: None)
         return

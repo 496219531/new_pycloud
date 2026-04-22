@@ -13,6 +13,7 @@ from importlib import metadata as importlib_metadata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.data_ref import coerce_data_ref
@@ -101,6 +102,54 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             http_base_url=str(item.get("http_base_url", "") or ""),
         )
     return out
+
+
+def _service_endpoint_key(http_base_url: str) -> str:
+    text = str(http_base_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return text
+
+
+def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[str, object]]:
+    grouped: Dict[Tuple[str, str], List[NodeServiceState]] = {}
+    for svc in services:
+        key = (str(svc.service_name or "").strip(), _service_endpoint_key(str(svc.http_base_url or "").strip()))
+        grouped.setdefault(key, []).append(svc)
+
+    merged: List[Dict[str, object]] = []
+    for (_service_name, _endpoint_key), items in sorted(grouped.items(), key=lambda item: item[0]):
+        ordered = sorted(
+            items,
+            key=lambda svc: (
+                getattr(svc, "lease_expire_at", utc_now()),
+                int(getattr(svc, "alive_workers", 0) or 0),
+                int(getattr(svc, "worker_count", 0) or 0),
+                str(getattr(svc, "service_id", "") or ""),
+            ),
+            reverse=True,
+        )
+        primary = ordered[0]
+        duplicate_count = len(ordered)
+        merged.append(
+            {
+                "primary": primary,
+                "service_id": str(primary.service_id or ""),
+                "service_name": str(primary.service_name or ""),
+                "status": int(primary.status),
+                "worker_count": max(int(getattr(item, "worker_count", 0) or 0) for item in ordered),
+                "alive_workers": max(int(getattr(item, "alive_workers", 0) or 0) for item in ordered),
+                "in_flight": max(int(getattr(item, "in_flight", 0) or 0) for item in ordered),
+                "lease_expire_at": max(getattr(item, "lease_expire_at", utc_now()) for item in ordered),
+                "http_base_url": str(primary.http_base_url or ""),
+                "duplicate_count": duplicate_count,
+                "service_ids": [str(item.service_id or "") for item in ordered],
+            }
+        )
+    return merged
 
 
 def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
@@ -375,19 +424,30 @@ def _job_queue_service_http_base(state: InfoCenterState, owner: str) -> str:
     return ""
 
 
-def _reorder_job_via_http(http_base_url: str, job_id: str, *, direction: str) -> Dict[str, object]:
+def _reorder_job_via_http(http_base_url: str, job_id: str, *, direction: str, auth_token: str = "") -> Dict[str, object]:
     base = str(http_base_url or "").strip().rstrip("/")
     if not base:
         raise RuntimeError("job orchestrator route has no http_base_url")
     raw = json.dumps({"job_id": str(job_id or "").strip(), "direction": str(direction or "").strip()}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    normalized_auth_token = str(auth_token or "").strip()
+    if normalized_auth_token:
+        headers["Authorization"] = f"Bearer {normalized_auth_token}"
     req = Request(
         f"{base}/call/reorder_job?timeout_sec=5.000",
         method="POST",
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         data=raw,
     )
-    with urlopen(req, timeout=6.0) as resp:
-        payload = json.loads(resp.read().decode("utf-8") or "{}")
+    try:
+        with urlopen(req, timeout=6.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            payload = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
+        except Exception:
+            payload = {"ok": False, "error": exc.reason}
+        raise RuntimeError(str((payload or {}).get("error", exc.reason))) from exc
     if not isinstance(payload, dict) or not payload.get("ok", False):
         raise RuntimeError(str((payload or {}).get("error", "reorder failed")))
     return payload
@@ -460,15 +520,19 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             )
     for node in nodes:
         services = sorted(node.services.values(), key=lambda item: (item.service_name, item.service_id))
+        merged_services = _merge_services_for_display(services)
         task_pools = sorted(node.task_pools.values(), key=lambda item: (item.created_at, item.pool_name, item.pool_id), reverse=True)
         node_healthy = bool(node.healthy)
         timing_map = _parse_service_timing_metrics(dict(node.metadata))
         pool_timing_map = _parse_task_pool_timing_metrics(dict(node.metadata))
         loaded = "<br>".join(
-            f"{html.escape(svc.service_name)} "
-            f"<span class='muted'>[{(svc.alive_workers if node_healthy else 0)}/{svc.worker_count} alive, "
-            f"in-flight {(svc.in_flight if node_healthy else 0)}]</span>"
-            for svc in services
+            (
+                f"{html.escape(str(item['service_name']))} "
+                f"<span class='muted'>[{(int(item['alive_workers']) if node_healthy else 0)}/{int(item['worker_count'])} alive, "
+                f"in-flight {(int(item['in_flight']) if node_healthy else 0)}]"
+                f"{' merged×' + str(int(item['duplicate_count'])) if int(item['duplicate_count']) > 1 else ''}</span>"
+            )
+            for item in merged_services
         ) or "-"
         active_runtimes = ", ".join(node.active_runtimes[:10]) or "-"
         node_rows.append(
@@ -490,7 +554,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{node.task_pool_worker_available()}</td>"
             f"<td>{sum(int(getattr(pool, 'inflight', 0) or 0) for pool in task_pools)}</td>"
             f"<td>{len(task_pools)}</td>"
-            f"<td>{len(services)}</td>"
+            f"<td>{len(merged_services)}</td>"
             f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
             "<td>"
@@ -501,28 +565,32 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "</td>"
             "</tr>"
         )
-        for svc in services:
+        for item in merged_services:
+            svc = item["primary"]
             stale_row = "" if node_healthy else " class='stale-row'"
-            timing = timing_map.get(str(svc.service_id), {})
+            timing = timing_map.get(str(item["service_id"]), {})
+            service_id_text = html.escape(str(item["service_id"]) or "-")
+            if int(item["duplicate_count"]) > 1:
+                service_id_text = f"{service_id_text} (+{int(item['duplicate_count']) - 1})"
             service_rows.append(
                 f"<tr{stale_row}>"
                 f"<td>{html.escape(node.node_id)}</td>"
                 f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
-                f"<td>{html.escape(svc.service_name)}</td>"
-                f"<td>{html.escape(svc.service_id)}</td>"
+                f"<td>{html.escape(str(item['service_name']))}</td>"
+                f"<td>{service_id_text}</td>"
                 f"<td>{'yes' if node_healthy else 'no'}</td>"
-                f"<td>{html.escape(_effective_service_status_text(node_healthy=node_healthy, service_status=svc.status))}</td>"
-                f"<td>{svc.worker_count}</td>"
-                f"<td>{svc.alive_workers if node_healthy else 0}</td>"
-                f"<td>{svc.in_flight if node_healthy else 0}</td>"
+                f"<td>{html.escape(_effective_service_status_text(node_healthy=node_healthy, service_status=int(item['status'])))}</td>"
+                f"<td>{int(item['worker_count'])}</td>"
+                f"<td>{int(item['alive_workers']) if node_healthy else 0}</td>"
+                f"<td>{int(item['in_flight']) if node_healthy else 0}</td>"
                 f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
-                f"<td>{html.escape(_dt_text(svc.lease_expire_at))}</td>"
-                f"<td>{html.escape(svc.http_base_url or '-')}</td>"
+                f"<td>{html.escape(_dt_text(item['lease_expire_at']))}</td>"
+                f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
                 "</tr>"
             )
         for pool in task_pools:
@@ -555,7 +623,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         metadata = dict(node.metadata or {})
         component = str(metadata.get("component", "") or "").strip()
         if component == "job-orchestrator":
-            job_service = next((svc for svc in services if svc.service_name == "job-orchestrator"), None)
+            job_service = next((item["primary"] for item in merged_services if str(item["service_name"]) == "job-orchestrator"), None)
             job_waiting = str(metadata.get("job_waiting", "0") or "0")
             job_running = str(metadata.get("job_running", "0") or "0")
             job_terminal = str(metadata.get("job_terminal", "0") or "0")
@@ -918,7 +986,12 @@ class InfoCenterHttpServer:
                             http_base_url = _job_queue_service_http_base(state, owner)
                             if not http_base_url:
                                 raise RuntimeError("job orchestrator route not found")
-                            _reorder_job_via_http(http_base_url, job_id, direction=direction)
+                            _reorder_job_via_http(
+                                http_base_url,
+                                job_id,
+                                direction=direction,
+                                auth_token=str(self.server_ref.auth_token or ""),
+                            )
                     except Exception as exc:
                         self._send_json(502, {"ok": False, "error": str(exc)})
                         return

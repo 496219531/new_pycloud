@@ -890,11 +890,13 @@ class NodeControlState:
             self._validate_managed_global_names(managed_global_names, module=module)
             return methods
         finally:
+            extracted_dir = str(getattr(module, "__pycloud_temp_extract_dir__", "") or "").strip() if module is not None else ""
             _purge_loaded_artifact_modules(
                 artifact.path,
                 entry_module=artifact.entry_module,
                 package_format=artifact.package_format,
                 dependency_path=dependency_path,
+                extra_prefixes=([extracted_dir] if extracted_dir else []),
             )
 
     def _ensure_artifact_ready(

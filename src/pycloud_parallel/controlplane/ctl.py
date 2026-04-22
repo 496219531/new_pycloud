@@ -10,12 +10,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+import uuid
 from typing import Dict, Iterable, List, Tuple
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -825,6 +827,60 @@ def _env_override_int(extra_env: Dict[str, str], key: str, default: int) -> int:
         raise ValueError(f"--env {key} must be int, got {raw!r}") from exc
 
 
+def _spawn_server_debug_macos_terminal(
+    root: Path,
+    log_path: Path,
+    args: Iterable[str],
+    *,
+    env: Dict[str, str],
+) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = _logs_dir(root) / ".debug-launch"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    pid_path = temp_dir / f"{log_path.stem}-{token}.pid"
+    script_path = temp_dir / f"{log_path.stem}-{token}.sh"
+    quoted_command = " ".join(shlex.quote(part) for part in _server_command(*args))
+    lines = [
+        "#!/bin/bash",
+        "set -e",
+        f"cd {shlex.quote(str(root))}",
+        f"echo $$ > {shlex.quote(str(pid_path))}",
+        "rm -- \"$0\"",
+    ]
+    for key, value in sorted(env.items()):
+        lines.append(f"export {key}={shlex.quote(str(value))}")
+    lines.append(f"exec {quoted_command}")
+    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script_path.chmod(0o755)
+
+    command_text = f"bash {shlex.quote(str(script_path))}"
+    subprocess.run(
+        [
+            "osascript",
+            "-e",
+            'tell application "Terminal" to activate',
+            "-e",
+            f'tell application "Terminal" to do script {json.dumps(command_text)}',
+        ],
+        check=True,
+        cwd=str(root),
+        env=env,
+    )
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            raw = pid_path.read_text(encoding="utf-8").strip()
+            pid_path.unlink(missing_ok=True)
+            return int(raw)
+        except FileNotFoundError:
+            time.sleep(0.05)
+        except ValueError:
+            break
+    return 0
+
+
 def _spawn_server(
     root: Path,
     log_path: Path,
@@ -849,6 +905,13 @@ def _spawn_server(
             creationflags=creationflags,
         )
     else:
+        if debug and sys.platform == "darwin":
+            return _spawn_server_debug_macos_terminal(
+                root,
+                log_path,
+                args,
+                env=env,
+            )
         if debug:
             proc = subprocess.Popen(
                 _server_command(*args),
@@ -2291,6 +2354,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_job_orchestrator.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="queue capacity advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--node-tags", default="job", help="comma-separated node tags advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--node-version", default="v1", help="node version string advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--admin-token", default="", help="admin token required for reorder_job; defaults to PYCLOUD_JOB_ORCHESTRATOR_ADMIN_TOKEN or PYCLOUD_INFOCENTER_TOKEN")
     start_node = subparsers.add_parser("start-node", help="start one local nodecontrol process")
     _add_local_argument(start_node)
     _add_env_argument(start_node)

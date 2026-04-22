@@ -1244,6 +1244,7 @@ class JobQueueManager:
                 raise RuntimeError("driver returned no valid subtasks")
             return subtasks
         finally:
+            extracted_dir = str(getattr(module, "__pycloud_temp_extract_dir__", "") or "").strip() if module is not None else ""
             produced = None
             fn = None
             module = None
@@ -1253,6 +1254,7 @@ class JobQueueManager:
                     entry_module=entry_module,
                     package_format=package_format,
                     dependency_path="",
+                    extra_prefixes=([extracted_dir] if extracted_dir else []),
                 )
             except Exception:
                 pass
@@ -1865,6 +1867,7 @@ class JobQueueManager:
                     entry_module=entry_module,
                     package_format=package_format,
                     dependency_path="",
+                    extra_prefixes=([extracted_dir] if extracted_dir else []),
                 )
             except Exception:
                 pass

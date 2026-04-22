@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
+from pycloud_parallel.controlplane.job_orchestrator import JobOrchestratorServer
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.data.ref import DataRef, data_ref_to_payload
 
@@ -171,6 +172,34 @@ def test_reorder_waiting_job_updates_waiting_order() -> None:
 
     summary = queue.summary()
     assert [item["job_id"] for item in summary["waiting_jobs"]] == ["job-3", "job-1", "job-2"]
+
+
+def test_job_orchestrator_reorder_job_requires_admin_token() -> None:
+    server = JobOrchestratorServer(
+        bind="127.0.0.1:0",
+        infocenter_addr="127.0.0.1:50051",
+        node_id="job-orch-test",
+        admin_token="admin-token",
+    )
+    queue = server.job_queue
+    queue.submit_job({"job_id": "job-1", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 1}]})
+    queue.submit_job({"job_id": "job-2", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 2}]})
+    queue.submit_job({"job_id": "job-3", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 3}]})
+    with queue._cv:  # noqa: SLF001
+        queue._waiting_order = ["job-1", "job-2", "job-3"]  # noqa: SLF001
+
+    status, body = server._invoke(server.service_id, "reorder_job", {"job_id": "job-3", "direction": "up"}, "", 5.0)
+    assert status == 403
+    assert body["error"] == "admin auth required"
+
+    status, body = server._invoke(server.service_id, "reorder_job", {"job_id": "job-3", "direction": "up"}, "owner-token", 5.0)
+    assert status == 403
+    assert body["error"] == "admin auth required"
+
+    status, body = server._invoke(server.service_id, "reorder_job", {"job_id": "job-3", "direction": "up"}, "admin-token", 5.0)
+    assert status == 200
+    waiting_ids = [item["job_id"] for item in body["queue"]["waiting_jobs"]]
+    assert waiting_ids == ["job-1", "job-3", "job-2"]
 
 
 def test_expand_subtasks_from_driver_blob() -> None:

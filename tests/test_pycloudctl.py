@@ -1440,6 +1440,7 @@ def test_spawn_server_debug_inherits_stdio_on_posix(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ctl.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(ctl.os, "name", "posix", raising=False)
+    monkeypatch.setattr(ctl.sys, "platform", "linux", raising=False)
 
     pid = ctl._spawn_server(
         tmp_path,
@@ -1453,3 +1454,32 @@ def test_spawn_server_debug_inherits_stdio_on_posix(tmp_path, monkeypatch):
     assert captured["stderr"] is None
     assert captured["close_fds"] is True
     assert captured["creationflags"] == 0
+
+
+def test_spawn_server_debug_uses_terminal_windows_on_macos(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_spawn(root, log_path, args, *, env):
+        captured["root"] = root
+        captured["log_path"] = log_path
+        captured["args"] = list(args)
+        captured["env"] = dict(env)
+        return 45678
+
+    monkeypatch.setattr(ctl.os, "name", "posix", raising=False)
+    monkeypatch.setattr(ctl.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(ctl, "_spawn_server_debug_macos_terminal", fake_spawn)
+
+    pid = ctl._spawn_server(
+        tmp_path,
+        tmp_path / "logs" / "service.log",
+        ["--role", "controlplane"],
+        extra_env={"PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": "1048576"},
+        debug=True,
+    )
+
+    assert pid == 45678
+    assert captured["root"] == tmp_path
+    assert captured["log_path"] == tmp_path / "logs" / "service.log"
+    assert captured["args"] == ["--role", "controlplane"]
+    assert captured["env"]["PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES"] == "1048576"

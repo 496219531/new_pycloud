@@ -905,6 +905,7 @@ def test_gateway_retries_second_route_when_first_route_is_broken(tmp_path):
 
 
 def test_gateway_supports_http_only_job_orchestrator_service():
+    admin_token = "job-admin-token"
     infocenter = build_infocenter_server("127.0.0.1:0")
     infocenter.start()
     gateway = build_gateway_server("127.0.0.1:0", infocenter_addr=infocenter.base_url)
@@ -913,10 +914,11 @@ def test_gateway_supports_http_only_job_orchestrator_service():
         "127.0.0.1:0",
         infocenter_addr=infocenter.base_url,
         node_id="job-orchestrator-test",
+        admin_token=admin_token,
     )
     job_orchestrator.start()
     with job_orchestrator.job_queue._cv:  # noqa: SLF001
-        job_orchestrator.job_queue._running_job_id = "__test_blocked__"  # noqa: SLF001
+        job_orchestrator.job_queue._stop = True  # noqa: SLF001
 
     try:
         assert _wait_until(
@@ -973,16 +975,34 @@ def test_gateway_supports_http_only_job_orchestrator_service():
                 timeout_sec=5.0,
             )
             third_job_id = str(third["job"]["job_id"])
-            reorder = owner_client.call(
-                service_name="job-orchestrator",
-                method="reorder_job",
-                payload={"job_id": third_job_id, "direction": "up"},
-                timeout_sec=5.0,
-            )
-            assert reorder["ok"] is True
-            waiting_ids = [item["job_id"] for item in reorder["queue"]["waiting_jobs"]]
-            assert second_job_id in waiting_ids and third_job_id in waiting_ids
-            assert waiting_ids.index(third_job_id) < waiting_ids.index(second_job_id)
+            with pytest.raises(RuntimeError, match="admin auth required"):
+                owner_client.call(
+                    service_name="job-orchestrator",
+                    method="reorder_job",
+                    payload={"job_id": third_job_id, "direction": "up"},
+                    timeout_sec=5.0,
+                )
+
+            with GatewayServiceClient(gateway.base_url, timeout_sec=5.0) as no_token_client:
+                with pytest.raises(RuntimeError, match="admin auth required"):
+                    no_token_client.call(
+                        service_name="job-orchestrator",
+                        method="reorder_job",
+                        payload={"job_id": third_job_id, "direction": "up"},
+                        timeout_sec=5.0,
+                    )
+
+            with GatewayServiceClient(gateway.base_url, timeout_sec=5.0, service_token=admin_token) as admin_client:
+                reorder = admin_client.call(
+                    service_name="job-orchestrator",
+                    method="reorder_job",
+                    payload={"job_id": third_job_id, "direction": "up"},
+                    timeout_sec=5.0,
+                )
+                assert reorder["ok"] is True
+                waiting_ids = [item["job_id"] for item in reorder["queue"]["waiting_jobs"]]
+                assert second_job_id in waiting_ids and third_job_id in waiting_ids
+                assert waiting_ids.index(third_job_id) < waiting_ids.index(second_job_id)
 
             with GatewayServiceClient(gateway.base_url, timeout_sec=5.0, service_token="job-other-token") as other_client:
                 with pytest.raises(RuntimeError, match="cancel auth failed"):

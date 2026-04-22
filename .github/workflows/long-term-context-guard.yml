@@ -1,0 +1,69 @@
+name: Long-Term Context Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+jobs:
+  require-long-term-context-sync:
+    name: Require LONG_TERM_CONTEXT Sync For Boundary Changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.base_ref }}"
+          git fetch origin "${BASE_REF}:${BASE_REF}" --depth=1 || true
+          CHANGED_FILES="$(git diff --name-only "origin/${BASE_REF}...HEAD" || git diff --name-only "${BASE_REF}...HEAD")"
+          {
+            echo 'files<<EOF'
+            echo "${CHANGED_FILES}"
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+          echo "Changed files:"
+          echo "${CHANGED_FILES}"
+
+      - name: Enforce context sync
+        shell: bash
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          set -euo pipefail
+
+          key_changed=0
+          context_changed=0
+
+          while IFS= read -r file; do
+            [ -z "${file}" ] && continue
+            case "${file}" in
+              src/pycloud_parallel/controlplane/policy_profile.py|\
+              src/pycloud_parallel/controlplane/effective_policy.py|\
+              src/pycloud_parallel/controlplane/serialization_mode.py|\
+              src/pycloud_parallel/controlplane/serialization.py|\
+              src/pycloud_parallel/controlplane/job_queue.py|\
+              src/pycloud_parallel/controlplane/job_orchestrator.py|\
+              src/pycloud_parallel/execution/queue.py|\
+              src/pycloud_parallel/execution/task_pool.py|\
+              src/pycloud_parallel/execution/support.py)
+                key_changed=1
+                ;;
+              docs/LONG_TERM_CONTEXT.md)
+                context_changed=1
+                ;;
+            esac
+          done <<< "${CHANGED_FILES}"
+
+          if [ "${key_changed}" -eq 1 ] && [ "${context_changed}" -eq 0 ]; then
+            echo "::error::Boundary/default-policy files changed but docs/LONG_TERM_CONTEXT.md was not updated."
+            echo "::error::Please sync docs/LONG_TERM_CONTEXT.md (or explicitly split this PR)."
+            exit 1
+          fi
+
+          echo "Long-term context guard passed."
