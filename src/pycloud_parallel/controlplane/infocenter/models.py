@@ -78,6 +78,7 @@ class NodeState:
     service_worker_used: int = 0
     task_pool_worker_capacity: int = 0
     task_pool_worker_used: int = 0
+    accept_service_deploy: bool = True
     schedulable: bool = True
     drain: bool = False
     reason: str = ""

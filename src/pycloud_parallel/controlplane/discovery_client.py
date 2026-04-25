@@ -3,9 +3,11 @@ from __future__ import annotations
 """Discovery-based low-level service transport client."""
 
 import contextlib
+import atexit
+import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
@@ -39,6 +41,74 @@ client_mod = SimpleNamespace(
     _node_instance_key_from_route=_node_instance_key_from_route,
 )
 
+_SHARED_ROUTE_CACHES: Dict[Tuple[object, ...], _DiscoveryRouteCache] = {}
+_SHARED_ROUTE_CACHES_LOCK = threading.Lock()
+
+
+def _shared_route_cache_key(
+    *,
+    infocenter_target: str,
+    timeout_sec: float,
+    refresh_interval_sec: float,
+    failure_threshold: int,
+    open_sec: float,
+    route_limit: int,
+) -> Tuple[object, ...]:
+    return (
+        threading.get_ident(),
+        str(infocenter_target or "").strip(),
+        round(max(0.1, float(timeout_sec)), 3),
+        round(max(0.2, float(refresh_interval_sec)), 3),
+        max(1, int(failure_threshold)),
+        round(max(0.1, float(open_sec)), 3),
+        max(1, int(route_limit)),
+    )
+
+
+def _get_shared_route_cache(
+    *,
+    infocenter_target: str,
+    timeout_sec: float,
+    refresh_interval_sec: float,
+    failure_threshold: int,
+    open_sec: float,
+    route_limit: int,
+) -> _DiscoveryRouteCache:
+    key = _shared_route_cache_key(
+        infocenter_target=infocenter_target,
+        timeout_sec=timeout_sec,
+        refresh_interval_sec=refresh_interval_sec,
+        failure_threshold=failure_threshold,
+        open_sec=open_sec,
+        route_limit=route_limit,
+    )
+    with _SHARED_ROUTE_CACHES_LOCK:
+        cache = _SHARED_ROUTE_CACHES.get(key)
+        if cache is None:
+            cache = client_mod._DiscoveryRouteCache(
+                infocenter_target=str(infocenter_target or "").strip(),
+                timeout_sec=timeout_sec,
+                refresh_interval_sec=refresh_interval_sec,
+                failure_threshold=failure_threshold,
+                open_sec=open_sec,
+                route_limit=route_limit,
+            )
+            cache.start()
+            _SHARED_ROUTE_CACHES[key] = cache
+        return cache
+
+
+def _stop_shared_route_caches() -> None:
+    with _SHARED_ROUTE_CACHES_LOCK:
+        caches = list(_SHARED_ROUTE_CACHES.values())
+        _SHARED_ROUTE_CACHES.clear()
+    for cache in caches:
+        with contextlib.suppress(Exception):
+            cache.stop()
+
+
+atexit.register(_stop_shared_route_caches)
+
 
 class DiscoveryServiceClient:
     """Low-level discovery transport client for service calls."""
@@ -53,21 +123,35 @@ class DiscoveryServiceClient:
         failure_threshold: int = 3,
         open_sec: float = 5.0,
         route_limit: int = 500,
+        shared_route_cache: bool = False,
     ) -> None:
         self.infocenter_target = str(infocenter_target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.service_token = str(service_token or "").strip()
-        self._route_cache = client_mod._DiscoveryRouteCache(
-            infocenter_target=self.infocenter_target,
-            timeout_sec=self.timeout_sec,
-            refresh_interval_sec=refresh_interval_sec,
-            failure_threshold=failure_threshold,
-            open_sec=open_sec,
-            route_limit=route_limit,
-        )
-        self._route_cache.start()
+        self._shared_route_cache = bool(shared_route_cache)
+        if self._shared_route_cache:
+            self._route_cache = _get_shared_route_cache(
+                infocenter_target=self.infocenter_target,
+                timeout_sec=self.timeout_sec,
+                refresh_interval_sec=refresh_interval_sec,
+                failure_threshold=failure_threshold,
+                open_sec=open_sec,
+                route_limit=route_limit,
+            )
+        else:
+            self._route_cache = client_mod._DiscoveryRouteCache(
+                infocenter_target=self.infocenter_target,
+                timeout_sec=self.timeout_sec,
+                refresh_interval_sec=refresh_interval_sec,
+                failure_threshold=failure_threshold,
+                open_sec=open_sec,
+                route_limit=route_limit,
+            )
+            self._route_cache.start()
 
     def close(self) -> None:
+        if self._shared_route_cache:
+            return
         self._route_cache.stop()
 
     def __enter__(self) -> "DiscoveryServiceClient":
@@ -90,6 +174,7 @@ class DiscoveryServiceClient:
             "service_name": str(info["service_name"]),
             "refreshed_at": info["refreshed_at"],
             "route_count": int(info["route_count"]),
+            "route_cache_index": int(info.get("route_cache_index", 0) or 0),
             "routes": [client_mod._serialize_route(route) for route in routes],
             "last_call": dict(info.get("last_call") or {}),
         }
@@ -203,10 +288,17 @@ class DiscoveryServiceClient:
 
         def _has_untried_cached_route() -> bool:
             try:
+                cached = [
+                    item
+                    for item in self._route_cache.get_routes(name)
+                    if str(getattr(item, "service_id", "") or "") not in tried
+                ]
+                if cached:
+                    return True
                 return bool(
                     [
                         item
-                        for item in self._route_cache.get_routes(name)
+                        for item in self._route_cache.refresh(name, force=True)
                         if str(getattr(item, "service_id", "") or "") not in tried
                     ]
                 )

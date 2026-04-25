@@ -121,6 +121,7 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
         metadata["pycloud_version"] = self._pycloud_version()
+        metadata["accept_service_deploy"] = "true"
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -153,6 +154,7 @@ class NodeInfoCenterRegistrar:
             service_worker_used=self.state.service_worker_used(),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
             task_pool_worker_used=self.state.task_pool_worker_used(),
+            accept_service_deploy=True,
             python_version=self.state.python_version,
             capability=self.state.node_capability(),
         )
@@ -175,6 +177,7 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
         metadata["pycloud_version"] = self._pycloud_version()
+        metadata["accept_service_deploy"] = "true"
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -211,6 +214,7 @@ class NodeInfoCenterRegistrar:
             service_worker_used=self.state.service_worker_used(),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
             task_pool_worker_used=self.state.task_pool_worker_used(),
+            accept_service_deploy=True,
             python_version=self.state.python_version,
             capability=self.state.node_capability(),
         )
@@ -326,6 +330,7 @@ class JobOrchestratorInfoCenterRegistrar:
         snapshot = dict(self.status_provider() or {})
         metadata = dict(self.metadata)
         metadata["component"] = "job-orchestrator"
+        metadata["accept_service_deploy"] = "false"
         metadata["pycloud_version"] = _pycloud_version()
         metadata["current_job_id"] = str(snapshot.get("current_job_id", "") or "")
         metadata["current_job_status"] = str(snapshot.get("current_job_status", "") or "")
@@ -393,6 +398,7 @@ class JobOrchestratorInfoCenterRegistrar:
             services=[self._build_service_payload(healthy=True)],
             service_worker_capacity=1,
             service_worker_used=1,
+            accept_service_deploy=False,
             python_version="py3",
             capability=detect_local_node_capability(),
         )
@@ -422,6 +428,7 @@ class JobOrchestratorInfoCenterRegistrar:
             services=[self._build_service_payload(healthy=True)],
             service_worker_capacity=1,
             service_worker_used=1,
+            accept_service_deploy=False,
             python_version="py3",
             capability=detect_local_node_capability(),
         )

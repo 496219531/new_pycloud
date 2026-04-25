@@ -108,6 +108,7 @@ def _summarize_discovered_nodes(nodes: Sequence["InfoCenterNode"], *, limit: int
         rows.append(
             f"{node.node_id}(healthy={'yes' if node.healthy else 'no'},"
             f"schedulable={'yes' if node.schedulable else 'no'},"
+            f"accept_deploy={'yes' if getattr(node, 'accept_service_deploy', True) else 'no'},"
             f"drain={'yes' if node.drain else 'no'},"
             f"svc_avail={int(node.service_worker_available)},"
             f"py={node.python_version or '-'})"

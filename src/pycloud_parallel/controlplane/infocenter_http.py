@@ -46,6 +46,19 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     return False
 
 
+def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 def _split_host_port(bind: str) -> Tuple[str, int]:
     if ":" not in bind:
         raise ValueError("bind must be host:port")
@@ -253,6 +266,7 @@ def _serialize_node(state) -> Dict[str, object]:
         "task_pool_worker_capacity": int(state.task_pool_worker_capacity),
         "task_pool_worker_used": int(state.task_pool_worker_used),
         "task_pool_worker_available": int(state.task_pool_worker_available()),
+        "accept_service_deploy": bool(getattr(state, "accept_service_deploy", True)),
         "task_pool_count": int(len(active_task_pools)),
         "task_pool_total_count": int(len(task_pools)),
         "service_count": int(len(services)),
@@ -549,6 +563,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(node.control_addr)}</td>"
             f"<td>{'yes' if node.healthy else 'no'}</td>"
             f"<td>{'yes' if node.schedulable else 'no'}</td>"
+            f"<td>{'yes' if getattr(node, 'accept_service_deploy', True) else 'no'}</td>"
             f"<td>{'yes' if node.drain else 'no'}</td>"
             f"<td>{html.escape(str((node.metadata or {}).get('pycloud_version', '-') or '-'))}</td>"
             f"<td>{html.escape(node.python_version or '-')}</td>"
@@ -719,7 +734,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "Timing columns keep only average total latency plus child decode/invoke/encode averages. "
         "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>"
+        "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>pycloud</th>"
         "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>pool cap</th><th>pool used</th><th>pool avail</th><th>pool inflight</th><th>pool count</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
         "</tr></thead><tbody>"
         f"{node_body}"
@@ -823,6 +838,10 @@ class InfoCenterHttpServer:
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                         task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
                         task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
+                        accept_service_deploy=_coerce_bool(
+                            payload.get("accept_service_deploy", (payload.get("metadata") or {}).get("accept_service_deploy")),
+                            default=True,
+                        ),
                         capability=_parse_node_capability(payload.get("capability")),
                     )
                     self._send_json(200, {"ok": True, "heartbeat_interval_sec": state.heartbeat_interval_sec, "node": _serialize_node(node)})
@@ -853,6 +872,10 @@ class InfoCenterHttpServer:
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                         task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
                         task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
+                        accept_service_deploy=_coerce_bool(
+                            payload.get("accept_service_deploy", (payload.get("metadata") or {}).get("accept_service_deploy")),
+                            default=True,
+                        ),
                         capability=_parse_node_capability(payload.get("capability")),
                     )
                     if node is None:

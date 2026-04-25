@@ -19,6 +19,19 @@ from pycloud_parallel.execution.scheduler import (
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 
+def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 @dataclass(frozen=True)
 class InfoCenterNodeService:
     service_name: str
@@ -64,6 +77,7 @@ class InfoCenterNode:
     task_pool_worker_capacity: int = 0
     task_pool_worker_used: int = 0
     task_pool_worker_available: int = 0
+    accept_service_deploy: bool = True
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
@@ -215,6 +229,7 @@ class InfoCenterClient:
         service_worker_used: int = 0,
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
+        accept_service_deploy: bool = True,
         python_version: str = "",
         capability: Optional[NodeCapability] = None,
     ) -> Dict[str, object]:
@@ -258,6 +273,7 @@ class InfoCenterClient:
                 "service_worker_used": max(0, int(service_worker_used or 0)),
                 "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
                 "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
+                "accept_service_deploy": bool(accept_service_deploy),
                 "capability": (capability or NodeCapability()).to_dict(),
             },
         )
@@ -277,6 +293,7 @@ class InfoCenterClient:
         service_worker_used: int = 0,
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
+        accept_service_deploy: bool = True,
         python_version: str = "",
         capability: Optional[NodeCapability] = None,
     ) -> Dict[str, object]:
@@ -317,6 +334,7 @@ class InfoCenterClient:
                 "service_worker_used": max(0, int(service_worker_used or 0)),
                 "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
                 "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
+                "accept_service_deploy": bool(accept_service_deploy),
                 "capability": (capability or NodeCapability()).to_dict(),
             },
         )
@@ -393,6 +411,7 @@ class InfoCenterClient:
                     task_pool_worker_capacity=int(item.get("task_pool_worker_capacity", 0) or 0),
                     task_pool_worker_used=int(item.get("task_pool_worker_used", 0) or 0),
                     task_pool_worker_available=int(item.get("task_pool_worker_available", 0) or 0),
+                    accept_service_deploy=_coerce_bool(item.get("accept_service_deploy"), default=True),
                     schedulable=bool(item.get("schedulable", True)),
                     drain=bool(item.get("drain", False)),
                     reason=str(item.get("reason", "") or ""),

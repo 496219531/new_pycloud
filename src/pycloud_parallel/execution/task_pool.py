@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import os
+import sys
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -75,6 +76,29 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 logger = logging.getLogger(__name__)
 _TASK_POOL_CLOSE_RETRY_DELAYS_SEC = (0.0, 0.5, 1.0, 2.0)
 _DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR = 1.5
+
+
+def _emit_taskpool_notice(message: str) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    print(f"[TaskPool] {text}", file=sys.stderr, flush=True)
+
+
+def _format_pool_route_summary(routes: Sequence[Dict[str, object]]) -> str:
+    rows = []
+    for item in routes:
+        node_instance_id = str(item.get("node_instance_id", "") or "")
+        node_id = str(item.get("node_id", "") or "")
+        control_addr = str(item.get("control_addr", "") or "")
+        pool_id = str(item.get("pool_id", "") or "")
+        pool_name = str(item.get("pool_name", "") or "")
+        node_label = node_id or node_instance_id or "-"
+        rows.append(
+            f"{node_label}/{node_instance_id or '-'}@{control_addr or '-'}"
+            f"(pool_id={pool_id or '-'}, pool_name={pool_name or '-'})"
+        )
+    return "[" + ", ".join(rows) + "]"
 
 
 class _IndexedPayloadBuffer:
@@ -267,6 +291,27 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if self._backend is not None and hasattr(self._backend, "node_instance_ids"):
             return list(getattr(self._backend, "node_instance_ids"))
         return list(self._pools.keys())
+
+    def route_summary(self) -> List[Dict[str, object]]:
+        if self._backend is not None and hasattr(self._backend, "route_summary"):
+            return list(getattr(self._backend, "route_summary")())
+        routes: List[Dict[str, object]] = []
+        for node_key, pool in sorted(self._pools.items()):
+            node = self.nodes.get(node_key)
+            routes.append(
+                {
+                    "node_instance_id": str(node_key or ""),
+                    "node_id": str(node.node_id if node is not None else getattr(pool, "node_id", "") or ""),
+                    "control_addr": str(node.control_addr if node is not None else ""),
+                    "pool_id": str(getattr(pool, "pool_id", "") or ""),
+                    "pool_name": str(getattr(pool, "pool_name", "") or ""),
+                    "owner_client_id": str(getattr(pool, "owner_client_id", "") or ""),
+                }
+            )
+        return routes
+
+    def routes(self) -> List[Dict[str, object]]:
+        return self.route_summary()
 
     @property
     def methods(self) -> List[str]:
@@ -2184,6 +2229,10 @@ def _build_task_pool_from_infocenter(
         effective_policy=effective_policy,
     )
     session._start_keepalive()
+    _emit_taskpool_notice(
+        f"open success pool_name={effective_pool_name} "
+        f"routes={_format_pool_route_summary(session.route_summary())}"
+    )
     return session
 
 

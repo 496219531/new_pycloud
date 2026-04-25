@@ -19,6 +19,19 @@ from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
+def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 class InfoCenterState:
     def __init__(self, *, lease_ttl_sec: int = 90, heartbeat_interval_sec: int = 30) -> None:
         self.lease_ttl_sec = max(1, lease_ttl_sec)
@@ -122,6 +135,7 @@ class InfoCenterState:
         service_worker_used: int = 0,
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
+        accept_service_deploy: bool = True,
         python_version: str = "",
         capability: Optional[NodeCapability] = None,
     ) -> NodeState:
@@ -165,6 +179,7 @@ class InfoCenterState:
             state.service_worker_used = max(0, min(int(service_worker_used or 0), state.service_worker_capacity or int(service_worker_used or 0)))
             state.task_pool_worker_capacity = max(0, int(task_pool_worker_capacity or 0))
             state.task_pool_worker_used = max(0, min(int(task_pool_worker_used or 0), state.task_pool_worker_capacity or int(task_pool_worker_used or 0)))
+            state.accept_service_deploy = bool(accept_service_deploy)
             if capability is not None:
                 state.capability = capability
             if state.metrics.credit == 0:
@@ -319,6 +334,7 @@ class InfoCenterState:
             service_worker_used=int(metadata.get("service_worker_used", "0") or 0),
             task_pool_worker_capacity=int(metadata.get("task_pool_worker_capacity", "0") or 0),
             task_pool_worker_used=int(metadata.get("task_pool_worker_used", "0") or 0),
+            accept_service_deploy=_coerce_bool(metadata.get("accept_service_deploy"), default=True),
             python_version=metadata.get("python_version", ""),
             capability=NodeCapability.from_dict(getattr(request, "capability", None) and {
                 "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
@@ -347,6 +363,7 @@ class InfoCenterState:
         service_worker_used: int = 0,
         task_pool_worker_capacity: int = 0,
         task_pool_worker_used: int = 0,
+        accept_service_deploy: Optional[bool] = None,
         python_version: str = "",
         capability: Optional[NodeCapability] = None,
     ) -> Optional[NodeState]:
@@ -390,6 +407,8 @@ class InfoCenterState:
                     state.task_pool_worker_capacity or int(task_pool_worker_used or 0),
                 ),
             )
+            if accept_service_deploy is not None:
+                state.accept_service_deploy = bool(accept_service_deploy)
             if capability is not None:
                 state.capability = capability
             return state
@@ -482,6 +501,7 @@ class InfoCenterState:
                 service_worker_used=state.service_worker_used,
                 task_pool_worker_capacity=state.task_pool_worker_capacity,
                 task_pool_worker_used=state.task_pool_worker_used,
+                accept_service_deploy=state.accept_service_deploy,
                 schedulable=state.schedulable,
                 drain=state.drain,
                 reason=state.reason,
@@ -591,6 +611,7 @@ class InfoCenterState:
                         service_worker_used=state.service_worker_used,
                         task_pool_worker_capacity=state.task_pool_worker_capacity,
                         task_pool_worker_used=state.task_pool_worker_used,
+                        accept_service_deploy=state.accept_service_deploy,
                         schedulable=state.schedulable,
                         drain=state.drain,
                         reason=state.reason,
@@ -638,6 +659,7 @@ class InfoCenterState:
                 service_worker_used=state.service_worker_used,
                 task_pool_worker_capacity=state.task_pool_worker_capacity,
                 task_pool_worker_used=state.task_pool_worker_used,
+                accept_service_deploy=state.accept_service_deploy,
                 schedulable=state.schedulable,
                 drain=state.drain,
                 reason=state.reason,

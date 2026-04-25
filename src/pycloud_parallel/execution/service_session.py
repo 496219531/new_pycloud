@@ -55,6 +55,7 @@ from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
     CONTROLPLANE_UNAVAILABLE,
     ROUTE_UNAVAILABLE,
+    STAGING_FAILED,
     before_probe,
     candidate_allowed,
     classify_service_error,
@@ -110,6 +111,39 @@ def _node_control_client(*args, **kwargs):
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
     return NodeControlClient(*args, **kwargs)
+
+
+def _route_attr(route: object, name: str, default: object = "") -> object:
+    if isinstance(route, dict):
+        return route.get(name, default)
+    return getattr(route, name, default)
+
+
+def _route_summary_item(route: object) -> Dict[str, object]:
+    return {
+        "node_instance_id": str(_route_attr(route, "node_instance_id", "") or ""),
+        "node_id": str(_route_attr(route, "node_id", "") or ""),
+        "control_addr": str(_route_attr(route, "control_addr", "") or ""),
+        "service_name": str(_route_attr(route, "service_name", "") or ""),
+        "service_id": str(_route_attr(route, "service_id", "") or ""),
+        "http_base_url": str(_route_attr(route, "http_base_url", "") or ""),
+    }
+
+
+def _format_route_summary(routes: Sequence[Dict[str, object]]) -> str:
+    rows = []
+    for item in routes:
+        node_instance_id = str(item.get("node_instance_id", "") or "")
+        node_id = str(item.get("node_id", "") or "")
+        control_addr = str(item.get("control_addr", "") or "")
+        service_id = str(item.get("service_id", "") or "")
+        http_base_url = str(item.get("http_base_url", "") or "")
+        node_label = node_id or node_instance_id or "-"
+        rows.append(
+            f"{node_label}/{node_instance_id or '-'}@{control_addr or '-'}"
+            f"(service_id={service_id or '-'}, http={http_base_url or '-'})"
+        )
+    return "[" + ", ".join(rows) + "]"
 
 
 @dataclass
@@ -643,6 +677,7 @@ class _ConnectedService:
             self._client_mod = gateway_client_mod.client_mod
         self._discovered_methods: Optional[List[str]] = None
         self._last_status: Optional[Dict[str, object]] = None
+        self._route_notice_emitted = False
         self.effective_policy: Optional[EffectivePolicy] = None
         self.serialization_mode = str(serialization_mode or "").strip()
         if not self.service_name:
@@ -661,6 +696,29 @@ class _ConnectedService:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def route_summary(self) -> List[Dict[str, object]]:
+        if self.transport == "discovery":
+            routes = self._discoverable_routes(force_refresh=False)
+        else:
+            status = self.status()
+            routes = list(status.get("routes", []) or []) if isinstance(status, dict) else []
+        return [_route_summary_item(route) for route in routes]
+
+    def routes(self) -> List[Dict[str, object]]:
+        return self.route_summary()
+
+    def _emit_route_notice_once(self, routes: Sequence[object]) -> None:
+        if self._route_notice_emitted:
+            return
+        summary = [_route_summary_item(route) for route in routes]
+        if not summary:
+            return
+        self._route_notice_emitted = True
+        _emit_owner_notice(
+            f"connected routes service_name={self.service_name} "
+            f"transport={self.transport} routes={_format_route_summary(summary)}"
+        )
 
     def _validate_service_ready(self) -> Dict[str, object]:
         def _probe() -> Dict[str, object]:
@@ -693,6 +751,7 @@ class _ConnectedService:
                     f"service_name={self.service_name!r} via {self.transport}"
                 )
             self._refresh_effective_policy_from_routes(status.get("routes", []) or [])
+            self._emit_route_notice_once(status.get("routes", []) or [])
             return status
 
         return _retry_ready_state(
@@ -876,6 +935,7 @@ class _ConnectedService:
         if isinstance(status, dict):
             self._last_status = status
             self._refresh_effective_policy_from_routes(status.get("routes", []) or [])
+            self._emit_route_notice_once(status.get("routes", []) or [])
         return status
 
     def fetch_result_data(self, response_or_data: object, *, target_path: str = ""):
@@ -917,9 +977,11 @@ class _ConnectedService:
         routes = [route for route in routes if str(getattr(route, "service_name", "") or "").strip() == self.service_name]
         if routes:
             self._refresh_effective_policy_from_routes(routes)
+            self._emit_route_notice_once(routes)
             return routes
         routes = self._discover_routes_from_nodes()
         self._refresh_effective_policy_from_routes(routes)
+        self._emit_route_notice_once(routes)
         return routes
 
     def _discover_routes_from_nodes(self) -> List[InfoCenterServiceRoute]:
@@ -1046,10 +1108,18 @@ class _ConnectedService:
             def _has_alternative() -> bool:
                 if route_cache is not None:
                     with contextlib.suppress(Exception):
+                        cached = [
+                            item
+                            for item in route_cache.get_routes(self.service_name)
+                            if str(getattr(item, "service_id", "") or "") not in tried
+                        ]
+                        if cached:
+                            return True
+                    with contextlib.suppress(Exception):
                         return bool(
                             [
                                 item
-                                for item in route_cache.get_routes(self.service_name)
+                                for item in route_cache.refresh(self.service_name, force=True)
                                 if str(getattr(item, "service_id", "") or "") not in tried
                             ]
                         )
@@ -1449,6 +1519,32 @@ class Service(ServiceExecutionSession):
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
         return self.sessions
 
+    def route_summary(self) -> List[Dict[str, object]]:
+        routes: List[Dict[str, object]] = []
+        for node_key, session in sorted(self.sessions.items()):
+            node = self.nodes.get(node_key)
+            control_addr = ""
+            node_id = ""
+            if node is not None:
+                control_addr = str(node.control_addr or "")
+                node_id = str(node.node_id or "")
+            elif node_key in self._clients:
+                control_addr = str(self._clients[node_key].target or "")
+            routes.append(
+                {
+                    "node_instance_id": str(node_key or ""),
+                    "node_id": node_id,
+                    "control_addr": control_addr,
+                    "service_name": str(self.service_name or ""),
+                    "service_id": str(session.service_id or ""),
+                    "http_base_url": str(session.http_base_url or ""),
+                }
+            )
+        return routes
+
+    def routes(self) -> List[Dict[str, object]]:
+        return self.route_summary()
+
     @classmethod
     def deploy(
         cls,
@@ -1505,6 +1601,7 @@ class Service(ServiceExecutionSession):
                     target,
                     timeout_sec=timeout_sec,
                     service_token=service_token,
+                    shared_route_cache=True,
                 ),
                 service_name=service_name,
                 transport=normalized_transport,
@@ -1758,6 +1855,23 @@ class Service(ServiceExecutionSession):
                 )
 
             discovered_instance_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
+
+            def _reject_non_deploy_nodes(nodes: Sequence[InfoCenterNode], *, scope: str) -> None:
+                rejected = [
+                    node
+                    for node in nodes
+                    if not bool(getattr(node, "accept_service_deploy", True))
+                    or not str(getattr(node, "control_addr", "") or "").strip()
+                ]
+                if rejected:
+                    details = ", ".join(
+                        f"{node.node_id}/{_node_instance_key_from_node(node)}"
+                        f"(accept_deploy={'yes' if getattr(node, 'accept_service_deploy', True) else 'no'},"
+                        f" control_addr={str(getattr(node, 'control_addr', '') or '') or '-'})"
+                        for node in rejected
+                    )
+                    raise RuntimeError(f"{scope} contains nodes that do not accept service deployment: {details}")
+
             if requested_node_instance_ids:
                 missing_node_instance_ids = [
                     node_id for node_id in requested_node_instance_ids if node_id not in discovered_instance_map
@@ -1767,6 +1881,7 @@ class Service(ServiceExecutionSession):
                         f"requested node_instance_ids not found in current discovery scope: {missing_node_instance_ids}"
                     )
                 selected_nodes = [discovered_instance_map[node_id] for node_id in requested_node_instance_ids]
+                _reject_non_deploy_nodes(selected_nodes, scope="requested_node_instance_ids")
                 if normalized_runtime:
                     incompatible = [
                         node
@@ -1792,6 +1907,7 @@ class Service(ServiceExecutionSession):
                         f"requested node_ids not found in current discovery scope: {missing_node_ids}"
                     )
                 selected_nodes = [discovered_node_map[node_id] for node_id in requested_node_ids]
+                _reject_non_deploy_nodes(selected_nodes, scope="requested_node_ids")
                 if normalized_runtime:
                     incompatible = [
                         node
@@ -1813,6 +1929,8 @@ class Service(ServiceExecutionSession):
                 node
                 for node in discovered_nodes
                 if node.healthy and node.schedulable and not node.drain
+                and bool(getattr(node, "accept_service_deploy", True))
+                and str(getattr(node, "control_addr", "") or "").strip()
             ]
             if normalized_runtime:
                 candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=normalized_runtime)
@@ -1986,7 +2104,8 @@ class Service(ServiceExecutionSession):
                             )
                         else:
                             _emit_owner_notice(
-                                f"reuse existing service service_name={effective_service_name} nodes={list(group.sessions.keys())}"
+                                f"reuse existing service service_name={effective_service_name} "
+                                f"routes={_format_route_summary(group.route_summary())}"
                             )
                             return group
 
@@ -2088,15 +2207,17 @@ class Service(ServiceExecutionSession):
             )
             group._persist_session_cache()
             group._start_keepalive()
-            deployed_nodes = list(sessions.keys())
             if failures:
                 _emit_owner_notice(
                     "deploy success with partial failures "
-                    f"service_name={effective_service_name} nodes={deployed_nodes} failures={failures}"
+                    f"service_name={effective_service_name} "
+                    f"routes={_format_route_summary(group.route_summary())} "
+                    f"failures={failures}"
                 )
             else:
                 _emit_owner_notice(
-                    f"deploy success service_name={effective_service_name} nodes={deployed_nodes}"
+                    f"deploy success service_name={effective_service_name} "
+                    f"routes={_format_route_summary(group.route_summary())}"
                 )
             return group
         except Exception:

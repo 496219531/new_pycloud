@@ -104,7 +104,7 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert "svc-reg-sync" in raw
             assert ">2</td><td>2</td>" in raw
             assert "controlplane_version=" in raw
-            assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>drain</th><th>pycloud</th>" in raw
+            assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>pycloud</th>" in raw
             assert "avg_total_ms" in raw
             assert "avg_child_decode_ms" in raw
             assert "avg_child_invoke_ms" in raw
@@ -319,6 +319,34 @@ def test_ops_page_marks_lost_service_instances(tmp_path):
     finally:
         registrar.close()
         node_state.close()
+        info_server.stop()
+
+
+def test_infocenter_tracks_nodes_that_do_not_accept_service_deploy():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as infocenter:
+            infocenter.register_node(
+                node_id="job-orchestrator-01",
+                node_instance_id="job-orchestrator-01-inst",
+                control_addr="",
+                capacity=1,
+                queue_capacity=4000,
+                tags=["job"],
+                metadata={"component": "job-orchestrator", "accept_service_deploy": "false"},
+                accept_service_deploy=False,
+            )
+
+            nodes = infocenter.list_nodes(healthy_only=True, limit=20)
+
+        assert len(nodes) == 1
+        assert nodes[0].node_id == "job-orchestrator-01"
+        assert nodes[0].accept_service_deploy is False
+    finally:
         info_server.stop()
 
 

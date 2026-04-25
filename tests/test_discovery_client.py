@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import time
 from concurrent import futures
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Tuple
@@ -369,6 +370,48 @@ class TestDiscoveryConnectedService:
             assert observations[-1]["failed_route_count"] == 2
             assert observations[-1]["last_failed_route_id"] == "svc-id-2"
             assert observations[-1]["selected_route_id"] == "svc-id-3"
+        finally:
+            client.close()
+
+    def test_call_sync_failover_handles_staging_failure(self):
+        routes = [_demo_route_variant(i) for i in range(1, 3)]
+        failures = []
+        successes = []
+
+        def select_route(_service_name, *, exclude_service_ids=None, strategy="predicted_busy", **_kwargs):
+            del strategy
+            excluded = set(exclude_service_ids or ())
+            for route in routes:
+                if route.service_id not in excluded:
+                    return route
+            raise RuntimeError("no available route")
+
+        def prepare_payload(route, payload):
+            if route.service_id == "svc-id-1":
+                raise RuntimeError("staging connection refused")
+            return payload
+
+        def fake_call(route, *, method, payload, timeout_sec, service_token, **_kwargs):
+            del method, payload, timeout_sec, service_token
+            return {"ok": True, "data": {"route": route.service_id}}
+
+        client = _connect_discovery_service(timeout_sec=8.0, validate_on_init=False)
+        try:
+            with (
+                patch.object(type(client), "_ensure_effective_policy_loaded", return_value=None),
+                patch.object(type(client), "_prepare_discovery_route_payload", side_effect=prepare_payload),
+                patch.object(client._route_cache, "select_route", side_effect=select_route),
+                patch.object(client._route_cache, "get_routes", return_value=routes),
+                patch.object(client._route_cache, "refresh", return_value=routes),
+                patch.object(client._route_cache, "mark_failure", side_effect=lambda route, error: failures.append((route.service_id, error))),
+                patch.object(client._route_cache, "mark_success", side_effect=lambda route: successes.append(route.service_id)),
+                patch.object(client._client_mod, "_call_route_http", side_effect=fake_call),
+            ):
+                result = client.call_sync("square", x=7)
+            assert result == {"route": "svc-id-2"}
+            assert [item[0] for item in failures] == ["svc-id-1"]
+            assert "staging connection refused" in failures[0][1]
+            assert successes == ["svc-id-2"]
         finally:
             client.close()
 
@@ -869,6 +912,160 @@ def test_discovery_route_cache_uses_local_inflight_before_infocenter_refresh():
         assert cache.select_route("svc-demo").service_id == "svc-lower-snapshot"
     finally:
         cache.stop()
+
+
+def test_discovery_route_cache_round_robins_equal_predicted_routes():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    try:
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[
+                _demo_route_variant(1),
+                _demo_route_variant(2),
+            ],
+        )
+
+        first = cache.select_route("svc-demo")
+        cache.mark_success(first)
+        second = cache.select_route("svc-demo")
+        cache.mark_success(second)
+        third = cache.select_route("svc-demo")
+
+        assert [first.service_id, second.service_id, third.service_id] == ["svc-id-1", "svc-id-2", "svc-id-1"]
+        assert cache.snapshot_info("svc-demo")["route_cache_index"] == 3
+    finally:
+        cache.stop()
+
+
+def test_discovery_route_cache_concurrent_selects_are_reserved_atomically():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    try:
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[
+                _demo_route_variant(1),
+                _demo_route_variant(2),
+            ],
+        )
+
+        def _select_once():
+            return cache.select_route("svc-demo").service_id
+
+        with futures.ThreadPoolExecutor(max_workers=11) as executor:
+            selected = list(executor.map(lambda _idx: _select_once(), range(80)))
+
+        counts = Counter(selected)
+        assert counts["svc-id-1"] == 40
+        assert counts["svc-id-2"] == 40
+        assert cache.snapshot_info("svc-demo")["route_cache_index"] == 80
+    finally:
+        cache.stop()
+
+
+def test_discovery_route_cache_concurrent_selects_same_host_same_node_id():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    try:
+        route_1 = replace(
+            _demo_route_variant(1),
+            node_id="same-host-node",
+            node_instance_id="same-host-node-inst-a",
+            control_addr="10.168.70.123:50061",
+            http_base_url="http://10.168.70.123:18081/svc/svc-id-1",
+        )
+        route_2 = replace(
+            _demo_route_variant(2),
+            node_id="same-host-node",
+            node_instance_id="same-host-node-inst-b",
+            control_addr="10.168.70.123:50062",
+            http_base_url="http://10.168.70.123:18082/svc/svc-id-2",
+        )
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[route_1, route_2],
+        )
+
+        def _select_once():
+            return cache.select_route("svc-demo").service_id
+
+        with futures.ThreadPoolExecutor(max_workers=11) as executor:
+            selected = list(executor.map(lambda _idx: _select_once(), range(80)))
+
+        counts = Counter(selected)
+        assert counts["svc-id-1"] == 40
+        assert counts["svc-id-2"] == 40
+    finally:
+        cache.stop()
+
+
+def test_discovery_route_cache_concurrent_selects_same_host_distinct_node_ids():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    try:
+        route_1 = replace(
+            _demo_route_variant(1),
+            node_id="same-host-node-a",
+            node_instance_id="same-host-node-a-inst",
+            control_addr="10.168.70.123:50061",
+            http_base_url="http://10.168.70.123:18081/svc/svc-id-1",
+        )
+        route_2 = replace(
+            _demo_route_variant(2),
+            node_id="same-host-node-b",
+            node_instance_id="same-host-node-b-inst",
+            control_addr="10.168.70.123:50062",
+            http_base_url="http://10.168.70.123:18082/svc/svc-id-2",
+        )
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[route_1, route_2],
+        )
+
+        def _select_once():
+            return cache.select_route("svc-demo").service_id
+
+        with futures.ThreadPoolExecutor(max_workers=11) as executor:
+            selected = list(executor.map(lambda _idx: _select_once(), range(80)))
+
+        counts = Counter(selected)
+        assert counts["svc-id-1"] == 40
+        assert counts["svc-id-2"] == 40
+    finally:
+        cache.stop()
+
+
+def test_discovery_service_client_can_share_route_cache_after_close():
+    from pycloud_parallel.controlplane import discovery_client as discovery_client_mod
+
+    discovery_client_mod._stop_shared_route_caches()
+    first_client = DiscoveryServiceClient(
+        "127.0.0.1:50051",
+        timeout_sec=5.0,
+        shared_route_cache=True,
+    )
+    try:
+        first_client._route_cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[_demo_route_variant(1), _demo_route_variant(2)],
+        )
+        first = first_client._route_cache.select_route("svc-demo")  # noqa: SLF001
+        first_client._route_cache.mark_success(first)  # noqa: SLF001
+        assert first_client.get_status(service_name="svc-demo")["route_cache_index"] == 1
+    finally:
+        first_client.close()
+
+    second_client = DiscoveryServiceClient(
+        "127.0.0.1:50051",
+        timeout_sec=5.0,
+        shared_route_cache=True,
+    )
+    try:
+        second = second_client._route_cache.select_route("svc-demo")  # noqa: SLF001
+        second_client._route_cache.mark_success(second)  # noqa: SLF001
+
+        assert second.service_id == "svc-id-2"
+        assert second_client.get_status(service_name="svc-demo")["route_cache_index"] == 2
+    finally:
+        second_client.close()
+        discovery_client_mod._stop_shared_route_caches()
 
 
 def test_discovery_route_cache_route_failure_opens_breaker_immediately():
