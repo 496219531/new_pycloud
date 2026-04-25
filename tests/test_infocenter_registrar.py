@@ -169,6 +169,55 @@ def test_ops_page_merges_duplicate_services_with_same_endpoint():
     assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
 
 
+def test_infocenter_replaces_existing_node_with_same_control_addr():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-old-instance",
+        node_id="node-old",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        version="old",
+        services={
+            "svc-old": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-old",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            ),
+        },
+    )
+
+    info_state.register_node_record(
+        node_instance_id="node-new-instance",
+        node_id="node-new",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        version="new",
+        services={
+            "svc-new": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-new",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                http_base_url="http://127.0.0.1:18081/svc/svc-new",
+            ),
+        },
+    )
+
+    nodes = info_state.list_nodes(healthy_only=True, tags=["compute"], limit=20)
+    routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=20)
+
+    assert [node.node_instance_id for node in nodes] == ["node-new-instance"]
+    assert [route["service_id"] for route in routes] == ["svc-new"]
+
+
 def test_infocenter_http_version_prefers_runtime_package_version(monkeypatch):
     import pycloud_parallel
     from pycloud_parallel.controlplane import infocenter_http

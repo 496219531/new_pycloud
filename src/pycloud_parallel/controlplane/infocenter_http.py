@@ -461,6 +461,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     job_queue_rows: List[str] = []
     recent_job_rows: List[tuple] = []
     waiting_job_rows: List[tuple] = []
+    current_job_timing: Dict[str, object] = {}
+    queue_timing: Dict[str, object] = {}
     if job_queue is not None:
         summary = dict(job_queue.summary() or {})
         current_job_timing = dict(summary.get("current_job_timing") or {})

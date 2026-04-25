@@ -45,7 +45,7 @@ class InfoCenterState:
         for ref_id in expired:
             self._data_refs.pop(ref_id, None)
 
-    def _prune_replaced_stale_nodes_locked(
+    def _prune_replaced_nodes_locked(
         self,
         *,
         node_instance_id: str,
@@ -53,21 +53,19 @@ class InfoCenterState:
         control_addr: str,
         now: Optional[datetime] = None,
     ) -> None:
-        current_time = now or utc_now()
+        del now
+        del node_id
         normalized_instance_id = str(node_instance_id or "").strip()
-        normalized_node_id = str(node_id or "").strip()
         normalized_control_addr = str(control_addr or "").strip()
-        if not normalized_instance_id or not normalized_node_id or not normalized_control_addr:
+        if not normalized_instance_id or not normalized_control_addr:
             return
-        stale_keys = [
+        replaced_keys = [
             key
             for key, state in self._nodes.items()
             if key != normalized_instance_id
-            and str(state.node_id or "").strip() == normalized_node_id
             and str(state.control_addr or "").strip() == normalized_control_addr
-            and self._node_is_stale_locked(state, now=current_time)
         ]
-        for key in stale_keys:
+        for key in replaced_keys:
             self._nodes.pop(key, None)
 
     def _effective_service_state_locked(
@@ -132,7 +130,7 @@ class InfoCenterState:
         if not normalized_instance_id:
             raise ValueError("node_instance_id is required")
         with self._lock:
-            self._prune_replaced_stale_nodes_locked(
+            self._prune_replaced_nodes_locked(
                 node_instance_id=normalized_instance_id,
                 node_id=node_id,
                 control_addr=control_addr,
