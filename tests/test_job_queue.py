@@ -174,6 +174,29 @@ def test_reorder_waiting_job_updates_waiting_order() -> None:
     assert [item["job_id"] for item in summary["waiting_jobs"]] == ["job-3", "job-1", "job-2"]
 
 
+def test_job_queue_summary_includes_timing_aggregate() -> None:
+    queue = JobQueueManager()
+    first = queue.submit_job({"job_id": "job-timing-1", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 1}]})
+    second = queue.submit_job({"job_id": "job-timing-2", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 2}]})
+    first.status = "SUCCEEDED"
+    first.finished_at = datetime.now(timezone.utc)
+    first.timing.update({"queue_wait_ms": 100.0, "running_tasks_ms": 300.0, "total_ms": 500.0, "pool_action": "reuse", "pool_reuse_count": 1})
+    second.status = "FAILED"
+    second.finished_at = datetime.now(timezone.utc)
+    second.timing.update({"queue_wait_ms": 200.0, "running_tasks_ms": 500.0, "total_ms": 900.0, "pool_action": "rebuild", "executor_rebuild_count": 1})
+
+    summary = queue.summary()
+
+    assert "timing" in summary
+    assert summary["timing"]["job_count"] == 2
+    assert summary["timing"]["avg_queue_wait_ms"] == 150.0
+    assert summary["timing"]["avg_running_tasks_ms"] == 400.0
+    assert summary["timing"]["max_total_ms"] == 900.0
+    assert summary["timing"]["pool_reuse_count"] == 1
+    assert summary["timing"]["pool_rebuild_count"] == 1
+    assert summary["recent_jobs"][0]["timing"]
+
+
 def test_job_orchestrator_reorder_job_requires_admin_token() -> None:
     server = JobOrchestratorServer(
         bind="127.0.0.1:0",
@@ -1799,7 +1822,7 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
     assert resp["job"]["job_id"] == "job-1"
     assert captured["service_name"] == "job-orchestrator"
     assert captured["method"] == "get_job_status"
-    assert captured["payload"] == {"job_id": "job-1"}
+    assert captured["payload"] == {"job_id": "job-1", "include_details": False}
     assert captured["service_token"] == "token-discovery"
     assert captured["serialization_mode"] == "structured_v1"
     assert captured["route"].http_base_url == "http://127.0.0.1:18080/svc/job-orch-1"
@@ -2199,6 +2222,73 @@ def test_run_job_non_hook_uses_larger_default_worker_and_all_nodes(monkeypatch) 
     assert mocked.call_args.kwargs["node_count"] == 3
 
 
+def test_run_job_non_hook_renders_results_while_polling(monkeypatch) -> None:
+    from pycloud_parallel.controlplane import job_queue as job_queue_module
+    from pycloud_parallel.controlplane.serialization import dict_to_struct
+    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+    queue = JobQueueManager()
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    state = queue.submit_job(  # noqa: SLF001
+        {
+            "job_id": "job-render-streaming",
+            "client_id": "client-a",
+            "code_version": "sha256:test",
+            "entry_module": "task_demo",
+            "entry_callable": "run",
+            "subtasks": [{"value": 1}, {"value": 2}],
+        }
+    )
+    state.status = "RUNNING"
+    rendered = {"count": 0}
+
+    class _FakePool:
+        job_id = "job-render-streaming"
+
+        def submit_payloads(self, subtasks, **kwargs):
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[
+                    pb2.TaskAccepted(task_id=f"t-{idx}", status=pb2.TASK_STATUS_QUEUED)
+                    for idx, _ in enumerate(subtasks, start=1)
+                ],
+                rejected=[],
+            )
+
+        def iter_results(self, **kwargs):
+            yield pb2.TaskResult(task_id="t-1", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1}))
+            assert rendered["count"] == 1
+            yield pb2.TaskResult(task_id="t-2", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 2}))
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            return None
+
+    def _wrapped_task_result_to_dict(*args, **kwargs):
+        rendered["count"] += 1
+        return original_task_result_to_dict(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.job_queue.InfoCenterClient.select_task_nodes",
+        lambda self, **kwargs: [SimpleNamespace(node_id="n1")],
+    )
+    fake_pool = _FakePool()
+    original_task_result_to_dict = job_queue_module._task_result_to_dict  # noqa: SLF001
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool), patch(
+        "pycloud_parallel.controlplane.job_queue._task_result_to_dict",
+        side_effect=_wrapped_task_result_to_dict,
+    ):
+        queue._run_job("job-render-streaming")  # noqa: SLF001
+
+    job = queue.get_job("job-render-streaming")
+    assert job is not None
+    assert job.status == "SUCCEEDED"
+    assert len(job.results) == 2
+    assert rendered["count"] == 2
+
+
 def test_job_queue_client_wait_for_terminal_polls_until_done() -> None:
     from pycloud_parallel import JobQueue
 
@@ -2207,15 +2297,20 @@ def test_job_queue_client_wait_for_terminal_polls_until_done() -> None:
         {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}},
         {"ok": True, "job": {"job_id": "job-1", "status": "RUNNING"}},
         {"ok": True, "job": {"job_id": "job-1", "status": "SUCCEEDED"}},
+        {"ok": True, "job": {"job_id": "job-1", "status": "SUCCEEDED", "final_result": {"count": 1}}},
     ]
 
-    def _fake_status(job_id):
+    def _fake_status(job_id, *, include_details=False):
         assert job_id == "job-1"
-        return states.pop(0)
+        payload = states.pop(0)
+        if include_details:
+            assert payload["job"]["status"] == "SUCCEEDED"
+        return payload
 
     client.get_job_status = _fake_status  # type: ignore[method-assign]
     result = client.wait_for_terminal("job-1", timeout_sec=2.0, poll_interval_sec=0.01)
     assert result["job"]["status"] == "SUCCEEDED"
+    assert result["job"]["final_result"] == {"count": 1}
 
 
 def test_job_queue_client_decodes_dataframe_final_result_from_job_response() -> None:
@@ -2243,7 +2338,7 @@ def test_job_queue_client_decodes_dataframe_final_result_from_job_response() -> 
 
     client._service_client.call = _fake_call  # type: ignore[method-assign]
     try:
-        resp = client.get_job_status("job-1")
+        resp = client.get_job_status("job-1", include_details=True)
     finally:
         client.close()
 
@@ -2253,3 +2348,24 @@ def test_job_queue_client_decodes_dataframe_final_result_from_job_response() -> 
     assert isinstance(final_result[0], pd.DataFrame)
     assert final_result[0].equals(frame)
     assert isinstance(resp["job"]["results"][0]["result"], pd.DataFrame)
+
+
+def test_job_queue_client_get_job_status_defaults_to_metadata_only() -> None:
+    from pycloud_parallel import JobQueue
+
+    client = JobQueue("127.0.0.1:50051", client_id="client-status")
+    captured = {}
+
+    def _fake_call(*, service_name, method, payload=None, timeout_sec=60.0, service_token=None):
+        del service_name, method, timeout_sec, service_token
+        captured["payload"] = dict(payload or {})
+        return {"ok": True, "job": {"job_id": "job-1", "status": "SUCCEEDED"}}
+
+    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    try:
+        resp = client.get_job_status("job-1")
+    finally:
+        client.close()
+
+    assert resp["job"]["job_id"] == "job-1"
+    assert captured["payload"] == {"job_id": "job-1", "include_details": False}

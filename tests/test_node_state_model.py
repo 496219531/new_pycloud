@@ -15,6 +15,7 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 import pytest
@@ -1313,8 +1314,12 @@ def test_service_session_http_call_and_end(tmp_path):
         assert float(timing.get("last_build_execute_spec_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_child_decode_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_child_invoke_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_invoke_wrapper_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_user_fn_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_child_encode_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_invoke_ms", 0.0) or 0.0) == float(timing.get("last_child_invoke_ms", 0.0) or 0.0)
+        assert float(timing.get("avg_invoke_wrapper_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("avg_user_fn_ms", 0.0) or 0.0) >= 0.0
 
         hb = state.heartbeat_service(
             owner_client_id="owner-a",
@@ -1397,8 +1402,206 @@ def test_task_pool_timing_metrics_recorded(tmp_path):
         assert float(timing.get("avg_queue_wait_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_child_decode_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_child_invoke_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_invoke_wrapper_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("last_user_fn_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_child_encode_ms", 0.0) or 0.0) >= 0.0
         assert float(timing.get("last_invoke_ms", 0.0) or 0.0) == float(timing.get("last_child_invoke_ms", 0.0) or 0.0)
+        assert float(timing.get("avg_invoke_wrapper_ms", 0.0) or 0.0) >= 0.0
+        assert float(timing.get("avg_user_fn_ms", 0.0) or 0.0) >= 0.0
+    finally:
+        state.close()
+
+
+def test_submit_pool_tasks_rejects_when_node_queue_capacity_exceeded(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-queue-full-01",
+        queue_capacity=1,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_queue_full"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        blob = (
+            b"import time\n"
+            b"def run(value=0, sleep_ms=0, **_kwargs):\n"
+            b"    time.sleep(max(0, int(sleep_ms)) / 1000.0)\n"
+            b"    return {'value': int(value)}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-queue-full",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_queue_full_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        with patch(
+            "pycloud_parallel.controlplane.nodecontrol_state.decode_transport_payload_bytes",
+            side_effect=AssertionError("rejected payload should not be decoded"),
+        ) as mocked_decode:
+            accepted, rejected = state.submit_pool_tasks(
+                pool_id=pool.pool_id,
+                pool_token=pool.pool_token,
+                tasks=[
+                    pb2.TaskSubmitItem(task_id="pool-queue-1", payload=dict_to_struct({"value": 1, "sleep_ms": 200})),
+                    pb2.TaskSubmitItem(
+                        task_id="pool-queue-2",
+                        transport_payload=pb2.TransportPayload(
+                            codec="pickle_stable_v1",
+                            version=1,
+                            payload=b"large-rejected-payload",
+                        ),
+                    ),
+                ],
+                job_id="job-pool-queue-full",
+            )
+        assert [item.task_id for item in accepted] == ["pool-queue-1"]
+        assert len(rejected) == 1
+        assert rejected[0].task_id == "pool-queue-2"
+        assert rejected[0].code == pb2.ERROR_CODE_QUEUE_FULL
+        mocked_decode.assert_not_called()
+    finally:
+        state.close()
+
+
+def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-partial-reject-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_partial_reject"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        submitted = []
+
+        class _FakeExecutorHost:
+            def is_alive(self):
+                return True
+
+            def create_task_pool(self, **_kwargs):
+                pass
+
+            def submit_pool_task(self, **kwargs):
+                submitted.append(kwargs)
+
+            def stop_task_pool(self, **_kwargs):
+                pass
+
+            def drain_events(self):
+                return []
+
+            def close(self):
+                pass
+
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-partial-reject",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_partial_reject_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        accepted, rejected = state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            tasks=[
+                pb2.TaskSubmitItem(task_id="pool-good-1", payload=dict_to_struct({"value": 1})),
+                pb2.TaskSubmitItem(
+                    task_id="pool-bad-1",
+                    transport_payload=pb2.TransportPayload(
+                        codec="pickle_stable_v1",
+                        version=1,
+                        payload=b"not-a-valid-pickle-payload",
+                    ),
+                ),
+            ],
+            job_id="job-partial-reject",
+        )
+
+        assert [item.task_id for item in accepted] == ["pool-good-1"]
+        assert len(rejected) == 1
+        assert rejected[0].task_id == "pool-bad-1"
+        assert rejected[0].code == pb2.ERROR_CODE_INTERNAL_ERROR
+        assert [item["task_id"] for item in submitted] == ["pool-good-1"]
+        assert "pool-good-1" in state._pool_tasks  # noqa: SLF001
+        assert "pool-bad-1" not in state._pool_tasks  # noqa: SLF001
+        assert not state._pool_task_reserved_ids  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_pull_pool_results_prunes_completed_task_state(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-prune-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_prune"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-prune",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_prune_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        accepted, rejected = state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            tasks=[pb2.TaskSubmitItem(task_id="pool-prune-1", payload=dict_to_struct({"value": 7}))],
+            job_id="job-pool-prune",
+        )
+        assert len(accepted) == 1
+        assert not rejected
+
+        deadline = time.time() + 10.0
+        results = []
+        while time.time() < deadline and not results:
+            state._drain_executor_events()  # noqa: SLF001
+            assert "pool-prune-1" in state._pool_tasks  # noqa: SLF001
+            results, _cursor = state.pull_pool_results(
+                pool_id=pool.pool_id,
+                pool_token=pool.pool_token,
+                limit=10,
+                wait_ms=0,
+                cursor="",
+            )
+            if not results:
+                time.sleep(0.05)
+
+        assert len(results) == 1
+        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
+        assert "pool-prune-1" not in state._pool_tasks  # noqa: SLF001
     finally:
         state.close()
 

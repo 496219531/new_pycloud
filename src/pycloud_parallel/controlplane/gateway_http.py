@@ -3,6 +3,7 @@ from __future__ import annotations
 """HTTP gateway for service-mode transport requests."""
 
 import errno
+import contextlib
 import ipaddress
 import json
 import threading
@@ -163,48 +164,70 @@ class GatewayHttpApp:
             self.stage_manager.cleanup(request)
             return 400, {"ok": False, "error": str(exc)}
         tried = set()
-        try:
-            route = self.route_cache.select_route(service_name)
-            tried.add(route.service_id)
-            resp = self._invoke_uploaded_route(
-                route,
-                method=method,
-                parsed_upload=parsed_upload,
-                timeout_sec=timeout_sec,
-                service_token=service_token,
-            )
-            self.route_cache.mark_success(route)
-            self.stage_manager.cleanup(request)
-            return 200, resp
-        except GatewayCallError as exc:
-            self.stage_manager.preserve_failure(request, status="call_failed")
-            if not self._is_route_failure(exc):
-                return exc.status_code, exc.data
-            self.route_cache.mark_failure(route, str(exc))
+        attempt_count = 0
+        failed_count = 0
+        last_failed_route_id = ""
+        last_error: Exception | None = None
+
+        def _record_observation(*, selected_route_id: str = "") -> None:
+            recorder = getattr(self.route_cache, "record_call_observation", None)
+            if callable(recorder):
+                recorder(
+                    service_name,
+                    route_attempt_count=attempt_count,
+                    failed_route_count=failed_count,
+                    last_failed_route_id=last_failed_route_id,
+                    selected_route_id=selected_route_id,
+                )
+
+        while True:
             try:
-                self.route_cache.refresh(service_name, force=True)
-                retry_route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+            except Exception as exc:
+                _record_observation()
+                message = str(last_error or exc)
+                self.stage_manager.preserve_failure(request, status="failed")
+                return 502, {"ok": False, "error": f"gateway upload-call failed: {message}"}
+            route_id = str(route.service_id or "")
+            if route_id in tried:
+                self.route_cache.release_route(route)
+                _record_observation()
+                message = str(last_error or f"no untried route for service_name={service_name}")
+                self.stage_manager.preserve_failure(request, status="failed")
+                return 502, {"ok": False, "error": f"gateway upload-call failed: {message}"}
+            tried.add(route_id)
+            attempt_count += 1
+            try:
                 resp = self._invoke_uploaded_route(
-                    retry_route,
+                    route,
                     method=method,
                     parsed_upload=parsed_upload,
                     timeout_sec=timeout_sec,
                     service_token=service_token,
                 )
-                self.route_cache.mark_success(retry_route)
+                self.route_cache.mark_success(route)
+                _record_observation(selected_route_id=route_id)
                 self.stage_manager.cleanup(request)
                 return 200, resp
-            except GatewayCallError as retry_exc:
-                self.stage_manager.preserve_failure(request, status="retry_failed")
-                if self._is_route_failure(retry_exc):
-                    self.route_cache.mark_failure(retry_route, str(retry_exc))
-                return retry_exc.status_code, retry_exc.data
-            except Exception as retry_exc:
-                self.stage_manager.preserve_failure(request, status="retry_failed")
-                return 502, {"ok": False, "error": f"gateway retry failed: {retry_exc}"}
-        except Exception as exc:
-            self.stage_manager.preserve_failure(request, status="failed")
-            return 502, {"ok": False, "error": f"gateway upload-call failed: {exc}"}
+            except GatewayCallError as exc:
+                last_error = exc
+                self.stage_manager.preserve_failure(request, status="call_failed")
+                if not self._is_route_failure(exc):
+                    self.route_cache.release_route(route)
+                    _record_observation()
+                    return exc.status_code, exc.data
+                failed_count += 1
+                last_failed_route_id = route_id
+                self.route_cache.mark_failure(route, str(exc))
+                with contextlib.suppress(Exception):
+                    self.route_cache.refresh(service_name, force=True)
+                continue
+            except Exception as exc:
+                last_error = exc
+                self.route_cache.release_route(route)
+                _record_observation()
+                self.stage_manager.preserve_failure(request, status="failed")
+                return 502, {"ok": False, "error": f"gateway upload-call failed: {exc}"}
 
     def handle_post(self, *, path: str, headers, body: bytes) -> Optional[Tuple[Any, ...]]:
         if self._stopped:
@@ -241,18 +264,12 @@ class GatewayHttpApp:
         service_token = self._extract_token(headers)
 
         tried = set()
-        try:
-            route = self.route_cache.select_route(service_name)
-            tried.add(route.service_id)
-            resp = self._invoke_route(
-                route,
-                method=method,
-                payload=payload,
-                timeout_sec=timeout_sec,
-                service_token=service_token,
-                serialization_mode=serialization_mode,
-            )
-            self.route_cache.mark_success(route)
+        attempt_count = 0
+        failed_count = 0
+        last_failed_route_id = ""
+        last_error: Exception | None = None
+
+        def _route_success_response(resp: Dict[str, object]):
             if (
                 _is_http_transport_content_type(str(headers.get("Content-Type", "") or ""))
                 and isinstance(resp, dict)
@@ -266,43 +283,62 @@ class GatewayHttpApp:
                 )
                 return 200, raw, response_headers.pop("Content-Type", "application/octet-stream"), response_headers
             return 200, resp
-        except GatewayCallError as exc:
-            if not self._is_route_failure(exc):
-                return exc.status_code, exc.data
-            self.route_cache.mark_failure(route, str(exc))
+
+        def _record_observation(*, selected_route_id: str = "") -> None:
+            recorder = getattr(self.route_cache, "record_call_observation", None)
+            if callable(recorder):
+                recorder(
+                    service_name,
+                    route_attempt_count=attempt_count,
+                    failed_route_count=failed_count,
+                    last_failed_route_id=last_failed_route_id,
+                    selected_route_id=selected_route_id,
+                )
+
+        while True:
             try:
-                self.route_cache.refresh(service_name, force=True)
-                retry_route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+            except Exception as exc:
+                _record_observation()
+                message = str(last_error or exc)
+                return 502, {"ok": False, "error": f"gateway call failed: {message}"}
+            route_id = str(route.service_id or "")
+            if route_id in tried:
+                self.route_cache.release_route(route)
+                _record_observation()
+                message = str(last_error or f"no untried route for service_name={service_name}")
+                return 502, {"ok": False, "error": f"gateway call failed: {message}"}
+            tried.add(route_id)
+            attempt_count += 1
+            try:
                 resp = self._invoke_route(
-                    retry_route,
+                    route,
                     method=method,
                     payload=payload,
                     timeout_sec=timeout_sec,
                     service_token=service_token,
                     serialization_mode=serialization_mode,
                 )
-                self.route_cache.mark_success(retry_route)
-                if (
-                    _is_http_transport_content_type(str(headers.get("Content-Type", "") or ""))
-                    and isinstance(resp, dict)
-                    and bool(resp.get("ok", False))
-                    and "data" in resp
-                ):
-                    raw, response_headers = _encode_http_transport_response_body(
-                        resp.get("data"),
-                        context="service_result",
-                        mode=serialization_mode,
-                    )
-                    return 200, raw, response_headers.pop("Content-Type", "application/octet-stream"), response_headers
-                return 200, resp
-            except GatewayCallError as retry_exc:
-                if self._is_route_failure(retry_exc):
-                    self.route_cache.mark_failure(retry_route, str(retry_exc))
-                return retry_exc.status_code, retry_exc.data
-            except Exception as retry_exc:
-                return 502, {"ok": False, "error": f"gateway retry failed: {retry_exc}"}
-        except Exception as exc:
-            return 502, {"ok": False, "error": f"gateway call failed: {exc}"}
+                self.route_cache.mark_success(route)
+                _record_observation(selected_route_id=route_id)
+                return _route_success_response(resp)
+            except GatewayCallError as exc:
+                last_error = exc
+                if not self._is_route_failure(exc):
+                    self.route_cache.release_route(route)
+                    _record_observation()
+                    return exc.status_code, exc.data
+                failed_count += 1
+                last_failed_route_id = route_id
+                self.route_cache.mark_failure(route, str(exc))
+                with contextlib.suppress(Exception):
+                    self.route_cache.refresh(service_name, force=True)
+                continue
+            except Exception as exc:
+                last_error = exc
+                self.route_cache.release_route(route)
+                _record_observation()
+                return 502, {"ok": False, "error": f"gateway call failed: {exc}"}
 
     def handle_get(self, *, path: str, headers) -> Optional[Tuple[int, Dict[str, object]]]:
         if self._stopped:
@@ -381,6 +417,7 @@ class GatewayHttpApp:
             "service_name": service_name,
             "refreshed_at": info["refreshed_at"],
             "route_count": info["route_count"],
+            "last_call": dict(info.get("last_call") or {}),
             "routes": serialized,
         }
 
@@ -567,13 +604,16 @@ class GatewayHttpApp:
         return ""
 
     def _is_route_failure(self, exc: GatewayCallError) -> bool:
-        if exc.status_code == 502:
+        msg = str(exc.data.get("error", "") or "").lower()
+        error_type = str(exc.data.get("error_type", "") or "").lower()
+        if any(text in f"{error_type} {msg}" for text in ("usererror", "failed_user", "user error")):
+            return False
+        if exc.status_code in (502, 503, 504):
             return True
         if exc.status_code == 200:
             return False
         if exc.status_code not in (404, 409, 500):
             return False
-        msg = str(exc.data.get("error", "") or "").lower()
         return any(text in msg for text in ("service not found", "service not running", "service executor stopped", "artifact missing"))
 
     def _validate_route_url(self, http_base_url: str) -> str:

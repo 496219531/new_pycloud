@@ -66,7 +66,13 @@ def test_shared_execution_timing_helpers_produce_consistent_metrics_and_event():
         executor_ms=9.0,
         finalize_ms=1.5,
         total_ms=12.0,
-        subprocess_timings={"decode_ms": 1.0, "invoke_ms": 5.0, "encode_ms": 1.0},
+        subprocess_timings={
+            "decode_ms": 1.0,
+            "invoke_ms": 5.0,
+            "invoke_wrapper_ms": 0.5,
+            "user_fn_ms": 4.5,
+            "encode_ms": 1.0,
+        },
     )
 
     metrics = update_execution_timing_metrics(
@@ -81,6 +87,8 @@ def test_shared_execution_timing_helpers_produce_consistent_metrics_and_event():
     assert metrics["last_method"] == "run"
     assert metrics["last_queue_wait_ms"] == 2.0
     assert metrics["avg_invoke_ms"] == 5.0
+    assert metrics["avg_invoke_wrapper_ms"] == 0.5
+    assert metrics["avg_user_fn_ms"] == 4.5
 
     event = build_execution_timing_event(
         event="service_timing",

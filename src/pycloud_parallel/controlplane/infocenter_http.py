@@ -463,6 +463,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     waiting_job_rows: List[tuple] = []
     if job_queue is not None:
         summary = dict(job_queue.summary() or {})
+        current_job_timing = dict(summary.get("current_job_timing") or {})
+        queue_timing = dict(summary.get("timing") or {})
         job_queue_rows.append(
             "<tr>"
             "<td>embedded</td>"
@@ -471,6 +473,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "<td>-</td>"
             f"<td>{html.escape(str(summary.get('current_job_id', '') or '-'))}</td>"
             f"<td>{html.escape(str(summary.get('current_job_status', '') or '-'))}</td>"
+            f"<td>{html.escape(str(summary.get('current_job_phase', '') or '-'))}</td>"
+            f"<td>{html.escape(str(current_job_timing.get('pool_action', '') or '-'))}</td>"
+            f"<td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td>"
             f"<td>{int(summary.get('waiting', 0) or 0)}</td>"
             f"<td>{int(summary.get('running', 0) or 0)}</td>"
             f"<td>{int(summary.get('terminal', 0) or 0)}</td>"
@@ -614,6 +619,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('last_executor_create_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('avg_warmup_ms', '-')))}</td>"
+                f"<td>{html.escape(str(timing.get('executor_rebuild_count', '-')))}</td>"
                 f"<td>{html.escape(pool.code_version[:20] + ('...' if len(pool.code_version) > 20 else ''))}</td>"
                 f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
@@ -635,6 +643,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(str(metadata.get('pycloud_version', '-') or '-'))}</td>"
                 f"<td>{html.escape(str(metadata.get('current_job_id', '') or '-'))}</td>"
                 f"<td>{html.escape(str(metadata.get('current_job_status', '') or '-'))}</td>"
+                "<td>-</td>"
+                "<td>-</td>"
+                "<td>-</td>"
                 f"<td>{html.escape(job_waiting)}</td>"
                 f"<td>{html.escape(job_running)}</td>"
                 f"<td>{html.escape(job_terminal)}</td>"
@@ -684,14 +695,14 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     service_body = "\n".join(service_rows) or "<tr><td colspan='17'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
-    pool_body = "\n".join(pool_rows) or "<tr><td colspan='18'>no task pools</td></tr>"
+    pool_body = "\n".join(pool_rows) or "<tr><td colspan='22'>no task pools</td></tr>"
     job_queue_body = "\n".join(job_queue_rows) or "<tr><td colspan='11'>no job queues</td></tr>"
     recent_job_rows.sort(key=lambda item: item[0], reverse=True)
     recent_job_body = "\n".join(row for _sort_key, row in recent_job_rows) or "<tr><td colspan='8'>no recent jobs</td></tr>"
     waiting_job_rows.sort(key=lambda item: item[0])
     waiting_job_body = "\n".join(row for _sort_key, row in waiting_job_rows) or "<tr><td colspan='7'>no waiting jobs</td></tr>"
     return (
-        "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='10'><title>InfoCenter Ops</title>"
+        "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='5'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
         "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}"
         "th{background:#f5f5f5;text-align:left;}"
@@ -699,7 +710,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
         "</head><body>"
         f"<h1>InfoCenter Ops</h1><div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
-        "<div class='section-note'>auto_refresh_sec=10</div>"
+        "<div class='section-note'>auto_refresh_sec=5</div>"
         "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
         "Service table below shows each deployed service instance, worker process counts, and reduced timing metrics. "
         "Task pool table shows native temporary pools running on each node. "
@@ -714,9 +725,15 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "<h2>Job Queue</h2>"
         "<div class='section-note'>Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.</div>"
         "<table><thead><tr>"
-        "<th>owner</th><th>instance_id</th><th>healthy</th><th>pycloud</th><th>current_job_id</th><th>current_status</th><th>waiting</th><th>running</th><th>terminal</th><th>job_count</th><th>http_base_url</th>"
+        "<th>owner</th><th>instance_id</th><th>healthy</th><th>pycloud</th><th>current_job_id</th><th>current_status</th><th>current_phase</th><th>pool_action</th><th>current_total_ms</th><th>waiting</th><th>running</th><th>terminal</th><th>job_count</th><th>http_base_url</th>"
         "</tr></thead><tbody>"
         f"{job_queue_body}"
+        "</tbody></table>"
+        "<div class='section-note'>Job-orch timing is reduced timing for queue wait, pool prepare, globals fanout, task running, finalize, writeback and total. Windows-focused fields highlight executor create/rebuild, warmup, and first-result wait.</div>"
+        "<table><thead><tr>"
+        "<th>scope</th><th>job_count</th><th>avg_queue_wait_ms</th><th>avg_pool_prepare_ms</th><th>avg_fanout_globals_ms</th><th>avg_running_tasks_ms</th><th>avg_finalize_ms</th><th>avg_terminal_writeback_ms</th><th>avg_total_ms</th><th>max_total_ms</th><th>executor_create_count</th><th>executor_rebuild_count</th><th>pool_reuse_count</th><th>pool_create_count</th><th>pool_rebuild_count</th><th>avg_first_result_wait_ms</th><th>avg_warmup_ms</th></tr></thead><tbody>"
+        f"<tr><td>embedded-job-orch</td><td>{html.escape(str(queue_timing.get('job_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_queue_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_pool_prepare_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_fanout_globals_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_running_tasks_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_finalize_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_terminal_writeback_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('max_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_first_result_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_warmup_ms', '-')))}</td></tr>"
+        f"<tr><td>current-job</td><td>1</td><td>{html.escape(str(current_job_timing.get('queue_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_prepare_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('fanout_globals_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('running_tasks_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('finalize_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('terminal_writeback_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'create' else 0))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'rebuild' else 0))}</td><td>{html.escape(str(current_job_timing.get('first_result_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('warmup_ms', '-')))}</td></tr>"
         "</tbody></table>"
         "<h2>Recent Jobs</h2>"
         "<table><thead><tr>"
@@ -739,7 +756,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "</tbody></table>"
         "<h2>Task Pools</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th>"
+        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>last_executor_create_ms</th><th>avg_warmup_ms</th><th>executor_rebuild_count</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th>"
         "</tr></thead><tbody>"
         f"{pool_body}"
         "</tbody></table></body></html>"
@@ -1014,16 +1031,24 @@ class InfoCenterHttpServer:
                         content_length=length,
                     )
                     if handled is not None:
-                        code, resp = handled
-                        self._send_json(code, resp)
+                        if len(handled) == 4:
+                            code, resp, content_type, extra_headers = handled
+                            self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
+                        else:
+                            code, resp = handled
+                            self._send_json(code, resp)
                         return
                     body = self._read_body()
                     if body is None:
                         return
                     handled = gateway_app.handle_post(path=self.path, headers=self.headers, body=body)
                     if handled is not None:
-                        code, resp = handled
-                        self._send_json(code, resp)
+                        if len(handled) == 4:
+                            code, resp, content_type, extra_headers = handled
+                            self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
+                        else:
+                            code, resp = handled
+                            self._send_json(code, resp)
                         return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -1180,6 +1205,29 @@ class InfoCenterHttpServer:
                 try:
                     self.send_response(status_code)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except Exception as exc:
+                    if not _is_client_disconnect_error(exc):
+                        raise
+
+            def _send_body(
+                self,
+                status_code: int,
+                body: bytes,
+                *,
+                content_type: str,
+                extra_headers: Optional[Dict[str, str]] = None,
+            ) -> None:
+                raw = bytes(body or b"")
+                try:
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", content_type or "application/octet-stream")
+                    for key, value in (extra_headers or {}).items():
+                        if str(key).lower() == "content-type":
+                            continue
+                        self.send_header(str(key), str(value))
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)

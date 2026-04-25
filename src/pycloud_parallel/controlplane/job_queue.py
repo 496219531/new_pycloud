@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import math
 from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
@@ -42,7 +43,7 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.node.execution import (
-    _invoke_user_callable,
+    _invoke_local_user_callable,
     _load_user_module,
     _purge_loaded_artifact_modules,
 )
@@ -83,17 +84,19 @@ class _SharedTaskPoolState:
     last_used_at: datetime = field(default_factory=utc_now)
 
 
-def _close_executor_async(executor: Any) -> None:
+def _close_executor(executor: Any) -> None:
     if executor is None:
         return
+    try:
+        executor.close()
+    except Exception:
+        pass
 
-    def _worker() -> None:
-        try:
-            executor.close()
-        except Exception:
-            pass
 
-    threading.Thread(target=_worker, name="job-queue-executor-close", daemon=True).start()
+def _close_executor_async(executor: Any) -> None:
+    # Compatibility shim for older tests/callers; JobQueueManager now routes closes
+    # through its bounded maintenance executor instead of spawning a thread here.
+    _close_executor(executor)
 
 
 _TASKPOOL_SHARED_BINDING_ID = "taskpool_default"
@@ -108,6 +111,21 @@ class _SharedPoolState:
     policy_id: str
     current_mode: str
     last_used_at: datetime
+
+
+@dataclass(frozen=True)
+class _JobSharedPoolRequest:
+    raw_requested_mode: str
+    requested_mode: str
+    reset_pool: bool
+    default_worker_count: int
+    default_node_count: int
+
+
+@dataclass(frozen=True)
+class _JobTaskPoolSpec:
+    artifact_key: str
+    create_pool: Any
 
 
 def _task_result_to_dict(item: pb2.TaskResult, *, serialization_mode: str = "") -> Dict[str, object]:
@@ -349,9 +367,9 @@ def _resolve_job_hook_mapping(
             candidate = getattr(module, callable_name, None)
             if candidate is None or not callable(candidate):
                 raise RuntimeError(f"{label} callable not found: {callable_name}")
-            prepared = _invoke_user_callable(candidate, payload)
+            prepared = _invoke_local_user_callable(candidate, payload)
     elif callable(prepared):
-        prepared = _invoke_user_callable(prepared, payload)
+        prepared = _invoke_local_user_callable(prepared, payload)
 
     if prepared is None:
         return {}
@@ -380,9 +398,9 @@ def _resolve_task_generator_output(
         candidate = getattr(module, callable_name, None)
         if candidate is None or not callable(candidate):
             raise RuntimeError(f"task generator callable not found: {callable_name}")
-        produced = _invoke_user_callable(candidate, payload)
+        produced = _invoke_local_user_callable(candidate, payload)
     elif callable(produced):
-        produced = _invoke_user_callable(produced, payload)
+        produced = _invoke_local_user_callable(produced, payload)
 
     if isinstance(produced, dict) and isinstance(produced.get("payloads"), list):
         produced = produced["payloads"]
@@ -408,11 +426,39 @@ def _preview_job_value(value: object, *, limit: int = 160) -> str:
     return normalized[: max(13, int(limit) - 3)] + "..."
 
 
+def _ms(delta_sec: float) -> float:
+    return round(max(0.0, float(delta_sec or 0.0)) * 1000.0, 3)
+
+
 def _artifact_key_preview(value: str) -> str:
     text = str(value or "").strip()
     if len(text) <= 24:
         return text
     return text[:24] + "..."
+
+
+def _default_timing_summary() -> Dict[str, object]:
+    return {
+        "queue_wait_ms": 0.0,
+        "resolve_refs_ms": 0.0,
+        "select_nodes_ms": 0.0,
+        "pool_prepare_ms": 0.0,
+        "executor_create_ms": 0.0,
+        "executor_rebuild_ms": 0.0,
+        "warmup_ms": 0.0,
+        "fanout_globals_ms": 0.0,
+        "running_tasks_ms": 0.0,
+        "first_result_wait_ms": 0.0,
+        "finalize_ms": 0.0,
+        "terminal_writeback_ms": 0.0,
+        "total_ms": 0.0,
+        "executor_create_count": 0,
+        "executor_rebuild_count": 0,
+        "pool_reuse_count": 0,
+        "result_count": 0,
+        "task_count": 0,
+        "pool_action": "",
+    }
 
 
 def _resolve_job_executor_max_in_flight(executor: object, requested: object) -> int:
@@ -423,6 +469,14 @@ def _resolve_job_executor_max_in_flight(executor: object, requested: object) -> 
             normalized = 0
         if normalized > 0:
             return max(1, normalized)
+    pools = getattr(executor, "_pools", None)
+    if isinstance(pools, dict) and pools:
+        total_workers = sum(
+            max(0, int(getattr(pool, "worker_count", 0) or 0))
+            for pool in pools.values()
+        )
+        if total_workers > 0:
+            return max(1, int(math.ceil(float(total_workers) * 1.5)))
     resolver = getattr(executor, "_resolve_max_in_flight", None)
     if callable(resolver):
         try:
@@ -525,8 +579,18 @@ class JobState:
     staged_ref_ids: List[str] = field(default_factory=list)
     last_ref_touch_at: Optional[datetime] = None
     payload_schema_version: int = 1
+    timing: Dict[str, object] = field(default_factory=_default_timing_summary)
+    final_result_preview: str = ""
+    error_preview: str = ""
+    _timing_marks: Dict[str, float] = field(default_factory=dict, repr=False)
 
-    def as_dict(self) -> Dict[str, object]:
+    def as_dict(
+        self,
+        *,
+        include_payload: bool = True,
+        include_results: bool = True,
+        include_final_result: bool = True,
+    ) -> Dict[str, object]:
         return {
             "job_id": self.job_id,
             "client_id": self.client_id,
@@ -538,16 +602,20 @@ class JobState:
             "code_version": self.code_version,
             "entry_module": self.entry_module,
             "entry_callable": self.entry_callable,
-            "payload": dict(self.payload),
+            "payload": dict(self.payload) if include_payload else {},
             "checkpoint": dict(self.checkpoint),
             "cancel_requested": bool(self.cancel_requested),
             "error": self.error,
-            "results": list(self.results),
-            "final_result": self.final_result,
+            "error_preview": self.error_preview,
+            "results": list(self.results) if include_results else [],
+            "result_count": len(self.results),
+            "final_result": self.final_result if include_final_result else None,
+            "final_result_preview": self.final_result_preview,
             "enqueue_seq": int(self.enqueue_seq or 0),
             "staged_ref_ids": list(self.staged_ref_ids),
             "last_ref_touch_at": self.last_ref_touch_at.isoformat() if self.last_ref_touch_at else "",
             "payload_schema_version": int(self.payload_schema_version or 0),
+            "timing": dict(self.timing or {}),
         }
 
 
@@ -569,6 +637,15 @@ class JobQueueManager:
         self._controlplane_target = ""
         self._stop = False
         self._thread: Optional[threading.Thread] = None
+        self._maintenance_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobq-maint")
+        self._driver_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(os.getenv("PYCLOUD_JOB_QUEUE_DRIVER_WORKERS", "1") or 1)),
+            thread_name_prefix="jobq-driver",
+        )
+        self._summary_cache: Optional[Dict[str, object]] = None
+        self._summary_cache_revision: int = 0
+        self._summary_cache_built_at_monotonic: float = 0.0
+        self._summary_cache_ttl_sec = max(0.0, float(os.getenv("PYCLOUD_JOB_QUEUE_SUMMARY_CACHE_TTL_SEC", "1.0") or 1.0))
         self._retention_sec = max(60, int(os.getenv("PYCLOUD_JOB_QUEUE_RETENTION_SEC", "3600") or 3600))
         self._taskpool_policy_id = str(taskpool_policy_id or "").strip().lower() or _TASKPOOL_SHARED_POLICY_ID
         self._taskpool_profile = get_policy_profile(self._taskpool_policy_id)
@@ -580,6 +657,131 @@ class JobQueueManager:
                 else (os.getenv("PYCLOUD_JOB_QUEUE_POOL_IDLE_TTL_SEC", "30") or 30)
             ),
         )
+
+    def _submit_executor_close(self, executor: Any) -> None:
+        if executor is None:
+            return
+        try:
+            self._maintenance_executor.submit(_close_executor, executor)
+        except RuntimeError:
+            _close_executor(executor)
+
+    def _job_state_locked(self, job_id: str) -> Optional[JobState]:
+        return self._jobs.get(str(job_id or "").strip())
+
+    def _invalidate_summary_locked(self) -> None:
+        self._summary_cache_revision += 1
+        self._summary_cache = None
+
+    def _job_timing_set_locked(self, job_id: str, key: str, value: object) -> None:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return
+        timing = state.timing if isinstance(state.timing, dict) else _default_timing_summary()
+        state.timing = timing
+        timing[str(key)] = value
+        self._invalidate_summary_locked()
+
+    def _job_timing_add_locked(self, job_id: str, key: str, delta: float) -> None:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return
+        timing = state.timing if isinstance(state.timing, dict) else _default_timing_summary()
+        state.timing = timing
+        current = float(timing.get(str(key), 0.0) or 0.0)
+        timing[str(key)] = round(current + float(delta or 0.0), 3)
+        self._invalidate_summary_locked()
+
+    def _job_timing_mark_locked(self, job_id: str, mark: str) -> None:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return
+        state._timing_marks[str(mark)] = time.monotonic()
+
+    def _job_timing_finish_locked(self, job_id: str, mark: str, metric_key: str) -> float:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return 0.0
+        started = state._timing_marks.pop(str(mark), None)
+        if started is None:
+            return 0.0
+        elapsed_ms = _ms(time.monotonic() - started)
+        timing = state.timing if isinstance(state.timing, dict) else _default_timing_summary()
+        state.timing = timing
+        timing[str(metric_key)] = elapsed_ms
+        self._invalidate_summary_locked()
+        return elapsed_ms
+
+    def _job_timing_snapshot_locked(self, job_id: str) -> Dict[str, object]:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return {}
+        return dict(state.timing or {})
+
+    def _job_timing_finalize_locked(self, job_id: str) -> None:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return
+        submitted_mark = state._timing_marks.get("submitted_at_monotonic")
+        if submitted_mark is None:
+            return
+        timing = state.timing if isinstance(state.timing, dict) else _default_timing_summary()
+        state.timing = timing
+        timing["total_ms"] = _ms(time.monotonic() - submitted_mark)
+        self._invalidate_summary_locked()
+
+    def _refresh_job_previews_locked(self, job_id: str) -> None:
+        state = self._job_state_locked(job_id)
+        if state is None:
+            return
+        state.error_preview = _preview_job_value(state.error)
+        state.final_result_preview = _preview_job_value(state.final_result)
+        self._invalidate_summary_locked()
+
+    def _aggregate_job_timing_locked(self, jobs: Sequence[JobState]) -> Dict[str, object]:
+        numeric_keys = [
+            "queue_wait_ms",
+            "resolve_refs_ms",
+            "select_nodes_ms",
+            "pool_prepare_ms",
+            "executor_create_ms",
+            "executor_rebuild_ms",
+            "warmup_ms",
+            "fanout_globals_ms",
+            "running_tasks_ms",
+            "first_result_wait_ms",
+            "finalize_ms",
+            "terminal_writeback_ms",
+            "total_ms",
+        ]
+        out: Dict[str, object] = {
+            "job_count": 0,
+            "executor_create_count": 0,
+            "executor_rebuild_count": 0,
+            "pool_reuse_count": 0,
+            "pool_create_count": 0,
+            "pool_rebuild_count": 0,
+            "max_total_ms": 0.0,
+        }
+        sums = {key: 0.0 for key in numeric_keys}
+        counted = 0
+        for job in jobs:
+            timing = dict(job.timing or {})
+            if not timing:
+                continue
+            counted += 1
+            for key in numeric_keys:
+                sums[key] += float(timing.get(key, 0.0) or 0.0)
+            out["executor_create_count"] = int(out["executor_create_count"]) + int(timing.get("executor_create_count", 0) or 0)
+            out["executor_rebuild_count"] = int(out["executor_rebuild_count"]) + int(timing.get("executor_rebuild_count", 0) or 0)
+            out["pool_reuse_count"] = int(out["pool_reuse_count"]) + (1 if str(timing.get("pool_action", "") or "") == "reuse" else 0)
+            out["pool_create_count"] = int(out["pool_create_count"]) + (1 if str(timing.get("pool_action", "") or "") == "create" else 0)
+            out["pool_rebuild_count"] = int(out["pool_rebuild_count"]) + (1 if str(timing.get("pool_action", "") or "") == "rebuild" else 0)
+            out["max_total_ms"] = round(max(float(out["max_total_ms"] or 0.0), float(timing.get("total_ms", 0.0) or 0.0)), 3)
+        out["job_count"] = counted
+        for key, total in sums.items():
+            out[f"avg_{key}"] = round((total / counted), 3) if counted > 0 else 0.0
+        return out
 
     def start(self, *, controlplane_target: str) -> None:
         with self._lock:
@@ -607,11 +809,13 @@ class JobQueueManager:
             shared_executor = self._shared_pool.executor if self._shared_pool is not None else None
             self._shared_pool = None
             release_states = [state for state in self._jobs.values() if state.staged_ref_ids]
-        _close_executor_async(executor)
+        self._submit_executor_close(executor)
         if shared_executor is not None and shared_executor is not executor:
-            _close_executor_async(shared_executor)
+            self._submit_executor_close(shared_executor)
         for state in release_states:
             self._release_job_refs(state)
+        self._driver_executor.shutdown(wait=False, cancel_futures=True)
+        self._maintenance_executor.shutdown(wait=False, cancel_futures=True)
 
     def _resolve_requested_task_mode(self, payload: Dict[str, object]) -> str:
         requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
@@ -621,6 +825,18 @@ class JobQueueManager:
             context="taskpool_session",
         )
         return effective.resolved_mode
+
+    def _resolve_job_shared_pool_request(self, payload: Dict[str, object]) -> _JobSharedPoolRequest:
+        return _JobSharedPoolRequest(
+            raw_requested_mode=str(payload.get("task_serialization_mode", "") or "").strip(),
+            requested_mode=self._resolve_requested_task_mode(payload),
+            reset_pool=bool(payload.get("reset_pool", False)),
+            default_worker_count=_default_job_worker_count(),
+            default_node_count=_default_job_node_count(
+                controlplane_target=self._controlplane_target,
+                payload=payload,
+            ),
+        )
 
     def _shared_pool_artifact_key(
         self,
@@ -641,23 +857,21 @@ class JobQueueManager:
             code_key = f"path:{str(artifact_path).strip()}"
         else:
             code_key = f"module:{str(entry_module).strip()}"
-        return "|".join(
-            [
-                code_key,
-                str(runtime or "").strip(),
-                str(entry_module or "").strip(),
-                str(entry_callable or "").strip(),
-                str(package_format or "").strip(),
-                ",".join(sorted(str(item).strip() for item in (dependency_allowlist or ()) if str(item).strip())),
-                ",".join(sorted(str(item).strip() for item in (managed_global_names or ()) if str(item).strip())),
-                ",".join(sorted(str(item).strip() for item in (task_resource_paths or ()) if str(item).strip())),
-            ]
+        return self._artifact_key_from_code_key(
+            code_key=code_key,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
+            task_resource_paths=task_resource_paths,
         )
 
-    def _artifact_key(
+    def _artifact_key_from_code_key(
         self,
         *,
-        blob: bytes,
+        code_key: str,
         runtime: str,
         entry_module: str,
         entry_callable: str,
@@ -666,10 +880,9 @@ class JobQueueManager:
         managed_global_names: Sequence[str],
         task_resource_paths: Sequence[str],
     ) -> str:
-        digest = hashlib.sha256(bytes(blob or b"")).hexdigest()
         return "|".join(
             [
-                digest,
+                str(code_key or "").strip(),
                 str(runtime or "").strip(),
                 str(entry_module or "").strip(),
                 str(entry_callable or "").strip(),
@@ -792,7 +1005,7 @@ class JobQueueManager:
                 )
                 pool_to_close = self._close_shared_pool_locked()
         if pool_to_close is not None:
-            _close_executor_async(pool_to_close)
+            self._submit_executor_close(pool_to_close)
 
         pool = create_pool(requested_mode or _TASKPOOL_SHARED_DEFAULT_MODE)
         if not hasattr(pool, "unordered") and hasattr(pool, "imap_unordered"):
@@ -822,6 +1035,238 @@ class JobQueueManager:
             effective.resolved_mode,
         )
         return pool
+
+    def _record_pool_prepare_timing_locked(
+        self,
+        *,
+        state: Optional[JobState],
+        action: str,
+        pool_prepare_ms: float,
+    ) -> None:
+        if state is None:
+            return
+        state.timing["pool_action"] = action
+        state.timing["pool_prepare_ms"] = pool_prepare_ms
+        state.timing["executor_create_ms"] = pool_prepare_ms if action == "create" else 0.0
+        state.timing["executor_rebuild_ms"] = pool_prepare_ms if action == "rebuild" else 0.0
+        state.timing["executor_create_count"] = 1 if action == "create" else 0
+        state.timing["executor_rebuild_count"] = 1 if action == "rebuild" else 0
+        state.timing["pool_reuse_count"] = 1 if action == "reuse" else 0
+
+    def _prepare_shared_pool_for_job(
+        self,
+        *,
+        job_id: str,
+        job_id_snapshot: str,
+        artifact_key: str,
+        requested_mode: str,
+        reset_pool: bool,
+        create_pool: Any,
+    ) -> TaskPool:
+        with self._lock:
+            shared_before = self._shared_pool.executor if self._shared_pool is not None else None
+        pool_prepare_started = time.monotonic()
+        executor = self._get_or_create_shared_pool(
+            artifact_key=artifact_key,
+            requested_mode=requested_mode,
+            reset_pool=reset_pool,
+            create_pool=create_pool,
+        )
+        pool_prepare_ms = _ms(time.monotonic() - pool_prepare_started)
+        executor._job_id = job_id_snapshot  # noqa: SLF001
+        action = "reuse" if shared_before is not None and shared_before is executor else ("rebuild" if shared_before is not None else "create")
+        with self._lock:
+            self._current_executor = executor
+            self._record_pool_prepare_timing_locked(
+                state=self._jobs.get(job_id),
+                action=action,
+                pool_prepare_ms=pool_prepare_ms,
+            )
+        return executor
+
+    def _fanout_job_update_globals(
+        self,
+        *,
+        job_id: str,
+        job_id_snapshot: str,
+        executor: Any,
+        prepared_update_globals: Dict[str, object],
+        phase_log: bool,
+    ) -> float:
+        if not prepared_update_globals:
+            return 0.0
+        warmup_started = time.monotonic()
+        with self._lock:
+            current_state = self._jobs.get(job_id)
+            if current_state is not None:
+                current_state.checkpoint["phase"] = "fanout_globals"
+        if phase_log:
+            logger.info(
+                "[JobQueue] phase=fanout_globals job_id=%s key_count=%d",
+                job_id_snapshot,
+                len(prepared_update_globals),
+            )
+        else:
+            logger.info(
+                "[JobQueue] update_globals job_id=%s key_count=%d",
+                job_id_snapshot,
+                len(prepared_update_globals),
+            )
+        executor.update_globals(dict(prepared_update_globals))
+        warmup_ms = _ms(time.monotonic() - warmup_started)
+        with self._lock:
+            current_state = self._jobs.get(job_id)
+            if current_state is not None:
+                current_state.timing["warmup_ms"] = warmup_ms
+                current_state.timing["fanout_globals_ms"] = warmup_ms
+        if phase_log:
+            logger.info(
+                "[JobQueue] phase=fanout_globals_done job_id=%s key_count=%d",
+                job_id_snapshot,
+                len(prepared_update_globals),
+            )
+        return warmup_ms
+
+    def _build_plain_job_task_pool_spec(
+        self,
+        *,
+        payload: Dict[str, object],
+        kwargs: Dict[str, object],
+        client_id: str,
+        job_id_snapshot: str,
+        pool_request: _JobSharedPoolRequest,
+        artifact_path: str,
+        task_resource_paths: Sequence[str],
+    ) -> _JobTaskPoolSpec:
+        artifact_key = self._shared_pool_artifact_key(
+            blob=kwargs.get("blob"),
+            artifact_path=artifact_path,
+            runtime=str(kwargs.get("runtime", "py3") or "py3"),
+            entry_module=str(kwargs.get("entry_module", "") or ""),
+            entry_callable=str(kwargs.get("entry_callable", "run") or "run"),
+            package_format=str(kwargs.get("package_format", "") or ""),
+            dependency_allowlist=list(kwargs.get("dependency_allowlist") or ()),
+            managed_global_names=list(kwargs.get("managed_global_names") or ()),
+            task_resource_paths=task_resource_paths,
+        )
+
+        def _create_pool(mode: str) -> TaskPool:
+            return _create_job_task_pool(
+                infocenter_target=self._controlplane_target,
+                job_id=job_id_snapshot,
+                owner_client_id=kwargs.get("client_id") or client_id,
+                pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
+                blob=kwargs.get("blob"),
+                artifact_path=artifact_path,
+                runtime=kwargs.get("runtime", "py3"),
+                entry_module=kwargs.get("entry_module", ""),
+                entry_callable=kwargs.get("entry_callable", "run"),
+                package_format=kwargs.get("package_format", ""),
+                serialization_mode=pool_request.raw_requested_mode or "",
+                policy_id=self._taskpool_policy_id,
+                dependency_allowlist=kwargs.get("dependency_allowlist"),
+                managed_global_names=kwargs.get("managed_global_names"),
+                worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", pool_request.default_worker_count)) or pool_request.default_worker_count)),
+                heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
+                idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
+                healthy_only=kwargs.get("healthy_only", True),
+                tags=kwargs.get("tags"),
+                node_ids=kwargs.get("node_ids"),
+                node_count=max(0, int(payload.get("pool_node_count", kwargs.get("node_count", pool_request.default_node_count) or pool_request.default_node_count) or 0)),
+                node_limit=kwargs.get("node_limit", 100),
+                timeout_sec=kwargs.get("timeout_sec", 10.0),
+            )
+
+        return _JobTaskPoolSpec(artifact_key=artifact_key, create_pool=_create_pool)
+
+    def _build_hook_job_task_pool_spec(
+        self,
+        *,
+        payload: Dict[str, object],
+        client_id: str,
+        job_id_snapshot: str,
+        pool_request: _JobSharedPoolRequest,
+        blob: bytes,
+        package_format: str,
+        entry_module: str,
+        task_entry_callable: str,
+        task_resource_paths: Sequence[str],
+        module: Any,
+        task_entry: Any,
+        effective_managed_global_names: Sequence[str],
+    ) -> _JobTaskPoolSpec:
+        artifact_key = self._shared_pool_artifact_key(
+            blob=blob,
+            runtime=str(payload.get("runtime", "py3") or "py3"),
+            entry_module=entry_module,
+            entry_callable=task_entry_callable,
+            package_format=package_format,
+            dependency_allowlist=list(payload.get("dependency_allowlist") or ()),
+            managed_global_names=effective_managed_global_names,
+            task_resource_paths=task_resource_paths,
+        )
+
+        def _create_pool(mode: str) -> TaskPool:
+            task_pool_kwargs = {
+                "infocenter_target": self._controlplane_target,
+                "job_id": job_id_snapshot,
+                "owner_client_id": client_id,
+                "pool_name": str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
+                "runtime": str(payload.get("runtime", "py3") or "py3"),
+                "serialization_mode": pool_request.raw_requested_mode or "",
+                "policy_id": self._taskpool_policy_id,
+                "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
+                "managed_global_names": list(effective_managed_global_names or ()),
+                "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", pool_request.default_worker_count)) or pool_request.default_worker_count)),
+                "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
+                "idle_ttl_sec": max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
+                "healthy_only": bool(payload.get("healthy_only", True)),
+                "tags": list(payload.get("tags") or ()),
+                "node_ids": list(payload.get("node_ids") or ()),
+                "node_count": max(0, int(payload.get("pool_node_count", payload.get("node_count", pool_request.default_node_count) or pool_request.default_node_count) or 0)),
+                "node_limit": int(payload.get("node_limit", 100) or 100),
+                "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
+            }
+            if task_resource_paths:
+                task_pool_kwargs.update(
+                    source=module,
+                    entry_callable=task_entry_callable,
+                    resource_paths=list(task_resource_paths),
+                )
+            else:
+                task_pool_kwargs["entry_func"] = task_entry
+            return _create_job_task_pool(**task_pool_kwargs)
+
+        return _JobTaskPoolSpec(artifact_key=artifact_key, create_pool=_create_pool)
+
+    def _prepare_job_executor_for_run(
+        self,
+        *,
+        job_id: str,
+        job_id_snapshot: str,
+        artifact_key: str,
+        requested_mode: str,
+        reset_pool: bool,
+        create_pool: Any,
+        prepared_update_globals: Dict[str, object],
+        phase_log: bool,
+    ) -> TaskPool:
+        executor = self._prepare_shared_pool_for_job(
+            job_id=job_id,
+            job_id_snapshot=job_id_snapshot,
+            artifact_key=artifact_key,
+            requested_mode=requested_mode,
+            reset_pool=reset_pool,
+            create_pool=create_pool,
+        )
+        self._fanout_job_update_globals(
+            job_id=job_id,
+            job_id_snapshot=job_id_snapshot,
+            executor=executor,
+            prepared_update_globals=prepared_update_globals,
+            phase_log=phase_log,
+        )
+        return executor
 
     def submit_job(self, payload: Dict[str, object], *, auth_token: str = "") -> JobState:
         raw_payload = dict(payload or {})
@@ -867,8 +1312,12 @@ class JobQueueManager:
                 last_ref_touch_at=submitted_at if staged_ref_ids else None,
                 payload_schema_version=2 if staged_ref_ids else 1,
             )
+            state.error_preview = ""
+            state.final_result_preview = ""
             self._jobs[job_id] = state
+            state._timing_marks["submitted_at_monotonic"] = time.monotonic()
             self._insert_waiting_job_locked(state)
+            self._invalidate_summary_locked()
             self._ensure_scheduler_thread_locked()
             self._cv.notify_all()
         logger.info(
@@ -883,7 +1332,7 @@ class JobQueueManager:
             bool(normalized_payload.get("reset_pool", False)),
             priority,
         )
-        _close_executor_async(executor_to_close)
+        self._submit_executor_close(executor_to_close)
         return state
 
     def get_job(self, job_id: str) -> Optional[JobState]:
@@ -892,7 +1341,7 @@ class JobQueueManager:
             if any(item.status == "WAITING" and not item.cancel_requested for item in self._jobs.values()):
                 self._ensure_scheduler_thread_locked()
             state = self._jobs.get(str(job_id or "").strip())
-        _close_executor_async(executor_to_close)
+        self._submit_executor_close(executor_to_close)
         return state
 
     def summary(self, *, recent_limit: int = 5, waiting_limit: int = 50) -> Dict[str, object]:
@@ -900,61 +1349,83 @@ class JobQueueManager:
             executor_to_close = self._detach_stale_running_locked()
             if any(item.status == "WAITING" and not item.cancel_requested for item in self._jobs.values()):
                 self._ensure_scheduler_thread_locked()
+            if (
+                self._summary_cache is not None
+                and (time.monotonic() - self._summary_cache_built_at_monotonic) <= self._summary_cache_ttl_sec
+            ):
+                cached = dict(self._summary_cache)
+                self._submit_executor_close(executor_to_close)
+                return cached
             jobs = list(self._jobs.values())
-            waiting = sum(1 for item in jobs if item.status == "WAITING" and not item.cancel_requested)
-            running = sum(1 for item in jobs if item.status == "RUNNING")
-            succeeded = sum(1 for item in jobs if item.status == "SUCCEEDED")
-            failed = sum(1 for item in jobs if item.status == "FAILED")
-            cancelled = sum(1 for item in jobs if item.status == "CANCELLED")
             current = str(self._running_job_id or "").strip()
             current_state = self._jobs.get(current) if current else None
-            recent_jobs = sorted(
-                jobs,
-                key=lambda item: (
-                    (item.finished_at or item.started_at or item.submitted_at).timestamp(),
-                    item.submitted_at.timestamp(),
-                    item.job_id,
-                ),
-                reverse=True,
-            )[: max(0, int(recent_limit or 0))]
-            waiting_jobs: List[Dict[str, object]] = []
-            for position, job_id in enumerate(list(self._waiting_order)[: max(0, int(waiting_limit or 0))], start=1):
-                item = self._jobs.get(job_id)
-                if item is None or item.status != "WAITING" or item.cancel_requested:
-                    continue
-                waiting_jobs.append(
-                    {
-                        "job_id": str(item.job_id or ""),
-                        "priority": int(item.priority or 0),
-                        "submitted_at": item.submitted_at.isoformat(),
-                        "position": position,
-                    }
-                )
-            summary = {
-                "job_count": len(jobs),
-                "waiting": waiting,
-                "running": running,
-                "succeeded": succeeded,
-                "failed": failed,
-                "cancelled": cancelled,
-                "terminal": succeeded + failed + cancelled,
-                "current_job_id": current,
-                "current_job_status": str(current_state.status) if current_state is not None else "",
-                "recent_jobs": [
-                    {
-                        "job_id": str(item.job_id or ""),
-                        "status": str(item.status or ""),
-                        "submitted_at": item.submitted_at.isoformat(),
-                        "finished_at": item.finished_at.isoformat() if item.finished_at else "",
-                        "final_result_preview": _preview_job_value(item.final_result),
-                        "error_preview": _preview_job_value(item.error),
-                    }
-                    for item in recent_jobs
-                ],
-                "waiting_jobs": waiting_jobs,
-            }
-        _close_executor_async(executor_to_close)
-        return summary
+            waiting_order = list(self._waiting_order)
+            current_job_status = str(current_state.status) if current_state is not None else ""
+            current_job_phase = str(((current_state.checkpoint or {}).get("phase", "") if current_state is not None else "") or "")
+            current_job_timing = dict(current_state.timing or {}) if current_state is not None else {}
+            aggregate_timing = self._aggregate_job_timing_locked(jobs)
+            cache_revision = self._summary_cache_revision
+        self._submit_executor_close(executor_to_close)
+        waiting = sum(1 for item in jobs if item.status == "WAITING" and not item.cancel_requested)
+        running = sum(1 for item in jobs if item.status == "RUNNING")
+        succeeded = sum(1 for item in jobs if item.status == "SUCCEEDED")
+        failed = sum(1 for item in jobs if item.status == "FAILED")
+        cancelled = sum(1 for item in jobs if item.status == "CANCELLED")
+        recent_jobs = sorted(
+            jobs,
+            key=lambda item: (
+                (item.finished_at or item.started_at or item.submitted_at).timestamp(),
+                item.submitted_at.timestamp(),
+                item.job_id,
+            ),
+            reverse=True,
+        )[: max(0, int(recent_limit or 0))]
+        waiting_jobs: List[Dict[str, object]] = []
+        job_map = {item.job_id: item for item in jobs}
+        for position, job_id in enumerate(waiting_order[: max(0, int(waiting_limit or 0))], start=1):
+            item = job_map.get(job_id)
+            if item is None or item.status != "WAITING" or item.cancel_requested:
+                continue
+            waiting_jobs.append(
+                {
+                    "job_id": str(item.job_id or ""),
+                    "priority": int(item.priority or 0),
+                    "submitted_at": item.submitted_at.isoformat(),
+                    "position": position,
+                }
+            )
+        summary_payload = {
+            "job_count": len(jobs),
+            "waiting": waiting,
+            "running": running,
+            "succeeded": succeeded,
+            "failed": failed,
+            "cancelled": cancelled,
+            "terminal": succeeded + failed + cancelled,
+            "current_job_id": current,
+            "current_job_status": current_job_status,
+            "current_job_phase": current_job_phase,
+            "current_job_timing": current_job_timing,
+            "recent_jobs": [
+                {
+                    "job_id": str(item.job_id or ""),
+                    "status": str(item.status or ""),
+                    "submitted_at": item.submitted_at.isoformat(),
+                    "finished_at": item.finished_at.isoformat() if item.finished_at else "",
+                    "final_result_preview": str(item.final_result_preview or ""),
+                    "error_preview": str(item.error_preview or ""),
+                    "timing": dict(item.timing or {}),
+                }
+                for item in recent_jobs
+            ],
+            "waiting_jobs": waiting_jobs,
+            "timing": aggregate_timing,
+        }
+        with self._lock:
+            if cache_revision == self._summary_cache_revision:
+                self._summary_cache = dict(summary_payload)
+                self._summary_cache_built_at_monotonic = time.monotonic()
+        return summary_payload
 
     def cancel_job(self, job_id: str, *, auth_token: str = "") -> Optional[JobState]:
         normalized = str(job_id or "").strip()
@@ -974,10 +1445,13 @@ class JobQueueManager:
                 state.status = "CANCELLED"
                 state.finished_at = utc_now()
                 state.cancel_requested = True
+                self._refresh_job_previews_locked(normalized)
                 self._remove_waiting_job_locked(state.job_id)
+                self._invalidate_summary_locked()
                 release_state = JobState(**{**state.__dict__})
             elif state.status == "RUNNING":
                 state.cancel_requested = True
+                self._invalidate_summary_locked()
                 executor = self._current_executor
                 if executor is not None and getattr(executor, "job_id", "") == state.job_id:
                     try:
@@ -1023,6 +1497,7 @@ class JobQueueManager:
                 self._waiting_order[idx + 1], self._waiting_order[idx] = self._waiting_order[idx], self._waiting_order[idx + 1]
             elif move not in {"up", "down"}:
                 raise ValueError("direction must be 'up' or 'down'")
+            self._invalidate_summary_locked()
             self._cv.notify_all()
             return state
 
@@ -1076,6 +1551,8 @@ class JobQueueManager:
             state = self._jobs.pop(job_id, None)
             if state is not None:
                 released.append(state)
+        if released:
+            self._invalidate_summary_locked()
         return released
 
     def _job_ref_touch_interval_sec(self, state: JobState) -> float:
@@ -1097,12 +1574,27 @@ class JobQueueManager:
                 out.append(state)
         return out
 
-    def _touch_job_refs(self, state: JobState) -> None:
-        if not self._controlplane_target or not state.staged_ref_ids:
+    def _job_ref_snapshot(self, state: Optional[JobState]) -> tuple[str, List[str]]:
+        if state is None:
+            return "", []
+        return (
+            str(state.job_id or "").strip(),
+            [str(ref_id).strip() for ref_id in list(state.staged_ref_ids or ()) if str(ref_id).strip()],
+        )
+
+    def _touch_refs_for_job(
+        self,
+        *,
+        job_id: str,
+        ref_ids: Sequence[str],
+        invalidate_summary: bool,
+    ) -> None:
+        snapshot = [str(ref_id).strip() for ref_id in list(ref_ids or ()) if str(ref_id).strip()]
+        if not self._controlplane_target or not snapshot:
             return
         client = DataRegistryClient(self._controlplane_target, timeout_sec=5.0)
         touched = False
-        for ref_id in list(state.staged_ref_ids):
+        for ref_id in snapshot:
             try:
                 client.touch(ref_id)
                 touched = True
@@ -1110,26 +1602,51 @@ class JobQueueManager:
                 continue
         if touched:
             with self._lock:
-                current = self._jobs.get(state.job_id)
+                current = self._jobs.get(str(job_id or "").strip())
                 if current is not None:
                     current.last_ref_touch_at = utc_now()
+                    if invalidate_summary:
+                        self._invalidate_summary_locked()
 
-    def _release_job_refs(self, state: JobState) -> None:
-        if not self._controlplane_target or not state.staged_ref_ids:
+    def _release_refs_for_job(
+        self,
+        *,
+        job_id: str,
+        ref_ids: Sequence[str],
+        invalidate_summary: bool,
+    ) -> None:
+        snapshot = [str(ref_id).strip() for ref_id in list(ref_ids or ()) if str(ref_id).strip()]
+        if not self._controlplane_target or not snapshot:
             return
         client = DataRegistryClient(self._controlplane_target, timeout_sec=5.0)
-        for ref_id in list(state.staged_ref_ids):
+        for ref_id in snapshot:
             with contextlib.suppress(Exception):
                 client.release(ref_id)
         with self._lock:
-            current = self._jobs.get(state.job_id)
+            current = self._jobs.get(str(job_id or "").strip())
             if current is not None:
-                current.staged_ref_ids = []
+                current.staged_ref_ids = [ref_id for ref_id in current.staged_ref_ids if ref_id not in snapshot]
+                if invalidate_summary:
+                    self._invalidate_summary_locked()
+
+    def _touch_job_refs(self, state: JobState) -> None:
+        job_id, ref_ids = self._job_ref_snapshot(state)
+        self._touch_refs_for_job(job_id=job_id, ref_ids=ref_ids, invalidate_summary=True)
+
+    def _touch_job_refs_snapshot(self, *, job_id: str, ref_ids: Sequence[str]) -> None:
+        self._touch_refs_for_job(job_id=job_id, ref_ids=ref_ids, invalidate_summary=False)
+
+    def _release_job_refs(self, state: JobState) -> None:
+        job_id, ref_ids = self._job_ref_snapshot(state)
+        self._release_refs_for_job(job_id=job_id, ref_ids=ref_ids, invalidate_summary=True)
+
+    def _release_job_refs_snapshot(self, *, job_id: str, ref_ids: Sequence[str]) -> None:
+        self._release_refs_for_job(job_id=job_id, ref_ids=ref_ids, invalidate_summary=False)
 
     def _loop(self) -> None:
         while True:
-            refs_to_touch: List[JobState] = []
-            refs_to_release: List[JobState] = []
+            refs_to_touch: List[tuple[str, List[str]]] = []
+            refs_to_release: List[tuple[str, List[str]]] = []
             next_job: Optional[JobState] = None
             shared_pool_to_close: Any = None
             with self._cv:
@@ -1140,13 +1657,22 @@ class JobQueueManager:
                             self._shared_pool.last_used_at = utc_now()
                         self._running_job_id = ""
                         self._current_executor = None
+                        self._invalidate_summary_locked()
                         self._cv.notify_all()
                         break
                     self._cv.wait(timeout=0.1)
                 if self._stop:
                     return
-                refs_to_release = self._cleanup_jobs_locked()
-                refs_to_touch = self._jobs_needing_ref_touch_locked(now=utc_now())
+                refs_to_release = [
+                    (state.job_id, list(state.staged_ref_ids))
+                    for state in self._cleanup_jobs_locked()
+                    if state.staged_ref_ids
+                ]
+                refs_to_touch = [
+                    (state.job_id, list(state.staged_ref_ids))
+                    for state in self._jobs_needing_ref_touch_locked(now=utc_now())
+                    if state.staged_ref_ids
+                ]
                 next_job = self._pick_next_job_locked()
                 if next_job is None:
                     if not self._running_job_id and self._shared_pool_idle_expired_locked(now=utc_now()):
@@ -1164,8 +1690,12 @@ class JobQueueManager:
                     if next_job.checkpoint is None:
                         next_job.checkpoint = {}
                     next_job.checkpoint["phase"] = "preparing"
+                    submitted_mark = next_job._timing_marks.get("submitted_at_monotonic")
+                    if submitted_mark is not None:
+                        next_job.timing["queue_wait_ms"] = _ms(time.monotonic() - submitted_mark)
                     self._remove_waiting_job_locked(next_job.job_id)
                     self._running_job_id = next_job.job_id
+                    self._invalidate_summary_locked()
                     logger.info(
                         "[JobQueue] start job_id=%s client_id=%s entry_module=%s job_mode=%s",
                         next_job.job_id,
@@ -1173,11 +1703,11 @@ class JobQueueManager:
                         next_job.entry_module,
                         str(next_job.payload.get("job_mode", "") or ""),
                     )
-            for state in refs_to_release:
-                self._release_job_refs(state)
-            for state in refs_to_touch:
-                self._touch_job_refs(state)
-            _close_executor_async(shared_pool_to_close)
+            for job_id, ref_ids in refs_to_release:
+                self._maintenance_executor.submit(self._release_job_refs_snapshot, job_id=job_id, ref_ids=ref_ids)
+            for job_id, ref_ids in refs_to_touch:
+                self._maintenance_executor.submit(self._touch_job_refs_snapshot, job_id=job_id, ref_ids=ref_ids)
+            self._submit_executor_close(shared_pool_to_close)
             if next_job is None:
                 continue
             self._run_job(next_job.job_id)
@@ -1196,6 +1726,7 @@ class JobQueueManager:
                     self._shared_pool.last_used_at = utc_now()
                 self._running_job_id = ""
                 self._current_executor = None
+                self._invalidate_summary_locked()
                 self._cv.notify_all()
 
     def _expand_subtasks(self, payload: Dict[str, object]) -> List[Dict[str, object]]:
@@ -1234,7 +1765,7 @@ class JobQueueManager:
             fn = getattr(module, entry_callable, None)
             if fn is None or not callable(fn):
                 raise RuntimeError(f"driver callable not found: {entry_callable}")
-            produced = _invoke_user_callable(fn, driver_payload)
+            produced = _invoke_local_user_callable(fn, driver_payload)
             if isinstance(produced, dict) and isinstance(produced.get("subtasks"), list):
                 produced = produced["subtasks"]
             if not isinstance(produced, list):
@@ -1275,6 +1806,7 @@ class JobQueueManager:
                 state = self._jobs.get(job_id)
                 if state is not None:
                     state.checkpoint["phase"] = "resolving_refs"
+                    self._job_timing_mark_locked(job_id, "resolve_refs")
             resolved_payload = _resolve_payload_data_refs(
                 payload,
                 registry_target=self._controlplane_target,
@@ -1285,14 +1817,18 @@ class JobQueueManager:
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
+                    self._job_timing_finish_locked(job_id, "resolve_refs", "resolve_refs_ms")
                     state.checkpoint["phase"] = "selecting_nodes"
         except Exception as exc:
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
-                    state.status = "FAILED"
-                    state.finished_at = utc_now()
-                    state.error = str(exc)
+                    self._job_timing_finish_locked(job_id, "resolve_refs", "resolve_refs_ms")
+                    self._job_timing_finalize_locked(job_id)
+                state.status = "FAILED"
+                state.finished_at = utc_now()
+                state.error = str(exc)
+                self._invalidate_summary_locked()
             return
 
         if _uses_job_hooks(payload):
@@ -1305,9 +1841,19 @@ class JobQueueManager:
             return
 
         try:
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jobq-expand") as executor:
-                fut = executor.submit(self._expand_subtasks, payload)
-                subtasks = fut.result(timeout=float(payload.get("driver_timeout_sec", 120.0) or 120.0))
+            fut = self._driver_executor.submit(self._expand_subtasks, payload)
+            subtasks = fut.result(timeout=float(payload.get("driver_timeout_sec", 120.0) or 120.0))
+        except FutureTimeout as exc:
+            with contextlib.suppress(Exception):
+                fut.cancel()
+            with self._lock:
+                state = self._jobs.get(job_id)
+                if state is not None:
+                    state.status = "FAILED"
+                    state.finished_at = utc_now()
+                    state.error = f"driver timed out after {float(payload.get('driver_timeout_sec', 120.0) or 120.0):.1f}s"
+                    self._invalidate_summary_locked()
+            return
         except Exception as exc:
             with self._lock:
                 state = self._jobs.get(job_id)
@@ -1315,6 +1861,7 @@ class JobQueueManager:
                     state.status = "FAILED"
                     state.finished_at = utc_now()
                     state.error = f"driver failed: {exc}"
+                    self._invalidate_summary_locked()
             return
         if not subtasks:
             with self._lock:
@@ -1323,6 +1870,7 @@ class JobQueueManager:
                     state.status = "FAILED"
                     state.finished_at = utc_now()
                     state.error = "job payload must provide non-empty subtasks list or valid driver"
+                    self._invalidate_summary_locked()
             return
 
         kwargs = {
@@ -1379,14 +1927,11 @@ class JobQueueManager:
             kwargs["blob"] = blob
         artifact_path = str(payload.get("artifact_path", "") or "").strip()
         task_resource_paths = [str(item).strip() for item in list(payload.get("task_resource_paths") or ()) if str(item).strip()]
-        raw_requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
-        requested_mode = self._resolve_requested_task_mode(payload)
-        reset_pool = bool(payload.get("reset_pool", False))
-        default_worker_count = _default_job_worker_count()
-        default_node_count = _default_job_node_count(
-            controlplane_target=self._controlplane_target,
-            payload=payload,
-        )
+        with self._lock:
+            self._job_timing_mark_locked(job_id, "select_nodes")
+        pool_request = self._resolve_job_shared_pool_request(payload)
+        with self._lock:
+            self._job_timing_finish_locked(job_id, "select_nodes", "select_nodes_ms")
 
         executor: Optional[Any] = None
         try:
@@ -1394,72 +1939,35 @@ class JobQueueManager:
                 "[JobQueue] run job_id=%s mode=plain subtasks=%d requested_mode=%s reset_pool=%s",
                 job_id_snapshot,
                 len(subtasks),
-                requested_mode,
-                reset_pool,
+                pool_request.requested_mode,
+                pool_request.reset_pool,
             )
-            artifact_key = self._shared_pool_artifact_key(
-                blob=kwargs.get("blob"),
+            pool_spec = self._build_plain_job_task_pool_spec(
+                payload=payload,
+                kwargs=kwargs,
+                client_id=client_id,
+                job_id_snapshot=job_id_snapshot,
+                pool_request=pool_request,
                 artifact_path=artifact_path,
-                runtime=str(kwargs.get("runtime", "py3") or "py3"),
-                entry_module=str(kwargs.get("entry_module", "") or ""),
-                entry_callable=str(kwargs.get("entry_callable", "run") or "run"),
-                package_format=str(kwargs.get("package_format", "") or ""),
-                dependency_allowlist=list(kwargs.get("dependency_allowlist") or ()),
-                managed_global_names=list(kwargs.get("managed_global_names") or ()),
                 task_resource_paths=task_resource_paths,
             )
-
-            def _create_pool(mode: str) -> TaskPool:
-                return _create_job_task_pool(
-                    infocenter_target=self._controlplane_target,
-                    job_id=job_id_snapshot,
-                    owner_client_id=kwargs.get("client_id") or client_id,
-                    pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
-                    blob=kwargs.get("blob"),
-                    artifact_path=artifact_path,
-                    runtime=kwargs.get("runtime", "py3"),
-                    entry_module=kwargs.get("entry_module", ""),
-                    entry_callable=kwargs.get("entry_callable", "run"),
-                    package_format=kwargs.get("package_format", ""),
-                    serialization_mode=raw_requested_mode or "",
-                    policy_id=self._taskpool_policy_id,
-                    dependency_allowlist=kwargs.get("dependency_allowlist"),
-                    managed_global_names=kwargs.get("managed_global_names"),
-                    worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
-                    heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
-                    idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
-                    healthy_only=kwargs.get("healthy_only", True),
-                    tags=kwargs.get("tags"),
-                    node_ids=kwargs.get("node_ids"),
-                    node_count=max(0, int(payload.get("pool_node_count", kwargs.get("node_count", default_node_count) or default_node_count) or 0)),
-                    node_limit=kwargs.get("node_limit", 100),
-                    timeout_sec=kwargs.get("timeout_sec", 10.0),
-                )
-
-            executor = self._get_or_create_shared_pool(
-                artifact_key=artifact_key,
-                requested_mode=requested_mode,
-                reset_pool=reset_pool,
-                create_pool=_create_pool,
+            executor = self._prepare_job_executor_for_run(
+                job_id=job_id,
+                job_id_snapshot=job_id_snapshot,
+                artifact_key=pool_spec.artifact_key,
+                requested_mode=pool_request.requested_mode,
+                reset_pool=pool_request.reset_pool,
+                create_pool=pool_spec.create_pool,
+                prepared_update_globals=prepared_update_globals,
+                phase_log=False,
             )
-            executor._job_id = job_id_snapshot  # noqa: SLF001
-            with self._lock:
-                self._current_executor = executor
-            if prepared_update_globals:
-                with self._lock:
-                    state = self._jobs.get(job_id)
-                    if state is not None:
-                        state.checkpoint["phase"] = "fanout_globals"
-                logger.info(
-                    "[JobQueue] update_globals job_id=%s key_count=%d",
-                    job_id_snapshot,
-                    len(prepared_update_globals),
-                )
-                executor.update_globals(dict(prepared_update_globals))
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
                     state.checkpoint["phase"] = "running_tasks"
+                    state.timing["task_count"] = len(subtasks)
+            running_started = time.monotonic()
+            first_result_wait_ms = 0.0
             submit_resp = executor.submit_payloads(
                 subtasks,
                 job_id=job_id_snapshot,
@@ -1474,18 +1982,30 @@ class JobQueueManager:
                 len(list(submit_resp.rejected or ())),
             )
             pending = {str(item.task_id or "").strip() for item in submit_resp.accepted}
-            results: List[pb2.TaskResult] = []
+            rendered_results: List[Dict[str, object]] = []
+            has_failed = False
             deadline = time.monotonic() + float(payload.get("wait_timeout_sec", 3600.0) or 3600.0)
             chunk_timeout = max(0.5, min(10.0, float(payload.get("wait_chunk_timeout_sec", 5.0) or 5.0)))
             if pending and not hasattr(executor, "iter_results") and hasattr(executor, "wait_for_results"):
-                results = list(
-                    executor.wait_for_results(
-                        expected_count=len(pending),
-                        timeout_sec=max(0.1, deadline - time.monotonic()),
-                        wait_ms=int(payload.get("wait_ms", 500) or 500),
-                        job_id=job_id_snapshot,
-                    )
+                wait_results = executor.wait_for_results(
+                    expected_count=len(pending),
+                    timeout_sec=max(0.1, deadline - time.monotonic()),
+                    wait_ms=int(payload.get("wait_ms", 500) or 500),
+                    job_id=job_id_snapshot,
                 )
+                saw_result = False
+                for item in wait_results:
+                    saw_result = True
+                    tid = str(item.task_id or "").strip()
+                    if tid in pending:
+                        pending.discard(tid)
+                    if item.status != pb2.TASK_STATUS_SUCCEEDED:
+                        has_failed = True
+                    rendered_results.append(
+                        _task_result_to_dict(item, serialization_mode=pool_request.requested_mode)
+                    )
+                if saw_result:
+                    first_result_wait_ms = _ms(time.monotonic() - running_started)
                 pending.clear()
             while pending:
                 if time.monotonic() >= deadline:
@@ -1499,43 +2019,55 @@ class JobQueueManager:
                     except Exception:
                         pass
                     break
-                batch = list(
-                    executor.iter_results(
-                        max_count=min(len(pending), int(payload.get("result_limit", 100) or 100)),
-                        timeout_sec=chunk_timeout,
-                        wait_ms=int(payload.get("wait_ms", 500) or 500),
-                        job_id=job_id_snapshot,
-                    )
-                )
-                for item in batch:
+                batch_count = 0
+                for item in executor.iter_results(
+                    max_count=min(len(pending), int(payload.get("result_limit", 100) or 100)),
+                    timeout_sec=chunk_timeout,
+                    wait_ms=int(payload.get("wait_ms", 500) or 500),
+                    job_id=job_id_snapshot,
+                ):
+                    batch_count += 1
                     tid = str(item.task_id or "").strip()
                     if tid in pending:
                         pending.discard(tid)
-                    results.append(item)
-                if not batch:
+                    if item.status != pb2.TASK_STATUS_SUCCEEDED:
+                        has_failed = True
+                    rendered_results.append(
+                        _task_result_to_dict(item, serialization_mode=pool_request.requested_mode)
+                    )
+                if batch_count and first_result_wait_ms <= 0.0:
+                    first_result_wait_ms = _ms(time.monotonic() - running_started)
+                if not batch_count:
                     time.sleep(0.05)
-            rendered_results = [_task_result_to_dict(item, serialization_mode=requested_mode) for item in results]
+            running_tasks_ms = _ms(time.monotonic() - running_started)
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is None:
                     return
+                state.timing["result_count"] = len(rendered_results)
+                state.timing["first_result_wait_ms"] = first_result_wait_ms
+                state.timing["running_tasks_ms"] = running_tasks_ms
                 state.results = rendered_results
                 state.finished_at = utc_now()
                 if state.cancel_requested:
                     state.status = "CANCELLED"
-                elif any(item.status != pb2.TASK_STATUS_SUCCEEDED for item in results):
+                elif has_failed:
                     state.status = "FAILED"
                     state.error = "one or more subtasks failed"
                 else:
                     state.status = "SUCCEEDED"
+                self._refresh_job_previews_locked(job_id)
+                self._job_timing_finalize_locked(job_id)
         except Exception as exc:
             logger.exception("[JobQueue] run job failed job_id=%s", job_id_snapshot)
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
+                    self._job_timing_finalize_locked(job_id)
                     state.status = "FAILED"
                     state.finished_at = utc_now()
                     state.error = str(exc)
+                    self._refresh_job_previews_locked(job_id)
 
     def _run_job_with_hooks(
         self,
@@ -1558,6 +2090,7 @@ class JobQueueManager:
                     state.status = "FAILED"
                     state.finished_at = utc_now()
                     state.error = "job hook mode requires blob_b64/blob_ref"
+                    self._invalidate_summary_locked()
             return
 
         package_format = str(payload.get("package_format", "py") or "py").strip() or "py"
@@ -1565,9 +2098,7 @@ class JobQueueManager:
         task_entry_callable = str(payload.get("entry_callable", "run") or "run").strip() or "run"
         raw_task_generator = payload.get("task_generator_callable", "task_generator")
         task_resource_paths = [str(item).strip() for item in list(payload.get("task_resource_paths") or ()) if str(item).strip()]
-        raw_requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
-        requested_mode = self._resolve_requested_task_mode(payload)
-        reset_pool = bool(payload.get("reset_pool", False))
+        pool_request = self._resolve_job_shared_pool_request(payload)
         handle_result_callable = (
             str(payload.get("handle_result_callable", "") or "").strip()
         )
@@ -1591,8 +2122,8 @@ class JobQueueManager:
                 "[JobQueue] run job_id=%s mode=hooks entry_module=%s requested_mode=%s reset_pool=%s",
                 job_id_snapshot,
                 entry_module,
-                requested_mode,
-                reset_pool,
+                pool_request.requested_mode,
+                pool_request.reset_pool,
             )
             tmp_path.write_bytes(blob)
             module = _load_user_module(
@@ -1619,6 +2150,8 @@ class JobQueueManager:
             hook_kwargs = _normalize_job_payload(raw_job_payload)
             hook_kwargs.setdefault("job_id", job_id_snapshot)
             hook_kwargs.setdefault("client_id", client_id)
+            with self._lock:
+                self._job_timing_mark_locked(job_id, "select_nodes")
             prepared_update_globals = _resolve_job_hook_mapping(
                 raw_update_globals,
                 module=module,
@@ -1632,80 +2165,33 @@ class JobQueueManager:
                     for name in prepared_update_globals.keys()
                     if str(name).strip()
                 ]
-            default_worker_count = _default_job_worker_count()
-            default_node_count = _default_job_node_count(
-                controlplane_target=self._controlplane_target,
-                payload=payload,
-            )
-
-            artifact_key = self._shared_pool_artifact_key(
-                blob=blob,
-                runtime=str(payload.get("runtime", "py3") or "py3"),
-                entry_module=entry_module,
-                entry_callable=task_entry_callable,
-                package_format=package_format,
-                dependency_allowlist=list(payload.get("dependency_allowlist") or ()),
-                managed_global_names=effective_managed_global_names,
-                task_resource_paths=task_resource_paths,
-            )
-
-            def _create_pool(mode: str) -> TaskPool:
-                task_pool_kwargs = {
-                    "infocenter_target": self._controlplane_target,
-                    "job_id": job_id_snapshot,
-                    "owner_client_id": client_id,
-                    "pool_name": str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
-                    "runtime": str(payload.get("runtime", "py3") or "py3"),
-                    "serialization_mode": raw_requested_mode or "",
-                    "policy_id": self._taskpool_policy_id,
-                    "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
-                    "managed_global_names": effective_managed_global_names,
-                    "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", default_worker_count)) or default_worker_count)),
-                    "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
-                    "idle_ttl_sec": max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
-                    "healthy_only": bool(payload.get("healthy_only", True)),
-                    "tags": list(payload.get("tags") or ()),
-                    "node_ids": list(payload.get("node_ids") or ()),
-                    "node_count": max(0, int(payload.get("pool_node_count", payload.get("node_count", default_node_count) or default_node_count) or 0)),
-                    "node_limit": int(payload.get("node_limit", 100) or 100),
-                    "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
-                }
-                if task_resource_paths:
-                    task_pool_kwargs.update(
-                        source=module,
-                        entry_callable=task_entry_callable,
-                        resource_paths=task_resource_paths,
-                    )
-                else:
-                    task_pool_kwargs["entry_func"] = task_entry
-                return _create_job_task_pool(**task_pool_kwargs)
-
-            executor = self._get_or_create_shared_pool(
-                artifact_key=artifact_key,
-                requested_mode=requested_mode,
-                reset_pool=reset_pool,
-                create_pool=_create_pool,
-            )
-            executor._job_id = job_id_snapshot  # noqa: SLF001
             with self._lock:
-                self._current_executor = executor
+                self._job_timing_finish_locked(job_id, "select_nodes", "select_nodes_ms")
 
-            if prepared_update_globals:
-                with self._lock:
-                    current_state = self._jobs.get(job_id)
-                    if current_state is not None:
-                        current_state.checkpoint["phase"] = "fanout_globals"
-                logger.info(
-                    "[JobQueue] phase=fanout_globals job_id=%s key_count=%d",
-                    job_id_snapshot,
-                    len(prepared_update_globals),
-                )
-                executor.update_globals(dict(prepared_update_globals))
-                logger.info(
-                    "[JobQueue] phase=fanout_globals_done job_id=%s key_count=%d",
-                    job_id_snapshot,
-                    len(prepared_update_globals),
-                )
+            pool_spec = self._build_hook_job_task_pool_spec(
+                payload=payload,
+                client_id=client_id,
+                job_id_snapshot=job_id_snapshot,
+                pool_request=pool_request,
+                blob=blob,
+                package_format=package_format,
+                entry_module=entry_module,
+                task_entry_callable=task_entry_callable,
+                task_resource_paths=task_resource_paths,
+                module=module,
+                task_entry=task_entry,
+                effective_managed_global_names=effective_managed_global_names,
+            )
+            executor = self._prepare_job_executor_for_run(
+                job_id=job_id,
+                job_id_snapshot=job_id_snapshot,
+                artifact_key=pool_spec.artifact_key,
+                requested_mode=pool_request.requested_mode,
+                reset_pool=pool_request.reset_pool,
+                create_pool=pool_spec.create_pool,
+                prepared_update_globals=prepared_update_globals,
+                phase_log=True,
+            )
 
             produced = _resolve_task_generator_output(
                 task_generator,
@@ -1726,6 +2212,11 @@ class JobQueueManager:
             state_obj: object = payload.get("initial_state")
             if state_obj is None:
                 state_obj = {"results": []}
+            if isinstance(produced, list):
+                with self._lock:
+                    current_state = self._jobs.get(job_id)
+                    if current_state is not None:
+                        current_state.timing["task_count"] = len(produced)
             rendered_results: List[Dict[str, object]] = []
             with self._lock:
                 current_state = self._jobs.get(job_id)
@@ -1737,6 +2228,8 @@ class JobQueueManager:
                 _resolve_job_executor_max_in_flight(executor, payload.get("max_in_flight")),
                 max(1, int(payload.get("receive_batch", 10) or 10)),
             )
+            running_started = time.monotonic()
+            first_result_wait_ms = 0.0
             stream = executor.imap_unordered(
                 _payload_stream(),
                 max_in_flight=_resolve_job_executor_max_in_flight(executor, payload.get("max_in_flight")),
@@ -1785,14 +2278,24 @@ class JobQueueManager:
                     )
                     if returned_state is not None:
                         state_obj = returned_state
+                if first_result_wait_ms <= 0.0:
+                    first_result_wait_ms = _ms(time.monotonic() - running_started)
             logger.info(
                 "[JobQueue] phase=running_tasks_done job_id=%s count=%d",
                 job_id_snapshot,
                 len(rendered_results),
             )
+            running_tasks_ms = _ms(time.monotonic() - running_started)
+            with self._lock:
+                current_state = self._jobs.get(job_id)
+                if current_state is not None:
+                    current_state.timing["result_count"] = len(rendered_results)
+                    current_state.timing["first_result_wait_ms"] = first_result_wait_ms
+                    current_state.timing["running_tasks_ms"] = running_tasks_ms
 
             final_result = state_obj
             if finalize is not None:
+                finalize_started = time.monotonic()
                 with self._lock:
                     current_state = self._jobs.get(job_id)
                     if current_state is not None:
@@ -1810,6 +2313,11 @@ class JobQueueManager:
                 )
                 if finalized is not None:
                     final_result = finalized
+                finalize_ms = _ms(time.monotonic() - finalize_started)
+                with self._lock:
+                    current_state = self._jobs.get(job_id)
+                    if current_state is not None:
+                        current_state.timing["finalize_ms"] = finalize_ms
                 logger.info(
                     "[JobQueue] phase=finalize_done job_id=%s final_type=%s",
                     job_id_snapshot,
@@ -1826,6 +2334,7 @@ class JobQueueManager:
                 len(rendered_results),
                 type(final_result).__name__,
             )
+            terminal_writeback_started = time.monotonic()
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is None:
@@ -1838,6 +2347,9 @@ class JobQueueManager:
                 else:
                     state.status = "SUCCEEDED"
                 state.checkpoint["phase"] = "terminal_done"
+                state.timing["terminal_writeback_ms"] = _ms(time.monotonic() - terminal_writeback_started)
+                self._refresh_job_previews_locked(job_id)
+                self._job_timing_finalize_locked(job_id)
             logger.info(
                 "[JobQueue] phase=terminal_done job_id=%s status=%s results=%d",
                 job_id_snapshot,
@@ -1849,9 +2361,11 @@ class JobQueueManager:
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
+                    self._job_timing_finalize_locked(job_id)
                     state.status = "FAILED"
                     state.finished_at = utc_now()
                     state.error = str(exc)
+                    self._refresh_job_previews_locked(job_id)
         finally:
             stream = None
             produced = None

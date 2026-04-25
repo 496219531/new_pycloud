@@ -30,6 +30,11 @@ class CandidateBreakerState:
 
 def classify_service_error(exc: Exception, *, route_failure: bool = False) -> str:
     message = str(exc or "").strip()
+    data = getattr(exc, "data", None)
+    if isinstance(data, dict):
+        error_type = str(data.get("error_type", "") or "")
+        error = str(data.get("error", "") or "")
+        message = " ".join(part for part in (message, error_type, error) if part)
     lowered = message.lower()
     if route_failure:
         return ROUTE_UNAVAILABLE

@@ -14,7 +14,6 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from pycloud_parallel import JobQueue, Service, TaskPool
-from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 
 from calc_asset_ratio.ok import calc_asset_ratio
 import calc_asset_ratio_job_module
@@ -302,7 +301,7 @@ def calc_fund_list_asset_ratio2(
         t1 = time.time()
         print(t1 - t0)
         results = []
-        for _task_id, data in pool.unordered(payloads, timeout_sec=300,max_in_flight=32):
+        for _task_id, data in pool.unordered(payloads, timeout_sec=300):
             results.append(_normalize_result_item(data))
         t2 = time.time()
         print(t2 - t1)
@@ -333,7 +332,6 @@ def calc_fund_list_asset_ratio_taskpool_aunordered(
             items = []
             async for item in pool.aunordered(
                 payloads,
-                max_in_flight=32,
                 timeout_sec=300.0,
             ):
                 items.append(item)
@@ -393,7 +391,6 @@ def calc_fund_list_asset_ratio_job(
         CONTROLPLANE_TARGET,
         client_id=client_id,
         timeout_sec=300.0,
-        # serialization_mode=TASKPOOL_SERIALIZATION_MODE,
     ) as client:
         resp = client.submit_job_from_module(
             module=calc_asset_ratio_job_module,
@@ -514,14 +511,14 @@ if __name__ == "__main__":
         1652875,
     ]
     t1 = time.time()
-    result = calc_fund_list_asset_ratio(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)

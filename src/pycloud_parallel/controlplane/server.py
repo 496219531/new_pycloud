@@ -381,7 +381,7 @@ def main() -> None:
     def _sync_routes_now() -> None:
         registrar = registrar_holder["value"]
         if registrar is not None:
-            registrar.sync_now()
+            registrar.request_sync()
 
     server, state = build_nodecontrol_server(
         bind,

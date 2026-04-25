@@ -575,7 +575,7 @@ class QueueServiceClient:
     def recent_job_ids(self) -> List[str]:
         return list(self._recent_job_ids)
 
-    def get_job_status(self, job_id: str) -> Dict[str, object]:
+    def get_job_status(self, job_id: str, *, include_details: bool = False) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
             raise ValueError("JobQueue.get_job_status() requires job_id")
@@ -583,7 +583,7 @@ class QueueServiceClient:
         call_kwargs = {
             "service_name": self.service_name,
             "method": "get_job_status",
-            "payload": {"job_id": normalized},
+            "payload": {"job_id": normalized, "include_details": bool(include_details)},
             "timeout_sec": self.timeout_sec,
         }
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
@@ -684,16 +684,19 @@ class QueueServiceClient:
         *,
         timeout_sec: float = 30.0,
         poll_interval_sec: float = 0.5,
+        include_details: bool = True,
     ) -> Dict[str, object]:
         normalized = str(job_id or "").strip()
         if not normalized:
             raise ValueError("JobQueue.wait_for_terminal() requires job_id")
         deadline = time.time() + max(0.1, float(timeout_sec))
         while time.time() < deadline:
-            payload = self.get_job_status(normalized)
+            payload = self.get_job_status(normalized, include_details=False)
             job = dict(payload.get("job") or {})
             status = str(job.get("status", "") or "")
             if status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                if include_details:
+                    return self.get_job_status(normalized, include_details=True)
                 return payload
             time.sleep(max(0.05, float(poll_interval_sec)))
         raise TimeoutError(f"job did not reach terminal state before timeout: {normalized}")

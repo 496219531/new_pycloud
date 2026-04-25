@@ -21,6 +21,8 @@ from pycloud_parallel.controlplane.gateway_http import GatewayCallError, Gateway
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
+from pycloud_parallel.controlplane.policy_profile import get_policy_profile
 from pycloud_parallel.controlplane.server import (
     build_controlplane_server,
     build_gateway_server,
@@ -70,6 +72,63 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Ser
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
     return server, f"127.0.0.1:{port}", state
+
+
+def _gateway_route_variant(index: int, *, service_name: str = "svc-gateway-retry") -> InfoCenterServiceRoute:
+    return InfoCenterServiceRoute(
+        service_name=service_name,
+        service_id=f"svc-gw-{index}",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_instance_id=f"node-gw-{index}-inst",
+        node_id=f"node-gw-{index}",
+        control_addr=f"127.0.0.1:{50060 + index}",
+        node_healthy=True,
+        worker_count=1,
+        alive_workers=1,
+        in_flight=0,
+        lease_expire_at=datetime.now(timezone.utc),
+        http_base_url=f"http://127.0.0.1:{18080 + index}/svc/svc-gw-{index}",
+    )
+
+
+class _SequenceRouteCache:
+    def __init__(self, routes):
+        self.routes = list(routes)
+        self.failures = []
+        self.successes = []
+        self.releases = []
+        self.observations = []
+        self.refreshes = []
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False):
+        del service_name, force_refresh
+        excluded = set(exclude_service_ids or ())
+        for route in self.routes:
+            if route.service_id not in excluded:
+                return route
+        raise RuntimeError("no available route")
+
+    def refresh(self, service_name: str, force: bool = False):
+        self.refreshes.append((service_name, force))
+        return list(self.routes)
+
+    def mark_success(self, route) -> None:
+        self.successes.append(route.service_id)
+
+    def mark_failure(self, route, error: str) -> None:
+        self.failures.append((route.service_id, error))
+
+    def release_route(self, route) -> None:
+        self.releases.append(route.service_id)
+
+    def record_call_observation(self, service_name: str, **kwargs) -> None:
+        self.observations.append((service_name, kwargs))
 
 
 def _create_exported_service(target: str, service_name: str) -> str:
@@ -214,6 +273,19 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
             assert sorted(item["method"] for item in methods) == ["add", "mul"]
             body = gateway.call(service_name="svc_gateway_controlplane", method="mul", payload={"value": 6}, timeout_sec=5.0)
             assert body["data"]["square"] == 36
+            bytes_body = gateway.call(
+                service_name="svc_gateway_controlplane",
+                method="mul",
+                payload={"value": 9},
+                timeout_sec=5.0,
+                serialization_mode="structured_v1",
+                effective_policy=resolve_effective_policy(
+                    get_policy_profile("trusted_internal"),
+                    requested_mode="structured_v1",
+                    context="gateway_public",
+                ),
+            )
+            assert bytes_body["data"]["square"] == 81
 
         with GatewayServiceClient(controlplane.base_url, timeout_sec=5.0) as module_client:
             assert sorted(item["method"] for item in module_client.list_methods(service_name="svc_gateway_controlplane", include_docs=False)) == ["add", "mul"]
@@ -706,6 +778,147 @@ def test_gateway_route_cache_defaults_to_predicted_busy():
         assert cache.select_route("svc-gateway-cache", force_refresh=True).service_id == "svc-low-predicted"
     finally:
         cache.stop()
+
+
+def test_gateway_route_cache_uses_local_inflight_before_infocenter_refresh():
+    class _StaticSource:
+        def __init__(self, routes):
+            self._routes = list(routes)
+
+        def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int):
+            del service_name, healthy_only, limit
+            return list(self._routes)
+
+    routes = [
+        InfoCenterServiceRoute(
+            service_name="svc-gateway-cache",
+            service_id="svc-busier-snapshot",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_instance_id="node-1-inst",
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            node_healthy=True,
+            worker_count=2,
+            alive_workers=2,
+            in_flight=1,
+            lease_expire_at=datetime.now(timezone.utc),
+            http_base_url="http://127.0.0.1:18081/svc/svc-busier-snapshot",
+            predicted_busy=40.0,
+        ),
+        InfoCenterServiceRoute(
+            service_name="svc-gateway-cache",
+            service_id="svc-lower-snapshot",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_instance_id="node-2-inst",
+            node_id="node-2",
+            control_addr="127.0.0.1:50062",
+            node_healthy=True,
+            worker_count=2,
+            alive_workers=2,
+            in_flight=3,
+            lease_expire_at=datetime.now(timezone.utc),
+            http_base_url="http://127.0.0.1:18082/svc/svc-lower-snapshot",
+            predicted_busy=12.0,
+        ),
+    ]
+    cache = GatewayRouteCache(source=_StaticSource(routes), refresh_interval_sec=60.0)
+    try:
+        first = cache.select_route("svc-gateway-cache", force_refresh=True)
+        second = cache.select_route("svc-gateway-cache")
+
+        assert first.service_id == "svc-lower-snapshot"
+        assert second.service_id == "svc-busier-snapshot"
+
+        cache.mark_success(first)
+        cache.mark_success(second)
+
+        assert cache.select_route("svc-gateway-cache").service_id == "svc-lower-snapshot"
+    finally:
+        cache.stop()
+
+
+def test_gateway_route_cache_route_failure_opens_breaker_immediately():
+    route = _gateway_route_variant(1, service_name="svc-gateway-cache")
+
+    class _StaticSource:
+        def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int):
+            del service_name, healthy_only, limit
+            return [route]
+
+    cache = GatewayRouteCache(
+        source=_StaticSource(),
+        refresh_interval_sec=60.0,
+        failure_threshold=3,
+        open_sec=5.0,
+    )
+    try:
+        selected = cache.select_route("svc-gateway-cache", force_refresh=True)
+        cache.mark_failure(selected, "connection refused")
+
+        with pytest.raises(RuntimeError, match="no available route"):
+            cache.select_route("svc-gateway-cache")
+    finally:
+        cache.stop()
+
+
+def test_gateway_call_failover_tries_all_candidate_routes():
+    routes = [_gateway_route_variant(i) for i in range(1, 5)]
+    route_cache = _SequenceRouteCache(routes)
+    app = GatewayHttpApp(route_cache=route_cache)
+    attempts = []
+
+    def _fake_invoke(self, route, *, method, payload, timeout_sec, service_token, serialization_mode=""):
+        del self
+        del method, payload, timeout_sec, service_token, serialization_mode
+        attempts.append(route.service_id)
+        if route.service_id in {"svc-gw-1", "svc-gw-2"}:
+            raise GatewayCallError(status_code=502, data={"ok": False, "error": "connection refused"})
+        return {"ok": True, "data": {"route": route.service_id}}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(GatewayHttpApp, "_invoke_route", _fake_invoke)
+        code, body = app.handle_post(
+            path="/svc/svc-gateway-retry/call/run?timeout_sec=5.000",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"x": 1}).encode("utf-8"),
+        )
+
+    assert code == 200
+    assert body["data"]["route"] == "svc-gw-3"
+    assert attempts == ["svc-gw-1", "svc-gw-2", "svc-gw-3"]
+    assert [item[0] for item in route_cache.failures] == ["svc-gw-1", "svc-gw-2"]
+    assert route_cache.successes == ["svc-gw-3"]
+    assert route_cache.observations[-1][1]["route_attempt_count"] == 3
+    assert route_cache.observations[-1][1]["failed_route_count"] == 2
+    assert route_cache.observations[-1][1]["last_failed_route_id"] == "svc-gw-2"
+    assert route_cache.observations[-1][1]["selected_route_id"] == "svc-gw-3"
+
+
+def test_gateway_call_user_error_does_not_failover():
+    routes = [_gateway_route_variant(i) for i in range(1, 3)]
+    route_cache = _SequenceRouteCache(routes)
+    app = GatewayHttpApp(route_cache=route_cache)
+    attempts = []
+
+    def _fake_invoke(self, route, *, method, payload, timeout_sec, service_token, serialization_mode=""):
+        del self
+        del method, payload, timeout_sec, service_token, serialization_mode
+        attempts.append(route.service_id)
+        raise GatewayCallError(status_code=400, data={"ok": False, "error_type": "UserError", "error": "bad args"})
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(GatewayHttpApp, "_invoke_route", _fake_invoke)
+        code, body = app.handle_post(
+            path="/svc/svc-gateway-retry/call/run?timeout_sec=5.000",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"x": 1}).encode("utf-8"),
+        )
+
+    assert code == 400
+    assert body["error"] == "bad args"
+    assert attempts == ["svc-gw-1"]
+    assert route_cache.failures == []
+    assert route_cache.releases == ["svc-gw-1"]
 
 
 def test_standalone_gateway_reads_routes_from_infocenter(tmp_path):

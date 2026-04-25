@@ -19,6 +19,7 @@ from pycloud_parallel.execution.failover import (
 )
 from pycloud_parallel.execution.scheduler import (
     SERVICE_DEFAULT,
+    StrategyProfile,
     resolve_service_strategy,
     SchedulerCandidate,
     SchedulerState,
@@ -54,6 +55,8 @@ class _DiscoveryRouteCache:
         self._lock = threading.Lock()
         self._snapshots: Dict[str, _ServiceRouteSnapshot] = {}
         self._local_state: Dict[Tuple[str, str], CandidateBreakerState] = {}
+        self._local_inflight: Dict[Tuple[str, str], int] = {}
+        self._last_call_observation: Dict[str, Dict[str, object]] = {}
         self._route_index: Dict[str, int] = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -108,6 +111,15 @@ class _DiscoveryRouteCache:
         with self._lock:
             if force or name not in self._snapshots or rows:
                 self._snapshots[name] = snapshot
+            valid_ids = {str(getattr(route, "service_id", "") or "") for route in rows}
+            for key in list(self._local_state.keys()):
+                svc_name, svc_id = key
+                if svc_name == name and ((valid_ids and svc_id not in valid_ids) or not valid_ids):
+                    self._local_state.pop(key, None)
+            for key in list(self._local_inflight.keys()):
+                svc_name, svc_id = key
+                if svc_name == name and ((valid_ids and svc_id not in valid_ids) or not valid_ids):
+                    self._local_inflight.pop(key, None)
         return rows
 
     def get_routes(self, service_name: str) -> Sequence[object]:
@@ -129,7 +141,33 @@ class _DiscoveryRouteCache:
             "refreshed_at": snapshot.refreshed_at.isoformat() if snapshot is not None else "",
             "route_count": len(routes),
             "routes": routes,
+            "last_call": self._last_call_info(str(service_name or "").strip()),
         }
+
+    def record_call_observation(
+        self,
+        service_name: str,
+        *,
+        route_attempt_count: int,
+        failed_route_count: int,
+        last_failed_route_id: str = "",
+        selected_route_id: str = "",
+    ) -> None:
+        name = str(service_name or "").strip()
+        if not name:
+            return
+        with self._lock:
+            self._last_call_observation[name] = {
+                "route_attempt_count": int(route_attempt_count or 0),
+                "failed_route_count": int(failed_route_count or 0),
+                "last_failed_route_id": str(last_failed_route_id or ""),
+                "selected_route_id": str(selected_route_id or ""),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    def _last_call_info(self, service_name: str) -> Dict[str, object]:
+        with self._lock:
+            return dict(self._last_call_observation.get(str(service_name or "").strip(), {}))
 
     def select_route(
         self,
@@ -160,17 +198,28 @@ class _DiscoveryRouteCache:
             with self._lock:
                 idx = self._route_index.get(name, 0)
                 self._route_index[name] = idx + 1
-            return candidates[idx % len(candidates)]
+            selected_route = candidates[idx % len(candidates)]
+            self._reserve_route(selected_route)
+            return selected_route
         normalized_strategy, profile = resolve_service_strategy(strategy)
         if normalized_strategy == "round_robin":
             candidates.sort(key=lambda route: (_node_instance_key_from_route(route), route.service_id))
             with self._lock:
                 idx = self._route_index.get(name, 0)
                 self._route_index[name] = idx + 1
-            return candidates[idx % len(candidates)]
+            selected_route = candidates[idx % len(candidates)]
+            self._reserve_route(selected_route)
+            return selected_route
         if normalized_strategy == "least_inflight":
-            candidates.sort(key=lambda route: _route_sort_key(route, strategy=normalized_strategy))
-            return candidates[0]
+            candidates.sort(
+                key=lambda route: (
+                    self._local_inflight_count(name, str(route.service_id)),
+                    _route_sort_key(route, strategy=normalized_strategy),
+                )
+            )
+            selected_route = candidates[0]
+            self._reserve_route(selected_route)
+            return selected_route
         scheduler_candidates: List[SchedulerCandidate] = []
         recent_failures: Dict[str, int] = {}
         for route in candidates:
@@ -197,19 +246,66 @@ class _DiscoveryRouteCache:
         with self._lock:
             idx = self._route_index.get(name, 0)
             self._route_index[name] = idx + 1
+        route_profile = StrategyProfile(
+            name=f"route_cache_{(profile or SERVICE_DEFAULT).name}",
+            weights={"local_inflight": 8.0, **dict((profile or SERVICE_DEFAULT).weights)},
+            tie_break=(profile or SERVICE_DEFAULT).tie_break,
+            failure_penalty=(profile or SERVICE_DEFAULT).failure_penalty,
+        )
         selected = select_one_candidate(
             scheduler_candidates,
-            profile=profile or SERVICE_DEFAULT,
-            state=SchedulerState(recent_submit_failures=recent_failures),
+            profile=route_profile,
+            state=SchedulerState(
+                local_inflight_by_candidate=self._local_inflight_snapshot(name, candidates),
+                recent_submit_failures=recent_failures,
+            ),
             round_robin_counter=idx,
         )
         for route in candidates:
             if str(route.service_id) == str(selected.id):
                 if self.before_probe(route):
+                    self._reserve_route(route)
                     return route
                 break
         candidates.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
-        return candidates[0]
+        selected_route = candidates[0]
+        self._reserve_route(selected_route)
+        return selected_route
+
+    def _local_inflight_count(self, service_name: str, service_id: str) -> int:
+        with self._lock:
+            return int(self._local_inflight.get((str(service_name or "").strip(), str(service_id or "").strip()), 0) or 0)
+
+    def _local_inflight_snapshot(self, service_name: str, routes: Sequence[object]) -> Dict[str, int]:
+        name = str(service_name or "").strip()
+        with self._lock:
+            return {
+                str(getattr(route, "service_id", "") or ""): int(
+                    self._local_inflight.get((name, str(getattr(route, "service_id", "") or "")), 0) or 0
+                )
+                for route in routes
+            }
+
+    def _reserve_route(self, route) -> None:
+        key = (str(getattr(route, "service_name", "") or "").strip(), str(getattr(route, "service_id", "") or "").strip())
+        if not key[0] or not key[1]:
+            return
+        with self._lock:
+            self._local_inflight[key] = int(self._local_inflight.get(key, 0) or 0) + 1
+
+    def _release_route(self, route) -> None:
+        key = (str(getattr(route, "service_name", "") or "").strip(), str(getattr(route, "service_id", "") or "").strip())
+        if not key[0] or not key[1]:
+            return
+        with self._lock:
+            current = int(self._local_inflight.get(key, 0) or 0)
+            if current <= 1:
+                self._local_inflight.pop(key, None)
+            else:
+                self._local_inflight[key] = current - 1
+
+    def release_route(self, route) -> None:
+        self._release_route(route)
 
     def _route_available(self, service_name: str, service_id: str) -> bool:
         key = (service_name, service_id)
@@ -233,9 +329,9 @@ class _DiscoveryRouteCache:
         key = (route.service_name, route.service_id)
         with self._lock:
             state = self._local_state.get(key)
-            if state is None:
-                return
-            mark_candidate_success(state)
+            if state is not None:
+                mark_candidate_success(state)
+        self._release_route(route)
 
     def mark_failure(self, route, error: str) -> None:
         key = (route.service_name, route.service_id)
@@ -248,7 +344,8 @@ class _DiscoveryRouteCache:
                 state,
                 failure_kind=ROUTE_UNAVAILABLE,
                 error=RuntimeError(str(error or "")),
-                failure_threshold=self.failure_threshold,
+                failure_threshold=1,
                 cooldown_sec=self.open_sec,
                 max_cooldown_sec=self.open_sec,
             )
+        self._release_route(route)

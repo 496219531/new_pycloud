@@ -91,6 +91,7 @@ class DiscoveryServiceClient:
             "refreshed_at": info["refreshed_at"],
             "route_count": int(info["route_count"]),
             "routes": [client_mod._serialize_route(route) for route in routes],
+            "last_call": dict(info.get("last_call") or {}),
         }
 
     def download_result_to_file(self, response_or_data: object, *, target_path: str) -> Path:
@@ -162,9 +163,10 @@ class DiscoveryServiceClient:
             raise ValueError("method is required")
         token = self.service_token if service_token is None else str(service_token or "").strip()
         tried: Set[str] = set()
-        route = self._route_cache.select_route(name, strategy=strategy)
-        tried.add(route.service_id)
-        remaining_routes = list(self._route_cache.get_routes(name))
+        attempt_count = 0
+        failed_count = 0
+        last_failed_route_id = ""
+        last_error: Optional[Exception] = None
 
         def _prepare_payload_for_route(selected_route: object) -> Dict[str, object]:
             control_addr = str(getattr(selected_route, "control_addr", "") or "").strip()
@@ -188,80 +190,87 @@ class DiscoveryServiceClient:
                 with contextlib.suppress(Exception):
                     route_client.close()
 
-        try:
-            prepared_payload = _prepare_payload_for_route(route)
-        except Exception as exc:
-            self._route_cache.mark_failure(route, str(exc))
-            retry_candidates = [
-                item
-                for item in remaining_routes
-                if str(getattr(item, "service_id", "") or "") not in tried
-            ]
-            if not should_failover(STAGING_FAILED, has_alternative_candidate=bool(retry_candidates)):
-                raise RuntimeError(str(exc)) from exc
-            self._route_cache.refresh(name, force=True)
-            retry_route = self._route_cache.select_route(name, exclude_service_ids=tried, strategy=strategy)
-            tried.add(retry_route.service_id)
-            retry_payload = _prepare_payload_for_route(retry_route)
-            resp = client_mod._call_route_http(
-                retry_route,
-                method=method_name,
-                payload=retry_payload,
-                timeout_sec=max(0.1, float(timeout_sec)),
-                service_token=token,
-                **({"effective_policy": effective_policy} if effective_policy is not None else {}),
-            )
-            self._route_cache.mark_success(retry_route)
-            return self._attach_controlplane_locator(resp, route=retry_route)
-        try:
-            call_kwargs = {
-                "method": method_name,
-                "payload": prepared_payload,
-                "timeout_sec": max(0.1, float(timeout_sec)),
-                "service_token": token,
-            }
-            if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
-                call_kwargs["serialization_mode"] = serialization_mode
-            if effective_policy is not None:
-                call_kwargs["effective_policy"] = effective_policy
-            resp = client_mod._call_route_http(route, **call_kwargs)
-            self._route_cache.mark_success(route)
-            return self._attach_controlplane_locator(resp, route=route)
-        except client_mod.DiscoveryCallError as exc:
-            failure_kind = classify_service_error(exc, route_failure=client_mod._is_route_failure(exc))
-            if not should_failover(
-                failure_kind,
-                has_alternative_candidate=bool(
+        def _record_observation(*, selected_route_id: str = "") -> None:
+            recorder = getattr(self._route_cache, "record_call_observation", None)
+            if callable(recorder):
+                recorder(
+                    name,
+                    route_attempt_count=attempt_count,
+                    failed_route_count=failed_count,
+                    last_failed_route_id=last_failed_route_id,
+                    selected_route_id=selected_route_id,
+                )
+
+        def _has_untried_cached_route() -> bool:
+            try:
+                return bool(
                     [
                         item
-                        for item in remaining_routes
+                        for item in self._route_cache.get_routes(name)
                         if str(getattr(item, "service_id", "") or "") not in tried
                     ]
-                ),
-            ):
-                raise RuntimeError(str(exc)) from exc
-            self._route_cache.mark_failure(route, str(exc))
-            self._route_cache.refresh(name, force=True)
-            retry_route = self._route_cache.select_route(name, exclude_service_ids=tried, strategy=strategy)
+                )
+            except Exception:
+                return True
+
+        while True:
             try:
-                retry_payload = _prepare_payload_for_route(retry_route)
-                retry_kwargs = {
+                route = self._route_cache.select_route(name, exclude_service_ids=tried, strategy=strategy)
+            except Exception as select_exc:
+                _record_observation()
+                if last_error is not None:
+                    raise RuntimeError(str(last_error)) from last_error
+                raise RuntimeError(str(select_exc)) from select_exc
+            route_id = str(getattr(route, "service_id", "") or "")
+            if route_id in tried:
+                self._route_cache.release_route(route)
+                _record_observation()
+                if last_error is not None:
+                    raise RuntimeError(str(last_error)) from last_error
+                raise RuntimeError(f"no untried route for service_name={name}")
+            tried.add(route_id)
+            attempt_count += 1
+            try:
+                prepared_payload = _prepare_payload_for_route(route)
+                call_kwargs = {
                     "method": method_name,
-                    "payload": retry_payload,
+                    "payload": prepared_payload,
                     "timeout_sec": max(0.1, float(timeout_sec)),
                     "service_token": token,
                 }
                 if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
-                    retry_kwargs["serialization_mode"] = serialization_mode
+                    call_kwargs["serialization_mode"] = serialization_mode
                 if effective_policy is not None:
-                    retry_kwargs["effective_policy"] = effective_policy
-                resp = client_mod._call_route_http(retry_route, **retry_kwargs)
-                self._route_cache.mark_success(retry_route)
-                return self._attach_controlplane_locator(resp, route=retry_route)
-            except client_mod.DiscoveryCallError as retry_exc:
-                if client_mod._is_route_failure(retry_exc):
-                    self._route_cache.mark_failure(retry_route, str(retry_exc))
-                raise RuntimeError(str(retry_exc)) from retry_exc
+                    call_kwargs["effective_policy"] = effective_policy
+                resp = client_mod._call_route_http(route, **call_kwargs)
+                self._route_cache.mark_success(route)
+                _record_observation(selected_route_id=route_id)
+                return self._attach_controlplane_locator(resp, route=route)
+            except client_mod.DiscoveryCallError as exc:
+                last_error = exc
+                failure_kind = classify_service_error(exc, route_failure=client_mod._is_route_failure(exc))
+                if not should_failover(failure_kind, has_alternative_candidate=_has_untried_cached_route()):
+                    self._route_cache.release_route(route)
+                    _record_observation()
+                    raise RuntimeError(str(exc)) from exc
+                failed_count += 1
+                last_failed_route_id = route_id
+                self._route_cache.mark_failure(route, str(exc))
+                with contextlib.suppress(Exception):
+                    self._route_cache.refresh(name, force=True)
+                continue
+            except Exception as exc:
+                last_error = exc
+                if not should_failover(STAGING_FAILED, has_alternative_candidate=_has_untried_cached_route()):
+                    self._route_cache.release_route(route)
+                    _record_observation()
+                    raise RuntimeError(str(exc)) from exc
+                failed_count += 1
+                last_failed_route_id = route_id
+                self._route_cache.mark_failure(route, str(exc))
+                with contextlib.suppress(Exception):
+                    self._route_cache.refresh(name, force=True)
+                continue
 
     def _list_methods_via_route(self, route: object, *, include_docs: bool) -> List[Dict[str, object]]:
         if not str(getattr(route, "control_addr", "") or "").strip():

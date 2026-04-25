@@ -25,6 +25,7 @@ from google.protobuf import timestamp_pb2
 
 from pycloud_parallel.controlplane.artifact import (
     _default_entry_module_for_module,
+    _packaging_kwargs,
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.config import (
@@ -1371,7 +1372,7 @@ def _auto_package_function(func: Callable) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        packager.package_function(func, output_file=tmp_path, include_tests=True)
+        packager.package_function(func, output_file=tmp_path, **_packaging_kwargs())
         with open(tmp_path, "rb") as f:
             return f.read()
     finally:
@@ -1384,7 +1385,7 @@ def _auto_package_function(func: Callable) -> bytes:
 def _package_directory_to_targz(dir_path: Path) -> Path:
     from pycloud_parallel.controlplane.dependency import DependencyPackager
 
-    return Path(DependencyPackager().package_directory(dir_path, include_tests=True))
+    return Path(DependencyPackager().package_directory(dir_path, **_packaging_kwargs()))
 
 
 def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
@@ -1394,8 +1395,7 @@ def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
         DependencyPackager().package_paths(
             root_dir=root_dir,
             paths=paths,
-            include_tests=True,
-            synthesize_missing_package_inits=True,
+            **_packaging_kwargs(synthesize_missing_package_inits=True),
         )
     )
 
@@ -1469,7 +1469,7 @@ def _prepare_code_blob(
         try:
             normalized_resource_paths = [str(item) for item in list(resource_paths or ()) if str(item or "").strip()]
             if not normalized_resource_paths:
-                packager.package_module(module, output_file=tmp_path, include_tests=True)
+                packager.package_module(module, output_file=tmp_path, **_packaging_kwargs())
             else:
                 loaded_module = module
                 deps = packager.analyzer.analyze_module(loaded_module)
@@ -1495,7 +1495,7 @@ def _prepare_code_blob(
                         module_name=module_name,
                         module_file=module_file,
                         deps=deps,
-                        include_tests=True,
+                        include_tests=bool(_packaging_kwargs()["include_tests"]),
                     )
                 )
                 for raw in normalized_resource_paths:
@@ -1544,8 +1544,7 @@ def _prepare_code_blob(
             try:
                 tar_path = packager.package_roots(
                     paths,
-                    include_tests=True,
-                    synthesize_missing_package_inits=True,
+                    **_packaging_kwargs(synthesize_missing_package_inits=True),
                 )
                 with open(tar_path, "rb") as f:
                     return f.read(), "artifact_bundle.tar.gz"

@@ -877,6 +877,26 @@ def _validate_arrow_compatible(obj: Any) -> None:
     )
 
 
+def _normalize_local_invoke_payload(payload: Any) -> Any:
+    if isinstance(payload, dict) and ("args" in payload or "kwargs" in payload):
+        other_keys = set(payload.keys()) - {"args", "kwargs"}
+        if not other_keys:
+            args = payload.get("args", [])
+            kwargs = payload.get("kwargs", {})
+            _validate_arrow_compatible(args)
+            _validate_arrow_compatible(kwargs)
+            args = convert_dict_to_arrow(args)
+            kwargs = convert_dict_to_arrow(kwargs)
+            if not isinstance(args, list):
+                args = list(args) if args else []
+            if not isinstance(kwargs, dict):
+                kwargs = {}
+            return {"args": args, "kwargs": kwargs}
+    if isinstance(payload, dict):
+        return convert_dict_to_arrow(payload)
+    return payload
+
+
 def _invoke_user_callable(fn, payload: dict):
     try:
         signature = inspect.signature(fn)
@@ -892,13 +912,9 @@ def _invoke_user_callable(fn, payload: dict):
         if not other_keys:
             args = payload.get("args", [])
             kwargs = payload.get("kwargs", {})
-            _validate_arrow_compatible(args)
-            _validate_arrow_compatible(kwargs)
-            args = convert_dict_to_arrow(args)
-            kwargs = convert_dict_to_arrow(kwargs)
-            if not isinstance(args, list):
-                args = list(args) if args else []
-            if not isinstance(kwargs, dict):
+            if args is None:
+                args = []
+            if kwargs is None or not isinstance(kwargs, dict):
                 kwargs = {}
             log_payload_flow(
                 "user_invoke",
@@ -909,13 +925,12 @@ def _invoke_user_callable(fn, payload: dict):
             return fn(*args, **kwargs)
 
     if isinstance(payload, dict):
-        deserialized = convert_dict_to_arrow(payload)
         log_payload_flow(
             "user_invoke",
             mode="http_kwargs",
-            kwargs_summary=summarize_payload_flow_value(deserialized),
+            kwargs_summary=summarize_payload_flow_value(payload),
         )
-        return fn(**deserialized)
+        return fn(**payload)
 
     log_payload_flow(
         "user_invoke",
@@ -923,6 +938,85 @@ def _invoke_user_callable(fn, payload: dict):
         payload_summary=summarize_payload_flow_value(payload),
     )
     return fn(payload)
+
+
+def _invoke_local_user_callable(fn, payload: dict):
+    return _invoke_user_callable(fn, _normalize_local_invoke_payload(payload))
+
+
+def _invoke_user_callable_timed(fn, payload: dict):
+    wrapper_start = time.perf_counter()
+    wrapper_end = wrapper_start
+    user_start = wrapper_start
+    user_end = wrapper_start
+
+    def _call_with_user_timing(*args, **kwargs):
+        nonlocal user_start, user_end
+        user_start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            user_end = time.perf_counter()
+
+    try:
+        try:
+            signature = inspect.signature(fn)
+            params = list(signature.parameters.values())
+        except Exception:
+            params = []
+
+        if not params:
+            return _call_with_user_timing()
+
+        if isinstance(payload, dict) and ("args" in payload or "kwargs" in payload):
+            other_keys = set(payload.keys()) - {"args", "kwargs"}
+            if not other_keys:
+                args = payload.get("args", [])
+                kwargs = payload.get("kwargs", {})
+                if args is None:
+                    args = []
+                if kwargs is None or not isinstance(kwargs, dict):
+                    kwargs = {}
+                log_payload_flow(
+                    "user_invoke",
+                    mode="args_kwargs",
+                    args_summary=summarize_payload_flow_value(args),
+                    kwargs_summary=summarize_payload_flow_value(kwargs),
+                )
+                return _call_with_user_timing(*args, **kwargs)
+
+        if isinstance(payload, dict):
+            log_payload_flow(
+                "user_invoke",
+                mode="http_kwargs",
+                kwargs_summary=summarize_payload_flow_value(payload),
+            )
+            return _call_with_user_timing(**payload)
+
+        log_payload_flow(
+            "user_invoke",
+            mode="direct_payload",
+            payload_summary=summarize_payload_flow_value(payload),
+        )
+        return _call_with_user_timing(payload)
+    finally:
+        wrapper_end = time.perf_counter()
+        if user_end < user_start:
+            user_end = user_start
+        total_invoke_ms = max(0.0, wrapper_end - wrapper_start) * 1000.0
+        user_fn_ms = max(0.0, user_end - user_start) * 1000.0
+        _invoke_user_callable_timed.last_timings = {
+            "invoke_ms": round(total_invoke_ms, 3),
+            "invoke_wrapper_ms": round(max(0.0, total_invoke_ms - user_fn_ms), 3),
+            "user_fn_ms": round(user_fn_ms, 3),
+        }
+
+
+_invoke_user_callable_timed.last_timings = {
+    "invoke_ms": 0.0,
+    "invoke_wrapper_ms": 0.0,
+    "user_fn_ms": 0.0,
+}
 
 
 def _apply_managed_globals_to_router(
@@ -1046,6 +1140,8 @@ def _execute_payload_in_subprocess(
     decode_end = decode_start
     invoke_start = decode_start
     invoke_end = decode_start
+    invoke_wrapper_ms = 0.0
+    user_fn_ms = 0.0
     encode_start = decode_start
     encode_end = decode_start
 
@@ -1053,6 +1149,8 @@ def _execute_payload_in_subprocess(
         return {
             "decode_ms": round(max(0.0, decode_end - decode_start) * 1000.0, 3),
             "invoke_ms": round(max(0.0, invoke_end - invoke_start) * 1000.0, 3),
+            "invoke_wrapper_ms": round(max(0.0, float(invoke_wrapper_ms or 0.0)), 3),
+            "user_fn_ms": round(max(0.0, float(user_fn_ms or 0.0)), 3),
             "encode_ms": round(max(0.0, encode_end - encode_start) * 1000.0, 3),
         }
 
@@ -1118,8 +1216,11 @@ def _execute_payload_in_subprocess(
                         encode_end = decode_end
                         return ("SUCCEEDED", {"warmed": True, "worker_pid": os.getpid()}, "", "", _timings())
                     invoke_start = decode_end
-                    ret = _invoke_user_callable(fn, resolved_payload)
+                    ret = _invoke_user_callable_timed(fn, resolved_payload)
                     invoke_end = time.perf_counter()
+                    timed = dict(getattr(_invoke_user_callable_timed, "last_timings", {}) or {})
+                    invoke_wrapper_ms = float(timed.get("invoke_wrapper_ms", 0.0) or 0.0)
+                    user_fn_ms = float(timed.get("user_fn_ms", 0.0) or 0.0)
                     encode_start = invoke_end
                 status_text, result, error_type, error_message = _normalize_user_return(
                     ret,
@@ -1147,6 +1248,9 @@ def _execute_payload_in_subprocess(
                     decode_end = now
                 elif invoke_end <= invoke_start:
                     invoke_end = now
+                    timed = dict(getattr(_invoke_user_callable_timed, "last_timings", {}) or {})
+                    invoke_wrapper_ms = float(timed.get("invoke_wrapper_ms", 0.0) or 0.0)
+                    user_fn_ms = float(timed.get("user_fn_ms", 0.0) or 0.0)
                 else:
                     encode_end = now
                 if isinstance(exc, (ImportError, ModuleNotFoundError)):
@@ -1175,6 +1279,7 @@ __all__ = [
     "_discover_callable_methods_or_raise_user_error",
     "_execute_payload_in_subprocess",
     "_install_dependency_allowlist",
+    "_invoke_local_user_callable",
     "_invoke_user_callable",
     "_is_user_artifact_error",
     "_load_callable_router",
@@ -1186,6 +1291,7 @@ __all__ = [
     "_package_suffix",
     "_purge_loaded_artifact_modules",
     "_apply_managed_globals_to_router",
+    "_normalize_local_invoke_payload",
     "_resolve_apply_managed_globals_hook",
     "_temporary_import_paths",
     "_temporary_working_dir",

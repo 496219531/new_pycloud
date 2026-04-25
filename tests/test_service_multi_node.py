@@ -166,8 +166,8 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             timeout_sec=10.0,
             breaker_enabled=True,
             breaker_failure_threshold=1,
-            breaker_cooldown_sec=0.8,
-            breaker_max_cooldown_sec=2.0,
+            breaker_cooldown_sec=30.0,
+            breaker_max_cooldown_sec=30.0,
             session_cache_dir=str(tmp_path / "session_cache"),
         )
 
@@ -177,11 +177,11 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             origin_call = session_n1.call
             fault_once = {"count": 0}
 
-            def flaky_call(method, payload, *, timeout_sec=60.0, token=None):
+            def flaky_call(method, payload, *, timeout_sec=60.0, token=None, **kwargs):
                 if fault_once["count"] == 0:
                     fault_once["count"] += 1
                     raise RuntimeError("synthetic first failure on node-cb-01")
-                return origin_call(method, payload, timeout_sec=timeout_sec, token=token)
+                return origin_call(method, payload, timeout_sec=timeout_sec, token=token, **kwargs)
 
             session_n1.call = flaky_call  # type: ignore[assignment]
 
@@ -211,7 +211,8 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             assert node_id_second == "node-cb-02"
             assert resp_second["ok"] is True
 
-            time.sleep(1.0)
+            with group._route_lock:
+                group._breaker_states["node-cb-01"].disabled_until_monotonic = time.monotonic() - 0.001
 
             node_id_third, resp_third = group.call_balanced(
                 "run",
@@ -284,7 +285,7 @@ def test_service_group_user_error_does_not_failover(tmp_path):
         try:
             first = group.sessions["node-user-01"]
 
-            def user_error(method, payload, *, timeout_sec=60.0, token=None):
+            def user_error(method, payload, *, timeout_sec=60.0, token=None, **_kwargs):
                 raise RuntimeError("UserError: synthetic bad input")
 
             first.call = user_error  # type: ignore[assignment]

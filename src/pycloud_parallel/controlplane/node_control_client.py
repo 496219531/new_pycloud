@@ -18,6 +18,7 @@ from pycloud_parallel.controlplane.artifact import (
     _default_entry_module_for_package,
     _normalize_dependency_policy_mode,
     _normalize_entry_module_arg,
+    _packaging_kwargs,
     _resolve_package_format,
 )
 from .client_transport import _materialize_downloaded_result
@@ -106,7 +107,7 @@ def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
         DependencyPackager().package_paths(
             root_dir=root_dir,
             paths=paths,
-            include_tests=True,
+            **_packaging_kwargs(),
         )
     )
 
@@ -169,6 +170,25 @@ def _serialize_upload_object_requests_from_file(
         )
     )
     yield from (pb2.UploadObjectRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
+
+
+def _build_uploaded_object_ref(
+    *,
+    object_id: str,
+    format: str,
+    size_bytes: int,
+) -> DataRef:
+    resolved_object_id = str(object_id or "").strip()
+    return DataRef(
+        ref_id=resolved_object_id,
+        storage_id=resolved_object_id,
+        logical_type="",
+        format=str(format or "").strip(),
+        size_bytes=int(size_bytes or 0),
+        materialize_as="path",
+        locator_kind="node_local",
+        locator_token="",
+    )
 
 
 class NodeControlClient:
@@ -308,21 +328,16 @@ class NodeControlClient:
             source_kind="file",
             local_digest_known=bool(cached_object_id),
         )
-        if effective_mode == "known_digest_precheck":
-            return self._upload_object_from_local_file_precheck(
-                file_path=path,
-                format=effective_format,
-                chunk_size=chunk_size,
-                cached_object_id=str(cached_object_id or "").strip(),
-                precheck_enabled=trusted_precheck is not False,
-            )
-        if effective_mode == "single_pass_authoritative":
-            return self._upload_object_from_local_file_single_pass(
-                file_path=path,
-                format=effective_format,
-                chunk_size=chunk_size,
-            )
-        raise ValueError(f"unsupported file object transfer mode: {effective_mode!r}")
+        return self._upload_object_impl(
+            source_kind="file",
+            file_path=path,
+            blob=None,
+            format=effective_format,
+            chunk_size=chunk_size,
+            transfer_mode=effective_mode,
+            cached_object_id=str(cached_object_id or "").strip(),
+            precheck_enabled=trusted_precheck is not False,
+        )
 
     def upload_object_from_bytes(
         self,
@@ -339,20 +354,100 @@ class NodeControlClient:
             source_kind="memory",
             local_digest_known=False,
         )
-        if effective_mode == "known_digest_precheck":
-            return self._upload_object_from_bytes_precheck(
-                blob=blob,
+        return self._upload_object_impl(
+            source_kind="memory",
+            file_path=None,
+            blob=bytes(blob),
+            format=effective_format,
+            chunk_size=chunk_size,
+            transfer_mode=effective_mode,
+            cached_object_id="",
+            precheck_enabled=trusted_precheck is not False,
+        )
+
+    def _upload_object_impl(
+        self,
+        *,
+        source_kind: str,
+        file_path: Optional[Path],
+        blob: Optional[bytes],
+        format: str,
+        chunk_size: int,
+        transfer_mode: str,
+        cached_object_id: str,
+        precheck_enabled: bool,
+    ) -> DataRef:
+        normalized_source_kind = str(source_kind or "").strip().lower()
+        effective_format = (
+            normalize_object_format(format, source_name=file_path.name)
+            if normalized_source_kind == "file" and file_path is not None
+            else normalize_object_format(format, default="bin")
+        )
+        normalized_mode = _normalize_object_transfer_mode(transfer_mode)
+        if normalized_mode not in {"known_digest_precheck", "single_pass_authoritative"}:
+            raise ValueError(f"unsupported {normalized_source_kind} object transfer mode: {transfer_mode!r}")
+
+        upload_blob = bytes(blob or b"")
+        upload_path = file_path
+        size_bytes = upload_path.stat().st_size if upload_path is not None else len(upload_blob)
+        object_id = ""
+        if normalized_mode == "known_digest_precheck":
+            object_id = str(cached_object_id or "").strip()
+            if not object_id:
+                digest = (
+                    _sha256_file(upload_path)
+                    if upload_path is not None
+                    else hashlib.sha256(upload_blob).hexdigest()
+                )
+                object_id = object_id_from_sha256_hex(digest)
+                if upload_path is not None:
+                    store_file_digest(upload_path, format=effective_format, object_id=object_id)
+            if precheck_enabled:
+                existing = self._object_ref_if_exists(
+                    object_id=object_id,
+                    fallback_format=effective_format,
+                    fallback_size=size_bytes,
+                )
+                if existing is not None:
+                    return existing
+
+        request_stream = (
+            _serialize_upload_object_requests_from_file(
+                file_path=upload_path,
+                object_id=object_id if normalized_mode == "known_digest_precheck" else "",
                 format=effective_format,
+                integrity_mode=("client_declared" if normalized_mode == "known_digest_precheck" else "server_authoritative"),
                 chunk_size=chunk_size,
-                precheck_enabled=trusted_precheck is not False,
             )
-        if effective_mode == "single_pass_authoritative":
-            return self._upload_object_from_bytes_single_pass(
-                blob=blob,
+            if upload_path is not None
+            else _serialize_upload_object_requests_from_bytes(
+                blob=upload_blob,
+                object_id=object_id if normalized_mode == "known_digest_precheck" else "",
                 format=effective_format,
+                integrity_mode=("client_declared" if normalized_mode == "known_digest_precheck" else "server_authoritative"),
                 chunk_size=chunk_size,
             )
-        raise ValueError(f"unsupported memory object transfer mode: {effective_mode!r}")
+        )
+        try:
+            resp = self.stub.UploadObject(request_stream, timeout=self.timeout_sec)
+        except Exception:
+            if upload_path is not None and cached_object_id:
+                invalidate_file_digest(upload_path, format=effective_format)
+            raise
+        if not resp.ok:
+            if upload_path is not None and cached_object_id:
+                invalidate_file_digest(upload_path, format=effective_format)
+            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
+
+        final_object_id = str(resp.object_id or object_id).strip()
+        ref = _build_uploaded_object_ref(
+            object_id=final_object_id,
+            format=str(resp.format or effective_format),
+            size_bytes=int(resp.size_bytes or size_bytes),
+        )
+        if upload_path is not None:
+            store_file_digest(upload_path, format=effective_format, object_id=ref.object_id)
+        return ref
 
     def _upload_object_from_local_file_precheck(
         self,
@@ -363,51 +458,16 @@ class NodeControlClient:
         cached_object_id: str,
         precheck_enabled: bool,
     ) -> DataRef:
-        effective_format = normalize_object_format(format, source_name=file_path.name)
-        object_id = str(cached_object_id or "").strip()
-        if not object_id:
-            digest = _sha256_file(file_path)
-            object_id = object_id_from_sha256_hex(digest)
-            store_file_digest(file_path, format=effective_format, object_id=object_id)
-        if precheck_enabled:
-            existing = self._object_ref_if_exists(
-                object_id=object_id,
-                fallback_format=effective_format,
-                fallback_size=file_path.stat().st_size,
-            )
-            if existing is not None:
-                return existing
-        try:
-            resp = self.stub.UploadObject(
-                _serialize_upload_object_requests_from_file(
-                    file_path=file_path,
-                    object_id=object_id,
-                    format=effective_format,
-                    integrity_mode="client_declared",
-                    chunk_size=chunk_size,
-                ),
-                timeout=self.timeout_sec,
-            )
-        except Exception:
-            if cached_object_id:
-                invalidate_file_digest(file_path, format=effective_format)
-            raise
-        if not resp.ok:
-            if cached_object_id:
-                invalidate_file_digest(file_path, format=effective_format)
-            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        ref = DataRef(
-            ref_id=str(resp.object_id or object_id),
-            storage_id=str(resp.object_id or object_id),
-            logical_type="",
-            format=str(resp.format or effective_format),
-            size_bytes=int(resp.size_bytes or file_path.stat().st_size),
-            materialize_as="path",
-            locator_kind="node_local",
-            locator_token="",
+        return self._upload_object_impl(
+            source_kind="file",
+            file_path=file_path,
+            blob=None,
+            format=format,
+            chunk_size=chunk_size,
+            transfer_mode="known_digest_precheck",
+            cached_object_id=str(cached_object_id or "").strip(),
+            precheck_enabled=precheck_enabled,
         )
-        store_file_digest(file_path, format=effective_format, object_id=ref.object_id)
-        return ref
 
     def _upload_object_from_local_file_single_pass(
         self,
@@ -416,31 +476,16 @@ class NodeControlClient:
         format: str,
         chunk_size: int,
     ) -> DataRef:
-        effective_format = normalize_object_format(format, source_name=file_path.name)
-        resp = self.stub.UploadObject(
-            _serialize_upload_object_requests_from_file(
-                file_path=file_path,
-                object_id="",
-                format=effective_format,
-                integrity_mode="server_authoritative",
-                chunk_size=chunk_size,
-            ),
-            timeout=self.timeout_sec,
+        return self._upload_object_impl(
+            source_kind="file",
+            file_path=file_path,
+            blob=None,
+            format=format,
+            chunk_size=chunk_size,
+            transfer_mode="single_pass_authoritative",
+            cached_object_id="",
+            precheck_enabled=False,
         )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        ref = DataRef(
-            ref_id=str(resp.object_id or ""),
-            storage_id=str(resp.object_id or ""),
-            logical_type="",
-            format=str(resp.format or effective_format),
-            size_bytes=int(resp.size_bytes or file_path.stat().st_size),
-            materialize_as="path",
-            locator_kind="node_local",
-            locator_token="",
-        )
-        store_file_digest(file_path, format=effective_format, object_id=ref.object_id)
-        return ref
 
     def _upload_object_from_bytes_precheck(
         self,
@@ -450,38 +495,15 @@ class NodeControlClient:
         chunk_size: int,
         precheck_enabled: bool,
     ) -> DataRef:
-        digest = hashlib.sha256(blob).hexdigest()
-        object_id = object_id_from_sha256_hex(digest)
-        effective_format = normalize_object_format(format, default="bin")
-        if precheck_enabled:
-            existing = self._object_ref_if_exists(
-                object_id=object_id,
-                fallback_format=effective_format,
-                fallback_size=len(blob),
-            )
-            if existing is not None:
-                return existing
-        resp = self.stub.UploadObject(
-            _serialize_upload_object_requests_from_bytes(
-                blob=blob,
-                object_id=object_id,
-                format=effective_format,
-                integrity_mode="client_declared",
-                chunk_size=chunk_size,
-            ),
-            timeout=self.timeout_sec,
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        return DataRef(
-            ref_id=str(resp.object_id or object_id),
-            storage_id=str(resp.object_id or object_id),
-            logical_type="",
-            format=str(resp.format or effective_format),
-            size_bytes=int(resp.size_bytes or len(blob)),
-            materialize_as="path",
-            locator_kind="node_local",
-            locator_token="",
+        return self._upload_object_impl(
+            source_kind="memory",
+            file_path=None,
+            blob=bytes(blob),
+            format=format,
+            chunk_size=chunk_size,
+            transfer_mode="known_digest_precheck",
+            cached_object_id="",
+            precheck_enabled=precheck_enabled,
         )
 
     def _upload_object_from_bytes_single_pass(
@@ -491,28 +513,15 @@ class NodeControlClient:
         format: str,
         chunk_size: int,
     ) -> DataRef:
-        effective_format = normalize_object_format(format, default="bin")
-        resp = self.stub.UploadObject(
-            _serialize_upload_object_requests_from_bytes(
-                blob=blob,
-                object_id="",
-                format=effective_format,
-                integrity_mode="server_authoritative",
-                chunk_size=chunk_size,
-            ),
-            timeout=self.timeout_sec,
-        )
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "upload object failed"))
-        return DataRef(
-            ref_id=str(resp.object_id or ""),
-            storage_id=str(resp.object_id or ""),
-            logical_type="",
-            format=str(resp.format or effective_format),
-            size_bytes=int(resp.size_bytes or len(blob)),
-            materialize_as="path",
-            locator_kind="node_local",
-            locator_token="",
+        return self._upload_object_impl(
+            source_kind="memory",
+            file_path=None,
+            blob=bytes(blob),
+            format=format,
+            chunk_size=chunk_size,
+            transfer_mode="single_pass_authoritative",
+            cached_object_id="",
+            precheck_enabled=False,
         )
 
     def get_object_meta(self, *, object_id: str) -> pb2.GetObjectMetaResponse:

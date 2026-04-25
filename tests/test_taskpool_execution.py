@@ -140,6 +140,223 @@ def test_native_task_pool_session_dynamic_default_max_in_flight_uses_effective_w
         session.close()
 
 
+def test_native_task_pool_session_dynamic_default_max_in_flight_prefers_pool_worker_count_over_node_capacity() -> None:
+    from pycloud_parallel import TaskPool
+
+    fake_status_1 = SimpleNamespace(alive_workers=5, worker_count=5)
+    fake_status_2 = SimpleNamespace(alive_workers=5, worker_count=5)
+    fake_pool_1 = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=5,
+        get_status=lambda: fake_status_1,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    fake_pool_2 = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=5,
+        get_status=lambda: fake_status_2,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool_1, "node-2": fake_pool_2},
+        nodes={
+            "node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=10),
+            "node-2": SimpleNamespace(node_id="node-2", task_pool_worker_available=10),
+        },
+        task_method="run",
+    )
+    try:
+        assert session._resolve_max_in_flight(None) == 15  # noqa: SLF001
+    finally:
+        session.close()
+
+
+def test_iter_items_merges_shared_kwargs_lazily() -> None:
+    from pycloud_parallel import TaskPool
+
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=1,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool},
+        nodes={"node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=1)},
+        task_method="run",
+    )
+    consumed = {"count": 0}
+
+    def _payloads():
+        for value in range(1000):
+            consumed["count"] += 1
+            yield {"value": value}
+
+    def _fake_imap(payloads, **_kwargs):
+        first = next(iter(payloads))
+        assert first == {"value": 0, "shared": 7}
+        assert consumed["count"] == 1
+        yield 0, first
+
+    try:
+        with patch.object(session, "imap_unordered", side_effect=_fake_imap):
+            items = list(session.iter_items(_payloads(), max_in_flight=1, timeout_sec=0.1, shared=7))
+        assert consumed["count"] == 1
+        assert items[0].result == {"value": 0, "shared": 7}
+    finally:
+        session.close()
+
+
+def test_task_pool_map_uses_dynamic_default_max_in_flight_by_default() -> None:
+    from pycloud_parallel import TaskPool
+
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner-demo",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=2,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool},
+        nodes={"node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=2)},
+        task_method="run",
+    )
+    try:
+        expected = session._resolve_max_in_flight(None)  # noqa: SLF001
+        with patch.object(session, "collect_items", return_value=[]) as mocked_collect:
+            session.map([1, 2, 3], arg_name="value", timeout_sec=0.1)
+        assert mocked_collect.call_args.kwargs["max_in_flight"] == expected
+    finally:
+        session.close()
+
+
+def test_submit_payloads_reuses_scheduler_candidate_snapshot_for_batch() -> None:
+    from pycloud_parallel import TaskPool
+
+    submit_calls = {"node-a": 0, "node-b": 0}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 2
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._client = SimpleNamespace(close=lambda: None)
+
+        def submit_tasks(self, tasks, job_id=""):
+            submit_calls[self.node_id] += 1
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def close(self, reason=""):
+            return None
+
+    session = TaskPool(
+        pools={"node-a": _Pool("node-a"), "node-b": _Pool("node-b")},
+        nodes={},
+        task_method="run",
+        job_id="job-submit-batch-plan",
+    )
+
+    original = session._build_pool_scheduler_candidates  # noqa: SLF001
+    call_count = {"value": 0}
+
+    def _wrapped(*args, **kwargs):
+        call_count["value"] += 1
+        return original(*args, **kwargs)
+
+    try:
+        with patch.object(session, "_build_pool_scheduler_candidates", side_effect=_wrapped):
+            resp = session.submit_payloads([{"value": 1}, {"value": 2}, {"value": 3}])
+        assert len(resp.accepted) == 3
+        assert call_count["value"] == 1
+        assert sum(submit_calls.values()) >= 1
+    finally:
+        session.close()
+
+
+def test_imap_unordered_reuses_scheduler_candidate_snapshot_per_fill() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(
+                fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id}
+            )
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                self._ready.append(
+                    pb2.TaskResult(
+                        task_id=item.task_id,
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"value": item.task_id}),
+                    )
+                )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+        def close(self, reason=""):
+            return None
+
+    session = TaskPool(
+        pools={"node-a": _Pool("node-a"), "node-b": _Pool("node-b")},
+        nodes={},
+        task_method="run",
+        job_id="job-imap-batch-plan",
+    )
+    original = session._build_pool_scheduler_candidates  # noqa: SLF001
+    call_count = {"value": 0}
+
+    def _wrapped(*args, **kwargs):
+        call_count["value"] += 1
+        return original(*args, **kwargs)
+
+    try:
+        with patch.object(session, "_build_pool_scheduler_candidates", side_effect=_wrapped):
+            out = list(
+                session.imap_unordered(
+                    [{"value": 1}, {"value": 2}],
+                    max_in_flight=2,
+                    timeout_sec=0.1,
+                )
+            )
+        assert [index for index, _item in out] == [0, 1]
+        assert call_count["value"] == 2
+    finally:
+        session.close()
+
+
 def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None:
     from pycloud_parallel import TaskPool
 
@@ -543,21 +760,36 @@ def test_native_task_pool_session_submit_values_delegates() -> None:
     from pycloud_parallel import TaskPool
 
     session = TaskPool(
-        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        pools={
+            "node-1": SimpleNamespace(
+                owner_client_id="owner",
+                code_version="sha256:test",
+                heartbeat_timeout_sec=30,
+                worker_count=2,
+            )
+        },
         nodes={},
         task_method="run",
         job_id="job-values",
     )
-    captured = {}
+    captured = {"chunks": []}
 
     def _fake_submit(payloads, **kwargs):
-        captured["payloads"] = payloads
+        captured["chunks"].append(list(payloads))
         captured["kwargs"] = kwargs
-        return pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[])
+        return pb2.SubmitTasksResponse(
+            ok=True,
+            accepted=[pb2.TaskAccepted(task_id=f"t-{len(captured['chunks'])}", status=pb2.TASK_STATUS_QUEUED)],
+            rejected=[],
+        )
 
     session.submit_payloads = _fake_submit  # type: ignore[method-assign]
-    session.submit_values([1, 2, 3], arg_name="x", extra=9)
-    assert captured["payloads"] == [{"x": 1, "extra": 9}, {"x": 2, "extra": 9}, {"x": 3, "extra": 9}]
+    resp = session.submit_values([1, 2, 3, 4], arg_name="x", extra=9)
+    assert captured["chunks"] == [
+        [{"x": 1, "extra": 9}, {"x": 2, "extra": 9}, {"x": 3, "extra": 9}],
+        [{"x": 4, "extra": 9}],
+    ]
+    assert len(resp.accepted) == 2
 
 
 def test_native_task_pool_session_is_alive_tracks_remaining_nodes() -> None:
@@ -710,6 +942,33 @@ def test_native_task_pool_session_map_forwards_strategy_to_collect_items() -> No
         session.map([1, 2], strategy="taskpool_throughput")
 
     assert mocked.call_args.kwargs["strategy"] == "taskpool_throughput"
+
+
+def test_native_task_pool_session_map_builds_payloads_lazily() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-map-lazy",
+    )
+    consumed = {"count": 0}
+
+    def _values():
+        for value in range(1000):
+            consumed["count"] += 1
+            yield value
+
+    def _fake_collect(payloads, **kwargs):
+        first = next(iter(payloads))
+        assert first == {"value": 0, "extra": 9}
+        assert consumed["count"] == 1
+        return []
+
+    with patch.object(session, "collect_items", side_effect=_fake_collect):
+        assert session.map(_values(), arg_name="value", extra=9) == []
+    assert consumed["count"] == 1
 
 
 def test_native_task_pool_session_keepalive_degrades_per_node() -> None:
@@ -991,6 +1250,30 @@ def test_native_task_pool_session_imap_unordered_streams_results() -> None:
     assert [index for index, _ in items] == [0, 1, 2]
     assert materialized == submitted
     assert session._pending_task_ids == set()  # noqa: SLF001
+
+
+def test_native_task_pool_session_imap_unordered_rejects_non_mapping_payloads() -> None:
+    from pycloud_parallel import TaskPool
+
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=1,
+        close=lambda reason="": None,
+        _client=SimpleNamespace(close=lambda: None),
+    )
+    session = TaskPool(
+        pools={"node-1": fake_pool},
+        nodes={"node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=1)},
+        task_method="run",
+        job_id="job-invalid-payload",
+    )
+    try:
+        with pytest.raises(TypeError, match="payloads must yield dict items"):
+            list(session.imap_unordered([None], max_in_flight=1, timeout_sec=0.1))
+    finally:
+        session.close()
 
 
 def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_polling() -> None:

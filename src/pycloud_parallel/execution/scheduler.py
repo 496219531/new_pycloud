@@ -187,16 +187,34 @@ def _normalize_feature_values(
     return normalized
 
 
+def _normalize_features(
+    candidates: Sequence[SchedulerCandidate],
+    *,
+    features: Sequence[str],
+    state: SchedulerState,
+) -> Dict[str, Dict[str, float]]:
+    return {
+        str(feature): _normalize_feature_values(candidates, feature=str(feature), state=state)
+        for feature in features
+    }
+
+
 def score_candidate(
     candidate: SchedulerCandidate,
     *,
     profile: StrategyProfile,
     state: SchedulerState,
     candidates: Sequence[SchedulerCandidate],
+    normalized_features: Dict[str, Dict[str, float]] | None = None,
 ) -> float:
     score = 0.0
+    feature_maps = normalized_features or _normalize_features(
+        candidates,
+        features=tuple(profile.weights.keys()),
+        state=state,
+    )
     for feature, weight in profile.weights.items():
-        normalized = _normalize_feature_values(candidates, feature=feature, state=state)
+        normalized = feature_maps.get(str(feature), {})
         score += float(weight) * float(normalized.get(candidate.id, 0.0))
     failures = _raw_feature_value(candidate, feature="recent_failures", state=state)
     score += float(profile.failure_penalty) * max(0.0, failures)
@@ -213,8 +231,22 @@ def select_one_candidate(
     filtered = filter_candidates(candidates, state)
     if not filtered:
         raise RuntimeError("no available scheduler candidates")
+    normalized_features = _normalize_features(
+        filtered,
+        features=tuple(profile.weights.keys()),
+        state=state,
+    )
     scored = [
-        (score_candidate(candidate, profile=profile, state=state, candidates=filtered), candidate)
+        (
+            score_candidate(
+                candidate,
+                profile=profile,
+                state=state,
+                candidates=filtered,
+                normalized_features=normalized_features,
+            ),
+            candidate,
+        )
         for candidate in filtered
     ]
     best_score = min(score for score, _candidate in scored)

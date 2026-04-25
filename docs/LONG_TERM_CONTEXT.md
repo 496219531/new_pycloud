@@ -1,6 +1,6 @@
 # 长期上下文（Long-Term Context）
 
-最后更新：2026-04-22（Asia/Shanghai）
+最后更新：2026-04-25（Asia/Shanghai）
 适用范围：`new_pycloud` 主仓库（V1 公开面与控制面实现）
 
 ## 1. 这份文件的目的
@@ -99,20 +99,47 @@ V1 公开概念固定为：
    - 对应文档（本文件 + `ARCHITECTURE_OVERVIEW.md` + `CLIENT_SURFACE_OVERVIEW.md`）
    - 对应测试
 
-## 8. 文档维护规则
+## 8. 近期精简路线
+
+这部分不是行为边界，而是给 coder 的低风险重构顺序。目标是减少重复实现，降低后续继续加 timing / policy / transport 字段时的同步成本。
+
+### 8.1 优先级顺序
+
+1. `nodecontrol_state.py`：收口 service/task-pool timing recorder
+2. `node_control_client.py`：收口 object upload 的 file/bytes + precheck/single-pass 分支
+3. `job_queue.py`：收口 plain job / hooks job 的共享 `TaskPool` 准备流程
+4. `job_queue.py`：收口 job staged refs 的 touch/release helpers
+5. `support.py` / `artifact.py`：集中 artifact packaging 默认值
+
+### 8.2 重构约束
+
+1. 第一轮只做结构精简，不改变对外 API 和默认行为
+2. `timing_metrics` 字段名保持兼容，`/ops` 页面展示不回归
+3. object upload 的四条路径行为保持一致：file/bytes 与 precheck/single-pass 都必须继续覆盖
+4. `JobQueue` 的 `pool_action`、`pool_prepare_ms`、`warmup_ms`、`running_tasks_ms`、`first_result_wait_ms` 等 timing 字段不能丢
+5. artifact packaging 的 `include_tests` 默认值先集中管理，是否切到 `False` 作为单独性能优化决策处理
+
+### 8.3 验收建议
+
+1. 跑现有 `JobQueue` / shared pool / mode switch 回归测试
+2. 跑 object upload 相关测试，覆盖 bytes 与 file 两类输入
+3. 手动或测试确认 `/ops` 仍能看到 service 与 task-pool timing 聚合
+4. 对 Windows 性能优化另开小步变更，不混入本轮精简
+
+## 9. 文档维护规则
 
 1. 只有“会影响默认行为/边界”的决策才写入本文件
 2. 每次更新请改“最后更新”日期，并附一句变化摘要
 3. 如果与其他文档冲突，以本文件为优先修正源，再回补其他文档
 
-## 9. 更新准入规则（多人/多线程协作）
+## 10. 更新准入规则（多人/多线程协作）
 
-### 9.1 谁可以改
+### 10.1 谁可以改
 
 1. 任何有仓库写权限的维护者都可以修改本文件
 2. 但修改应遵循“明确指令 + 可验证依据 + 同步测试/文档”的最小流程
 
-### 9.2 何时允许改
+### 10.2 何时允许改
 
 满足任一条件可更新：
 
@@ -120,19 +147,19 @@ V1 公开概念固定为：
 2. 边界约束发生变化（例如 submit 参数权限、共享池生命周期、安全校验）
 3. 已有条目与代码事实不一致，需要纠偏
 
-### 9.3 何时不该改
+### 10.3 何时不该改
 
 1. 仅是临时排障结论、尚未定稿的讨论
 2. 仅当前线程上下文、不会影响全局行为的局部细节
 3. 尚无代码/测试佐证的猜测性结论
 
-### 9.4 自动化与触发方式
+### 10.4 自动化与触发方式
 
 1. 本文件不会被系统自动追加或自动改写
 2. 必须由维护者在对应线程中明确执行编辑动作（人工或 coder）
 3. 未经明确编辑动作，不应假设“对话内容已经自动沉淀到本文件”
 
-### 9.5 提交前检查清单（建议）
+### 10.5 提交前检查清单（建议）
 
 1. 是否更新“最后更新”日期与“本次更新摘要”
 2. 是否给出可核对的代码/测试依据
@@ -142,13 +169,13 @@ V1 公开概念固定为：
    - `docs/TASK_MODE.md` / `docs/TASK_CLIENT_GUIDE.md`（按需）
 4. 是否补充或更新了对应回归测试（至少最小集合）
 
-### 9.6 并发修改冲突处理
+### 10.6 并发修改冲突处理
 
 1. 以“更晚且有代码依据”的版本为主
 2. 冲突合并时优先保留约束性条款，删去重复叙述
 3. 若两条规则冲突，先在 PR/评审中做显式裁决，再落文档，不做隐式覆盖
 
-### 9.7 自动守卫（CI）
+### 10.7 自动守卫（CI）
 
 仓库已配置：
 
@@ -161,9 +188,9 @@ V1 公开概念固定为：
 
 ---
 
-本次更新摘要（2026-04-22）：
+本次更新摘要（2026-04-25）：
 
-1. 固化 JobQueue/job-orch 的长期边界：policy 启动时固定、submit 仅允许 mode、共享池串行复用、软切失败回退重建
-2. 明确三层模型里 mode/policy 的职责分离与 node 过滤边界
-3. 增加多人协作更新准入规则：明确“非自动写入、需显式编辑触发”的机制与提交流程
-4. 新增 PR 模板与 CI 守卫，强制关键边界改动同步更新长期上下文文档
+1. 保留 JobQueue/job-orch 的长期边界：policy 启动时固定、submit 仅允许 mode、共享池串行复用、软切失败回退重建
+2. 明确近期代码精简路线：timing recorder、object upload、JobQueue shared-pool setup、staged refs、artifact packaging defaults
+3. 规定精简约束：第一轮不改 API、不改默认行为、不丢 timing 字段、不混入 Windows 性能默认值切换
+4. 保留多人协作更新准入规则与 CI 守卫要求

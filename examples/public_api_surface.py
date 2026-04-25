@@ -46,11 +46,6 @@ def main():
     print("  pool = TaskPool.open(...)")
     print("  results = pool.wait_for_data(...)")
     print()
-    print("  # 本地并行")
-    print("  from pycloud_parallel.local import foreach, parallel_for")
-    print("  print(foreach(lambda x: x * x, [1, 2, 3]))")
-    print()
-
     print("=" * 60)
     print("  完成")
     print("=" * 60)

@@ -42,7 +42,7 @@ from pycloud_parallel.controlplane.serialization import (
     encode_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
-from pycloud_parallel.controlplane.task_backend import NativeTaskBackend, _TaskPoolCallProxy
+from pycloud_parallel.controlplane.task_backend import _TaskPoolCallProxy
 from pycloud_parallel.execution.base import ExecutionItem, TaskExecutionSession
 from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
@@ -75,6 +75,44 @@ from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 logger = logging.getLogger(__name__)
 _TASK_POOL_CLOSE_RETRY_DELAYS_SEC = (0.0, 0.5, 1.0, 2.0)
 _DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR = 1.5
+
+
+class _IndexedPayloadBuffer:
+    def __init__(self, payloads: Iterable[Dict[str, object]]) -> None:
+        self._payload_iter = iter(payloads)
+        self._retry_payloads: "deque[Tuple[int, Dict[str, object]]]" = deque()
+        self._input_exhausted = False
+        self._next_index = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self._input_exhausted
+
+    @property
+    def has_retry(self) -> bool:
+        return bool(self._retry_payloads)
+
+    def next(self) -> Optional[Tuple[int, Dict[str, object]]]:
+        if self._retry_payloads:
+            index, payload = self._retry_payloads.popleft()
+            return int(index), dict(payload or {})
+        if self._input_exhausted:
+            return None
+        try:
+            raw_payload = next(self._payload_iter)
+        except StopIteration:
+            self._input_exhausted = True
+            return None
+        if not isinstance(raw_payload, dict):
+            raise TypeError("payloads must yield dict items")
+        payload = dict(raw_payload)
+        index = self._next_index
+        self._next_index += 1
+        return index, payload
+
+    def requeue_front(self, items: Sequence[Tuple[int, Dict[str, object], Any]]) -> None:
+        for index, payload, _item in reversed(list(items)):
+            self._retry_payloads.appendleft((int(index), dict(payload or {})))
 
 
 def _infocenter_client(*args, **kwargs):
@@ -191,8 +229,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._exclusive_mode = ""
         self._exclusive_owner_thread_id = 0
         self._exclusive_depth = 0
-        if self._backend is None:
-            self._backend = NativeTaskBackend(self)
         self._init_execution_session_state()
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
@@ -366,16 +402,13 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         total_workers = 0
         for node_id in self._available_pool_node_ids():
             pool = self._pools.get(node_id)
-            node = self.nodes.get(node_id)
             worker_capacity = max(0, int(getattr(pool, "worker_count", 0) or 0))
-            alive_workers = max(
-                0,
-                int(getattr(node, "task_pool_worker_available", 0) or 0),
-            )
-            if alive_workers <= 0 and pool is not None:
+            alive_workers = 0
+            if pool is not None:
                 with contextlib.suppress(Exception):
                     info = pool.get_status()
                     alive_workers = max(0, int(getattr(info, "alive_workers", 0) or 0))
+                    worker_capacity = max(worker_capacity, int(getattr(info, "worker_count", 0) or 0))
             total_workers += max(alive_workers, worker_capacity, 0)
         return max(1, total_workers)
 
@@ -408,6 +441,42 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             round_robin_counter=idx,
         )
         return str(selected.id)
+
+    def _plan_pool_node_targets(
+        self,
+        *,
+        count: int,
+        strategy: str,
+        state: SchedulerState,
+        allowed_node_ids: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        normalized_count = max(0, int(count or 0))
+        if normalized_count <= 0:
+            return []
+        candidates, selected_state = self._build_pool_scheduler_candidates(
+            allowed_node_ids=allowed_node_ids,
+            state=state,
+        )
+        if not candidates:
+            raise RuntimeError("task pool has no active node pools")
+        profile = resolve_taskpool_strategy(strategy)
+        with self._pool_lock:
+            rr_start = self._pool_cycle
+            self._pool_cycle += normalized_count
+        planned: List[str] = []
+        for offset in range(normalized_count):
+            selected = select_one_candidate(
+                candidates,
+                profile=profile,
+                state=selected_state,
+                round_robin_counter=rr_start + offset,
+            )
+            target_node_id = str(selected.id)
+            selected_state.local_inflight_by_candidate[target_node_id] = (
+                int(selected_state.local_inflight_by_candidate.get(target_node_id, 0) or 0) + 1
+            )
+            planned.append(target_node_id)
+        return planned
 
     def _build_task_submit_item(
         self,
@@ -533,33 +602,19 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if self._closed:
             raise RuntimeError("TaskPool session is closed")
         self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
-        profile = resolve_taskpool_strategy(strategy)
         temp_state = SchedulerState(
             local_inflight_by_candidate=dict(self._scheduler_state.local_inflight_by_candidate),
             disabled_candidates=set(self._scheduler_state.disabled_candidates),
             recent_submit_failures=dict(self._scheduler_state.recent_submit_failures),
         )
         grouped: Dict[str, List[pb2.TaskSubmitItem]] = {}
-        for payload in payloads:
-            candidates, state = self._build_pool_scheduler_candidates(
-                allowed_node_ids=self._available_pool_node_ids(),
-                state=temp_state,
-            )
-            if not candidates:
-                raise RuntimeError("task pool has no active node pools")
-            with self._pool_lock:
-                rr = self._pool_cycle
-                self._pool_cycle += 1
-            selected = select_one_candidate(
-                candidates,
-                profile=profile,
-                state=state,
-                round_robin_counter=rr,
-            )
-            target_node_id = str(selected.id)
-            temp_state.local_inflight_by_candidate[target_node_id] = (
-                int(temp_state.local_inflight_by_candidate.get(target_node_id, 0) or 0) + 1
-            )
+        planned_targets = self._plan_pool_node_targets(
+            count=len(payloads),
+            strategy=strategy,
+            state=temp_state,
+            allowed_node_ids=self._available_pool_node_ids(),
+        )
+        for payload, target_node_id in zip(payloads, planned_targets):
             grouped.setdefault(target_node_id, []).append(
                 self._build_task_submit_item(
                     node_id=target_node_id,
@@ -735,14 +790,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         payloads: Iterable[Dict[str, object]],
         *,
         shared_kwargs: Optional[Dict[str, object]] = None,
-    ) -> List[Dict[str, object]]:
+    ) -> Iterator[Dict[str, object]]:
         shared = dict(shared_kwargs or {})
-        merged: List[Dict[str, object]] = []
         for payload in payloads:
             if not isinstance(payload, dict):
                 raise TypeError("payloads must be mapping payloads")
-            merged.append({**dict(payload), **shared})
-        return merged
+            yield {**dict(payload), **shared}
 
     def _item_with_index(self, item: ExecutionItem, *, index: int, key: Union[int, str]) -> ExecutionItem:
         return replace(item, index=int(index), key=key)
@@ -764,26 +817,13 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         )
         grouped: Dict[str, List[Tuple[int, pb2.TaskSubmitItem]]] = {}
         index_by_task_id: Dict[str, int] = {}
-        for idx, payload in enumerate(payloads):
-            candidates, state = self._build_pool_scheduler_candidates(
-                allowed_node_ids=self._available_pool_node_ids(),
-                state=temp_state,
-            )
-            if not candidates:
-                raise RuntimeError("task pool has no active node pools")
-            with self._pool_lock:
-                rr = self._pool_cycle
-                self._pool_cycle += 1
-            selected = select_one_candidate(
-                candidates,
-                profile=TASKPOOL_DEFAULT,
-                state=state,
-                round_robin_counter=rr,
-            )
-            target_node_id = str(selected.id)
-            temp_state.local_inflight_by_candidate[target_node_id] = (
-                int(temp_state.local_inflight_by_candidate.get(target_node_id, 0) or 0) + 1
-            )
+        planned_targets = self._plan_pool_node_targets(
+            count=len(payloads),
+            strategy=TASKPOOL_DEFAULT.name,
+            state=temp_state,
+            allowed_node_ids=self._available_pool_node_ids(),
+        )
+        for idx, (payload, target_node_id) in enumerate(zip(payloads, planned_targets)):
             item = self._build_task_submit_item(
                 node_id=target_node_id,
                 payload=dict(payload or {}),
@@ -820,7 +860,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 )
         return accepted_task_ids, index_by_task_id, rejected_items
 
-    def _iter_result_items(
+    def _iter_raw_results(
         self,
         *,
         max_count: Optional[int] = None,
@@ -898,7 +938,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             )
             return
         self._assert_session_available("iter_results")
-        for _node_id, item in self._iter_result_items(
+        for _node_id, item in self._iter_raw_results(
             max_count=max_count,
             timeout_sec=timeout_sec,
             wait_ms=wait_ms,
@@ -938,7 +978,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_ids: Optional[Set[str]] = None,
     ) -> Iterator[Tuple[str, Any]]:
         self._assert_session_available("iter_data")
-        for item in self.iter_items(
+        for item in self._iter_execution_items(
             max_count=max_count,
             timeout_sec=timeout_sec,
             wait_ms=wait_ms,
@@ -1013,7 +1053,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         unique = {digest for digest in digests.values() if str(digest).strip()}
         return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()))
 
-    def _iter_received_items(
+    def _iter_execution_items(
         self,
         *,
         max_count: Optional[int] = None,
@@ -1023,7 +1063,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
     ) -> Iterator[ExecutionItem]:
-        for node_id, task_result in self._iter_result_items(
+        self._assert_session_available("iter_items")
+        for node_id, task_result in self._iter_raw_results(
             max_count=max_count,
             timeout_sec=timeout_sec,
             wait_ms=wait_ms,
@@ -1056,7 +1097,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         """
         self._assert_session_available("iter_items")
         if payloads is None:
-            yield from self._iter_received_items(
+            yield from self._iter_execution_items(
                 max_count=max_count,
                 timeout_sec=timeout_sec,
                 wait_ms=wait_ms,
@@ -1196,7 +1237,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
     def _collect_data_for_task_ids(self, task_ids: Set[str], *, timeout_sec: float = 30.0) -> List[Tuple[str, Any]]:
         out: List[Tuple[str, Any]] = []
-        for node_id, item in self._iter_result_items(max_count=len(task_ids), timeout_sec=timeout_sec, task_ids=set(task_ids)):
+        for node_id, item in self._iter_raw_results(max_count=len(task_ids), timeout_sec=timeout_sec, task_ids=set(task_ids)):
             if int(item.status) != int(pb2.TASK_STATUS_SUCCEEDED):
                 error = item.error
                 raise RuntimeError(str(error.message or f"task failed: {item.task_id}"))
@@ -1220,18 +1261,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 limit=limit,
                 job_id=job_id,
             )
-        self._assert_session_available("wait_for_results")
         max_count = max(0, int(expected_count or 0))
-        return [
-            item
-            for _node_id, item in self._iter_result_items(
+        return list(
+            self.iter_results(
                 max_count=(max_count if max_count > 0 else None),
                 timeout_sec=timeout_sec,
                 wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
             )
-        ]
+        )
 
     def wait_for_data(
         self,
@@ -1241,16 +1280,19 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     ) -> Sequence[Any]:
         if self._backend is not None:
             return self._backend.wait_for_data(expected_count=expected_count, timeout_sec=timeout_sec)
-        self._assert_session_available("wait_for_data")
-        results = self.wait_for_results(expected_count=expected_count, timeout_sec=timeout_sec)
-        return _resolve_task_results_data(
-            _NativePoolResultAdapter(serialization_mode=self._serialization_mode),
-            results,
-        )
+        max_count = max(0, int(expected_count or 0))
+        return [
+            data
+            for _task_id, data in self.iter_data(
+                max_count=(max_count if max_count > 0 else None),
+                timeout_sec=timeout_sec,
+                raise_on_error=True,
+            )
+        ]
 
     def submit_values(
         self,
-        values: Sequence[Any],
+        values: Iterable[Any],
         *,
         arg_name: str = "value",
         task_method: str = "",
@@ -1268,12 +1310,253 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 **shared_kwargs,
             )
         normalized_arg = str(arg_name or "value").strip() or "value"
-        payloads = [{normalized_arg: value, **dict(shared_kwargs)} for value in values]
-        return self.submit_payloads(
-            payloads,
-            task_method=task_method,
-            strategy=strategy,
-            serialization_mode=serialization_mode,
+        shared = dict(shared_kwargs)
+        chunk_size = max(1, self._resolve_max_in_flight(None))
+        accepted: List[pb2.TaskAccepted] = []
+        rejected: List[pb2.TaskRejected] = []
+        ok = True
+        chunk: List[Dict[str, object]] = []
+        for value in values:
+            chunk.append({normalized_arg: value, **shared})
+            if len(chunk) < chunk_size:
+                continue
+            resp = self.submit_payloads(
+                chunk,
+                task_method=task_method,
+                strategy=strategy,
+                serialization_mode=serialization_mode,
+            )
+            ok = ok and bool(resp.ok)
+            accepted.extend(resp.accepted)
+            rejected.extend(resp.rejected)
+            chunk = []
+        if chunk:
+            resp = self.submit_payloads(
+                chunk,
+                task_method=task_method,
+                strategy=strategy,
+                serialization_mode=serialization_mode,
+            )
+            ok = ok and bool(resp.ok)
+            accepted.extend(resp.accepted)
+            rejected.extend(resp.rejected)
+        return pb2.SubmitTasksResponse(ok=ok, accepted=accepted, rejected=rejected, node_credit=0)
+
+    def _plan_limited_pool_node_targets(
+        self,
+        available_by_node: Dict[str, int],
+        *,
+        node_order: Sequence[str],
+        max_new_tasks: int,
+        profile,
+        inflight_by_node: Dict[str, int],
+        disabled_submit_nodes: Set[str],
+        infra_failures_by_node: Dict[str, int],
+        round_robin_start: int,
+    ) -> List[str]:
+        if max_new_tasks <= 0:
+            return []
+        remaining = {
+            node_id: max(0, int(available_by_node.get(node_id, 0) or 0))
+            for node_id in node_order
+            if node_id not in disabled_submit_nodes
+        }
+        allowed = [node_id for node_id in node_order if remaining.get(node_id, 0) > 0]
+        if not allowed:
+            return []
+        state = SchedulerState(
+            local_inflight_by_candidate=dict(inflight_by_node),
+            disabled_candidates=set(disabled_submit_nodes),
+            recent_submit_failures=dict(infra_failures_by_node),
+        )
+        candidates, state = self._build_pool_scheduler_candidates(
+            allowed_node_ids=allowed,
+            state=state,
+        )
+        planned: List[str] = []
+        rr_counter = int(round_robin_start or 0)
+        while max_new_tasks > 0:
+            if not any(remaining.get(node_id, 0) > 0 for node_id in node_order):
+                break
+            try:
+                selected = select_one_candidate(
+                    candidates,
+                    profile=profile,
+                    state=state,
+                    round_robin_counter=rr_counter,
+                )
+            except RuntimeError:
+                break
+            node_id = str(selected.id)
+            if remaining.get(node_id, 0) <= 0:
+                state.disabled_candidates.add(node_id)
+                continue
+            rr_counter += 1
+            planned.append(node_id)
+            remaining[node_id] = max(0, int(remaining.get(node_id, 0) or 0) - 1)
+            state.local_inflight_by_candidate[node_id] = (
+                int(state.local_inflight_by_candidate.get(node_id, 0) or 0) + 1
+            )
+            if remaining[node_id] <= 0:
+                state.disabled_candidates.add(node_id)
+            max_new_tasks -= 1
+        return planned
+
+    def _submit_imap_entries_to_nodes(
+        self,
+        grouped: Dict[str, List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]],
+        *,
+        node_order: Sequence[str],
+        job_id: str,
+        disabled_submit_nodes: Set[str],
+        scheduler_failures: Dict[str, str],
+        payload_buffer: _IndexedPayloadBuffer,
+        inflight_by_node: Dict[str, int],
+    ) -> int:
+        submitted = 0
+        for node_id in node_order:
+            entries = grouped.get(node_id, [])
+            if not entries:
+                continue
+            try:
+                resp = self._submit_task_items_to_node(
+                    node_id,
+                    [item for _index, _payload, item in entries],
+                    job_id=job_id,
+                )
+            except Exception as exc:
+                disabled_submit_nodes.add(node_id)
+                self._mark_pool_submit_failure(node_id, failure_kind=SUBMIT_FAILED, error=exc)
+                scheduler_failures[node_id] = repr(exc)
+                payload_buffer.requeue_front(entries)
+                continue
+            accepted_ids = {str(item.task_id) for item in resp.accepted if str(item.task_id).strip()}
+            if not accepted_ids:
+                self._mark_pool_submit_failure(
+                    node_id,
+                    failure_kind=SUBMIT_FAILED,
+                    error=RuntimeError("submit returned no accepted task ids"),
+                )
+                payload_buffer.requeue_front(entries)
+                continue
+            self._mark_pool_submit_success(node_id)
+            accepted_count = 0
+            rejected_entries: List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]] = []
+            for entry in entries:
+                if str(entry[2].task_id) in accepted_ids:
+                    accepted_count += 1
+                else:
+                    rejected_entries.append(entry)
+            if rejected_entries:
+                payload_buffer.requeue_front(rejected_entries)
+            inflight_by_node[node_id] = int(inflight_by_node.get(node_id, 0) or 0) + accepted_count
+            submitted += accepted_count
+        return submitted
+
+    def _poll_imap_results_once(
+        self,
+        *,
+        ordered_node_ids: Sequence[str],
+        inflight_by_node: Dict[str, int],
+        disabled_submit_nodes: Set[str],
+        scheduler_failures: Dict[str, str],
+        infra_failures_by_node: Dict[str, int],
+        task_index_by_id: Dict[str, int],
+    ) -> Tuple[List[ExecutionItem], Dict[str, int]]:
+        completed_items: List[ExecutionItem] = []
+        freed_by_node: Dict[str, int] = {}
+        for node_id in ordered_node_ids:
+            pull_limit = max(1, int(inflight_by_node.get(node_id, 0) or 1))
+            try:
+                resp = self._pools[node_id].pull_results(limit=pull_limit, wait_ms=0, cursor="")
+            except Exception as exc:
+                disabled_submit_nodes.add(node_id)
+                self._mark_pool_submit_failure(node_id, failure_kind=SUBMIT_FAILED, error=exc)
+                scheduler_failures[node_id] = repr(exc)
+                continue
+            if not resp.results:
+                continue
+            for result in resp.results:
+                normalized = str(result.task_id or "").strip()
+                if not self._is_pending_task_id(normalized):
+                    continue
+                self._mark_result_consumed(result.task_id)
+                inflight_by_node[node_id] = max(0, int(inflight_by_node.get(node_id, 0) or 0) - 1)
+                freed_by_node[node_id] = int(freed_by_node.get(node_id, 0) or 0) + 1
+                if int(result.status) == int(pb2.TASK_STATUS_FAILED_INFRA):
+                    infra_failures_by_node[node_id] = int(infra_failures_by_node.get(node_id, 0) or 0) + 1
+                    self._mark_pool_submit_failure(
+                        node_id,
+                        failure_kind=REMOTE_INFRA_FAILED,
+                        error=RuntimeError(str(result.error.message or "remote infra failure")),
+                    )
+                    if int(infra_failures_by_node.get(node_id, 0) or 0) >= 2:
+                        disabled_submit_nodes.add(node_id)
+                elif int(result.status) == int(pb2.TASK_STATUS_SUCCEEDED):
+                    infra_failures_by_node.pop(node_id, None)
+                    self._mark_pool_submit_success(node_id)
+                item = self._task_result_to_item(node_id, result)
+                index = int(task_index_by_id.get(normalized, -1))
+                completed_items.append(self._item_with_index(item, index=index, key=index if index >= 0 else normalized))
+        return completed_items, freed_by_node
+
+    def _fill_imap_from_quota(
+        self,
+        available_by_node: Dict[str, int],
+        *,
+        node_order: Sequence[str],
+        max_pending: int,
+        profile,
+        inflight_by_node: Dict[str, int],
+        disabled_submit_nodes: Set[str],
+        infra_failures_by_node: Dict[str, int],
+        poll_start_idx: int,
+        payload_buffer: _IndexedPayloadBuffer,
+        task_index_by_id: Dict[str, int],
+        scheduler_failures: Dict[str, str],
+    ) -> int:
+        available_global = max(0, int(max_pending or 0) - sum(inflight_by_node.values()))
+        if available_global <= 0:
+            return 0
+        capped_by_node = {
+            node_id: max(0, int(available_by_node.get(node_id, 0) or 0))
+            for node_id in node_order
+            if node_id not in disabled_submit_nodes
+        }
+        targets = self._plan_limited_pool_node_targets(
+            capped_by_node,
+            node_order=node_order,
+            max_new_tasks=available_global,
+            profile=profile,
+            inflight_by_node=inflight_by_node,
+            disabled_submit_nodes=disabled_submit_nodes,
+            infra_failures_by_node=infra_failures_by_node,
+            round_robin_start=poll_start_idx,
+        )
+        if not targets:
+            return 0
+        grouped: Dict[str, List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]] = {}
+        for node_id in targets:
+            indexed_payload = payload_buffer.next()
+            if indexed_payload is None:
+                break
+            index, payload = indexed_payload
+            item = self._build_task_submit_item(
+                node_id=node_id,
+                payload=payload,
+                timeout_hint_sec=0,
+                priority=1,
+            )
+            task_index_by_id[str(item.task_id)] = int(index)
+            grouped.setdefault(node_id, []).append((int(index), payload, item))
+        return self._submit_imap_entries_to_nodes(
+            grouped,
+            node_order=node_order,
+            job_id=self.job_id,
+            disabled_submit_nodes=disabled_submit_nodes,
+            scheduler_failures=scheduler_failures,
+            payload_buffer=payload_buffer,
+            inflight_by_node=inflight_by_node,
         )
 
     def imap_unordered(
@@ -1312,11 +1595,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 unexpected = ", ".join(sorted(shared_kwargs))
                 raise TypeError(f"unexpected keyword arguments for imap_unordered(): {unexpected}")
             profile = resolve_taskpool_strategy(strategy)
-            payload_iter = iter(payloads)
-            retry_payloads: "deque[Tuple[int, Dict[str, object]]]" = deque()
-            input_exhausted = False
+            payload_buffer = _IndexedPayloadBuffer(payloads)
             ready_items: "deque[ExecutionItem]" = deque()
-            next_payload_index = 0
             task_index_by_id: Dict[str, int] = {}
             node_ids = self._available_pool_node_ids()
             if not node_ids:
@@ -1329,139 +1609,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
             cancelled_for_error = False
 
-            def _plan_targets(
-                available_by_node: Dict[str, int],
-                *,
-                node_order: Sequence[str],
-                max_new_tasks: int,
-            ) -> List[str]:
-                if max_new_tasks <= 0:
-                    return []
-                remaining = {
-                    node_id: max(0, int(available_by_node.get(node_id, 0) or 0))
-                    for node_id in node_order
-                    if node_id not in disabled_submit_nodes
-                }
-                planned: List[str] = []
-                rr_counter = poll_start_idx
-                while max_new_tasks > 0:
-                    allowed = [node_id for node_id in node_order if remaining.get(node_id, 0) > 0]
-                    if not allowed:
-                        break
-                    candidates, state = self._build_pool_scheduler_candidates(
-                        allowed_node_ids=allowed,
-                        state=SchedulerState(
-                            local_inflight_by_candidate=dict(inflight_by_node),
-                            disabled_candidates=set(disabled_submit_nodes),
-                            recent_submit_failures=dict(infra_failures_by_node),
-                        ),
-                    )
-                    selected = select_one_candidate(
-                        candidates,
-                        profile=profile,
-                        state=state,
-                        round_robin_counter=rr_counter,
-                    )
-                    node_id = str(selected.id)
-                    rr_counter += 1
-                    planned.append(node_id)
-                    remaining[node_id] = max(0, int(remaining.get(node_id, 0) or 0) - 1)
-                    max_new_tasks -= 1
-                return planned
-
-            def _next_payload() -> Optional[Tuple[int, Dict[str, object]]]:
-                nonlocal input_exhausted, next_payload_index
-                if retry_payloads:
-                    index, payload = retry_payloads.popleft()
-                    return int(index), dict(payload or {})
-                if input_exhausted:
-                    return None
-                try:
-                    payload = dict(next(payload_iter) or {})
-                    index = next_payload_index
-                    next_payload_index += 1
-                    return index, payload
-                except StopIteration:
-                    input_exhausted = True
-                    return None
-
-            def _requeue_payloads_front(items: Sequence[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]) -> None:
-                for index, payload, _item in reversed(list(items)):
-                    retry_payloads.appendleft((int(index), dict(payload or {})))
-
-            def _fill_from_quota(
-                available_by_node: Dict[str, int],
-                *,
-                node_order: Sequence[str],
-            ) -> int:
-                available_global = max(0, max_pending - sum(inflight_by_node.values()))
-                if available_global <= 0:
-                    return 0
-                capped_by_node = {
-                    node_id: max(0, int(available_by_node.get(node_id, 0) or 0))
-                    for node_id in node_order
-                    if node_id not in disabled_submit_nodes
-                }
-                targets = _plan_targets(capped_by_node, node_order=node_order, max_new_tasks=available_global)
-                if not targets:
-                    return 0
-                grouped: Dict[str, List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]] = {}
-                for node_id in targets:
-                    indexed_payload = _next_payload()
-                    if indexed_payload is None:
-                        break
-                    index, payload = indexed_payload
-                    item = self._build_task_submit_item(
-                        node_id=node_id,
-                        payload=payload,
-                        timeout_hint_sec=0,
-                        priority=1,
-                    )
-                    task_index_by_id[str(item.task_id)] = int(index)
-                    grouped.setdefault(node_id, []).append((int(index), payload, item))
-                submitted = 0
-                for node_id in node_order:
-                    entries = grouped.get(node_id, [])
-                    if not entries:
-                        continue
-                    try:
-                        resp = self._submit_task_items_to_node(
-                            node_id,
-                            [item for _index, _payload, item in entries],
-                            job_id=self.job_id,
-                        )
-                    except Exception as exc:
-                        disabled_submit_nodes.add(node_id)
-                        self._mark_pool_submit_failure(node_id, failure_kind=SUBMIT_FAILED, error=exc)
-                        scheduler_failures[node_id] = repr(exc)
-                        _requeue_payloads_front(entries)
-                        continue
-                    accepted_ids = {str(item.task_id) for item in resp.accepted if str(item.task_id).strip()}
-                    if not accepted_ids:
-                        self._mark_pool_submit_failure(
-                            node_id,
-                            failure_kind=SUBMIT_FAILED,
-                            error=RuntimeError("submit returned no accepted task ids"),
-                        )
-                        _requeue_payloads_front(entries)
-                        continue
-                    self._mark_pool_submit_success(node_id)
-                    accepted_count = 0
-                    rejected_entries: List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]] = []
-                    for entry in entries:
-                        if str(entry[2].task_id) in accepted_ids:
-                            accepted_count += 1
-                        else:
-                            rejected_entries.append(entry)
-                    if rejected_entries:
-                        _requeue_payloads_front(rejected_entries)
-                    inflight_by_node[node_id] += accepted_count
-                    submitted += accepted_count
-                return submitted
-
             initial_quota = {node_id: max_pending for node_id in node_ids}
-            _fill_from_quota(initial_quota, node_order=node_ids)
-            if self._pending_result_count() <= 0 and not retry_payloads and input_exhausted:
+            self._fill_imap_from_quota(
+                initial_quota,
+                node_order=node_ids,
+                max_pending=max_pending,
+                profile=profile,
+                inflight_by_node=inflight_by_node,
+                disabled_submit_nodes=disabled_submit_nodes,
+                infra_failures_by_node=infra_failures_by_node,
+                poll_start_idx=poll_start_idx,
+                payload_buffer=payload_buffer,
+                task_index_by_id=task_index_by_id,
+                scheduler_failures=scheduler_failures,
+            )
+            if self._pending_result_count() <= 0 and not payload_buffer.has_retry and payload_buffer.exhausted:
                 return
 
             while True:
@@ -1482,60 +1644,42 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 if yielded > 0:
                     continue
 
-                if input_exhausted and not retry_payloads and self._pending_result_count() <= 0:
+                if payload_buffer.exhausted and not payload_buffer.has_retry and self._pending_result_count() <= 0:
                     return
 
                 if self._pending_result_count() <= 0:
                     idle_quota = {node_id: max_pending for node_id in node_ids}
-                    submitted_now = _fill_from_quota(idle_quota, node_order=node_ids)
+                    submitted_now = self._fill_imap_from_quota(
+                        idle_quota,
+                        node_order=node_ids,
+                        max_pending=max_pending,
+                        profile=profile,
+                        inflight_by_node=inflight_by_node,
+                        disabled_submit_nodes=disabled_submit_nodes,
+                        infra_failures_by_node=infra_failures_by_node,
+                        poll_start_idx=poll_start_idx,
+                        payload_buffer=payload_buffer,
+                        task_index_by_id=task_index_by_id,
+                        scheduler_failures=scheduler_failures,
+                    )
                     if submitted_now > 0:
                         wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
                         continue
-                    if retry_payloads or not input_exhausted:
+                    if payload_buffer.has_retry or not payload_buffer.exhausted:
                         failure_suffix = f"; failures={scheduler_failures}" if scheduler_failures else ""
                         raise RuntimeError(f"imap_unordered could not submit tasks to any active task pool node{failure_suffix}")
                     return
 
                 ordered_node_ids = node_ids[poll_start_idx:] + node_ids[:poll_start_idx]
                 poll_start_idx = (poll_start_idx + 1) % len(node_ids)
-                completed_items: List[ExecutionItem] = []
-                freed_by_node: Dict[str, int] = {}
-                completion_order: List[str] = []
-                for node_id in ordered_node_ids:
-                    pull_limit = max(1, int(inflight_by_node.get(node_id, 0) or 1))
-                    try:
-                        resp = self._pools[node_id].pull_results(limit=pull_limit, wait_ms=0, cursor="")
-                    except Exception as exc:
-                        disabled_submit_nodes.add(node_id)
-                        self._mark_pool_submit_failure(node_id, failure_kind=SUBMIT_FAILED, error=exc)
-                        scheduler_failures[node_id] = repr(exc)
-                        continue
-                    if not resp.results:
-                        continue
-                    for result in resp.results:
-                        normalized = str(result.task_id or "").strip()
-                        if not self._is_pending_task_id(normalized):
-                            continue
-                        self._mark_result_consumed(result.task_id)
-                        inflight_by_node[node_id] = max(0, inflight_by_node[node_id] - 1)
-                        freed_by_node[node_id] = freed_by_node.get(node_id, 0) + 1
-                        if node_id not in completion_order:
-                            completion_order.append(node_id)
-                        if int(result.status) == int(pb2.TASK_STATUS_FAILED_INFRA):
-                            infra_failures_by_node[node_id] = infra_failures_by_node.get(node_id, 0) + 1
-                            self._mark_pool_submit_failure(
-                                node_id,
-                                failure_kind=REMOTE_INFRA_FAILED,
-                                error=RuntimeError(str(result.error.message or "remote infra failure")),
-                            )
-                            if infra_failures_by_node[node_id] >= 2:
-                                disabled_submit_nodes.add(node_id)
-                        elif int(result.status) == int(pb2.TASK_STATUS_SUCCEEDED):
-                            infra_failures_by_node.pop(node_id, None)
-                            self._mark_pool_submit_success(node_id)
-                        item = self._task_result_to_item(node_id, result)
-                        index = int(task_index_by_id.get(normalized, -1))
-                        completed_items.append(self._item_with_index(item, index=index, key=index if index >= 0 else normalized))
+                completed_items, freed_by_node = self._poll_imap_results_once(
+                    ordered_node_ids=ordered_node_ids,
+                    inflight_by_node=inflight_by_node,
+                    disabled_submit_nodes=disabled_submit_nodes,
+                    scheduler_failures=scheduler_failures,
+                    infra_failures_by_node=infra_failures_by_node,
+                    task_index_by_id=task_index_by_id,
+                )
 
                 if completed_items:
                     wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
@@ -1544,7 +1688,19 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         freed_total = max(0, sum(int(value or 0) for value in freed_by_node.values()))
                         if freed_total > 0:
                             refill_quota = {node_id: freed_total for node_id in node_ids}
-                            _fill_from_quota(refill_quota, node_order=node_ids)
+                            self._fill_imap_from_quota(
+                                refill_quota,
+                                node_order=node_ids,
+                                max_pending=max_pending,
+                                profile=profile,
+                                inflight_by_node=inflight_by_node,
+                                disabled_submit_nodes=disabled_submit_nodes,
+                                infra_failures_by_node=infra_failures_by_node,
+                                poll_start_idx=poll_start_idx,
+                                payload_buffer=payload_buffer,
+                                task_index_by_id=task_index_by_id,
+                                scheduler_failures=scheduler_failures,
+                            )
                     continue
 
                 if time.time() >= wait_deadline:
@@ -1678,11 +1834,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
     def map(
         self,
-        values: Sequence[Any],
+        values: Iterable[Any],
         *,
         arg_name: str = "value",
         task_method: str = "",
         strategy: str = "taskpool_default",
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> Sequence[Any]:
@@ -1692,26 +1849,30 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 arg_name=arg_name,
                 task_method=task_method,
                 strategy=strategy,
+                max_in_flight=max_in_flight,
                 timeout_sec=timeout_sec,
                 **shared_kwargs,
             )
-        payloads = [{str(arg_name or "value").strip() or "value": value, **dict(shared_kwargs)} for value in values]
+        normalized_arg = str(arg_name or "value").strip() or "value"
+        shared = dict(shared_kwargs)
+        payloads = ({normalized_arg: value, **shared} for value in values)
         items = self.collect_items(
             payloads,
             task_method=task_method,
             strategy=strategy,
-            max_in_flight=max(1, len(payloads) or 1),
+            max_in_flight=self._resolve_max_in_flight(max_in_flight),
             timeout_sec=timeout_sec,
         )
         return [item.result if item.ok else None for item in items]
 
     async def amap(
         self,
-        values: Sequence[Any],
+        values: Iterable[Any],
         *,
         arg_name: str = "value",
         task_method: str = "",
         strategy: str = "taskpool_default",
+        max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> Sequence[Any]:
@@ -1721,6 +1882,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 arg_name=arg_name,
                 task_method=task_method,
                 strategy=strategy,
+                max_in_flight=max_in_flight,
                 timeout_sec=timeout_sec,
                 **shared_kwargs,
             )
@@ -1767,7 +1929,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def is_alive(self) -> bool:
         if self._backend is not None and hasattr(self._backend, "is_alive"):
             return bool(self._backend.is_alive())
-        return super().is_alive()
+        return (not self._closed) and (not self.failed) and any(
+            node_id in self._active_nodes for node_id in self._pools
+        )
 
     def put_data(
         self,
@@ -1826,7 +1990,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return
         self._closed = True
         self._stop_keepalive()
-        if self._backend is not None and not isinstance(self._backend, NativeTaskBackend):
+        if self._backend is not None:
             self._backend.close()
             return
         for pool in self._pools.values():
@@ -1865,12 +2029,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if self.effective_policy is not None:
             effective_policy_text = (
                 f" effective_policy={self.effective_policy.policy_id}@v{self.effective_policy.version}"
-            )
-        if isinstance(self._backend, NativeTaskBackend) or self._backend is None:
-            return (
-                f"<{type(self).__name__} methods={self.methods} "
-                f"nodes={len(self.node_ids)} serialization_mode={self._serialization_mode}"
-                f"{effective_policy_text}>"
             )
         if self._backend is not None:
             return repr(self._backend)

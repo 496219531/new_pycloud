@@ -539,10 +539,19 @@ print(client.square.sync(x=9))
 ### 5. 本地并行（辅助能力）
 
 ```python
-from pycloud_parallel.local import foreach, parallel_for
+from pycloud_parallel.local import configure, foreach, parallel_for
 
-print(foreach(lambda x: x * x, [1, 2, 3], max_workers=2))
-print(parallel_for(range(5), lambda i: i + 1, max_workers=2))
+configure(max_workers=2, reset=True)
+print(foreach([1, 2, 3], lambda x: x * x).values)
+
+@parallel_for()
+def add_one(items):
+    out = []
+    for item in items:
+        out.append(item + 1)
+    return out
+
+print(add_one([1, 2, 3]))
 ```
 
 ## 服务模式说明

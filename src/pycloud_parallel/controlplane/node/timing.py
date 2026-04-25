@@ -3,6 +3,8 @@ from __future__ import annotations
 """Shared timing/metrics helpers for service and task-pool execution flows."""
 
 from dataclasses import dataclass
+import json
+import logging
 from typing import Dict, Mapping, Optional
 
 
@@ -23,7 +25,7 @@ class ExecutionTimingSample:
 
 def _normalize_timing_sample(
     sample: ExecutionTimingSample,
-) -> tuple[float, float, float, float, float, float, float, int, float]:
+) -> tuple[float, float, float, float, float, float, float, float, float, int, float]:
     setup_ms = float(sample.setup_ms or 0.0)
     build_execute_spec_ms = float(sample.build_execute_spec_ms or 0.0)
     executor_ms = float(sample.executor_ms or 0.0)
@@ -31,8 +33,9 @@ def _normalize_timing_sample(
     total_ms = float(sample.total_ms or 0.0)
     decode_ms = float((sample.subprocess_timings or {}).get("decode_ms", 0.0) or 0.0)
     invoke_ms = float((sample.subprocess_timings or {}).get("invoke_ms", 0.0) or 0.0)
+    invoke_wrapper_ms = float((sample.subprocess_timings or {}).get("invoke_wrapper_ms", 0.0) or 0.0)
+    user_fn_ms = float((sample.subprocess_timings or {}).get("user_fn_ms", 0.0) or 0.0)
     encode_ms = float((sample.subprocess_timings or {}).get("encode_ms", 0.0) or 0.0)
-    sample_count = 0
     queue_wait_ms = max(0.0, executor_ms - decode_ms - invoke_ms - encode_ms)
     return (
         setup_ms,
@@ -42,6 +45,8 @@ def _normalize_timing_sample(
         total_ms,
         decode_ms,
         invoke_ms,
+        invoke_wrapper_ms,
+        user_fn_ms,
         int(sample.http_status or 0),
         queue_wait_ms,
     )
@@ -72,6 +77,8 @@ def update_execution_timing_metrics(
         total_ms,
         decode_ms,
         invoke_ms,
+        invoke_wrapper_ms,
+        user_fn_ms,
         _http_status,
         queue_wait_ms,
     ) = _normalize_timing_sample(sample)
@@ -101,12 +108,16 @@ def update_execution_timing_metrics(
         updated["last_child_decode_ms"] = round(decode_ms, 3)
         updated["last_invoke_ms"] = round(invoke_ms, 3)
         updated["last_child_invoke_ms"] = round(invoke_ms, 3)
+        updated["last_invoke_wrapper_ms"] = round(invoke_wrapper_ms, 3)
+        updated["last_user_fn_ms"] = round(user_fn_ms, 3)
         updated["last_child_encode_ms"] = round(encode_ms, 3)
         updated["ema_child_invoke_ms"] = round(ema, 3)
         updated["ema_samples"] = ema_samples
         updated["avg_child_decode_ms"] = _avg("avg_child_decode_ms", decode_ms)
         updated["avg_invoke_ms"] = _avg("avg_invoke_ms", invoke_ms)
         updated["avg_child_invoke_ms"] = updated["avg_invoke_ms"]
+        updated["avg_invoke_wrapper_ms"] = _avg("avg_invoke_wrapper_ms", invoke_wrapper_ms)
+        updated["avg_user_fn_ms"] = _avg("avg_user_fn_ms", user_fn_ms)
         updated["avg_child_encode_ms"] = _avg("avg_child_encode_ms", encode_ms)
         if include_queue_wait:
             updated["last_queue_wait_ms"] = round(queue_wait_ms, 3)
@@ -115,12 +126,16 @@ def update_execution_timing_metrics(
         updated.setdefault("last_child_decode_ms", 0.0)
         updated.setdefault("last_invoke_ms", 0.0)
         updated.setdefault("last_child_invoke_ms", updated.get("last_invoke_ms", 0.0))
+        updated.setdefault("last_invoke_wrapper_ms", 0.0)
+        updated.setdefault("last_user_fn_ms", 0.0)
         updated.setdefault("last_child_encode_ms", 0.0)
         updated.setdefault("ema_child_invoke_ms", 0.0)
         updated.setdefault("ema_samples", 0)
         updated.setdefault("avg_child_decode_ms", 0.0)
         updated.setdefault("avg_invoke_ms", 0.0)
         updated.setdefault("avg_child_invoke_ms", updated.get("avg_invoke_ms", 0.0))
+        updated.setdefault("avg_invoke_wrapper_ms", 0.0)
+        updated.setdefault("avg_user_fn_ms", 0.0)
         updated.setdefault("avg_child_encode_ms", 0.0)
         if include_queue_wait:
             updated.setdefault("last_queue_wait_ms", 0.0)
@@ -150,6 +165,8 @@ def build_execution_timing_event(
         total_ms,
         _decode_ms,
         _invoke_ms,
+        _invoke_wrapper_ms,
+        _user_fn_ms,
         http_status,
         queue_wait_ms,
     ) = _normalize_timing_sample(sample)
@@ -177,8 +194,45 @@ def build_execution_timing_event(
     return payload
 
 
+def record_execution_timing(
+    metrics: Mapping[str, object] | None,
+    *,
+    sample: ExecutionTimingSample,
+    include_http_status: bool,
+    include_queue_wait: bool,
+    updated_at: str,
+    event: str,
+    id_key: str,
+    id_value: str,
+    name_key: str,
+    name_value: str,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, object]:
+    updated = update_execution_timing_metrics(
+        metrics,
+        sample=sample,
+        include_http_status=include_http_status,
+        include_queue_wait=include_queue_wait,
+    )
+    updated["updated_at"] = str(updated_at or "")
+    if logger is not None:
+        payload = build_execution_timing_event(
+            event=event,
+            id_key=id_key,
+            id_value=id_value,
+            name_key=name_key,
+            name_value=name_value,
+            sample=sample,
+            include_http_status=include_http_status,
+            include_queue_wait=include_queue_wait,
+        )
+        logger.info(json.dumps(payload, ensure_ascii=False))
+    return updated
+
+
 __all__ = [
     "ExecutionTimingSample",
     "build_execution_timing_event",
+    "record_execution_timing",
     "update_execution_timing_metrics",
 ]

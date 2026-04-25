@@ -72,6 +72,8 @@ def test_executor_host_service_call_roundtrip(tmp_path):
         assert resp["result"] == {"value": 7, "square": 49}
         assert float((resp.get("timings") or {}).get("decode_ms", 0.0) or 0.0) >= 0.0
         assert float((resp.get("timings") or {}).get("invoke_ms", 0.0) or 0.0) >= 0.0
+        assert float((resp.get("timings") or {}).get("invoke_wrapper_ms", 0.0) or 0.0) >= 0.0
+        assert float((resp.get("timings") or {}).get("user_fn_ms", 0.0) or 0.0) >= 0.0
         assert float((resp.get("timings") or {}).get("encode_ms", 0.0) or 0.0) >= 0.0
         host.stop_service(service_id="svc-host-roundtrip")
     finally:

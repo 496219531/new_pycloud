@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 import zipfile
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -109,8 +109,7 @@ from pycloud_parallel.controlplane.node.session_views import (
 )
 from pycloud_parallel.controlplane.node.timing import (
     ExecutionTimingSample,
-    build_execution_timing_event,
-    update_execution_timing_metrics,
+    record_execution_timing,
 )
 from pycloud_parallel.data.ref import (
     normalize_object_format,
@@ -189,6 +188,7 @@ class NodeControlState:
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._pool_tasks: Dict[str, TaskState] = {}
+        self._pool_task_reserved_ids: set[str] = set()
         self._codes: Dict[str, CodeArtifact] = {}
         self._objects: Dict[str, ObjectArtifact] = {}
         self._services: Dict[str, ServiceSession] = {}
@@ -224,6 +224,7 @@ class NodeControlState:
             if (self.enable_internal_executor or self.enable_service_session)
             else None
         )
+        self._cleanup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nodecontrol-cleanup")
         self._dispatcher: Optional[threading.Thread] = None
         self._service_http_gateway: Optional[ServiceHttpGateway] = None
 
@@ -276,26 +277,19 @@ class NodeControlState:
                 error_type=str(error_type or ""),
                 error_message=str(error_message or ""),
             )
-            metrics = update_execution_timing_metrics(
+            session.timing_metrics = record_execution_timing(
                 session.timing_metrics,
                 sample=sample,
                 include_http_status=True,
                 include_queue_wait=True,
-            )
-            metrics["updated_at"] = utc_now().isoformat()
-            session.timing_metrics = metrics
-
-            event = build_execution_timing_event(
+                updated_at=utc_now().isoformat(),
                 event="service_timing",
                 id_key="service_id",
                 id_value=session.service_id,
                 name_key="service_name",
                 name_value=session.service_name,
-                sample=sample,
-                include_http_status=True,
-                include_queue_wait=False,
+                logger=service_timing_logger,
             )
-            service_timing_logger.info(json.dumps(event, ensure_ascii=False))
         except Exception as exc:
             logger = logging.getLogger(__name__)
             logger.debug("failed to record service timing: %r", exc)
@@ -328,29 +322,53 @@ class NodeControlState:
                 error_type=str(error_type or ""),
                 error_message=str(error_message or ""),
             )
-            metrics = update_execution_timing_metrics(
+            pool.timing_metrics = record_execution_timing(
                 pool.timing_metrics,
                 sample=sample,
                 include_http_status=False,
                 include_queue_wait=True,
-            )
-            metrics["updated_at"] = utc_now().isoformat()
-            pool.timing_metrics = metrics
-
-            event = build_execution_timing_event(
+                updated_at=utc_now().isoformat(),
                 event="task_pool_timing",
                 id_key="pool_id",
                 id_value=pool.pool_id,
                 name_key="pool_name",
                 name_value=pool.pool_name,
-                sample=sample,
-                include_http_status=False,
-                include_queue_wait=True,
+                logger=service_timing_logger,
             )
-            service_timing_logger.info(json.dumps(event, ensure_ascii=False))
         except Exception as exc:
             logger = logging.getLogger(__name__)
             logger.debug("failed to record task pool timing: %r", exc)
+
+    def _record_task_pool_lifecycle_timing_locked(
+        self,
+        pool: TaskPoolState,
+        *,
+        metric: str,
+        elapsed_ms: float,
+    ) -> None:
+        metrics = dict(pool.timing_metrics or {})
+        count_key = f"{metric}_count"
+        last_key = f"last_{metric}_ms"
+        avg_key = f"avg_{metric}_ms"
+        count = int(metrics.get(count_key, 0) or 0) + 1
+        metrics[count_key] = count
+        metrics[last_key] = round(float(elapsed_ms or 0.0), 3)
+        prev_avg = float(metrics.get(avg_key, 0.0) or 0.0)
+        metrics[avg_key] = round((((prev_avg * (count - 1)) + float(elapsed_ms or 0.0)) / count), 3)
+        metrics["updated_at"] = utc_now().isoformat()
+        pool.timing_metrics = metrics
+
+    def _increment_task_pool_metric_locked(
+        self,
+        pool: TaskPoolState,
+        *,
+        key: str,
+        delta: int = 1,
+    ) -> None:
+        metrics = dict(pool.timing_metrics or {})
+        metrics[str(key)] = int(metrics.get(str(key), 0) or 0) + int(delta or 0)
+        metrics["updated_at"] = utc_now().isoformat()
+        pool.timing_metrics = metrics
 
     def service_timing_metadata(self) -> Dict[str, str]:
         with self._lock:
@@ -386,8 +404,25 @@ class NodeControlState:
         if self._service_http_gateway is not None:
             self._service_http_gateway.stop()
         self._shutdown_all_services()
+        self._cleanup_executor.shutdown(wait=True, cancel_futures=False)
         if self._executor_host is not None:
             self._executor_host.close()
+
+    def _submit_stop_task_pool(self, executor_host: ExecutorHostClient, *, pool_id: str) -> None:
+        normalized = str(pool_id or "").strip()
+        if not normalized:
+            return
+
+        def _stop() -> None:
+            try:
+                executor_host.stop_task_pool(pool_id=normalized)
+            except Exception:
+                logger.exception("[NodeControl] async stop_task_pool failed pool_id=%s", normalized)
+
+        try:
+            self._cleanup_executor.submit(_stop)
+        except RuntimeError:
+            _stop()
 
     @property
     def data_store(self) -> DataStore:
@@ -1038,6 +1073,29 @@ class NodeControlState:
     @staticmethod
     def _task_pool_inflight_locked(pool: TaskPoolState) -> int:
         return pool.resource_snapshot().in_flight
+
+    @staticmethod
+    def _pool_task_is_terminal_status(status: int) -> bool:
+        return int(status) in {
+            int(pb2.TASK_STATUS_SUCCEEDED),
+            int(pb2.TASK_STATUS_FAILED_USER),
+            int(pb2.TASK_STATUS_FAILED_INFRA),
+            int(pb2.TASK_STATUS_CANCELLED),
+        }
+
+    @staticmethod
+    def _pool_task_is_active_status(status: int) -> bool:
+        return int(status) in {
+            int(pb2.TASK_STATUS_QUEUED),
+            int(pb2.TASK_STATUS_RUNNING),
+        }
+
+    def _node_queue_occupancy_locked(self) -> int:
+        service_inflight = sum(self._service_inflight_locked(session) for session in self._services.values())
+        pool_active = sum(
+            1 for task in self._pool_tasks.values() if self._pool_task_is_active_status(int(task.status or 0))
+        )
+        return service_inflight + pool_active + len(self._pool_task_reserved_ids)
 
     def task_pool_worker_used(self) -> int:
         with self._lock:
@@ -1713,12 +1771,14 @@ class NodeControlState:
             with self._lock:
                 self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
             raise RuntimeError("executor host unavailable")
+        executor_create_started = time.monotonic()
         try:
             executor_host.create_task_pool(pool_id=pool_id, worker_count=actual_workers)
         except Exception:
             with self._lock:
                 self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
             raise
+        executor_create_ms = (time.monotonic() - executor_create_started) * 1000.0
         try:
             pool = TaskPoolState(
                 pool_id=pool_id,
@@ -1751,6 +1811,11 @@ class NodeControlState:
             with self._lock:
                 self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
                 self._task_pools[pool_id] = pool
+                self._record_task_pool_lifecycle_timing_locked(
+                    pool,
+                    metric="executor_create",
+                    elapsed_ms=executor_create_ms,
+                )
                 self._register_client_code_token_locked(
                     client_id=pool.pool_id,
                     code_version=pool.code_version,
@@ -1786,9 +1851,11 @@ class NodeControlState:
             task_count=len(tasks),
             job_id=str(job_id or "").strip(),
         )
-        now = utc_now()
+        normalized_pool_id = str(pool_id or "").strip()
+        normalized_job_id = str(job_id or "").strip()
+        reserved_items: List[pb2.TaskSubmitItem] = []
         with self._cv:
-            pool = self._task_pools.get(str(pool_id or "").strip())
+            pool = self._task_pools.get(normalized_pool_id)
             if pool is None:
                 raise KeyError("task pool not found")
             if not pool.pool_token or pool.pool_token != str(pool_token or "").strip():
@@ -1798,7 +1865,39 @@ class NodeControlState:
             artifact = self._codes.get(pool.code_version)
             if artifact is None:
                 raise RuntimeError("code artifact missing")
+            if self._executor_host is None:
+                raise RuntimeError("executor host unavailable")
             for item in tasks:
+                task_id = str(item.task_id or "").strip()
+                if task_id in self._pool_tasks or task_id in self._pool_task_reserved_ids:
+                    rejected.append(
+                        pb2.TaskRejected(
+                            task_id=task_id,
+                            code=pb2.ERROR_CODE_DUPLICATE_TASK,
+                            message="duplicate task_id",
+                        )
+                    )
+                    continue
+                if self._node_queue_occupancy_locked() >= int(self.queue_capacity):
+                    rejected.append(
+                        pb2.TaskRejected(
+                            task_id=task_id,
+                            code=pb2.ERROR_CODE_QUEUE_FULL,
+                            message=(
+                                f"node queue capacity exceeded "
+                                f"(queue_capacity={int(self.queue_capacity)}, pool_id={normalized_pool_id})"
+                            ),
+                        )
+                    )
+                    continue
+                self._pool_task_reserved_ids.add(task_id)
+                reserved_items.append(item)
+
+        work_dir = _code_data_dir(self._artifact_dir, code_version=artifact.code_version)
+        for item in reserved_items:
+            task_id = str(item.task_id or "").strip()
+            record: Optional[TaskState] = None
+            try:
                 if item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
                     item_serialization_mode = str(item.transport_payload.codec or "").strip().lower()
                     item_uses_transport_payload = True
@@ -1818,19 +1917,11 @@ class NodeControlState:
                         mode=item_serialization_mode,
                         context="taskpool_session",
                     )
-                if item.task_id in self._pool_tasks:
-                    rejected.append(
-                        pb2.TaskRejected(
-                            task_id=item.task_id,
-                            code=pb2.ERROR_CODE_DUPLICATE_TASK,
-                            message="duplicate task_id",
-                        )
-                    )
-                    continue
+                now = utc_now()
                 record = TaskState(
-                    task_id=item.task_id,
+                    task_id=task_id,
                     client_id=pool.pool_id,
-                    job_id=str(job_id or "").strip(),
+                    job_id=normalized_job_id,
                     code_version=pool.code_version,
                     runtime_key=str(item.runtime_key or "").strip(),
                     execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
@@ -1846,12 +1937,51 @@ class NodeControlState:
                     serialization_mode=item_serialization_mode,
                     use_transport_result=item_uses_transport_payload,
                 )
-                self._pool_tasks[item.task_id] = record
+                with self._cv:
+                    current_pool = self._task_pools.get(normalized_pool_id)
+                    if current_pool is None:
+                        self._pool_task_reserved_ids.discard(task_id)
+                        rejected.append(
+                            pb2.TaskRejected(
+                                task_id=task_id,
+                                code=pb2.ERROR_CODE_INTERNAL_ERROR,
+                                message="task pool not found",
+                            )
+                        )
+                        continue
+                    if current_pool.status != "RUNNING":
+                        self._pool_task_reserved_ids.discard(task_id)
+                        rejected.append(
+                            pb2.TaskRejected(
+                                task_id=task_id,
+                                code=pb2.ERROR_CODE_INTERNAL_ERROR,
+                                message="task pool not running",
+                            )
+                        )
+                        continue
+                    self._pool_task_reserved_ids.discard(task_id)
+                    self._pool_tasks[task_id] = record
+            except Exception as exc:
+                with self._cv:
+                    self._pool_task_reserved_ids.discard(task_id)
+                    current = self._pool_tasks.get(task_id)
+                    if record is not None and current is record:
+                        self._pool_tasks.pop(task_id, None)
+                rejected.append(
+                    pb2.TaskRejected(
+                        task_id=task_id,
+                        code=pb2.ERROR_CODE_INTERNAL_ERROR,
+                        message=f"prepare task failed: {exc}",
+                    )
+                )
+                continue
+
+            try:
                 build_start = time.perf_counter()
                 execute_spec = _build_execute_spec(
                     artifact,
                     object_dir=self._object_dir,
-                    work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                    work_dir=work_dir,
                     method_name=artifact.entry_callable,
                     payload=self._resolve_memory_object_refs_in_payload_locked(record.payload),
                     payload_mode="task_submit",
@@ -1863,12 +1993,29 @@ class NodeControlState:
                 record.dispatch_build_execute_spec_ms = (time.perf_counter() - build_start) * 1000.0
                 self._executor_host.submit_pool_task(
                     pool_id=pool.pool_id,
-                    task_id=item.task_id,
+                    task_id=task_id,
                     attempt=record.attempt,
                     execute_spec=execute_spec,
                 )
-                pool.task_count += 1
-                accepted.append(pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED))
+            except Exception as exc:
+                with self._cv:
+                    current = self._pool_tasks.get(task_id)
+                    if current is record:
+                        self._pool_tasks.pop(task_id, None)
+                rejected.append(
+                    pb2.TaskRejected(
+                        task_id=task_id,
+                        code=pb2.ERROR_CODE_INTERNAL_ERROR,
+                        message=f"submit task to executor failed: {exc}",
+                    )
+                )
+                continue
+
+            with self._cv:
+                current_pool = self._task_pools.get(normalized_pool_id)
+                if current_pool is not None:
+                    current_pool.task_count += 1
+            accepted.append(pb2.TaskAccepted(task_id=task_id, status=pb2.TASK_STATUS_QUEUED))
         log_payload_flow(
             "taskpool_submit_state_result",
             pool_id=str(pool_id or "").strip(),
@@ -1895,6 +2042,17 @@ class NodeControlState:
             wait_ms=max(0, int(wait_ms or 0)),
             cursor=cursor,
         )
+        if results:
+            with self._cv:
+                for item in results:
+                    task_id = str(item.task_id or "").strip()
+                    if not task_id:
+                        continue
+                    task = self._pool_tasks.get(task_id)
+                    if task is None:
+                        continue
+                    if self._pool_task_is_terminal_status(int(task.status or 0)):
+                        self._pool_tasks.pop(task_id, None)
         log_payload_flow(
             "taskpool_pull_results_state",
             pool_id=str(pool_id or "").strip(),
@@ -1932,18 +2090,7 @@ class NodeControlState:
 
         if stop_executor is not None:
             executor_host, closed_pool_id = stop_executor
-
-            def _stop_pool_executor_async() -> None:
-                try:
-                    executor_host.stop_task_pool(pool_id=closed_pool_id)
-                except Exception:
-                    logger.exception("[NodeControl] async stop_task_pool failed pool_id=%s", closed_pool_id)
-
-            threading.Thread(
-                target=_stop_pool_executor_async,
-                name=f"node-stop-task-pool-{closed_pool_id[:8]}",
-                daemon=True,
-            ).start()
+            self._submit_stop_task_pool(executor_host, pool_id=closed_pool_id)
         return closed_pool
 
     def cancel_pool_job(
@@ -2443,6 +2590,7 @@ class NodeControlState:
             warmup_only=True,
         )
         if pool is not None:
+            warmup_started = time.monotonic()
             self._execute_warmup(
                 executor_host=executor_host,
                 scope="pool",
@@ -2450,6 +2598,14 @@ class NodeControlState:
                 worker_count=worker_count,
                 execute_spec=execute_spec,
             )
+            with self._lock:
+                current_pool = self._task_pools.get(pool.pool_id)
+                if current_pool is not None:
+                    self._record_task_pool_lifecycle_timing_locked(
+                        current_pool,
+                        metric="warmup",
+                        elapsed_ms=(time.monotonic() - warmup_started) * 1000.0,
+                    )
         else:
             self._execute_warmup(
                 executor_host=executor_host,
@@ -2558,6 +2714,17 @@ class NodeControlState:
             if self._executor_host is None:
                 return
             for item in self._executor_host.drain_events():
+                kind = str(item.get("kind", "") or "")
+                if kind == "pool_executor_rebuilt":
+                    pool_id = str(item.get("pool_id", "") or "")
+                    pool = self._task_pools.get(pool_id)
+                    if pool is not None:
+                        self._increment_task_pool_metric_locked(
+                            pool,
+                            key="executor_rebuild_count",
+                            delta=max(1, int(item.get("recoveries", 1) or 1)),
+                        )
+                    continue
                 if str(item.get("kind", "") or "") == "pool_task_done":
                     pool_id = str(item.get("pool_id", "") or "")
                     task_id = str(item.get("task_id", "") or "")
@@ -2651,7 +2818,7 @@ class NodeControlState:
                 if now <= pool.lease_expire_at:
                     continue
                 if self._executor_host is not None and pool.executor_ready:
-                    self._executor_host.stop_task_pool(pool_id=pool.pool_id)
+                    self._submit_stop_task_pool(self._executor_host, pool_id=pool.pool_id)
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.status = "STOPPED"

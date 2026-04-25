@@ -6,6 +6,7 @@ import io
 import sys
 import tarfile
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -255,6 +256,47 @@ def test_service_iter_item_calls_uses_group_dynamic_default_max_in_flight():
     )
 
     assert len(items) == 4
+
+
+def test_service_iter_item_calls_submits_streaming_window_only():
+    from pycloud_parallel.execution.service_session import _service_iter_item_calls
+
+    produced = []
+    started = []
+    release = threading.Event()
+
+    def _payloads():
+        for idx in range(5):
+            produced.append(idx)
+            yield {"x": idx}
+
+    class _Group:
+        def call_balanced(self, method, payload, *, timeout_sec, strategy, refresh_status):  # noqa: ARG002
+            started.append(int(payload["x"]))
+            release.wait(timeout=5.0)
+            return "node-1", {"data": payload}
+
+    iterator = _service_iter_item_calls(
+        _Group(),
+        method="square",
+        payloads=_payloads(),
+        timeout_sec=30.0,
+        strategy="predicted_busy",
+        refresh_status=True,
+        max_in_flight=2,
+    )
+    results = []
+    thread = threading.Thread(target=lambda: results.append(next(iterator)), daemon=True)
+    thread.start()
+    deadline = time.time() + 2.0
+    while len(started) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert produced == [0, 1]
+    release.set()
+    thread.join(timeout=2.0)
+    assert len(results) == 1
+    assert produced == [0, 1]
 
     def test_async_call(self):
         """测试异步调用。"""

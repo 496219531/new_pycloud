@@ -35,7 +35,7 @@
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
   - 当前控制面、节点、任务模式、服务模式与外部 Web 层的边界
 - [LONG_TERM_CONTEXT.md](LONG_TERM_CONTEXT.md)
-  - 长期稳定决策基线（mode/policy、JobQueue/shared pool、变更规约、回归清单）
+  - 长期稳定决策基线（mode/policy、JobQueue/shared pool、近期精简路线、变更规约、回归清单）
 
 ## 任务模式
 

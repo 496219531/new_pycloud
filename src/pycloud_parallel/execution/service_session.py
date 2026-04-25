@@ -469,15 +469,24 @@ def _service_iter_item_calls(
     refresh_status: bool,
     max_in_flight: Optional[int],
 ) -> Iterator[ExecutionItem]:
-    items = [dict(payload or {}) for payload in payloads]
-    if not items:
-        return iter(())
-    limit = _resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=len(items))
+    try:
+        item_count = len(payloads)  # type: ignore[arg-type]
+    except Exception:
+        item_count = 2**31 - 1
+    limit = _resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=max(1, int(item_count or 1)))
 
     def _generator() -> Iterator[ExecutionItem]:
+        payload_iter = enumerate(dict(payload or {}) for payload in payloads)
+
         with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="service-items") as executor:
-            future_to_index = {
-                executor.submit(
+            pending: Dict[object, int] = {}
+
+            def _submit_next() -> bool:
+                try:
+                    idx, payload = next(payload_iter)
+                except StopIteration:
+                    return False
+                future = executor.submit(
                     _call_service_payload_sync,
                     group,
                     method=method,
@@ -485,16 +494,25 @@ def _service_iter_item_calls(
                     timeout_sec=timeout_sec,
                     strategy=strategy,
                     refresh_status=refresh_status,
-                ): idx
-                for idx, payload in enumerate(items)
-            }
-            for future in as_completed(future_to_index):
-                idx = future_to_index[future]
+                )
+                pending[future] = idx
+                return True
+
+            for _ in range(limit):
+                if not _submit_next():
+                    break
+
+            while pending:
+                for future in as_completed(tuple(pending.keys())):
+                    idx = pending.pop(future)
+                    break
                 try:
                     node_id, result = future.result()
                     yield _service_item_success(idx, result, node_id=node_id)
                 except Exception as exc:
                     yield _service_item_failure(idx, exc)
+                while len(pending) < limit and _submit_next():
+                    pass
 
     return _generator()
 
@@ -1002,15 +1020,63 @@ class _ConnectedService:
         if self.transport == "discovery":
             route_cache = self._route_cache
             strategy_name, _profile = resolve_service_strategy(strategy)
-            if route_cache is not None:
-                route = route_cache.select_route(self.service_name, strategy=strategy_name)
-            else:
-                routes = self._discoverable_routes(force_refresh=True)
-                if not routes:
-                    raise RuntimeError(f"no available route for service_name={self.service_name!r}")
-                route = sorted(routes, key=lambda item: _route_sort_key(item, strategy=strategy_name))[0]
-            tried = {str(getattr(route, "service_id", "") or "")}
+            tried: Set[str] = set()
+            attempt_count = 0
+            failed_count = 0
+            last_failed_route_id = ""
+            last_error: Optional[Exception] = None
             token = getattr(self._transport_client, "service_token", "")
+
+            def _select_route():
+                if route_cache is not None:
+                    return route_cache.select_route(
+                        self.service_name,
+                        exclude_service_ids=tried,
+                        strategy=strategy_name,
+                    )
+                candidates = [
+                    item
+                    for item in self._discoverable_routes(force_refresh=True)
+                    if str(getattr(item, "service_id", "") or "") not in tried
+                ]
+                if not candidates:
+                    raise RuntimeError(f"no available route for service_name={self.service_name!r}")
+                return sorted(candidates, key=lambda item: _route_sort_key(item, strategy=strategy_name))[0]
+
+            def _has_alternative() -> bool:
+                if route_cache is not None:
+                    with contextlib.suppress(Exception):
+                        return bool(
+                            [
+                                item
+                                for item in route_cache.get_routes(self.service_name)
+                                if str(getattr(item, "service_id", "") or "") not in tried
+                            ]
+                        )
+                    return True
+                with contextlib.suppress(Exception):
+                    return bool(
+                        [
+                            item
+                            for item in self._discoverable_routes(force_refresh=True)
+                            if str(getattr(item, "service_id", "") or "") not in tried
+                        ]
+                    )
+                return True
+
+            def _record_observation(*, selected_route_id: str = "") -> None:
+                if route_cache is None:
+                    return
+                recorder = getattr(route_cache, "record_call_observation", None)
+                if callable(recorder):
+                    with contextlib.suppress(Exception):
+                        recorder(
+                            self.service_name,
+                            route_attempt_count=attempt_count,
+                            failed_route_count=failed_count,
+                            last_failed_route_id=last_failed_route_id,
+                            selected_route_id=selected_route_id,
+                        )
 
             def _call_route(selected_route: object) -> Tuple[str, Dict[str, object]]:
                 prepared_payload = self._prepare_discovery_route_payload(selected_route, payload)
@@ -1031,47 +1097,65 @@ class _ConnectedService:
                     resp = attach_locator(resp, route=selected_route)
                 return self._client_mod._node_instance_key_from_route(selected_route), resp
 
-            try:
-                node_id, response = _call_route(route)
-                if route_cache is not None:
-                    with contextlib.suppress(Exception):
-                        route_cache.mark_success(route)
-                return node_id, response
-            except self._client_mod.DiscoveryCallError as exc:
-                if not self._client_mod._is_route_failure(exc):
-                    raise RuntimeError(str(exc)) from exc
-                if route_cache is not None:
-                    with contextlib.suppress(Exception):
-                        route_cache.mark_failure(route, str(exc))
-                    with contextlib.suppress(Exception):
-                        route_cache.refresh(self.service_name, force=True)
-                    retry_route = route_cache.select_route(
-                        self.service_name,
-                        exclude_service_ids=tried,
-                        strategy=strategy_name,
-                    )
-                else:
-                    retry_candidates = [
-                        item for item in self._discoverable_routes(force_refresh=True)
-                        if str(getattr(item, "service_id", "") or "") not in tried
-                    ]
-                    if not retry_candidates:
-                        raise RuntimeError(str(exc)) from exc
-                    retry_route = sorted(
-                        retry_candidates,
-                        key=lambda item: _route_sort_key(item, strategy=strategy_name),
-                    )[0]
+            while True:
                 try:
-                    node_id, response = _call_route(retry_route)
+                    route = _select_route()
+                except Exception as select_exc:
+                    _record_observation()
+                    if last_error is not None:
+                        raise RuntimeError(str(last_error)) from last_error
+                    raise RuntimeError(str(select_exc)) from select_exc
+                route_id = str(getattr(route, "service_id", "") or "")
+                if route_id in tried:
                     if route_cache is not None:
                         with contextlib.suppress(Exception):
-                            route_cache.mark_success(retry_route)
-                    return node_id, response
-                except self._client_mod.DiscoveryCallError as retry_exc:
-                    if self._client_mod._is_route_failure(retry_exc) and route_cache is not None:
+                            route_cache.release_route(route)
+                    _record_observation()
+                    if last_error is not None:
+                        raise RuntimeError(str(last_error)) from last_error
+                    raise RuntimeError(f"no untried route for service_name={self.service_name!r}")
+                tried.add(route_id)
+                attempt_count += 1
+                try:
+                    node_id, response = _call_route(route)
+                    if route_cache is not None:
                         with contextlib.suppress(Exception):
-                            route_cache.mark_failure(retry_route, str(retry_exc))
-                    raise RuntimeError(str(retry_exc)) from retry_exc
+                            route_cache.mark_success(route)
+                    _record_observation(selected_route_id=route_id)
+                    return node_id, response
+                except self._client_mod.DiscoveryCallError as exc:
+                    last_error = exc
+                    failure_kind = classify_service_error(exc, route_failure=self._client_mod._is_route_failure(exc))
+                    if not should_failover(failure_kind, has_alternative_candidate=_has_alternative()):
+                        if route_cache is not None:
+                            with contextlib.suppress(Exception):
+                                route_cache.release_route(route)
+                        _record_observation()
+                        raise RuntimeError(str(exc)) from exc
+                    failed_count += 1
+                    last_failed_route_id = route_id
+                    if route_cache is not None:
+                        with contextlib.suppress(Exception):
+                            route_cache.mark_failure(route, str(exc))
+                        with contextlib.suppress(Exception):
+                            route_cache.refresh(self.service_name, force=True)
+                    continue
+                except Exception as exc:
+                    last_error = exc
+                    if not should_failover(STAGING_FAILED, has_alternative_candidate=_has_alternative()):
+                        if route_cache is not None:
+                            with contextlib.suppress(Exception):
+                                route_cache.release_route(route)
+                        _record_observation()
+                        raise RuntimeError(str(exc)) from exc
+                    failed_count += 1
+                    last_failed_route_id = route_id
+                    if route_cache is not None:
+                        with contextlib.suppress(Exception):
+                            route_cache.mark_failure(route, str(exc))
+                        with contextlib.suppress(Exception):
+                            route_cache.refresh(self.service_name, force=True)
+                    continue
         response = self._transport_client.call(
             service_name=self.service_name,
             method=method,
@@ -2841,14 +2925,14 @@ class Service(ServiceExecutionSession):
             breaker_state, allowed = self._breaker_candidate_state(node_id)
             if not allowed:
                 continue
-            # Prefer closed nodes over half-open probe nodes.
             state_rank[node_id] = 0 if breaker_state == "closed" else 1
             candidates.append(node_id)
         if not candidates:
             raise RuntimeError("no available service node (all candidates may be open-circuit)")
 
         if normalized_strategy == "round_robin":
-            ranked_candidates = sorted(candidates, key=lambda node_id: (state_rank.get(node_id, 0), node_id))
+            probe_candidates = [node_id for node_id in candidates if state_rank.get(node_id, 0) > 0]
+            ranked_candidates = sorted(probe_candidates or candidates, key=lambda node_id: node_id)
             with self._route_lock:
                 idx = self._route_index % len(ranked_candidates)
                 self._route_index += 1

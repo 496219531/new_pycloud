@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:
             "无法导入 pycloud_parallel 依赖。\n"
             f"当前解释器: {sys.executable}\n"
             "请使用已安装项目依赖的解释器运行，或先安装依赖后再执行。\n"
-            "例如在这台机器上可优先尝试: python examples/demo_http_compat.py"
+            "例如在这台机器上可优先尝试: python examples/service_http_call_flow.py"
         ) from exc
     raise
 

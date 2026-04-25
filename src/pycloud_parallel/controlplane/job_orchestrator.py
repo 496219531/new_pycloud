@@ -146,10 +146,18 @@ class JobOrchestratorServer:
             job_id = str((payload or {}).get("job_id", "") or "").strip()
             if not job_id:
                 return 400, {"ok": False, "error": "job_id is required"}
+            include_details = bool((payload or {}).get("include_details", False))
             state = self.job_queue.get_job(job_id)
             if state is None:
                 return 404, {"ok": False, "error": "job not found"}
-            return 200, {"ok": True, "job": state.as_dict()}
+            return 200, {
+                "ok": True,
+                "job": state.as_dict(
+                    include_payload=include_details,
+                    include_results=include_details,
+                    include_final_result=include_details,
+                ),
+            }
         if requested_method == "reorder_job":
             job_id = str((payload or {}).get("job_id", "") or "").strip()
             direction = str((payload or {}).get("direction", "") or "").strip().lower()

@@ -64,6 +64,7 @@ class NodeInfoCenterRegistrar:
 
         self._client = InfoCenterClient(self.infocenter_addr, timeout_sec=self.rpc_timeout_sec)
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._registered = False
         self._next_hb_sec = self.fallback_heartbeat_sec
@@ -77,11 +78,13 @@ class NodeInfoCenterRegistrar:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._wake_event.clear()
         self._thread = threading.Thread(target=self._loop, name=f"node-registrar-{self.node_id}", daemon=True)
         self._thread.start()
 
     def close(self) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
@@ -101,9 +104,18 @@ class NodeInfoCenterRegistrar:
         try:
             return self._register_once() if should_register else self._heartbeat_once()
         except Exception:
+            logger.exception(
+                "[Registrar] node sync failed node_id=%s node_instance_id=%s should_register=%s",
+                self.node_id,
+                self.node_instance_id,
+                should_register,
+            )
             with self._sync_lock:
                 self._registered = False
             return False
+
+    def request_sync(self) -> None:
+        self._wake_event.set()
 
     def _register_once(self) -> bool:
         metadata = dict(self.metadata)
@@ -219,7 +231,8 @@ class NodeInfoCenterRegistrar:
             self.sync_now()
             with self._sync_lock:
                 wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
-            self._stop_event.wait(max(1, int(wait_sec)))
+            self._wake_event.wait(max(1, int(wait_sec)))
+            self._wake_event.clear()
 
 
 class JobOrchestratorInfoCenterRegistrar:
@@ -255,6 +268,7 @@ class JobOrchestratorInfoCenterRegistrar:
 
         self._client = InfoCenterClient(self.infocenter_addr, timeout_sec=self.rpc_timeout_sec)
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._registered = False
         self._next_hb_sec = self.fallback_heartbeat_sec
@@ -264,6 +278,7 @@ class JobOrchestratorInfoCenterRegistrar:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._wake_event.clear()
         self._thread = threading.Thread(
             target=self._loop,
             name=f"job-registrar-{self.node_id}",
@@ -273,6 +288,7 @@ class JobOrchestratorInfoCenterRegistrar:
 
     def close(self) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
@@ -292,9 +308,19 @@ class JobOrchestratorInfoCenterRegistrar:
         try:
             return self._register_once() if should_register else self._heartbeat_once()
         except Exception:
+            logger.exception(
+                "[Registrar] job-orch sync failed node_id=%s node_instance_id=%s service_id=%s should_register=%s",
+                self.node_id,
+                self.node_instance_id,
+                self.service_id,
+                should_register,
+            )
             with self._sync_lock:
                 self._registered = False
             return False
+
+    def request_sync(self) -> None:
+        self._wake_event.set()
 
     def _build_metadata(self) -> Dict[str, str]:
         snapshot = dict(self.status_provider() or {})
@@ -420,4 +446,5 @@ class JobOrchestratorInfoCenterRegistrar:
             self.sync_now()
             with self._sync_lock:
                 wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
-            self._stop_event.wait(max(1, int(wait_sec)))
+            self._wake_event.wait(max(1, int(wait_sec)))
+            self._wake_event.clear()

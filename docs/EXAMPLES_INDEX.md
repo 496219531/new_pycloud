@@ -20,8 +20,6 @@
    - Arrow / DataFrame / ndarray 类型往返示例
 9. `service_positional_args.py`
    - 服务位置参数和 kwargs 调用示例
-10. `local_parallel_max_workers.py`
-   - `pycloud_parallel.local` 的 max_workers 用法
 
 当前约定：
 
@@ -34,3 +32,6 @@
 
 1. 共享任务池相关旧客户端入口
 2. 共享任务池相关旧示例
+3. 函数级 `max_workers` 本地并行 demo
+4. Cloudpickle 诊断 demo
+5. legacy async transport demo

@@ -471,9 +471,12 @@ def _list_route_methods_http(
 
 
 def _is_route_failure(exc: DiscoveryCallError) -> bool:
-    if exc.status_code == 502:
+    msg = str(exc.data.get("error", "") or "").lower()
+    error_type = str(exc.data.get("error_type", "") or "").lower()
+    if any(text in f"{error_type} {msg}" for text in ("usererror", "failed_user", "user error")):
+        return False
+    if exc.status_code in (502, 503, 504):
         return True
     if exc.status_code not in (404, 409, 500):
         return False
-    msg = str(exc.data.get("error", "") or "").lower()
     return any(text in msg for text in ("service not found", "service not running", "service executor stopped", "artifact missing"))
