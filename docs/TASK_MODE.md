@@ -121,9 +121,10 @@ client.submit(
 4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 6. `JobQueue` 自己固定使用 `structured_v1 + default_safe`
-7. `job-orch` 的 `taskpool_policy_id` 固定于启动时，不接受 `submit(...)` 运行期覆盖
-8. 如果你在 `submit(...)` 里传 `serialization_mode`，它会作为后续 `TaskPool` 执行面的 mode 偏好；`submit(...)` 不再接受 `policy_id`
-9. `job-orch` 运行期维持单个共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先在 job 边界软切 mode 复用池，软切失败才回退重建池，空闲超过 idle TTL 后再主动关池
+7. `job-orch` 是系统启动时挂载的 startup service，通过 `mount_python_module_service(...)` 挂载内置系统 module，自身 submit 入口固定 `structured_v1`
+8. `job-orch` 的 `taskpool_policy_id` 固定于启动时，通过 startup managed globals 注入，不接受 `submit(...)` 运行期覆盖
+9. 如果你在 `submit(...)` 里传 `task_serialization_mode`，它会作为后续 `TaskPool` 执行面的 mode 偏好；`submit(...)` 不再接受 `policy_id/taskpool_policy_id`
+10. `job-orch` 运行期维持单个共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先在 job 边界软切 mode 复用池，软切失败才回退重建池，空闲超过 idle TTL 后再主动关池
 
 模块对象写法：
 

@@ -43,6 +43,7 @@ from pycloud_parallel.controlplane.serialization import (
     is_arrow_compatible,
     log_payload_flow,
     serialize_arrow_compatible,
+    stable_pickle_loads,
     summarize_payload_flow_value,
 )
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_current_node
@@ -1029,11 +1030,12 @@ def _apply_managed_globals_to_router(
     entry_module: str,
     method_name: str,
     session_kind: str,
-) -> None:
+) -> Dict[str, Any]:
     normalized_scope_dir = str(scope_dir or "").strip()
     normalized_digest = str(globals_digest or "").strip()
     if not normalized_scope_dir or not normalized_digest:
-        return
+        return {}
+    total_started = time.perf_counter()
 
     with _MANAGED_GLOBALS_APPLY_LOCKS_LOCK:
         apply_lock = _MANAGED_GLOBALS_APPLY_LOCKS.get(normalized_scope_dir)
@@ -1044,28 +1046,69 @@ def _apply_managed_globals_to_router(
     with apply_lock:
         with _MANAGED_GLOBALS_CACHE_LOCK:
             if _MANAGED_GLOBALS_CACHE.get(normalized_scope_dir) == normalized_digest:
-                return
+                service_timing_logger.info(
+                    "[ManagedGlobals] cache_hit scope_dir=%s digest=%s total_ms=%.3f",
+                    normalized_scope_dir,
+                    normalized_digest,
+                    (time.perf_counter() - total_started) * 1000.0,
+                )
+                return {
+                    "managed_globals_cache_hit": True,
+                    "managed_globals_ms": round((time.perf_counter() - total_started) * 1000.0, 3),
+                }
 
+        manifest_started = time.perf_counter()
         manifest_path = _managed_globals_manifest_path(Path(normalized_scope_dir), normalized_digest)
         if not manifest_path.exists():
             raise RuntimeError(f"managed globals manifest missing: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
         values_meta = dict(manifest.get("values") or {})
+        manifest_ms = (time.perf_counter() - manifest_started) * 1000.0
 
         resolved_values: Dict[str, Any] = {}
+        per_key_timings: Dict[str, Dict[str, float]] = {}
+        value_json_ms = 0.0
+        convert_ms = 0.0
+        resolve_refs_ms = 0.0
         for name, item in values_meta.items():
             if not isinstance(item, dict):
                 continue
             value_digest = str(item.get("sha256", "") or "").strip()
             if not value_digest:
                 continue
-            value_path = _managed_globals_value_path(Path(normalized_scope_dir), value_digest=value_digest)
+            value_codec = str(item.get("codec", "json") or "json").strip().lower()
+            value_path = _managed_globals_value_path(
+                Path(normalized_scope_dir),
+                value_digest=value_digest,
+                codec=value_codec,
+            )
             if not value_path.exists():
                 raise RuntimeError(f"managed globals value missing: {value_path}")
-            serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
-            resolved_value = convert_dict_to_arrow(serialized_value)
+            key_started = time.perf_counter()
+            value_json_started = time.perf_counter()
+            if value_codec == "pickle_stable_v1":
+                serialized_value = stable_pickle_loads(value_path.read_bytes())
+            else:
+                serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
+            key_value_json_ms = (time.perf_counter() - value_json_started) * 1000.0
+            convert_started = time.perf_counter()
+            resolved_value = serialized_value if value_codec == "pickle_stable_v1" else convert_dict_to_arrow(serialized_value)
+            key_convert_ms = (time.perf_counter() - convert_started) * 1000.0
+            resolve_started = time.perf_counter()
             resolved_values[name] = _resolve_object_refs_in_payload(resolved_value, object_dir=object_dir)
+            key_resolve_refs_ms = (time.perf_counter() - resolve_started) * 1000.0
+            key_total_ms = (time.perf_counter() - key_started) * 1000.0
+            value_json_ms += key_value_json_ms
+            convert_ms += key_convert_ms
+            resolve_refs_ms += key_resolve_refs_ms
+            per_key_timings[str(name)] = {
+                "value_json_ms": round(key_value_json_ms, 3),
+                "convert_ms": round(key_convert_ms, 3),
+                "resolve_refs_ms": round(key_resolve_refs_ms, 3),
+                "total_ms": round(key_total_ms, 3),
+            }
 
+        hook_started = time.perf_counter()
         apply_hook = _resolve_apply_managed_globals_hook(module)
         fallback_assign_values: Optional[Dict[str, Any]] = None
         if apply_hook is None:
@@ -1084,7 +1127,9 @@ def _apply_managed_globals_to_router(
                 fallback_assign_values = dict(hook_result)
             else:
                 raise RuntimeError("apply_managed_globals must return None or dict")
+        hook_ms = (time.perf_counter() - hook_started) * 1000.0
 
+        assign_started = time.perf_counter()
         if fallback_assign_values:
             if apply_hook is not None:
                 module_globals = getattr(module, "__dict__", None)
@@ -1110,9 +1155,38 @@ def _apply_managed_globals_to_router(
                         if not normalized_name:
                             continue
                         globals_dict[normalized_name] = value
+        assign_ms = (time.perf_counter() - assign_started) * 1000.0
 
         with _MANAGED_GLOBALS_CACHE_LOCK:
             _MANAGED_GLOBALS_CACHE[normalized_scope_dir] = normalized_digest
+        service_timing_logger.info(
+            "[ManagedGlobals] applied scope_dir=%s digest=%s entry_module=%s method=%s session_kind=%s keys=%s manifest_ms=%.3f value_json_ms=%.3f convert_ms=%.3f resolve_refs_ms=%.3f hook_ms=%.3f assign_ms=%.3f total_ms=%.3f per_key=%s",
+            normalized_scope_dir,
+            normalized_digest,
+            str(entry_module or "").strip(),
+            str(method_name or "").strip(),
+            str(session_kind or "").strip(),
+            sorted(per_key_timings.keys()),
+            manifest_ms,
+            value_json_ms,
+            convert_ms,
+            resolve_refs_ms,
+            hook_ms,
+            assign_ms,
+            (time.perf_counter() - total_started) * 1000.0,
+            per_key_timings,
+        )
+        return {
+            "managed_globals_cache_hit": False,
+            "managed_globals_manifest_ms": round(manifest_ms, 3),
+            "managed_globals_value_json_ms": round(value_json_ms, 3),
+            "managed_globals_convert_ms": round(convert_ms, 3),
+            "managed_globals_resolve_refs_ms": round(resolve_refs_ms, 3),
+            "managed_globals_hook_ms": round(hook_ms, 3),
+            "managed_globals_assign_ms": round(assign_ms, 3),
+            "managed_globals_ms": round((time.perf_counter() - total_started) * 1000.0, 3),
+            "managed_globals_per_key": per_key_timings,
+        }
 
 
 def _execute_payload_in_subprocess(
@@ -1144,15 +1218,19 @@ def _execute_payload_in_subprocess(
     user_fn_ms = 0.0
     encode_start = decode_start
     encode_end = decode_start
+    managed_globals_timings: Dict[str, Any] = {}
 
-    def _timings() -> Dict[str, float]:
-        return {
+    def _timings() -> Dict[str, Any]:
+        timings: Dict[str, Any] = {
             "decode_ms": round(max(0.0, decode_end - decode_start) * 1000.0, 3),
             "invoke_ms": round(max(0.0, invoke_end - invoke_start) * 1000.0, 3),
             "invoke_wrapper_ms": round(max(0.0, float(invoke_wrapper_ms or 0.0)), 3),
             "user_fn_ms": round(max(0.0, float(user_fn_ms or 0.0)), 3),
             "encode_ms": round(max(0.0, encode_end - encode_start) * 1000.0, 3),
         }
+        if managed_globals_timings:
+            timings.update(managed_globals_timings)
+        return timings
 
     try:
         with _temporary_working_dir(work_dir):
@@ -1190,7 +1268,7 @@ def _execute_payload_in_subprocess(
                     fn = router.get(method)
                     if fn is None:
                         raise RuntimeError(f"method `{method}` not exported")
-                    _apply_managed_globals_to_router(
+                    managed_globals_timings = _apply_managed_globals_to_router(
                         module,
                         router,
                         scope_dir=managed_globals_scope_dir,

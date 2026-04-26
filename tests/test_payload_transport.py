@@ -108,6 +108,49 @@ def test_prepare_outbound_payload_job_submit_applies_managed_globals_policy(tmp_
     assert uploads[1] == b"abc"
 
 
+def test_prepare_managed_globals_batches_splits_inline_keys(monkeypatch) -> None:
+    from pycloud_parallel.execution import support
+
+    monkeypatch.setattr(support, "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
+
+    batches, stats = support._prepare_managed_globals_batches_for_upload(
+        [],
+        {"a": "x" * 400, "b": "y" * 400, "c": "z" * 20},
+    )
+
+    assert batches == [{"a": "x" * 400}, {"b": "y" * 400, "c": "z" * 20}]
+    assert stats["globals_batch_count"] == 2
+    assert stats["batch_keys"] == [["a"], ["b", "c"]]
+    assert stats["staged_keys"] == []
+    assert stats["inline_keys"] == ["a", "b", "c"]
+    assert all(size <= 1000 for size in stats["batch_bytes"])
+
+
+def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch) -> None:
+    from pycloud_parallel.execution import support
+
+    uploaded = []
+
+    class _Client:
+        def upload_object_from_bytes(self, *, blob, format, chunk_size):  # noqa: ANN001
+            uploaded.append((bytes(blob), str(format), int(chunk_size)))
+            return DataRef(ref_id="obj-1", storage_id="obj-1", format=format, size_bytes=len(blob))
+
+    monkeypatch.setattr(support, "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
+
+    batches, stats = support._prepare_managed_globals_batches_for_upload(
+        [_Client()],
+        {"big": {"payload": "x" * 3000}},
+    )
+
+    assert len(uploaded) == 1
+    assert stats["globals_batch_count"] == 1
+    assert stats["staged_keys"] == ["big"]
+    assert stats["inline_keys"] == []
+    assert isinstance(batches[0]["big"], DataRef)
+    assert stats["batch_bytes"][0] <= 1000
+
+
 def test_normalize_inbound_payload_deserializes_before_object_resolution() -> None:
     captured = {}
 

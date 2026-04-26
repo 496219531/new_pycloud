@@ -81,6 +81,37 @@ class InfoCenterState:
         for key in replaced_keys:
             self._nodes.pop(key, None)
 
+    def _validate_startup_service_names_locked(
+        self,
+        *,
+        node_instance_id: str,
+        metadata: Dict[str, str],
+        services: Dict[str, NodeServiceState],
+        now: datetime,
+    ) -> None:
+        if not _coerce_bool((metadata or {}).get("startup_service"), default=False):
+            return
+        names: Dict[str, str] = {}
+        for svc in services.values():
+            name = str(svc.service_name or "").strip()
+            if not name:
+                continue
+            existing_id = names.get(name)
+            if existing_id and existing_id != svc.service_id:
+                raise ValueError(f"startup service_name already exists in node registration: {name}")
+            names[name] = str(svc.service_id or "").strip()
+        if not names:
+            return
+        for key, state in self._nodes.items():
+            if key == node_instance_id or not self._node_is_healthy_locked(state, now=now):
+                continue
+            if not _coerce_bool(state.metadata.get("startup_service"), default=False):
+                continue
+            for svc in state.services.values():
+                name = str(svc.service_name or "").strip()
+                if name in names:
+                    raise ValueError(f"startup service_name already exists: {name}")
+
     def _effective_service_state_locked(
         self,
         state: NodeState,
@@ -150,6 +181,14 @@ class InfoCenterState:
                 control_addr=control_addr,
                 now=now,
             )
+            incoming_metadata = dict(metadata or {})
+            incoming_services = dict(services or {})
+            self._validate_startup_service_names_locked(
+                node_instance_id=normalized_instance_id,
+                metadata=incoming_metadata,
+                services=incoming_services,
+                now=now,
+            )
             state = self._nodes.get(normalized_instance_id)
             if state is None:
                 state = NodeState(
@@ -169,10 +208,10 @@ class InfoCenterState:
             state.tags = list(tags or [])
             state.version = str(version or "")
             state.python_version = str(python_version or state.python_version or "").strip()
-            state.metadata = dict(metadata or {})
+            state.metadata = incoming_metadata
             state.healthy = True
             state.last_seen_at = now
-            state.services = dict(services or {})
+            state.services = incoming_services
             state.task_pools = dict(task_pools or {})
             state.active_runtimes = [str(x).strip() for x in (active_runtimes or []) if str(x).strip()]
             state.service_worker_capacity = max(0, int(service_worker_capacity or 0))

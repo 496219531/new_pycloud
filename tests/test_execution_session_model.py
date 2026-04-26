@@ -147,6 +147,36 @@ def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() ->
     )
 
 
+def test_service_session_client_update_globals_prepared_uses_prepared_rpc() -> None:
+    from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
+
+    grpc_client = MagicMock()
+    grpc_client.update_service_globals_prepared.return_value = SimpleNamespace(globals_digest="sha256:digest")
+    service = ServiceSessionClient(
+        _client=grpc_client,
+        owner_client_id="owner-a",
+        service_id="svc-1",
+        service_token="svc-token",
+        code_version="sha256:" + ("e" * 64),
+        http_base_url="http://127.0.0.1:18080/svc/svc-1",
+        heartbeat_timeout_sec=30,
+        worker_count=2,
+        status=pb2.SERVICE_STATUS_RUNNING,
+        service_name="svc-demo",
+    )
+
+    resp = service.update_globals_prepared({"cfg": {"k": "v"}})
+
+    assert resp.globals_digest == "sha256:digest"
+    grpc_client.update_service_globals_prepared.assert_called_once_with(
+        owner_client_id="owner-a",
+        service_id="svc-1",
+        service_token="svc-token",
+        prepared_values={"cfg": {"k": "v"}},
+    )
+    grpc_client.update_service_globals.assert_not_called()
+
+
 def test_service_group_exposes_replicas_and_snapshot() -> None:
     from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
     from pycloud_parallel.execution.service_session import Service
@@ -261,12 +291,13 @@ def test_task_pool_session_put_data_uses_shared_client_upload_path(monkeypatch) 
     monkeypatch.setattr(
         task_pool_module,
         "_put_data_via_clients",
-        lambda clients, data, *, format="", chunk_size=0: captured.update(
+        lambda clients, data, *, format="", chunk_size=0, serialization_mode="": captured.update(
             {
                 "clients": list(clients),
                 "data": data,
                 "format": format,
                 "chunk_size": chunk_size,
+                "serialization_mode": serialization_mode,
             }
         )
         or DataRef(
@@ -283,3 +314,4 @@ def test_task_pool_session_put_data_uses_shared_client_upload_path(monkeypatch) 
     assert captured["clients"] == [pool_client]
     assert captured["data"] == {"ok": True}
     assert captured["format"] == "json"
+    assert captured["serialization_mode"] == session.serialization_mode

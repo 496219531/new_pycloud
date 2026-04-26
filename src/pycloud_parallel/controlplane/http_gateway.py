@@ -36,6 +36,13 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
 
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
+SERVICE_HTTP_REQUEST_QUEUE_SIZE = 1024
+
+
+class _ServiceThreadingHTTPServer(ThreadingHTTPServer):
+    # The stdlib default backlog is 5, which is too small for bursty async
+    # service calls that fan out many HTTP connections to a single route.
+    request_queue_size = SERVICE_HTTP_REQUEST_QUEUE_SIZE
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -249,7 +256,7 @@ class ServiceHttpGateway:
         with self._start_lock:
             if self._server is not None:
                 return
-            self._server = ThreadingHTTPServer((host, port), _Handler)
+            self._server = _ServiceThreadingHTTPServer((host, port), _Handler)
             self._thread = threading.Thread(target=self._server.serve_forever, name="service-http-gateway", daemon=True)
             self._thread.start()
 

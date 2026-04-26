@@ -7,9 +7,11 @@ from datetime import datetime, timezone, timedelta
 import asyncio
 import contextlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import importlib
 import inspect
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -32,7 +34,11 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
-from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
+from pycloud_parallel.controlplane.effective_policy import (
+    EffectivePolicy,
+    resolve_effective_policy,
+    should_use_transport_payload_bytes,
+)
 from pycloud_parallel.controlplane.infocenter_client import (
     InfoCenterNode,
     InfoCenterServiceRoute,
@@ -50,6 +56,8 @@ from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
+from pycloud_parallel.controlplane.serialization import dict_to_struct
+from pycloud_parallel.controlplane.serialization import encode_transport_payload_bytes
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
@@ -85,7 +93,7 @@ from pycloud_parallel.execution.support import (
     _filter_nodes_by_runtime,
     _get_local_ip,
     _prepare_code_blob,
-    _prepare_managed_globals_values_for_upload,
+    _prepare_managed_globals_batches_for_upload,
     _put_data_via_clients,
     _resolve_public_target_arg,
     _resolve_high_level_service_data,
@@ -100,6 +108,9 @@ from pycloud_parallel.execution.support import (
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
+
+logger = logging.getLogger(__name__)
+
 
 def _infocenter_client(*args, **kwargs):
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -678,6 +689,9 @@ class _ConnectedService:
         self._discovered_methods: Optional[List[str]] = None
         self._last_status: Optional[Dict[str, object]] = None
         self._route_notice_emitted = False
+        self._async_call_gate: Optional[asyncio.Semaphore] = None
+        self._async_call_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._async_call_gate_capacity = 0
         self.effective_policy: Optional[EffectivePolicy] = None
         self.serialization_mode = str(serialization_mode or "").strip()
         if not self.service_name:
@@ -1061,6 +1075,19 @@ class _ConnectedService:
     def _default_max_in_flight(self) -> int:
         return _scaled_default_max_in_flight(self._effective_worker_count())
 
+    def _get_async_call_gate(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        capacity = max(1, int(self._default_max_in_flight()))
+        if (
+            self._async_call_gate is None
+            or self._async_call_gate_loop is not loop
+            or self._async_call_gate_capacity != capacity
+        ):
+            self._async_call_gate = asyncio.Semaphore(capacity)
+            self._async_call_gate_loop = loop
+            self._async_call_gate_capacity = capacity
+        return self._async_call_gate
+
     def call_balanced(
         self,
         method: str,
@@ -1248,18 +1275,19 @@ class _ConnectedService:
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.call_balanced(
-                method,
-                payload,
-                timeout_sec=timeout_sec,
-                strategy=strategy,
-                refresh_status=refresh_status,
-                max_attempts=max_attempts,
-                serialization_mode=serialization_mode,
-            ),
-        )
+        async with self._get_async_call_gate():
+            return await loop.run_in_executor(
+                None,
+                lambda: self.call_balanced(
+                    method,
+                    payload,
+                    timeout_sec=timeout_sec,
+                    strategy=strategy,
+                    refresh_status=refresh_status,
+                    max_attempts=max_attempts,
+                    serialization_mode=serialization_mode,
+                ),
+            )
 
     async def acall_all(
         self,
@@ -1511,6 +1539,9 @@ class Service(ServiceExecutionSession):
     _breaker_states: Dict[str, CandidateBreakerState] = field(default_factory=dict, repr=False)
     _discovered_methods: Optional[List[str]] = field(default=None, repr=False)
     _closed: bool = field(default=False, repr=False)
+    _async_call_gate: Optional[asyncio.Semaphore] = field(default=None, repr=False)
+    _async_call_gate_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
+    _async_call_gate_capacity: int = field(default=0, repr=False)
     serialization_mode: str = ""
     policy_id: InitVar[str] = ""
     _policy_id: str = field(default="", repr=False)
@@ -1544,6 +1575,127 @@ class Service(ServiceExecutionSession):
 
     def routes(self) -> List[Dict[str, object]]:
         return self.route_summary()
+
+    @classmethod
+    def startup(
+        cls,
+        *,
+        source: Any = None,
+        deps: Optional[Any] = None,
+        service_name: str = "",
+        entry_module: str = "",
+        entry_callable: str = "run",
+        export_methods: Optional[Sequence[str]] = None,
+        bind: Optional[str] = None,
+        target: str = "",
+        infocenter_target: str = "",
+        control_addr: str = "",
+        node_id: str = "",
+        service_http_base_url: str = "",
+        service_id: str = "",
+        worker_count: int = 1,
+        policy_id: str = "",
+        runtime: str = "py3",
+        package_format: str = "",
+        dependency_allowlist: Optional[Sequence[str]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        tags: Optional[Sequence[str]] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        heartbeat_sec: int = 10,
+        rpc_timeout_sec: float = 5.0,
+        start: bool = True,
+    ):
+        """Product-facing startup-mounted service action.
+
+        Use this when a process should expose a fixed Python module as a
+        service at startup time while reusing the normal NodeControl service
+        executor path.
+        """
+        from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+        module_name = str(entry_module or "").strip()
+        if source is not None:
+            if isinstance(source, str):
+                module_name = str(source or "").strip()
+            else:
+                module_name = str(getattr(source, "__name__", "") or "").strip()
+        if not module_name:
+            raise ValueError("Service.startup() requires entry_module=... or source=module")
+        effective_service_name = str(service_name or module_name.rsplit(".", 1)[-1] or "startup-service").strip()
+        effective_node_id = str(node_id or f"{effective_service_name}-startup").strip()
+        service_http_bind = "0.0.0.0:0" if bind is None else str(bind).strip()
+        artifact_source = source
+        if artifact_source is None or isinstance(artifact_source, str):
+            artifact_source = importlib.import_module(module_name)
+        normalized_artifact = _normalize_artifact_input(
+            consumer_kind="service",
+            source=artifact_source,
+            deps=deps,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            export_mode="explicit" if export_methods else "all",
+            export_methods=export_methods,
+            dependency_allowlist=dependency_allowlist,
+            managed_global_names=managed_global_names,
+        )
+        prepared_artifact = _prepare_artifact(
+            normalized_artifact,
+            consumer_kind="service",
+        )
+        effective_worker_count = max(1, int(worker_count or 1))
+        node = StartupServiceNode(
+            node_id=effective_node_id,
+            worker_capacity=effective_worker_count,
+            service_worker_capacity=effective_worker_count,
+            task_pool_worker_capacity=1,
+            service_http_bind=service_http_bind,
+            service_http_base_url=str(service_http_base_url or "").strip(),
+            enable_internal_executor=False,
+            enable_service_session=True,
+            service_default_worker_count=effective_worker_count,
+        )
+        node.close_on_registration_lost = True
+        if not start:
+            node.stop_service_gateway()
+        node.mount_prepared_service(
+            owner_client_id=f"{effective_node_id}-owner",
+            service_name=effective_service_name,
+            sha256=prepared_artifact.content_sha256,
+            runtime=prepared_artifact.runtime,
+            entry_module=prepared_artifact.entry_module,
+            entry_callable=prepared_artifact.entry_callable,
+            package_format=prepared_artifact.package_format,
+            export_mode=prepared_artifact.export_mode,
+            export_methods=list(prepared_artifact.export_methods),
+            export_decorator=prepared_artifact.export_decorator,
+            dependency_policy_mode=prepared_artifact.dependency_policy_mode,
+            dependency_allowlist=list(prepared_artifact.dependency_allowlist),
+            managed_global_names=list(prepared_artifact.managed_global_names),
+            policy_id=policy_id,
+            worker_count=effective_worker_count,
+            heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
+            idle_ttl_sec=0,
+            expose_http=bool(start),
+            chunks=[prepared_artifact.blob],
+            service_id=service_id,
+        )
+        effective_infocenter_target = str(infocenter_target or target or "").strip()
+        if effective_infocenter_target:
+            node.start_infocenter_registration(
+                infocenter_target=effective_infocenter_target,
+                control_addr=control_addr,
+                tags=tags,
+                metadata={
+                    "service_name": effective_service_name,
+                    "entry_module": module_name,
+                    **dict(metadata or {}),
+                },
+                heartbeat_sec=heartbeat_sec,
+                rpc_timeout_sec=rpc_timeout_sec,
+            )
+        return node
 
     @classmethod
     def deploy(
@@ -2133,8 +2285,12 @@ class Service(ServiceExecutionSession):
             nodes: Dict[str, InfoCenterNode] = {}
             failures: Dict[str, str] = {}
 
-            for node in selected_nodes:
-                client = _node_control_client(node.control_addr, timeout_sec=timeout_sec)
+            def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]:
+                node_key = _node_instance_key_from_node(node)
+                try:
+                    client = _node_control_client(node.control_addr, timeout_sec=timeout_sec)
+                except Exception as exc:
+                    return node_key, node, None, None, repr(exc)
                 node_worker_count = max(1, int(worker_count or 1))
                 if int(getattr(node, "service_worker_available", 0) or 0) > 0:
                     node_worker_count = max(1, min(node_worker_count, int(getattr(node, "service_worker_available", 0) or 0)))
@@ -2159,21 +2315,40 @@ class Service(ServiceExecutionSession):
                         chunk_size=chunk_size,
                     )
                 except Exception as exc:
-                    failures[_node_instance_key_from_node(node)] = repr(exc)
                     client.close()
-                    if not allow_partial:
-                        cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
-                        raise RuntimeError(
-                            f"deploy failed on node={node.node_id}/{_node_instance_key_from_node(node)}: {exc}"
-                        ) from exc
-                    continue
-
-                node_key = _node_instance_key_from_node(node)
+                    return node_key, node, None, None, repr(exc)
                 session.node_instance_id = node_key
                 session.node_id = str(node.node_id or "")
+                return node_key, node, client, session, ""
+
+            create_results: List[Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]] = []
+            if len(selected_nodes) == 1:
+                create_results.append(_create_service_on_node(selected_nodes[0]))
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, len(selected_nodes)), thread_name_prefix="service-deploy") as executor:
+                    futures = [executor.submit(_create_service_on_node, node) for node in selected_nodes]
+                    for future in futures:
+                        create_results.append(future.result())
+
+            first_failure: Tuple[str, str] = ("", "")
+            for node_key, node, client, session, error_message in create_results:
+                if error_message:
+                    failures[node_key] = error_message
+                    if not first_failure[0]:
+                        first_failure = (node_key, error_message)
+                    continue
+                if client is None or session is None:
+                    continue
                 sessions[node_key] = session
                 clients[node_key] = client
                 nodes[node_key] = node
+
+            if failures and not allow_partial:
+                cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
+                node_key, message = first_failure
+                raise RuntimeError(
+                    f"deploy failed on node={node_key}: {message}"
+                )
 
             if len(sessions) < required_success_nodes:
                 cls._cleanup_created_services(sessions=sessions, clients=clients, reason="insufficient success nodes")
@@ -2482,15 +2657,30 @@ class Service(ServiceExecutionSession):
     ) -> List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]]:
         out: List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]] = []
         failures: Dict[str, str] = {}
+        http_only_routes: Dict[str, str] = {}
         for route in active_routes:
-            client = _node_control_client(route.control_addr, timeout_sec=timeout_sec)
+            route_key = _node_instance_key_from_route(route)
+            control_addr = str(getattr(route, "control_addr", "") or "").strip()
+            if not control_addr:
+                http_only_routes[route_key] = (
+                    f"service_id={str(getattr(route, 'service_id', '') or '') or '-'} "
+                    f"service_name={str(getattr(route, 'service_name', '') or '') or '-'} "
+                    f"http_base_url={str(getattr(route, 'http_base_url', '') or '') or '-'}"
+                )
+                continue
+            client = _node_control_client(control_addr, timeout_sec=timeout_sec)
             try:
                 info = client.get_service_status(service_id=route.service_id)
                 out.append((route, info))
             except Exception as exc:
-                failures[_node_instance_key_from_route(route)] = repr(exc)
+                failures[route_key] = repr(exc)
             finally:
                 client.close()
+        if http_only_routes:
+            raise RuntimeError(
+                "service_name already exists as startup/http-only service route; "
+                f"Service.deploy cannot inspect or reuse routes without control_addr: {http_only_routes}"
+            )
         if failures:
             raise RuntimeError(f"failed to inspect existing active service routes: {failures}")
         return out
@@ -2901,23 +3091,94 @@ class Service(ServiceExecutionSession):
         prepare_kwargs: Dict[str, object] = {}
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             prepare_kwargs["serialization_mode"] = self.serialization_mode
-        prepared_values = _prepare_managed_globals_values_for_upload(
+        prepared_batches, _ = _prepare_managed_globals_batches_for_upload(
             active_clients,
             values,
             effective_policy=self.effective_policy,
+            context="service_owner",
             **prepare_kwargs,
         )
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=self.serialization_mode,
+            context="service_owner",
+        )
+        encoded_batches = []
+        for prepared_values in prepared_batches:
+            if should_use_transport_payload_bytes(
+                mode=effective_serialization_mode,
+                effective_policy=self.effective_policy,
+            ):
+                encoded_batches.append(
+                    (
+                        prepared_values,
+                        None,
+                        encode_transport_payload_bytes(
+                            prepared_values,
+                            mode=effective_serialization_mode,
+                            context="service_owner",
+                            limit_bytes=(
+                                int(self.effective_policy.inline_payload_hard_limit_bytes)
+                                if self.effective_policy is not None
+                                else 0
+                            ),
+                        ),
+                    )
+                )
+            else:
+                encoded_batches.append(
+                    (
+                        prepared_values,
+                        dict_to_struct(prepared_values, mode=effective_serialization_mode),
+                        None,
+                    )
+                )
         digests: Dict[str, str] = {}
         failed_nodes: Dict[str, str] = {}
+        update_targets: List[Tuple[str, ServiceSessionClient]] = []
         for node_id, session in sessions_snapshot:
             if getattr(session, "failed", False):
                 failed_nodes[node_id] = str(getattr(session, "last_error", "") or "session failed")
                 continue
+            update_targets.append((node_id, session))
+
+        def _update_node_globals(node_id: str, session: ServiceSessionClient) -> Tuple[str, str, str]:
             try:
-                resp = session.update_globals_prepared(prepared_values)
-                digests[node_id] = resp.globals_digest
+                resp = None
+                for prepared_values, values_struct, transport_values in encoded_batches:
+                    update_encoded = getattr(session, "update_globals_encoded", None)
+                    if callable(update_encoded):
+                        resp = update_encoded(
+                            prepared_keys=sorted(str(key) for key in prepared_values.keys()),
+                            values=values_struct,
+                            transport_values=transport_values,
+                        )
+                    else:
+                        resp = session.update_globals_prepared(
+                            prepared_values,
+                            serialization_mode=self.serialization_mode,
+                            effective_policy=self.effective_policy,
+                        )
+                return (
+                    node_id,
+                    str(getattr(resp, "globals_digest", "") or ""),
+                    "",
+                )
             except Exception as exc:
-                failed_nodes[node_id] = repr(exc)
+                return node_id, "", repr(exc)
+
+        if len(update_targets) == 1:
+            update_results = [_update_node_globals(*update_targets[0])]
+        else:
+            update_results = []
+            with ThreadPoolExecutor(max_workers=max(1, len(update_targets)), thread_name_prefix="service-update-globals") as executor:
+                futures = [executor.submit(_update_node_globals, node_id, session) for node_id, session in update_targets]
+                for future in futures:
+                    update_results.append(future.result())
+        for node_id, digest, error_message in update_results:
+            if error_message:
+                failed_nodes[node_id] = error_message
+            else:
+                digests[node_id] = digest
 
         for node_id, message in failed_nodes.items():
             with self._route_lock:
@@ -3015,6 +3276,19 @@ class Service(ServiceExecutionSession):
 
     def _default_max_in_flight(self) -> int:
         return _scaled_default_max_in_flight(self._effective_worker_count())
+
+    def _get_async_call_gate(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        capacity = max(1, int(self._default_max_in_flight()))
+        if (
+            self._async_call_gate is None
+            or self._async_call_gate_loop is not loop
+            or self._async_call_gate_capacity != capacity
+        ):
+            self._async_call_gate = asyncio.Semaphore(capacity)
+            self._async_call_gate_loop = loop
+            self._async_call_gate_capacity = capacity
+        return self._async_call_gate
 
     def call_on_node(
         self,
@@ -3235,37 +3509,38 @@ class Service(ServiceExecutionSession):
         last_error: Optional[Exception] = None
 
         loop = asyncio.get_running_loop()
-        for _ in range(tries):
-            node_id = self._select_node(strategy=strategy, refresh_status=refresh_status, exclude=excluded)
-            excluded.add(node_id)
-            if not self._breaker_before_invoke(node_id):
-                continue
-            try:
-                # 在线程池中执行同步调用，不阻塞事件循环
-                call_kwargs = {
-                    "timeout_sec": timeout_sec,
-                }
-                if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
-                    call_kwargs["serialization_mode"] = effective_serialization_mode
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda nid=node_id, kwargs=call_kwargs: self.sessions[nid].call(
-                        method,
-                        payload,
-                        **kwargs,
-                    ),
-                )
-                self._breaker_mark_success(node_id)
-                return node_id, resp
-            except Exception as exc:
-                last_error = exc
-                failure_kind = classify_service_error(exc)
-                self._breaker_mark_failure(node_id, exc)
-                if not should_failover(
-                    failure_kind,
-                    has_alternative_candidate=(len(self.sessions) - len(excluded)) > 0,
-                ):
-                    raise RuntimeError(str(exc)) from exc
+        async with self._get_async_call_gate():
+            for _ in range(tries):
+                node_id = self._select_node(strategy=strategy, refresh_status=refresh_status, exclude=excluded)
+                excluded.add(node_id)
+                if not self._breaker_before_invoke(node_id):
+                    continue
+                try:
+                    # 在线程池中执行同步调用，不阻塞事件循环
+                    call_kwargs = {
+                        "timeout_sec": timeout_sec,
+                    }
+                    if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
+                        call_kwargs["serialization_mode"] = effective_serialization_mode
+                    resp = await loop.run_in_executor(
+                        None,
+                        lambda nid=node_id, kwargs=call_kwargs: self.sessions[nid].call(
+                            method,
+                            payload,
+                            **kwargs,
+                        ),
+                    )
+                    self._breaker_mark_success(node_id)
+                    return node_id, resp
+                except Exception as exc:
+                    last_error = exc
+                    failure_kind = classify_service_error(exc)
+                    self._breaker_mark_failure(node_id, exc)
+                    if not should_failover(
+                        failure_kind,
+                        has_alternative_candidate=(len(self.sessions) - len(excluded)) > 0,
+                    ):
+                        raise RuntimeError(str(exc)) from exc
 
         raise RuntimeError(f"call failed on all candidate nodes: {last_error}")
 

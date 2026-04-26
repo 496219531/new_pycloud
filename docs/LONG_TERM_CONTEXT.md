@@ -53,14 +53,15 @@ V1 公开概念固定为：
 ### 4.1 调用面约束
 
 1. `JobQueue` 自身 transport 固定：`structured_v1 + default_safe`
-2. `JobQueue.submit(...)` 允许传 `serialization_mode`
-3. `JobQueue.submit(...)` 不再接受 `policy_id`（应直接报错）
+2. `JobQueue.submit(...)` 允许传 `task_serialization_mode`，只影响后续 TaskPool 执行面
+3. `JobQueue.submit(...)` 不再接受 `policy_id/taskpool_policy_id`（应直接报错）
 
 ### 4.2 orch 侧约束
 
-1. `job-orch` 的 `taskpool_policy_id` 在启动时确定
-2. 运行期不支持 submit 覆盖该 policy
-3. 管理员如需改 policy，应通过部署/启动参数变更后重启生效
+1. `job-orch` 是系统启动时挂载的 startup service，自身 submit 入口固定 `structured_v1`
+2. `job-orch` 的 `taskpool_policy_id` 在启动时确定
+3. 运行期不支持 submit 覆盖该 policy
+4. 管理员如需改 policy，应通过部署/启动参数变更后重启生效
 
 ### 4.3 共享池约束
 
@@ -190,7 +191,7 @@ V1 公开概念固定为：
 
 本次更新摘要（2026-04-25）：
 
-1. 保留 JobQueue/job-orch 的长期边界：policy 启动时固定、submit 仅允许 mode、共享池串行复用、软切失败回退重建
+1. 保留 JobQueue/job-orch 的长期边界：job-orch 通过 startup service module 挂载，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
 2. 明确近期代码精简路线：timing recorder、object upload、JobQueue shared-pool setup、staged refs、artifact packaging defaults
 3. 规定精简约束：第一轮不改 API、不改默认行为、不丢 timing 字段、不混入 Windows 性能默认值切换
 4. 保留多人协作更新准入规则与 CI 守卫要求

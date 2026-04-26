@@ -7,7 +7,7 @@ import hashlib
 from datetime import timedelta
 from pathlib import Path
 import tempfile
-from typing import Any, Dict, Iterator, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
 import grpc
 from google.protobuf import timestamp_pb2
@@ -45,10 +45,12 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
-from pycloud_parallel.execution.support import _prepare_local_artifact_for_upload, _prepare_managed_globals_values_for_upload
+from pycloud_parallel.execution.support import (
+    _prepare_local_artifact_for_upload,
+    _prepare_managed_globals_batches_for_upload,
+)
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
-
 
 def _utc_now():
     from datetime import datetime, timezone
@@ -776,13 +778,27 @@ class NodeControlClient:
         code_token: str,
         values: Dict[str, object],
     ) -> pb2.UpdateRuntimeGlobalsResponse:
-        prepared_values = _prepare_managed_globals_values_for_upload([self], values)
-        return self.update_runtime_globals_prepared(
-            client_id=client_id,
-            code_version=code_version,
-            runtime_key=runtime_key,
-            code_token=code_token,
-            prepared_values=prepared_values,
+        batches, _ = _prepare_managed_globals_batches_for_upload([self], values)
+        last_resp: Optional[pb2.UpdateRuntimeGlobalsResponse] = None
+        updated_names: List[str] = []
+        for prepared_values in batches:
+            last_resp = self.update_runtime_globals_prepared(
+                client_id=client_id,
+                code_version=code_version,
+                runtime_key=runtime_key,
+                code_token=code_token,
+                prepared_values=prepared_values,
+            )
+            updated_names.extend(str(name) for name in last_resp.updated_names)
+        if last_resp is None:
+            return pb2.UpdateRuntimeGlobalsResponse(ok=True, code_version=code_version, runtime_key=runtime_key or code_version)
+        return pb2.UpdateRuntimeGlobalsResponse(
+            ok=last_resp.ok,
+            code_version=last_resp.code_version,
+            runtime_key=last_resp.runtime_key,
+            globals_digest=last_resp.globals_digest,
+            updated_names=sorted(set(updated_names)),
+            error=last_resp.error,
         )
 
     def update_runtime_globals_prepared(
@@ -814,12 +830,48 @@ class NodeControlClient:
                 prepared_values,
                 mode=effective_serialization_mode,
                 context="taskpool_session",
+                limit_bytes=int(effective_policy.inline_payload_hard_limit_bytes) if effective_policy is not None else 0,
             )
         else:
             request_kwargs["values"] = dict_to_struct(
                 prepared_values,
                 mode=effective_serialization_mode,
             )
+        resp = self.stub.UpdateRuntimeGlobals(
+            pb2.UpdateRuntimeGlobalsRequest(**request_kwargs),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "update runtime globals failed"))
+        return resp
+
+    def update_runtime_globals_encoded(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str,
+        code_token: str,
+        prepared_keys: Sequence[str],
+        values: Optional[Any] = None,
+        transport_values: Optional[pb2.TransportPayload] = None,
+    ) -> pb2.UpdateRuntimeGlobalsResponse:
+        request_kwargs = {
+            "client_id": str(client_id or "").strip(),
+            "code_version": str(code_version or "").strip(),
+            "runtime_key": str(runtime_key or "").strip(),
+            "code_token": str(code_token or "").strip(),
+        }
+        if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
+            request_kwargs["transport_values"] = pb2.TransportPayload(
+                codec=str(transport_values.codec or ""),
+                version=int(transport_values.version or 0),
+                payload=bytes(transport_values.payload or b""),
+            )
+        elif values is not None:
+            request_kwargs["values"] = values
+        else:
+            request_kwargs["values"] = dict_to_struct({})
         resp = self.stub.UpdateRuntimeGlobals(
             pb2.UpdateRuntimeGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,
@@ -1398,10 +1450,48 @@ class NodeControlClient:
             request_mode=serialization_mode,
             context="object_upload",
         )
-        prepared_values = _prepare_managed_globals_values_for_upload(
+        batches, _ = _prepare_managed_globals_batches_for_upload(
             [self],
             values,
             serialization_mode=effective_serialization_mode,
+            effective_policy=effective_policy,
+            context="service_owner",
+        )
+        last_resp: Optional[pb2.UpdateServiceGlobalsResponse] = None
+        updated_names: List[str] = []
+        for prepared_values in batches:
+            last_resp = self.update_service_globals_prepared(
+                owner_client_id=owner_client_id,
+                service_id=service_id,
+                service_token=service_token,
+                prepared_values=prepared_values,
+                serialization_mode=effective_serialization_mode,
+                effective_policy=effective_policy,
+            )
+            updated_names.extend(str(name) for name in last_resp.updated_names)
+        if last_resp is None:
+            return pb2.UpdateServiceGlobalsResponse(ok=True, service_id=service_id)
+        return pb2.UpdateServiceGlobalsResponse(
+            ok=last_resp.ok,
+            service_id=last_resp.service_id,
+            globals_digest=last_resp.globals_digest,
+            updated_names=sorted(set(updated_names)),
+            error=last_resp.error,
+        )
+
+    def update_service_globals_prepared(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        prepared_values: Dict[str, object],
+        serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="object_upload",
         )
         request_kwargs = {
             "owner_client_id": str(owner_client_id or "").strip(),
@@ -1416,9 +1506,43 @@ class NodeControlClient:
                 prepared_values,
                 mode=effective_serialization_mode,
                 context="service_owner",
+                limit_bytes=int(effective_policy.inline_payload_hard_limit_bytes) if effective_policy is not None else 0,
             )
         else:
             request_kwargs["values"] = dict_to_struct(prepared_values, mode=effective_serialization_mode)
+        resp = self.stub.UpdateServiceGlobals(
+            pb2.UpdateServiceGlobalsRequest(**request_kwargs),
+            timeout=self.timeout_sec,
+        )
+        if not resp.ok:
+            raise RuntimeError(_err_msg(resp.error, "update service globals failed"))
+        return resp
+
+    def update_service_globals_encoded(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        prepared_keys: Sequence[str],
+        values: Optional[Any] = None,
+        transport_values: Optional[pb2.TransportPayload] = None,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        request_kwargs = {
+            "owner_client_id": str(owner_client_id or "").strip(),
+            "service_id": str(service_id or "").strip(),
+            "service_token": str(service_token or "").strip(),
+        }
+        if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
+            request_kwargs["transport_values"] = pb2.TransportPayload(
+                codec=str(transport_values.codec or ""),
+                version=int(transport_values.version or 0),
+                payload=bytes(transport_values.payload or b""),
+            )
+        elif values is not None:
+            request_kwargs["values"] = values
+        else:
+            request_kwargs["values"] = dict_to_struct({})
         resp = self.stub.UpdateServiceGlobals(
             pb2.UpdateServiceGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,

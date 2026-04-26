@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import importlib
 import json
 import logging
 import os
@@ -8,18 +9,157 @@ import threading
 import uuid
 from typing import Dict, List, Optional, Tuple
 
-from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.policy_profile import get_default_policy_id_for_binding
-from pycloud_parallel.controlplane.registrar import JobOrchestratorInfoCenterRegistrar
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 
 
 DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME = "job-orchestrator"
+_JOB_ORCH_SUBMIT_TRANSPORT_MODE = "structured_v1"
+_SUBMIT_POLICY_FIELD_ERROR = (
+    "job submit policy_id/taskpool_policy_id is not supported; "
+    "policy is owned by startup node/deployment"
+)
 logger = logging.getLogger(__name__)
 
 
-class JobOrchestratorServer:
+def _reject_submit_policy_fields(payload: Dict[str, object]) -> Optional[Tuple[int, Dict[str, object]]]:
+    for field in ("policy_id", "taskpool_policy_id"):
+        if str((payload or {}).get(field, "") or "").strip():
+            return 400, {"ok": False, "error": _SUBMIT_POLICY_FIELD_ERROR}
+    return None
+
+
+class JobOrchestratorModule:
+    """Job queue service logic mounted by a startup-only service node."""
+
+    def __init__(
+        self,
+        *,
+        service_name: str = DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME,
+        queue_capacity: int = 4000,
+        taskpool_policy_id: str = "",
+        admin_token: str = "",
+        render_job_detail_page=None,
+    ) -> None:
+        self.service_name = str(service_name or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME).strip() or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME
+        self.queue_capacity = max(1, int(queue_capacity or 1))
+        self.taskpool_policy_id = (
+            str(taskpool_policy_id or "").strip().lower()
+            or get_default_policy_id_for_binding("taskpool_default")
+        )
+        self.admin_token = str(admin_token or "").strip()
+        self.service_id = uuid.uuid4().hex
+        self.base_url = ""
+        self.job_queue = JobQueueManager(taskpool_policy_id=self.taskpool_policy_id)
+        self._render_job_detail_page = render_job_detail_page
+
+    def start(self, *, controlplane_target: str) -> None:
+        self.job_queue.start(controlplane_target=controlplane_target)
+
+    def close(self) -> None:
+        self.job_queue.close()
+
+    def _check_admin_token(self, token: str) -> bool:
+        expected = str(self.admin_token or "").strip()
+        if not expected:
+            return False
+        return str(token or "").strip() == expected
+
+    def submit_job(
+        self,
+        payload: Dict[str, object],
+        token: str,
+        serialization_mode: str = "",
+    ) -> Tuple[int, Dict[str, object]]:
+        if str(serialization_mode or "").strip().lower() != _JOB_ORCH_SUBMIT_TRANSPORT_MODE:
+            return 400, {
+                "ok": False,
+                "error": (
+                    "job submit transport serialization_mode must be structured_v1; "
+                    "use task_serialization_mode for TaskPool execution mode"
+                ),
+            }
+        policy_rejected = _reject_submit_policy_fields(dict(payload or {}))
+        if policy_rejected is not None:
+            return policy_rejected
+        logger.info(
+            "[JobOrch] submit_job service_id=%s client_id=%s entry_module=%s job_mode=%s task_mode=%s reset_pool=%s",
+            self.service_id,
+            str((payload or {}).get("client_id", "") or ""),
+            str((payload or {}).get("entry_module", "") or ""),
+            str((payload or {}).get("job_mode", "") or ""),
+            str((payload or {}).get("task_serialization_mode", "") or ""),
+            bool((payload or {}).get("reset_pool", False)),
+        )
+        state = self.job_queue.submit_job(dict(payload or {}), auth_token=token)
+        return 200, {"ok": True, "job": state.as_dict()}
+
+    def get_job_status(self, job_id: str, *, include_details: bool = False) -> Tuple[int, Dict[str, object]]:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            return 400, {"ok": False, "error": "job_id is required"}
+        state = self.job_queue.get_job(normalized)
+        if state is None:
+            return 404, {"ok": False, "error": "job not found"}
+        return 200, {
+            "ok": True,
+            "job": state.as_dict(
+                include_payload=include_details,
+                include_results=include_details,
+                include_final_result=include_details,
+            ),
+        }
+
+    def cancel_job(self, job_id: str, *, token: str) -> Tuple[int, Dict[str, object]]:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            return 400, {"ok": False, "error": "job_id is required"}
+        logger.info("[JobOrch] cancel_job service_id=%s job_id=%s", self.service_id, normalized)
+        try:
+            state = self.job_queue.cancel_job(normalized, auth_token=token)
+        except PermissionError as exc:
+            return 403, {"ok": False, "error": str(exc)}
+        if state is None:
+            return 404, {"ok": False, "error": "job not found"}
+        return 200, {"ok": True, "job": state.as_dict()}
+
+    def reorder_job(self, job_id: str, *, direction: str, token: str) -> Tuple[int, Dict[str, object]]:
+        normalized = str(job_id or "").strip()
+        if not normalized:
+            return 400, {"ok": False, "error": "job_id is required"}
+        if not self._check_admin_token(token):
+            return 403, {"ok": False, "error": "admin auth required"}
+        try:
+            state = self.job_queue.reorder_job(normalized, direction=str(direction or "").strip().lower())
+        except ValueError as exc:
+            return 400, {"ok": False, "error": str(exc)}
+        if state is None:
+            return 404, {"ok": False, "error": "job not found"}
+        if state.status != "WAITING":
+            return 409, {"ok": False, "error": "only waiting jobs can be reordered", "job": state.as_dict()}
+        return 200, {"ok": True, "job": state.as_dict(), "queue": self.job_queue.summary()}
+
+    def extra_get(
+        self,
+        path_parts: List[str],
+        query: Dict[str, List[str]],
+    ) -> Optional[Tuple[int, Dict[str, object]]]:
+        if len(path_parts) == 2 and path_parts[0] == "jobs":
+            job_id = str(path_parts[1] or "").strip()
+            if not job_id:
+                return 400, {"ok": False, "error": "job_id is required"}
+            state = self.job_queue.get_job(job_id)
+            if state is None:
+                return 404, {"ok": False, "error": "job not found"}
+            view = str((query.get("view", [""]) or [""])[0] or "").strip().lower()
+            if view == "html" and self._render_job_detail_page is not None:
+                return 200, self._render_job_detail_page(state.as_dict()), "text/html; charset=utf-8"
+            return 200, {"ok": True, "job": state.as_dict()}
+        return None
+
+
+class JobOrchestratorServer(StartupServiceNode):
     def __init__(
         self,
         *,
@@ -30,16 +170,33 @@ class JobOrchestratorServer:
         queue_capacity: int = 4000,
         tags: Optional[List[str]] = None,
         version: str = "",
+        job_orch_policy_id: str = "",
         taskpool_policy_id: str = "",
         admin_token: str = "",
     ) -> None:
         self.bind = str(bind or "").strip()
         self.infocenter_addr = str(infocenter_addr or "").strip()
         self.node_id = str(node_id or "job-orchestrator-01").strip() or "job-orchestrator-01"
+        super().__init__(
+            node_id=self.node_id,
+            service_http_bind=self.bind,
+            service_http_base_url="",
+            worker_capacity=1,
+            queue_capacity=queue_capacity,
+            service_worker_capacity=1,
+            task_pool_worker_capacity=1,
+            enable_internal_executor=False,
+            enable_service_session=False,
+            accept_service_deploy=False,
+        )
         self.service_name = str(service_name or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME).strip() or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME
         self.queue_capacity = max(1, int(queue_capacity or 1))
         self.tags = list(tags or ["job"])
         self.version = str(version or "")
+        self.job_orch_policy_id = (
+            str(job_orch_policy_id or "").strip().lower()
+            or get_default_policy_id_for_binding("service_internal")
+        )
         self.taskpool_policy_id = (
             str(taskpool_policy_id or "").strip().lower()
             or get_default_policy_id_for_binding("taskpool_default")
@@ -49,49 +206,77 @@ class JobOrchestratorServer:
         self.admin_token = str(admin_token or env_admin_token or fallback_admin_token or "").strip()
 
         self.service_id = uuid.uuid4().hex
-        self.job_queue = JobQueueManager(taskpool_policy_id=self.taskpool_policy_id)
-        self._http = ServiceHttpGateway(
-            bind=self.bind,
-            invoke_handler=self._invoke,
-            status_handler=self._status,
-            methods_handler=self._methods,
-            extra_get_handler=self._extra_get,
-        )
-        self._registrar = JobOrchestratorInfoCenterRegistrar(
-            infocenter_addr=self.infocenter_addr,
-            node_id=self.node_id,
-            service_id=self.service_id,
+        service_module_name = "pycloud_parallel.controlplane.job_orchestrator_service"
+        self._service_module = importlib.import_module(service_module_name)
+        mount = self.mount_python_module_service(
             service_name=self.service_name,
-            http_base_url_provider=lambda: self.base_url,
-            status_provider=self.job_queue.summary,
-            queue_capacity=self.queue_capacity,
-            tags=self.tags,
-            version=self.version,
+            entry_module=service_module_name,
+            export_methods=("submit_job", "get_job_status", "cancel_job", "reorder_job"),
+            service_id=self.service_id,
+            worker_count=1,
+            policy_id=self.job_orch_policy_id,
+            managed_global_names=(
+                "service_id",
+                "service_name",
+                "queue_capacity",
+                "taskpool_policy_id",
+                "admin_token",
+                "controlplane_target",
+                "base_url",
+                "render_job_detail_page",
+            ),
         )
+        self.service_id = mount.service_id
+        self.update_globals(self._managed_globals(), service_id=self.service_id)
+        self.module = self._service_module.business_module(self.service_id)
+        self.job_queue = self.module.job_queue
         self.base_url = ""
         self._stopped = threading.Event()
 
-    def _check_admin_token(self, token: str) -> bool:
-        expected = str(self.admin_token or "").strip()
-        if not expected:
-            return False
-        return str(token or "").strip() == expected
+    def _managed_globals(self) -> Dict[str, object]:
+        return {
+            "service_id": self.service_id,
+            "service_name": self.service_name,
+            "queue_capacity": self.queue_capacity,
+            "taskpool_policy_id": self.taskpool_policy_id,
+            "admin_token": self.admin_token,
+            "controlplane_target": self.infocenter_addr,
+            "render_job_detail_page": self._render_job_detail_page,
+        }
 
     def start(self) -> None:
         self._stopped.clear()
         logger.info(
-            "[JobOrch] start bind=%s infocenter=%s node_id=%s service_name=%s service_id=%s taskpool_policy_id=%s",
+            "[JobOrch] start bind=%s infocenter=%s node_id=%s service_name=%s service_id=%s job_orch_policy_id=%s taskpool_policy_id=%s",
             self.bind,
             self.infocenter_addr,
             self.node_id,
             self.service_name,
             self.service_id,
+            self.job_orch_policy_id,
             self.taskpool_policy_id,
         )
-        self._http.start()
-        self.base_url = self._http.base_url
-        self.job_queue.start(controlplane_target=self.infocenter_addr)
-        self._registrar.start()
+        self.start_mounted_service_gateway()
+        self.base_url = self.service_http_base_url
+        values = self._managed_globals()
+        if self.base_url:
+            values["base_url"] = self.base_url
+        self.update_globals(values, service_id=self.service_id)
+        self.module = self._service_module.business_module(self.service_id)
+        self._service_module.start(
+            controlplane_target=self.infocenter_addr,
+            base_url=self.base_url,
+            service_id=self.service_id,
+        )
+        self.start_infocenter_registration(
+            infocenter_target=self.infocenter_addr,
+            control_addr="",
+            capacity=1,
+            queue_capacity=self.queue_capacity,
+            tags=self.tags,
+            version=self.version,
+            metadata={"component": "job-orchestrator"},
+        )
 
     def stop(self, grace: int = 0) -> None:
         del grace
@@ -101,166 +286,12 @@ class JobOrchestratorServer:
             self.service_name,
             self.service_id,
         )
-        self._registrar.close()
-        self.job_queue.close()
-        self._http.stop()
+        self._service_module.close(service_id=self.service_id)
+        super().close()
         self._stopped.set()
 
     def wait_for_termination(self) -> None:
         self._stopped.wait()
-
-    def _ensure_service(self, service_id: str) -> Optional[Tuple[int, Dict[str, object]]]:
-        normalized = str(service_id or "").strip()
-        if normalized != self.service_id:
-            return 404, {"ok": False, "error": "service not found"}
-        return None
-
-    def _invoke(
-        self,
-        service_id: str,
-        method: str,
-        payload: Dict[str, object],
-        token: str,
-        timeout_sec: float,
-        serialization_mode: str = "",
-        use_transport_result: bool = False,
-    ) -> Tuple[int, Dict[str, object]]:
-        del timeout_sec, serialization_mode, use_transport_result
-        rejected = self._ensure_service(service_id)
-        if rejected is not None:
-            return rejected
-        requested_method = str(method or "").strip()
-        if requested_method == "submit_job":
-            logger.info(
-                "[JobOrch] submit_job service_id=%s client_id=%s entry_module=%s job_mode=%s task_mode=%s reset_pool=%s",
-                service_id,
-                str((payload or {}).get("client_id", "") or ""),
-                str((payload or {}).get("entry_module", "") or ""),
-                str((payload or {}).get("job_mode", "") or ""),
-                str((payload or {}).get("task_serialization_mode", "") or ""),
-                bool((payload or {}).get("reset_pool", False)),
-            )
-            state = self.job_queue.submit_job(dict(payload or {}), auth_token=token)
-            return 200, {"ok": True, "job": state.as_dict()}
-        if requested_method in {"get_job", "get_job_status"}:
-            job_id = str((payload or {}).get("job_id", "") or "").strip()
-            if not job_id:
-                return 400, {"ok": False, "error": "job_id is required"}
-            include_details = bool((payload or {}).get("include_details", False))
-            state = self.job_queue.get_job(job_id)
-            if state is None:
-                return 404, {"ok": False, "error": "job not found"}
-            return 200, {
-                "ok": True,
-                "job": state.as_dict(
-                    include_payload=include_details,
-                    include_results=include_details,
-                    include_final_result=include_details,
-                ),
-            }
-        if requested_method == "reorder_job":
-            job_id = str((payload or {}).get("job_id", "") or "").strip()
-            direction = str((payload or {}).get("direction", "") or "").strip().lower()
-            if not job_id:
-                return 400, {"ok": False, "error": "job_id is required"}
-            if not self._check_admin_token(token):
-                return 403, {"ok": False, "error": "admin auth required"}
-            try:
-                state = self.job_queue.reorder_job(job_id, direction=direction)
-            except ValueError as exc:
-                return 400, {"ok": False, "error": str(exc)}
-            if state is None:
-                return 404, {"ok": False, "error": "job not found"}
-            if state.status != "WAITING":
-                return 409, {"ok": False, "error": "only waiting jobs can be reordered", "job": state.as_dict()}
-            return 200, {"ok": True, "job": state.as_dict(), "queue": self.job_queue.summary()}
-        if requested_method == "cancel_job":
-            job_id = str((payload or {}).get("job_id", "") or "").strip()
-            if not job_id:
-                return 400, {"ok": False, "error": "job_id is required"}
-            logger.info("[JobOrch] cancel_job service_id=%s job_id=%s", service_id, job_id)
-            try:
-                state = self.job_queue.cancel_job(job_id, auth_token=token)
-            except PermissionError as exc:
-                return 403, {"ok": False, "error": str(exc)}
-            if state is None:
-                return 404, {"ok": False, "error": "job not found"}
-            return 200, {"ok": True, "job": state.as_dict()}
-        return 404, {"ok": False, "error": f"unknown method: {requested_method}"}
-
-    def _status(self, service_id: str) -> Tuple[int, Dict[str, object]]:
-        rejected = self._ensure_service(service_id)
-        if rejected is not None:
-            return rejected
-        queue = self.job_queue.summary()
-        return 200, {
-            "ok": True,
-            "service": {
-                "service_id": self.service_id,
-                "service_name": self.service_name,
-                "status": int(pb2.SERVICE_STATUS_RUNNING),
-                "status_text": pb2.ServiceStatus.Name(pb2.SERVICE_STATUS_RUNNING),
-                "http_base_url": f"{self.base_url}/svc/{self.service_id}" if self.base_url else "",
-                "methods": [item["method"] for item in self._method_specs()],
-            },
-            "queue": queue,
-        }
-
-    def _methods(self, service_id: str, include_docs: bool) -> Tuple[int, Dict[str, object]]:
-        rejected = self._ensure_service(service_id)
-        if rejected is not None:
-            return rejected
-        methods = self._method_specs()
-        if not include_docs:
-            methods = [{**item, "doc": ""} for item in methods]
-        return 200, {"ok": True, "service_id": self.service_id, "methods": methods}
-
-    def _extra_get(
-        self,
-        service_id: str,
-        path_parts: List[str],
-        query: Dict[str, List[str]],
-    ) -> Optional[Tuple[int, Dict[str, object]]]:
-        rejected = self._ensure_service(service_id)
-        if rejected is not None:
-            return rejected
-        if len(path_parts) == 2 and path_parts[0] == "jobs":
-            job_id = str(path_parts[1] or "").strip()
-            if not job_id:
-                return 400, {"ok": False, "error": "job_id is required"}
-            state = self.job_queue.get_job(job_id)
-            if state is None:
-                return 404, {"ok": False, "error": "job not found"}
-            view = str((query.get("view", [""]) or [""])[0] or "").strip().lower()
-            if view == "html":
-                return 200, self._render_job_detail_page(state.as_dict()), "text/html; charset=utf-8"
-            return 200, {"ok": True, "job": state.as_dict()}
-        return None
-
-    @staticmethod
-    def _method_specs() -> List[Dict[str, str]]:
-        return [
-            {
-                "method": "submit_job",
-                "qualified_name": "job_orchestrator.submit_job",
-                "doc": "Submit a job payload to the single job orchestrator.",
-            },
-            {
-                "method": "get_job_status",
-                "qualified_name": "job_orchestrator.get_job_status",
-                "doc": "Fetch the current state for one job_id.",
-            },
-            {
-                "method": "cancel_job",
-                "qualified_name": "job_orchestrator.cancel_job",
-                "doc": "Request cancellation for one job_id.",
-            },
-            {
-                "method": "reorder_job",
-                "qualified_name": "job_orchestrator.reorder_job",
-                "doc": "Move one waiting job up or down inside the queue.",
-            },
-        ]
 
     def _render_job_detail_page(self, job: Dict[str, object]) -> str:
         pretty = json.dumps(job, ensure_ascii=False, indent=2, default=str)

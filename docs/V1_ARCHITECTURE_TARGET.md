@@ -12,6 +12,8 @@ V1 freezes the user-facing model to five concepts only:
 
 Local-only parallel helpers remain available under `pycloud_parallel.local`, not the top-level package.
 
+`Service.startup(...)` is the product-level path for startup-mounted services. It returns an internal startup-node handle that supports services attached when the process starts and rejects dynamic service deployment by default. `NodeControlState` extends that internal base and adds dynamic deployment support.
+
 ## Concepts Removed From The Final Public Surface
 
 These legacy categories are transitional and must not survive the V1 cleanup:

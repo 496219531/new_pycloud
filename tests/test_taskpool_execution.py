@@ -7,6 +7,7 @@ import importlib
 import io
 import sys
 import tarfile
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -103,6 +104,148 @@ def test_native_task_pool_session_submit_and_wait() -> None:
         assert session.job_id == "job-native"
         assert session.node_ids == ["node-1"]
         assert session.methods == ["run"]
+    finally:
+        session.close()
+
+
+def test_task_pool_from_infocenter_creates_node_pools_concurrently(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.execution import task_pool as task_pool_mod
+
+    nodes = [
+        SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061"),
+        SimpleNamespace(node_id="node-2", control_addr="127.0.0.1:50062"),
+    ]
+    started = []
+    finished = []
+    lock = threading.Lock()
+    both_started = threading.Event()
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            return list(nodes)
+
+    class _FakeNodeClient:
+        def __init__(self, addr: str):
+            self.addr = addr
+
+        def create_task_pool_from_bytes(self, **_kwargs):
+            with lock:
+                started.append(self.addr)
+                if len(started) == len(nodes):
+                    both_started.set()
+            assert both_started.wait(timeout=1.0)
+            with lock:
+                finished.append(self.addr)
+            suffix = self.addr.rsplit(":", 1)[-1]
+            return SimpleNamespace(
+                owner_client_id="owner-demo",
+                pool_id=f"pool-{suffix}",
+                pool_token=f"token-{suffix}",
+                code_version="sha256:test",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+                pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+                heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+                cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
+                close=lambda reason="": None,
+                _client=SimpleNamespace(close=lambda: None),
+            )
+
+    monkeypatch.setattr(task_pool_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
+    monkeypatch.setattr(task_pool_mod, "_node_control_client", lambda addr, **_kwargs: _FakeNodeClient(addr))
+
+    session = TaskPool.from_infocenter(
+        infocenter_target="127.0.0.1:50051",
+        job_id="job-native-parallel-create",
+        blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+        entry_module="task_demo",
+        entry_callable="run",
+        worker_count=2,
+        node_count=2,
+    )
+    try:
+        assert set(started) == {"127.0.0.1:50061", "127.0.0.1:50062"}
+        assert set(finished) == set(started)
+        assert session.node_ids == ["node-1", "node-2"]
+    finally:
+        session.close()
+
+
+def test_task_pool_update_globals_fans_out_to_nodes_concurrently(monkeypatch) -> None:
+    from google.protobuf import struct_pb2
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.execution import task_pool as task_pool_mod
+
+    nodes = {
+        "node-1": SimpleNamespace(node_id="node-1"),
+        "node-2": SimpleNamespace(node_id="node-2"),
+    }
+    started = []
+    encode_calls = []
+    lock = threading.Lock()
+    both_started = threading.Event()
+
+    def _fake_dict_to_struct(values, *, mode="legacy_v1"):
+        encode_calls.append((dict(values), mode))
+        return struct_pb2.Struct()
+
+    def _fake_encode_transport_payload_bytes(values, **_kwargs):
+        encode_calls.append((dict(values), "transport"))
+        return pb2.TransportPayload(codec="test", version=1, payload=b"payload")
+
+    monkeypatch.setattr(task_pool_mod, "dict_to_struct", _fake_dict_to_struct)
+    monkeypatch.setattr(task_pool_mod, "encode_transport_payload_bytes", _fake_encode_transport_payload_bytes)
+
+    class _FakeClient:
+        def __init__(self, node_id: str):
+            self.node_id = node_id
+
+        def update_runtime_globals_encoded(self, **kwargs):
+            assert kwargs["prepared_keys"] == ["STATE"]
+            assert kwargs.get("values") is not None or kwargs.get("transport_values") is not None
+            with lock:
+                started.append(self.node_id)
+                if len(started) == len(nodes):
+                    both_started.set()
+            assert both_started.wait(timeout=1.0)
+            return SimpleNamespace(globals_digest="sha256:globals")
+
+        def update_runtime_globals_prepared(self, **_kwargs):
+            raise AssertionError("update_globals should use pre-encoded payloads when supported")
+
+        def close(self):
+            pass
+
+    def _pool(node_id: str):
+        return SimpleNamespace(
+            owner_client_id="owner-demo",
+            pool_id=f"pool-{node_id}",
+            pool_token=f"token-{node_id}",
+            code_version="sha256:test",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            close=lambda reason="": None,
+            _client=_FakeClient(node_id),
+        )
+
+    session = TaskPool(
+        pools={node_id: _pool(node_id) for node_id in nodes},
+        nodes=nodes,
+        task_method="run",
+        job_id="job-update-globals-parallel",
+    )
+    try:
+        assert session.update_globals({"STATE": 1}) == "sha256:globals"
+        assert set(started) == set(nodes)
+        assert len(encode_calls) == 1
     finally:
         session.close()
 
@@ -721,7 +864,13 @@ def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
     def _fake_prepare(clients, values, **_kwargs):
         prepared_values["clients"] = clients
         prepared_values["values"] = values
-        return {"cfg": {"k": "v"}}
+        return [{"cfg": {"k": "v"}}], {
+            "globals_batch_count": 1,
+            "batch_keys": [["cfg"]],
+            "batch_bytes": [1],
+            "staged_keys": [],
+            "inline_keys": ["cfg"],
+        }
 
     pool_a = SimpleNamespace(
         owner_client_id="owner-demo",
@@ -749,7 +898,7 @@ def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
         task_method="run",
         job_id="job-update-globals",
     )
-    with patch("pycloud_parallel.execution.task_pool._prepare_managed_globals_values_for_upload", _fake_prepare):
+    with patch("pycloud_parallel.execution.task_pool._prepare_managed_globals_batches_for_upload", _fake_prepare):
         digest = session.update_globals({"cfg": {"k": "v"}})
     assert digest == "sha256:same"
     assert session.globals_digests == {"node-a": "sha256:same", "node-b": "sha256:same"}

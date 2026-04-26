@@ -36,9 +36,9 @@ from pycloud_parallel.controlplane.data_store import DataStore
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
-from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
+from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
 from pycloud_parallel.controlplane.node.helpers import (
     _append_bytes_to_segment,
     _artifact_exists,
@@ -59,6 +59,7 @@ from pycloud_parallel.controlplane.node.helpers import (
     _is_user_artifact_error,
     _load_managed_globals_snapshot_serialized,
     _load_object_meta,
+    _managed_globals_binary_value,
     _managed_globals_scope_dir,
     _missing_import_name,
     _normalize_dependency_allowlist,
@@ -123,6 +124,7 @@ from pycloud_parallel.controlplane.serialization import (
     detect_transport_mode,
     log_payload_flow,
     serialize_arrow_compatible,
+    stable_pickle_dumps,
     struct_to_python,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
@@ -133,7 +135,7 @@ from pycloud_parallel.runtime.errors import normalize_invoke_error
 logger = logging.getLogger(__name__)
 
 
-class NodeControlState:
+class NodeControlState(NodeRuntimeBase):
     """NodeControl 状态管理。
 
     负责代码上传、任务提交、结果拉取等核心功能。
@@ -167,7 +169,12 @@ class NodeControlState:
         service_http_bind: str = "0.0.0.0:18080",
         service_http_base_url: str = "",
     ) -> None:
-        self.node_id = node_id
+        super().__init__(
+            node_id=node_id,
+            service_http_bind=service_http_bind,
+            service_http_base_url=service_http_base_url,
+            accept_service_deploy=True,
+        )
         self.worker_capacity = max(1, worker_capacity)
         self.queue_capacity = max(1, queue_capacity)
         self.heartbeat_timeout_sec = max(5, heartbeat_timeout_sec)
@@ -181,8 +188,6 @@ class NodeControlState:
         self.service_worker_capacity = max(1, int(service_worker_capacity or worker_capacity))
         default_task_pool_capacity = max(1, int(os.cpu_count() or 1))
         self.task_pool_worker_capacity = max(1, int(task_pool_worker_capacity or default_task_pool_capacity))
-        self.service_http_bind = service_http_bind
-        self.service_http_base_url = service_http_base_url.strip()
         self.started_at = utc_now()
 
         self._lock = threading.Lock()
@@ -226,7 +231,6 @@ class NodeControlState:
         )
         self._cleanup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nodecontrol-cleanup")
         self._dispatcher: Optional[threading.Thread] = None
-        self._service_http_gateway: Optional[ServiceHttpGateway] = None
 
         if self.enable_internal_executor:
             self._dispatcher = threading.Thread(
@@ -237,15 +241,11 @@ class NodeControlState:
             self._dispatcher.start()
 
         if self.enable_service_session and self.service_http_bind:
-            self._service_http_gateway = ServiceHttpGateway(
-                bind=self.service_http_bind,
+            self.start_service_gateway(
                 invoke_handler=self._invoke_service_http,
                 status_handler=self._service_status_http,
                 methods_handler=self._service_methods_http,
             )
-            self._service_http_gateway.start()
-            if not self.service_http_base_url:
-                self.service_http_base_url = self._service_http_gateway.base_url
 
     def _record_service_timing_locked(
         self,
@@ -401,12 +401,11 @@ class NodeControlState:
         self._monitor.join(timeout=1.0)
         if self._dispatcher is not None:
             self._dispatcher.join(timeout=1.0)
-        if self._service_http_gateway is not None:
-            self._service_http_gateway.stop()
+        self.stop_service_gateway()
         self._shutdown_all_services()
-        self._cleanup_executor.shutdown(wait=True, cancel_futures=False)
+        self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
         if self._executor_host is not None:
-            self._executor_host.close()
+            self._executor_host.close(shutdown_timeout_sec=2.0)
 
     def _submit_stop_task_pool(self, executor_host: ExecutorHostClient, *, pool_id: str) -> None:
         normalized = str(pool_id or "").strip()
@@ -531,6 +530,7 @@ class NodeControlState:
         state: ManagedGlobalsState,
         *,
         values: Dict[str, Any],
+        serialization_mode: str = "",
     ) -> Tuple[str, List[str]]:
         if not values:
             raise ValueError("managed globals values cannot be empty")
@@ -546,7 +546,13 @@ class NodeControlState:
                     f"managed globals must be data values, not callables/modules/classes: {[name]}"
                 )
             prepared_value = self._prepare_managed_globals_value_for_subprocess_locked(value)
-            current_values[name] = serialize_arrow_compatible(prepared_value)
+            if str(serialization_mode or "").strip().lower() == "pickle_stable_v1":
+                current_values[name] = _managed_globals_binary_value(
+                    codec="pickle_stable_v1",
+                    payload=stable_pickle_dumps(prepared_value),
+                )
+            else:
+                current_values[name] = serialize_arrow_compatible(prepared_value)
             updated_names.append(name)
         state.globals_digest = _write_managed_globals_snapshot(state, values_serialized=current_values)
         _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
@@ -1610,6 +1616,7 @@ class NodeControlState:
         idle_ttl_sec: int,
         expose_http: bool,
         chunks: Iterable[bytes],
+        service_id: str = "",
     ) -> ServiceSession:
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
@@ -1641,7 +1648,7 @@ class NodeControlState:
         actual_hb_timeout = max(5, heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec)
         actual_idle_ttl = max(0, idle_ttl_sec)
         now = utc_now()
-        service_id = uuid.uuid4().hex
+        service_id = str(service_id or "").strip() or uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
 
@@ -1670,6 +1677,19 @@ class NodeControlState:
             raise RuntimeError("executor host unavailable")
         try:
             executor_host.create_service(service_id=service_id, worker_count=actual_workers)
+            executor_host.preload_service(
+                service_id=service_id,
+                fanout=actual_workers,
+                execute_spec=_build_execute_spec(
+                    artifact,
+                    object_dir=self._object_dir,
+                    work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                    method_name=next(iter(method_info.keys()), artifact.entry_callable),
+                    payload={},
+                    payload_mode="http_call",
+                    warmup_only=True,
+                ),
+            )
             session = ServiceSession(
                 service_id=service_id,
                 owner_client_id=owner_client_id,
@@ -1704,7 +1724,43 @@ class NodeControlState:
             with self._lock:
                 if reserved:
                     self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
+            with contextlib.suppress(Exception):
+                executor_host.stop_service(service_id=service_id)
             raise
+
+    def update_globals(
+        self,
+        values: Dict[str, Any],
+        *,
+        service_id: str = "",
+        service_name: str = "",
+    ) -> str:
+        """Update startup-created service globals through the normal service path."""
+        if not isinstance(values, dict):
+            raise RuntimeError("update_globals values must be a dict")
+        normalized_service_id = str(service_id or "").strip()
+        normalized_service_name = str(service_name or "").strip()
+        with self._lock:
+            sessions = [
+                session
+                for session in self._services.values()
+                if (not normalized_service_id or session.service_id == normalized_service_id)
+                and (not normalized_service_name or session.service_name == normalized_service_name)
+            ]
+        if not sessions:
+            raise KeyError("service not found")
+        digests: Dict[str, str] = {}
+        for session in sessions:
+            digest, _updated = self.update_service_globals(
+                owner_client_id=session.owner_client_id,
+                service_id=session.service_id,
+                service_token=session.service_token,
+                values=values,
+            )
+            digests[session.service_id] = digest
+        self.globals_digests = dict(digests)
+        unique = {digest for digest in digests.values() if str(digest).strip()}
+        return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()), "")
 
     def create_task_pool(
         self,
@@ -1774,9 +1830,24 @@ class NodeControlState:
         executor_create_started = time.monotonic()
         try:
             executor_host.create_task_pool(pool_id=pool_id, worker_count=actual_workers)
+            executor_host.preload_pool(
+                pool_id=pool_id,
+                fanout=actual_workers,
+                execute_spec=_build_execute_spec(
+                    artifact,
+                    object_dir=self._object_dir,
+                    work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                    method_name=str(entry_callable or "run").strip() or "run",
+                    payload={},
+                    payload_mode="task_submit",
+                    warmup_only=True,
+                ),
+            )
         except Exception:
             with self._lock:
                 self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+            with contextlib.suppress(Exception):
+                executor_host.stop_task_pool(pool_id=pool_id)
             raise
         executor_create_ms = (time.monotonic() - executor_create_started) * 1000.0
         try:
@@ -2494,6 +2565,7 @@ class NodeControlState:
         service_id: str,
         service_token: str,
         values: Dict[str, Any],
+        serialization_mode: str = "",
     ) -> Tuple[str, List[str]]:
         with self._lock:
             session = self._services.get(service_id)
@@ -2509,7 +2581,11 @@ class NodeControlState:
             state = self._ensure_service_managed_globals_state_locked(session)
             if state is None:
                 raise ValueError("service artifact did not declare managed globals")
-            globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
+            globals_digest, updated_names = self._update_managed_globals_state(
+                state,
+                values=values,
+                serialization_mode=serialization_mode,
+            )
             session.managed_globals_scope_dir = state.scope_dir
             session.managed_globals_digest = globals_digest
             executor_host = self._executor_host
@@ -2544,6 +2620,7 @@ class NodeControlState:
         runtime_key: str,
         code_token: str,
         values: Dict[str, Any],
+        serialization_mode: str = "",
     ) -> Tuple[str, List[str]]:
         normalized_client_id = str(client_id or "").strip()
         normalized_code_version = str(code_version or "").strip()
@@ -2568,7 +2645,11 @@ class NodeControlState:
             )
             if state is None:
                 raise ValueError("task artifact did not declare managed globals")
-            globals_digest, updated_names = self._update_managed_globals_state(state, values=values)
+            globals_digest, updated_names = self._update_managed_globals_state(
+                state,
+                values=values,
+                serialization_mode=serialization_mode,
+            )
             self._runtime_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = state
             executor_host = self._executor_host
             pool = self._task_pools.get(normalized_client_id)
@@ -2589,8 +2670,8 @@ class NodeControlState:
             managed_globals_digest=globals_digest,
             warmup_only=True,
         )
+        warmup_started = time.monotonic()
         if pool is not None:
-            warmup_started = time.monotonic()
             self._execute_warmup(
                 executor_host=executor_host,
                 scope="pool",
@@ -2808,6 +2889,8 @@ class NodeControlState:
         with self._lock:
             for session in self._services.values():
                 if session.status != pb2.SERVICE_STATUS_RUNNING:
+                    continue
+                if bool(getattr(session, "node_managed", False)):
                     continue
                 if now <= session.lease_expire_at:
                     continue

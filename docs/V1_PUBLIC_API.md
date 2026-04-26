@@ -20,6 +20,22 @@ from pycloud_parallel import (
 )
 ```
 
+## `Service.startup(...)`
+
+启动时固定挂载服务归到 `Service` 产品入口下，和 `deploy(...)`、`connect(...)` 并列：
+
+```python
+from pycloud_parallel import Service
+
+node = Service.startup(
+    service_name="calc",
+    entry_module="my_package.calc_service",
+    bind="0.0.0.0:18080",
+)
+```
+
+它的语义是“启动时部署”，不是运行期动态部署。返回对象是底层启动节点句柄，默认不接受运行期动态部署；普通 `NodeControl` 节点额外支持动态部署。
+
 本地并行入口单独放到：
 
 ```python

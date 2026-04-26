@@ -13,14 +13,15 @@
 1. 旧共享任务池模式已经移除
 2. 任务执行现在优先走原生 `TaskPool`
 3. 大任务排队入口优先走 `JobQueue`
-4. `Service / TaskPool / JobQueue` 当前共用统一 scheduler 核心来回答“这次该选谁”
-5. `TaskPool` 的批量 refill / `Service` 的 RPC 发送循环仍然各自保留，不强行混成一套
+4. 启动时固定服务使用 `Service.startup(...)`，运行期动态部署使用 `Service.deploy(...)`
+5. `Service / TaskPool / JobQueue` 当前共用统一 scheduler 核心来回答“这次该选谁”
+6. `TaskPool` 的批量 refill / `Service` 的 RPC 发送循环仍然各自保留，不强行混成一套
 
 分工：
 
 | 类 | 模式 | 用途 |
 |---|---|---|
-| `Service` | Service | 部署并拥有内部函数服务 |
+| `Service` | Service | `deploy(...)` 动态部署、`connect(...)` 连接已有服务、`startup(...)` 启动时挂载固定 module |
 | `TaskPool` | TaskPool | 创建原生专属任务池并执行 subtasks |
 | `JobQueue` | JobQueue | 提交大任务、排队、单活调度 |
 | `DataRef` | Data | 大对象 / 大结果 / 文件引用 |
@@ -174,6 +175,7 @@ carrier 选择也已经改成同一个原则：
 
 1. `JobQueue` 自己的 transport/session 默认绑定 `jobqueue_controlplane_transport -> default_safe`
 2. 这个 binding 的默认 mode 仍然是 `structured_v1`
-3. 用户在 `JobQueue.submit(...)` 里传的 `serialization_mode`，解释为未来 `TaskPool` 的执行策略；`policy_id` 不再允许由 submit 传入
-4. `job-orchestrator` 运行期维护单共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先软切 mode 复用，软切失败再回退重建
-5. 因此 job-orchestrator 的调用面和后续 task 执行面的策略边界是分开的
+3. `job-orchestrator` 是 startup service，通过 `mount_python_module_service(...)` 挂载内置系统 module
+4. 用户在 `JobQueue.submit(...)` 里传的 `task_serialization_mode`，解释为未来 `TaskPool` 的执行策略；`policy_id/taskpool_policy_id` 不再允许由 submit 传入
+5. `job-orchestrator` 运行期维护单共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先软切 mode 复用，软切失败再回退重建
+6. 因此 job-orchestrator 的调用面和后续 task 执行面的策略边界是分开的

@@ -169,6 +169,46 @@ def test_ops_page_merges_duplicate_services_with_same_endpoint():
     assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
 
 
+def test_startup_service_registration_rejects_duplicate_service_name():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="startup-a",
+        node_id="startup-a",
+        control_addr="127.0.0.1:18081",
+        capacity=1,
+        queue_capacity=1,
+        metadata={"startup_service": "true"},
+        services={
+            "svc-a": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-a",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="startup service_name already exists"):
+        info_state.register_node_record(
+            node_instance_id="startup-b",
+            node_id="startup-b",
+            control_addr="127.0.0.1:18082",
+            capacity=1,
+            queue_capacity=1,
+            metadata={"startup_service": "true"},
+            services={
+                "svc-b": NodeServiceState(
+                    service_name="calc_asset_ratio",
+                    service_id="svc-b",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    worker_count=1,
+                    alive_workers=1,
+                )
+            },
+        )
+
+
 def test_infocenter_replaces_existing_node_with_same_control_addr():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(
@@ -744,6 +784,50 @@ def test_infocenter_client_select_task_nodes_filters_by_python_runtime():
                 )
             )
             assert [node.node_id for node in selected_ge] == ["node-py311", "node-py313"]
+    finally:
+        info_server.stop()
+
+
+def test_infocenter_client_select_task_nodes_skips_startup_only_nodes():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-compute",
+                control_addr="127.0.0.1:50101",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+                accept_service_deploy=True,
+            )
+            client.register_node(
+                node_id="node-startup-only",
+                control_addr="127.0.0.1:18080",
+                capacity=4,
+                queue_capacity=20,
+                tags=["startup-service"],
+                accept_service_deploy=False,
+            )
+            for node_id in ("node-compute", "node-startup-only"):
+                client.heartbeat_node(
+                    node_id=node_id,
+                    healthy=True,
+                    metrics={"queued": 0, "inflight": 0, "running": 0, "credit": 8},
+                    accept_service_deploy=(node_id == "node-compute"),
+                )
+
+            selected = list(
+                client.select_task_nodes(
+                    healthy_only=True,
+                    node_count=10,
+                    require_credit=False,
+                )
+            )
+            assert [node.node_id for node in selected] == ["node-compute"]
     finally:
         info_server.stop()
 

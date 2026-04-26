@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,9 +11,182 @@ import pandas as pd
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
-from pycloud_parallel.controlplane.job_orchestrator import JobOrchestratorServer
+from pycloud_parallel.controlplane.job_orchestrator import JobOrchestratorModule, JobOrchestratorServer
+from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.data.ref import DataRef, data_ref_to_payload
+
+
+def test_startup_service_node_rejects_dynamic_service_deploy() -> None:
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+
+    with pytest.raises(RuntimeError, match="dynamic service deployment is disabled"):
+        node.create_service()
+
+
+def test_startup_service_node_mounts_python_module_service(tmp_path, monkeypatch) -> None:
+    module_path = tmp_path / "startup_calc.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    mount = node.mount_python_module_service(service_name="startup-calc", entry_module="startup_calc")
+
+    code, methods = node._methods_mounted_startup_service(mount.service_id, include_docs=False)  # noqa: SLF001
+    assert code == 200
+    assert methods["service_id"] == mount.service_id
+    assert [item["method"] for item in methods["methods"]] == ["add"]
+
+    code, body = node._invoke_mounted_startup_service(  # noqa: SLF001
+        mount.service_id,
+        "add",
+        {"x": 2, "y": 3},
+        "",
+        5.0,
+    )
+    assert code == 200
+    assert body["data"] == {"value": 5}
+
+
+def test_startup_service_node_updates_python_module_managed_globals(tmp_path, monkeypatch) -> None:
+    module_path = tmp_path / "startup_cfg.py"
+    module_path.write_text(
+        "CFG = {}\n"
+        "LAST_CONTEXT = {}\n\n"
+        "def apply_managed_globals(values, **context):\n"
+        "    global CFG, LAST_CONTEXT\n"
+        "    CFG = dict(values.get('cfg') or {})\n"
+        "    LAST_CONTEXT = dict(context)\n\n"
+        "def read_cfg(_service_id=''):\n"
+        "    return {'cfg': CFG, 'service_id': _service_id, 'context_service_id': LAST_CONTEXT.get('service_id')}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    mount = node.mount_python_module_service(
+        service_name="startup-cfg",
+        entry_module="startup_cfg",
+        managed_global_names=("cfg",),
+    )
+    digest = node.update_globals({"cfg": {"mode": "fast"}}, service_id=mount.service_id)
+
+    assert digest.startswith("sha256:")
+    assert node.globals_digests == {mount.service_id: digest}
+    code, body = node._invoke_mounted_startup_service(  # noqa: SLF001
+        mount.service_id,
+        "read_cfg",
+        {},
+        "",
+        5.0,
+    )
+    assert code == 200
+    assert body["data"]["cfg"] == {"mode": "fast"}
+    assert body["data"]["service_id"] == mount.service_id
+    assert body["data"]["context_service_id"] == mount.service_id
+
+
+def test_startup_service_node_applies_pending_managed_globals_on_mount(tmp_path, monkeypatch) -> None:
+    module_path = tmp_path / "startup_pending_cfg.py"
+    module_path.write_text(
+        "CFG = {}\n\n"
+        "def apply_managed_globals(values, **_context):\n"
+        "    global CFG\n"
+        "    CFG = dict(values.get('cfg') or {})\n\n"
+        "def read_cfg():\n"
+        "    return {'cfg': CFG}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    service_id = "startup-pending-service"
+    digest = node.update_globals({"cfg": {"mode": "pending"}}, service_id=service_id)
+    mount = node.mount_python_module_service(
+        service_name="startup-pending",
+        entry_module="startup_pending_cfg",
+        service_id=service_id,
+        managed_global_names=("cfg",),
+    )
+
+    assert node.globals_digests[mount.service_id] == digest
+    code, body = node._invoke_mounted_startup_service(  # noqa: SLF001
+        mount.service_id,
+        "read_cfg",
+        {},
+        "",
+        5.0,
+    )
+    assert code == 200
+    assert body["data"]["cfg"] == {"mode": "pending"}
+
+
+def test_startup_service_node_infocenter_registration_is_background(monkeypatch) -> None:
+    events = []
+
+    class _FakeRegistrar:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+
+        def sync_now(self):
+            events.append(("sync_now", {}))
+            raise AssertionError("startup registration should not synchronously sync")
+
+        def start(self):
+            events.append(("start", {}))
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.registrar.NodeInfoCenterRegistrar",
+        _FakeRegistrar,
+    )
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+
+    node.start_infocenter_registration(infocenter_target="http://127.0.0.1:9", heartbeat_sec=1)
+
+    assert [name for name, _payload in events] == ["init", "start"]
+
+
+def test_nodecontrol_and_job_orchestrator_use_startup_service_node_base() -> None:
+    server = JobOrchestratorServer(
+        bind="127.0.0.1:0",
+        infocenter_addr="127.0.0.1:50051",
+        node_id="job-orchestrator-test",
+    )
+
+    assert isinstance(server, StartupServiceNode)
+    assert issubclass(StartupServiceNode, NodeControlState)
+    assert isinstance(server.module, JobOrchestratorModule)
+    assert server.accept_service_deploy is False
+    assert server.module.service_name == "job-orchestrator"
+    reports = server.service_report_payloads()
+    assert len(reports) == 1
+    assert reports[0]["service_name"] == "job-orchestrator"
+    assert reports[0]["service_id"] == server.service_id
+    assert reports[0]["policy_id"] == server.job_orch_policy_id
+    assert reports[0]["alive_workers"] == 1
+
+
+def test_job_orchestrator_instances_have_independent_startup_service_ids() -> None:
+    first = JobOrchestratorServer(
+        bind="127.0.0.1:0",
+        infocenter_addr="127.0.0.1:50051",
+        node_id="job-orch-a",
+    )
+    second = JobOrchestratorServer(
+        bind="127.0.0.1:0",
+        infocenter_addr="127.0.0.1:50051",
+        node_id="job-orch-b",
+    )
+
+    assert first.node_id != second.node_id
+    assert first.service_id != second.service_id
+    assert first.service_report_payloads()[0]["service_id"] == first.service_id
+    assert second.service_report_payloads()[0]["service_id"] == second.service_id
 
 
 def test_submit_and_cancel_waiting_job() -> None:
@@ -211,15 +385,15 @@ def test_job_orchestrator_reorder_job_requires_admin_token() -> None:
     with queue._cv:  # noqa: SLF001
         queue._waiting_order = ["job-1", "job-2", "job-3"]  # noqa: SLF001
 
-    status, body = server._invoke(server.service_id, "reorder_job", {"job_id": "job-3", "direction": "up"}, "", 5.0)
+    status, body = server.module.reorder_job("job-3", direction="up", token="")
     assert status == 403
     assert body["error"] == "admin auth required"
 
-    status, body = server._invoke(server.service_id, "reorder_job", {"job_id": "job-3", "direction": "up"}, "owner-token", 5.0)
+    status, body = server.module.reorder_job("job-3", direction="up", token="owner-token")
     assert status == 403
     assert body["error"] == "admin auth required"
 
-    status, body = server._invoke(server.service_id, "reorder_job", {"job_id": "job-3", "direction": "up"}, "admin-token", 5.0)
+    status, body = server.module.reorder_job("job-3", direction="up", token="admin-token")
     assert status == 200
     waiting_ids = [item["job_id"] for item in body["queue"]["waiting_jobs"]]
     assert waiting_ids == ["job-1", "job-3", "job-2"]
@@ -1337,19 +1511,69 @@ def test_job_queue_submit_interprets_task_serialization_mode_for_future_task_poo
     assert captured["task_serialization_mode"] == "pickle_stable_v1"
 
 
-def test_job_queue_submit_rejects_policy_id() -> None:
+def test_job_queue_public_submit_helpers_do_not_expose_policy_id() -> None:
+    from pycloud_parallel import JobQueue
+
+    assert "policy_id" not in inspect.signature(JobQueue.submit).parameters
+    assert "policy_id" not in inspect.signature(JobQueue.submit_job_from_bytes).parameters
+    assert "policy_id" not in inspect.signature(JobQueue.submit_job_from_module).parameters
+
+
+def test_job_queue_submit_job_rejects_policy_override_fields() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
     try:
-        with pytest.raises(ValueError, match="no longer accepts policy_id"):
-            client.submit(
-                source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
-                entry_module="job_demo",
-                policy_id="pickle_internal_heavy",
-            )
+        for field in ("policy_id", "taskpool_policy_id"):
+            with pytest.raises(ValueError, match="policy_id/taskpool_policy_id"):
+                client.submit_job({"entry_module": "job_demo", "subtasks": [], field: "trusted_internal"})
     finally:
         client.close()
+
+
+def test_job_queue_manager_submit_rejects_taskpool_policy_id() -> None:
+    queue = JobQueueManager()
+
+    with pytest.raises(ValueError, match="policy_id/taskpool_policy_id"):
+        queue.submit_job(
+            {
+                "job_id": "job-policy-rejected",
+                "client_id": "client-a",
+                "entry_module": "task_demo",
+                "subtasks": [{"value": 1}],
+                "taskpool_policy_id": "trusted_internal",
+            }
+        )
+
+
+def test_job_orchestrator_module_rejects_submit_policy_fields() -> None:
+    module = JobOrchestratorModule()
+
+    for field in ("policy_id", "taskpool_policy_id"):
+        status, body = module.submit_job(
+            {
+                "entry_module": "task_demo",
+                "subtasks": [{"value": 1}],
+                field: "trusted_internal",
+            },
+            "",
+            serialization_mode="structured_v1",
+        )
+        assert status == 400
+        assert "policy_id/taskpool_policy_id" in body["error"]
+
+
+def test_job_orchestrator_module_rejects_non_structured_submit_mode() -> None:
+    module = JobOrchestratorModule()
+
+    status, body = module.submit_job(
+        {"entry_module": "task_demo", "subtasks": [{"value": 1}]},
+        "",
+        serialization_mode="pickle_stable_v1",
+    )
+
+    assert status == 400
+    assert "structured_v1" in body["error"]
 
 
 def test_job_queue_client_submit_rejects_callable_source() -> None:

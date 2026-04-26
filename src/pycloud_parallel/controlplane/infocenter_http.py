@@ -821,29 +821,33 @@ class InfoCenterHttpServer:
                     payload = self._read_json()
                     if payload is None:
                         return
-                    node = state.register_node_record(
-                        node_instance_id=str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip(),
-                        node_id=str(payload.get("node_id", "")).strip(),
-                        control_addr=str(payload.get("control_addr", "")).strip(),
-                        capacity=max(1, int(payload.get("capacity", 1) or 1)),
-                        queue_capacity=max(1, int(payload.get("queue_capacity", 1) or 1)),
-                        tags=payload.get("tags") or [],
-                        version=str(payload.get("version", "") or ""),
-                        python_version=str(payload.get("python_version", "") or ""),
-                        metadata=dict(payload.get("metadata") or {}),
-                        services=_parse_services(payload.get("services")),
-                        task_pools=_parse_task_pools(payload.get("task_pools")),
-                        active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
-                        service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
-                        service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
-                        task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
-                        task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
-                        accept_service_deploy=_coerce_bool(
-                            payload.get("accept_service_deploy", (payload.get("metadata") or {}).get("accept_service_deploy")),
-                            default=True,
-                        ),
-                        capability=_parse_node_capability(payload.get("capability")),
-                    )
+                    try:
+                        node = state.register_node_record(
+                            node_instance_id=str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip(),
+                            node_id=str(payload.get("node_id", "")).strip(),
+                            control_addr=str(payload.get("control_addr", "")).strip(),
+                            capacity=max(1, int(payload.get("capacity", 1) or 1)),
+                            queue_capacity=max(1, int(payload.get("queue_capacity", 1) or 1)),
+                            tags=payload.get("tags") or [],
+                            version=str(payload.get("version", "") or ""),
+                            python_version=str(payload.get("python_version", "") or ""),
+                            metadata=dict(payload.get("metadata") or {}),
+                            services=_parse_services(payload.get("services")),
+                            task_pools=_parse_task_pools(payload.get("task_pools")),
+                            active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
+                            service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
+                            service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
+                            task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
+                            task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
+                            accept_service_deploy=_coerce_bool(
+                                payload.get("accept_service_deploy", (payload.get("metadata") or {}).get("accept_service_deploy")),
+                                default=True,
+                            ),
+                            capability=_parse_node_capability(payload.get("capability")),
+                        )
+                    except ValueError as exc:
+                        self._send_json(400, {"ok": False, "error": str(exc)})
+                        return
                     self._send_json(200, {"ok": True, "heartbeat_interval_sec": state.heartbeat_interval_sec, "node": _serialize_node(node)})
                     return
                 if parsed.path == "/nodes/heartbeat":

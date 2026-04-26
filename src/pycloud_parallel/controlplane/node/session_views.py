@@ -3,16 +3,17 @@ from __future__ import annotations
 """Shared session view and warmup helpers for NodeControl service/task-pool state."""
 
 import logging
+from datetime import timedelta
 from typing import Dict, List, Sequence, Tuple
 
 from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
 from pycloud_parallel.controlplane.node.models import ServiceSession, TaskPoolState
-from pycloud_parallel.controlplane.state_time import dt_to_ts
+from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
 def warmup_fanout(worker_count: int) -> int:
-    return max(1, int(worker_count or 1) * 2)
+    return max(1, int(worker_count or 1))
 
 
 def normalize_warmup_result(result: object, *, fanout: int) -> Tuple[int, List[int]]:
@@ -36,8 +37,17 @@ def log_warmup_result(
     worker_pids: Sequence[int],
 ) -> None:
     unique_pids = sorted({int(pid) for pid in worker_pids if int(pid or 0) > 0})
-    logger.info(
-        "[Warmup] scope=%s key=%s worker_count=%d submitted=%d warmed_workers=%d pids=%s",
+    if int(submitted_count or 0) > 0 and not unique_pids:
+        logger.debug(
+            "[Warmup] scope=%s key=%s worker_count=%d submitted=%d completion=async pids=pending",
+            scope,
+            key,
+            int(worker_count or 0),
+            int(submitted_count or 0),
+        )
+        return
+    logger.debug(
+        "[Warmup] scope=%s key=%s worker_count=%d submitted=%d completed_workers=%d pids=%s",
         scope,
         key,
         int(worker_count or 0),
@@ -80,8 +90,15 @@ def execute_warmup(
     return normalize_warmup_result(raw_result, fanout=fanout)
 
 
+def _service_lease_expire_at(session: ServiceSession):
+    if bool(getattr(session, "node_managed", False)) and session.is_running():
+        return utc_now() + timedelta(seconds=max(5, int(session.heartbeat_timeout_sec or 5)))
+    return session.lease_expire_at
+
+
 def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
     resource = session.resource_snapshot(in_flight=in_flight)
+    lease_expire_at = _service_lease_expire_at(session)
     return {
         "service_id": session.service_id,
         "owner_client_id": session.owner_client_id,
@@ -97,7 +114,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "returned_count": resource.returned_count,
         "created_at": session.created_at,
         "last_heartbeat_at": session.last_heartbeat_at,
-        "lease_expire_at": session.lease_expire_at,
+        "lease_expire_at": lease_expire_at,
         "http_base_url": session.http_base_url,
         "methods": sorted(session.methods.keys()),
         "timing_metrics": dict(session.timing_metrics or {}),
@@ -106,6 +123,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
 
 def build_service_route_report(session: ServiceSession, *, in_flight: int) -> pb2.ServiceRouteReport:
     resource = session.resource_snapshot(in_flight=in_flight)
+    lease_expire_at = _service_lease_expire_at(session)
     return pb2.ServiceRouteReport(
         service_name=session.service_name,
         service_id=session.service_id,
@@ -113,7 +131,7 @@ def build_service_route_report(session: ServiceSession, *, in_flight: int) -> pb
         worker_count=resource.worker_count,
         alive_workers=resource.alive_workers,
         in_flight=resource.in_flight,
-        lease_expire_at=dt_to_ts(session.lease_expire_at),
+        lease_expire_at=dt_to_ts(lease_expire_at),
         http_base_url=session.http_base_url,
         policy_id=str(session.policy_id or "").strip().lower() or "default_safe",
     )
@@ -122,6 +140,7 @@ def build_service_route_report(session: ServiceSession, *, in_flight: int) -> pb
 def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
     resource = session.resource_snapshot(in_flight=in_flight)
     metrics = dict(session.timing_metrics or {})
+    lease_expire_at = _service_lease_expire_at(session)
     return {
         "service_name": session.service_name,
         "service_id": session.service_id,
@@ -134,7 +153,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "returned_count": int(resource.returned_count),
         "ema_child_invoke_ms": float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
         "ema_samples": int(metrics.get("ema_samples", 0) or 0),
-        "lease_expire_at": session.lease_expire_at.isoformat(),
+        "lease_expire_at": lease_expire_at.isoformat(),
         "http_base_url": session.http_base_url,
     }
 

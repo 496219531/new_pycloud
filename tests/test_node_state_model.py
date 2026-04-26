@@ -1492,6 +1492,9 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
             def create_task_pool(self, **_kwargs):
                 pass
 
+            def preload_pool(self, **_kwargs):
+                return 1
+
             def submit_pool_task(self, **kwargs):
                 submitted.append(kwargs)
 
@@ -1545,6 +1548,131 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
         assert "pool-good-1" in state._pool_tasks  # noqa: SLF001
         assert "pool-bad-1" not in state._pool_tasks  # noqa: SLF001
         assert not state._pool_task_reserved_ids  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_create_task_pool_preloads_entry_module_on_workers(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-preload-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_preload"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def preload_pool(self, **kwargs):
+            calls.append(("preload", kwargs))
+            return int(kwargs["fanout"])
+
+        def stop_task_pool(self, **kwargs):
+            calls.append(("stop", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-preload",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_preload",
+            entry_callable="run",
+            package_format="py",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        assert pool.worker_count == 2
+        assert [kind for kind, _payload in calls] == ["create", "preload"]
+        preload = calls[1][1]
+        assert preload["pool_id"] == pool.pool_id
+        assert preload["fanout"] == 2
+        assert preload["execute_spec"]["entry_module"] == "pool_preload"
+        assert preload["execute_spec"]["method_name"] == "run"
+        assert preload["execute_spec"]["payload_mode"] == "task_submit"
+        assert preload["execute_spec"]["warmup_only"] is True
+    finally:
+        state.close()
+
+
+def test_create_service_preloads_entry_module_on_workers(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-preload-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_service_preload"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def preload_service(self, **kwargs):
+            calls.append(("preload", kwargs))
+            return int(kwargs["fanout"])
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-service",
+            service_name="svc-preload",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_preload",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        assert session.worker_count == 2
+        assert [kind for kind, _payload in calls] == ["create", "preload"]
+        preload = calls[1][1]
+        assert preload["service_id"] == session.service_id
+        assert preload["fanout"] == 2
+        assert preload["execute_spec"]["entry_module"] == "service_preload"
+        assert preload["execute_spec"]["method_name"] == "serve"
+        assert preload["execute_spec"]["payload_mode"] == "http_call"
+        assert preload["execute_spec"]["warmup_only"] is True
     finally:
         state.close()
 
@@ -1959,7 +2087,7 @@ def test_update_service_globals_triggers_warmup_with_worker_pids(tmp_path, monke
         assert updated == ["A"]
         warmup = next(item for kind, item in warmup_calls if kind == "warmup")
         assert warmup["service_id"] == session.service_id
-        assert warmup["fanout"] == 4
+        assert warmup["fanout"] == 2
         logged = next(item for kind, item in warmup_calls if kind == "log")
         assert logged["worker_pids"] == [111, 222]
     finally:
@@ -2063,6 +2191,56 @@ def test_task_pool_execution_uses_private_managed_globals(tmp_path):
 
         assert len(results) == 1
         assert struct_to_dict(results[0].result) == {"state": 123}
+    finally:
+        state.close()
+
+
+def test_runtime_managed_globals_pickle_mode_keeps_binary_snapshot(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-managed-pickle-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_managed_pickle"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"STATE = None\ndef run(**_kwargs):\n    return {'state': STATE}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-managed-pickle",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_managed_pickle",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["STATE"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        monkeypatch.setattr(state._executor_host, "warmup_pool", lambda **_kwargs: [123])  # noqa: SLF001
+
+        globals_digest, updated = state.update_runtime_globals(
+            client_id=pool.pool_id,
+            code_version=pool.code_version,
+            runtime_key=pool.pool_id,
+            code_token=state.get_client_code_token(client_id=pool.pool_id, code_version=pool.code_version),
+            values={"STATE": {"value": [1, 2, 3]}},
+            serialization_mode="pickle_stable_v1",
+        )
+
+        assert updated == ["STATE"]
+        manifest_path = Path(pool.managed_globals_scope_dir) / "manifests" / f"{globals_digest.replace('sha256:', '')}.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        item = manifest["values"]["STATE"]
+        assert item["codec"] == "pickle_stable_v1"
+        value_path = Path(pool.managed_globals_scope_dir) / "values" / f"{item['sha256']}.bin"
+        assert value_path.exists()
+        assert not (Path(pool.managed_globals_scope_dir) / "values" / f"{item['sha256']}.json").exists()
+        assert serialization_mod.stable_pickle_loads(value_path.read_bytes()) == {"value": [1, 2, 3]}
     finally:
         state.close()
 
@@ -2203,7 +2381,7 @@ def test_update_runtime_globals_for_pool_triggers_pool_warmup(tmp_path, monkeypa
         assert updated == ["STATE"]
         warmup = next(item for kind, item in warmup_calls if kind == "warmup")
         assert warmup["pool_id"] == pool.pool_id
-        assert warmup["fanout"] == 4
+        assert warmup["fanout"] == 2
         logged = next(item for kind, item in warmup_calls if kind == "log")
         assert logged["worker_pids"] == [333, 444]
     finally:

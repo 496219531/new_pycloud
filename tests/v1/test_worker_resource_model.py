@@ -95,7 +95,7 @@ def test_execute_warmup_dispatches_scope_and_normalizes_result():
         worker_count=2,
         execute_spec={"warmup_only": True},
     )
-    assert submitted == 3
+    assert submitted == 1
     assert worker_pids == [101, 102]
 
     submitted, worker_pids = execute_warmup(
@@ -105,7 +105,7 @@ def test_execute_warmup_dispatches_scope_and_normalizes_result():
         worker_count=2,
         execute_spec={"warmup_only": True},
     )
-    assert submitted == 4
+    assert submitted == 2
     assert worker_pids == [201, 202]
 
     submitted, worker_pids = execute_warmup(
@@ -115,5 +115,5 @@ def test_execute_warmup_dispatches_scope_and_normalizes_result():
         worker_count=2,
         execute_spec={"warmup_only": True},
     )
-    assert submitted == 4
+    assert submitted == 2
     assert worker_pids == []

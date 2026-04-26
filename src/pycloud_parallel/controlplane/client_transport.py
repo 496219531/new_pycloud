@@ -344,7 +344,14 @@ class DiscoveryCallError(Exception):
     data: Dict[str, object]
 
     def __str__(self) -> str:
-        return str(self.data.get("error", f"http {self.status_code}"))
+        message = str(self.data.get("error", f"http {self.status_code}") or f"http {self.status_code}")
+        error_type = str(self.data.get("error_type", "") or "").strip()
+        if error_type and error_type not in message:
+            message = f"{message} ({error_type})"
+        traceback_text = str(self.data.get("traceback", "") or "").strip()
+        if traceback_text:
+            message = f"{message}\n{traceback_text}"
+        return message
 
 
 def _serialize_route(route: Any) -> Dict[str, object]:

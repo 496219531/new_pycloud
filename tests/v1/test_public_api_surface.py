@@ -34,6 +34,7 @@ def test_top_level_no_longer_exposes_legacy_or_local_runtime_names():
         "JobQueue" + "Client",
         "TaskPool" + "Session",
         "DedicatedTaskService" + "Session",
+        "Startup" + "ServiceNode",
         "configure",
         "foreach",
         "parallel_for",
@@ -58,6 +59,7 @@ def test_api_service_module_exposes_only_service():
     assert dir(api_service_module) == ["Service"]
     assert not hasattr(api_service_module, "ServiceGroup")
     assert not hasattr(api_service_module, "deploy_service_from_infocenter")
+    assert callable(ApiService.startup)
     assert callable(ApiService.deploy)
     assert callable(ApiService.connect)
     discovery = ApiService.connect(
@@ -83,7 +85,7 @@ def test_api_service_module_exposes_only_service():
         assert isinstance(getattr(type(gateway), "methods", None), property)
     finally:
         discovery.close()
-        gateway.close()
+    gateway.close()
 
 
 def test_api_service_connect_no_longer_exposes_policy_id():

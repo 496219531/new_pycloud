@@ -159,7 +159,7 @@ def test_shared_pool_idle_expiry_detected():
 def test_jobqueue_submit_rejects_policy_id():
     client = JobQueue("127.0.0.1:50051", client_id="policy-reject")
     try:
-        with pytest.raises(ValueError, match="no longer accepts policy_id"):
+        with pytest.raises(TypeError, match="unexpected keyword argument 'policy_id'"):
             client.submit(
                 source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
                 entry_module="job_demo",

@@ -207,7 +207,7 @@ from pycloud_parallel import (
 语义：
 
 1. `Service`
-   - owner 侧部署并持有常驻服务会话
+   - 服务产品入口：`deploy(...)` 动态部署、`connect(...)` 连接已有服务、`startup(...)` 启动时挂载固定 module
 2. `TaskPool`
    - 批量任务执行会话，对应专属任务池
 3. `JobQueue`
@@ -216,6 +216,20 @@ from pycloud_parallel import (
    - 唯一公开的大对象引用类型
 5. `export`
    - 模块 / package 部署时的导出装饰器
+
+启动时固定服务走 `Service.startup(...)`：
+
+```python
+from pycloud_parallel import Service
+
+node = Service.startup(
+    service_name="calc",
+    entry_module="my_package.calc_service",
+    bind="0.0.0.0:18080",
+)
+```
+
+这条路径和 `Service.deploy(...)` 的动态部署不同：`Service.startup(...)` 只在当前进程启动时挂载固定 module，不接受运行期动态部署；需要动态部署能力时使用普通 `NodeControl` 节点。
 
 本地并行入口不再从顶层包导出，请改用：
 

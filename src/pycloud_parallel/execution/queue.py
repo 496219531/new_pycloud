@@ -327,10 +327,16 @@ class QueueServiceClient:
         )
 
     def submit_job(self, payload: Dict[str, object]) -> Dict[str, object]:
+        raw_payload = dict(payload or {})
+        if any(str(raw_payload.get(field, "") or "").strip() for field in ("policy_id", "taskpool_policy_id")):
+            raise ValueError(
+                "job submit policy_id/taskpool_policy_id is not supported; "
+                "policy is owned by startup node/deployment"
+            )
         effective_policy = self._refresh_effective_policy()
         prepared_payload = _stage_job_submit_payload_for_transport(
             target=self.target,
-            payload=dict(payload or {}),
+            payload=raw_payload,
             timeout_sec=self.timeout_sec,
             serialization_mode=self.serialization_mode,
         )
@@ -375,7 +381,6 @@ class QueueServiceClient:
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
         task_serialization_mode: str = "",
-        policy_id: str = "",
         reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
@@ -538,7 +543,6 @@ class QueueServiceClient:
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
         task_serialization_mode: str = "",
-        policy_id: str = "",
         reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
@@ -549,8 +553,6 @@ class QueueServiceClient:
         Default path: ``submit(source=my_job_module, ...)``.
         Advanced path: ``submit(artifact=Artifact(...), ...)``.
         """
-        if str(policy_id or "").strip():
-            raise ValueError("JobQueue.submit() no longer accepts policy_id; only task_serialization_mode is allowed")
         payload = self._prepare_submit_source_payload(
             source=source,
             artifact=artifact,
@@ -564,7 +566,6 @@ class QueueServiceClient:
             resource_paths=resource_paths,
             task_resource_paths=task_resource_paths,
             task_serialization_mode=task_serialization_mode,
-            policy_id=policy_id,
             reset_pool=reset_pool,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
@@ -625,7 +626,6 @@ class QueueServiceClient:
         package_format: str = "py",
         dependency_allowlist: Optional[Sequence[str]] = None,
         task_serialization_mode: str = "",
-        policy_id: str = "",
         reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
@@ -640,7 +640,6 @@ class QueueServiceClient:
             package_format=_resolve_package_format(package_format, default="py"),
             dependency_allowlist=dependency_allowlist,
             task_serialization_mode=task_serialization_mode,
-            policy_id=policy_id,
             reset_pool=reset_pool,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,
@@ -657,7 +656,6 @@ class QueueServiceClient:
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
         task_serialization_mode: str = "",
-        policy_id: str = "",
         reset_pool: bool = False,
         update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
         handle_result_callable: str = "",
@@ -671,7 +669,6 @@ class QueueServiceClient:
             resource_paths=resource_paths,
             task_resource_paths=task_resource_paths,
             task_serialization_mode=task_serialization_mode,
-            policy_id=policy_id,
             reset_pool=reset_pool,
             update_globals=update_globals,
             handle_result_callable=handle_result_callable,

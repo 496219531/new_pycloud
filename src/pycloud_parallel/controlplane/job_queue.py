@@ -1239,35 +1239,6 @@ class JobQueueManager:
 
         return _JobTaskPoolSpec(artifact_key=artifact_key, create_pool=_create_pool)
 
-    def _prepare_job_executor_for_run(
-        self,
-        *,
-        job_id: str,
-        job_id_snapshot: str,
-        artifact_key: str,
-        requested_mode: str,
-        reset_pool: bool,
-        create_pool: Any,
-        prepared_update_globals: Dict[str, object],
-        phase_log: bool,
-    ) -> TaskPool:
-        executor = self._prepare_shared_pool_for_job(
-            job_id=job_id,
-            job_id_snapshot=job_id_snapshot,
-            artifact_key=artifact_key,
-            requested_mode=requested_mode,
-            reset_pool=reset_pool,
-            create_pool=create_pool,
-        )
-        self._fanout_job_update_globals(
-            job_id=job_id,
-            job_id_snapshot=job_id_snapshot,
-            executor=executor,
-            prepared_update_globals=prepared_update_globals,
-            phase_log=phase_log,
-        )
-        return executor
-
     def submit_job(self, payload: Dict[str, object], *, auth_token: str = "") -> JobState:
         raw_payload = dict(payload or {})
         normalized_payload = normalize_inbound_payload(
@@ -1278,9 +1249,9 @@ class JobQueueManager:
         )
         if not isinstance(normalized_payload, dict):
             raise ValueError("job payload must resolve to a dict")
-        if str(normalized_payload.get("policy_id", "") or "").strip():
+        if any(str(normalized_payload.get(field, "") or "").strip() for field in ("policy_id", "taskpool_policy_id")):
             raise ValueError(
-                "job-orchestrator taskpool policy is fixed at startup; submit policy_id is not supported"
+                "job submit policy_id/taskpool_policy_id is not supported; policy is owned by startup node/deployment"
             )
         _validate_delayed_resolve_refs(normalized_payload)
         job_id = str(normalized_payload.get("job_id", "") or "").strip() or f"jobq-{uuid.uuid4().hex}"
@@ -1951,13 +1922,18 @@ class JobQueueManager:
                 artifact_path=artifact_path,
                 task_resource_paths=task_resource_paths,
             )
-            executor = self._prepare_job_executor_for_run(
+            executor = self._prepare_shared_pool_for_job(
                 job_id=job_id,
                 job_id_snapshot=job_id_snapshot,
                 artifact_key=pool_spec.artifact_key,
                 requested_mode=pool_request.requested_mode,
                 reset_pool=pool_request.reset_pool,
                 create_pool=pool_spec.create_pool,
+            )
+            self._fanout_job_update_globals(
+                job_id=job_id,
+                job_id_snapshot=job_id_snapshot,
+                executor=executor,
                 prepared_update_globals=prepared_update_globals,
                 phase_log=False,
             )
@@ -2182,13 +2158,18 @@ class JobQueueManager:
                 task_entry=task_entry,
                 effective_managed_global_names=effective_managed_global_names,
             )
-            executor = self._prepare_job_executor_for_run(
+            executor = self._prepare_shared_pool_for_job(
                 job_id=job_id,
                 job_id_snapshot=job_id_snapshot,
                 artifact_key=pool_spec.artifact_key,
                 requested_mode=pool_request.requested_mode,
                 reset_pool=pool_request.reset_pool,
                 create_pool=pool_spec.create_pool,
+            )
+            self._fanout_job_update_globals(
+                job_id=job_id,
+                job_id_snapshot=job_id_snapshot,
+                executor=executor,
                 prepared_update_globals=prepared_update_globals,
                 phase_log=True,
             )

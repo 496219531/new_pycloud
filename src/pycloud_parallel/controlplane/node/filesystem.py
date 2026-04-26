@@ -3,6 +3,7 @@ from __future__ import annotations
 """Filesystem helpers for NodeControl code/object layout and managed-globals snapshots."""
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from pycloud_parallel.data.ref import normalize_object_id
 
 _SEGMENT_WRITER_LOCKS_LOCK = threading.Lock()
 _SEGMENT_WRITER_LOCKS: Dict[Tuple[str, int], threading.Lock] = {}
+_MANAGED_GLOBAL_BINARY_SENTINEL = "__pycloud_managed_global_binary__"
 
 
 def _managed_globals_scope_dir(base_dir: Path, *, scope_kind: str, scope_key: str) -> Path:
@@ -228,11 +230,12 @@ def _managed_globals_manifest_path(scope_dir: Path, globals_digest: str) -> Path
     return Path(scope_dir) / "manifests" / f"{normalized}.json"
 
 
-def _managed_globals_value_path(scope_dir: Path, *, value_digest: str) -> Path:
+def _managed_globals_value_path(scope_dir: Path, *, value_digest: str, codec: str = "json") -> Path:
     normalized = str(value_digest or "").replace("sha256:", "").strip().lower()
     if not normalized:
         raise ValueError("value_digest is required")
-    return Path(scope_dir) / "values" / f"{normalized}.json"
+    suffix = ".bin" if str(codec or "").strip().lower() == "pickle_stable_v1" else ".json"
+    return Path(scope_dir) / "values" / f"{normalized}{suffix}"
 
 
 def _managed_globals_current_path(scope_dir: Path) -> Path:
@@ -249,6 +252,30 @@ def _normalize_managed_global_names(names: Sequence[str]) -> Tuple[str, ...]:
         seen.add(name)
         normalized.append(name)
     return tuple(sorted(normalized))
+
+
+def _managed_globals_binary_value(*, codec: str, payload: bytes) -> Dict[str, Any]:
+    return {
+        _MANAGED_GLOBAL_BINARY_SENTINEL: {
+            "codec": str(codec or "").strip().lower(),
+            "payload": bytes(payload or b""),
+        }
+    }
+
+
+def _managed_globals_binary_payload(value: Any) -> Optional[Tuple[str, bytes]]:
+    if not isinstance(value, dict) or _MANAGED_GLOBAL_BINARY_SENTINEL not in value:
+        return None
+    payload = dict(value.get(_MANAGED_GLOBAL_BINARY_SENTINEL) or {})
+    codec = str(payload.get("codec", "") or "").strip().lower()
+    raw = payload.get("payload", b"")
+    if isinstance(raw, str):
+        raw_bytes = raw.encode("latin1")
+    else:
+        raw_bytes = bytes(raw or b"")
+    if not codec:
+        return None
+    return codec, raw_bytes
 
 
 def _load_managed_globals_snapshot_serialized(state: ManagedGlobalsState) -> Dict[str, Any]:
@@ -268,10 +295,14 @@ def _load_managed_globals_snapshot_serialized(state: ManagedGlobalsState) -> Dic
         value_digest = str(item.get("sha256", "") or "").strip()
         if not value_digest:
             continue
-        value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest)
+        codec = str(item.get("codec", "json") or "json").strip().lower()
+        value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest, codec=codec)
         if not value_path.exists():
             continue
-        out[name] = json.loads(value_path.read_text(encoding="utf-8") or "null")
+        if codec == "pickle_stable_v1":
+            out[name] = _managed_globals_binary_value(codec=codec, payload=value_path.read_bytes())
+        else:
+            out[name] = json.loads(value_path.read_text(encoding="utf-8") or "null")
     return out
 
 
@@ -291,13 +322,21 @@ def _write_managed_globals_snapshot(
         if name not in values_serialized:
             continue
         payload = values_serialized[name]
-        value_digest = _sha256_text(payload)
-        value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest)
+        binary_payload = _managed_globals_binary_payload(payload)
+        if binary_payload is None:
+            codec = "json"
+            value_digest = _sha256_text(payload)
+            value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest, codec=codec)
+            value_bytes = _stable_json_bytes(payload)
+        else:
+            codec, value_bytes = binary_payload
+            value_digest = hashlib.sha256(value_bytes).hexdigest()
+            value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest, codec=codec)
         if not value_path.exists():
             tmp_path = value_path.with_suffix(".tmp")
-            tmp_path.write_bytes(_stable_json_bytes(payload))
+            tmp_path.write_bytes(value_bytes)
             os.replace(str(tmp_path), str(value_path))
-        values_meta[name] = {"sha256": value_digest}
+        values_meta[name] = {"sha256": value_digest, "codec": codec}
 
     manifest = {
         "scope_kind": state.scope_kind,
@@ -529,6 +568,8 @@ __all__ = [
     "_existing_code_meta_path",
     "_load_code_meta",
     "_load_managed_globals_snapshot_serialized",
+    "_managed_globals_binary_payload",
+    "_managed_globals_binary_value",
     "_managed_globals_scope_dir",
     "_normalize_code_version",
     "_normalize_managed_global_names",

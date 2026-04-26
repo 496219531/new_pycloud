@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from dataclasses import replace
 import inspect
@@ -37,7 +38,7 @@ from pycloud_parallel.controlplane.serialization_mode import resolve_effective_s
 from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
-from pycloud_parallel.controlplane.serialization import detect_transport_mode, serialize_inline_payload, struct_to_python
+from pycloud_parallel.controlplane.serialization import detect_transport_mode, dict_to_struct, serialize_inline_payload, struct_to_python
 from pycloud_parallel.controlplane.serialization import (
     decode_transport_payload_bytes,
     encode_transport_payload_bytes,
@@ -64,7 +65,7 @@ from pycloud_parallel.execution.scheduler import (
 from pycloud_parallel.execution.support import (
     _get_local_ip,
     _prepare_code_blob,
-    _prepare_managed_globals_values_for_upload,
+    _prepare_managed_globals_batches_for_upload,
     _prepare_task_payload_for_submit,
     _put_data_via_clients,
     _resolve_public_target_arg,
@@ -215,11 +216,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         serialization_mode: str = "",
         policy_id: str = "",
         effective_policy: Optional[EffectivePolicy] = None,
-        backend: Optional[Any] = None,
     ) -> None:
         self._pools = pools
         self.nodes = nodes
-        self._backend = backend
         self._task_method = str(task_method or "run").strip() or "run"
         self._job_id = str(job_id or f"pool-{uuid.uuid4().hex[:12]}").strip()
         self._policy_id = (
@@ -256,45 +255,31 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._init_execution_session_state()
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
-        if self._backend is not None and hasattr(self._backend, "replicas"):
-            return dict(getattr(self._backend, "replicas") or {})
         return self._pools
 
     @property
     def client_id(self) -> str:
-        if self._backend is not None and hasattr(self._backend, "client_id"):
-            return str(getattr(self._backend, "client_id"))
         first = next(iter(self._pools.values()))
         return first.owner_client_id
 
     @property
     def job_id(self) -> str:
-        if self._backend is not None and hasattr(self._backend, "job_id"):
-            return str(getattr(self._backend, "job_id"))
         return self._job_id
 
     @property
     def code_version(self) -> str:
-        if self._backend is not None and hasattr(self._backend, "code_version"):
-            return str(getattr(self._backend, "code_version"))
         first = next(iter(self._pools.values()))
         return first.code_version
 
     @property
     def node_ids(self) -> Sequence[str]:
-        if self._backend is not None and hasattr(self._backend, "node_ids"):
-            return list(getattr(self._backend, "node_ids"))
         return [self.nodes[key].node_id if key in self.nodes else key for key in self._pools.keys()]
 
     @property
     def node_instance_ids(self) -> Sequence[str]:
-        if self._backend is not None and hasattr(self._backend, "node_instance_ids"):
-            return list(getattr(self._backend, "node_instance_ids"))
         return list(self._pools.keys())
 
     def route_summary(self) -> List[Dict[str, object]]:
-        if self._backend is not None and hasattr(self._backend, "route_summary"):
-            return list(getattr(self._backend, "route_summary")())
         routes: List[Dict[str, object]] = []
         for node_key, pool in sorted(self._pools.items()):
             node = self.nodes.get(node_key)
@@ -315,8 +300,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
     @property
     def methods(self) -> List[str]:
-        if self._backend is not None and hasattr(self._backend, "methods"):
-            return list(getattr(self._backend, "methods"))
         return [self._task_method]
 
     @property
@@ -340,13 +323,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
     def _available_pool_node_ids(self) -> List[str]:
         ordered_node_ids = [str(node_id) for node_id in self._pools.keys()]
-        if self._backend is not None and hasattr(self._backend, "replicas"):
-            active = {str(node_id) for node_id in getattr(self._backend, "replicas").keys()}
-            return [
-                node_id
-                for node_id in ordered_node_ids
-                if node_id in active and self._pool_candidate_allowed(node_id)
-            ]
         if hasattr(self, "_active_nodes"):
             active = {str(node_id) for node_id in list(getattr(self, "_active_nodes") or [])}
             return [
@@ -624,19 +600,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         runtime_key: str = "",
         serialization_mode: str = "",
     ) -> pb2.SubmitTasksResponse:
-        if self._backend is not None:
-            return self._backend.submit_payloads(
-                payloads,
-                task_method=task_method,
-                strategy=strategy,
-                timeout_sec=timeout_sec,
-                job_id=job_id,
-                task_id_prefix=task_id_prefix,
-                timeout_hint_sec=timeout_hint_sec,
-                priority=priority,
-                runtime_key=runtime_key,
-                serialization_mode=serialization_mode,
-            )
         del timeout_sec, runtime_key
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
@@ -973,15 +936,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
     ) -> Iterator[pb2.TaskResult]:
-        if self._backend is not None:
-            yield from self._backend.iter_results(
-                max_count=max_count,
-                timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
-                limit=limit,
-                job_id=job_id,
-            )
-            return
         self._assert_session_available("iter_results")
         for _node_id, item in self._iter_raw_results(
             max_count=max_count,
@@ -1062,8 +1016,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         )
 
     def update_globals(self, values: Dict[str, object]) -> str:
-        if self._backend is not None:
-            return str(self._backend.update_globals(values))
         if self._closed:
             raise RuntimeError("task pool session is closed")
         pools_snapshot = list(self._pools.items())
@@ -1071,26 +1023,95 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         prepare_kwargs: Dict[str, object] = {}
         if str(self._serialization_mode or "").strip() and self._serialization_mode != "legacy_v1":
             prepare_kwargs["serialization_mode"] = self._serialization_mode
-        prepared_values = _prepare_managed_globals_values_for_upload(
+        prepared_batches, _ = _prepare_managed_globals_batches_for_upload(
             active_clients,
             values,
             effective_policy=self.effective_policy,
+            context="taskpool_session",
             **prepare_kwargs,
         )
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=self._serialization_mode,
+            context="taskpool_session",
+        )
+        encoded_batches = []
+        for prepared_values in prepared_batches:
+            if should_use_transport_payload_bytes(
+                mode=effective_serialization_mode,
+                effective_policy=self.effective_policy,
+            ):
+                encoded_batches.append(
+                    (
+                        prepared_values,
+                        None,
+                        encode_transport_payload_bytes(
+                            prepared_values,
+                            mode=effective_serialization_mode,
+                            context="taskpool_session",
+                            limit_bytes=(
+                                int(self.effective_policy.inline_payload_hard_limit_bytes)
+                                if self.effective_policy is not None
+                                else 0
+                            ),
+                        ),
+                    )
+                )
+            else:
+                encoded_batches.append(
+                    (
+                        prepared_values,
+                        dict_to_struct(prepared_values, mode=effective_serialization_mode),
+                        None,
+                    )
+                )
         digests: Dict[str, str] = {}
         failed_nodes: Dict[str, str] = {}
-        for node_id, pool in pools_snapshot:
+
+        def _update_node_globals(node_id: str, pool: NativeTaskPoolClient) -> Tuple[str, str, str]:
             try:
-                resp = pool._client.update_runtime_globals_prepared(  # noqa: SLF001
-                    client_id=pool.pool_id,
-                    code_version=pool.code_version,
-                    runtime_key=pool.pool_id,
-                    code_token=pool.pool_token,
-                    prepared_values=prepared_values,
+                resp = None
+                for prepared_values, values_struct, transport_values in encoded_batches:
+                    update_encoded = getattr(pool._client, "update_runtime_globals_encoded", None)  # noqa: SLF001
+                    if callable(update_encoded):
+                        resp = update_encoded(
+                            client_id=pool.pool_id,
+                            code_version=pool.code_version,
+                            runtime_key=pool.pool_id,
+                            code_token=pool.pool_token,
+                            prepared_keys=sorted(str(key) for key in prepared_values.keys()),
+                            values=values_struct,
+                            transport_values=transport_values,
+                        )
+                    else:
+                        resp = pool._client.update_runtime_globals_prepared(  # noqa: SLF001
+                            client_id=pool.pool_id,
+                            code_version=pool.code_version,
+                            runtime_key=pool.pool_id,
+                            code_token=pool.pool_token,
+                            prepared_values=prepared_values,
+                            serialization_mode=self._serialization_mode,
+                            effective_policy=self.effective_policy,
+                        )
+                return (
+                    node_id,
+                    str(getattr(resp, "globals_digest", "") or ""),
+                    "",
                 )
-                digests[node_id] = resp.globals_digest
             except Exception as exc:
-                failed_nodes[node_id] = repr(exc)
+                return node_id, "", repr(exc)
+
+        if len(pools_snapshot) == 1:
+            update_results = [_update_node_globals(pools_snapshot[0][0], pools_snapshot[0][1])]
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, len(pools_snapshot)), thread_name_prefix="taskpool-update-globals") as executor:
+                futures = [executor.submit(_update_node_globals, node_id, pool) for node_id, pool in pools_snapshot]
+                update_results = [future.result() for future in futures]
+
+        for node_id, digest, error_text in update_results:
+            if error_text:
+                failed_nodes[node_id] = error_text
+            elif digest:
+                digests[node_id] = digest
 
         if not digests:
             raise RuntimeError(f"update_globals failed on all nodes: {failed_nodes}")
@@ -1298,14 +1319,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
     ) -> Sequence[pb2.TaskResult]:
-        if self._backend is not None:
-            return self._backend.wait_for_results(
-                expected_count=expected_count,
-                timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
-                limit=limit,
-                job_id=job_id,
-            )
         max_count = max(0, int(expected_count or 0))
         return list(
             self.iter_results(
@@ -1323,8 +1336,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         expected_count: int = 0,
         timeout_sec: float = 30.0,
     ) -> Sequence[Any]:
-        if self._backend is not None:
-            return self._backend.wait_for_data(expected_count=expected_count, timeout_sec=timeout_sec)
         max_count = max(0, int(expected_count or 0))
         return [
             data
@@ -1345,15 +1356,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         serialization_mode: str = "",
         **shared_kwargs,
     ) -> pb2.SubmitTasksResponse:
-        if self._backend is not None:
-            return self._backend.submit_values(
-                values,
-                arg_name=arg_name,
-                task_method=task_method,
-                strategy=strategy,
-                serialization_mode=serialization_mode,
-                **shared_kwargs,
-            )
         normalized_arg = str(arg_name or "value").strip() or "value"
         shared = dict(shared_kwargs)
         chunk_size = max(1, self._resolve_max_in_flight(None))
@@ -1614,16 +1616,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> Iterator[Tuple[int, Any]]:
-        if self._backend is not None:
-            yield from self._backend.imap_unordered(
-                payloads,
-                task_method=task_method,
-                strategy=strategy,
-                max_in_flight=max_in_flight,
-                timeout_sec=timeout_sec,
-                **shared_kwargs,
-            )
-            return
         if self._closed:
             raise RuntimeError("task pool session is closed")
         self._enter_exclusive_mode("imap_unordered", require_clean=True)
@@ -1773,16 +1765,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 f"TaskPool.unordered() no longer accepts low-level control args: {', '.join(forbidden)}; "
                 "use TaskPool.imap_unordered() for low-level streaming controls"
             )
-        if self._backend is not None:
-            yield from self._backend.unordered(
-                payloads,
-                task_method=task_method,
-                strategy=strategy,
-                max_in_flight=max_in_flight,
-                timeout_sec=timeout_sec,
-                **shared_kwargs,
-            )
-            return
         for item in self.iter_items(
             payloads,
             task_method=task_method,
@@ -1837,24 +1819,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         node_window_factor: float = 2.0,
         **shared_kwargs,
     ) -> int:
-        if self._backend is not None:
-            return int(
-                self._backend.consume_unordered(
-                    payloads,
-                    handle=handle,
-                    task_method=task_method,
-                    strategy=strategy,
-                    max_in_flight=max_in_flight,
-                    timeout_sec=timeout_sec,
-                    receive_batch=receive_batch,
-                    submit_timeout_sec=submit_timeout_sec,
-                    result_timeout_sec=result_timeout_sec,
-                    wait_ms=wait_ms,
-                    raise_on_error=raise_on_error,
-                    node_window_factor=node_window_factor,
-                    **shared_kwargs,
-                )
-            )
         if not callable(handle):
             raise TypeError("handle must be callable")
         processed = 0
@@ -1888,16 +1852,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         timeout_sec: float = 30.0,
         **shared_kwargs,
     ) -> Sequence[Any]:
-        if self._backend is not None:
-            return self._backend.map(
-                values,
-                arg_name=arg_name,
-                task_method=task_method,
-                strategy=strategy,
-                max_in_flight=max_in_flight,
-                timeout_sec=timeout_sec,
-                **shared_kwargs,
-            )
         normalized_arg = str(arg_name or "value").strip() or "value"
         shared = dict(shared_kwargs)
         payloads = ({normalized_arg: value, **shared} for value in values)
@@ -1939,8 +1893,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         reason: str = "",
         job_id: str = "",
     ) -> pb2.CancelJobResponse:
-        if self._backend is not None:
-            return self._backend.cancel_job(reason=reason, job_id=job_id)
         self._assert_session_available("cancel_job")
         effective_job_id = str(job_id or self.job_id).strip()
         queued_cancelled = 0
@@ -1964,16 +1916,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         )
 
     def status_map(self) -> Dict[str, pb2.TaskPoolStatusInfo]:
-        if self._backend is not None:
-            return self._backend.status_map()
         return {node_id: pool.get_status() for node_id, pool in self._pools.items()}
 
     def status(self) -> ExecutionSessionStatus:
         return super().status()
 
     def is_alive(self) -> bool:
-        if self._backend is not None and hasattr(self._backend, "is_alive"):
-            return bool(self._backend.is_alive())
         return (not self._closed) and (not self.failed) and any(
             node_id in self._active_nodes for node_id in self._pools
         )
@@ -2035,9 +1983,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return
         self._closed = True
         self._stop_keepalive()
-        if self._backend is not None:
-            self._backend.close()
-            return
         for pool in self._pools.values():
             _close_task_pool_replica(pool, reason="task pool session close")
             with contextlib.suppress(Exception):
@@ -2050,21 +1995,15 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self.close()
 
     def __getattr__(self, name: str):
-        if self._backend is not None and hasattr(self._backend, "__getattr__") and not name.startswith("_"):
-            return self._backend.__getattr__(name)
         if name.startswith("_"):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         return _TaskPoolCallProxy(session=self, method_name=self._ensure_method(name))
 
     def call_sync(self, method: str, **kwargs) -> Any:
-        if self._backend is not None:
-            return self._backend.call_sync(method, **kwargs)
         normalized = self._ensure_method(method)
         return getattr(self, normalized).sync(**kwargs)
 
     async def call(self, method: str, **kwargs) -> Any:
-        if self._backend is not None:
-            return await self._backend.call(method, **kwargs)
         normalized = self._ensure_method(method)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: getattr(self, normalized).sync(**kwargs))
@@ -2075,8 +2014,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             effective_policy_text = (
                 f" effective_policy={self.effective_policy.policy_id}@v{self.effective_policy.version}"
             )
-        if self._backend is not None:
-            return repr(self._backend)
         return (
             f"<{type(self).__name__} methods={self.methods} "
             f"nodes={len(self.node_ids)} serialization_mode={self._serialization_mode}"
@@ -2195,9 +2132,7 @@ def _build_task_pool_from_infocenter(
         context="taskpool_session",
     )
 
-    pools: Dict[str, NativeTaskPoolClient] = {}
-    nodes: Dict[str, InfoCenterNode] = {}
-    for node in desired_nodes:
+    def _create_pool_on_node(node: InfoCenterNode) -> Tuple[InfoCenterNode, NativeTaskPoolClient]:
         client = _node_control_client(node.control_addr, timeout_sec=timeout_sec)
         pool = client.create_task_pool_from_bytes(
             owner_client_id=effective_owner,
@@ -2214,6 +2149,32 @@ def _build_task_pool_from_infocenter(
             idle_ttl_sec=idle_ttl_sec,
             chunk_size=chunk_size,
         )
+        return node, pool
+
+    created: List[Tuple[InfoCenterNode, NativeTaskPoolClient]] = []
+    if len(desired_nodes) == 1:
+        created.append(_create_pool_on_node(desired_nodes[0]))
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, len(desired_nodes)), thread_name_prefix="taskpool-create") as executor:
+            futures = [executor.submit(_create_pool_on_node, node) for node in desired_nodes]
+            try:
+                for future in futures:
+                    created.append(future.result())
+            except Exception:
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+                for node, pool in created:
+                    _close_task_pool_replica(pool, reason="task pool multi-node create failed")
+                    client = getattr(pool, "_client", None)
+                    if client is not None:
+                        with contextlib.suppress(Exception):
+                            client.close()
+                raise
+
+    pools: Dict[str, NativeTaskPoolClient] = {}
+    nodes: Dict[str, InfoCenterNode] = {}
+    for node, pool in created:
         node_key = _node_instance_key_from_node(node)
         pool.node_instance_id = node_key
         pool.node_id = str(node.node_id or "")

@@ -204,15 +204,26 @@ class NativeTaskPoolClient:
         self.lease_expire_at = _timestamp_to_datetime(info.lease_expire_at)
         return info
 
-    def update_globals_prepared(self, prepared_values: Dict[str, object]) -> pb2.UpdateRuntimeGlobalsResponse:
+    def update_globals_prepared(
+        self,
+        prepared_values: Dict[str, object],
+        *,
+        serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
+    ) -> pb2.UpdateRuntimeGlobalsResponse:
+        kwargs = {}
+        if str(serialization_mode or "").strip():
+            kwargs["serialization_mode"] = serialization_mode
+        if effective_policy is not None:
+            kwargs["effective_policy"] = effective_policy
         return self._client.update_runtime_globals_prepared(
             client_id=self.pool_id,
             code_version=self.code_version,
             runtime_key=self.pool_id,
             code_token=self.pool_token,
             prepared_values=prepared_values,
+            **kwargs,
         )
-
 
 @dataclass
 class ServiceSessionClient:
@@ -417,10 +428,38 @@ class ServiceSessionClient:
     def update_globals(self, values: Dict[str, object]) -> pb2.UpdateServiceGlobalsResponse:
         return self.update_globals_prepared(values)
 
-    def update_globals_prepared(self, prepared_values: Dict[str, object]) -> pb2.UpdateServiceGlobalsResponse:
-        return self._client.update_service_globals(
+    def update_globals_prepared(
+        self,
+        prepared_values: Dict[str, object],
+        *,
+        serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        kwargs = {}
+        if str(serialization_mode or "").strip():
+            kwargs["serialization_mode"] = serialization_mode
+        if effective_policy is not None:
+            kwargs["effective_policy"] = effective_policy
+        return self._client.update_service_globals_prepared(
             owner_client_id=self.owner_client_id,
             service_id=self.service_id,
             service_token=self.service_token,
-            values=prepared_values,
+            prepared_values=prepared_values,
+            **kwargs,
+        )
+
+    def update_globals_encoded(
+        self,
+        *,
+        prepared_keys: Sequence[str],
+        values: Optional[object] = None,
+        transport_values: Optional[pb2.TransportPayload] = None,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        return self._client.update_service_globals_encoded(
+            owner_client_id=self.owner_client_id,
+            service_id=self.service_id,
+            service_token=self.service_token,
+            prepared_keys=prepared_keys,
+            values=values,
+            transport_values=transport_values,
         )

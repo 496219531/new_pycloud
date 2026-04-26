@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, Optional
 from importlib import metadata as importlib_metadata
+from urllib.error import URLError
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.node_capability import detect_local_node_capability
@@ -16,6 +17,22 @@ from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
+
+
+def _is_expected_connect_failure(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        return reason is None or isinstance(reason, (ConnectionError, TimeoutError, OSError))
+    return False
+
+
+def _error_summary(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", None)
+    if reason is not None:
+        return repr(reason)
+    return repr(exc)
 
 
 def _pycloud_version() -> str:
@@ -86,7 +103,7 @@ class NodeInfoCenterRegistrar:
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
-        if thread is not None:
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
             if thread.is_alive():
                 return
@@ -98,30 +115,68 @@ class NodeInfoCenterRegistrar:
         if not self._sync_lock.acquire(blocking=False):
             return False
         try:
-            should_register = not self._registered
+            was_registered = bool(self._registered)
+            should_register = not was_registered
         finally:
             self._sync_lock.release()
         try:
-            return self._register_once() if should_register else self._heartbeat_once()
-        except Exception:
-            logger.exception(
-                "[Registrar] node sync failed node_id=%s node_instance_id=%s should_register=%s",
-                self.node_id,
-                self.node_instance_id,
-                should_register,
-            )
+            ok = self._register_once() if should_register else self._heartbeat_once()
+            if was_registered and not ok:
+                self._close_state_if_registration_lost("registration no longer accepted")
+            return ok
+        except Exception as exc:
+            if _is_expected_connect_failure(exc):
+                logger.warning(
+                    "[Registrar] node sync deferred node_id=%s node_instance_id=%s should_register=%s error=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    should_register,
+                    _error_summary(exc),
+                )
+                logger.debug("[Registrar] node sync traceback", exc_info=True)
+            else:
+                logger.exception(
+                    "[Registrar] node sync failed node_id=%s node_instance_id=%s should_register=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    should_register,
+                )
             with self._sync_lock:
                 self._registered = False
+            if was_registered or not _is_expected_connect_failure(exc):
+                self._close_state_if_registration_lost(_error_summary(exc))
             return False
 
     def request_sync(self) -> None:
         self._wake_event.set()
 
+    def _close_state_if_registration_lost(self, reason: str) -> None:
+        if not bool(getattr(self.state, "close_on_registration_lost", False)):
+            return
+        with self._sync_lock:
+            if bool(self._registered):
+                return
+        try:
+            logger.warning(
+                "[Registrar] closing state after registration lost node_id=%s node_instance_id=%s reason=%s",
+                self.node_id,
+                self.node_instance_id,
+                str(reason or "registration lost"),
+            )
+            self.state.close()
+        except Exception:
+            logger.exception(
+                "[Registrar] close after registration lost failed node_id=%s node_instance_id=%s",
+                self.node_id,
+                self.node_instance_id,
+            )
+
     def _register_once(self) -> bool:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
         metadata["pycloud_version"] = self._pycloud_version()
-        metadata["accept_service_deploy"] = "true"
+        accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
+        metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -154,7 +209,7 @@ class NodeInfoCenterRegistrar:
             service_worker_used=self.state.service_worker_used(),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
             task_pool_worker_used=self.state.task_pool_worker_used(),
-            accept_service_deploy=True,
+            accept_service_deploy=accept_service_deploy,
             python_version=self.state.python_version,
             capability=self.state.node_capability(),
         )
@@ -177,7 +232,8 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(self.state.service_timing_metadata())
         metadata["pycloud_version"] = self._pycloud_version()
-        metadata["accept_service_deploy"] = "true"
+        accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
+        metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -214,7 +270,7 @@ class NodeInfoCenterRegistrar:
             service_worker_used=self.state.service_worker_used(),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
             task_pool_worker_used=self.state.task_pool_worker_used(),
-            accept_service_deploy=True,
+            accept_service_deploy=accept_service_deploy,
             python_version=self.state.python_version,
             capability=self.state.node_capability(),
         )
@@ -311,14 +367,25 @@ class JobOrchestratorInfoCenterRegistrar:
             self._sync_lock.release()
         try:
             return self._register_once() if should_register else self._heartbeat_once()
-        except Exception:
-            logger.exception(
-                "[Registrar] job-orch sync failed node_id=%s node_instance_id=%s service_id=%s should_register=%s",
-                self.node_id,
-                self.node_instance_id,
-                self.service_id,
-                should_register,
-            )
+        except Exception as exc:
+            if _is_expected_connect_failure(exc):
+                logger.warning(
+                    "[Registrar] job-orch sync deferred node_id=%s node_instance_id=%s service_id=%s should_register=%s error=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    self.service_id,
+                    should_register,
+                    _error_summary(exc),
+                )
+                logger.debug("[Registrar] job-orch sync traceback", exc_info=True)
+            else:
+                logger.exception(
+                    "[Registrar] job-orch sync failed node_id=%s node_instance_id=%s service_id=%s should_register=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    self.service_id,
+                    should_register,
+                )
             with self._sync_lock:
                 self._registered = False
             return False

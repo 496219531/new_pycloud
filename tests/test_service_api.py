@@ -83,6 +83,375 @@ def test_service_route_summary_reports_fixed_routes():
     ]
 
 
+def test_service_deploy_from_infocenter_creates_node_services_concurrently(tmp_path):
+    from pycloud_parallel.execution.service_session import Service
+    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+    nodes = [
+        SimpleNamespace(
+            node_id="node-1",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        ),
+        SimpleNamespace(
+            node_id="node-2",
+            control_addr="127.0.0.1:50062",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        ),
+    ]
+    condition = threading.Condition()
+    started = []
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            with condition:
+                started.append(self.target)
+                condition.notify_all()
+                if len(started) < 2:
+                    assert condition.wait_for(lambda: len(started) >= 2, timeout=1.0)
+            return SimpleNamespace(
+                service_id=f"svc-{self.target.rsplit(':', 1)[-1]}",
+                service_token="token",
+                http_base_url=f"http://{self.target}/svc/demo",
+                heartbeat_timeout_sec=30,
+                worker_count=int(kwargs["worker_count"]),
+                status=pb2.SERVICE_STATUS_RUNNING,
+            )
+
+        def close(self) -> None:
+            return None
+
+    with patch(
+        "pycloud_parallel.execution.service_session._retry_infocenter_request",
+        return_value=((), nodes),
+    ), patch(
+        "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+        _FakeNodeControlClient,
+    ), patch.object(
+        Service,
+        "_persist_session_cache",
+        lambda self: None,
+    ), patch.object(
+        Service,
+        "_start_keepalive",
+        lambda self, interval_sec=None: None,
+    ):
+        group = Service.deploy_from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            owner_client_id="owner-demo",
+            service_name="svc-concurrent",
+            blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+            entry_module="svc_concurrent",
+            entry_callable="run",
+            worker_count=2,
+            node_count=2,
+            min_success_nodes=2,
+            allow_partial=False,
+            session_cache_dir=str(tmp_path),
+        )
+
+    try:
+        assert started == ["127.0.0.1:50061", "127.0.0.1:50062"]
+        assert group.node_instance_ids() == ["node-1", "node-2"]
+    finally:
+        group.close(end_services=False)
+
+
+def test_service_update_globals_fans_out_to_nodes_concurrently(monkeypatch):
+    from pycloud_parallel.execution import service_session as service_session_mod
+    from pycloud_parallel.execution.service_session import Service
+
+    condition = threading.Condition()
+    started = []
+    encoded_calls = []
+
+    class _FakeServiceSession:
+        failed = False
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self.service_id = f"svc-{node_id}"
+            self.http_base_url = ""
+
+        def update_globals_encoded(self, *, prepared_keys, values=None, transport_values=None):
+            assert prepared_keys == ["cfg"]
+            assert values is not None or transport_values is not None
+            with condition:
+                started.append(self.node_id)
+                condition.notify_all()
+                if len(started) < 2:
+                    assert condition.wait_for(lambda: len(started) >= 2, timeout=1.0)
+            return SimpleNamespace(globals_digest=f"digest-{self.node_id}")
+
+        def update_globals_prepared(self, *_args, **_kwargs):
+            raise AssertionError("service update should use pre-encoded globals")
+
+    monkeypatch.setattr(
+        service_session_mod,
+        "_prepare_managed_globals_batches_for_upload",
+        lambda _clients, values, **_kwargs: ([dict(values)], {
+            "globals_batch_count": 1,
+            "batch_keys": [["cfg"]],
+            "batch_bytes": [0],
+            "staged_keys": [],
+            "inline_keys": ["cfg"],
+        }),
+    )
+    monkeypatch.setattr(service_session_mod, "should_use_transport_payload_bytes", lambda **_kwargs: False)
+
+    def _fake_dict_to_struct(value, *, mode=""):
+        encoded_calls.append((dict(value), mode))
+        return {"encoded": dict(value)}
+
+    monkeypatch.setattr(service_session_mod, "dict_to_struct", _fake_dict_to_struct)
+
+    group = Service(
+        owner_client_id="owner-demo",
+        service_name="svc-update",
+        sessions={
+            "node-1": _FakeServiceSession("node-1"),
+            "node-2": _FakeServiceSession("node-2"),
+        },
+        nodes={
+            "node-1": SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061"),
+            "node-2": SimpleNamespace(node_id="node-2", control_addr="127.0.0.1:50062"),
+        },
+        _clients={"node-1": object(), "node-2": object()},
+    )
+
+    digest = group.update_globals({"cfg": {"mode": "fast"}})
+
+    assert digest in {"digest-node-1", "digest-node-2"}
+    assert sorted(started) == ["node-1", "node-2"]
+    assert len(encoded_calls) == 1
+
+
+def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_calc_service.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        service_name="startup-calc",
+        entry_module="startup_calc_service",
+        export_methods=("add",),
+        bind="",
+        worker_count=2,
+        start=False,
+    )
+    try:
+        from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
+
+        assert isinstance(node, NodeControlState)
+        assert node.accept_service_deploy is False
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        assert session.worker_count == 2
+        assert session.node_managed is True
+
+        code, body = node.call_service(
+            service_id=session.service_id,
+            method="add",
+            payload={"args": [4], "kwargs": {"y": 5}},
+            service_token=session.service_token,
+            timeout_sec=5.0,
+        )
+        assert code == 200
+        assert body["data"] == {"value": 9}
+
+        from pycloud_parallel.controlplane.state_time import utc_now
+        from datetime import timedelta
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        session.lease_expire_at = utc_now() - timedelta(seconds=1)
+        node._handle_service_timeouts()  # noqa: SLF001
+        assert session.status == pb2.SERVICE_STATUS_RUNNING
+        assert node.service_report_payloads()[0]["service_name"] == "startup-calc"
+    finally:
+        node.close()
+
+
+def test_service_startup_defaults_to_dynamic_http_bind(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_dynamic_bind_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        service_name="startup-dynamic",
+        entry_module="startup_dynamic_bind_service",
+        start=False,
+    )
+
+    try:
+        assert node.service_http_bind == "0.0.0.0:0"
+    finally:
+        node.close()
+
+
+def test_service_startup_http_gateway_uses_large_accept_backlog(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_backlog_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        service_name="startup-backlog",
+        entry_module="startup_backlog_service",
+        bind="127.0.0.1:0",
+    )
+    try:
+        server = node._service_http_gateway._server  # noqa: SLF001
+        assert server is not None
+        assert server.request_queue_size >= 1024
+    finally:
+        node.close()
+
+
+def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_registered_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    calls = []
+
+    def _fake_start_infocenter_registration(self, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_infocenter_registration",
+        _fake_start_infocenter_registration,
+    )
+
+    node = Service.startup(
+        infocenter_target="127.0.0.1:50051",
+        service_name="startup-registered",
+        entry_module="startup_registered_service",
+        worker_count=3,
+        policy_id="trusted_internal",
+        start=False,
+    )
+
+    try:
+        assert node.service_worker_capacity == 3
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        assert session.policy_id == "trusted_internal"
+        assert session.node_managed is True
+        assert calls == [
+            {
+                "infocenter_target": "127.0.0.1:50051",
+                "control_addr": "",
+                "tags": None,
+                "metadata": {
+                    "service_name": "startup-registered",
+                    "entry_module": "startup_registered_service",
+                },
+                "heartbeat_sec": 10,
+                "rpc_timeout_sec": 5.0,
+            }
+        ]
+        assert node.close_on_registration_lost is True
+    finally:
+        node.close()
+
+
+def test_service_startup_update_globals_uses_service_executor_path(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_globals_service.py"
+    module_path.write_text(
+        "cfg = None\n"
+        "def read_cfg():\n"
+        "    return cfg\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        service_name="startup-globals",
+        entry_module="startup_globals_service",
+        export_methods=("read_cfg",),
+        managed_global_names=("cfg",),
+        start=False,
+    )
+
+    try:
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        first_digest = node.update_globals({"cfg": {"value": 42}})
+        code, body = node.call_service(
+            service_id=session.service_id,
+            method="read_cfg",
+            payload={},
+            service_token=session.service_token,
+            timeout_sec=5.0,
+        )
+        assert code == 200
+        assert body["data"] == {"value": 42}
+        assert first_digest
+        assert node.globals_digests == {session.service_id: first_digest}
+    finally:
+        node.close()
+
+
+def test_connected_service_async_calls_are_gated():
+    from pycloud_parallel.execution.service_session import _ConnectedService
+
+    service = _ConnectedService.__new__(_ConnectedService)
+    service._async_call_gate = None
+    service._async_call_gate_loop = None
+    service._async_call_gate_capacity = 0
+    service._default_max_in_flight = lambda: 2
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def _call_balanced(method, payload, **kwargs):
+        nonlocal active, max_active
+        del method, payload, kwargs
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            return "node-1", {"ok": True}
+        finally:
+            with lock:
+                active -= 1
+
+    service.call_balanced = _call_balanced
+
+    async def _run():
+        await asyncio.gather(
+            *[
+                service.acall_balanced("run", {}, timeout_sec=1.0, refresh_status=False)
+                for _ in range(8)
+            ]
+        )
+
+    asyncio.run(_run())
+    assert max_active == 2
+
+
 class TestCallProxy:
     """测试 _CallProxy 类。"""
 
@@ -1228,8 +1597,17 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
-            return_value={"cfg": {"k": "v"}},
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            return_value=(
+                [{"cfg": {"k": "v"}}],
+                {
+                    "globals_batch_count": 1,
+                    "batch_keys": [["cfg"]],
+                    "batch_bytes": [1],
+                    "staged_keys": [],
+                    "inline_keys": ["cfg"],
+                },
+            ),
         ) as mocked_prepare:
             digest = group.update_globals({"cfg": {"k": "v"}})
 
@@ -1239,8 +1617,16 @@ class TestOwnerServiceFacade:
         prepare_args, prepare_kwargs = mocked_prepare.call_args
         assert prepare_args == ([client_a, client_b], {"cfg": {"k": "v"}})
         assert prepare_kwargs["effective_policy"] == group.effective_policy
-        session_a.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
-        session_b.update_globals_prepared.assert_called_once_with({"cfg": {"k": "v"}})
+        session_a.update_globals_prepared.assert_called_once_with(
+            {"cfg": {"k": "v"}},
+            serialization_mode=group.serialization_mode,
+            effective_policy=group.effective_policy,
+        )
+        session_b.update_globals_prepared.assert_called_once_with(
+            {"cfg": {"k": "v"}},
+            serialization_mode=group.serialization_mode,
+            effective_policy=group.effective_policy,
+        )
 
     def test_service_group_update_globals_prunes_failed_nodes(self):
         from pycloud_parallel.execution.service_session import Service
@@ -1261,8 +1647,17 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
-            return_value={"cfg": {"k": "v"}},
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            return_value=(
+                [{"cfg": {"k": "v"}}],
+                {
+                    "globals_batch_count": 1,
+                    "batch_keys": [["cfg"]],
+                    "batch_bytes": [1],
+                    "staged_keys": [],
+                    "inline_keys": ["cfg"],
+                },
+            ),
         ):
             digest = group.update_globals({"cfg": {"k": "v"}})
 
@@ -1291,8 +1686,17 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
-            return_value={"cfg": {"k": "v"}},
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            return_value=(
+                [{"cfg": {"k": "v"}}],
+                {
+                    "globals_batch_count": 1,
+                    "batch_keys": [["cfg"]],
+                    "batch_bytes": [1],
+                    "staged_keys": [],
+                    "inline_keys": ["cfg"],
+                },
+            ),
         ):
             digest = group.update_globals({"cfg": {"k": "v"}})
 
@@ -1314,8 +1718,17 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_values_for_upload",
-            return_value={"cfg": {"k": "v"}},
+            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            return_value=(
+                [{"cfg": {"k": "v"}}],
+                {
+                    "globals_batch_count": 1,
+                    "batch_keys": [["cfg"]],
+                    "batch_bytes": [1],
+                    "staged_keys": [],
+                    "inline_keys": ["cfg"],
+                },
+            ),
         ):
             with pytest.raises(RuntimeError, match="update_globals failed on all nodes"):
                 group.update_globals({"cfg": {"k": "v"}})
@@ -1610,6 +2023,26 @@ class TestOwnerServiceFacade:
             assert create_calls[0]["service_name"] == "demo-race-service"
         finally:
             group.close(end_services=False)
+
+    def test_inspect_existing_routes_rejects_startup_http_only_route(self):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        route = SimpleNamespace(
+            service_name="calc_asset_ratio",
+            service_id="calc-asset-ratio-startup-1",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_id="startup-node",
+            node_instance_id="startup-node-inst",
+            control_addr="",
+            http_base_url="http://127.0.0.1:18080/svc/calc-asset-ratio-startup-1",
+        )
+
+        with patch("pycloud_parallel.execution.service_session._node_control_client") as mocked_client:
+            with pytest.raises(RuntimeError, match="startup/http-only service route"):
+                Service._inspect_existing_routes(active_routes=[route], timeout_sec=1.0)
+
+        mocked_client.assert_not_called()
 
     def test_async_call_all_interface(self):
         """测试异步 call_all 接口。"""

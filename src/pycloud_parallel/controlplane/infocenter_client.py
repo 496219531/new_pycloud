@@ -655,6 +655,7 @@ class InfoCenterClient:
                 if node.healthy
                 and node.schedulable
                 and not node.drain
+                and bool(getattr(node, "accept_service_deploy", True))
                 and str(node.control_addr or "").strip()
                 and (not require_credit or node.credit > 0)
             ]

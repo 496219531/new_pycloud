@@ -6,6 +6,7 @@ import logging
 import hashlib
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
@@ -538,6 +539,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         request: pb2.UpdateRuntimeGlobalsRequest,
         context: grpc.ServicerContext,
     ) -> pb2.UpdateRuntimeGlobalsResponse:
+        total_started = time.monotonic()
         logger.info(
             "[NodeControl] UpdateRuntimeGlobals peer=%s client_id=%s code_version=%s runtime_key=%s",
             _peer(context),
@@ -546,7 +548,9 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.runtime_key,
         )
         try:
+            decode_started = time.monotonic()
             if request.HasField("transport_values") and str(request.transport_values.codec or "").strip():
+                serialization_mode = str(request.transport_values.codec or "").strip().lower()
                 decoded_values = decode_transport_payload_bytes(
                     request.transport_values.codec,
                     request.transport_values.version,
@@ -555,18 +559,32 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 )
             else:
                 raw_values = struct_to_python(request.values)
+                serialization_mode = detect_transport_mode(raw_values, default="legacy_v1")
                 decoded_values = decode_payload_from_transport(
                     raw_values,
                     policy=get_payload_policy("managed_globals"),
-                    mode=detect_transport_mode(raw_values, default="legacy_v1"),
+                    mode=serialization_mode,
                     context="taskpool_session",
                 )
+            decode_ms = (time.monotonic() - decode_started) * 1000.0
+            state_started = time.monotonic()
             globals_digest, updated_names = self._state.update_runtime_globals(
                 client_id=request.client_id,
                 code_version=request.code_version,
                 runtime_key=request.runtime_key,
                 code_token=request.code_token,
                 values=decoded_values,
+                serialization_mode=serialization_mode,
+            )
+            state_ms = (time.monotonic() - state_started) * 1000.0
+            logger.info(
+                "[NodeControl] UpdateRuntimeGlobals timing client_id=%s runtime_key=%s keys=%s decode_ms=%.3f state_ms=%.3f total_ms=%.3f",
+                request.client_id,
+                request.runtime_key,
+                sorted(str(key) for key in decoded_values.keys()) if isinstance(decoded_values, dict) else [],
+                decode_ms,
+                state_ms,
+                (time.monotonic() - total_started) * 1000.0,
             )
             return pb2.UpdateRuntimeGlobalsResponse(
                 ok=True,
@@ -1201,6 +1219,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
         request: pb2.UpdateServiceGlobalsRequest,
         context: grpc.ServicerContext,
     ) -> pb2.UpdateServiceGlobalsResponse:
+        total_started = time.monotonic()
         logger.info(
             "[NodeControl] UpdateServiceGlobals peer=%s service_id=%s owner_client_id=%s",
             _peer(context),
@@ -1208,7 +1227,9 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.owner_client_id,
         )
         try:
+            decode_started = time.monotonic()
             if request.HasField("transport_values") and str(request.transport_values.codec or "").strip():
+                serialization_mode = str(request.transport_values.codec or "").strip().lower()
                 decoded_values = decode_transport_payload_bytes(
                     request.transport_values.codec,
                     request.transport_values.version,
@@ -1217,17 +1238,30 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
                 )
             else:
                 raw_values = struct_to_python(request.values)
+                serialization_mode = detect_transport_mode(raw_values, default="legacy_v1")
                 decoded_values = decode_payload_from_transport(
                     raw_values,
                     policy=get_payload_policy("managed_globals"),
-                    mode=detect_transport_mode(raw_values, default="legacy_v1"),
+                    mode=serialization_mode,
                     context="service_owner",
                 )
+            decode_ms = (time.monotonic() - decode_started) * 1000.0
+            state_started = time.monotonic()
             globals_digest, updated_names = self._state.update_service_globals(
                 owner_client_id=request.owner_client_id,
                 service_id=request.service_id,
                 service_token=request.service_token,
                 values=decoded_values,
+                serialization_mode=serialization_mode,
+            )
+            state_ms = (time.monotonic() - state_started) * 1000.0
+            logger.info(
+                "[NodeControl] UpdateServiceGlobals timing service_id=%s keys=%s decode_ms=%.3f state_ms=%.3f total_ms=%.3f",
+                request.service_id,
+                sorted(str(key) for key in decoded_values.keys()) if isinstance(decoded_values, dict) else [],
+                decode_ms,
+                state_ms,
+                (time.monotonic() - total_started) * 1000.0,
             )
             return pb2.UpdateServiceGlobalsResponse(
                 ok=True,

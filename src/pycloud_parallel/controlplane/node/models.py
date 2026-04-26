@@ -153,6 +153,7 @@ class ServiceSession:
     timing_metrics: Dict[str, object] = field(default_factory=dict)
     request_count: int = 0
     returned_count: int = 0
+    node_managed: bool = False
 
     def is_running(self) -> bool:
         return int(self.status or 0) in {

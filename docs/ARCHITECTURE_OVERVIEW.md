@@ -317,10 +317,11 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 
 1. queue 自己的 controlplane transport 固定绑定 `jobqueue_controlplane_transport`
 2. 这个 binding 当前固定落到 `default_safe + structured_v1`
-3. `job-orch` 在启动时冻结自己的 `taskpool_policy_id`
-4. 用户在 `submit(...)` 里只能改 `serialization_mode`；后续 `TaskPool` 会在 job 边界按这个 mode 软切
-5. session 对外可见的是 queue 自己冻结后的 `effective_policy`
-6. `job-orch` 运行期维护单共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先软切复用，软切失败再回退重建
+3. `job-orch` 作为 startup service 通过 `mount_python_module_service(...)` 挂载内置系统 module
+4. `job-orch` 在启动时通过 startup managed globals 冻结自己的 `taskpool_policy_id`
+5. 用户在 `submit(...)` 里只能改 `task_serialization_mode`；后续 `TaskPool` 会在 job 边界按这个 mode 软切
+6. session 对外可见的是 queue 自己冻结后的 `effective_policy`
+7. `job-orch` 运行期维护单共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先软切复用，软切失败再回退重建
 
 这里要特别注意：
 
@@ -336,8 +337,8 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 
 1. 初始化后 queue 自己就固定到 `structured_v1 + default_safe`
 2. orchestrator route 只负责发现和路由，不再决定 queue 自己的 effective policy
-3. `policy_id` 固定于 orch 启动时，不接受 submit 运行期覆盖
-4. 真正给 task 执行面用的只有 `submit(...)` 上传的 `serialization_mode`，并在共享 `TaskPool` 的 job 边界软切
+3. `policy_id/taskpool_policy_id` 固定于 orch 启动时，不接受 submit 运行期覆盖
+4. 真正给 task 执行面用的只有 `submit(...)` 上传的 `task_serialization_mode`，并在共享 `TaskPool` 的 job 边界软切
 5. 共享池在空闲超过 idle TTL 时才会被回收；不是每个 job 结束就关池
 
 ### 9.4 Payload Policy 的来源

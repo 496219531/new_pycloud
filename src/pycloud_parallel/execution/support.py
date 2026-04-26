@@ -30,6 +30,7 @@ from pycloud_parallel.controlplane.artifact import (
 )
 from pycloud_parallel.controlplane.config import (
     FILE_HASH_CHUNK_SIZE_BYTES,
+    GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES,
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
@@ -38,7 +39,11 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_CHUNK_SIZE_BYTES,
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
-from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, payload_policy_from_effective_policy
+from pycloud_parallel.controlplane.effective_policy import (
+    EffectivePolicy,
+    payload_policy_from_effective_policy,
+    should_use_transport_payload_bytes,
+)
 from pycloud_parallel.controlplane.netutil import detect_local_ip
 from pycloud_parallel.data.ref import normalize_materialize_as, normalize_object_format
 from pycloud_parallel.controlplane.payload_transport import (
@@ -49,11 +54,13 @@ from pycloud_parallel.controlplane.payload_transport import (
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.serialization import (
     dataframe_bundle_parquet_frame,
+    encode_transport_payload_bytes,
     log_payload_flow,
     serialize_arrow_compatible,
     serialize_dataframe_bundle,
     serialize_series_bundle,
     serialize_by_mode,
+    serialize_inline_payload,
     summarize_payload_flow_value,
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
@@ -727,6 +734,162 @@ def _prepare_managed_globals_values_for_upload(
             effective_policy=effective_policy,
         )
         for name, value in (values or {}).items()
+    }
+
+
+def _managed_globals_effective_inline_limit(
+    *,
+    effective_policy: Optional[EffectivePolicy] = None,
+) -> int:
+    policy = _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)
+    return max(
+        1,
+        min(
+            int(policy.inline_payload_hard_limit_bytes),
+            int(GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES),
+        ),
+    )
+
+
+def _encoded_managed_globals_size(
+    values: Dict[str, object],
+    *,
+    serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
+    context: str = "taskpool_session",
+) -> int:
+    effective_mode = resolve_effective_serialization_mode(
+        request_mode=serialization_mode,
+        context=context,
+    )
+    if should_use_transport_payload_bytes(mode=effective_mode, effective_policy=effective_policy):
+        transport = encode_transport_payload_bytes(
+            values,
+            mode=effective_mode,
+            context=context,
+        )
+        return len(bytes(transport.payload or b""))
+    _serialized, _struct, size_bytes = serialize_inline_payload(
+        values,
+        context=context,
+        limit_bytes=sys.maxsize,
+        mode=effective_mode,
+    )
+    return int(size_bytes)
+
+
+def _stage_managed_global_value_for_upload(
+    clients: Sequence[Any],
+    value: Any,
+    *,
+    serialization_mode: str = "",
+) -> Any:
+    if maybe_data_ref(value) is not None:
+        return value
+    return _put_data_via_clients(
+        clients,
+        value,
+        default_serialization_mode=serialization_mode,
+    )
+
+
+def _prepare_managed_globals_batches_for_upload(
+    clients: Sequence[Any],
+    values: Dict[str, object],
+    *,
+    serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
+    context: str = "taskpool_session",
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    limit_bytes = _managed_globals_effective_inline_limit(effective_policy=effective_policy)
+    batches: List[Dict[str, object]] = []
+    batch_bytes: List[int] = []
+    inline_keys: List[str] = []
+    staged_keys: List[str] = []
+    current: Dict[str, object] = {}
+    current_size = 0
+    if not values:
+        empty_size = _encoded_managed_globals_size(
+            {},
+            serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
+            context=context,
+        )
+        return [{}], {
+            "globals_batch_count": 1,
+            "batch_keys": [[]],
+            "batch_bytes": [empty_size],
+            "staged_keys": [],
+            "inline_keys": [],
+            "effective_grpc_limit_bytes": limit_bytes,
+        }
+
+    for raw_name, raw_value in (values or {}).items():
+        name = str(raw_name)
+        prepared_value = raw_value
+        staged = False
+        try:
+            single_size = _encoded_managed_globals_size(
+                {name: raw_value},
+                serialization_mode=serialization_mode,
+                effective_policy=effective_policy,
+                context=context,
+            )
+        except Exception:
+            single_size = limit_bytes + 1
+
+        if single_size > limit_bytes:
+            prepared_value = _stage_managed_global_value_for_upload(
+                clients,
+                raw_value,
+                serialization_mode=serialization_mode,
+            )
+            staged = True
+            single_size = _encoded_managed_globals_size(
+                {name: prepared_value},
+                serialization_mode=serialization_mode,
+                effective_policy=effective_policy,
+                context=context,
+            )
+            if single_size > limit_bytes:
+                raise ValueError(
+                    "managed global remains above effective gRPC limit after staging: "
+                    f"key={name!r} size_bytes={single_size} limit_bytes={limit_bytes}"
+                )
+
+        candidate = dict(current)
+        candidate[name] = prepared_value
+        candidate_size = _encoded_managed_globals_size(
+            candidate,
+            serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
+            context=context,
+        )
+        if current and candidate_size > limit_bytes:
+            batches.append(current)
+            batch_bytes.append(current_size)
+            current = {name: prepared_value}
+            current_size = single_size
+        else:
+            current = candidate
+            current_size = candidate_size
+
+        if staged:
+            staged_keys.append(name)
+        else:
+            inline_keys.append(name)
+
+    if current:
+        batches.append(current)
+        batch_bytes.append(current_size)
+
+    return batches, {
+        "globals_batch_count": len(batches),
+        "batch_keys": [sorted(str(key) for key in batch.keys()) for batch in batches],
+        "batch_bytes": batch_bytes,
+        "staged_keys": sorted(staged_keys),
+        "inline_keys": sorted(inline_keys),
+        "effective_grpc_limit_bytes": limit_bytes,
     }
 
 
@@ -1734,6 +1897,7 @@ __all__ = [
     "_prepare_job_blob_submit_fields",
     "_prepare_job_submit_payload_for_call",
     "_prepare_managed_global_value_for_upload",
+    "_prepare_managed_globals_batches_for_upload",
     "_prepare_managed_globals_values_for_upload",
     "_prepare_local_artifact_for_upload",
     "_prepare_task_payload_for_submit",
