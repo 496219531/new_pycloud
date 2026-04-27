@@ -17,6 +17,7 @@ from pycloud_parallel.controlplane.config import (
     NODE_MAX_WORKERS,
     NODE_QUEUE_CAPACITY,
     NODE_WORKER_CAPACITY,
+    EXECUTOR_BACKEND,
     SERVICE_DEFAULT_WORKERS,
     SERVICE_HEARTBEAT_TIMEOUT_SEC,
     grpc_channel_options,
@@ -196,6 +197,7 @@ def build_nodecontrol_server(
     max_workers: int = NODE_MAX_WORKERS,
     service_http_bind: str = "0.0.0.0:18080",
     service_http_base_url: str = "",
+    executor_backend: str = EXECUTOR_BACKEND,
     service_default_worker_count: int = SERVICE_DEFAULT_WORKERS,
     service_default_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
     on_service_routes_changed: Optional[Callable[[], None]] = None,
@@ -211,6 +213,7 @@ def build_nodecontrol_server(
         queue_capacity=queue_capacity,
         service_http_bind=service_http_bind,
         service_http_base_url=service_http_base_url,
+        executor_backend=executor_backend,
         service_default_worker_count=service_default_worker_count,
         service_default_heartbeat_timeout_sec=service_default_heartbeat_timeout_sec,
     )
@@ -280,6 +283,11 @@ def main() -> None:
     parser.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS)
     parser.add_argument("--service-http-bind", default="")
     parser.add_argument("--service-http-base-url", default="")
+    parser.add_argument(
+        "--executor-backend",
+        default=EXECUTOR_BACKEND,
+        choices=("subprocess_host", "embedded"),
+    )
     parser.add_argument("--service-default-workers", type=int, default=SERVICE_DEFAULT_WORKERS)
     parser.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC)
     parser.add_argument("--infocenter-addr", default="")
@@ -409,6 +417,7 @@ def main() -> None:
         max_workers=args.max_workers,
         service_http_bind=service_http_bind,
         service_http_base_url=service_http_base_url,
+        executor_backend=args.executor_backend,
         service_default_worker_count=args.service_default_workers,
         service_default_heartbeat_timeout_sec=args.service_heartbeat_timeout_sec,
         on_service_routes_changed=_sync_routes_now,

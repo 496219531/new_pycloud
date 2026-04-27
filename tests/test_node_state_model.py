@@ -147,6 +147,24 @@ def test_nodecontrol_default_artifact_dir_isolated_by_bind_port(tmp_path, monkey
         server_b.stop(0)
 
 
+def test_nodecontrol_default_executor_backend_is_embedded(tmp_path):
+    state = NodeControlState(
+        node_id="node-default-backend",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_default_backend"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        assert state.executor_backend == "embedded"
+        assert state._executor_host is not None  # noqa: SLF001
+        assert state._executor_host.backend_name == "embedded"  # noqa: SLF001
+    finally:
+        state.close()
+
+
 def test_normalize_user_return_inlines_dataframe_when_limit_allows(tmp_path, monkeypatch):
     pd = pytest.importorskip("pandas")
 
@@ -3057,6 +3075,60 @@ def test_service_call_recovers_after_executor_host_restart(tmp_path):
         assert code == 200
         assert body["ok"] is True
         assert body["data"] == {"v": 8, "square": 64}
+    finally:
+        state.close()
+
+
+def test_nodecontrol_embedded_executor_backend_service_call(tmp_path):
+    state = NodeControlState(
+        node_id="node-svc-embedded-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        executor_backend="embedded",
+        service_http_bind="127.0.0.1:0",
+        monitor_interval_sec=1,
+    )
+    try:
+        blob = (
+            b"def pycloud_export(fn):\n"
+            b"    fn.__pycloud_export__ = True\n"
+            b"    return fn\n\n"
+            b"@pycloud_export\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    v = int(value)\n"
+            b"    return {'v': v, 'triple': v * 3}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-embedded",
+            service_name="svc-embedded",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_embedded_backend",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+        assert state._executor_host is not None  # noqa: SLF001
+        assert state._executor_host.backend_name == "embedded"  # noqa: SLF001
+
+        code, body = state.call_service(
+            service_id=session.service_id,
+            method="run",
+            payload={"value": 7},
+            service_token=session.service_token,
+            timeout_sec=5.0,
+        )
+        assert code == 200
+        assert body["ok"] is True
+        assert body["data"] == {"v": 7, "triple": 21}
     finally:
         state.close()
 

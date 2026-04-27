@@ -51,6 +51,7 @@ PYCLOUD_TRUST_MODE = "PYCLOUD_TRUST_MODE"
 PYCLOUD_OBJECT_TRANSFER_MODE = "PYCLOUD_OBJECT_TRANSFER_MODE"
 PYCLOUD_SERIALIZATION_MODE = "PYCLOUD_SERIALIZATION_MODE"
 PYCLOUD_DEPENDENCY_POLICY_MODE = "PYCLOUD_DEPENDENCY_POLICY_MODE"
+PYCLOUD_EXECUTOR_BACKEND = "PYCLOUD_EXECUTOR_BACKEND"
 
 
 INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
@@ -88,6 +89,11 @@ DEPENDENCY_POLICY_MODE = _env_choice(
     "legacy_v1",
     {"legacy_v1", "prebuilt", "node_preinstalled", "allow_install"},
 )
+EXECUTOR_BACKEND = _env_choice(
+    PYCLOUD_EXECUTOR_BACKEND,
+    "embedded",
+    {"subprocess_host", "embedded"},
+)
 
 GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
 GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
@@ -105,6 +111,7 @@ ObjectTransferMode = Literal["auto", "known_digest_precheck", "single_pass_autho
 SystemMode = Literal["trusted_default"]
 SerializationMode = Literal["legacy_v1", "structured_v1", "pickle_stable_v1"]
 DependencyPolicyMode = Literal["legacy_v1", "prebuilt", "node_preinstalled", "allow_install"]
+ExecutorBackendMode = Literal["subprocess_host", "embedded"]
 
 
 @dataclass(frozen=True)

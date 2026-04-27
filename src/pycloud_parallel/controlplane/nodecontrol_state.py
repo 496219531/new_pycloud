@@ -29,13 +29,14 @@ from pycloud_parallel.controlplane.artifact import (
     _normalize_dependency_policy_mode,
 )
 from pycloud_parallel.controlplane.config import (
+    EXECUTOR_BACKEND,
     OBJECT_SEGMENT_MAX_BYTES,
     OBJECT_SEGMENT_TARGET_BYTES,
     get_payload_policy,
 )
 from pycloud_parallel.controlplane.data_store import DataStore
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
-from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
+from pycloud_parallel.controlplane.executor_backend import ExecutorBackend, create_executor_backend, normalize_executor_backend
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
 from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
@@ -162,6 +163,7 @@ class NodeControlState(NodeRuntimeBase):
         artifact_dir: str = "./code_cache",
         enable_internal_executor: bool = True,
         executor_poll_interval_sec: float = 0.05,
+        executor_backend: str = "",
         enable_service_session: bool = True,
         service_default_worker_count: int = 10,
         service_default_heartbeat_timeout_sec: int = 30,
@@ -183,6 +185,7 @@ class NodeControlState(NodeRuntimeBase):
         self.monitor_interval_sec = max(1, monitor_interval_sec)
         self.enable_internal_executor = bool(enable_internal_executor)
         self.executor_poll_interval_sec = max(0.01, float(executor_poll_interval_sec))
+        self.executor_backend = normalize_executor_backend(executor_backend or EXECUTOR_BACKEND)
         self.enable_service_session = bool(enable_service_session)
         self.service_default_worker_count = max(1, service_default_worker_count)
         self.service_default_heartbeat_timeout_sec = max(5, service_default_heartbeat_timeout_sec)
@@ -225,10 +228,8 @@ class NodeControlState(NodeRuntimeBase):
         self._stop_event = threading.Event()
         self._monitor = threading.Thread(target=self._monitor_loop, name="nodecontrol-monitor", daemon=True)
         self._monitor.start()
-        self._executor_host = (
-            ExecutorHostClient(task_worker_capacity=self.worker_capacity)
-            if (self.enable_internal_executor or self.enable_service_session)
-            else None
+        self._executor_host: Optional[ExecutorBackend] = (
+            self._create_executor_backend() if self._executor_host_required() else None
         )
         self._cleanup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nodecontrol-cleanup")
         self._dispatcher: Optional[threading.Thread] = None
@@ -409,7 +410,13 @@ class NodeControlState(NodeRuntimeBase):
         if self._executor_host is not None:
             self._executor_host.close(shutdown_timeout_sec=2.0)
 
-    def _submit_stop_task_pool(self, executor_host: ExecutorHostClient, *, pool_id: str) -> None:
+    def _create_executor_backend(self) -> ExecutorBackend:
+        return create_executor_backend(
+            executor_backend=self.executor_backend,
+            task_worker_capacity=self.worker_capacity,
+        )
+
+    def _submit_stop_task_pool(self, executor_host: ExecutorBackend, *, pool_id: str) -> None:
         normalized = str(pool_id or "").strip()
         if not normalized:
             return
@@ -616,7 +623,7 @@ class NodeControlState(NodeRuntimeBase):
     def _execute_warmup(
         self,
         *,
-        executor_host: ExecutorHostClient,
+        executor_host: ExecutorBackend,
         scope: str,
         key: str,
         worker_count: int,
@@ -751,7 +758,7 @@ class NodeControlState(NodeRuntimeBase):
 
         current_time = now or utc_now()
         old_host = self._executor_host
-        self._executor_host = ExecutorHostClient(task_worker_capacity=self.worker_capacity)
+        self._executor_host = self._create_executor_backend()
 
         for session in self._services.values():
             if session.status != pb2.SERVICE_STATUS_RUNNING or not session.executor_ready:

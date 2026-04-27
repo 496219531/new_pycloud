@@ -3,404 +3,26 @@ from __future__ import annotations
 """Dedicated local executor host process for user-code execution."""
 
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
-import logging
 import multiprocessing as mp
+import os
 import queue
+import signal
 import threading
 import time
 from typing import Any, Deque, Dict, Optional
 
-logger = logging.getLogger(__name__)
+from pycloud_parallel.controlplane.executor_core import ExecutorCore
 
 
 def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
-    service_executors: Dict[str, ProcessPoolExecutor] = {}
-    service_workers: Dict[str, int] = {}
-    pool_executors: Dict[str, ProcessPoolExecutor] = {}
-    pool_workers: Dict[str, int] = {}
-    task_executor: Optional[ProcessPoolExecutor] = None
-    inflight: Dict[object, Dict[str, Any]] = {}
-    shutdown_q: "queue.Queue[object]" = queue.Queue()
-    completed_futures: "queue.Queue[object]" = queue.Queue()
-    shutdown_sentinel = object()
+    def _emit(item: Dict[str, Any]) -> None:
+        event_q.put(dict(item))
 
-    def _send_response(request_id: str, **payload: object) -> None:
-        event_q.put({"kind": "response", "request_id": request_id, **payload})
-
-    def _shutdown_executor(executor: Optional[ProcessPoolExecutor], *, wait: bool = False) -> None:
-        if executor is None:
-            return
-        processes = list(getattr(executor, "_processes", {}).values())
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        for proc in processes:
-            try:
-                if proc.is_alive():
-                    proc.terminate()
-                proc.join(timeout=2.0 if wait else 0.2)
-                if proc.is_alive() and hasattr(proc, "kill"):
-                    proc.kill()
-                    proc.join(timeout=1.0)
-            except Exception:
-                continue
-
-    def _shutdown_executor_async(executor: Optional[ProcessPoolExecutor], *, wait: bool = False) -> None:
-        if executor is None:
-            return
-        shutdown_q.put((executor, bool(wait)))
-
-    def _shutdown_worker() -> None:
-        while True:
-            item = shutdown_q.get()
-            if item is shutdown_sentinel:
-                return
-            executor, wait = item
-            _shutdown_executor(executor, wait=bool(wait))
-
-    shutdown_thread = threading.Thread(target=_shutdown_worker, name="executor-host-shutdown", daemon=True)
-    shutdown_thread.start()
-
-    def _ensure_mp_context():
-        return mp.get_context("spawn")
-
-    def _submit_callable(executor: ProcessPoolExecutor, args: Dict[str, Any]):
-        from pycloud_parallel.controlplane.node.execution import _execute_payload_in_subprocess
-
-        return executor.submit(
-            _execute_payload_in_subprocess,
-            args["artifact_path"],
-            args["entry_module"],
-            args["package_format"],
-            args["dependency_path"],
-            str(args.get("dependency_policy_mode", "prebuilt") or "prebuilt"),
-            args["object_dir"],
-            args.get("work_dir", ""),
-            args.get("managed_globals_scope_dir", ""),
-            args.get("managed_globals_digest", ""),
-            args["export_mode"],
-            args["export_methods"],
-            args["export_decorator"],
-            args["method_name"],
-            args["entry_callable"],
-            args["payload"],
-            bool(args.get("warmup_only", False)),
-            str(args.get("payload_mode", "task_submit") or "task_submit"),
-            str(args.get("serialization_mode", "") or "").strip().lower(),
-            args.get("use_transport_result", None),
-        )
-
-    def _enqueue_completed_future(future) -> None:
-        try:
-            completed_futures.put_nowait(future)
-        except Exception:
-            pass
-
-    def _track_inflight(future, meta: Dict[str, Any]) -> None:
-        inflight[future] = meta
-        future.add_done_callback(_enqueue_completed_future)
-
-    def _is_recoverable_pool_error(exc: BaseException) -> bool:
-        if isinstance(exc, BrokenProcessPool):
-            return True
-        text = repr(exc)
-        return "terminated abruptly while the future was running or pending" in text or "BrokenProcessPool" in text
-
-    def _submit_service_future(service_id: str, payload: Dict[str, Any]):
-        executor = service_executors.get(service_id)
-        if executor is None and service_id in service_workers:
-            executor = _rebuild_service_executor(service_id)
-        if executor is None:
-            raise RuntimeError("service executor missing")
-        try:
-            return _submit_callable(executor, payload)
-        except Exception as exc:
-            if not _is_recoverable_pool_error(exc):
-                raise
-            executor = _rebuild_service_executor(service_id)
-            if executor is None:
-                raise RuntimeError("service executor missing after rebuild") from exc
-            return _submit_callable(executor, payload)
-
-    def _submit_pool_future(pool_id: str, payload: Dict[str, Any]):
-        executor = pool_executors.get(pool_id)
-        if executor is None and pool_id in pool_workers:
-            executor = _rebuild_pool_executor(pool_id)
-        if executor is None:
-            raise RuntimeError("task pool missing")
-        try:
-            return _submit_callable(executor, payload)
-        except Exception as exc:
-            if not _is_recoverable_pool_error(exc):
-                raise
-            executor = _rebuild_pool_executor(pool_id)
-            if executor is None:
-                raise RuntimeError("task pool missing after rebuild") from exc
-            return _submit_callable(executor, payload)
-
-    def _submit_runtime_future(payload: Dict[str, Any]):
-        nonlocal task_executor
-        executor = _ensure_task_executor()
-        try:
-            return _submit_callable(executor, payload)
-        except Exception as exc:
-            if not _is_recoverable_pool_error(exc):
-                raise
-            old_executor = task_executor
-            task_executor = None
-            _shutdown_executor_async(old_executor, wait=True)
-            executor = _ensure_task_executor()
-            return _submit_callable(executor, payload)
-
-    def _unpack_subprocess_result(value: Any) -> tuple[str, Any, str, str, Dict[str, Any]]:
-        if isinstance(value, tuple):
-            if len(value) == 5:
-                status_text, result, err_type, err_message, timings = value
-                return (
-                    str(status_text or ""),
-                    result,
-                    str(err_type or ""),
-                    str(err_message or ""),
-                    dict(timings or {}),
-                )
-            if len(value) == 4:
-                status_text, result, err_type, err_message = value
-                return (
-                    str(status_text or ""),
-                    result,
-                    str(err_type or ""),
-                    str(err_message or ""),
-                    {},
-                )
-        raise RuntimeError(f"unexpected subprocess result shape: {type(value).__name__}")
-
-    def _ensure_task_executor() -> ProcessPoolExecutor:
-        nonlocal task_executor
-        if task_executor is None:
-            task_executor = ProcessPoolExecutor(
-                max_workers=max(1, int(task_worker_capacity or 1)),
-                mp_context=_ensure_mp_context(),
-            )
-        return task_executor
-
-    def _submit_background_calls(
-        executor: Optional[ProcessPoolExecutor],
-        args: Dict[str, Any],
-        *,
-        fanout: int,
-        kind: str,
-        label: str,
-    ) -> int:
-        if executor is None:
-            return 0
-        submitted = max(1, int(fanout or 1))
-        for _ in range(submitted):
-            future = _submit_callable(executor, args)
-
-            def _consume_background_result(done_future, *, call_kind: str = kind, call_label: str = label) -> None:
-                try:
-                    status_text, _result, err_type, err_message, _timings = _unpack_subprocess_result(done_future.result())
-                except Exception as exc:
-                    logger.debug("%s future failed kind=%s err=%r", call_label, call_kind, exc)
-                    return
-                if status_text != "SUCCEEDED":
-                    logger.debug(
-                        "%s future returned non-success kind=%s status=%s err_type=%s err_message=%s",
-                        call_label,
-                        call_kind,
-                        status_text,
-                        err_type,
-                        err_message,
-                    )
-
-            future.add_done_callback(_consume_background_result)
-        return submitted
-
-    def _submit_warmup(executor: Optional[ProcessPoolExecutor], args: Dict[str, Any], *, fanout: int, kind: str) -> int:
-        return _submit_background_calls(executor, args, fanout=fanout, kind=kind, label="warmup")
-
-    def _submit_preload(executor: Optional[ProcessPoolExecutor], args: Dict[str, Any], *, fanout: int, kind: str) -> int:
-        return _submit_background_calls(executor, args, fanout=fanout, kind=kind, label="preload")
-
-    def _rebuild_service_executor(service_id: str) -> Optional[ProcessPoolExecutor]:
-        worker_count = max(1, int(service_workers.get(service_id, 1) or 1))
-        existing = service_executors.pop(service_id, None)
-        _shutdown_executor_async(existing, wait=True)
-        executor = ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=_ensure_mp_context(),
-        )
-        service_executors[service_id] = executor
-        return executor
-
-    def _rebuild_pool_executor(pool_id: str) -> Optional[ProcessPoolExecutor]:
-        worker_count = max(1, int(pool_workers.get(pool_id, 1) or 1))
-        existing = pool_executors.pop(pool_id, None)
-        _shutdown_executor_async(existing, wait=True)
-        executor = ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=_ensure_mp_context(),
-        )
-        pool_executors[pool_id] = executor
-        return executor
-
-    def _handle_request(message: Dict[str, Any]) -> bool:
-        request_id = str(message.get("request_id", "") or "")
-        action = str(message.get("action", "") or "")
-        payload = dict(message.get("payload") or {})
-        if action == "shutdown":
-            _send_response(request_id, ok=True)
-            return False
-
-        try:
-            if action == "create_service":
-                service_id = str(payload.get("service_id", "") or "")
-                worker_count = max(1, int(payload.get("worker_count", 1) or 1))
-                service_workers[service_id] = worker_count
-                service_executors[service_id] = _rebuild_service_executor(service_id)
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "stop_service":
-                service_id = str(payload.get("service_id", "") or "")
-                executor = service_executors.pop(service_id, None)
-                service_workers.pop(service_id, None)
-                _shutdown_executor(executor, wait=True)
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "create_task_pool":
-                pool_id = str(payload.get("pool_id", "") or "")
-                worker_count = max(1, int(payload.get("worker_count", 1) or 1))
-                pool_workers[pool_id] = worker_count
-                pool_executors[pool_id] = _rebuild_pool_executor(pool_id)
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "stop_task_pool":
-                pool_id = str(payload.get("pool_id", "") or "")
-                executor = pool_executors.pop(pool_id, None)
-                pool_workers.pop(pool_id, None)
-                _shutdown_executor(executor, wait=True)
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "call_service":
-                service_id = str(payload.get("service_id", "") or "")
-                if service_id not in service_workers:
-                    _send_response(request_id, ok=False, error="service executor missing")
-                    return True
-                future = _submit_service_future(service_id, payload)
-                _track_inflight(future, {
-                    "kind": "service",
-                    "service_id": service_id,
-                    "request_id": request_id,
-                    "start_at": time.monotonic(),
-                    "timeout_sec": max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)),
-                    "payload": dict(payload),
-                    "recoveries": 0,
-                })
-                return True
-
-            if action == "warmup_service":
-                service_id = str(payload.get("service_id", "") or "")
-                executor = service_executors.get(service_id)
-                if executor is None and service_id in service_workers:
-                    executor = _rebuild_service_executor(service_id)
-                if executor is None:
-                    _send_response(request_id, ok=False, error="service executor missing")
-                    return True
-                fanout = max(1, int(payload.get("fanout", 1) or 1))
-                submitted = _submit_warmup(executor, payload, fanout=fanout, kind="service")
-                _send_response(request_id, ok=True, submitted=submitted)
-                return True
-
-            if action == "preload_service":
-                service_id = str(payload.get("service_id", "") or "")
-                executor = service_executors.get(service_id)
-                if executor is None and service_id in service_workers:
-                    executor = _rebuild_service_executor(service_id)
-                if executor is None:
-                    _send_response(request_id, ok=False, error="service executor missing")
-                    return True
-                fanout = max(1, int(payload.get("fanout", 1) or 1))
-                submitted = _submit_preload(executor, payload, fanout=fanout, kind="service")
-                _send_response(request_id, ok=True, submitted=submitted)
-                return True
-
-            if action == "submit_runtime_task":
-                future = _submit_runtime_future(payload)
-                _track_inflight(future, {
-                    "kind": "runtime",
-                    "runtime_key": str(payload.get("runtime_key", "") or ""),
-                    "task_id": str(payload.get("task_id", "") or ""),
-                    "attempt": int(payload.get("attempt", 0) or 0),
-                    "payload": dict(payload),
-                    "recoveries": 0,
-                })
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "warmup_runtime":
-                executor = _ensure_task_executor()
-                fanout = max(1, int(payload.get("fanout", 1) or 1))
-                submitted = _submit_warmup(executor, payload, fanout=fanout, kind="runtime")
-                _send_response(request_id, ok=True, submitted=submitted)
-                return True
-
-            if action == "submit_pool_task":
-                pool_id = str(payload.get("pool_id", "") or "")
-                if pool_id not in pool_workers:
-                    _send_response(request_id, ok=False, error="task pool missing")
-                    return True
-                future = _submit_pool_future(pool_id, payload)
-                _track_inflight(future, {
-                    "kind": "pool",
-                    "pool_id": pool_id,
-                    "task_id": str(payload.get("task_id", "") or ""),
-                    "attempt": int(payload.get("attempt", 0) or 0),
-                    "start_at": time.monotonic(),
-                    "payload": dict(payload),
-                    "recoveries": 0,
-                })
-                _send_response(request_id, ok=True)
-                return True
-
-            if action == "warmup_pool":
-                pool_id = str(payload.get("pool_id", "") or "")
-                executor = pool_executors.get(pool_id)
-                if executor is None and pool_id in pool_workers:
-                    executor = _rebuild_pool_executor(pool_id)
-                if executor is None:
-                    _send_response(request_id, ok=False, error="task pool missing")
-                    return True
-                fanout = max(1, int(payload.get("fanout", 1) or 1))
-                submitted = _submit_warmup(executor, payload, fanout=fanout, kind="pool")
-                _send_response(request_id, ok=True, submitted=submitted)
-                return True
-
-            if action == "preload_pool":
-                pool_id = str(payload.get("pool_id", "") or "")
-                executor = pool_executors.get(pool_id)
-                if executor is None and pool_id in pool_workers:
-                    executor = _rebuild_pool_executor(pool_id)
-                if executor is None:
-                    _send_response(request_id, ok=False, error="task pool missing")
-                    return True
-                fanout = max(1, int(payload.get("fanout", 1) or 1))
-                submitted = _submit_preload(executor, payload, fanout=fanout, kind="pool")
-                _send_response(request_id, ok=True, submitted=submitted)
-                return True
-
-            _send_response(request_id, ok=False, error=f"unknown action: {action}")
-            return True
-        except Exception as exc:
-            _send_response(request_id, ok=False, error=repr(exc))
-            return True
-
+    core = ExecutorCore(
+        task_worker_capacity=max(1, int(task_worker_capacity or 1)),
+        emit_response=_emit,
+        emit_event=_emit,
+    )
     running = True
     while running:
         try:
@@ -408,144 +30,13 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
         except queue.Empty:
             message = None
         if isinstance(message, dict):
-            running = _handle_request(message)
-
-        now = time.monotonic()
-        while True:
-            try:
-                future = completed_futures.get_nowait()
-            except queue.Empty:
-                break
-            meta = inflight.pop(future, None)
-            if meta is None:
-                continue
-            try:
-                status_text, result, err_type, err_message, timings = _unpack_subprocess_result(future.result())
-            except Exception as exc:
-                kind = str(meta.get("kind", "") or "")
-                recoveries = int(meta.get("recoveries", 0) or 0)
-                if _is_recoverable_pool_error(exc) and recoveries < 1:
-                    retry_payload = dict(meta.get("payload") or {})
-                    try:
-                        if kind == "service":
-                            retry_future = _submit_service_future(str(meta.get("service_id", "") or ""), retry_payload)
-                        elif kind == "pool":
-                            retry_future = _submit_pool_future(str(meta.get("pool_id", "") or ""), retry_payload)
-                        elif kind == "runtime":
-                            retry_future = _submit_runtime_future(retry_payload)
-                        else:
-                            retry_future = None
-                    except Exception:
-                        retry_future = None
-                    if retry_future is not None:
-                        if kind == "pool":
-                            event_q.put(
-                                {
-                                    "kind": "pool_executor_rebuilt",
-                                    "pool_id": str(meta.get("pool_id", "") or ""),
-                                    "recoveries": recoveries + 1,
-                                }
-                            )
-                        elif kind == "service":
-                            event_q.put(
-                                {
-                                    "kind": "service_executor_rebuilt",
-                                    "service_id": str(meta.get("service_id", "") or ""),
-                                    "recoveries": recoveries + 1,
-                                }
-                            )
-                        retry_meta = dict(meta)
-                        retry_meta["recoveries"] = recoveries + 1
-                        _track_inflight(retry_future, retry_meta)
-                        continue
-                status_text = "FAILED_INFRA"
-                result = None
-                err_type = "InfraException"
-                err_message = repr(exc)
-                timings = {}
-            kind = str(meta.get("kind", "") or "")
-            if kind == "pool":
-                event_q.put(
-                    {
-                        "kind": "pool_task_done",
-                        "pool_id": str(meta.get("pool_id", "") or ""),
-                        "task_id": str(meta.get("task_id", "") or ""),
-                        "attempt": int(meta.get("attempt", 0) or 0),
-                        "status_text": status_text,
-                        "result": result,
-                        "err_type": err_type,
-                        "err_message": err_message,
-                        "timings": timings,
-                    }
-                )
-                continue
-            if kind == "runtime":
-                event_q.put(
-                    {
-                        "kind": "runtime_task_done",
-                        "runtime_key": str(meta.get("runtime_key", "") or ""),
-                        "task_id": str(meta.get("task_id", "") or ""),
-                        "attempt": int(meta.get("attempt", 0) or 0),
-                        "status_text": status_text,
-                        "result": result,
-                        "err_type": err_type,
-                        "err_message": err_message,
-                    }
-                )
-                continue
-            if kind == "service":
-                event_q.put(
-                    {
-                        "kind": "response",
-                        "request_id": str(meta.get("request_id", "") or ""),
-                        "ok": True,
-                        "status_text": status_text,
-                        "result": result,
-                        "err_type": err_type,
-                        "err_message": err_message,
-                        "timings": timings,
-                    }
-                )
-                continue
-
-        timed_out = []
-        for future, meta in list(inflight.items()):
-            if str(meta.get("kind", "") or "") != "service":
-                continue
-            start_at = float(meta.get("start_at", now) or now)
-            timeout_sec = float(meta.get("timeout_sec", 60.0) or 60.0)
-            if now - start_at <= timeout_sec:
-                continue
-            timed_out.append((future, meta))
-        for future, meta in timed_out:
-            inflight.pop(future, None)
-            service_id = str(meta.get("service_id", "") or "")
-            if service_id:
-                executor = service_executors.pop(service_id, None)
-                if executor is not None:
-                    _shutdown_executor(executor, wait=False)
-            else:
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
-            event_q.put(
-                {
-                    "kind": "response",
-                    "request_id": str(meta.get("request_id", "") or ""),
-                    "ok": False,
-                    "timeout": True,
-                    "error": "invoke timeout",
-                }
+            running = core.handle_request(
+                str(message.get("request_id", "") or ""),
+                str(message.get("action", "") or ""),
+                dict(message.get("payload") or {}),
             )
-
-    for executor in list(service_executors.values()):
-        _shutdown_executor(executor, wait=True)
-    for executor in list(pool_executors.values()):
-        _shutdown_executor(executor, wait=True)
-    _shutdown_executor(task_executor, wait=True)
-    shutdown_q.put(shutdown_sentinel)
-    shutdown_thread.join(timeout=5.0)
+        core.poll_once()
+    core.close()
 
 
 class ExecutorHostClient:
@@ -556,6 +47,7 @@ class ExecutorHostClient:
         self._responses: Dict[str, Dict[str, Any]] = {}
         self._expired_requests: set[str] = set()
         self._async_events: Deque[Dict[str, Any]] = deque()
+        self._worker_pids: set[int] = set()
         self._cv = threading.Condition()
         self._seq = 0
         self._closed = False
@@ -582,6 +74,16 @@ class ExecutorHostClient:
                 continue
             kind = str(item.get("kind", "") or "")
             with self._cv:
+                if kind == "executor_worker_pids":
+                    for pid in item.get("worker_pids", ()) or ():
+                        try:
+                            normalized_pid = int(pid)
+                        except (TypeError, ValueError):
+                            continue
+                        if normalized_pid > 0:
+                            self._worker_pids.add(normalized_pid)
+                    self._async_events.append(item)
+                    continue
                 if kind == "response":
                     request_id = str(item.get("request_id", "") or "")
                     if request_id in self._expired_requests:
@@ -612,6 +114,7 @@ class ExecutorHostClient:
         if self._process.is_alive() and hasattr(self._process, "kill"):
             self._process.kill()
             self._process.join(timeout=1.0)
+        self._terminate_tracked_workers()
         try:
             self._request_q.cancel_join_thread()
             self._request_q.close()
@@ -623,11 +126,37 @@ class ExecutorHostClient:
         except Exception:
             pass
 
+    def _terminate_tracked_workers(self) -> None:
+        with self._cv:
+            worker_pids = list(self._worker_pids)
+            self._worker_pids.clear()
+        current_pid = os.getpid()
+        for pid in worker_pids:
+            if pid <= 0 or pid == current_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                continue
+        if worker_pids:
+            time.sleep(0.05)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for pid in worker_pids:
+            if pid <= 0 or pid == current_pid:
+                continue
+            try:
+                os.kill(pid, sigkill)
+            except Exception:
+                continue
+
     def drain_events(self) -> list[Dict[str, Any]]:
         with self._cv:
             items = list(self._async_events)
             self._async_events.clear()
             return items
+
+    def poll_events(self) -> list[Dict[str, Any]]:
+        return self.drain_events()
 
     def _request(self, action: str, *, payload: Optional[Dict[str, Any]] = None, timeout_sec: float = 10.0) -> Dict[str, Any]:
         if self._closed and action != "shutdown":
