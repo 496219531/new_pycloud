@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import threading
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlsplit
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, _node_instance_key_from_route, _route_sort_key
 from pycloud_parallel.execution.failover import (
@@ -193,6 +194,13 @@ class _DiscoveryRouteCache:
             and route.http_base_url
             and route.service_id not in excluded
         ]
+        conflicts = self._conflicting_http_endpoint_keys(candidates)
+        if conflicts:
+            candidates = [
+                route
+                for route in candidates
+                if self._http_endpoint_key(str(getattr(route, "http_base_url", "") or "")) not in conflicts
+            ]
         normalized_strategy, profile = resolve_service_strategy(strategy)
         with self._lock:
             candidates = [
@@ -201,6 +209,11 @@ class _DiscoveryRouteCache:
                 if self._route_available_locked(name, str(route.service_id))
             ]
             if not candidates:
+                if conflicts:
+                    details = ", ".join(sorted(conflicts))
+                    raise RuntimeError(
+                        f"no available route for service_name={name}; conflicting service HTTP endpoints across node instances: {details}"
+                    )
                 raise RuntimeError(f"no available route for service_name={name}")
             idx = self._route_index.get(name, 0)
             self._route_index[name] = idx + 1
@@ -278,6 +291,26 @@ class _DiscoveryRouteCache:
             selected_route = top_tier[idx % len(top_tier)]
             self._reserve_route_locked(selected_route)
             return selected_route
+
+    @staticmethod
+    def _http_endpoint_key(http_base_url: str) -> str:
+        parsed = urlsplit(str(http_base_url or "").strip())
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+    @classmethod
+    def _conflicting_http_endpoint_keys(cls, routes: Sequence[object]) -> Set[str]:
+        owners: Dict[str, Set[str]] = {}
+        for route in routes:
+            key = cls._http_endpoint_key(str(getattr(route, "http_base_url", "") or ""))
+            if not key:
+                continue
+            node_key = _node_instance_key_from_route(route)
+            if not node_key:
+                continue
+            owners.setdefault(key, set()).add(str(node_key))
+        return {key for key, node_keys in owners.items() if len(node_keys) > 1}
 
     def _local_inflight_count_locked(self, service_name: str, service_id: str) -> int:
         return int(self._local_inflight.get((str(service_name or "").strip(), str(service_id or "").strip()), 0) or 0)

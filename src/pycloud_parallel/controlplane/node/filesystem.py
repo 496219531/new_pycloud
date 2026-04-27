@@ -10,6 +10,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -24,6 +25,38 @@ from pycloud_parallel.data.ref import normalize_object_id
 _SEGMENT_WRITER_LOCKS_LOCK = threading.Lock()
 _SEGMENT_WRITER_LOCKS: Dict[Tuple[str, int], threading.Lock] = {}
 _MANAGED_GLOBAL_BINARY_SENTINEL = "__pycloud_managed_global_binary__"
+
+
+def _is_transient_metadata_replace_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return getattr(exc, "errno", None) in {1, 13, 16, 32, 33}
+
+
+def _replace_metadata_file_with_retry(source_path: Path | str, target_path: Path | str, *, max_attempts: int = 8) -> None:
+    source = Path(source_path)
+    target = Path(target_path)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            os.replace(str(source), str(target))
+            return
+        except Exception as exc:
+            if not _is_transient_metadata_replace_error(exc):
+                raise
+            last_exc = exc
+            time.sleep(min(0.5, 0.02 * float(attempt + 1)))
+    with contextlib.suppress(Exception):
+        source.unlink(missing_ok=True)
+    if isinstance(last_exc, PermissionError):
+        raise PermissionError(
+            f"could not replace metadata file after retry: {target}; "
+            "on Windows, check code_cache permissions and antivirus/file-indexer locks"
+        ) from last_exc
+    if last_exc is not None:
+        raise last_exc
 
 
 def _managed_globals_scope_dir(base_dir: Path, *, scope_kind: str, scope_key: str) -> Path:
@@ -504,7 +537,7 @@ def _write_code_meta(base_dir: Path, artifact: CodeArtifact, *, last_at: Optiona
         os.write(fd, _stable_json_bytes(payload))
     finally:
         os.close(fd)
-    os.replace(tmp_name, str(meta_path))
+    _replace_metadata_file_with_retry(tmp_name, meta_path)
     _write_code_index(base_dir, artifact, created_at=created_at, last_at=effective_last_at)
 
 
@@ -519,7 +552,7 @@ def touch_code_last_at(base_dir: Path, *, code_version: str) -> None:
         os.write(fd, _stable_json_bytes(meta))
     finally:
         os.close(fd)
-    os.replace(tmp_name, str(meta_path))
+    _replace_metadata_file_with_retry(tmp_name, meta_path)
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any], *, prefix: str = ".meta-") -> None:
@@ -530,7 +563,7 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any], *, prefix: str = ".m
         os.write(fd, data)
     finally:
         os.close(fd)
-    os.replace(tmp_name, str(path))
+    _replace_metadata_file_with_retry(tmp_name, path)
 
 
 def _write_managed_globals_current(scope_dir: Path, *, globals_digest: str) -> None:
@@ -542,7 +575,7 @@ def _write_managed_globals_current(scope_dir: Path, *, globals_digest: str) -> N
     }
     tmp_path = current_path.with_suffix(".tmp")
     tmp_path.write_bytes(_stable_json_bytes(payload))
-    os.replace(str(tmp_path), str(current_path))
+    _replace_metadata_file_with_retry(tmp_path, current_path)
 
 
 def _code_artifact_exists(artifact: CodeArtifact) -> bool:

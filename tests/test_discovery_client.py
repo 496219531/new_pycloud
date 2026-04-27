@@ -1032,6 +1032,34 @@ def test_discovery_route_cache_concurrent_selects_same_host_distinct_node_ids():
         cache.stop()
 
 
+def test_discovery_route_cache_rejects_duplicate_http_endpoint_across_nodes():
+    cache = _DiscoveryRouteCache(infocenter_target="127.0.0.1:50051", timeout_sec=5.0)
+    try:
+        route_1 = replace(
+            _demo_route_variant(1),
+            node_id="same-host-node-a",
+            node_instance_id="same-host-node-a-inst",
+            control_addr="10.168.70.123:50061",
+            http_base_url="http://10.168.70.123:18081/svc/svc-id-1",
+        )
+        route_2 = replace(
+            _demo_route_variant(2),
+            node_id="same-host-node-b",
+            node_instance_id="same-host-node-b-inst",
+            control_addr="10.168.70.123:50062",
+            http_base_url="http://10.168.70.123:18081/svc/svc-id-2",
+        )
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(  # noqa: SLF001
+            service_name="svc-demo",
+            routes=[route_1, route_2],
+        )
+
+        with pytest.raises(RuntimeError, match="conflicting service HTTP endpoints"):
+            cache.select_route("svc-demo")
+    finally:
+        cache.stop()
+
+
 def test_discovery_service_client_can_share_route_cache_after_close():
     from pycloud_parallel.controlplane import discovery_client as discovery_client_mod
 

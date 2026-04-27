@@ -213,13 +213,14 @@ def test_service_update_globals_fans_out_to_nodes_concurrently(monkeypatch):
             "inline_keys": ["cfg"],
         }),
     )
-    monkeypatch.setattr(service_session_mod, "should_use_transport_payload_bytes", lambda **_kwargs: False)
+    def _fake_encode_batches(prepared_batches, **_kwargs):
+        encoded = []
+        for value in prepared_batches:
+            encoded_calls.append(dict(value))
+            encoded.append((dict(value), {"encoded": dict(value)}, None))
+        return encoded
 
-    def _fake_dict_to_struct(value, *, mode=""):
-        encoded_calls.append((dict(value), mode))
-        return {"encoded": dict(value)}
-
-    monkeypatch.setattr(service_session_mod, "dict_to_struct", _fake_dict_to_struct)
+    monkeypatch.setattr(service_session_mod, "_encode_managed_globals_batches", _fake_encode_batches)
 
     group = Service(
         owner_client_id="owner-demo",
@@ -324,6 +325,43 @@ def test_service_startup_http_gateway_uses_large_accept_backlog(tmp_path, monkey
         server = node._service_http_gateway._server  # noqa: SLF001
         assert server is not None
         assert server.request_queue_size >= 1024
+    finally:
+        node.close()
+
+
+def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_http_dataref_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        service_name="startup-http-dataref",
+        entry_module="startup_http_dataref_service",
+        bind="127.0.0.1:0",
+    )
+    try:
+        from pycloud_parallel.controlplane.data_ref import DataRef
+        from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
+
+        session = next(iter(node._services.values()))  # noqa: SLF001
+        source = tmp_path / "payload.txt"
+        source.write_text("startup-http-result", encoding="utf-8")
+        artifact = node.data_store.store_path(source)
+        ref = DataRef(
+            ref_id=artifact.object_id,
+            storage_id=artifact.object_id,
+            logical_type="text",
+            format=artifact.format,
+            size_bytes=artifact.size_bytes,
+            materialize_as="text",
+            locator_kind="service_http",
+            locator_token=session.http_base_url,
+            node_id=node.node_id,
+        )
+
+        with DiscoveryServiceClient("127.0.0.1:1", timeout_sec=1.0) as client:
+            assert client.fetch_result_data({"data": ref}) == "startup-http-result"
     finally:
         node.close()
 
@@ -1244,6 +1282,92 @@ class TestOwnerServiceFacade:
 
         assert targets == ["127.0.0.1:50061"]
         assert list(group.nodes.keys()) == ["node-1-inst"]
+        for client in group._clients.values():  # noqa: SLF001
+            client.close()
+
+    def test_deploy_from_infocenter_auto_keeps_duplicate_node_ids_by_instance(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+        nodes = [
+            SimpleNamespace(
+                node_id="node-1",
+                node_instance_id="node-1-a",
+                control_addr="127.0.0.1:50061",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                accept_service_deploy=True,
+                service_worker_available=2,
+                capacity=2,
+                queued=0,
+                python_version="py3.11",
+            ),
+            SimpleNamespace(
+                node_id="node-1",
+                node_instance_id="node-1-b",
+                control_addr="127.0.0.1:50062",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                accept_service_deploy=True,
+                service_worker_available=2,
+                capacity=2,
+                queued=0,
+                python_version="py3.11",
+            ),
+        ]
+        targets = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+                targets.append(target)
+
+            def create_service_from_bytes(self, **_kwargs):
+                return SimpleNamespace(
+                    service_id=f"svc-{self.target.rsplit(':', 1)[-1]}",
+                    service_token="token",
+                    http_base_url=f"http://{self.target}/svc/demo",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=((), nodes),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service.deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-service",
+                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                entry_callable="run",
+                node_count=2,
+                min_success_nodes=2,
+                allow_partial=False,
+                session_cache_dir=str(tmp_path),
+            )
+
+        assert targets == ["127.0.0.1:50061", "127.0.0.1:50062"]
+        assert list(group.nodes.keys()) == ["node-1-a", "node-1-b"]
         for client in group._clients.values():  # noqa: SLF001
             client.close()
 

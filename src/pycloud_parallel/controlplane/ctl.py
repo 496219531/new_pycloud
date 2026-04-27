@@ -141,6 +141,14 @@ def _resolve_bind_value(
     return _format_host_port(resolved_host, resolved_port)
 
 
+def _default_service_http_bind_for_node_bind(bind: str) -> str:
+    host, grpc_port = _split_host_port(bind)
+    http_port = 18081
+    if int(grpc_port) >= 50061:
+        http_port = int(grpc_port) - 31980
+    return _format_host_port(host, http_port)
+
+
 def _probe_host(host: str) -> str:
     text = str(host or "").strip()
     if text in {"", "0.0.0.0", "::", "[::]"}:
@@ -1551,8 +1559,11 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
         remote_hint=infocenter_addr,
         prefer_local=bool(getattr(args, "local", False)),
     )
+    service_http_seed = str(getattr(args, "service_http_bind", "") or "").strip()
+    if not service_http_seed:
+        service_http_seed = _default_service_http_bind_for_node_bind(bind)
     service_http_bind = _resolve_bind_value(
-        str(args.service_http_bind),
+        service_http_seed,
         host=str(getattr(args, "service_http_host", "") or ""),
         port=int(getattr(args, "service_http_port", 0) or 0),
         label="service http bind",
@@ -2363,7 +2374,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_node.add_argument("--bind", default="0.0.0.0:50061", help="full gRPC bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
     start_node.add_argument("--node-host", default="", help="optional grpc bind host override for start-node; default auto-detects local IP")
     start_node.add_argument("--node-port", type=int, default=0, help="optional grpc bind port override for start-node")
-    start_node.add_argument("--service-http-bind", default="0.0.0.0:18081", help="full service HTTP bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
+    start_node.add_argument("--service-http-bind", default="", help="full service HTTP bind address in host:port form for start-node; defaults to the node bind host and a port derived from the gRPC port, for example 50061 -> 18081")
     start_node.add_argument("--service-http-host", default="", help="optional service http bind host override for start-node; default auto-detects local IP")
     start_node.add_argument("--service-http-port", type=int, default=0, help="optional service http bind port override for start-node")
     start_node.add_argument(

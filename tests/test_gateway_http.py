@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent import futures
+from dataclasses import replace
 from datetime import datetime, timezone
 from email.message import Message
 import io
@@ -89,6 +90,29 @@ def _gateway_route_variant(index: int, *, service_name: str = "svc-gateway-retry
         lease_expire_at=datetime.now(timezone.utc),
         http_base_url=f"http://127.0.0.1:{18080 + index}/svc/svc-gw-{index}",
     )
+
+
+def test_gateway_http_only_route_marks_data_ref_as_service_http() -> None:
+    source_route = _gateway_route_variant(1, service_name="svc-startup-http")
+    route = replace(source_route, control_addr="")
+    calls = []
+    app = GatewayHttpApp(
+        route_cache=_SequenceRouteCache([route]),
+        controlplane_target="127.0.0.1:50051",
+        register_data_ref=lambda **kwargs: calls.append(kwargs),
+    )
+
+    ref = DataRef(
+        ref_id="sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        materialize_as="text",
+    )
+    body = app._attach_controlplane_locator({"ok": True, "data": ref}, route=route)  # noqa: SLF001
+
+    updated = body["data"]
+    assert updated.locator_kind == "service_http"
+    assert updated.locator_token == route.http_base_url
+    assert updated.node_instance_id == route.node_instance_id
+    assert calls == []
 
 
 class _SequenceRouteCache:

@@ -38,7 +38,7 @@ from pycloud_parallel.controlplane.serialization_mode import resolve_effective_s
 from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
-from pycloud_parallel.controlplane.serialization import detect_transport_mode, dict_to_struct, serialize_inline_payload, struct_to_python
+from pycloud_parallel.controlplane.serialization import detect_transport_mode, serialize_inline_payload, struct_to_python
 from pycloud_parallel.controlplane.serialization import (
     decode_transport_payload_bytes,
     encode_transport_payload_bytes,
@@ -63,6 +63,7 @@ from pycloud_parallel.execution.scheduler import (
     select_one_candidate,
 )
 from pycloud_parallel.execution.support import (
+    _encode_managed_globals_batches,
     _get_local_ip,
     _prepare_code_blob,
     _prepare_managed_globals_batches_for_upload,
@@ -1030,40 +1031,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             context="taskpool_session",
             **prepare_kwargs,
         )
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=self._serialization_mode,
+        encoded_batches = _encode_managed_globals_batches(
+            prepared_batches,
+            serialization_mode=self._serialization_mode,
+            effective_policy=self.effective_policy,
             context="taskpool_session",
         )
-        encoded_batches = []
-        for prepared_values in prepared_batches:
-            if should_use_transport_payload_bytes(
-                mode=effective_serialization_mode,
-                effective_policy=self.effective_policy,
-            ):
-                encoded_batches.append(
-                    (
-                        prepared_values,
-                        None,
-                        encode_transport_payload_bytes(
-                            prepared_values,
-                            mode=effective_serialization_mode,
-                            context="taskpool_session",
-                            limit_bytes=(
-                                int(self.effective_policy.inline_payload_hard_limit_bytes)
-                                if self.effective_policy is not None
-                                else 0
-                            ),
-                        ),
-                    )
-                )
-            else:
-                encoded_batches.append(
-                    (
-                        prepared_values,
-                        dict_to_struct(prepared_values, mode=effective_serialization_mode),
-                        None,
-                    )
-                )
         digests: Dict[str, str] = {}
         failed_nodes: Dict[str, str] = {}
 

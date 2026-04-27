@@ -70,6 +70,47 @@ def _err_msg(resp_error: pb2.Error, default_msg: str) -> str:
     return default_msg
 
 
+def _set_prepared_globals_payload(
+    request_kwargs: Dict[str, object],
+    prepared_values: Dict[str, object],
+    *,
+    mode: str,
+    effective_policy: Optional[EffectivePolicy],
+    context: str,
+) -> None:
+    if should_use_transport_payload_bytes(mode=mode, effective_policy=effective_policy):
+        request_kwargs["transport_values"] = encode_transport_payload_bytes(
+            prepared_values,
+            mode=mode,
+            context=context,
+            limit_bytes=(
+                int(effective_policy.inline_payload_hard_limit_bytes)
+                if effective_policy is not None
+                else 0
+            ),
+        )
+    else:
+        request_kwargs["values"] = dict_to_struct(prepared_values, mode=mode)
+
+
+def _set_encoded_globals_payload(
+    request_kwargs: Dict[str, object],
+    *,
+    values: Optional[Any] = None,
+    transport_values: Optional[pb2.TransportPayload] = None,
+) -> None:
+    if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
+        request_kwargs["transport_values"] = pb2.TransportPayload(
+            codec=str(transport_values.codec or ""),
+            version=int(transport_values.version or 0),
+            payload=bytes(transport_values.payload or b""),
+        )
+    elif values is not None:
+        request_kwargs["values"] = values
+    else:
+        request_kwargs["values"] = dict_to_struct({})
+
+
 def _sha256_file(path: Path, *, chunk_size: int = FILE_HASH_CHUNK_SIZE_BYTES) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fp:
@@ -822,21 +863,13 @@ class NodeControlClient:
             "runtime_key": str(runtime_key or "").strip(),
             "code_token": str(code_token or "").strip(),
         }
-        if should_use_transport_payload_bytes(
+        _set_prepared_globals_payload(
+            request_kwargs,
+            prepared_values,
             mode=effective_serialization_mode,
             effective_policy=effective_policy,
-        ):
-            request_kwargs["transport_values"] = encode_transport_payload_bytes(
-                prepared_values,
-                mode=effective_serialization_mode,
-                context="taskpool_session",
-                limit_bytes=int(effective_policy.inline_payload_hard_limit_bytes) if effective_policy is not None else 0,
-            )
-        else:
-            request_kwargs["values"] = dict_to_struct(
-                prepared_values,
-                mode=effective_serialization_mode,
-            )
+            context="taskpool_session",
+        )
         resp = self.stub.UpdateRuntimeGlobals(
             pb2.UpdateRuntimeGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,
@@ -862,16 +895,11 @@ class NodeControlClient:
             "runtime_key": str(runtime_key or "").strip(),
             "code_token": str(code_token or "").strip(),
         }
-        if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
-            request_kwargs["transport_values"] = pb2.TransportPayload(
-                codec=str(transport_values.codec or ""),
-                version=int(transport_values.version or 0),
-                payload=bytes(transport_values.payload or b""),
-            )
-        elif values is not None:
-            request_kwargs["values"] = values
-        else:
-            request_kwargs["values"] = dict_to_struct({})
+        _set_encoded_globals_payload(
+            request_kwargs,
+            values=values,
+            transport_values=transport_values,
+        )
         resp = self.stub.UpdateRuntimeGlobals(
             pb2.UpdateRuntimeGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,
@@ -1498,18 +1526,13 @@ class NodeControlClient:
             "service_id": str(service_id or "").strip(),
             "service_token": str(service_token or "").strip(),
         }
-        if should_use_transport_payload_bytes(
+        _set_prepared_globals_payload(
+            request_kwargs,
+            prepared_values,
             mode=effective_serialization_mode,
             effective_policy=effective_policy,
-        ):
-            request_kwargs["transport_values"] = encode_transport_payload_bytes(
-                prepared_values,
-                mode=effective_serialization_mode,
-                context="service_owner",
-                limit_bytes=int(effective_policy.inline_payload_hard_limit_bytes) if effective_policy is not None else 0,
-            )
-        else:
-            request_kwargs["values"] = dict_to_struct(prepared_values, mode=effective_serialization_mode)
+            context="service_owner",
+        )
         resp = self.stub.UpdateServiceGlobals(
             pb2.UpdateServiceGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,
@@ -1533,16 +1556,11 @@ class NodeControlClient:
             "service_id": str(service_id or "").strip(),
             "service_token": str(service_token or "").strip(),
         }
-        if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
-            request_kwargs["transport_values"] = pb2.TransportPayload(
-                codec=str(transport_values.codec or ""),
-                version=int(transport_values.version or 0),
-                payload=bytes(transport_values.payload or b""),
-            )
-        elif values is not None:
-            request_kwargs["values"] = values
-        else:
-            request_kwargs["values"] = dict_to_struct({})
+        _set_encoded_globals_payload(
+            request_kwargs,
+            values=values,
+            transport_values=transport_values,
+        )
         resp = self.stub.UpdateServiceGlobals(
             pb2.UpdateServiceGlobalsRequest(**request_kwargs),
             timeout=self.timeout_sec,

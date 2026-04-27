@@ -3,6 +3,7 @@ from __future__ import annotations
 """Restricted startup service node built on the normal NodeControl runtime."""
 
 from typing import Any
+from urllib.parse import unquote
 
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
@@ -84,6 +85,23 @@ class StartupServiceNode(NodeControlState):
         service_name: str = "",
     ) -> str:
         return self.update_globals(values, service_id=service_id, service_name=service_name)
+
+    def _extra_get_mounted_startup_service(self, service_id: str, path_parts: list[str], query: dict[str, list[str]]):
+        handled = NodeRuntimeBase._extra_get_mounted_startup_service(self, service_id, path_parts, query)
+        if handled is not None:
+            return handled
+        if len(path_parts) == 2 and path_parts[0] == "objects":
+            object_id = unquote(str(path_parts[1] or ""))
+            artifact = self.get_object_artifact(object_id)
+            if getattr(artifact, "storage_backend", "file") == "segment":
+                with open(artifact.segment_path, "rb") as fp:
+                    fp.seek(max(0, int(getattr(artifact, "segment_offset", 0) or 0)))
+                    body = fp.read(max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes)))
+            else:
+                with open(artifact.path, "rb") as fp:
+                    body = fp.read()
+            return 200, body, "application/octet-stream"
+        return None
 
     def close(self) -> None:
         NodeControlState.close(self)

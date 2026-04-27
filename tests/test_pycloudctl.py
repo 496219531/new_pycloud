@@ -1250,6 +1250,37 @@ def test_cmd_start_node_uses_loopback_defaults_when_local_enabled(tmp_path, monk
     ]
 
 
+def test_cmd_start_node_derives_default_service_http_port_from_node_bind(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-node",
+        "--node-id",
+        "node-2",
+        "--infocenter-addr",
+        "10.168.70.123:50051",
+        "--bind",
+        "10.168.30.154:50062",
+    ])
+    started: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.168.30.154")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+    monkeypatch.setattr(ctl, "_default_node_worker_capacity", lambda: 6)
+    monkeypatch.setattr(
+        ctl,
+        "_start_standalone_node",
+        lambda root, **kwargs: started.append({"root": root, **kwargs}),
+    )
+
+    assert ctl._cmd_start_node(args) == 0
+    assert started[0]["bind"] == "10.168.30.154:50062"
+    assert started[0]["service_http_bind"] == "10.168.30.154:18082"
+
+
 def test_cmd_start_node_can_disable_registration(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args([

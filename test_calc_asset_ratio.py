@@ -288,14 +288,14 @@ def calc_fund_list_asset_ratio2(
         infocenter_target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
         source=calc_asset_ratio.get_fund_asset_ratio,
-        worker_count=5,
-        node_count=2,
+        worker_count=7,
+        node_count=1,
         tags=["compute"],
         timeout_sec=300.0,
         managed_global_names=MANAGED_GLOBAL_NAMES,
         serialization_mode=TASKPOOL_SERIALIZATION_MODE,
     ) as pool:
-        pool.update_globals(calc_asset_ratio.update_globals())
+        # pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
         print("pool status:", {k: v.status for k, v in pool.status_map().items()})
         t1 = time.time()

@@ -1300,13 +1300,20 @@ def _execute_payload_in_subprocess(
                     invoke_wrapper_ms = float(timed.get("invoke_wrapper_ms", 0.0) or 0.0)
                     user_fn_ms = float(timed.get("user_fn_ms", 0.0) or 0.0)
                     encode_start = invoke_end
-                status_text, result, error_type, error_message = _normalize_user_return(
-                    ret,
-                    object_dir=object_dir,
-                    serialization_mode=serialization_mode,
-                    use_transport_result=use_transport_result,
-                )
-                encode_end = time.perf_counter()
+                try:
+                    status_text, result, error_type, error_message = _normalize_user_return(
+                        ret,
+                        object_dir=object_dir,
+                        serialization_mode=serialization_mode,
+                        use_transport_result=use_transport_result,
+                    )
+                except LargeResultError:
+                    raise
+                except Exception as exc:
+                    encode_end = time.perf_counter()
+                    return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
+                else:
+                    encode_end = time.perf_counter()
                 return (status_text, result, error_type, error_message, _timings())
             except LargeResultError as exc:
                 if decode_end <= decode_start:

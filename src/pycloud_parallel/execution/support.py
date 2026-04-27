@@ -54,6 +54,7 @@ from pycloud_parallel.controlplane.payload_transport import (
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.serialization import (
     dataframe_bundle_parquet_frame,
+    dict_to_struct,
     encode_transport_payload_bytes,
     log_payload_flow,
     serialize_arrow_compatible,
@@ -776,6 +777,47 @@ def _encoded_managed_globals_size(
         mode=effective_mode,
     )
     return int(size_bytes)
+
+
+def _encode_managed_globals_batches(
+    prepared_batches: Sequence[Dict[str, object]],
+    *,
+    serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
+    context: str = "taskpool_session",
+) -> List[Tuple[Dict[str, object], Optional[object], Optional[object]]]:
+    effective_mode = resolve_effective_serialization_mode(
+        request_mode=serialization_mode,
+        context=context,
+    )
+    encoded_batches: List[Tuple[Dict[str, object], Optional[object], Optional[object]]] = []
+    for prepared_values in prepared_batches:
+        if should_use_transport_payload_bytes(mode=effective_mode, effective_policy=effective_policy):
+            encoded_batches.append(
+                (
+                    prepared_values,
+                    None,
+                    encode_transport_payload_bytes(
+                        prepared_values,
+                        mode=effective_mode,
+                        context=context,
+                        limit_bytes=(
+                            int(effective_policy.inline_payload_hard_limit_bytes)
+                            if effective_policy is not None
+                            else 0
+                        ),
+                    ),
+                )
+            )
+        else:
+            encoded_batches.append(
+                (
+                    prepared_values,
+                    dict_to_struct(prepared_values, mode=effective_mode),
+                    None,
+                )
+            )
+    return encoded_batches
 
 
 def _stage_managed_global_value_for_upload(
@@ -1887,6 +1929,7 @@ __all__ = [
     "_default_job_update_globals_for_blob",
     "_default_service_session_cache_dir",
     "_emit_owner_notice",
+    "_encode_managed_globals_batches",
     "_ensure_private_dir",
     "_filter_nodes_by_runtime",
     "_get_local_ip",

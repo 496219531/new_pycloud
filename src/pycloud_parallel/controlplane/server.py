@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 import logging
+from pathlib import Path
+import re
 import signal
 from concurrent import futures
 from typing import Callable, Optional, Tuple
@@ -36,6 +38,18 @@ from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_artifact_dir_part(value: str, *, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or fallback
+
+
+def _default_nodecontrol_artifact_dir(*, bind: str, node_id: str) -> str:
+    _host, port = split_host_port(str(bind or ""))
+    node_part = _safe_artifact_dir_part(node_id, fallback="node")
+    return str((Path.cwd() / "code_cache" / f"{node_part}-{int(port)}").resolve())
 
 
 def _normalize_role(value: str) -> str:
@@ -176,6 +190,7 @@ def build_nodecontrol_server(
     bind: str,
     *,
     node_id: str,
+    artifact_dir: str = "",
     worker_capacity: int = NODE_WORKER_CAPACITY,
     queue_capacity: int = NODE_QUEUE_CAPACITY,
     max_workers: int = NODE_MAX_WORKERS,
@@ -191,6 +206,7 @@ def build_nodecontrol_server(
     )
     state = NodeControlState(
         node_id=node_id,
+        artifact_dir=artifact_dir or _default_nodecontrol_artifact_dir(bind=bind, node_id=node_id),
         worker_capacity=worker_capacity,
         queue_capacity=queue_capacity,
         service_http_bind=service_http_bind,
@@ -257,6 +273,7 @@ def main() -> None:
     parser.add_argument("--role", type=_normalize_role, required=True)
     parser.add_argument("--bind", default="")
     parser.add_argument("--node-id", default="node-local-01")
+    parser.add_argument("--artifact-dir", default="")
     parser.add_argument("--service-name", default=DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME)
     parser.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY)
     parser.add_argument("--worker-capacity", type=int, default=NODE_WORKER_CAPACITY)
@@ -386,6 +403,7 @@ def main() -> None:
     server, state = build_nodecontrol_server(
         bind,
         node_id=args.node_id,
+        artifact_dir=str(args.artifact_dir or "").strip(),
         queue_capacity=args.queue_capacity,
         worker_capacity=args.worker_capacity,
         max_workers=args.max_workers,

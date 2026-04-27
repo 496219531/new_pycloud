@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote
 
 from pycloud_parallel.controlplane.artifact import (
     _dependency_policy_allows_install,
@@ -245,6 +246,7 @@ class NodeControlState(NodeRuntimeBase):
                 invoke_handler=self._invoke_service_http,
                 status_handler=self._service_status_http,
                 methods_handler=self._service_methods_http,
+                extra_get_handler=self._service_extra_get_http,
             )
 
     def _record_service_timing_locked(
@@ -2536,6 +2538,27 @@ class NodeControlState(NodeRuntimeBase):
             serialization_mode=serialization_mode,
             use_transport_result=use_transport_result,
         )
+
+    def _service_extra_get_http(
+        self,
+        service_id: str,
+        path_parts: List[str],
+        query: Dict[str, List[str]],
+    ) -> Optional[Tuple[object, ...]]:
+        del service_id
+        del query
+        if len(path_parts) != 2 or path_parts[0] != "objects":
+            return None
+        object_id = unquote(str(path_parts[1] or ""))
+        artifact = self.get_object_artifact(object_id)
+        if getattr(artifact, "storage_backend", "file") == "segment":
+            with open(artifact.segment_path, "rb") as fp:
+                fp.seek(max(0, int(getattr(artifact, "segment_offset", 0) or 0)))
+                body = fp.read(max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes)))
+        else:
+            with open(artifact.path, "rb") as fp:
+                body = fp.read()
+        return 200, body, "application/octet-stream"
 
     def call_service(
         self,

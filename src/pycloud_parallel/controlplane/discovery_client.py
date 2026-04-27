@@ -5,9 +5,12 @@ from __future__ import annotations
 import contextlib
 import atexit
 import threading
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
@@ -15,12 +18,13 @@ from .client_transport import (
     _call_route_http,
     _is_route_failure,
     _list_route_methods_http,
+    _materialize_downloaded_result,
     _serialize_route,
 )
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
 from pycloud_parallel.controlplane.discovery_route_cache import _DiscoveryRouteCache
-from pycloud_parallel.controlplane.infocenter_client import _node_instance_key_from_route
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, _node_instance_key_from_route
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
@@ -184,6 +188,18 @@ class DiscoveryServiceClient:
         if ref is None:
             raise ValueError("service result is inline data; no download needed")
         self._touch_data_ref(ref)
+        data_ref = maybe_data_ref(ref)
+        if data_ref is not None:
+            http_base_url = self._service_http_base_url_for_ref(data_ref)
+            if http_base_url:
+                try:
+                    return self._download_service_http_ref_to_file(
+                        data_ref,
+                        http_base_url=http_base_url,
+                        target_path=target_path,
+                    )
+                finally:
+                    self._release_data_ref_if_consumed(ref)
         resolved = resolve_data_ref(ref, target=self.infocenter_target, timeout_sec=self.timeout_sec)
         try:
             with client_mod.NodeControlClient(resolved.control_addr, timeout_sec=self.timeout_sec) as client:
@@ -198,6 +214,33 @@ class DiscoveryServiceClient:
                 return response_or_data["data"]
             return response_or_data
         self._touch_data_ref(ref)
+        data_ref = maybe_data_ref(ref)
+        if data_ref is not None:
+            http_base_url = self._service_http_base_url_for_ref(data_ref)
+            if http_base_url:
+                try:
+                    if target_path:
+                        return self._download_service_http_ref_to_file(
+                            data_ref,
+                            http_base_url=http_base_url,
+                            target_path=target_path,
+                        )
+                    suffix = Path(f"result{('.' + data_ref.format) if data_ref.format else ''}")
+                    tmp = tempfile.NamedTemporaryFile(prefix="pycloud-result-", suffix=suffix.suffix, delete=False)
+                    tmp_path = Path(tmp.name)
+                    tmp.close()
+                    try:
+                        self._download_service_http_ref_to_file(
+                            data_ref,
+                            http_base_url=http_base_url,
+                            target_path=str(tmp_path),
+                        )
+                        return _materialize_downloaded_result(tmp_path, result_ref=data_ref)
+                    except Exception:
+                        tmp_path.unlink(missing_ok=True)
+                        raise
+                finally:
+                    self._release_data_ref_if_consumed(ref)
         resolved = resolve_data_ref(ref, target=self.infocenter_target, timeout_sec=self.timeout_sec)
         try:
             with client_mod.NodeControlClient(resolved.control_addr, timeout_sec=self.timeout_sec) as client:
@@ -381,6 +424,21 @@ class DiscoveryServiceClient:
     def _attach_controlplane_locator(self, response: Dict[str, object], *, route: object) -> Dict[str, object]:
         if not isinstance(response, dict) or "data" not in response:
             return response
+        route_control_addr = str(getattr(route, "control_addr", "") or "").strip()
+        route_http_base_url = str(getattr(route, "http_base_url", "") or "").strip()
+        if not route_control_addr and route_http_base_url:
+            updated = with_data_ref_locator(
+                response.get("data"),
+                locator_kind="service_http",
+                locator_token=route_http_base_url,
+                node_id=str(getattr(route, "node_id", "") or ""),
+                node_instance_id=str(getattr(route, "node_instance_id", "") or ""),
+            )
+            if updated is response.get("data"):
+                return response
+            body = dict(response)
+            body["data"] = updated
+            return body
         updated = with_data_ref_locator(
             response.get("data"),
             locator_kind="controlplane",
@@ -397,15 +455,58 @@ class DiscoveryServiceClient:
                     updated,
                     node_id=str(getattr(route, "node_id", "") or ""),
                     node_instance_id=str(getattr(route, "node_instance_id", "") or ""),
-                    control_addr=str(getattr(route, "control_addr", "") or ""),
+                    control_addr=route_control_addr,
                     locator_kind="node_control",
-                    locator_token=str(getattr(route, "control_addr", "") or ""),
+                    locator_token=route_control_addr,
                 )
             except Exception:
                 pass
         body = dict(response)
         body["data"] = updated
         return body
+
+    def _service_http_base_url_for_ref(self, ref: object) -> str:
+        data_ref = maybe_data_ref(ref)
+        if data_ref is None:
+            return ""
+        locator_kind = str(data_ref.locator_kind or "").strip().lower()
+        locator_token = str(data_ref.locator_token or "").strip()
+        if locator_kind == "service_http" and locator_token:
+            return locator_token.rstrip("/")
+        node_instance_id = str(data_ref.node_instance_id or "").strip()
+        if not node_instance_id:
+            return ""
+        try:
+            with InfoCenterClient(self.infocenter_target, timeout_sec=self.timeout_sec) as client:
+                routes = client.list_service_routes(service_name="", healthy_only=False, limit=2000)
+        except Exception:
+            return ""
+        for route in routes:
+            if str(getattr(route, "node_instance_id", "") or "").strip() != node_instance_id:
+                continue
+            if str(getattr(route, "control_addr", "") or "").strip():
+                continue
+            http_base_url = str(getattr(route, "http_base_url", "") or "").strip()
+            if http_base_url:
+                return http_base_url.rstrip("/")
+        return ""
+
+    def _download_service_http_ref_to_file(self, ref: object, *, http_base_url: str, target_path: str) -> Path:
+        data_ref = maybe_data_ref(ref)
+        if data_ref is None:
+            raise TypeError("result_ref must be a DataRef-compatible value")
+        if not str(target_path or "").strip():
+            raise ValueError("target_path is required")
+        object_id = str(data_ref.object_id or data_ref.ref_id or "").strip()
+        if not object_id:
+            raise ValueError("data ref object_id is required")
+        url = f"{str(http_base_url or '').rstrip('/')}/objects/{quote(object_id, safe='')}"
+        req = Request(url, method="GET")
+        path = Path(target_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with urlopen(req, timeout=max(2.0, self.timeout_sec + 1.0)) as resp:
+            path.write_bytes(resp.read())
+        return path
 
     def _touch_data_ref(self, ref: object) -> None:
         data_ref = maybe_data_ref(ref)

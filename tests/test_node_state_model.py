@@ -37,8 +37,10 @@ from pycloud_parallel.controlplane.node.filesystem import (
     _code_index_link_path,
     _code_pkg_dir,
     _code_variant_dir,
+    _load_code_meta,
+    _write_code_meta,
 )
-from pycloud_parallel.controlplane.node.models import StoredResultArtifact
+from pycloud_parallel.controlplane.node.models import CodeArtifact, StoredResultArtifact
 from pycloud_parallel.controlplane.node.results import (
     LargeResultError,
     _commit_result_file,
@@ -81,6 +83,68 @@ def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeyp
     stored = object_dir / digest[:2] / f"{digest[2:]}.bin"
     assert stored.exists()
     assert stored.read_bytes() == b"hello"
+
+
+def test_write_code_meta_retries_transient_permission_error(tmp_path, monkeypatch):
+    calls = {"count": 0}
+    real_replace = os.replace
+
+    def _flaky_replace(src, dst):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise PermissionError(13, "Access is denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _flaky_replace)
+    code_version = "a" * 64
+    artifact = CodeArtifact(
+        code_version=code_version,
+        path=str(tmp_path / "pkg"),
+        runtime="py3",
+        entry_module="demo_service",
+        entry_callable="run",
+        package_format="dir",
+        export_mode="module",
+        export_methods=(),
+        export_decorator="",
+        dependency_policy_mode="safe",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=12,
+        created_at=utc_now(),
+    )
+
+    _write_code_meta(tmp_path, artifact)
+
+    meta = _load_code_meta(tmp_path, code_version=code_version)
+    assert meta["code_version"] == code_version
+    assert meta["entry_module"] == "demo_service"
+    assert calls["count"] >= 2
+
+
+def test_nodecontrol_default_artifact_dir_isolated_by_bind_port(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.server import build_nodecontrol_server
+
+    monkeypatch.chdir(tmp_path)
+    server_a, state_a = build_nodecontrol_server(
+        "127.0.0.1:50061",
+        node_id="node-same",
+        service_http_bind="127.0.0.1:0",
+    )
+    server_b, state_b = build_nodecontrol_server(
+        "127.0.0.1:50062",
+        node_id="node-same",
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        assert state_a.artifact_dir != state_b.artifact_dir
+        assert state_a.artifact_dir.name == "node-same-50061"
+        assert state_b.artifact_dir.name == "node-same-50062"
+    finally:
+        state_a.close()
+        state_b.close()
+        server_a.stop(0)
+        server_b.stop(0)
 
 
 def test_normalize_user_return_inlines_dataframe_when_limit_allows(tmp_path, monkeypatch):
@@ -982,6 +1046,91 @@ def test_execute_payload_in_subprocess_uses_unified_inbound_normalizer(tmp_path,
         assert err_message == ""
         assert captured["payload"] == {"value": 5}
         assert captured["mode"] == "task_submit"
+    finally:
+        state.close()
+
+
+def test_execute_payload_marks_result_encode_permission_error_as_infra(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-result-encode-permission-01",
+        artifact_dir=str(tmp_path / "code_cache_result_encode_permission"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        artifact, _cached = state.put_code(
+            client_id="client-result-encode",
+            sha256="sha256:" + hashlib.sha256(blob).hexdigest(),
+            runtime="py3",
+            entry_module="result_encode_permission_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            chunks=[blob],
+        )
+
+        def _raise_permission(*_args, **_kwargs):
+            raise PermissionError(13, "Access is denied")
+
+        monkeypatch.setattr(
+            "pycloud_parallel.controlplane.node.execution._normalize_user_return",
+            _raise_permission,
+        )
+
+        status, _result, err_type, err_message, timings = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={},
+                payload_mode="http_call",
+            )
+        )
+
+        assert status == "FAILED_INFRA"
+        assert err_type == "PermissionError"
+        assert "Access is denied" in err_message
+        assert timings["encode_ms"] >= 0
+    finally:
+        state.close()
+
+
+def test_execute_payload_keeps_user_permission_error_as_user_failure(tmp_path):
+    state = NodeControlState(
+        node_id="node-user-permission-01",
+        artifact_dir=str(tmp_path / "code_cache_user_permission"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(**_kwargs):\n    raise PermissionError(13, 'Access is denied')\n"
+        artifact, _cached = state.put_code(
+            client_id="client-user-permission",
+            sha256="sha256:" + hashlib.sha256(blob).hexdigest(),
+            runtime="py3",
+            entry_module="user_permission_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            chunks=[blob],
+        )
+
+        status, _result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={},
+                payload_mode="http_call",
+            )
+        )
+
+        assert status == "FAILED_USER"
+        assert err_type == "PermissionError"
+        assert "Access is denied" in err_message
     finally:
         state.close()
 

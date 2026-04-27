@@ -193,16 +193,14 @@ def test_task_pool_update_globals_fans_out_to_nodes_concurrently(monkeypatch) ->
     lock = threading.Lock()
     both_started = threading.Event()
 
-    def _fake_dict_to_struct(values, *, mode="legacy_v1"):
-        encode_calls.append((dict(values), mode))
-        return struct_pb2.Struct()
+    def _fake_encode_batches(prepared_batches, **_kwargs):
+        encoded = []
+        for values in prepared_batches:
+            encode_calls.append(dict(values))
+            encoded.append((dict(values), struct_pb2.Struct(), None))
+        return encoded
 
-    def _fake_encode_transport_payload_bytes(values, **_kwargs):
-        encode_calls.append((dict(values), "transport"))
-        return pb2.TransportPayload(codec="test", version=1, payload=b"payload")
-
-    monkeypatch.setattr(task_pool_mod, "dict_to_struct", _fake_dict_to_struct)
-    monkeypatch.setattr(task_pool_mod, "encode_transport_payload_bytes", _fake_encode_transport_payload_bytes)
+    monkeypatch.setattr(task_pool_mod, "_encode_managed_globals_batches", _fake_encode_batches)
 
     class _FakeClient:
         def __init__(self, node_id: str):

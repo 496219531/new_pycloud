@@ -37,7 +37,6 @@ from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
     resolve_effective_policy,
-    should_use_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.infocenter_client import (
     InfoCenterNode,
@@ -56,8 +55,6 @@ from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
-from pycloud_parallel.controlplane.serialization import dict_to_struct
-from pycloud_parallel.controlplane.serialization import encode_transport_payload_bytes
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
@@ -89,6 +86,7 @@ from pycloud_parallel.execution.support import (
     _artifact_code_version,
     _default_service_session_cache_dir,
     _emit_owner_notice,
+    _encode_managed_globals_batches,
     _ensure_private_dir,
     _filter_nodes_by_runtime,
     _get_local_ip,
@@ -2104,7 +2102,7 @@ class Service(ServiceExecutionSession):
                     -int(node.service_worker_available),
                     -int(node.capacity),
                     int(node.queued),
-                    node.node_id,
+                    _node_instance_key_from_node(node),
                 )
             )
             effective_node_count = max(1, desired_node_count or required_success_nodes)
@@ -3098,40 +3096,12 @@ class Service(ServiceExecutionSession):
             context="service_owner",
             **prepare_kwargs,
         )
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=self.serialization_mode,
+        encoded_batches = _encode_managed_globals_batches(
+            prepared_batches,
+            serialization_mode=self.serialization_mode,
+            effective_policy=self.effective_policy,
             context="service_owner",
         )
-        encoded_batches = []
-        for prepared_values in prepared_batches:
-            if should_use_transport_payload_bytes(
-                mode=effective_serialization_mode,
-                effective_policy=self.effective_policy,
-            ):
-                encoded_batches.append(
-                    (
-                        prepared_values,
-                        None,
-                        encode_transport_payload_bytes(
-                            prepared_values,
-                            mode=effective_serialization_mode,
-                            context="service_owner",
-                            limit_bytes=(
-                                int(self.effective_policy.inline_payload_hard_limit_bytes)
-                                if self.effective_policy is not None
-                                else 0
-                            ),
-                        ),
-                    )
-                )
-            else:
-                encoded_batches.append(
-                    (
-                        prepared_values,
-                        dict_to_struct(prepared_values, mode=effective_serialization_mode),
-                        None,
-                    )
-                )
         digests: Dict[str, str] = {}
         failed_nodes: Dict[str, str] = {}
         update_targets: List[Tuple[str, ServiceSessionClient]] = []

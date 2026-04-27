@@ -645,10 +645,25 @@ class GatewayHttpApp:
     def _attach_controlplane_locator(self, data: Dict[str, object], *, route: InfoCenterServiceRoute) -> Dict[str, object]:
         if not isinstance(data, dict) or "data" not in data:
             return data
+        route_control_addr = str(route.control_addr or "").strip()
+        route_http_base_url = str(route.http_base_url or "").strip()
+        if not route_control_addr and route_http_base_url:
+            updated = with_data_ref_locator(
+                data.get("data"),
+                locator_kind="service_http",
+                locator_token=route_http_base_url,
+                node_id=str(route.node_id or ""),
+                node_instance_id=str(route.node_instance_id or ""),
+            )
+            if updated is data.get("data"):
+                return data
+            body = dict(data)
+            body["data"] = updated
+            return body
         updated = with_data_ref_locator(
             data.get("data"),
             locator_kind="controlplane" if self.controlplane_target else "node_control",
-            locator_token=self.controlplane_target or str(route.control_addr or ""),
+            locator_token=self.controlplane_target or route_control_addr,
             node_id=str(route.node_id or ""),
             node_instance_id=str(route.node_instance_id or ""),
         )
@@ -661,9 +676,9 @@ class GatewayHttpApp:
                     ref=updated,
                     node_id=str(route.node_id or ""),
                     node_instance_id=str(route.node_instance_id or ""),
-                    control_addr=str(route.control_addr or ""),
+                    control_addr=route_control_addr,
                     locator_kind="node_control",
-                    locator_token=str(route.control_addr or ""),
+                    locator_token=route_control_addr,
                 )
             except Exception:
                 pass
