@@ -295,7 +295,7 @@ def calc_fund_list_asset_ratio2(
         managed_global_names=MANAGED_GLOBAL_NAMES,
         serialization_mode=TASKPOOL_SERIALIZATION_MODE,
     ) as pool:
-        # pool.update_globals(calc_asset_ratio.update_globals())
+        pool.update_globals(calc_asset_ratio.update_globals())
         print("pool nodes:", pool.node_ids)
         print("pool status:", {k: v.status for k, v in pool.status_map().items()})
         t1 = time.time()
@@ -513,11 +513,11 @@ if __name__ == "__main__":
     t1 = time.time()
     # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)

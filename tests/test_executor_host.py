@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 
 import pytest
 
 from pycloud_parallel.controlplane.executor_backend import (
-    EmbeddedExecutorBackend,
     SubprocessExecutorBackend,
     create_executor_backend,
 )
+from pycloud_parallel.controlplane import executor_core as executor_core_mod
+from pycloud_parallel.controlplane.executor_core import ExecutorCore
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 from pycloud_parallel.controlplane.node.execution import _build_execute_spec
 from pycloud_parallel.controlplane.node.state import NodeControlState
@@ -61,15 +63,209 @@ def _wait_for_backend_event(backend, kind: str, *, timeout_sec: float = 8.0):
     raise AssertionError(f"timed out waiting for backend event: {kind}")
 
 
-def test_create_executor_backend_defaults_to_embedded():
+def test_create_executor_backend_defaults_to_subprocess_host():
     backend = create_executor_backend(task_worker_capacity=1)
     try:
-        assert backend.backend_name == "embedded"
+        assert backend.backend_name == "subprocess_host"
     finally:
         backend.close()
 
 
-@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend, EmbeddedExecutorBackend])
+def test_create_executor_backend_rejects_embedded():
+    with pytest.raises(ValueError, match="subprocess_host"):
+        create_executor_backend(executor_backend="embedded", task_worker_capacity=1)
+
+
+def test_subprocess_backend_uses_distinct_hosts_per_session(tmp_path):
+    state, artifact = _seed_artifact(
+        tmp_path,
+        blob=b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n",
+        entry_module="executor_backend_distinct_hosts",
+    )
+    backend = SubprocessExecutorBackend(task_worker_capacity=1)
+    try:
+        spec = _build_execute_spec(
+            artifact,
+            object_dir=state.object_dir,
+            work_dir=str(tmp_path),
+            method_name="run",
+            payload={},
+            payload_mode="task_submit",
+            warmup_only=True,
+        )
+        assert backend.prepare_artifact(artifact_spec=spec, scope="pool", key="pool-a").get("ok") is True
+        assert backend.prepare_artifact(artifact_spec=spec, scope="pool", key="pool-b").get("ok") is True
+        assert set(backend._pool_clients) == {"pool-a", "pool-b"}  # noqa: SLF001
+        assert backend._pool_clients["pool-a"] is not backend._pool_clients["pool-b"]  # noqa: SLF001
+    finally:
+        backend.close()
+        state.close()
+
+
+def test_subprocess_backend_reports_dead_session_host():
+    backend = SubprocessExecutorBackend(task_worker_capacity=1)
+
+    class _FakeClient:
+        def __init__(self, alive):
+            self._alive = alive
+
+        def is_alive(self):
+            return self._alive
+
+    try:
+        assert backend.is_alive()
+        backend._pool_clients["pool-dead"] = _FakeClient(False)  # noqa: SLF001
+        assert not backend.is_alive()
+        with pytest.raises(RuntimeError, match="task pool executor host died"):
+            backend.submit_pool_task(pool_id="pool-dead", task_id="task-1", attempt=1, execute_spec={})
+    finally:
+        backend._pool_clients.clear()  # noqa: SLF001
+        backend.close()
+
+
+def test_executor_core_defaults_to_fork_inside_host_on_posix(monkeypatch):
+    monkeypatch.setenv("PYCLOUD_EXECUTOR_PARENT_KIND", "executor_host")
+    monkeypatch.delenv("PYCLOUD_WORKER_START_METHOD", raising=False)
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(executor_core_mod.mp, "get_all_start_methods", lambda: ["fork", "spawn"])
+
+    contexts = []
+
+    class _FakeContext:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(executor_core_mod.mp, "get_context", lambda name: contexts.append(name) or _FakeContext(name))
+
+    assert ExecutorCore._ensure_mp_context().name == "fork"  # noqa: SLF001
+    assert contexts == ["fork"]
+
+
+def test_executor_core_defaults_to_spawn_on_windows(monkeypatch):
+    monkeypatch.setenv("PYCLOUD_EXECUTOR_PARENT_KIND", "executor_host")
+    monkeypatch.delenv("PYCLOUD_WORKER_START_METHOD", raising=False)
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(executor_core_mod.mp, "get_all_start_methods", lambda: ["spawn"])
+
+    contexts = []
+
+    class _FakeContext:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(executor_core_mod.mp, "get_context", lambda name: contexts.append(name) or _FakeContext(name))
+
+    assert ExecutorCore._ensure_mp_context().name == "spawn"  # noqa: SLF001
+    assert contexts == ["spawn"]
+
+
+@pytest.mark.parametrize("requested_start_method", ["", "fork"])
+def test_executor_core_falls_back_to_spawn_when_fork_submit_fails(monkeypatch, requested_start_method):
+    monkeypatch.setenv("PYCLOUD_EXECUTOR_PARENT_KIND", "executor_host")
+    if requested_start_method:
+        monkeypatch.setenv("PYCLOUD_WORKER_START_METHOD", requested_start_method)
+    else:
+        monkeypatch.delenv("PYCLOUD_WORKER_START_METHOD", raising=False)
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(executor_core_mod.mp, "get_all_start_methods", lambda: ["fork", "spawn"])
+
+    contexts = []
+
+    class _FakeContext:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(executor_core_mod.mp, "get_context", lambda name: contexts.append(name) or _FakeContext(name))
+
+    class _FakeExecutor:
+        def __init__(self, max_workers, mp_context):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(executor_core_mod, "ProcessPoolExecutor", _FakeExecutor)
+    calls = []
+
+    class _FakeFuture:
+        def add_done_callback(self, _callback):
+            pass
+
+    def _fake_submit(executor, _payload):
+        calls.append(executor.mp_context.name)
+        if executor.mp_context.name == "fork":
+            raise RuntimeError("fork failed")
+        return _FakeFuture()
+
+    monkeypatch.setattr(executor_core_mod, "submit_callable_to_worker", _fake_submit)
+
+    core = ExecutorCore(task_worker_capacity=1)
+    try:
+        assert core.handle_request("create", "create_task_pool", {"pool_id": "pool-fallback", "worker_count": 1})
+        assert core.handle_request(
+            "submit",
+            "submit_pool_task",
+            {"pool_id": "pool-fallback", "task_id": "task-1", "attempt": 1},
+        )
+        assert calls == ["fork", "spawn"]
+        assert contexts == ["fork", "spawn"]
+    finally:
+        core.close()
+
+
+def test_executor_core_background_submit_falls_back_to_spawn_when_fork_fails(monkeypatch):
+    monkeypatch.setenv("PYCLOUD_EXECUTOR_PARENT_KIND", "executor_host")
+    monkeypatch.setenv("PYCLOUD_WORKER_START_METHOD", "fork")
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(executor_core_mod.mp, "get_all_start_methods", lambda: ["fork", "spawn"])
+
+    contexts = []
+
+    class _FakeContext:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(executor_core_mod.mp, "get_context", lambda name: contexts.append(name) or _FakeContext(name))
+
+    class _FakeExecutor:
+        def __init__(self, max_workers, mp_context):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(executor_core_mod, "ProcessPoolExecutor", _FakeExecutor)
+    calls = []
+
+    class _FakeFuture:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    def _fake_submit(executor, _payload):
+        calls.append(executor.mp_context.name)
+        if executor.mp_context.name == "fork":
+            raise RuntimeError("fork failed")
+        return _FakeFuture()
+
+    monkeypatch.setattr(executor_core_mod, "submit_callable_to_worker", _fake_submit)
+
+    core = ExecutorCore(task_worker_capacity=1)
+    try:
+        assert core.handle_request("create", "create_task_pool", {"pool_id": "pool-warmup-fallback", "worker_count": 1})
+        assert core.handle_request(
+            "warmup",
+            "warmup_pool",
+            {"pool_id": "pool-warmup-fallback", "fanout": 1},
+        )
+        assert calls == ["fork", "spawn"]
+        assert contexts == ["fork", "spawn"]
+    finally:
+        core.close()
+
+
+@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_service_call_roundtrip(tmp_path, backend_cls):
     state, artifact = _seed_artifact(
         tmp_path,
@@ -101,7 +297,7 @@ def test_executor_backend_service_call_roundtrip(tmp_path, backend_cls):
         state.close()
 
 
-@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend, EmbeddedExecutorBackend])
+@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_warmup_and_preload_paths_keep_backend_usable(tmp_path, backend_cls):
     state, artifact = _seed_artifact(
         tmp_path,
@@ -180,7 +376,7 @@ def test_executor_backend_warmup_and_preload_paths_keep_backend_usable(tmp_path,
         state.close()
 
 
-@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend, EmbeddedExecutorBackend])
+@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_task_pool_submit_emits_done_event(tmp_path, backend_cls):
     state, artifact = _seed_artifact(
         tmp_path,
@@ -223,7 +419,7 @@ def test_executor_backend_task_pool_submit_emits_done_event(tmp_path, backend_cl
         state.close()
 
 
-@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend, EmbeddedExecutorBackend])
+@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_service_timeout_recycles_executor(tmp_path, backend_cls):
     state, artifact = _seed_artifact(
         tmp_path,
@@ -271,7 +467,7 @@ def test_executor_backend_service_timeout_recycles_executor(tmp_path, backend_cl
         state.close()
 
 
-@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend, EmbeddedExecutorBackend])
+@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_close_cleans_active_runtime_worker(tmp_path, backend_cls):
     state, artifact = _seed_artifact(
         tmp_path,
@@ -305,7 +501,7 @@ def test_executor_backend_close_cleans_active_runtime_worker(tmp_path, backend_c
         state.close()
 
 
-@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend, EmbeddedExecutorBackend])
+@pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_pool_recovers_after_broken_worker(tmp_path, backend_cls):
     state, artifact = _seed_artifact(
         tmp_path,

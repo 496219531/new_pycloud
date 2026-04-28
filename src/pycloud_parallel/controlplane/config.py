@@ -52,6 +52,11 @@ PYCLOUD_OBJECT_TRANSFER_MODE = "PYCLOUD_OBJECT_TRANSFER_MODE"
 PYCLOUD_SERIALIZATION_MODE = "PYCLOUD_SERIALIZATION_MODE"
 PYCLOUD_DEPENDENCY_POLICY_MODE = "PYCLOUD_DEPENDENCY_POLICY_MODE"
 PYCLOUD_EXECUTOR_BACKEND = "PYCLOUD_EXECUTOR_BACKEND"
+PYCLOUD_DATAREF_RESOLUTION = "PYCLOUD_DATAREF_RESOLUTION"
+PYCLOUD_DATAREF_UPLOAD_STRATEGY = "PYCLOUD_DATAREF_UPLOAD_STRATEGY"
+PYCLOUD_GATEWAY_DATAREF_RELAY = "PYCLOUD_GATEWAY_DATAREF_RELAY"
+PYCLOUD_JOBQUEUE_RESOLVE_REFS = "PYCLOUD_JOBQUEUE_RESOLVE_REFS"
+PYCLOUD_INLINE_TRANSPORT_CHECKSUM = "PYCLOUD_INLINE_TRANSPORT_CHECKSUM"
 
 
 INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
@@ -72,6 +77,7 @@ FILE_HASH_CHUNK_SIZE_BYTES = _env_int("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES", 1024
 OBJECT_SEGMENT_MAX_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024)
 OBJECT_SEGMENT_TARGET_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024)
 OBJECT_UPLOAD_TRUSTED_PRECHECK = _env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True)
+INLINE_TRANSPORT_CHECKSUM = _env_bool(PYCLOUD_INLINE_TRANSPORT_CHECKSUM, False)
 SYSTEM_MODE = _env_choice(PYCLOUD_SYSTEM_MODE, "trusted_default", {"trusted_default"})
 TRUST_MODE = _env_choice(PYCLOUD_TRUST_MODE, "trusted", {"trusted", "balanced", "strict"})
 OBJECT_TRANSFER_MODE = _env_choice(
@@ -91,8 +97,28 @@ DEPENDENCY_POLICY_MODE = _env_choice(
 )
 EXECUTOR_BACKEND = _env_choice(
     PYCLOUD_EXECUTOR_BACKEND,
-    "embedded",
-    {"subprocess_host", "embedded"},
+    "subprocess_host",
+    {"subprocess_host"},
+)
+DATAREF_RESOLUTION = _env_choice(
+    PYCLOUD_DATAREF_RESOLUTION,
+    "local_only",
+    {"local_only", "remote_fetch"},
+)
+DATAREF_UPLOAD_STRATEGY = _env_choice(
+    PYCLOUD_DATAREF_UPLOAD_STRATEGY,
+    "fanout",
+    {"fanout", "upload_once"},
+)
+GATEWAY_DATAREF_RELAY = _env_choice(
+    PYCLOUD_GATEWAY_DATAREF_RELAY,
+    "eager",
+    {"eager", "lazy"},
+)
+JOBQUEUE_RESOLVE_REFS = _env_choice(
+    PYCLOUD_JOBQUEUE_RESOLVE_REFS,
+    "eager",
+    {"eager", "defer_to_worker"},
 )
 
 GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
@@ -111,7 +137,11 @@ ObjectTransferMode = Literal["auto", "known_digest_precheck", "single_pass_autho
 SystemMode = Literal["trusted_default"]
 SerializationMode = Literal["legacy_v1", "structured_v1", "pickle_stable_v1"]
 DependencyPolicyMode = Literal["legacy_v1", "prebuilt", "node_preinstalled", "allow_install"]
-ExecutorBackendMode = Literal["subprocess_host", "embedded"]
+ExecutorBackendMode = Literal["subprocess_host"]
+DataRefResolutionMode = Literal["local_only", "remote_fetch"]
+DataRefUploadStrategy = Literal["fanout", "upload_once"]
+GatewayDataRefRelayMode = Literal["eager", "lazy"]
+JobQueueResolveRefsMode = Literal["eager", "defer_to_worker"]
 
 
 @dataclass(frozen=True)
@@ -202,6 +232,26 @@ def get_dependency_policy_mode() -> DependencyPolicyMode:
     return str(DEPENDENCY_POLICY_MODE or "legacy_v1").strip().lower()  # type: ignore[return-value]
 
 
+def get_dataref_resolution() -> DataRefResolutionMode:
+    return str(DATAREF_RESOLUTION or "local_only").strip().lower()  # type: ignore[return-value]
+
+
+def get_dataref_upload_strategy() -> DataRefUploadStrategy:
+    return str(DATAREF_UPLOAD_STRATEGY or "fanout").strip().lower()  # type: ignore[return-value]
+
+
+def get_gateway_dataref_relay() -> GatewayDataRefRelayMode:
+    return str(GATEWAY_DATAREF_RELAY or "eager").strip().lower()  # type: ignore[return-value]
+
+
+def get_jobqueue_resolve_refs() -> JobQueueResolveRefsMode:
+    return str(JOBQUEUE_RESOLVE_REFS or "eager").strip().lower()  # type: ignore[return-value]
+
+
+def get_inline_transport_checksum() -> bool:
+    return bool(INLINE_TRANSPORT_CHECKSUM)
+
+
 def resolve_object_transfer_mode(*, source_kind: str, local_digest_known: bool) -> ObjectTransferMode:
     mode = get_object_transfer_mode()
     if mode == "auto":
@@ -281,6 +331,7 @@ def reload_config() -> None:
         OBJECT_SEGMENT_MAX_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024),
         OBJECT_SEGMENT_TARGET_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024),
         OBJECT_UPLOAD_TRUSTED_PRECHECK=_env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True),
+        INLINE_TRANSPORT_CHECKSUM=_env_bool(PYCLOUD_INLINE_TRANSPORT_CHECKSUM, False),
         SYSTEM_MODE=_env_choice(PYCLOUD_SYSTEM_MODE, "trusted_default", {"trusted_default"}),
         TRUST_MODE=_env_choice(PYCLOUD_TRUST_MODE, "trusted", {"trusted", "balanced", "strict"}),
         OBJECT_TRANSFER_MODE=_env_choice(
@@ -297,6 +348,26 @@ def reload_config() -> None:
             PYCLOUD_DEPENDENCY_POLICY_MODE,
             "legacy_v1",
             {"legacy_v1", "prebuilt", "node_preinstalled", "allow_install"},
+        ),
+        DATAREF_RESOLUTION=_env_choice(
+            PYCLOUD_DATAREF_RESOLUTION,
+            "local_only",
+            {"local_only", "remote_fetch"},
+        ),
+        DATAREF_UPLOAD_STRATEGY=_env_choice(
+            PYCLOUD_DATAREF_UPLOAD_STRATEGY,
+            "fanout",
+            {"fanout", "upload_once"},
+        ),
+        GATEWAY_DATAREF_RELAY=_env_choice(
+            PYCLOUD_GATEWAY_DATAREF_RELAY,
+            "eager",
+            {"eager", "lazy"},
+        ),
+        JOBQUEUE_RESOLVE_REFS=_env_choice(
+            PYCLOUD_JOBQUEUE_RESOLVE_REFS,
+            "eager",
+            {"eager", "defer_to_worker"},
         ),
         GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
         GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
@@ -317,22 +388,31 @@ def grpc_channel_options() -> list[tuple[str, int]]:
 
 __all__ = [
     "DEPENDENCY_POLICY_MODE",
+    "DATAREF_RESOLUTION",
+    "DATAREF_UPLOAD_STRATEGY",
+    "DataRefResolutionMode",
+    "DataRefUploadStrategy",
     "DependencyPolicyMode",
     "FILE_HASH_CHUNK_SIZE_BYTES",
+    "GATEWAY_DATAREF_RELAY",
     "GATEWAY_MAX_UPLOAD_FILE_BYTES",
     "GATEWAY_MAX_UPLOAD_TOTAL_BYTES",
     "GATEWAY_STAGE_GC_INTERVAL_SEC",
     "GATEWAY_STAGE_TTL_SEC",
     "GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES",
     "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES",
+    "GatewayDataRefRelayMode",
     "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",
     "INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
     "INLINE_RESULT_HARD_LIMIT_BYTES",
     "INLINE_RESULT_SOFT_LIMIT_BYTES",
+    "INLINE_TRANSPORT_CHECKSUM",
     "JOB_PAYLOAD_MAX_BYTES",
     "JOB_STAGED_REF_TTL_SEC",
     "JOB_STAGING_REPLICA_COUNT",
+    "JOBQUEUE_RESOLVE_REFS",
+    "JobQueueResolveRefsMode",
     "NODE_MAX_WORKERS",
     "NODE_QUEUE_CAPACITY",
     "NODE_WORKER_CAPACITY",
@@ -346,6 +426,11 @@ __all__ = [
     "PayloadMode",
     "PayloadPolicy",
     "PYCLOUD_DEPENDENCY_POLICY_MODE",
+    "PYCLOUD_DATAREF_RESOLUTION",
+    "PYCLOUD_DATAREF_UPLOAD_STRATEGY",
+    "PYCLOUD_GATEWAY_DATAREF_RELAY",
+    "PYCLOUD_JOBQUEUE_RESOLVE_REFS",
+    "PYCLOUD_INLINE_TRANSPORT_CHECKSUM",
     "PYCLOUD_OBJECT_TRANSFER_MODE",
     "PYCLOUD_SERIALIZATION_MODE",
     "PYCLOUD_SYSTEM_MODE",
@@ -359,7 +444,12 @@ __all__ = [
     "TRUST_MODE",
     "TrustMode",
     "env_int",
+    "get_dataref_resolution",
+    "get_dataref_upload_strategy",
     "get_dependency_policy_mode",
+    "get_gateway_dataref_relay",
+    "get_inline_transport_checksum",
+    "get_jobqueue_resolve_refs",
     "get_object_transfer_mode",
     "get_payload_policy",
     "get_runtime_limits",

@@ -12,8 +12,9 @@ from typing import Any, BinaryIO, Dict, Optional, Sequence, Tuple
 import uuid
 
 from .client_transport import _decode_http_request_body_with_mode
+from pycloud_parallel.controlplane.config import get_gateway_dataref_relay
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref, with_data_ref_locator
-from pycloud_parallel.controlplane.data_registry import resolve_data_ref
+from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageFile, GatewayStageManager, GatewayStageRequest
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.data.ref import normalize_object_format
@@ -484,14 +485,41 @@ def relay_data_ref_v1(
     if normalized_ref is None:
         raise GatewayUploadError("relay_data_ref_v1 requires a DataRef-compatible value")
     route_control_addr = str(getattr(route, "control_addr", "") or "").strip()
-    if not route_control_addr:
-        raise GatewayUploadError("route control_addr is required for DataRef relay")
-    if str(normalized_ref.control_addr or "").strip() == route_control_addr:
+    if route_control_addr and str(normalized_ref.control_addr or "").strip() == route_control_addr:
         return normalized_ref
     resolved = resolve_data_ref(normalized_ref, target=registry_target, timeout_sec=max(0.1, float(timeout_sec)))
     source_addr = str(resolved.control_addr or "").strip()
     if not source_addr:
         raise GatewayUploadError(f"could not resolve data ref for relay: {normalized_ref.ref_id}")
+    if get_gateway_dataref_relay() == "lazy":
+        relayed = with_data_ref_locator(
+            normalized_ref,
+            locator_kind="node_control",
+            locator_token=source_addr,
+            node_id=str(resolved.node_id or normalized_ref.node_id or ""),
+            node_instance_id=str(resolved.node_instance_id or normalized_ref.node_instance_id or ""),
+            control_addr=source_addr,
+        )
+        if str(registry_target or "").strip():
+            with contextlib.suppress(Exception):
+                DataRegistryClient(registry_target, timeout_sec=max(0.1, float(timeout_sec))).register(
+                    relayed,
+                    node_id=str(relayed.node_id or ""),
+                    node_instance_id=str(relayed.node_instance_id or ""),
+                    control_addr=str(relayed.control_addr or ""),
+                    locator_kind="node_control",
+                    locator_token=str(relayed.control_addr or ""),
+                    replicas=resolved.replicas or (
+                        {
+                            "control_addr": str(relayed.control_addr or ""),
+                            "node_id": str(relayed.node_id or ""),
+                            "node_instance_id": str(relayed.node_instance_id or ""),
+                        },
+                    ),
+                )
+        return relayed
+    if not route_control_addr:
+        raise GatewayUploadError("route control_addr is required for DataRef relay")
     with NodeControlClient(source_addr, timeout_sec=max(0.1, float(timeout_sec))) as source_client:
         blob = source_client.download_object_bytes(object_id=normalized_ref.object_id)
     with NodeControlClient(route_control_addr, timeout_sec=max(0.1, float(timeout_sec))) as target_client:

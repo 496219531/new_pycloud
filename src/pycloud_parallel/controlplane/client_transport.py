@@ -31,6 +31,7 @@ from pycloud_parallel.controlplane.serialization import (
     deserialize_by_mode,
     log_payload_flow,
     serialize_arrow_compatible,
+    value_to_transport_payload,
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_received_transport_mode
 
@@ -219,10 +220,11 @@ def _encode_http_transport_response_body(
     context: str,
     mode: str,
 ) -> tuple[bytes, Dict[str, str]]:
-    transport = encode_transport_payload_bytes(
+    transport = value_to_transport_payload(
         value,
         mode=mode,
         context=context,
+        limit_bytes=get_payload_policy("result").inline_result_hard_limit_bytes,
     )
     headers = {
         "Content-Type": HTTP_TRANSPORT_CONTENT_TYPE,

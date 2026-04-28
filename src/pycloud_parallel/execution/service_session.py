@@ -1186,6 +1186,8 @@ class _ConnectedService:
                     and effective_serialization_mode != "legacy_v1"
                 ):
                     route_call_kwargs["serialization_mode"] = effective_serialization_mode
+                if self.effective_policy is not None:
+                    route_call_kwargs["effective_policy"] = self.effective_policy
                 resp = self._client_mod._call_route_http(selected_route, **route_call_kwargs)
                 attach_locator = getattr(self._transport_client, "_attach_controlplane_locator", None)
                 if callable(attach_locator):
@@ -3419,6 +3421,8 @@ class Service(ServiceExecutionSession):
                 }
                 if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
                     call_kwargs["serialization_mode"] = effective_serialization_mode
+                if self.effective_policy is not None:
+                    call_kwargs["effective_policy"] = self.effective_policy
                 resp = self.sessions[node_id].call(
                     method,
                     payload,

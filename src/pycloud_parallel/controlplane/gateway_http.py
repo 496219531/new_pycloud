@@ -662,10 +662,11 @@ class GatewayHttpApp:
             return body
         updated = with_data_ref_locator(
             data.get("data"),
-            locator_kind="controlplane" if self.controlplane_target else "node_control",
-            locator_token=self.controlplane_target or route_control_addr,
+            locator_kind="node_control" if route_control_addr else "controlplane",
+            locator_token=route_control_addr or self.controlplane_target,
             node_id=str(route.node_id or ""),
             node_instance_id=str(route.node_instance_id or ""),
+            control_addr=route_control_addr,
         )
         if updated is data.get("data"):
             return data

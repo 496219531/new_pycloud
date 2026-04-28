@@ -92,8 +92,8 @@ def resolve_effective_policy(
     inline_payload_hard_limit_bytes = int(profile.inline_payload_hard_limit_bytes)
     inline_payload_soft_limit_bytes = min(int(profile.inline_payload_soft_limit_bytes), inline_payload_hard_limit_bytes)
     inline_result_hard_limit_bytes = int(profile.inline_result_hard_limit_bytes)
-    use_transport_payload_bytes = bool(profile.use_transport_payload_bytes)
-    use_http_bytes_transport = bool(profile.use_http_bytes_transport) and (
+    use_transport_payload_bytes = bool(profile.use_transport_payload_bytes) and resolved_mode != "legacy_v1"
+    use_http_bytes_transport = use_transport_payload_bytes and bool(profile.use_http_bytes_transport) and (
         str(context or "").strip().lower() in {"gateway_public", "service_connect", "http_call", "jobqueue_session"}
     )
     allow_pickle_stable = "pickle_stable_v1" in allowed_modes and bool(profile.allow_pickle_stable)
@@ -140,9 +140,6 @@ def should_use_transport_payload_bytes(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> bool:
     if effective_policy is not None:
-        normalized_mode = str(mode or "").strip().lower() or "legacy_v1"
-        if normalized_mode == "legacy_v1":
-            return False
         return bool(effective_policy.use_transport_payload_bytes)
     from pycloud_parallel.controlplane.serialization import prefers_transport_payload_bytes
 
@@ -155,10 +152,10 @@ def should_use_http_bytes_transport(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> bool:
     if effective_policy is not None:
-        normalized_mode = str(mode or "").strip().lower() or "legacy_v1"
-        if normalized_mode == "legacy_v1":
-            return False
         return bool(effective_policy.use_http_bytes_transport)
+    normalized_mode = str(mode or "").strip().lower() or "legacy_v1"
+    if normalized_mode == "legacy_v1":
+        return False
     return should_use_transport_payload_bytes(
         mode=mode,
         effective_policy=None,

@@ -82,6 +82,24 @@ def test_pickle_stable_v1_dataframe_series_and_index_keep_structural_schema():
     assert "payload" in index_schema
 
 
+def test_pickle_stable_v1_uses_compact_datetime_index_schema():
+    index = pd.date_range("2024-01-01", periods=3, name="day")
+    series = pd.Series(np.array([1.0, 2.0, 3.0]), index=index, name="nav")
+
+    normalized = normalize_for_pickle_stable(series)
+    normalized_index = normalize_for_pickle_stable(index)
+    restored = stable_pickle_loads(stable_pickle_dumps(series))
+    restored_index = stable_pickle_loads(stable_pickle_dumps(index))
+
+    assert normalized["index"]["__codec__"] == "pd.index.datetime64.v1"
+    assert normalized["index"]["values"]["__codec__"] == "np.ndarray.v1"
+    assert normalized_index["__codec__"] == "pd.index.v1"
+    assert normalized_index["payload"]["__codec__"] == "pd.index.datetime64.v1"
+    assert normalized_index["payload"]["values"]["__codec__"] == "np.ndarray.v1"
+    assert restored.equals(series)
+    assert restored_index.equals(index)
+
+
 def test_pickle_stable_v1_decodes_legacy_data_b64_ndarray_payload():
     array = np.array([[1, 2], [3, 4]], dtype=np.int64)
     legacy_payload = {

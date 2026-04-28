@@ -441,10 +441,11 @@ class DiscoveryServiceClient:
             return body
         updated = with_data_ref_locator(
             response.get("data"),
-            locator_kind="controlplane",
-            locator_token=self.infocenter_target,
+            locator_kind="node_control" if route_control_addr else "controlplane",
+            locator_token=route_control_addr or self.infocenter_target,
             node_id=str(getattr(route, "node_id", "") or ""),
             node_instance_id=str(getattr(route, "node_instance_id", "") or ""),
+            control_addr=route_control_addr,
         )
         if updated is response.get("data"):
             return response

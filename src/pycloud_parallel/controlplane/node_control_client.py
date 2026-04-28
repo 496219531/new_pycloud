@@ -7,6 +7,7 @@ import hashlib
 from datetime import timedelta
 from pathlib import Path
 import tempfile
+import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
 import grpc
@@ -733,6 +734,7 @@ class NodeControlClient:
         data_ref = maybe_data_ref(result_ref)
         if data_ref is None:
             raise TypeError("result_ref must be a DataRef-compatible value")
+        total_started_at = time.perf_counter()
         log_payload_flow(
             "result_ref_fetch",
             format=data_ref.format,
@@ -741,14 +743,35 @@ class NodeControlClient:
             summary=summarize_payload_flow_value(data_ref),
         )
         if target_path:
-            return self.download_result_to_file(data_ref, target_path=target_path)
+            download_started_at = time.perf_counter()
+            path = self.download_result_to_file(data_ref, target_path=target_path)
+            log_payload_flow(
+                "result_ref_fetch_done",
+                client_result_ref_download_ms=(time.perf_counter() - download_started_at) * 1000.0,
+                client_result_materialize_ms=0.0,
+                client_result_total_ms=(time.perf_counter() - total_started_at) * 1000.0,
+                target_path=str(path),
+            )
+            return path
         suffix = Path(f"result{('.' + data_ref.format) if data_ref.format else ''}")
         tmp = tempfile.NamedTemporaryFile(prefix="pycloud-result-", suffix=suffix.suffix, delete=False)
         tmp_path = Path(tmp.name)
         tmp.close()
         try:
+            download_started_at = time.perf_counter()
             self.download_result_to_file(data_ref, target_path=str(tmp_path))
-            return _materialize_downloaded_result(tmp_path, result_ref=data_ref)
+            download_ms = (time.perf_counter() - download_started_at) * 1000.0
+            materialize_started_at = time.perf_counter()
+            result = _materialize_downloaded_result(tmp_path, result_ref=data_ref)
+            materialize_ms = (time.perf_counter() - materialize_started_at) * 1000.0
+            log_payload_flow(
+                "result_ref_fetch_done",
+                client_result_ref_download_ms=download_ms,
+                client_result_materialize_ms=materialize_ms,
+                client_result_total_ms=(time.perf_counter() - total_started_at) * 1000.0,
+                target_path=str(tmp_path),
+            )
+            return result
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise

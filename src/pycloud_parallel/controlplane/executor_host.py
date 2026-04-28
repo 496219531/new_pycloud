@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import deque
 import multiprocessing as mp
 import os
-import queue
 import signal
 import threading
 import time
@@ -15,6 +14,8 @@ from pycloud_parallel.controlplane.executor_core import ExecutorCore
 
 
 def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
+    os.environ["PYCLOUD_EXECUTOR_PARENT_KIND"] = "executor_host"
+
     def _emit(item: Dict[str, Any]) -> None:
         event_q.put(dict(item))
 
@@ -25,10 +26,10 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     )
     running = True
     while running:
-        try:
-            message = request_q.get(timeout=0.05)
-        except queue.Empty:
+        if request_q.empty():
             message = None
+        else:
+            message = request_q.get()
         if isinstance(message, dict):
             running = core.handle_request(
                 str(message.get("request_id", "") or ""),
@@ -36,14 +37,16 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
                 dict(message.get("payload") or {}),
             )
         core.poll_once()
+        if message is None:
+            time.sleep(0.01)
     core.close()
 
 
 class ExecutorHostClient:
     def __init__(self, *, task_worker_capacity: int = 1) -> None:
         self._ctx = mp.get_context("spawn")
-        self._request_q = self._ctx.Queue()
-        self._event_q = self._ctx.Queue()
+        self._request_q = self._ctx.SimpleQueue()
+        self._event_q = self._ctx.SimpleQueue()
         self._responses: Dict[str, Dict[str, Any]] = {}
         self._expired_requests: set[str] = set()
         self._async_events: Deque[Dict[str, Any]] = deque()
@@ -66,10 +69,10 @@ class ExecutorHostClient:
 
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
-            try:
-                item = self._event_q.get(timeout=0.1)
-            except queue.Empty:
+            if self._event_q.empty():
+                time.sleep(0.05)
                 continue
+            item = self._event_q.get()
             if not isinstance(item, dict):
                 continue
             kind = str(item.get("kind", "") or "")
@@ -116,12 +119,10 @@ class ExecutorHostClient:
             self._process.join(timeout=1.0)
         self._terminate_tracked_workers()
         try:
-            self._request_q.cancel_join_thread()
             self._request_q.close()
         except Exception:
             pass
         try:
-            self._event_q.cancel_join_thread()
             self._event_q.close()
         except Exception:
             pass
@@ -217,6 +218,14 @@ class ExecutorHostClient:
             raise RuntimeError(str(resp.get("error", f"{action} failed")))
         return resp
 
+    def prepare_artifact(self, *, artifact_spec: Dict[str, Any], timeout_sec: float = 30.0) -> Dict[str, Any]:
+        return self._request_action(
+            "prepare_artifact",
+            payload=dict(artifact_spec),
+            timeout_sec=max(1.0, float(timeout_sec or 1.0)),
+            raise_on_error=False,
+        )
+
     def _submit_task(
         self,
         action: str,
@@ -244,14 +253,6 @@ class ExecutorHostClient:
         )
         return int(resp.get("submitted", 0) or 0)
 
-    def _preload(self, action: str, *, identity: Dict[str, Any], fanout: int, execute_spec: Dict[str, Any]) -> int:
-        resp = self._request_action(
-            action,
-            payload={**dict(identity), "fanout": int(fanout), **dict(execute_spec)},
-            timeout_sec=max(1.0, float(fanout) + 5.0),
-        )
-        return int(resp.get("submitted", 0) or 0)
-
     def call_service(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]) -> Dict[str, Any]:
         return self._request_action(
             "call_service",
@@ -264,7 +265,7 @@ class ExecutorHostClient:
         return self._warmup("warmup_service", identity={"service_id": service_id}, fanout=fanout, execute_spec=execute_spec)
 
     def preload_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
-        return self._preload("preload_service", identity={"service_id": service_id}, fanout=fanout, execute_spec=execute_spec)
+        return self._warmup("preload_service", identity={"service_id": service_id}, fanout=fanout, execute_spec=execute_spec)
 
     def submit_runtime_task(
         self,
@@ -305,4 +306,4 @@ class ExecutorHostClient:
         return self._warmup("warmup_pool", identity={"pool_id": pool_id}, fanout=fanout, execute_spec=execute_spec)
 
     def preload_pool(self, *, pool_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
-        return self._preload("preload_pool", identity={"pool_id": pool_id}, fanout=fanout, execute_spec=execute_spec)
+        return self._warmup("preload_pool", identity={"pool_id": pool_id}, fanout=fanout, execute_spec=execute_spec)

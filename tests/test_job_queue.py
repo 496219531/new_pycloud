@@ -189,6 +189,24 @@ def test_job_orchestrator_instances_have_independent_startup_service_ids() -> No
     assert second.service_report_payloads()[0]["service_id"] == second.service_id
 
 
+def test_job_queue_manager_default_shared_pool_idle_ttl_is_longer(monkeypatch) -> None:
+    monkeypatch.delenv("PYCLOUD_JOB_QUEUE_POOL_IDLE_TTL_SEC", raising=False)
+
+    queue = JobQueueManager()
+
+    assert queue._pool_idle_ttl_sec == 300  # noqa: SLF001
+
+
+def test_job_queue_manager_shared_pool_idle_ttl_can_be_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("PYCLOUD_JOB_QUEUE_POOL_IDLE_TTL_SEC", "600")
+
+    from_env = JobQueueManager()
+    explicit = JobQueueManager(pool_idle_ttl_sec=120)
+
+    assert from_env._pool_idle_ttl_sec == 600  # noqa: SLF001
+    assert explicit._pool_idle_ttl_sec == 120  # noqa: SLF001
+
+
 def test_submit_and_cancel_waiting_job() -> None:
     queue = JobQueueManager()
     job = queue.submit_job(
@@ -1181,6 +1199,69 @@ def test_resolve_payload_data_refs_falls_back_across_replicas(monkeypatch) -> No
 
     assert resolved["job_payload"]["blob_ref"] == {"value": 1}
     assert attempts == ["127.0.0.1:50061", "127.0.0.1:50062"]
+
+
+def test_resolve_payload_data_refs_can_defer_to_worker(monkeypatch, request) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+    from pycloud_parallel.data.ref import DataRef
+    from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs
+
+    monkeypatch.setenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", "defer_to_worker")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    data_ref = DataRef(
+        ref_id="sha256:" + ("f" * 64),
+        storage_id="sha256:" + ("f" * 64),
+        format="json",
+        size_bytes=32,
+        logical_type="json",
+        materialize_as="json",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+        control_addr="127.0.0.1:50061",
+    )
+
+    class _ForbiddenNodeClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("defer_to_worker must not materialize DataRef in job-orch")
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.job_queue.NodeControlClient", _ForbiddenNodeClient)
+    resolved = _resolve_payload_data_refs(
+        {"job_payload": {"blob_ref": data_ref}},
+        registry_target="http://127.0.0.1:50051",
+        timeout_sec=1.0,
+    )
+
+    assert resolved["job_payload"]["blob_ref"] == data_ref
+
+
+def test_defer_payload_data_refs_still_rejects_unresolvable_ref(monkeypatch, request) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+    from pycloud_parallel.data.ref import DataRef
+    from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs
+
+    monkeypatch.setenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", "defer_to_worker")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    data_ref = DataRef(
+        ref_id="sha256:" + ("1" * 64),
+        storage_id="sha256:" + ("1" * 64),
+        format="json",
+        size_bytes=32,
+        logical_type="json",
+        materialize_as="json",
+        locator_kind="node_local",
+        locator_token="",
+    )
+
+    with pytest.raises(ValueError, match="resolvable locator"):
+        _resolve_payload_data_refs(
+            {"job_payload": {"blob_ref": data_ref}},
+            registry_target="http://127.0.0.1:50051",
+            timeout_sec=1.0,
+        )
 
 
 def test_submit_job_rejects_nested_unresolvable_business_blob_ref() -> None:

@@ -17,7 +17,7 @@ def test_builtin_policy_profiles_expose_expected_defaults():
 
     assert {"default_safe", "trusted_internal", "pickle_internal_heavy"}.issubset(profiles)
     assert get_policy_profile().policy_id == "default_safe"
-    assert get_policy_profile("trusted_internal").default_mode == "structured_v1"
+    assert get_policy_profile("trusted_internal").default_mode == "pickle_stable_v1"
 
 
 def test_builtin_policy_bindings_expose_expected_type_defaults():
@@ -33,9 +33,9 @@ def test_builtin_policy_bindings_expose_expected_type_defaults():
     assert get_default_policy_id_for_binding("gateway_public") == "default_safe"
     assert get_default_mode_for_binding("gateway_public") == "legacy_v1"
     assert get_default_policy_id_for_binding("service_internal") == "trusted_internal"
-    assert get_default_mode_for_binding("service_internal") == "structured_v1"
+    assert get_default_mode_for_binding("service_internal") == "pickle_stable_v1"
     assert get_default_policy_id_for_binding("taskpool_default") == "trusted_internal"
-    assert get_default_mode_for_binding("taskpool_default") == "structured_v1"
+    assert get_default_mode_for_binding("taskpool_default") == "pickle_stable_v1"
     assert get_default_policy_id_for_binding("taskpool_heavy_dataframe_numpy") == "pickle_internal_heavy"
     assert get_default_mode_for_binding("taskpool_heavy_dataframe_numpy") == "pickle_stable_v1"
     assert get_default_policy_id_for_binding("jobqueue_controlplane_transport") == "default_safe"

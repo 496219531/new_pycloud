@@ -17,14 +17,16 @@ from pycloud_parallel.controlplane.payload_transport import decode_payload_from_
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.controlplane.serialization import (
-    TRANSPORT_ENVELOPE_SENTINEL,
     decode_transport_payload_bytes,
-    encode_transport_payload_bytes,
     detect_transport_mode,
     dict_to_struct,
     log_payload_flow,
+    make_validated_inline_transport_carrier,
     struct_to_python,
+    value_to_transport_payload,
+    validate_inline_request_size,
     validate_inline_payload_structs,
+    validate_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -1132,11 +1134,24 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.HasField("transport_payload") and str(request.transport_payload.codec or "").strip()
         )
         if request_uses_transport_payload:
-            request_serialization_mode = str(request.transport_payload.codec or "").strip().lower()
-            decoded_payload = decode_transport_payload_bytes(
+            payload_policy = get_payload_policy("http_call")
+            request_serialization_mode, _raw_payload, request_payload_size = validate_transport_payload_bytes(
                 request.transport_payload.codec,
                 request.transport_payload.version,
                 request.transport_payload.payload,
+                context="service_owner",
+                limit_bytes=payload_policy.inline_payload_hard_limit_bytes,
+            )
+            validate_inline_request_size(
+                request_payload_size,
+                limit_bytes=payload_policy.inline_payload_request_limit_bytes,
+                context="call service request",
+            )
+            decoded_payload = make_validated_inline_transport_carrier(
+                codec=request_serialization_mode,
+                payload=_raw_payload,
+                content_size=request_payload_size,
+                payload_mode="service_call",
                 context="service_owner",
             )
         else:
@@ -1203,12 +1218,12 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             "method": request.method,
         }
         if request_uses_transport_payload:
-            if isinstance(body.get("data"), dict) and TRANSPORT_ENVELOPE_SENTINEL in body.get("data", {}):
-                raise RuntimeError("transport bytes lane received already-encoded result")
-            response_kwargs["transport_data"] = encode_transport_payload_bytes(
+            response_kwargs["transport_data"] = value_to_transport_payload(
                 body.get("data", {}),
                 mode=request_serialization_mode,
-                context="service_owner",
+                context="service_result",
+                limit_bytes=get_payload_policy("result").inline_result_hard_limit_bytes,
+                reject_transport_envelope=True,
             )
         else:
             response_kwargs["data"] = dict_to_struct(body.get("data", {}), mode=request_serialization_mode)

@@ -21,7 +21,7 @@ import math
 from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
-from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_payload_policy
+from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_jobqueue_resolve_refs, get_payload_policy
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -73,6 +73,7 @@ def _create_job_task_pool(**kwargs: Any) -> TaskPool:
 
 
 _JOB_ORCH_TASKPOOL_BINDING_ID = "taskpool_default"
+_DEFAULT_JOB_QUEUE_POOL_IDLE_TTL_SEC = 300
 
 
 @dataclass
@@ -249,6 +250,10 @@ def _resolve_payload_data_refs(
     registry_target: str,
     timeout_sec: float = 10.0,
 ) -> object:
+    if get_jobqueue_resolve_refs() == "defer_to_worker":
+        _validate_delayed_resolve_refs(value)
+        return value
+
     registry = DataRegistryClient(registry_target, timeout_sec=max(0.1, float(timeout_sec)))
 
     def _resolve(item: object, *, path: str = "payload") -> object:
@@ -654,7 +659,10 @@ class JobQueueManager:
             int(
                 pool_idle_ttl_sec
                 if pool_idle_ttl_sec is not None
-                else (os.getenv("PYCLOUD_JOB_QUEUE_POOL_IDLE_TTL_SEC", "30") or 30)
+                else (
+                    os.getenv("PYCLOUD_JOB_QUEUE_POOL_IDLE_TTL_SEC", str(_DEFAULT_JOB_QUEUE_POOL_IDLE_TTL_SEC))
+                    or _DEFAULT_JOB_QUEUE_POOL_IDLE_TTL_SEC
+                )
             ),
         )
 

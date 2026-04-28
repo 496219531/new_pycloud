@@ -37,6 +37,7 @@ from pycloud_parallel.controlplane.config import (
     JOB_STAGED_REF_TTL_SEC,
     JOB_STAGING_REPLICA_COUNT,
     OBJECT_CHUNK_SIZE_BYTES,
+    get_dataref_upload_strategy,
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import (
@@ -517,16 +518,51 @@ def _put_data_via_clients(
         serialization_mode=serialization_mode,
         default_serialization_mode=default_serialization_mode,
     )
+    return _upload_blob_via_clients(
+        clients,
+        blob,
+        fmt=effective_format,
+        chunk_size=chunk_size,
+        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        no_clients_msg="no node clients available for object upload",
+    )
+
+
+def _upload_blob_via_clients(
+    clients: Sequence[Any],
+    blob: bytes,
+    *,
+    fmt: str,
+    chunk_size: int,
+    materialize_as: str,
+    logical_type: str = "",
+    consume_on_read: bool = False,
+    no_clients_msg: str,
+) -> DataRef:
+    if not clients:
+        raise RuntimeError(no_clients_msg)
+    if get_dataref_upload_strategy() == "upload_once":
+        first_client = clients[0]
+        first = first_client.upload_object_from_bytes(
+            blob=blob,
+            format=fmt,
+            chunk_size=chunk_size,
+        )
+        return _data_ref_from_uploaded_object(
+            first,
+            client=first_client,
+            logical_type=logical_type,
+            materialize_as=materialize_as,
+            consume_on_read=consume_on_read,
+        )
     refs = [
         client.upload_object_from_bytes(
             blob=blob,
-            format=effective_format,
+            format=fmt,
             chunk_size=chunk_size,
         )
         for client in clients
     ]
-    if not refs:
-        raise RuntimeError("no node clients available for object upload")
     object_ids = {ref.object_id for ref in refs}
     formats = {ref.format for ref in refs}
     if len(object_ids) != 1 or len(formats) != 1:
@@ -535,13 +571,13 @@ def _put_data_via_clients(
     return DataRef(
         ref_id=first.object_id,
         storage_id=first.object_id,
-        logical_type="",
+        logical_type=logical_type,
         format=first.format,
         size_bytes=first.size_bytes,
-        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        materialize_as=materialize_as,
         locator_kind="node_local",
         locator_token="",
-        consume_on_read=bool(getattr(first, "consume_on_read", False)),
+        consume_on_read=consume_on_read or bool(getattr(first, "consume_on_read", False)),
         node_id=str(getattr(first, "node_id", "") or ""),
         node_instance_id=str(getattr(first, "node_instance_id", "") or ""),
         control_addr=str(getattr(first, "control_addr", "") or ""),
@@ -769,7 +805,7 @@ def _encoded_managed_globals_size(
             mode=effective_mode,
             context=context,
         )
-        return len(bytes(transport.payload or b""))
+        return len(transport.payload or b"")
     _serialized, _struct, size_bytes = serialize_inline_payload(
         values,
         context=context,
@@ -1127,34 +1163,64 @@ def _select_job_staging_clients(
 
 
 def _upload_text_data_via_clients(clients: Sequence[Any], text: str) -> DataRef:
-    blob = str(text or "").encode("utf-8")
-    refs = [
-        client.upload_object_from_bytes(
-            blob=blob,
-            format="txt",
-            chunk_size=OBJECT_CHUNK_SIZE_BYTES,
-        )
-        for client in clients
-    ]
-    if not refs:
-        raise RuntimeError("no node clients available for job staging upload")
-    object_ids = {ref.object_id for ref in refs}
-    if len(object_ids) != 1:
-        raise RuntimeError(f"inconsistent text object upload across nodes: {refs}")
-    first = refs[0]
-    return DataRef(
-        ref_id=first.object_id,
-        storage_id=first.object_id,
-        logical_type="text",
-        format=first.format,
-        size_bytes=first.size_bytes,
+    return _upload_blob_via_clients(
+        clients,
+        str(text or "").encode("utf-8"),
+        fmt="txt",
+        chunk_size=OBJECT_CHUNK_SIZE_BYTES,
         materialize_as="text",
-        locator_kind="node_local",
-        locator_token="",
+        logical_type="text",
         consume_on_read=False,
-        node_id=str(getattr(first, "node_id", "") or ""),
-        node_instance_id=str(getattr(first, "node_instance_id", "") or ""),
-        control_addr=str(getattr(first, "control_addr", "") or ""),
+        no_clients_msg="no node clients available for job staging upload",
+    )
+
+
+def _data_ref_from_uploaded_object(
+    uploaded_ref: DataRef,
+    *,
+    client: Any,
+    logical_type: str = "",
+    materialize_as: str,
+    consume_on_read: bool = False,
+) -> DataRef:
+    control_addr = str(getattr(uploaded_ref, "control_addr", "") or getattr(client, "target", "") or "").strip()
+    return DataRef(
+        ref_id=uploaded_ref.object_id,
+        storage_id=uploaded_ref.object_id,
+        logical_type=logical_type,
+        format=uploaded_ref.format,
+        size_bytes=uploaded_ref.size_bytes,
+        materialize_as=materialize_as,
+        locator_kind="node_control" if control_addr else "node_local",
+        locator_token=control_addr,
+        consume_on_read=consume_on_read or bool(getattr(uploaded_ref, "consume_on_read", False)),
+        node_id=str(getattr(uploaded_ref, "node_id", "") or getattr(client, "node_id", "") or ""),
+        node_instance_id=str(
+            getattr(uploaded_ref, "node_instance_id", "") or getattr(client, "node_instance_id", "") or ""
+        ),
+        control_addr=control_addr,
+    )
+
+
+def _replicas_for_uploaded_ref(object_ref: DataRef, replicas: Sequence[Dict[str, object]]) -> Sequence[Dict[str, object]]:
+    if get_dataref_upload_strategy() != "upload_once":
+        return replicas
+    control_addr = str(getattr(object_ref, "control_addr", "") or getattr(object_ref, "locator_token", "") or "").strip()
+    if not control_addr:
+        return ()
+    matches = [
+        dict(item)
+        for item in replicas
+        if str(item.get("control_addr", "") or "").strip() == control_addr
+    ]
+    if matches:
+        return matches
+    return (
+        {
+            "control_addr": control_addr,
+            "node_id": str(object_ref.node_id or ""),
+            "node_instance_id": str(object_ref.node_instance_id or ""),
+        },
     )
 
 
@@ -1209,12 +1275,13 @@ def _stage_job_value_as_data_ref(
                 locator_token=target,
                 consume_on_read=False,
             )
+        effective_replicas = _replicas_for_uploaded_ref(object_ref, replicas)
         from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 
         DataRegistryClient(target, timeout_sec=timeout_sec).register(
             staged_ref,
             ttl_sec=max(1, int(ttl_sec or JOB_STAGED_REF_TTL_SEC)),
-            replicas=replicas,
+            replicas=effective_replicas,
             locator_kind="controlplane",
             locator_token=target,
         )

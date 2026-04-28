@@ -115,6 +115,37 @@ def test_gateway_http_only_route_marks_data_ref_as_service_http() -> None:
     assert calls == []
 
 
+def test_gateway_attaches_result_ref_locator_without_materializing() -> None:
+    route = _gateway_route_variant(2, service_name="svc-result-ref")
+    calls = []
+    app = GatewayHttpApp(
+        route_cache=_SequenceRouteCache([route]),
+        controlplane_target="127.0.0.1:50051",
+        register_data_ref=lambda **kwargs: calls.append(kwargs),
+    )
+
+    ref = DataRef(
+        ref_id="sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        storage_id="sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        format="bin",
+        size_bytes=12,
+        materialize_as="bytes",
+        locator_kind="node_local",
+    )
+
+    body = app._attach_controlplane_locator({"ok": True, "data": ref}, route=route)  # noqa: SLF001
+
+    updated = body["data"]
+    assert updated.object_id == ref.object_id
+    assert updated.locator_kind == "node_control"
+    assert updated.locator_token == route.control_addr
+    assert updated.control_addr == route.control_addr
+    assert updated.node_id == route.node_id
+    assert updated.node_instance_id == route.node_instance_id
+    assert calls
+    assert calls[0]["control_addr"] == route.control_addr
+
+
 class _SequenceRouteCache:
     def __init__(self, routes):
         self.routes = list(routes)
@@ -1058,7 +1089,7 @@ def test_gateway_service_client_fetches_large_dataframe_result(tmp_path):
                 assert body["data"].node_id == "node-gw-large-01"
                 assert body["data"].locator_kind == "controlplane"
                 assert body["data"].locator_token == controlplane.base_url
-                assert body["data"].control_addr == ""
+                assert body["data"].control_addr == node_target
             else:
                 assert isinstance(body["data"], pd.DataFrame)
             frame = gateway.fetch_result_data(body)

@@ -25,6 +25,7 @@ class StoredDataArtifact:
 class DataStore:
     object_dir: str
     node_id: str = ""
+    node_instance_id: str = ""
     control_addr: str = ""
     put_uploaded_file_impl: Optional[Callable[..., Any]] = None
     store_path_impl: Optional[Callable[[Path], StoredDataArtifact]] = None
@@ -96,6 +97,7 @@ class DataStore:
             locator_kind="node_control" if normalized_control_addr else "node_local",
             locator_token=normalized_control_addr,
             node_id=str(self.node_id or ""),
+            node_instance_id=str(self.node_instance_id or ""),
             control_addr=normalized_control_addr,
         )
 
@@ -112,6 +114,7 @@ class DataStore:
             locator_kind="node_control" if normalized_control_addr else "node_local",
             locator_token=normalized_control_addr,
             control_addr=normalized_control_addr,
+            node_instance_id=str(self.node_instance_id or ""),
         )
 
 

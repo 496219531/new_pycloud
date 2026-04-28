@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar, Dict, Optional, Tuple
 
+from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.data_store import StoredDataArtifact
 from pycloud_parallel.controlplane.effective_policy import should_use_transport_payload_bytes
 from pycloud_parallel.controlplane.session_model import (
@@ -17,9 +18,8 @@ from pycloud_parallel.controlplane.session_model import (
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.controlplane.serialization import (
-    TRANSPORT_ENVELOPE_SENTINEL,
     dict_to_struct,
-    encode_transport_payload_bytes,
+    value_to_transport_payload,
 )
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -111,12 +111,13 @@ class TaskState:
             # Bytes transport must see the raw high-level result object exactly
             # once. Receiving an already transport-wrapped payload here would
             # double-encode the result and leak internal envelopes to clients.
-            if isinstance(self.result, dict) and TRANSPORT_ENVELOPE_SENTINEL in self.result:
-                raise RuntimeError("transport bytes lane received already-encoded result")
-            result_kwargs["transport_result"] = encode_transport_payload_bytes(
+            result_kwargs["transport_result"] = value_to_transport_payload(
                 self.result,
                 mode=self.serialization_mode,
                 context="taskpool_session",
+                carrier_context="service_result",
+                limit_bytes=get_payload_policy("result").inline_result_hard_limit_bytes,
+                reject_transport_envelope=True,
             )
         else:
             result_kwargs["result"] = dict_to_struct(self.result, mode=self.serialization_mode or "legacy_v1")

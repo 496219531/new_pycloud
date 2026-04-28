@@ -40,7 +40,9 @@ from pycloud_parallel.controlplane.node.results import (
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
+    decode_inline_transport_carrier,
     is_arrow_compatible,
+    is_inline_transport_carrier,
     log_payload_flow,
     serialize_arrow_compatible,
     stable_pickle_loads,
@@ -1221,12 +1223,16 @@ def _execute_payload_in_subprocess(
     managed_globals_timings: Dict[str, Any] = {}
 
     def _timings() -> Dict[str, Any]:
+        decode_ms = round(max(0.0, decode_end - decode_start) * 1000.0, 3)
+        encode_ms = round(max(0.0, encode_end - encode_start) * 1000.0, 3)
         timings: Dict[str, Any] = {
-            "decode_ms": round(max(0.0, decode_end - decode_start) * 1000.0, 3),
+            "decode_ms": decode_ms,
+            "worker_decode_ms": decode_ms,
             "invoke_ms": round(max(0.0, invoke_end - invoke_start) * 1000.0, 3),
             "invoke_wrapper_ms": round(max(0.0, float(invoke_wrapper_ms or 0.0)), 3),
             "user_fn_ms": round(max(0.0, float(user_fn_ms or 0.0)), 3),
-            "encode_ms": round(max(0.0, encode_end - encode_start) * 1000.0, 3),
+            "encode_ms": encode_ms,
+            "worker_encode_result_ms": encode_ms,
         }
         if managed_globals_timings:
             timings.update(managed_globals_timings)
@@ -1268,6 +1274,11 @@ def _execute_payload_in_subprocess(
                     fn = router.get(method)
                     if fn is None:
                         raise RuntimeError(f"method `{method}` not exported")
+                    normalized_payload_mode = str(payload_mode or "task_submit").strip().lower() or "task_submit"
+                    payload_policy = get_payload_policy(normalized_payload_mode)
+                    payload_context = (
+                        "service_owner" if normalized_payload_mode == "http_call" else "taskpool_session"
+                    )
                     managed_globals_timings = _apply_managed_globals_to_router(
                         module,
                         router,
@@ -1276,14 +1287,23 @@ def _execute_payload_in_subprocess(
                         object_dir=object_dir,
                         entry_module=entry_module,
                         method_name=method,
-                        session_kind=("service" if str(payload_mode or "task_submit") == "http_call" else "task_pool"),
+                        session_kind=("service" if normalized_payload_mode == "http_call" else "task_pool"),
                     )
                     from pycloud_parallel.controlplane.payload_transport import normalize_inbound_payload
 
+                    inbound_payload = (
+                        decode_inline_transport_carrier(
+                            payload,
+                            context=payload_context,
+                            limit_bytes=payload_policy.inline_payload_hard_limit_bytes,
+                        )
+                        if is_inline_transport_carrier(payload)
+                        else payload
+                    )
                     resolved_payload = normalize_inbound_payload(
-                        payload,
+                        inbound_payload,
                         object_dir=object_dir,
-                        policy=get_payload_policy(str(payload_mode or "task_submit")),
+                        policy=payload_policy,
                         resolve_object_refs=lambda value: _resolve_object_refs_in_payload(value, object_dir=object_dir),
                     )
                     decode_end = time.perf_counter()

@@ -4,12 +4,17 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from pycloud_parallel.controlplane.config import reload_config
 from pycloud_parallel.controlplane.node.models import TaskState
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import (
+    INLINE_TRANSPORT_CARRIER_SENTINEL,
+    decode_inline_transport_carrier,
     dict_to_struct,
     encode_transport_payload_bytes,
+    is_inline_transport_carrier,
     serialize_inline_payload,
+    transport_payload_to_inline_carrier,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.execution.task_pool import _NativePoolResultAdapter, TaskPool
@@ -135,10 +140,42 @@ def test_node_control_service_prefers_transport_payload_for_call_service():
     response = service.CallService(request, context)
 
     assert context.code is None
-    assert captured["payload"]["value"] == 7
+    assert is_inline_transport_carrier(captured["payload"])
+    assert decode_inline_transport_carrier(captured["payload"], context="service_owner")["value"] == 7
     assert response.ok is True
     assert response.HasField("transport_data")
     assert response.transport_data.codec == "pickle_stable_v1"
+
+
+def test_inline_transport_carrier_checksum_is_opt_in(monkeypatch):
+    transport = encode_transport_payload_bytes(
+        {"value": 7},
+        mode="pickle_stable_v1",
+        context="service_owner",
+    )
+
+    monkeypatch.setenv("PYCLOUD_INLINE_TRANSPORT_CHECKSUM", "0")
+    reload_config()
+    carrier = transport_payload_to_inline_carrier(transport, context="service_owner")
+    meta = carrier[INLINE_TRANSPORT_CARRIER_SENTINEL]
+    assert meta["checksum"] == ""
+    assert decode_inline_transport_carrier(carrier, context="service_owner") == {"value": 7}
+
+    monkeypatch.setenv("PYCLOUD_INLINE_TRANSPORT_CHECKSUM", "1")
+    reload_config()
+    carrier = transport_payload_to_inline_carrier(transport, context="service_owner")
+    meta = carrier[INLINE_TRANSPORT_CARRIER_SENTINEL]
+    assert str(meta["checksum"]).startswith("sha256:")
+    meta["checksum"] = "sha256:" + "0" * 64
+    try:
+        decode_inline_transport_carrier(carrier, context="service_owner")
+    except ValueError as exc:
+        assert "checksum mismatch" in str(exc)
+    else:
+        raise AssertionError("expected checksum mismatch")
+    finally:
+        monkeypatch.setenv("PYCLOUD_INLINE_TRANSPORT_CHECKSUM", "0")
+        reload_config()
 
 
 def test_task_pool_pickle_submit_uses_transport_payload():

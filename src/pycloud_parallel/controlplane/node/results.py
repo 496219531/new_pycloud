@@ -18,11 +18,11 @@ from pycloud_parallel.controlplane.config import (
     FILE_HASH_CHUNK_SIZE_BYTES,
     OBJECT_SEGMENT_MAX_BYTES,
     OBJECT_SEGMENT_TARGET_BYTES,
+    get_dataref_resolution,
     get_payload_policy,
 )
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref, maybe_data_ref, resolve_data_ref_materialize_as
 from pycloud_parallel.controlplane.data_store import DataStore
-from pycloud_parallel.controlplane.effective_policy import should_use_transport_payload_bytes
 from pycloud_parallel.controlplane.node.filesystem import (
     _materialized_objects_dir,
     _segment_relpath,
@@ -46,7 +46,7 @@ from pycloud_parallel.controlplane.serialization import (
     serialize_dataframe_bundle,
     serialize_series_bundle,
     summarize_payload_flow_value,
-    validate_inline_result_size,
+    transport_payload_to_inline_carrier,
     serialize_inline_result,
 )
 from pycloud_parallel.controlplane.state_time import utc_now
@@ -273,6 +273,92 @@ def _read_object_artifact_bytes(artifact: ObjectArtifact) -> bytes:
 
 def _materialized_object_path(root: Path, *, object_id: str, fmt: str) -> Path:
     return object_storage_path(_materialized_objects_dir(root), object_id=object_id, fmt=fmt)
+
+
+def _data_ref_remote_targets(data_ref: DataRef) -> tuple[str, ...]:
+    locator_kind = str(data_ref.locator_kind or "").strip().lower()
+    control_addr = str(data_ref.control_addr or "").strip()
+    locator_token = str(data_ref.locator_token or "").strip()
+    if control_addr:
+        return (control_addr,)
+    if locator_kind == "node_control" and locator_token:
+        return (locator_token,)
+    if locator_kind in {"controlplane", "node_local", ""} and locator_token:
+        from pycloud_parallel.controlplane.data_registry import DataRegistryClient
+
+        try:
+            resolved = DataRegistryClient(locator_token).resolve(data_ref)
+        except Exception as exc:
+            raise ObjectResolutionError(f"data ref registry resolve failed: {exc}") from exc
+        candidates = [str(item.get("control_addr", "") or "").strip() for item in resolved.replicas]
+        candidates.append(str(resolved.control_addr or "").strip())
+        return tuple(dict.fromkeys(item for item in candidates if item))
+    return ()
+
+
+def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) -> ObjectArtifact:
+    started_at = time.perf_counter()
+    from pycloud_parallel.controlplane.node_control_client import NodeControlClient
+
+    with NodeControlClient(target) as client:
+        blob = client.download_object_bytes(object_id=data_ref.object_id)
+    fetch_ms = (time.perf_counter() - started_at) * 1000.0
+
+    normalized_id = normalize_object_id(data_ref.object_id)
+    actual_id = object_id_from_sha256_hex(hashlib.sha256(blob).hexdigest())
+    if actual_id != normalized_id:
+        raise ObjectResolutionError(
+            f"remote object checksum mismatch: expected {normalized_id}, got {actual_id}"
+        )
+    expected_size = int(data_ref.size_bytes or 0)
+    if expected_size > 0 and expected_size != len(blob):
+        raise ObjectResolutionError(
+            f"remote object size mismatch: expected {expected_size}, got {len(blob)}"
+        )
+
+    cache_started_at = time.perf_counter()
+    normalized_format = normalize_object_format(data_ref.format, default="bin")
+    final_path = object_storage_path(object_dir, object_id=normalized_id, fmt=normalized_format)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix="pycloud-remote-object-",
+        suffix=object_format_suffix(normalized_format) or ".bin",
+        delete=False,
+        dir=str(final_path.parent),
+    ) as tmp_file:
+        tmp_file.write(blob)
+        tmp_path = Path(tmp_file.name)
+    try:
+        _replace_file_with_retry(tmp_path, final_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    created_at = utc_now()
+    _write_object_meta_with_retry(
+        object_dir,
+        object_id=normalized_id,
+        fmt=normalized_format,
+        size_bytes=len(blob),
+        created_at=created_at,
+        last_at=created_at,
+    )
+    cache_ms = (time.perf_counter() - cache_started_at) * 1000.0
+    log_payload_flow(
+        "dataref_remote_fetch_done",
+        object_id=normalized_id,
+        target=target,
+        worker_dataref_fetch_ms=fetch_ms,
+        worker_dataref_cache_write_ms=cache_ms,
+        size_bytes=len(blob),
+    )
+    return ObjectArtifact(
+        object_id=normalized_id,
+        path=str(final_path),
+        format=normalized_format,
+        size_bytes=len(blob),
+        created_at=created_at,
+        storage_backend="file",
+    )
 
 
 def _materialize_object_artifact(
@@ -563,24 +649,21 @@ def _normalize_result_value(
 ) -> Any:
     data_store = _data_store_for_object_dir(object_dir)
 
-    def _try_inline_result(value: Any) -> bool:
-        # This layer decides only whether a result may stay inline or must become a
-        # DataRef-backed artifact. It must not pre-wrap the result in a transport
-        # envelope; the outer response builder owns the single transport encode.
+    def _try_inline_result(value: Any) -> tuple[bool, Any]:
         try:
-            if (
-                should_use_transport_payload_bytes(mode=serialization_mode)
-                if use_transport_result is None
-                else bool(use_transport_result)
-            ):
+            if bool(use_transport_result):
+                result_limit = get_payload_policy("result").inline_result_hard_limit_bytes
                 transport = encode_transport_payload_bytes(
                     value,
                     mode=serialization_mode,
                     context="task result",
+                    limit_bytes=result_limit,
                 )
-                validate_inline_result_size(
-                    len(bytes(transport.payload or b"")),
-                    context="task result",
+                value = transport_payload_to_inline_carrier(
+                    transport,
+                    payload_mode="result",
+                    context="service_result",
+                    limit_bytes=result_limit,
                 )
             else:
                 serialize_inline_result(
@@ -589,9 +672,9 @@ def _normalize_result_value(
                     mode=serialization_mode,
                 )
         except ValueError:
-            return False
+            return False, None
         log_payload_flow("inline_result_ready", context="task result", summary=summarize_payload_flow_value(value))
-        return True
+        return True, value
 
     if isinstance(ret, Path):
         log_payload_flow("result_ref_store", path_type="path", summary=summarize_payload_flow_value(ret))
@@ -601,13 +684,15 @@ def _normalize_result_value(
         import pandas as pd
 
         if isinstance(ret, pd.DataFrame):
-            if _try_inline_result(ret):
-                return ret
+            is_inline, inline_value = _try_inline_result(ret)
+            if is_inline:
+                return inline_value
             log_payload_flow("result_ref_store", path_type="dataframe", summary=summarize_payload_flow_value(ret))
             return data_store.store_dataframe(ret)
         if isinstance(ret, pd.Series):
-            if _try_inline_result(ret):
-                return ret
+            is_inline, inline_value = _try_inline_result(ret)
+            if is_inline:
+                return inline_value
             log_payload_flow("result_ref_store", path_type="series", summary=summarize_payload_flow_value(ret))
             return data_store.store_series(ret)
     except ImportError:
@@ -617,15 +702,17 @@ def _normalize_result_value(
         import numpy as np
 
         if isinstance(ret, np.ndarray):
-            if _try_inline_result(ret):
-                return ret
+            is_inline, inline_value = _try_inline_result(ret)
+            if is_inline:
+                return inline_value
             log_payload_flow("result_ref_store", path_type="ndarray", summary=summarize_payload_flow_value(ret))
             return data_store.store_ndarray(ret)
     except ImportError:
         pass
 
-    if _try_inline_result(ret):
-        return ret
+    is_inline, inline_value = _try_inline_result(ret)
+    if is_inline:
+        return inline_value
     raise LargeResultError(
         "task result exceeds inline limit and must be returned as "
         "Path/DataFrame/Series/ndarray for DataRef storage"
@@ -695,12 +782,14 @@ def _data_store_for_object_dir(
     object_dir: str,
     *,
     node_id: str = "",
+    node_instance_id: str = "",
     control_addr: str = "",
 ) -> DataStore:
     normalized_dir = str(object_dir or "").strip()
     return DataStore(
         object_dir=normalized_dir,
         node_id=str(node_id or ""),
+        node_instance_id=str(node_instance_id or ""),
         control_addr=str(control_addr or ""),
         store_path_impl=lambda path: _store_result_path(path, object_dir=normalized_dir),
         store_dataframe_impl=lambda frame: _store_result_dataframe(frame, object_dir=normalized_dir),
@@ -764,6 +853,7 @@ def _resolve_single_data_ref(ref: DataRef | object, *, object_dir: str) -> Any:
     if artifact is not None:
         fallback_path = Path(artifact.path) if artifact.path else Path(artifact.segment_path)
         _touch_object_last_at(root, object_id=data_ref.object_id, fallback_path=fallback_path)
+        materialize_started_at = time.perf_counter()
         resolved = _materialize_object_artifact(
             artifact,
             materialize_as=materialized,
@@ -773,8 +863,48 @@ def _resolve_single_data_ref(ref: DataRef | object, *, object_dir: str) -> Any:
             "object_ref_resolved",
             materialize_as=materialized,
             summary=summarize_payload_flow_value(resolved),
+            worker_dataref_materialize_ms=(time.perf_counter() - materialize_started_at) * 1000.0,
         )
         return resolved
+    if get_dataref_resolution() == "remote_fetch":
+        targets = _data_ref_remote_targets(data_ref)
+        failures: list[tuple[str, BaseException]] = []
+        for target in targets:
+            log_payload_flow(
+                "dataref_remote_fetch_start",
+                object_id=normalize_object_id(data_ref.object_id),
+                target=target,
+                locator_kind=str(data_ref.locator_kind or ""),
+            )
+            try:
+                artifact = _cache_remote_data_ref(data_ref, object_dir=root, target=target)
+            except Exception as exc:
+                failures.append((target, exc))
+                log_payload_flow(
+                    "dataref_remote_fetch_failed",
+                    object_id=normalize_object_id(data_ref.object_id),
+                    target=target,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                continue
+            materialize_started_at = time.perf_counter()
+            resolved = _materialize_object_artifact(
+                artifact,
+                materialize_as=materialized,
+                root=root,
+            )
+            log_payload_flow(
+                "object_ref_resolved",
+                materialize_as=materialized,
+                summary=summarize_payload_flow_value(resolved),
+                worker_dataref_local_hit=False,
+                worker_dataref_materialize_ms=(time.perf_counter() - materialize_started_at) * 1000.0,
+            )
+            return resolved
+        if failures:
+            detail = "; ".join(f"{target}: {exc}" for target, exc in failures)
+            raise ObjectResolutionError(f"remote fetch failed for {data_ref.object_id}: {detail}") from failures[-1][1]
     raise ObjectResolutionError(f"object not found on node: {data_ref.object_id}")
 
 

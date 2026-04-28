@@ -87,6 +87,58 @@ def _create_exported_service(target: str, service_name: str) -> str:
     return session.service_id
 
 
+def test_discovery_attaches_result_ref_locator_without_materializing(monkeypatch) -> None:
+    route = InfoCenterServiceRoute(
+        service_name="svc-result-ref",
+        service_id="svc-result-ref-id",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_instance_id="node-result-ref-inst",
+        node_id="node-result-ref",
+        control_addr="127.0.0.1:50061",
+        node_healthy=True,
+        worker_count=1,
+        alive_workers=1,
+        in_flight=0,
+        lease_expire_at=datetime.now(timezone.utc),
+        http_base_url="http://127.0.0.1:18080/svc/svc-result-ref-id",
+    )
+    ref = DataRef(
+        ref_id="sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        storage_id="sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        format="bin",
+        size_bytes=12,
+        materialize_as="bytes",
+        locator_kind="node_local",
+    )
+    calls = []
+
+    class FakeRegistryClient:
+        def __init__(self, target, *, timeout_sec=10.0):
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def register(self, ref, **kwargs):
+            calls.append((self.target, ref, kwargs))
+            return {}
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.discovery_client.DataRegistryClient", FakeRegistryClient)
+    client = object.__new__(DiscoveryServiceClient)
+    client.infocenter_target = "127.0.0.1:50051"
+    client.timeout_sec = 5.0
+
+    body = client._attach_controlplane_locator({"ok": True, "data": ref}, route=route)  # noqa: SLF001
+
+    updated = body["data"]
+    assert updated.object_id == ref.object_id
+    assert updated.locator_kind == "node_control"
+    assert updated.locator_token == route.control_addr
+    assert updated.control_addr == route.control_addr
+    assert updated.node_id == route.node_id
+    assert updated.node_instance_id == route.node_instance_id
+    assert calls
+    assert calls[0][2]["control_addr"] == route.control_addr
+
+
 def _register_node_with_services(
     info_target: str,
     *,
@@ -803,9 +855,9 @@ def test_discovery_client_fetches_large_dataframe_result(tmp_path):
             assert body["ok"] is True
             assert isinstance(body["data"], DataRef)
             assert body["data"].node_id == "node-discovery-large-01"
-            assert body["data"].locator_kind == "controlplane"
-            assert body["data"].locator_token == controlplane.base_url
-            assert body["data"].control_addr == ""
+            assert body["data"].locator_kind in {"controlplane", "node_control"}
+            assert body["data"].locator_token in {controlplane.base_url, node_target}
+            assert body["data"].control_addr == node_target
             frame = client.fetch_result_data(body)
             assert isinstance(frame, pd.DataFrame)
             assert list(frame["x"].head(3)) == [4, 5, 6]

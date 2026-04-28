@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from datetime import date, datetime, time, timedelta
+import hashlib
 import logging
 import json
 from typing import Any, Optional, Sequence
@@ -17,6 +18,7 @@ from pycloud_parallel.controlplane.config import (
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     INLINE_RESULT_HARD_LIMIT_BYTES,
     INLINE_RESULT_SOFT_LIMIT_BYTES,
+    get_inline_transport_checksum,
 )
 from pycloud_parallel.controlplane.data_ref import (
     DataRef,
@@ -37,6 +39,7 @@ from pycloud_parallel.controlplane.structured_v1 import structured_dumps, struct
 payload_flow_logger = logging.getLogger("pycloud_parallel.payload_flow")
 MAX_ARROW_RECURSION_DEPTH = 200
 TRANSPORT_ENVELOPE_SENTINEL = "__pycloud_transport__"
+INLINE_TRANSPORT_CARRIER_SENTINEL = "__pycloud_inline_transport__"
 TRANSPORT_PAYLOAD_VERSION = 1
 
 
@@ -307,7 +310,7 @@ def prefers_transport_payload_bytes(mode: str = "") -> bool:
         request_mode=mode,
         context="transport_encode",
     )
-    return normalized == "pickle_stable_v1"
+    return normalized in {"structured_v1", "pickle_stable_v1"}
 
 
 def encode_transport_payload_bytes(
@@ -321,7 +324,13 @@ def encode_transport_payload_bytes(
         request_mode=mode,
         context=context,
     )
-    if normalized == "pickle_stable_v1":
+    if normalized == "legacy_v1":
+        payload = json.dumps(
+            serialize_arrow_compatible(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    elif normalized == "pickle_stable_v1":
         payload = stable_pickle_dumps(value)
     elif normalized == "structured_v1":
         payload = structured_dumps(value)
@@ -348,17 +357,19 @@ def decode_transport_payload_bytes(
     *,
     context: str = "payload",
     trust_mode: str = "",
+    limit_bytes: int = 0,
 ) -> Any:
-    normalized = resolve_received_transport_mode(
-        declared_mode=codec,
-        default_mode="legacy_v1",
+    normalized, raw, _size = validate_transport_payload_bytes(
+        codec,
+        version,
+        payload,
         context=context,
         trust_mode=trust_mode,
+        limit_bytes=limit_bytes,
     )
-    if int(version or 0) != TRANSPORT_PAYLOAD_VERSION:
-        raise ValueError(f"unsupported transport payload version: {version!r}")
-    raw = payload if isinstance(payload, bytes) else bytes(payload or b"")
-    if normalized == "pickle_stable_v1":
+    if normalized == "legacy_v1":
+        decoded = convert_dict_to_arrow(json.loads(raw.decode("utf-8") if raw else "null"))
+    elif normalized == "pickle_stable_v1":
         decoded = stable_pickle_loads(raw)
     elif normalized == "structured_v1":
         decoded = structured_loads(raw)
@@ -430,6 +441,219 @@ def validate_inline_payload_structs(
         total_size,
         limit_bytes=request_limit_bytes,
         context=request_context,
+    )
+
+
+def _coerce_payload_bytes(payload: bytes) -> bytes:
+    return payload if isinstance(payload, bytes) else bytes(payload or b"")
+
+
+def _transport_payload_checksum(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(_coerce_payload_bytes(payload)).hexdigest()
+
+
+def _maybe_transport_payload_checksum(payload: bytes) -> str:
+    return _transport_payload_checksum(payload) if get_inline_transport_checksum() else ""
+
+
+def validate_transport_payload_bytes(
+    codec: str,
+    version: int,
+    payload: bytes,
+    *,
+    context: str = "payload",
+    trust_mode: str = "",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> tuple[str, bytes, int]:
+    normalized = resolve_received_transport_mode(
+        declared_mode=codec,
+        default_mode="legacy_v1",
+        context=context,
+        trust_mode=trust_mode,
+    )
+    if int(version or 0) != TRANSPORT_PAYLOAD_VERSION:
+        raise ValueError(f"unsupported transport payload version: {version!r}")
+    raw = _coerce_payload_bytes(payload)
+    if int(limit_bytes or 0) > 0:
+        size = validate_inline_payload_size(
+            len(raw),
+            limit_bytes=max(1, int(limit_bytes)),
+            context=context,
+        )
+    else:
+        size = len(raw)
+    return normalized, raw, size
+
+
+def make_inline_transport_carrier(
+    *,
+    codec: str,
+    version: int,
+    payload: bytes,
+    payload_mode: str = "",
+    context: str = "payload",
+    trust_mode: str = "",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> dict[str, Any]:
+    normalized, raw, size = validate_transport_payload_bytes(
+        codec,
+        version,
+        payload,
+        context=context,
+        trust_mode=trust_mode,
+        limit_bytes=limit_bytes,
+    )
+    return make_validated_inline_transport_carrier(
+        codec=normalized,
+        payload=raw,
+        content_size=size,
+        payload_mode=payload_mode,
+        context=context,
+    )
+
+
+def make_validated_inline_transport_carrier(
+    *,
+    codec: str,
+    payload: bytes,
+    content_size: int,
+    payload_mode: str = "",
+    context: str = "payload",
+) -> dict[str, Any]:
+    return {
+        INLINE_TRANSPORT_CARRIER_SENTINEL: {
+            "carrier": "inline_bytes",
+            "codec": str(codec or "").strip().lower(),
+            "version": TRANSPORT_PAYLOAD_VERSION,
+            "payload_mode": str(payload_mode or context or ""),
+            "content_size": int(content_size or 0),
+            "checksum": _maybe_transport_payload_checksum(payload),
+            "content_bytes": payload,
+        }
+    }
+
+
+def is_inline_transport_carrier(value: Any) -> bool:
+    return isinstance(value, dict) and INLINE_TRANSPORT_CARRIER_SENTINEL in value
+
+
+def _inline_transport_carrier_meta(value: Any) -> dict[str, Any]:
+    if not is_inline_transport_carrier(value):
+        raise TypeError("payload is not an inline transport carrier")
+    meta = value.get(INLINE_TRANSPORT_CARRIER_SENTINEL)
+    if not isinstance(meta, dict):
+        raise ValueError("inline transport carrier metadata must be a dict")
+    if str(meta.get("carrier", "") or "").strip().lower() != "inline_bytes":
+        raise ValueError("unsupported inline transport carrier")
+    return meta
+
+
+def validate_inline_transport_carrier(
+    value: Any,
+    *,
+    context: str = "payload",
+    trust_mode: str = "",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> tuple[str, int, bytes]:
+    meta = _inline_transport_carrier_meta(value)
+    payload = meta.get("content_bytes", b"")
+    raw = _coerce_payload_bytes(payload)
+    normalized, raw, size = validate_transport_payload_bytes(
+        str(meta.get("codec", "") or ""),
+        int(meta.get("version", 0) or 0),
+        raw,
+        context=context,
+        trust_mode=trust_mode,
+        limit_bytes=limit_bytes,
+    )
+    declared_size = int(meta.get("content_size", size) or 0)
+    if declared_size != size:
+        raise ValueError(f"inline transport content_size mismatch: declared={declared_size} actual={size}")
+    checksum = str(meta.get("checksum", "") or "").strip().lower()
+    if checksum and checksum != _transport_payload_checksum(raw):
+        raise ValueError("inline transport checksum mismatch")
+    return normalized, TRANSPORT_PAYLOAD_VERSION, raw
+
+
+def transport_payload_to_inline_carrier(
+    transport: pb2.TransportPayload,
+    *,
+    payload_mode: str = "",
+    context: str = "payload",
+    trust_mode: str = "",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> dict[str, Any]:
+    return make_inline_transport_carrier(
+        codec=str(transport.codec or ""),
+        version=int(transport.version or 0),
+        payload=_coerce_payload_bytes(transport.payload),
+        payload_mode=payload_mode,
+        context=context,
+        trust_mode=trust_mode,
+        limit_bytes=limit_bytes,
+    )
+
+
+def inline_carrier_to_transport_payload(
+    value: Any,
+    *,
+    context: str = "payload",
+    trust_mode: str = "",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> pb2.TransportPayload:
+    codec, version, raw = validate_inline_transport_carrier(
+        value,
+        context=context,
+        trust_mode=trust_mode,
+        limit_bytes=limit_bytes,
+    )
+    return pb2.TransportPayload(codec=codec, version=version, payload=raw)
+
+
+def decode_inline_transport_carrier(
+    value: Any,
+    *,
+    context: str = "payload",
+    trust_mode: str = "",
+    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+) -> Any:
+    codec, version, raw = validate_inline_transport_carrier(
+        value,
+        context=context,
+        trust_mode=trust_mode,
+        limit_bytes=limit_bytes,
+    )
+    return decode_transport_payload_bytes(
+        codec,
+        version,
+        raw,
+        context=context,
+        trust_mode=trust_mode,
+    )
+
+
+def value_to_transport_payload(
+    value: Any,
+    *,
+    mode: str = "",
+    context: str = "payload",
+    carrier_context: str = "",
+    limit_bytes: int = 0,
+    reject_transport_envelope: bool = False,
+) -> pb2.TransportPayload:
+    if is_inline_transport_carrier(value):
+        return inline_carrier_to_transport_payload(
+            value,
+            context=carrier_context or context,
+            limit_bytes=limit_bytes,
+        )
+    if reject_transport_envelope and isinstance(value, dict) and TRANSPORT_ENVELOPE_SENTINEL in value:
+        raise RuntimeError("transport bytes lane received already-encoded result")
+    return encode_transport_payload_bytes(
+        value,
+        mode=mode,
+        context=context,
+        limit_bytes=limit_bytes,
     )
 
 
@@ -670,6 +894,16 @@ def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
         return {"__type__": "timedelta", "seconds": obj.total_seconds()}
     if maybe_data_ref(obj) is not None:
         return data_ref_to_payload(coerce_data_ref(obj))
+    if isinstance(obj, dict):
+        out = {}
+        seen_keys: set[str] = set()
+        for key, value in obj.items():
+            normalized_key = _normalize_mapping_key(key, path=path, existing_keys=seen_keys)
+            seen_keys.add(normalized_key)
+            out[normalized_key] = _serialize_arrow_compatible(value, path=_child_path(path, key), depth=depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_serialize_arrow_compatible(item, path=_child_path(path, idx), depth=depth + 1) for idx, item in enumerate(obj)]
 
     try:
         import numpy as np
@@ -721,17 +955,6 @@ def _serialize_arrow_compatible(obj: Any, *, path: str, depth: int) -> Any:
             }
     except ImportError:
         pass
-
-    if isinstance(obj, dict):
-        out = {}
-        seen_keys: set[str] = set()
-        for key, value in obj.items():
-            normalized_key = _normalize_mapping_key(key, path=path, existing_keys=seen_keys)
-            seen_keys.add(normalized_key)
-            out[normalized_key] = _serialize_arrow_compatible(value, path=_child_path(path, key), depth=depth + 1)
-        return out
-    if isinstance(obj, (list, tuple)):
-        return [_serialize_arrow_compatible(item, path=_child_path(path, idx), depth=depth + 1) for idx, item in enumerate(obj)]
 
     raise TypeError(
         f"{path} has unsupported type {type(obj).__name__}; "

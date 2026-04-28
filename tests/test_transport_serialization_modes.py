@@ -18,7 +18,12 @@ from pycloud_parallel.controlplane.payload_transport import (
     encode_result_for_transport,
 )
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
-from pycloud_parallel.controlplane.serialization import TRANSPORT_ENVELOPE_SENTINEL, encode_transport_value
+from pycloud_parallel.controlplane.serialization import (
+    TRANSPORT_ENVELOPE_SENTINEL,
+    decode_transport_payload_bytes,
+    encode_transport_payload_bytes,
+    encode_transport_value,
+)
 from pycloud_parallel.controlplane.pickle_stable_v1 import normalize_for_pickle_stable
 
 
@@ -41,6 +46,20 @@ def test_transport_payload_modes_roundtrip():
         assert np.array_equal(decoded["array"], payload["array"])
         if mode != "legacy_v1":
             assert decoded["blob"] == payload["blob"]
+
+
+def test_transport_payload_bytes_modes_roundtrip():
+    payload = {"frame": pd.DataFrame({"a": [1, 2]}), "value": 3}
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+        transport = encode_transport_payload_bytes(payload, mode=mode, context="service_owner")
+        decoded = decode_transport_payload_bytes(
+            transport.codec,
+            transport.version,
+            transport.payload,
+            context="service_owner",
+        )
+        assert decoded["frame"].equals(payload["frame"])
+        assert decoded["value"] == 3
 
 
 def test_pickle_stable_v1_transport_adapts_raw_codec_bytes_for_json_container():
@@ -100,6 +119,26 @@ def test_gateway_public_decode_rejects_pickle_transport():
         assert "pickle_stable_v1" in str(exc)
     else:
         raise AssertionError("expected gateway_public pickle decode to be rejected")
+
+
+def test_gateway_public_decode_rejects_pickle_transport_payload_bytes():
+    transport = encode_transport_payload_bytes(
+        {"value": 1},
+        mode="pickle_stable_v1",
+        context="service_owner",
+    )
+    try:
+        decode_transport_payload_bytes(
+            transport.codec,
+            transport.version,
+            transport.payload,
+            context="gateway_public",
+        )
+    except ValueError as exc:
+        assert "gateway_public" in str(exc)
+        assert "pickle_stable_v1" in str(exc)
+    else:
+        raise AssertionError("expected gateway_public pickle bytes decode to be rejected")
 
 
 def test_service_owner_decode_accepts_pickle_transport():

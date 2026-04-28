@@ -286,7 +286,7 @@ def main() -> None:
     parser.add_argument(
         "--executor-backend",
         default=EXECUTOR_BACKEND,
-        choices=("subprocess_host", "embedded"),
+        choices=("subprocess_host",),
     )
     parser.add_argument("--service-default-workers", type=int, default=SERVICE_DEFAULT_WORKERS)
     parser.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC)

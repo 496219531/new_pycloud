@@ -43,14 +43,19 @@ from pycloud_parallel.controlplane.node.filesystem import (
 from pycloud_parallel.controlplane.node.models import CodeArtifact, StoredResultArtifact
 from pycloud_parallel.controlplane.node.results import (
     LargeResultError,
+    ObjectResolutionError,
     _commit_result_file,
     _normalize_user_return,
     _resolve_object_refs_in_payload,
+    _resolve_single_data_ref,
 )
 from pycloud_parallel.controlplane.node.state import NodeControlState
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.serialization import (
+    decode_inline_transport_carrier,
     dict_to_struct,
+    encode_transport_payload_bytes,
+    is_inline_transport_carrier,
     struct_to_dict,
 )
 from pycloud_parallel.controlplane.state_time import utc_now
@@ -147,7 +152,7 @@ def test_nodecontrol_default_artifact_dir_isolated_by_bind_port(tmp_path, monkey
         server_b.stop(0)
 
 
-def test_nodecontrol_default_executor_backend_is_embedded(tmp_path):
+def test_nodecontrol_default_executor_backend_is_subprocess_host(tmp_path):
     state = NodeControlState(
         node_id="node-default-backend",
         queue_capacity=4,
@@ -158,9 +163,107 @@ def test_nodecontrol_default_executor_backend_is_embedded(tmp_path):
         service_http_bind="127.0.0.1:0",
     )
     try:
-        assert state.executor_backend == "embedded"
+        assert state.executor_backend == "subprocess_host"
         assert state._executor_host is not None  # noqa: SLF001
-        assert state._executor_host.backend_name == "embedded"  # noqa: SLF001
+        assert state._executor_host.backend_name == "subprocess_host"  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_task_pool_artifact_validation_runs_in_executor_host_not_node(tmp_path):
+    module_name = "node_should_not_import_entry_module_demo"
+    sys.modules.pop(module_name, None)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        source = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        info = tarfile.TarInfo(f"{module_name}.py")
+        info.size = len(source)
+        tf.addfile(info, io.BytesIO(source))
+    blob = buf.getvalue()
+    state = NodeControlState(
+        node_id="node-no-import-validation",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_no_node_import"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-no-node-import",
+            pool_name="pool-no-node-import",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module=module_name,
+            entry_callable="run",
+            package_format="tar.gz",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        assert pool.task_method == "run"
+        assert module_name not in sys.modules
+    finally:
+        state.close()
+        sys.modules.pop(module_name, None)
+
+
+def test_task_pool_artifact_prepare_is_cached_between_put_and_create(tmp_path):
+    state = NodeControlState(
+        node_id="node-prepare-cache",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_prepare_cache"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    prepare_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **kwargs):
+            prepare_calls.append(kwargs)
+            return {"ok": True, "methods": {"run": ("run", "")}}
+
+        def create_task_pool(self, **_kwargs):
+            pass
+
+        def preload_pool(self, **_kwargs):
+            return 1
+
+        def stop_task_pool(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        state.create_task_pool(
+            owner_client_id="owner-prepare-cache",
+            pool_name="pool-prepare-cache",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_prepare_cache",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        assert len(prepare_calls) == 1
     finally:
         state.close()
 
@@ -683,10 +786,190 @@ def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd.testing.assert_frame_equal(restored["frame"], frame)
 
 
+def test_data_ref_resolution_local_only_does_not_remote_fetch(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "local_only")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("remote fetch should not run in local_only mode")
+
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    blob = b"remote payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+    )
+
+    with pytest.raises(ObjectResolutionError, match="object not found on node"):
+        _resolve_single_data_ref(ref, object_dir=str(tmp_path))
+
+
+def test_data_ref_resolution_remote_fetches_and_caches(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef, object_storage_path
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"remote payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+    calls = []
+
+    class FakeClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def download_object_bytes(self, *, object_id):
+            calls.append((self.target, object_id))
+            return blob
+
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+    )
+
+    assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
+    assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
+    assert calls == [("127.0.0.1:50061", object_id)]
+    assert object_storage_path(tmp_path, object_id=object_id, fmt="bin").read_bytes() == blob
+
+
+def test_data_ref_resolution_remote_fetch_resolves_controlplane_locator(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.data_registry as data_registry_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"registry routed payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+    calls = []
+
+    class FakeRegistryClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def resolve(self, ref):
+            assert self.target == "infocenter:50051"
+            return data_registry_mod.ResolvedDataRef(
+                ref=ref,
+                control_addr="10.0.0.2:50061",
+                locator_kind="node_control",
+                locator_token="10.0.0.2:50061",
+                via_registry=True,
+                replicas=({"control_addr": "10.0.0.2:50061"},),
+            )
+
+    class FakeClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def download_object_bytes(self, *, object_id):
+            calls.append((self.target, object_id))
+            return blob
+
+    monkeypatch.setattr(data_registry_mod, "DataRegistryClient", FakeRegistryClient)
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="controlplane",
+        locator_token="infocenter:50051",
+    )
+
+    assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
+    assert calls == [("10.0.0.2:50061", object_id)]
+
+
+def test_data_ref_resolution_remote_fetch_rejects_checksum_mismatch(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef, object_storage_path
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    expected_blob = b"expected payload"
+    wrong_blob = b"wrong payload"
+    object_id = "sha256:" + hashlib.sha256(expected_blob).hexdigest()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def download_object_bytes(self, *, object_id):
+            return wrong_blob
+
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(expected_blob),
+        materialize_as="bytes",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+    )
+
+    with pytest.raises(ObjectResolutionError, match="checksum mismatch"):
+        _resolve_single_data_ref(ref, object_dir=str(tmp_path))
+    assert not object_storage_path(tmp_path, object_id=object_id, fmt="bin").exists()
+
+
 def test_data_store_builds_result_and_data_refs() -> None:
     from pycloud_parallel.controlplane.data_store import DataStore, StoredDataArtifact
 
-    store = DataStore(object_dir="/tmp/objects", node_id="node-1", control_addr="127.0.0.1:50061")
+    store = DataStore(
+        object_dir="/tmp/objects",
+        node_id="node-1",
+        node_instance_id="node-1-inst",
+        control_addr="127.0.0.1:50061",
+    )
     artifact = StoredDataArtifact(
         object_id="sha256:" + ("f" * 64),
         format="dfbundle",
@@ -702,6 +985,8 @@ def test_data_store_builds_result_and_data_refs() -> None:
     assert data_ref.control_addr == "127.0.0.1:50061"
     assert result_ref.object_id == artifact.object_id
     assert result_ref.node_id == "node-1"
+    assert result_ref.node_instance_id == "node-1-inst"
+    assert result_ref.control_addr == "127.0.0.1:50061"
 
 
 def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
@@ -1671,7 +1956,7 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
             def drain_events(self):
                 return []
 
-            def close(self):
+            def close(self, **_kwargs):
                 pass
 
         state._executor_host = _FakeExecutorHost()  # noqa: SLF001
@@ -1698,9 +1983,9 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
                 pb2.TaskSubmitItem(
                     task_id="pool-bad-1",
                     transport_payload=pb2.TransportPayload(
-                        codec="pickle_stable_v1",
+                        codec="unknown_v1",
                         version=1,
-                        payload=b"not-a-valid-pickle-payload",
+                        payload=b"{}",
                     ),
                 ),
             ],
@@ -1719,7 +2004,117 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
         state.close()
 
 
-def test_create_task_pool_preloads_entry_module_on_workers(tmp_path):
+@pytest.mark.parametrize("mode", ["legacy_v1", "structured_v1", "pickle_stable_v1"])
+def test_submit_pool_transport_payload_stays_opaque_until_worker(tmp_path, monkeypatch, mode):
+    state = NodeControlState(
+        node_id=f"node-pool-opaque-{mode}",
+        queue_capacity=16,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / f"code_cache_pool_opaque_{mode}"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        submitted = []
+
+        class _FakeExecutorHost:
+            def is_alive(self):
+                return True
+
+            def create_task_pool(self, **_kwargs):
+                pass
+
+            def preload_pool(self, **_kwargs):
+                return 1
+
+            def submit_pool_task(self, **kwargs):
+                submitted.append(kwargs)
+
+            def stop_task_pool(self, **_kwargs):
+                pass
+
+            def drain_events(self):
+                return []
+
+            def close(self, **_kwargs):
+                pass
+
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name=f"pool-opaque-{mode}",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module=f"pool_opaque_{mode}",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        monkeypatch.setattr(
+            "pycloud_parallel.controlplane.nodecontrol_state.decode_transport_payload_bytes",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("node must not decode inline bytes")),
+        )
+
+        accepted, rejected = state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            tasks=[
+                pb2.TaskSubmitItem(
+                    task_id=f"pool-opaque-{mode}",
+                    transport_payload=encode_transport_payload_bytes(
+                        {"value": 41},
+                        mode=mode,
+                        context="taskpool_session",
+                    ),
+                )
+            ],
+            job_id="job-opaque",
+        )
+
+        assert [item.task_id for item in accepted] == [f"pool-opaque-{mode}"]
+        assert rejected == []
+        execute_spec = submitted[0]["execute_spec"]
+        assert is_inline_transport_carrier(execute_spec["payload"])
+        assert decode_inline_transport_carrier(execute_spec["payload"], context="taskpool_session") == {"value": 41}
+
+        status_text, result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+            execute_spec["artifact_path"],
+            execute_spec["entry_module"],
+            execute_spec["package_format"],
+            execute_spec["dependency_path"],
+            execute_spec["dependency_policy_mode"],
+            execute_spec["object_dir"],
+            execute_spec["work_dir"],
+            execute_spec["managed_globals_scope_dir"],
+            execute_spec["managed_globals_digest"],
+            execute_spec["export_mode"],
+            execute_spec["export_methods"],
+            execute_spec["export_decorator"],
+            execute_spec["method_name"],
+            execute_spec["entry_callable"],
+            execute_spec["payload"],
+            execute_spec["warmup_only"],
+            execute_spec["payload_mode"],
+            execute_spec["serialization_mode"],
+            execute_spec["use_transport_result"],
+        )
+
+        assert status_text == "SUCCEEDED", (err_type, err_message)
+        assert is_inline_transport_carrier(result)
+        assert decode_inline_transport_carrier(result, context="service_result") == {"value": 42}
+    finally:
+        state.close()
+
+
+def test_create_task_pool_skips_preload_for_default_fork_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.delenv("PYCLOUD_WORKER_START_METHOD", raising=False)
     state = NodeControlState(
         node_id="node-pool-preload-01",
         queue_capacity=16,
@@ -1769,11 +2164,67 @@ def test_create_task_pool_preloads_entry_module_on_workers(tmp_path):
         )
 
         assert pool.worker_count == 2
+        assert [kind for kind, _payload in calls] == ["create"]
+    finally:
+        state.close()
+
+
+def test_create_task_pool_preloads_entry_module_for_spawn_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_WORKER_START_METHOD", "spawn")
+    state = NodeControlState(
+        node_id="node-pool-spawn-preload-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_spawn_preload"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def preload_pool(self, **kwargs):
+            calls.append(("preload", kwargs))
+            return int(kwargs["fanout"])
+
+        def stop_task_pool(self, **kwargs):
+            calls.append(("stop", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-spawn-preload",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_spawn_preload",
+            entry_callable="run",
+            package_format="py",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        assert pool.worker_count == 2
         assert [kind for kind, _payload in calls] == ["create", "preload"]
         preload = calls[1][1]
         assert preload["pool_id"] == pool.pool_id
         assert preload["fanout"] == 2
-        assert preload["execute_spec"]["entry_module"] == "pool_preload"
+        assert preload["execute_spec"]["entry_module"] == "pool_spawn_preload"
         assert preload["execute_spec"]["method_name"] == "run"
         assert preload["execute_spec"]["payload_mode"] == "task_submit"
         assert preload["execute_spec"]["warmup_only"] is True
@@ -1781,7 +2232,9 @@ def test_create_task_pool_preloads_entry_module_on_workers(tmp_path):
         state.close()
 
 
-def test_create_service_preloads_entry_module_on_workers(tmp_path):
+def test_create_service_skips_preload_for_default_fork_workers(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.delenv("PYCLOUD_WORKER_START_METHOD", raising=False)
     state = NodeControlState(
         node_id="node-service-preload-01",
         queue_capacity=16,
@@ -1832,11 +2285,68 @@ def test_create_service_preloads_entry_module_on_workers(tmp_path):
         )
 
         assert session.worker_count == 2
+        assert [kind for kind, _payload in calls] == ["create"]
+    finally:
+        state.close()
+
+
+def test_create_service_preloads_entry_module_for_spawn_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_WORKER_START_METHOD", "spawn")
+    state = NodeControlState(
+        node_id="node-service-spawn-preload-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_service_spawn_preload"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def preload_service(self, **kwargs):
+            calls.append(("preload", kwargs))
+            return int(kwargs["fanout"])
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-service",
+            service_name="svc-spawn-preload",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_spawn_preload",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=2,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        assert session.worker_count == 2
         assert [kind for kind, _payload in calls] == ["create", "preload"]
         preload = calls[1][1]
         assert preload["service_id"] == session.service_id
         assert preload["fanout"] == 2
-        assert preload["execute_spec"]["entry_module"] == "service_preload"
+        assert preload["execute_spec"]["entry_module"] == "service_spawn_preload"
         assert preload["execute_spec"]["method_name"] == "serve"
         assert preload["execute_spec"]["payload_mode"] == "http_call"
         assert preload["execute_spec"]["warmup_only"] is True
@@ -3075,60 +3585,6 @@ def test_service_call_recovers_after_executor_host_restart(tmp_path):
         assert code == 200
         assert body["ok"] is True
         assert body["data"] == {"v": 8, "square": 64}
-    finally:
-        state.close()
-
-
-def test_nodecontrol_embedded_executor_backend_service_call(tmp_path):
-    state = NodeControlState(
-        node_id="node-svc-embedded-01",
-        queue_capacity=16,
-        worker_capacity=2,
-        artifact_dir=str(tmp_path / "code_cache"),
-        enable_internal_executor=False,
-        enable_service_session=True,
-        executor_backend="embedded",
-        service_http_bind="127.0.0.1:0",
-        monitor_interval_sec=1,
-    )
-    try:
-        blob = (
-            b"def pycloud_export(fn):\n"
-            b"    fn.__pycloud_export__ = True\n"
-            b"    return fn\n\n"
-            b"@pycloud_export\n"
-            b"def run(value=0, **_kwargs):\n"
-            b"    v = int(value)\n"
-            b"    return {'v': v, 'triple': v * 3}\n"
-        )
-        digest = hashlib.sha256(blob).hexdigest()
-        session = state.create_service(
-            owner_client_id="owner-embedded",
-            service_name="svc-embedded",
-            sha256=f"sha256:{digest}",
-            runtime="py3",
-            entry_module="svc_embedded_backend",
-            entry_callable="run",
-            package_format="py",
-            worker_count=1,
-            heartbeat_timeout_sec=30,
-            idle_ttl_sec=0,
-            expose_http=False,
-            chunks=[blob],
-        )
-        assert state._executor_host is not None  # noqa: SLF001
-        assert state._executor_host.backend_name == "embedded"  # noqa: SLF001
-
-        code, body = state.call_service(
-            service_id=session.service_id,
-            method="run",
-            payload={"value": 7},
-            service_token=session.service_token,
-            timeout_sec=5.0,
-        )
-        assert code == 200
-        assert body["ok"] is True
-        assert body["data"] == {"v": 7, "triple": 21}
     finally:
         state.close()
 

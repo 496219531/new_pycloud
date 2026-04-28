@@ -6,8 +6,8 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 import logging
 import multiprocessing as mp
+import os
 import queue
-import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -73,6 +73,53 @@ def is_recoverable_pool_error(exc: BaseException) -> bool:
     return "terminated abruptly while the future was running or pending" in text or "BrokenProcessPool" in text
 
 
+def prepare_artifact_in_host(args: Dict[str, Any]) -> Dict[str, Any]:
+    from pycloud_parallel.controlplane.node.execution import (
+        _describe_artifact_error,
+        _is_user_artifact_error,
+        _load_callable_router,
+        _resolve_apply_managed_globals_hook,
+    )
+    from pycloud_parallel.controlplane.node.filesystem import _normalize_managed_global_names
+
+    artifact_path = str(args.get("artifact_path", "") or "")
+    entry_module = str(args.get("entry_module", "") or "")
+    package_format = str(args.get("package_format", "") or "")
+    dependency_path = str(args.get("dependency_path", "") or "")
+    entry_callable = str(args.get("entry_callable", "") or "")
+    try:
+        module, _router, method_info = _load_callable_router(
+            artifact_path,
+            entry_module=entry_module,
+            package_format=package_format,
+            dependency_path=dependency_path,
+            export_mode=str(args.get("export_mode", "") or ""),
+            export_methods=tuple(args.get("export_methods", ()) or ()),
+            export_decorator=str(args.get("export_decorator", "") or ""),
+            entry_callable=entry_callable,
+        )
+        managed_global_names = _normalize_managed_global_names(args.get("managed_global_names", ()) or ())
+        if managed_global_names and _resolve_apply_managed_globals_hook(module) is None:
+            missing = [name for name in managed_global_names if not hasattr(module, name)]
+            if missing:
+                raise ValueError(f"managed globals not found in entry module: {missing}")
+        return {"ok": True, "methods": dict(method_info)}
+    except Exception as exc:
+        if _is_user_artifact_error(exc):
+            return {
+                "ok": False,
+                "user_error": True,
+                "error": _describe_artifact_error(
+                    exc,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                    dependency_policy_mode=str(args.get("dependency_policy_mode", "") or ""),
+                ),
+            }
+        return {"ok": False, "user_error": False, "error": repr(exc)}
+
+
 class ExecutorCore:
     """Owns ProcessPoolExecutor instances and emits host-compatible events."""
 
@@ -92,11 +139,7 @@ class ExecutorCore:
         self._pool_workers: Dict[str, int] = {}
         self._task_executor: Optional[ProcessPoolExecutor] = None
         self._inflight: Dict[object, Dict[str, Any]] = {}
-        self._shutdown_q: "queue.Queue[object]" = queue.Queue()
         self._completed_futures: "queue.Queue[object]" = queue.Queue()
-        self._shutdown_sentinel = object()
-        self._shutdown_thread = threading.Thread(target=self._shutdown_worker, name="executor-core-shutdown", daemon=True)
-        self._shutdown_thread.start()
 
     def close(self) -> None:
         for executor in list(self._service_executors.values()):
@@ -109,11 +152,34 @@ class ExecutorCore:
         self._pool_executors.clear()
         self._pool_workers.clear()
         self._task_executor = None
-        self._shutdown_q.put(self._shutdown_sentinel)
-        self._shutdown_thread.join(timeout=5.0)
 
     @staticmethod
     def _ensure_mp_context():
+        return ExecutorCore._select_mp_context(allow_fork=True)
+
+    @staticmethod
+    def _spawn_mp_context():
+        return ExecutorCore._select_mp_context(allow_fork=False)
+
+    @staticmethod
+    def _select_mp_context(*, allow_fork: bool):
+        requested = str(os.getenv("PYCLOUD_WORKER_START_METHOD", "") or "").strip().lower()
+        parent_kind = str(os.getenv("PYCLOUD_EXECUTOR_PARENT_KIND", "") or "").strip().lower()
+        available = set(mp.get_all_start_methods())
+        if requested == "fork" and "fork" not in available:
+            return mp.get_context("spawn")
+        if requested:
+            if requested not in available:
+                raise ValueError(
+                    f"PYCLOUD_WORKER_START_METHOD must be one of {sorted(available)}; got {requested!r}"
+                )
+            if requested == "fork" and not allow_fork:
+                return mp.get_context("spawn")
+            if requested == "fork" and parent_kind != "executor_host":
+                return mp.get_context("spawn")
+            return mp.get_context(requested)
+        if allow_fork and os.name != "nt" and parent_kind == "executor_host" and "fork" in available:
+            return mp.get_context("fork")
         return mp.get_context("spawn")
 
     @staticmethod
@@ -135,18 +201,6 @@ class ExecutorCore:
                     proc.join(timeout=1.0)
             except Exception:
                 continue
-
-    def _shutdown_executor_async(self, executor: Optional[ProcessPoolExecutor], *, wait: bool = False) -> None:
-        if executor is not None:
-            self._shutdown_q.put((executor, bool(wait)))
-
-    def _shutdown_worker(self) -> None:
-        while True:
-            item = self._shutdown_q.get()
-            if item is self._shutdown_sentinel:
-                return
-            executor, wait = item
-            self._shutdown_executor(executor, wait=bool(wait))
 
     def _emit_response(self, request_id: str, **payload: object) -> None:
         if self._emit_response_func is not None:
@@ -186,27 +240,71 @@ class ExecutorCore:
 
     def _ensure_task_executor(self) -> ProcessPoolExecutor:
         if self._task_executor is None:
-            self._task_executor = ProcessPoolExecutor(
-                max_workers=self._task_worker_capacity,
-                mp_context=self._ensure_mp_context(),
-            )
+            self._task_executor = self._new_process_pool(max_workers=self._task_worker_capacity)
         return self._task_executor
 
+    def _new_process_pool(self, *, max_workers: int, force_spawn: bool = False) -> ProcessPoolExecutor:
+        try:
+            context = self._spawn_mp_context() if force_spawn else self._ensure_mp_context()
+            return ProcessPoolExecutor(max_workers=max_workers, mp_context=context)
+        except Exception as exc:
+            if not force_spawn and self._should_fallback_to_spawn(exc):
+                logger.warning("fork process pool startup failed; falling back to spawn: %r", exc)
+                return ProcessPoolExecutor(max_workers=max_workers, mp_context=self._spawn_mp_context())
+            raise
+
+    @staticmethod
+    def _should_fallback_to_spawn(exc: BaseException) -> bool:
+        requested = str(os.getenv("PYCLOUD_WORKER_START_METHOD", "") or "").strip().lower()
+        parent_kind = str(os.getenv("PYCLOUD_EXECUTOR_PARENT_KIND", "") or "").strip().lower()
+        if requested and requested != "fork":
+            return False
+        return os.name != "nt" and parent_kind == "executor_host" and "fork" in set(mp.get_all_start_methods())
+
     def _rebuild_service_executor(self, service_id: str) -> Optional[ProcessPoolExecutor]:
+        return self._rebuild_service_executor_with_context(service_id, force_spawn=False)
+
+    def _rebuild_service_executor_with_context(self, service_id: str, *, force_spawn: bool) -> Optional[ProcessPoolExecutor]:
         worker_count = max(1, int(self._service_workers.get(service_id, 1) or 1))
         existing = self._service_executors.pop(service_id, None)
-        self._shutdown_executor_async(existing, wait=True)
-        executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=self._ensure_mp_context())
+        self._shutdown_executor(existing, wait=True)
+        executor = self._new_process_pool(max_workers=worker_count, force_spawn=force_spawn)
         self._service_executors[service_id] = executor
         return executor
 
     def _rebuild_pool_executor(self, pool_id: str) -> Optional[ProcessPoolExecutor]:
+        return self._rebuild_pool_executor_with_context(pool_id, force_spawn=False)
+
+    def _rebuild_pool_executor_with_context(self, pool_id: str, *, force_spawn: bool) -> Optional[ProcessPoolExecutor]:
         worker_count = max(1, int(self._pool_workers.get(pool_id, 1) or 1))
         existing = self._pool_executors.pop(pool_id, None)
-        self._shutdown_executor_async(existing, wait=True)
-        executor = ProcessPoolExecutor(max_workers=worker_count, mp_context=self._ensure_mp_context())
+        self._shutdown_executor(existing, wait=True)
+        executor = self._new_process_pool(max_workers=worker_count, force_spawn=force_spawn)
         self._pool_executors[pool_id] = executor
         return executor
+
+    def _submit_with_spawn_fallback(self, *, scope: str, key: str, executor: ProcessPoolExecutor, payload: Dict[str, Any]):
+        try:
+            return submit_callable_to_worker(executor, payload), executor
+        except Exception as exc:
+            if not self._should_fallback_to_spawn(exc):
+                raise
+            logger.warning("fork worker submit failed; falling back to spawn scope=%s key=%s err=%r", scope, key, exc)
+            if scope == "service":
+                fallback_executor = self._rebuild_service_executor_with_context(key, force_spawn=True)
+            elif scope == "pool":
+                fallback_executor = self._rebuild_pool_executor_with_context(key, force_spawn=True)
+            elif scope == "runtime":
+                old_executor = self._task_executor
+                self._task_executor = None
+                self._shutdown_executor(old_executor, wait=True)
+                self._task_executor = self._new_process_pool(max_workers=self._task_worker_capacity, force_spawn=True)
+                fallback_executor = self._task_executor
+            else:
+                raise
+            if fallback_executor is None:
+                raise
+            return submit_callable_to_worker(fallback_executor, payload), fallback_executor
 
     def _submit_service_future(self, service_id: str, payload: Dict[str, Any]):
         executor = self._service_executors.get(service_id)
@@ -215,7 +313,7 @@ class ExecutorCore:
         if executor is None:
             raise RuntimeError("service executor missing")
         try:
-            future = submit_callable_to_worker(executor, payload)
+            future, executor = self._submit_with_spawn_fallback(scope="service", key=service_id, executor=executor, payload=payload)
             self._emit_executor_workers(scope="service", key=service_id, executor=executor)
             return future
         except Exception as exc:
@@ -224,7 +322,7 @@ class ExecutorCore:
             executor = self._rebuild_service_executor(service_id)
             if executor is None:
                 raise RuntimeError("service executor missing after rebuild") from exc
-            future = submit_callable_to_worker(executor, payload)
+            future, executor = self._submit_with_spawn_fallback(scope="service", key=service_id, executor=executor, payload=payload)
             self._emit_executor_workers(scope="service", key=service_id, executor=executor)
             return future
 
@@ -235,7 +333,7 @@ class ExecutorCore:
         if executor is None:
             raise RuntimeError("task pool missing")
         try:
-            future = submit_callable_to_worker(executor, payload)
+            future, executor = self._submit_with_spawn_fallback(scope="pool", key=pool_id, executor=executor, payload=payload)
             self._emit_executor_workers(scope="pool", key=pool_id, executor=executor)
             return future
         except Exception as exc:
@@ -244,14 +342,14 @@ class ExecutorCore:
             executor = self._rebuild_pool_executor(pool_id)
             if executor is None:
                 raise RuntimeError("task pool missing after rebuild") from exc
-            future = submit_callable_to_worker(executor, payload)
+            future, executor = self._submit_with_spawn_fallback(scope="pool", key=pool_id, executor=executor, payload=payload)
             self._emit_executor_workers(scope="pool", key=pool_id, executor=executor)
             return future
 
     def _submit_runtime_future(self, payload: Dict[str, Any]):
         executor = self._ensure_task_executor()
         try:
-            future = submit_callable_to_worker(executor, payload)
+            future, executor = self._submit_with_spawn_fallback(scope="runtime", key=str(payload.get("runtime_key", "") or ""), executor=executor, payload=payload)
             self._emit_executor_workers(scope="runtime", key=str(payload.get("runtime_key", "") or ""), executor=executor)
             return future
         except Exception as exc:
@@ -259,9 +357,9 @@ class ExecutorCore:
                 raise
             old_executor = self._task_executor
             self._task_executor = None
-            self._shutdown_executor_async(old_executor, wait=True)
+            self._shutdown_executor(old_executor, wait=True)
             executor = self._ensure_task_executor()
-            future = submit_callable_to_worker(executor, payload)
+            future, executor = self._submit_with_spawn_fallback(scope="runtime", key=str(payload.get("runtime_key", "") or ""), executor=executor, payload=payload)
             self._emit_executor_workers(scope="runtime", key=str(payload.get("runtime_key", "") or ""), executor=executor)
             return future
 
@@ -272,13 +370,20 @@ class ExecutorCore:
         *,
         fanout: int,
         kind: str,
+        key: str,
         label: str,
     ) -> int:
         if executor is None:
             return 0
         submitted = max(1, int(fanout or 1))
+        current_executor = executor
         for _ in range(submitted):
-            future = submit_callable_to_worker(executor, args)
+            future, current_executor = self._submit_with_spawn_fallback(
+                scope=kind,
+                key=key,
+                executor=current_executor,
+                payload=args,
+            )
 
             def _consume_background_result(done_future, *, call_kind: str = kind, call_label: str = label) -> None:
                 try:
@@ -297,7 +402,7 @@ class ExecutorCore:
                     )
 
             future.add_done_callback(_consume_background_result)
-        self._emit_executor_workers(scope=kind, key=str(args.get(f"{kind}_id", args.get("runtime_key", "")) or ""), executor=executor)
+        self._emit_executor_workers(scope=kind, key=key, executor=current_executor)
         return submitted
 
     def handle_request(self, request_id: str, action: str, payload: Dict[str, Any]) -> bool:
@@ -312,6 +417,11 @@ class ExecutorCore:
             return True
 
     def _handle_request_or_raise(self, request_id: str, action: str, payload: Dict[str, Any]) -> bool:
+        if action == "prepare_artifact":
+            prepared = prepare_artifact_in_host(payload)
+            self._emit_response(request_id, **prepared)
+            return True
+
         if action == "create_service":
             service_id = str(payload.get("service_id", "") or "")
             worker_count = max(1, int(payload.get("worker_count", 1) or 1))
@@ -373,7 +483,14 @@ class ExecutorCore:
                 self._emit_response(request_id, ok=False, error="service executor missing")
                 return True
             fanout = max(1, int(payload.get("fanout", 1) or 1))
-            submitted = self._submit_background_calls(executor, payload, fanout=fanout, kind="service", label="warmup")
+            submitted = self._submit_background_calls(
+                executor,
+                payload,
+                fanout=fanout,
+                kind="service",
+                key=service_id,
+                label="warmup",
+            )
             self._emit_response(request_id, ok=True, submitted=submitted)
             return True
 
@@ -386,7 +503,14 @@ class ExecutorCore:
                 self._emit_response(request_id, ok=False, error="service executor missing")
                 return True
             fanout = max(1, int(payload.get("fanout", 1) or 1))
-            submitted = self._submit_background_calls(executor, payload, fanout=fanout, kind="service", label="preload")
+            submitted = self._submit_background_calls(
+                executor,
+                payload,
+                fanout=fanout,
+                kind="service",
+                key=service_id,
+                label="preload",
+            )
             self._emit_response(request_id, ok=True, submitted=submitted)
             return True
 
@@ -409,7 +533,15 @@ class ExecutorCore:
         if action == "warmup_runtime":
             executor = self._ensure_task_executor()
             fanout = max(1, int(payload.get("fanout", 1) or 1))
-            submitted = self._submit_background_calls(executor, payload, fanout=fanout, kind="runtime", label="warmup")
+            runtime_key = str(payload.get("runtime_key", "") or "")
+            submitted = self._submit_background_calls(
+                executor,
+                payload,
+                fanout=fanout,
+                kind="runtime",
+                key=runtime_key,
+                label="warmup",
+            )
             self._emit_response(request_id, ok=True, submitted=submitted)
             return True
 
@@ -443,7 +575,14 @@ class ExecutorCore:
                 self._emit_response(request_id, ok=False, error="task pool missing")
                 return True
             fanout = max(1, int(payload.get("fanout", 1) or 1))
-            submitted = self._submit_background_calls(executor, payload, fanout=fanout, kind="pool", label="warmup")
+            submitted = self._submit_background_calls(
+                executor,
+                payload,
+                fanout=fanout,
+                kind="pool",
+                key=pool_id,
+                label="warmup",
+            )
             self._emit_response(request_id, ok=True, submitted=submitted)
             return True
 
@@ -456,7 +595,14 @@ class ExecutorCore:
                 self._emit_response(request_id, ok=False, error="task pool missing")
                 return True
             fanout = max(1, int(payload.get("fanout", 1) or 1))
-            submitted = self._submit_background_calls(executor, payload, fanout=fanout, kind="pool", label="preload")
+            submitted = self._submit_background_calls(
+                executor,
+                payload,
+                fanout=fanout,
+                kind="pool",
+                key=pool_id,
+                label="preload",
+            )
             self._emit_response(request_id, ok=True, submitted=submitted)
             return True
 

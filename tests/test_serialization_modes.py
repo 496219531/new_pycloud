@@ -6,7 +6,7 @@ import pandas as pd
 from pycloud_parallel.controlplane.data_ref import DataRef
 from pycloud_parallel.controlplane.node.results import _materialize_object_bytes
 from pycloud_parallel.controlplane.serialization import deserialize_by_mode, serialize_by_mode
-from pycloud_parallel.execution.support import _put_data_via_clients
+from pycloud_parallel.execution.support import _put_data_via_clients, _replicas_for_uploaded_ref
 
 
 def test_legacy_v1_mode_roundtrips_structured_values():
@@ -41,8 +41,9 @@ def test_pickle_stable_v1_mode_roundtrips_payload():
 
 
 class _FakeUploadClient:
-    def __init__(self) -> None:
+    def __init__(self, target: str = "") -> None:
         self.calls = []
+        self.target = target
 
     def upload_object_from_bytes(self, *, blob: bytes, format: str, chunk_size: int):
         self.calls.append({"blob": blob, "format": format, "chunk_size": chunk_size})
@@ -54,6 +55,62 @@ class _FakeUploadClient:
             locator_kind="node_local",
             locator_token="",
         )
+
+
+def test_put_data_via_clients_defaults_to_fanout(monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    clients = [_FakeUploadClient("node-a:50061"), _FakeUploadClient("node-b:50062")]
+    ref = _put_data_via_clients(clients, b"hello", serialization_mode="legacy_v1")
+
+    assert ref.locator_kind == "node_local"
+    assert len(clients[0].calls) == 1
+    assert len(clients[1].calls) == 1
+
+
+def test_put_data_via_clients_upload_once_sets_locator(monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "upload_once")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    clients = [_FakeUploadClient("node-a:50061"), _FakeUploadClient("node-b:50062")]
+    ref = _put_data_via_clients(clients, b"hello", serialization_mode="legacy_v1")
+
+    assert ref.locator_kind == "node_control"
+    assert ref.locator_token == "node-a:50061"
+    assert ref.control_addr == "node-a:50061"
+    assert len(clients[0].calls) == 1
+    assert clients[1].calls == []
+
+
+def test_upload_once_replica_registration_keeps_only_upload_target(monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "upload_once")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    ref = DataRef(
+        ref_id="sha256:" + "a" * 64,
+        storage_id="sha256:" + "a" * 64,
+        format="bin",
+        size_bytes=5,
+        locator_kind="node_control",
+        locator_token="node-a:50061",
+        control_addr="node-a:50061",
+    )
+    replicas = [
+        {"control_addr": "node-a:50061", "node_id": "node-a", "node_instance_id": "inst-a"},
+        {"control_addr": "node-b:50062", "node_id": "node-b", "node_instance_id": "inst-b"},
+    ]
+
+    assert list(_replicas_for_uploaded_ref(ref, replicas)) == [replicas[0]]
 
 
 def test_put_data_via_clients_supports_explicit_structured_mode():

@@ -52,6 +52,7 @@ class _FakeHttpResponse:
 
 def test_transport_lane_follows_effective_policy_before_mode():
     assert should_use_transport_payload_bytes(mode="pickle_stable_v1") is True
+    assert should_use_transport_payload_bytes(mode="legacy_v1") is False
     assert (
         should_use_transport_payload_bytes(
             mode="pickle_stable_v1",
@@ -202,4 +203,3 @@ def test_node_control_client_can_use_transport_lane_for_structured_mode():
     request = captured["request"]
     assert request.HasField("transport_payload")
     assert request.transport_payload.codec == "structured_v1"
-

@@ -124,10 +124,14 @@ from pycloud_parallel.controlplane.payload_transport import decode_payload_from_
 from pycloud_parallel.controlplane.serialization import (
     decode_transport_payload_bytes,
     detect_transport_mode,
+    is_inline_transport_carrier,
     log_payload_flow,
+    make_validated_inline_transport_carrier,
     serialize_arrow_compatible,
     stable_pickle_dumps,
     struct_to_python,
+    validate_inline_request_size,
+    validate_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -207,6 +211,7 @@ class NodeControlState(NodeRuntimeBase):
         self._task_pool_worker_reserved = 0
         self._code_write_locks: Dict[str, threading.Lock] = {}
         self._object_write_locks: Dict[str, threading.Lock] = {}
+        self._artifact_method_cache: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str], Dict[str, Tuple[str, str]]] = {}
 
         # 检测并保存当前 Python 版本
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
@@ -645,6 +650,15 @@ class NodeControlState(NodeRuntimeBase):
         )
         return submitted, worker_pids
 
+    @staticmethod
+    def _preload_after_create_required() -> bool:
+        if os.name == "nt":
+            return True
+        requested = str(os.getenv("PYCLOUD_WORKER_START_METHOD", "") or "").strip().lower()
+        if requested in {"spawn", "forkserver"}:
+            return True
+        return False
+
     def get_client_code_token(self, *, client_id: str, code_version: str) -> str:
         normalized_client_id = str(client_id or "").strip()
         normalized_code_version = str(code_version or "").strip()
@@ -764,6 +778,17 @@ class NodeControlState(NodeRuntimeBase):
             if session.status != pb2.SERVICE_STATUS_RUNNING or not session.executor_ready:
                 continue
             try:
+                artifact = self._get_live_code_artifact_locked(session.code_version)
+                if artifact is None:
+                    raise KeyError("code artifact not found")
+                self._ensure_artifact_ready(
+                    artifact,
+                    dependency_policy_mode=artifact.dependency_policy_mode,
+                    dependency_allowlist=artifact.dependency_allowlist,
+                    managed_global_names=session.managed_global_names,
+                    prepare_scope="service",
+                    prepare_key=session.service_id,
+                )
                 self._executor_host.create_service(
                     service_id=session.service_id,
                     worker_count=session.worker_count,
@@ -779,6 +804,17 @@ class NodeControlState(NodeRuntimeBase):
             if not pool.is_running() or not pool.executor_ready:
                 continue
             try:
+                artifact = self._get_live_code_artifact_locked(pool.code_version)
+                if artifact is None:
+                    raise KeyError("code artifact not found")
+                self._ensure_artifact_ready(
+                    artifact,
+                    dependency_policy_mode=artifact.dependency_policy_mode,
+                    dependency_allowlist=artifact.dependency_allowlist,
+                    managed_global_names=pool.managed_global_names,
+                    prepare_scope="pool",
+                    prepare_key=pool.pool_id,
+                )
                 self._executor_host.create_task_pool(
                     pool_id=pool.pool_id,
                     worker_count=pool.worker_count,
@@ -924,7 +960,42 @@ class NodeControlState(NodeRuntimeBase):
         *,
         dependency_path: str,
         managed_global_names: Sequence[str] = (),
+        prepare_scope: str = "",
+        prepare_key: str = "",
     ) -> Dict[str, Tuple[str, str]]:
+        executor_host = self._executor_host
+        if executor_host is not None and executor_host.is_alive() and hasattr(executor_host, "prepare_artifact"):
+            resp = executor_host.prepare_artifact(
+                artifact_spec={
+                    "artifact_path": artifact.path,
+                    "entry_module": artifact.entry_module,
+                    "package_format": artifact.package_format,
+                    "dependency_path": dependency_path,
+                    "dependency_policy_mode": artifact.dependency_policy_mode,
+                    "export_mode": artifact.export_mode,
+                    "export_methods": list(artifact.export_methods),
+                    "export_decorator": artifact.export_decorator,
+                    "entry_callable": artifact.entry_callable,
+                    "managed_global_names": list(managed_global_names or ()),
+                },
+                timeout_sec=60.0,
+                scope=prepare_scope,
+                key=prepare_key,
+            )
+            if not resp.get("ok", False):
+                error = str(resp.get("error", "artifact prepare failed") or "artifact prepare failed")
+                if bool(resp.get("user_error", False)):
+                    raise ValueError(error)
+                raise RuntimeError(error)
+            raw_methods = dict(resp.get("methods") or {})
+            return {
+                str(name): (
+                    str((info or ("", ""))[0] if isinstance(info, (list, tuple)) and info else ""),
+                    str((info or ("", ""))[1] if isinstance(info, (list, tuple)) and len(info) > 1 else ""),
+                )
+                for name, info in raw_methods.items()
+            }
+
         module = None
         try:
             module, methods = _discover_callable_methods(
@@ -949,6 +1020,16 @@ class NodeControlState(NodeRuntimeBase):
                 extra_prefixes=([extracted_dir] if extracted_dir else []),
             )
 
+    def _discard_new_code_artifact(self, artifact: CodeArtifact, *, cached: bool) -> None:
+        if cached:
+            return
+        with self._lock:
+            if self._codes.get(artifact.code_version) is artifact:
+                self._codes.pop(artifact.code_version, None)
+        shutil.rmtree(_code_variant_dir(self._artifact_dir, code_version=artifact.code_version), ignore_errors=True)
+        if artifact.dependency_path:
+            shutil.rmtree(artifact.dependency_path, ignore_errors=True)
+
     def _ensure_artifact_ready(
         self,
         artifact: CodeArtifact,
@@ -956,7 +1037,10 @@ class NodeControlState(NodeRuntimeBase):
         dependency_policy_mode: str = "",
         dependency_allowlist: Sequence[str],
         managed_global_names: Sequence[str] = (),
+        prepare_scope: str = "",
+        prepare_key: str = "",
     ) -> Dict[str, Tuple[str, str]]:
+        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
         normalized_allowlist = _normalize_dependency_allowlist(dependency_allowlist)
         normalized_policy_mode = _normalize_dependency_policy_mode(
             dependency_policy_mode or artifact.dependency_policy_mode,
@@ -991,11 +1075,29 @@ class NodeControlState(NodeRuntimeBase):
             created_dir = True
             candidate_dependency_path = str(target_dir)
 
+        def _cache_key(path: str) -> Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str]:
+            return (
+                str(artifact.code_version or ""),
+                str(path or ""),
+                str(normalized_policy_mode or ""),
+                tuple(effective_allowlist or ()),
+                tuple(normalized_managed_global_names or ()),
+                str(prepare_scope or "").strip().lower(),
+                str(prepare_key or "").strip(),
+            )
+
+        cache_key = _cache_key(candidate_dependency_path)
+        cached_method_info = self._artifact_method_cache.get(cache_key)
+        if cached_method_info is not None:
+            return dict(cached_method_info)
+
         try:
             method_info = self._validate_artifact_methods(
                 artifact,
                 dependency_path=candidate_dependency_path,
-                managed_global_names=managed_global_names,
+                managed_global_names=normalized_managed_global_names,
+                prepare_scope=prepare_scope,
+                prepare_key=prepare_key,
             )
         except Exception as exc:
             if not effective_allowlist or not _missing_import_name(exc):
@@ -1034,7 +1136,9 @@ class NodeControlState(NodeRuntimeBase):
                 method_info = self._validate_artifact_methods(
                     artifact,
                     dependency_path=str(target_dir),
-                    managed_global_names=managed_global_names,
+                    managed_global_names=normalized_managed_global_names,
+                    prepare_scope=prepare_scope,
+                    prepare_key=prepare_key,
                 )
             except Exception as repair_exc:
                 if created_dir or target_dir.exists():
@@ -1056,6 +1160,7 @@ class NodeControlState(NodeRuntimeBase):
             artifact.dependency_allowlist = effective_allowlist
             artifact.dependency_path = str(target_dir)
             _write_code_meta(self._artifact_dir, artifact)
+            self._artifact_method_cache[_cache_key(artifact.dependency_path)] = dict(method_info)
             return method_info
 
         artifact.dependency_policy_mode = normalized_policy_mode
@@ -1067,6 +1172,7 @@ class NodeControlState(NodeRuntimeBase):
             artifact.dependency_path = ""
             artifact.dependency_allowlist = ()
             _write_code_meta(self._artifact_dir, artifact)
+        self._artifact_method_cache[_cache_key(artifact.dependency_path or candidate_dependency_path)] = dict(method_info)
         return method_info
 
     def service_worker_used(self) -> int:
@@ -1630,35 +1736,42 @@ class NodeControlState(NodeRuntimeBase):
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
+        service_id = str(service_id or "").strip() or uuid.uuid4().hex
+        token = secrets.token_urlsafe(24)
 
-        artifact, _cached = self.put_code(
-            client_id=owner_client_id,
-            sha256=sha256,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            export_decorator=export_decorator,
-            dependency_policy_mode=dependency_policy_mode,
-            dependency_allowlist=dependency_allowlist,
-            chunks=chunks,
-            validate_load=True,
-        )
-        method_info = self._ensure_artifact_ready(
-            artifact,
-            dependency_policy_mode=dependency_policy_mode,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=normalized_managed_global_names,
-        )
+        try:
+            artifact, cached_artifact = self.put_code(
+                client_id=owner_client_id,
+                sha256=sha256,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=package_format,
+                export_mode=export_mode,
+                export_methods=export_methods,
+                export_decorator=export_decorator,
+                dependency_policy_mode=dependency_policy_mode,
+                dependency_allowlist=dependency_allowlist,
+                chunks=chunks,
+                validate_load=False,
+            )
+            method_info = self._ensure_artifact_ready(
+                artifact,
+                dependency_policy_mode=dependency_policy_mode,
+                dependency_allowlist=dependency_allowlist,
+                managed_global_names=normalized_managed_global_names,
+                prepare_scope="service",
+                prepare_key=service_id,
+            )
+        except Exception:
+            if "artifact" in locals():
+                self._discard_new_code_artifact(artifact, cached=bool(locals().get("cached_artifact", True)))
+            raise
 
         requested_workers = max(1, worker_count or self.service_default_worker_count)
         actual_hb_timeout = max(5, heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec)
         actual_idle_ttl = max(0, idle_ttl_sec)
         now = utc_now()
-        service_id = str(service_id or "").strip() or uuid.uuid4().hex
-        token = secrets.token_urlsafe(24)
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
 
         reserved = 0
@@ -1686,19 +1799,20 @@ class NodeControlState(NodeRuntimeBase):
             raise RuntimeError("executor host unavailable")
         try:
             executor_host.create_service(service_id=service_id, worker_count=actual_workers)
-            executor_host.preload_service(
-                service_id=service_id,
-                fanout=actual_workers,
-                execute_spec=_build_execute_spec(
-                    artifact,
-                    object_dir=self._object_dir,
-                    work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                    method_name=next(iter(method_info.keys()), artifact.entry_callable),
-                    payload={},
-                    payload_mode="http_call",
-                    warmup_only=True,
-                ),
-            )
+            if self._preload_after_create_required():
+                executor_host.preload_service(
+                    service_id=service_id,
+                    fanout=actual_workers,
+                    execute_spec=_build_execute_spec(
+                        artifact,
+                        object_dir=self._object_dir,
+                        work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                        method_name=next(iter(method_info.keys()), artifact.entry_callable),
+                        payload={},
+                        payload_mode="http_call",
+                        warmup_only=True,
+                    ),
+                )
             session = ServiceSession(
                 service_id=service_id,
                 owner_client_id=owner_client_id,
@@ -1792,31 +1906,38 @@ class NodeControlState(NodeRuntimeBase):
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
-        artifact, _cached = self.put_code(
-            client_id=owner_client_id,
-            sha256=sha256,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            export_mode="single",
-            export_methods=[entry_callable],
-            dependency_policy_mode=dependency_policy_mode,
-            dependency_allowlist=dependency_allowlist,
-            chunks=chunks,
-            validate_load=True,
-        )
-        self._ensure_artifact_ready(
-            artifact,
-            dependency_policy_mode=dependency_policy_mode,
-            dependency_allowlist=dependency_allowlist,
-            managed_global_names=normalized_managed_global_names,
-        )
+        pool_id = uuid.uuid4().hex
+        token = secrets.token_urlsafe(24)
+        try:
+            artifact, cached_artifact = self.put_code(
+                client_id=owner_client_id,
+                sha256=sha256,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=package_format,
+                export_mode="single",
+                export_methods=[entry_callable],
+                dependency_policy_mode=dependency_policy_mode,
+                dependency_allowlist=dependency_allowlist,
+                chunks=chunks,
+                validate_load=False,
+            )
+            self._ensure_artifact_ready(
+                artifact,
+                dependency_policy_mode=dependency_policy_mode,
+                dependency_allowlist=dependency_allowlist,
+                managed_global_names=normalized_managed_global_names,
+                prepare_scope="pool",
+                prepare_key=pool_id,
+            )
+        except Exception:
+            if "artifact" in locals():
+                self._discard_new_code_artifact(artifact, cached=bool(locals().get("cached_artifact", True)))
+            raise
 
         requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
         now = utc_now()
-        pool_id = uuid.uuid4().hex
-        token = secrets.token_urlsafe(24)
         reserved = 0
         with self._lock:
             active = sum(
@@ -1839,19 +1960,20 @@ class NodeControlState(NodeRuntimeBase):
         executor_create_started = time.monotonic()
         try:
             executor_host.create_task_pool(pool_id=pool_id, worker_count=actual_workers)
-            executor_host.preload_pool(
-                pool_id=pool_id,
-                fanout=actual_workers,
-                execute_spec=_build_execute_spec(
-                    artifact,
-                    object_dir=self._object_dir,
-                    work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                    method_name=str(entry_callable or "run").strip() or "run",
-                    payload={},
-                    payload_mode="task_submit",
-                    warmup_only=True,
-                ),
-            )
+            if self._preload_after_create_required():
+                executor_host.preload_pool(
+                    pool_id=pool_id,
+                    fanout=actual_workers,
+                    execute_spec=_build_execute_spec(
+                        artifact,
+                        object_dir=self._object_dir,
+                        work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                        method_name=str(entry_callable or "run").strip() or "run",
+                        payload={},
+                        payload_mode="task_submit",
+                        warmup_only=True,
+                    ),
+                )
         except Exception:
             with self._lock:
                 self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
@@ -1974,17 +2096,33 @@ class NodeControlState(NodeRuntimeBase):
                 reserved_items.append(item)
 
         work_dir = _code_data_dir(self._artifact_dir, code_version=artifact.code_version)
+        transport_request_size = 0
         for item in reserved_items:
             task_id = str(item.task_id or "").strip()
             record: Optional[TaskState] = None
             try:
                 if item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
-                    item_serialization_mode = str(item.transport_payload.codec or "").strip().lower()
-                    item_uses_transport_payload = True
-                    decoded_payload = decode_transport_payload_bytes(
+                    payload_policy = get_payload_policy("task_submit")
+                    item_serialization_mode, _raw_payload, item_payload_size = validate_transport_payload_bytes(
                         item.transport_payload.codec,
                         item.transport_payload.version,
                         item.transport_payload.payload,
+                        context="taskpool_session",
+                        limit_bytes=payload_policy.inline_payload_hard_limit_bytes,
+                    )
+                    proposed_request_size = transport_request_size + item_payload_size
+                    validate_inline_request_size(
+                        proposed_request_size,
+                        limit_bytes=payload_policy.inline_payload_request_limit_bytes,
+                        context="taskpool submit request",
+                    )
+                    transport_request_size = proposed_request_size
+                    item_uses_transport_payload = True
+                    decoded_payload = make_validated_inline_transport_carrier(
+                        codec=item_serialization_mode,
+                        payload=_raw_payload,
+                        content_size=item_payload_size,
+                        payload_mode="task_submit",
                         context="taskpool_session",
                     )
                 else:
@@ -2353,7 +2491,11 @@ class NodeControlState(NodeRuntimeBase):
                 return 409, {"ok": False, "error": "service executor stopped"}
             session.request_count += 1
             session.in_flight = self._service_inflight_locked(session)
-            prepared_payload = self._resolve_memory_object_refs_in_payload_locked(payload or {})
+            prepared_payload = (
+                payload
+                if is_inline_transport_carrier(payload)
+                else self._resolve_memory_object_refs_in_payload_locked(payload or {})
+            )
         setup_end = time.perf_counter()
 
         try:
@@ -2444,7 +2586,7 @@ class NodeControlState(NodeRuntimeBase):
             if isinstance(result, StoredResultArtifact):
                 with self._lock:
                     self.data_store.register_stored_result(result)
-                result = self.data_store.data_ref_from_stored_artifact(result)
+                result = self.data_store.result_ref_from_stored_artifact(result)
             finalize_end = time.perf_counter()
             with self._lock:
                 session = self._services.get(service_id)
@@ -2879,7 +3021,7 @@ class NodeControlState(NodeRuntimeBase):
                         task.status = pb2.TASK_STATUS_SUCCEEDED
                         if isinstance(result, StoredResultArtifact):
                             self.data_store.register_stored_result(result)
-                            task.result = self.data_store.data_ref_from_stored_artifact(result)
+                            task.result = self.data_store.result_ref_from_stored_artifact(result)
                         else:
                             task.result = {} if result is None else result
                         task.error_type = ""

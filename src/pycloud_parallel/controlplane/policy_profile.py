@@ -105,7 +105,7 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         policy_id="trusted_internal",
         version=1,
         allowed_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
-        default_mode="structured_v1",
+        default_mode="pickle_stable_v1",
         inline_payload_soft_limit_bytes=10 * 1024 * 1024,
         inline_payload_hard_limit_bytes=50 * 1024 * 1024,
         inline_result_hard_limit_bytes=1000 * 1024 * 1024,
@@ -141,12 +141,12 @@ _BUILTIN_POLICY_BINDINGS: Dict[str, PolicyBinding] = {
     "service_internal": PolicyBinding(
         binding_id="service_internal",
         policy_id="trusted_internal",
-        default_mode="structured_v1",
+        default_mode="pickle_stable_v1",
     ),
     "taskpool_default": PolicyBinding(
         binding_id="taskpool_default",
         policy_id="trusted_internal",
-        default_mode="structured_v1",
+        default_mode="pickle_stable_v1",
     ),
     "taskpool_heavy_dataframe_numpy": PolicyBinding(
         binding_id="taskpool_heavy_dataframe_numpy",
