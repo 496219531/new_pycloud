@@ -1542,6 +1542,10 @@ class Service(ServiceExecutionSession):
     _async_call_gate: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _async_call_gate_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
     _async_call_gate_capacity: int = field(default=0, repr=False)
+    _compensation_spec: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    _compensation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _last_compensation_attempt_at: float = field(default=0.0, repr=False)
+    _last_managed_globals: Optional[Dict[str, object]] = field(default=None, repr=False)
     serialization_mode: str = ""
     policy_id: InitVar[str] = ""
     _policy_id: str = field(default="", repr=False)
@@ -1575,6 +1579,154 @@ class Service(ServiceExecutionSession):
 
     def routes(self) -> List[Dict[str, object]]:
         return self.route_summary()
+
+    def _configure_dynamic_compensation(self, spec: Dict[str, Any]) -> None:
+        desired = max(0, int(spec.get("node_count", 0) or 0))
+        if desired <= 0:
+            self._compensation_spec = None
+            return
+        self._compensation_spec = dict(spec)
+
+    def _after_keepalive_tick(self) -> None:
+        spec = self._compensation_spec
+        if not spec:
+            return
+        now = time.monotonic()
+        interval_sec = max(5.0, float(spec.get("check_interval_sec", 15.0) or 15.0))
+        if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
+            return
+        self._last_compensation_attempt_at = now
+        self.try_compensate_replicas()
+
+    def try_compensate_replicas(self) -> int:
+        spec = self._compensation_spec
+        if not spec or self._closed:
+            return 0
+        if not self._compensation_lock.acquire(blocking=False):
+            return 0
+        try:
+            desired = max(0, int(spec.get("node_count", 0) or 0))
+            active = {str(node_id) for node_id in self._active_replica_ids if str(node_id)}
+            failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
+            if desired <= 0 or len(active) >= desired:
+                return 0
+            excluded = active | failed
+            with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
+                discovered_nodes = list(
+                    infocenter.list_nodes(
+                        healthy_only=bool(spec.get("healthy_only", True)),
+                        tags=list(spec.get("tags") or ()),
+                        limit=max(desired, int(spec.get("node_limit", 100) or 100)),
+                    )
+                )
+            requested_instance_ids = [
+                str(item).strip() for item in list(spec.get("node_instance_ids") or ()) if str(item).strip()
+            ]
+            requested_node_ids = [str(item).strip() for item in list(spec.get("node_ids") or ()) if str(item).strip()]
+            if requested_instance_ids:
+                node_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
+                candidate_nodes = [node_map[node_id] for node_id in requested_instance_ids if node_id in node_map]
+            elif requested_node_ids:
+                node_map = _build_unique_node_id_map(discovered_nodes, requested_ids=requested_node_ids)
+                candidate_nodes = [node_map[node_id] for node_id in requested_node_ids if node_id in node_map]
+            else:
+                candidate_nodes = [
+                    node
+                    for node in discovered_nodes
+                    if node.healthy
+                    and node.schedulable
+                    and not node.drain
+                    and bool(getattr(node, "accept_service_deploy", True))
+                    and str(getattr(node, "control_addr", "") or "").strip()
+                ]
+                runtime = normalize_python_runtime_spec(str(spec.get("runtime", "") or ""))
+                if runtime:
+                    candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=runtime)
+                candidate_nodes.sort(
+                    key=lambda node: (
+                        -int(getattr(node, "service_worker_available", 0) or 0),
+                        -int(getattr(node, "capacity", 0) or 0),
+                        int(getattr(node, "queued", 0) or 0),
+                        _node_instance_key_from_node(node),
+                    )
+                )
+            candidates = [
+                node
+                for node in candidate_nodes
+                if _node_instance_key_from_node(node) not in excluded
+                and bool(getattr(node, "accept_service_deploy", True))
+                and str(getattr(node, "control_addr", "") or "").strip()
+            ]
+            if not candidates:
+                return 0
+            missing = max(0, desired - len(active))
+
+            def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]:
+                node_key = _node_instance_key_from_node(node)
+                try:
+                    client = _node_control_client(node.control_addr, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
+                except Exception as exc:
+                    return node_key, node, None, None, repr(exc)
+                node_worker_count = max(1, int(spec.get("worker_count", 1) or 1))
+                if int(getattr(node, "service_worker_available", 0) or 0) > 0:
+                    node_worker_count = max(1, min(node_worker_count, int(getattr(node, "service_worker_available", 0) or 0)))
+                try:
+                    session = client.create_service_from_bytes(
+                        owner_client_id=self.owner_client_id,
+                        service_name=self.service_name,
+                        blob=spec.get("blob") or b"",
+                        runtime=str(spec.get("runtime", "py3") or "py3"),
+                        entry_module=str(spec.get("entry_module", "") or ""),
+                        entry_callable=str(spec.get("entry_callable", "run") or "run"),
+                        package_format=str(spec.get("package_format", "") or ""),
+                        export_mode=str(spec.get("export_mode", "decorator") or "decorator"),
+                        export_methods=list(spec.get("export_methods") or ()),
+                        deps=spec.get("deps"),
+                        managed_global_names=list(spec.get("managed_global_names") or ()),
+                        policy_id=str(spec.get("policy_id", "") or ""),
+                        worker_count=node_worker_count,
+                        heartbeat_timeout_sec=max(5, int(spec.get("heartbeat_timeout_sec", 30) or 30)),
+                        idle_ttl_sec=max(0, int(spec.get("idle_ttl_sec", 0) or 0)),
+                        expose_http=bool(spec.get("expose_http", True)),
+                        chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
+                    )
+                except Exception as exc:
+                    client.close()
+                    return node_key, node, None, None, repr(exc)
+                session.node_instance_id = node_key
+                session.node_id = str(node.node_id or "")
+                return node_key, node, client, session, ""
+
+            create_results = [_create_service_on_node(node) for node in candidates[:missing]]
+            added = 0
+            with self._route_lock:
+                for node_key, node, client, session, error_message in create_results:
+                    if error_message:
+                        self.failures[node_key] = error_message
+                        continue
+                    if client is None or session is None:
+                        continue
+                    if node_key in self.sessions:
+                        client.close()
+                        continue
+                    self.sessions[node_key] = session
+                    self._clients[node_key] = client
+                    self.nodes[node_key] = node
+                    self.failures.pop(node_key, None)
+                    self._active_replica_ids.add(node_key)
+                    self._breaker_states.setdefault(node_key, CandidateBreakerState())
+                    added += 1
+            if added:
+                self._persist_session_cache()
+                if self._last_managed_globals is not None:
+                    self.update_globals(dict(self._last_managed_globals))
+                _emit_owner_notice(
+                    f"dynamic compensation added={added} target_nodes={desired} "
+                    f"service_name={self.service_name} routes={_format_route_summary(self.route_summary())}"
+                )
+            return added
+        finally:
+            self._compensation_lock.release()
 
     @classmethod
     def startup(
@@ -1960,6 +2112,7 @@ class Service(ServiceExecutionSession):
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
         requested_node_instance_ids = [str(node_id).strip() for node_id in (node_instance_ids or []) if str(node_id).strip()]
         desired_node_count = max(0, int(node_count or 0))
+        compensation_target_count = desired_node_count or len(requested_node_instance_ids) or len(requested_node_ids)
         required_success_nodes = max(1, int(min_success_nodes))
         discovery_limit = max(
             1,
@@ -2379,6 +2532,33 @@ class Service(ServiceExecutionSession):
                 serialization_mode=effective_policy.resolved_mode,
                 policy_id=normalized_policy_id,
                 effective_policy=effective_policy,
+            )
+            group._configure_dynamic_compensation(
+                {
+                    "infocenter_target": infocenter_target,
+                    "blob": effective_blob,
+                    "runtime": runtime,
+                    "entry_module": effective_entry_module,
+                    "entry_callable": entry_callable,
+                    "package_format": effective_package_format,
+                    "export_mode": export_mode,
+                    "export_methods": export_methods,
+                    "deps": prepared_artifact.dependency_policy,
+                    "managed_global_names": managed_global_names,
+                    "policy_id": normalized_policy_id,
+                    "worker_count": worker_count,
+                    "heartbeat_timeout_sec": heartbeat_timeout_sec,
+                    "idle_ttl_sec": idle_ttl_sec,
+                    "expose_http": expose_http,
+                    "chunk_size": chunk_size,
+                    "healthy_only": healthy_only,
+                    "tags": list(tags or ()),
+                    "node_ids": requested_node_ids,
+                    "node_instance_ids": requested_node_instance_ids,
+                    "node_count": compensation_target_count,
+                    "node_limit": node_limit,
+                    "timeout_sec": timeout_sec,
+                }
             )
             group._persist_session_cache()
             group._start_keepalive()
@@ -3167,6 +3347,7 @@ class Service(ServiceExecutionSession):
         if not digests:
             raise RuntimeError(f"update_globals failed on all nodes: {failed_nodes}")
         self.globals_digests = dict(digests)
+        self._last_managed_globals = dict(values or {})
         unique = {digest for digest in digests.values() if str(digest).strip()}
         return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()))
 

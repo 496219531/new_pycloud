@@ -493,6 +493,7 @@ class InfoCenterState:
                 in_flight=max(0, int(item.in_flight)),
                 lease_expire_at=ts_to_dt(item.lease_expire_at),
                 http_base_url=item.http_base_url,
+                stop_reason=str(getattr(item, "stop_reason", "") or ""),
             )
         return out
 
@@ -518,6 +519,7 @@ class InfoCenterState:
                     in_flight=0,
                     lease_expire_at=now,
                     http_base_url=svc.http_base_url,
+                    stop_reason=str(svc.stop_reason or state.reason or "node lost"),
                 )
             state.services = degraded
             return NodeState(
@@ -562,6 +564,8 @@ class InfoCenterState:
                     effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
                         self._effective_service_state_locked(state, svc, now=now)
                     )
+                    if healthy_only and int(effective_status) != int(pb2.SERVICE_STATUS_RUNNING):
+                        continue
                     reported_inflight = max(0, int(svc.in_flight or 0))
                     received_count = max(0, int(svc.received_count or 0))
                     returned_count = max(0, int(svc.returned_count or 0))

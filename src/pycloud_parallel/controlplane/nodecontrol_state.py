@@ -794,11 +794,11 @@ class NodeControlState(NodeRuntimeBase):
                     worker_count=session.worker_count,
                 )
                 session.alive_workers = session.worker_count
-            except Exception:
+            except Exception as exc:
                 session.executor_ready = False
                 session.alive_workers = 0
                 session.status = pb2.SERVICE_STATUS_STOPPED
-                session.stop_reason = "executor host restart failed"
+                session.stop_reason = f"executor host restart failed: {exc!r}"
                 session.lease_expire_at = current_time
         for pool in self._task_pools.values():
             if not pool.is_running() or not pool.executor_ready:
@@ -820,10 +820,11 @@ class NodeControlState(NodeRuntimeBase):
                     worker_count=pool.worker_count,
                 )
                 pool.alive_workers = pool.worker_count
-            except Exception:
+            except Exception as exc:
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
+                pool.stop_reason = f"executor host restart failed: {exc!r}"
                 pool.lease_expire_at = current_time
 
         if old_host is not None:
@@ -1242,7 +1243,7 @@ class NodeControlState(NodeRuntimeBase):
                 inflight_by_pool[pool_id] = inflight_by_pool.get(pool_id, 0) + 1
             reports: Dict[str, NodeTaskPoolInfo] = {}
             for pool in self._task_pools.values():
-                if not (pool.is_running() or bool(pool.timing_metrics)):
+                if not (pool.is_running() or bool(pool.timing_metrics) or str(pool.stop_reason or "").strip()):
                     continue
                 reports[pool.pool_id] = _build_task_pool_info(
                     pool,
@@ -1705,6 +1706,86 @@ class NodeControlState(NodeRuntimeBase):
             if tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
 
+    def _remember_failed_service_create(
+        self,
+        *,
+        service_id: str,
+        owner_client_id: str,
+        service_name: str,
+        code_version: str,
+        worker_count: int,
+        heartbeat_timeout_sec: int,
+        idle_ttl_sec: int,
+        expose_http: bool,
+        service_token: str,
+        policy_id: str,
+        managed_global_names: Sequence[str],
+        reason: str,
+    ) -> None:
+        now = utc_now()
+        session = ServiceSession(
+            service_id=service_id,
+            owner_client_id=owner_client_id,
+            service_name=service_name or f"service-{service_id[:8]}",
+            code_version=code_version,
+            worker_count=max(1, int(worker_count or self.service_default_worker_count or 1)),
+            heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec or 30)),
+            idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+            expose_http=bool(expose_http),
+            service_token=service_token,
+            http_base_url=f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else "",
+            status=pb2.SERVICE_STATUS_STOPPED,
+            created_at=now,
+            last_heartbeat_at=now,
+            lease_expire_at=now,
+            policy_id=str(policy_id or "").strip().lower() or "default_safe",
+            executor_ready=False,
+            alive_workers=0,
+            managed_global_names=tuple(str(name) for name in managed_global_names or ()),
+            stop_reason=str(reason or "create service failed"),
+        )
+        with self._lock:
+            self._services[service_id] = session
+
+    def _remember_failed_task_pool_create(
+        self,
+        *,
+        pool_id: str,
+        owner_client_id: str,
+        pool_name: str,
+        code_version: str,
+        task_method: str,
+        worker_count: int,
+        heartbeat_timeout_sec: int,
+        idle_ttl_sec: int,
+        pool_token: str,
+        managed_global_names: Sequence[str],
+        reason: str,
+    ) -> None:
+        now = utc_now()
+        pool = TaskPoolState(
+            pool_id=pool_id,
+            owner_client_id=owner_client_id,
+            pool_name=str(pool_name or f"task-pool-{pool_id[:8]}"),
+            code_version=code_version,
+            task_method=str(task_method or "run").strip() or "run",
+            worker_count=max(1, int(worker_count or self.worker_capacity or 1)),
+            heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
+            idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+            pool_token=pool_token,
+            status="STOPPED",
+            created_at=now,
+            last_heartbeat_at=now,
+            lease_expire_at=now,
+            managed_global_names=tuple(str(name) for name in managed_global_names or ()),
+            executor_ready=False,
+            alive_workers=0,
+            task_count=0,
+            stop_reason=str(reason or "create task pool failed"),
+        )
+        with self._lock:
+            self._task_pools[pool_id] = pool
+
     def has_code_version(self, code_version: str) -> bool:
         with self._lock:
             return code_version in self._codes
@@ -1763,9 +1844,23 @@ class NodeControlState(NodeRuntimeBase):
                 prepare_scope="service",
                 prepare_key=service_id,
             )
-        except Exception:
+        except Exception as exc:
             if "artifact" in locals():
                 self._discard_new_code_artifact(artifact, cached=bool(locals().get("cached_artifact", True)))
+            self._remember_failed_service_create(
+                service_id=service_id,
+                owner_client_id=owner_client_id,
+                service_name=service_name,
+                code_version=str(getattr(locals().get("artifact", None), "code_version", "") or sha256 or ""),
+                worker_count=worker_count,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                expose_http=expose_http,
+                service_token=token,
+                policy_id=policy_id,
+                managed_global_names=normalized_managed_global_names,
+                reason=repr(exc),
+            )
             raise
 
         requested_workers = max(1, worker_count or self.service_default_worker_count)
@@ -1843,12 +1938,26 @@ class NodeControlState(NodeRuntimeBase):
                 if reserved:
                     self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
             return session
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 if reserved:
                     self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
             with contextlib.suppress(Exception):
                 executor_host.stop_service(service_id=service_id)
+            self._remember_failed_service_create(
+                service_id=service_id,
+                owner_client_id=owner_client_id,
+                service_name=service_name,
+                code_version=artifact.code_version,
+                worker_count=actual_workers,
+                heartbeat_timeout_sec=actual_hb_timeout,
+                idle_ttl_sec=actual_idle_ttl,
+                expose_http=expose_http,
+                service_token=token,
+                policy_id=policy_id,
+                managed_global_names=normalized_managed_global_names,
+                reason=repr(exc),
+            )
             raise
 
     def update_globals(
@@ -1931,9 +2040,22 @@ class NodeControlState(NodeRuntimeBase):
                 prepare_scope="pool",
                 prepare_key=pool_id,
             )
-        except Exception:
+        except Exception as exc:
             if "artifact" in locals():
                 self._discard_new_code_artifact(artifact, cached=bool(locals().get("cached_artifact", True)))
+            self._remember_failed_task_pool_create(
+                pool_id=pool_id,
+                owner_client_id=owner_client_id,
+                pool_name=pool_name,
+                code_version=str(getattr(locals().get("artifact", None), "code_version", "") or sha256 or ""),
+                task_method=entry_callable,
+                worker_count=worker_count,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                pool_token=token,
+                managed_global_names=normalized_managed_global_names,
+                reason=repr(exc),
+            )
             raise
 
         requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
@@ -1974,11 +2096,24 @@ class NodeControlState(NodeRuntimeBase):
                         warmup_only=True,
                     ),
                 )
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
             with contextlib.suppress(Exception):
                 executor_host.stop_task_pool(pool_id=pool_id)
+            self._remember_failed_task_pool_create(
+                pool_id=pool_id,
+                owner_client_id=owner_client_id,
+                pool_name=pool_name,
+                code_version=artifact.code_version,
+                task_method=entry_callable,
+                worker_count=actual_workers,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                pool_token=token,
+                managed_global_names=normalized_managed_global_names,
+                reason=repr(exc),
+            )
             raise
         executor_create_ms = (time.monotonic() - executor_create_started) * 1000.0
         try:
@@ -2287,7 +2422,6 @@ class NodeControlState(NodeRuntimeBase):
         pool_token: str,
         reason: str = "",
     ) -> TaskPoolState:
-        del reason
         normalized = str(pool_id or "").strip()
         stop_executor = None
         with self._lock:
@@ -2303,6 +2437,7 @@ class NodeControlState(NodeRuntimeBase):
             pool.executor_ready = False
             pool.alive_workers = 0
             pool.status = "STOPPED"
+            pool.stop_reason = reason or "owner requested"
             pool.lease_expire_at = utc_now()
             closed_pool = pool
 
@@ -3077,3 +3212,4 @@ class NodeControlState(NodeRuntimeBase):
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
+                pool.stop_reason = "owner heartbeat timeout"

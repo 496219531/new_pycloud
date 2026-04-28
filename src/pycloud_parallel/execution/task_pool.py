@@ -253,6 +253,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._exclusive_mode = ""
         self._exclusive_owner_thread_id = 0
         self._exclusive_depth = 0
+        self._compensation_spec: Optional[Dict[str, Any]] = None
+        self._compensation_lock = threading.Lock()
+        self._last_compensation_attempt_at = 0.0
+        self._last_managed_globals: Optional[Dict[str, object]] = None
         self._init_execution_session_state()
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
@@ -298,6 +302,116 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
     def routes(self) -> List[Dict[str, object]]:
         return self.route_summary()
+
+    def _configure_dynamic_compensation(self, spec: Dict[str, Any]) -> None:
+        desired = max(0, int(spec.get("node_count", 0) or 0))
+        if desired <= 0:
+            self._compensation_spec = None
+            return
+        self._compensation_spec = dict(spec)
+
+    def _after_keepalive_tick(self) -> None:
+        spec = self._compensation_spec
+        if not spec:
+            return
+        now = time.monotonic()
+        interval_sec = max(5.0, float(spec.get("check_interval_sec", 15.0) or 15.0))
+        if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
+            return
+        self._last_compensation_attempt_at = now
+        self.try_compensate_replicas()
+
+    def try_compensate_replicas(self) -> int:
+        spec = self._compensation_spec
+        if not spec or self._closed:
+            return 0
+        if not self._compensation_lock.acquire(blocking=False):
+            return 0
+        try:
+            desired = max(0, int(spec.get("node_count", 0) or 0))
+            active = {str(node_id) for node_id in self._active_replica_ids if str(node_id)}
+            failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
+            if desired <= 0 or len(active) >= desired:
+                return 0
+            excluded = active | failed
+            with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
+                selected_nodes = list(
+                    infocenter.select_task_nodes(
+                        healthy_only=bool(spec.get("healthy_only", True)),
+                        tags=list(spec.get("tags") or ()),
+                        node_ids=list(spec.get("node_ids") or ()),
+                        node_instance_ids=list(spec.get("node_instance_ids") or ()),
+                        node_count=desired,
+                        limit=max(desired, int(spec.get("node_limit", 100) or 100)),
+                        require_credit=False,
+                        preferred_runtime_key="",
+                        runtime=str(spec.get("runtime", "") or ""),
+                    )
+                )
+            candidates = [
+                node
+                for node in selected_nodes
+                if _node_instance_key_from_node(node) not in excluded
+            ]
+            if not candidates:
+                return 0
+            missing = max(0, desired - len(active))
+
+            def _create_pool_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, NativeTaskPoolClient]:
+                client = _node_control_client(node.control_addr, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
+                pool = client.create_task_pool_from_bytes(
+                    owner_client_id=str(spec.get("owner_client_id", "") or ""),
+                    pool_name=str(spec.get("pool_name", "") or ""),
+                    blob=spec.get("blob") or b"",
+                    runtime=str(spec.get("runtime", "py3") or "py3"),
+                    entry_module=str(spec.get("entry_module", "") or ""),
+                    entry_callable=str(spec.get("entry_callable", "run") or "run"),
+                    package_format=str(spec.get("package_format", "") or ""),
+                    deps=spec.get("deps"),
+                    managed_global_names=list(spec.get("managed_global_names") or ()),
+                    worker_count=max(1, int(spec.get("worker_count", 1) or 1)),
+                    heartbeat_timeout_sec=max(5, int(spec.get("heartbeat_timeout_sec", 30) or 30)),
+                    idle_ttl_sec=max(0, int(spec.get("idle_ttl_sec", 0) or 0)),
+                    chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
+                )
+                node_key = _node_instance_key_from_node(node)
+                pool.node_instance_id = node_key
+                pool.node_id = str(node.node_id or "")
+                return node_key, node, pool
+
+            created: List[Tuple[str, InfoCenterNode, NativeTaskPoolClient]] = []
+            for node in candidates[:missing]:
+                try:
+                    created.append(_create_pool_on_node(node))
+                except Exception as exc:
+                    self.failures[_node_instance_key_from_node(node)] = repr(exc)
+            if not created:
+                return 0
+            added = 0
+            with self._pool_lock:
+                for node_key, node, pool in created:
+                    if node_key in self._pools:
+                        _close_task_pool_replica(pool, reason="duplicate compensated task pool")
+                        with contextlib.suppress(Exception):
+                            pool._client.close()  # noqa: SLF001
+                        continue
+                    self._pools[node_key] = pool
+                    self.nodes[node_key] = node
+                    self.failures.pop(node_key, None)
+                    self._active_replica_ids.add(node_key)
+                    self._active_nodes.add(node_key)
+                    self._submit_breaker_states.setdefault(node_key, CandidateBreakerState())
+                    added += 1
+            if added and self._last_managed_globals is not None:
+                self.update_globals(dict(self._last_managed_globals))
+            if added:
+                _emit_taskpool_notice(
+                    f"dynamic compensation added={added} target_nodes={desired} "
+                    f"routes={_format_pool_route_summary(self.route_summary())}"
+                )
+            return added
+        finally:
+            self._compensation_lock.release()
 
     @property
     def methods(self) -> List[str]:
@@ -1089,6 +1203,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if not digests:
             raise RuntimeError(f"update_globals failed on all nodes: {failed_nodes}")
         self.globals_digests = dict(digests)
+        self._last_managed_globals = dict(values or {})
         unique = {digest for digest in digests.values() if str(digest).strip()}
         return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()))
 
@@ -2080,14 +2195,17 @@ def _build_task_pool_from_infocenter(
 
     effective_owner = str(owner_client_id or f"client-{_get_local_ip()}").strip()
     requested_count = max(0, int(node_count or 0))
+    requested_node_ids = [str(node_id).strip() for node_id in list(node_ids or ()) if str(node_id).strip()]
+    requested_node_instance_ids = [str(node_id).strip() for node_id in list(node_instance_ids or ()) if str(node_id).strip()]
+    compensation_target_count = requested_count or len(requested_node_instance_ids) or len(requested_node_ids)
     fetch_limit = requested_count if requested_count > 0 else node_limit
     with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
         selected_nodes = list(
             infocenter.select_task_nodes(
                 healthy_only=healthy_only,
                 tags=tags,
-                node_ids=node_ids,
-                node_instance_ids=node_instance_ids,
+                node_ids=requested_node_ids,
+                node_instance_ids=requested_node_instance_ids,
                 node_count=fetch_limit,
                 limit=node_limit,
                 require_credit=False,
@@ -2161,6 +2279,31 @@ def _build_task_pool_from_infocenter(
         serialization_mode=effective_policy.resolved_mode,
         policy_id=policy_id or get_default_policy_id_for_binding("taskpool_default"),
         effective_policy=effective_policy,
+    )
+    session._configure_dynamic_compensation(
+        {
+            "infocenter_target": infocenter_target,
+            "owner_client_id": effective_owner,
+            "pool_name": effective_pool_name,
+            "blob": effective_blob,
+            "runtime": runtime,
+            "entry_module": entry_module,
+            "entry_callable": entry_callable,
+            "package_format": effective_package_format,
+            "deps": prepared_artifact.dependency_policy,
+            "managed_global_names": managed_global_names,
+            "worker_count": worker_count,
+            "heartbeat_timeout_sec": heartbeat_timeout_sec,
+            "idle_ttl_sec": idle_ttl_sec,
+            "chunk_size": chunk_size,
+            "healthy_only": healthy_only,
+            "tags": list(tags or ()),
+            "node_ids": requested_node_ids,
+            "node_instance_ids": requested_node_instance_ids,
+            "node_count": compensation_target_count,
+            "node_limit": node_limit,
+            "timeout_sec": timeout_sec,
+        }
     )
     session._start_keepalive()
     _emit_taskpool_notice(

@@ -155,6 +155,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "ema_samples": int(metrics.get("ema_samples", 0) or 0),
         "lease_expire_at": lease_expire_at.isoformat(),
         "http_base_url": session.http_base_url,
+        "stop_reason": str(session.stop_reason or ""),
     }
 
 
@@ -178,6 +179,7 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
         created_at=pool.created_at,
         last_heartbeat_at=pool.last_heartbeat_at,
         lease_expire_at=pool.lease_expire_at,
+        failure_reason=str(pool.stop_reason or ""),
     )
 
 
@@ -201,6 +203,7 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "last_heartbeat_at": pool.last_heartbeat_at,
         "lease_expire_at": pool.lease_expire_at,
         "timing_metrics": dict(pool.timing_metrics or {}),
+        "failure_reason": str(pool.stop_reason or ""),
     }
 
 

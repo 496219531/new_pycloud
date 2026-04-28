@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Shared execution session base classes for the authoritative V1 execution layer."""
 
+import contextlib
 from dataclasses import dataclass
 import threading
 import time
@@ -164,6 +165,8 @@ class ExecutionSessionBase:
             replica.last_error = message
         if getattr(replica, "kind", "") == "service" and hasattr(replica, "status"):
             replica.status = pb2.SERVICE_STATUS_STOPPED
+        elif getattr(replica, "kind", "") == "task_pool" and hasattr(replica, "status"):
+            replica.status = "STOPPED"
         self._active_replica_ids.discard(node_id)
 
     def _keepalive_loop(self, interval_sec: float) -> None:
@@ -193,6 +196,10 @@ class ExecutionSessionBase:
                 self.failed = True
                 self._hb_stop.set()
                 break
+            hook = getattr(self, "_after_keepalive_tick", None)
+            if callable(hook):
+                with contextlib.suppress(Exception):
+                    hook()
 
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:

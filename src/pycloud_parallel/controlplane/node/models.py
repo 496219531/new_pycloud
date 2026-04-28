@@ -259,6 +259,7 @@ class TaskPoolState:
     task_count: int = 0
     timing_metrics: Dict[str, object] = field(default_factory=dict)
     returned_count: int = 0
+    stop_reason: str = ""
 
     def is_running(self) -> bool:
         return str(self.status or "").strip().upper() == "RUNNING"

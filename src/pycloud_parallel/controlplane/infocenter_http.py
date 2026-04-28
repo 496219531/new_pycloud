@@ -113,6 +113,7 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             ema_samples=max(0, int(item.get("ema_samples", 0) or 0)),
             lease_expire_at=_parse_dt(item.get("lease_expire_at") or item.get("lease_expire_at_ts") or utc_now()),
             http_base_url=str(item.get("http_base_url", "") or ""),
+            stop_reason=str(item.get("stop_reason", item.get("failure_reason", "")) or ""),
         )
     return out
 
@@ -158,6 +159,15 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
                 "in_flight": max(int(getattr(item, "in_flight", 0) or 0) for item in ordered),
                 "lease_expire_at": max(getattr(item, "lease_expire_at", utc_now()) for item in ordered),
                 "http_base_url": str(primary.http_base_url or ""),
+                "stop_reason": "; ".join(
+                    sorted(
+                        {
+                            str(getattr(item, "stop_reason", "") or "").strip()
+                            for item in ordered
+                            if str(getattr(item, "stop_reason", "") or "").strip()
+                        }
+                    )
+                ),
                 "duplicate_count": duplicate_count,
                 "service_ids": [str(item.service_id or "") for item in ordered],
             }
@@ -190,6 +200,7 @@ def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
             created_at=_parse_dt(item.get("created_at") or utc_now()),
             last_heartbeat_at=_parse_dt(item.get("last_heartbeat_at") or utc_now()),
             lease_expire_at=_parse_dt(item.get("lease_expire_at") or utc_now()),
+            failure_reason=str(item.get("failure_reason", item.get("stop_reason", "")) or ""),
         )
     return out
 
@@ -225,6 +236,7 @@ def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) 
         "in_flight": int(service.in_flight if node_healthy else 0),
         "lease_expire_at": _dt_text(service.lease_expire_at),
         "http_base_url": str(service.http_base_url or ""),
+        "stop_reason": str(service.stop_reason or ""),
     }
 
 
@@ -290,6 +302,7 @@ def _serialize_node(state) -> Dict[str, object]:
                 "created_at": _dt_text(pool.created_at),
                 "last_heartbeat_at": _dt_text(pool.last_heartbeat_at),
                 "lease_expire_at": _dt_text(pool.lease_expire_at),
+                "failure_reason": str(pool.failure_reason or ""),
             }
             for pool in task_pools
         ],
@@ -612,6 +625,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
                 f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
                 f"<td>{html.escape(_dt_text(item['lease_expire_at']))}</td>"
+                f"<td>{html.escape(str(item.get('stop_reason', '') or '-'))}</td>"
                 f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
                 "</tr>"
             )
@@ -643,6 +657,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.lease_expire_at))}</td>"
+                f"<td>{html.escape(str(getattr(pool, 'failure_reason', '') or '-'))}</td>"
                 "</tr>"
             ))
         metadata = dict(node.metadata or {})
@@ -709,10 +724,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                     )
                 )
     node_body = "\n".join(node_rows) or "<tr><td colspan='21'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='17'>no services</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='18'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
-    pool_body = "\n".join(pool_rows) or "<tr><td colspan='22'>no task pools</td></tr>"
+    pool_body = "\n".join(pool_rows) or "<tr><td colspan='23'>no task pools</td></tr>"
     job_queue_body = "\n".join(job_queue_rows) or "<tr><td colspan='11'>no job queues</td></tr>"
     recent_job_rows.sort(key=lambda item: item[0], reverse=True)
     recent_job_body = "\n".join(row for _sort_key, row in recent_job_rows) or "<tr><td colspan='8'>no recent jobs</td></tr>"
@@ -767,13 +782,13 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "</tbody></table>"
         "<h2>Service Instances</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>lease_expire_at</th><th>http_base_url</th>"
+        "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>lease_expire_at</th><th>failure_reason</th><th>http_base_url</th>"
         "</tr></thead><tbody>"
         f"{service_body}"
         "</tbody></table>"
         "<h2>Task Pools</h2>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>last_executor_create_ms</th><th>avg_warmup_ms</th><th>executor_rebuild_count</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th>"
+        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>last_executor_create_ms</th><th>avg_warmup_ms</th><th>executor_rebuild_count</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th><th>failure_reason</th>"
         "</tr></thead><tbody>"
         f"{pool_body}"
         "</tbody></table></body></html>"

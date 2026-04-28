@@ -10,7 +10,7 @@ import pytest
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _reorder_job_via_http
-from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
+from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeTaskPoolInfo
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.server import build_job_orchestrator_server
@@ -167,6 +167,45 @@ def test_ops_page_merges_duplicate_services_with_same_endpoint():
     assert "merged×2" in raw
     assert raw.count("calc_asset_ratio") >= 1
     assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
+
+
+def test_ops_page_shows_service_and_taskpool_failure_reasons():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-failed-1",
+        node_id="node-failed",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-failed": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-failed",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                worker_count=2,
+                alive_workers=0,
+                stop_reason="ModuleNotFoundError: missing_pkg",
+            )
+        },
+        task_pools={
+            "pool-failed": NodeTaskPoolInfo(
+                pool_id="pool-failed",
+                owner_client_id="owner-1",
+                pool_name="calc-pool",
+                code_version="sha256:test",
+                status="STOPPED",
+                worker_count=2,
+                failure_reason="executor host restart failed: missing_pkg",
+            )
+        },
+    )
+
+    raw = _render_ops_page(info_state)
+
+    assert "failure_reason" in raw
+    assert "ModuleNotFoundError: missing_pkg" in raw
+    assert "executor host restart failed: missing_pkg" in raw
 
 
 def test_startup_service_registration_rejects_duplicate_service_name():

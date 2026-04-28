@@ -43,6 +43,7 @@ class InfoCenterNodeService:
     alive_workers: int = 0
     in_flight: int = 0
     http_base_url: str = ""
+    stop_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class InfoCenterNodeTaskPool:
     worker_count: int = 0
     task_count: int = 0
     inflight: int = 0
+    failure_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -249,6 +251,7 @@ class InfoCenterClient:
                     "alive_workers": int(item.alive_workers),
                     "in_flight": int(item.in_flight),
                     "http_base_url": str(item.http_base_url),
+                    "stop_reason": str(getattr(item, "stop_reason", "") or ""),
                 }
             )
         return http_json_request(
@@ -313,6 +316,7 @@ class InfoCenterClient:
                     "alive_workers": int(item.alive_workers),
                     "in_flight": int(item.in_flight),
                     "http_base_url": str(item.http_base_url),
+                    "stop_reason": str(getattr(item, "stop_reason", "") or ""),
                 }
             )
         return http_json_request(
@@ -375,6 +379,7 @@ class InfoCenterClient:
                         alive_workers=int(svc.get("alive_workers", 0) or 0),
                         in_flight=int(svc.get("in_flight", 0) or 0),
                         http_base_url=str(svc.get("http_base_url", "") or ""),
+                        stop_reason=str(svc.get("stop_reason", svc.get("failure_reason", "")) or ""),
                     )
                 )
             task_pools = []
@@ -389,6 +394,7 @@ class InfoCenterClient:
                         worker_count=int(pool.get("worker_count", 0) or 0),
                         task_count=int(pool.get("task_count", 0) or 0),
                         inflight=int(pool.get("inflight", 0) or 0),
+                        failure_reason=str(pool.get("failure_reason", "") or ""),
                     )
                 )
             out.append(

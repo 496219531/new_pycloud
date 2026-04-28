@@ -72,6 +72,9 @@ class NativeTaskPoolClient:
     created_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
     lease_expire_at: Optional[datetime] = None
+    failed: bool = False
+    last_error: str = ""
+    heartbeat_failure_threshold: int = 3
 
     @property
     def session_id(self) -> str:
@@ -121,7 +124,8 @@ class NativeTaskPoolClient:
     ) -> ExecutionReplicaSnapshot:
         lease = self.lease()
         status_text = str(self.status or "RUNNING")
-        alive = not str(failure or "").strip() and status_text.upper() == "RUNNING"
+        failure_text = str(failure or self.last_error or "")
+        alive = not bool(self.failed) and not failure_text.strip() and status_text.upper() == "RUNNING"
         return ExecutionReplicaSnapshot(
             kind="task_pool",
             node_instance_id=str(node_instance_id or self.node_instance_id or ""),
@@ -133,7 +137,7 @@ class NativeTaskPoolClient:
             alive=alive,
             status=status_text,
             lease_expire_at=lease.lease_expire_at,
-            failure=str(failure or ""),
+            failure=failure_text,
         )
 
     def submit_tasks(
@@ -182,6 +186,8 @@ class NativeTaskPoolClient:
         now = _utc_now()
         self.last_heartbeat_at = now
         self.lease_expire_at = now + timedelta(seconds=max(1, int(self.heartbeat_timeout_sec or 0)))
+        self.failed = False
+        self.last_error = ""
         return resp
 
     def cancel_job(self, *, job_id: str, reason: str = "") -> pb2.CancelJobResponse:

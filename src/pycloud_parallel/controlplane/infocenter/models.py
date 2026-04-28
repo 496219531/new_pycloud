@@ -35,6 +35,7 @@ class NodeServiceState:
     ema_samples: int = 0
     lease_expire_at: datetime = field(default_factory=utc_now)
     http_base_url: str = ""
+    stop_reason: str = ""
 
 
 @dataclass
@@ -55,6 +56,7 @@ class NodeTaskPoolInfo:
     created_at: datetime = field(default_factory=utc_now)
     last_heartbeat_at: datetime = field(default_factory=utc_now)
     lease_expire_at: datetime = field(default_factory=utc_now)
+    failure_reason: str = ""
 
 
 @dataclass

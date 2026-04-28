@@ -170,6 +170,93 @@ def test_nodecontrol_default_executor_backend_is_subprocess_host(tmp_path):
         state.close()
 
 
+def test_failed_create_service_is_reported_for_ops(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-create-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_fail"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        monkeypatch.setattr(
+            state,
+            "_ensure_artifact_ready",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ModuleNotFoundError("missing_pkg")),
+        )
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+
+        with pytest.raises(ModuleNotFoundError):
+            state.create_service(
+                owner_client_id="owner-fail",
+                service_name="svc-fail",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="svc_fail",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=True,
+                chunks=[blob],
+            )
+
+        reports = state.service_report_payloads(include_stopped=True)
+        assert len(reports) == 1
+        assert reports[0]["service_name"] == "svc-fail"
+        assert reports[0]["status"] == pb2.SERVICE_STATUS_STOPPED
+        assert "missing_pkg" in reports[0]["stop_reason"]
+    finally:
+        state.close()
+
+
+def test_failed_create_task_pool_is_reported_for_ops(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-create-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        monkeypatch.setattr(
+            state,
+            "_ensure_artifact_ready",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ModuleNotFoundError("missing_pkg")),
+        )
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+
+        with pytest.raises(ModuleNotFoundError):
+            state.create_task_pool(
+                owner_client_id="owner-fail",
+                pool_name="pool-fail",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="pool_fail",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                chunks=[blob],
+            )
+
+        reports = state.task_pool_reports()
+        assert len(reports) == 1
+        report = next(iter(reports.values()))
+        assert report.pool_name == "pool-fail"
+        assert report.status == "STOPPED"
+        assert "missing_pkg" in report.failure_reason
+    finally:
+        state.close()
+
+
 def test_task_pool_artifact_validation_runs_in_executor_host_not_node(tmp_path):
     module_name = "node_should_not_import_entry_module_demo"
     sys.modules.pop(module_name, None)
