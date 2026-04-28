@@ -1,8 +1,9 @@
 @echo off
-setlocal
+setlocal EnableExtensions
+rem Thin wrapper around the installed/local pycloudctl CLI.
 
-set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..") do set "REPO_ROOT=%%~fI"
+for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"
+for %%I in ("%SCRIPT_DIR%\..") do set "REPO_ROOT=%%~fI"
 
 if defined PYTHONPATH (
     set "PYTHONPATH=%REPO_ROOT%\src;%PYTHONPATH%"
@@ -13,4 +14,5 @@ if defined PYTHONPATH (
 if not defined PYCLOUD_HOME set "PYCLOUD_HOME=%REPO_ROOT%"
 
 python -m pycloud_parallel.controlplane.ctl %*
-exit /b %ERRORLEVEL%
+set "EXIT_CODE=%ERRORLEVEL%"
+endlocal & exit /b %EXIT_CODE%

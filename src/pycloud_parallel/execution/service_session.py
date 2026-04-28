@@ -749,6 +749,8 @@ class _ConnectedService:
         self._async_call_gate: Optional[asyncio.Semaphore] = None
         self._async_call_gate_loop: Optional[asyncio.AbstractEventLoop] = None
         self._async_call_gate_capacity = 0
+        self._async_call_executor: Optional[ThreadPoolExecutor] = None
+        self._async_call_executor_capacity = 0
         self.effective_policy: Optional[EffectivePolicy] = None
         self.serialization_mode = str(serialization_mode or "").strip()
         if not self.service_name:
@@ -758,6 +760,11 @@ class _ConnectedService:
             self._refresh_effective_policy_from_routes()
 
     def close(self) -> None:
+        if self._async_call_executor is not None:
+            with contextlib.suppress(Exception):
+                self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+            self._async_call_executor = None
+            self._async_call_executor_capacity = 0
         close = getattr(self._transport_client, "close", None)
         if callable(close):
             close()
@@ -1145,6 +1152,22 @@ class _ConnectedService:
             self._async_call_gate_capacity = capacity
         return self._async_call_gate
 
+    def _get_async_call_executor(self) -> ThreadPoolExecutor:
+        capacity = max(1, int(self._default_max_in_flight()))
+        if (
+            self._async_call_executor is None
+            or self._async_call_executor_capacity != capacity
+        ):
+            if self._async_call_executor is not None:
+                with contextlib.suppress(Exception):
+                    self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+            self._async_call_executor = ThreadPoolExecutor(
+                max_workers=capacity,
+                thread_name_prefix="service-call",
+            )
+            self._async_call_executor_capacity = capacity
+        return self._async_call_executor
+
     def call_balanced(
         self,
         method: str,
@@ -1336,7 +1359,7 @@ class _ConnectedService:
         loop = asyncio.get_running_loop()
         async with self._get_async_call_gate():
             return await loop.run_in_executor(
-                None,
+                self._get_async_call_executor(),
                 lambda: self.call_balanced(
                     method,
                     payload,
@@ -1601,6 +1624,8 @@ class Service(ServiceExecutionSession):
     _async_call_gate: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _async_call_gate_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
     _async_call_gate_capacity: int = field(default=0, repr=False)
+    _async_call_executor: Optional[ThreadPoolExecutor] = field(default=None, repr=False)
+    _async_call_executor_capacity: int = field(default=0, repr=False)
     _compensation_spec: Optional[Dict[str, Any]] = field(default=None, repr=False)
     _compensation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _last_compensation_attempt_at: float = field(default=0.0, repr=False)
@@ -3607,6 +3632,22 @@ class Service(ServiceExecutionSession):
             self._async_call_gate_capacity = capacity
         return self._async_call_gate
 
+    def _get_async_call_executor(self) -> ThreadPoolExecutor:
+        capacity = max(1, int(self._default_max_in_flight()))
+        if (
+            self._async_call_executor is None
+            or self._async_call_executor_capacity != capacity
+        ):
+            if self._async_call_executor is not None:
+                with contextlib.suppress(Exception):
+                    self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+            self._async_call_executor = ThreadPoolExecutor(
+                max_workers=capacity,
+                thread_name_prefix="service-call",
+            )
+            self._async_call_executor_capacity = capacity
+        return self._async_call_executor
+
     def call_on_node(
         self,
         node_id: str,
@@ -3842,7 +3883,7 @@ class Service(ServiceExecutionSession):
                     if str(effective_serialization_mode or "").strip() and effective_serialization_mode != "legacy_v1":
                         call_kwargs["serialization_mode"] = effective_serialization_mode
                     resp = await loop.run_in_executor(
-                        None,
+                        self._get_async_call_executor(),
                         lambda nid=node_id, kwargs=call_kwargs: self.sessions[nid].call(
                             method,
                             payload,
@@ -3905,7 +3946,7 @@ class Service(ServiceExecutionSession):
                     return node_id, None, RuntimeError("circuit breaker open")
                 try:
                     resp = await loop.run_in_executor(
-                        None,
+                        self._get_async_call_executor(),
                         lambda nid=node_id: self.sessions[nid].call(
                             method,
                             payload,
@@ -3942,6 +3983,11 @@ class Service(ServiceExecutionSession):
             return
         self._closed = True
         self._stop_keepalive()
+        if self._async_call_executor is not None:
+            with contextlib.suppress(Exception):
+                self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+            self._async_call_executor = None
+            self._async_call_executor_capacity = 0
         if end_services:
             self.end(reason=reason)
         for client in self._clients.values():
