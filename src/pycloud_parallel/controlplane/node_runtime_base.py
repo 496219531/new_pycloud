@@ -8,6 +8,8 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
+import signal
 import sys
 import threading
 import uuid
@@ -90,6 +92,8 @@ class NodeRuntimeBase:
         self._pending_startup_globals: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._infocenter_registrar = None
         self._closed = threading.Event()
+        self._interrupt_shutdown_requested = False
+        self._interrupt_signal_handlers: Dict[object, object] = {}
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
         self._service_worker_capacity_override = 0
         self._task_pool_worker_capacity_override = 0
@@ -398,6 +402,7 @@ class NodeRuntimeBase:
             self._service_http_gateway.stop()
 
     def close(self) -> None:
+        self._restore_interrupt_shutdown_handlers()
         self._closed.set()
         if self._infocenter_registrar is not None:
             self._infocenter_registrar.close()
@@ -410,6 +415,43 @@ class NodeRuntimeBase:
             return
         while not self._closed.wait(3600.0):
             pass
+
+    def install_interrupt_shutdown_handlers(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None or sig in self._interrupt_signal_handlers:
+                continue
+            try:
+                previous = signal.getsignal(sig)
+                signal.signal(sig, self._handle_interrupt_signal)
+            except (OSError, ValueError):
+                continue
+            self._interrupt_signal_handlers[sig] = previous
+
+    def _restore_interrupt_shutdown_handlers(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return
+        handlers = dict(self._interrupt_signal_handlers)
+        self._interrupt_signal_handlers.clear()
+        for sig, previous in handlers.items():
+            try:
+                if signal.getsignal(sig) == self._handle_interrupt_signal:
+                    signal.signal(sig, previous)
+            except (OSError, ValueError):
+                pass
+
+    def _handle_interrupt_signal(self, signum, frame) -> None:
+        del frame
+        if self._interrupt_shutdown_requested:
+            os._exit(130)
+        self._interrupt_shutdown_requested = True
+        self._closed.set()
+        threading.Thread(target=self.close, name=f"{self.node_id}-signal-close", daemon=True).start()
+        if signum == getattr(signal, "SIGTERM", None):
+            raise SystemExit(128 + int(signum or 0))
+        raise KeyboardInterrupt
 
     def __enter__(self):
         return self

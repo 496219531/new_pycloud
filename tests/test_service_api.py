@@ -639,6 +639,34 @@ def test_service_startup_defaults_to_dynamic_http_bind(tmp_path, monkeypatch):
         node.close()
 
 
+def test_service_startup_installs_process_interrupt_shutdown(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_interrupt_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    calls = []
+
+    def _fake_install(self):
+        calls.append(self.node_id)
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.node_runtime_base.NodeRuntimeBase.install_interrupt_shutdown_handlers",
+        _fake_install,
+    )
+
+    node = Service.startup(
+        service_name="startup-interrupt",
+        entry_module="startup_interrupt_service",
+        node_id="startup-interrupt-node",
+        start=False,
+    )
+    try:
+        assert calls == ["startup-interrupt-node"]
+    finally:
+        node.close()
+
+
 def test_service_startup_http_gateway_uses_large_accept_backlog(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_backlog_service.py"
     module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")

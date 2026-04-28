@@ -1809,6 +1809,7 @@ class Service(ServiceExecutionSession):
             service_default_worker_count=effective_worker_count,
         )
         node.close_on_registration_lost = True
+        node.install_interrupt_shutdown_handlers()
         if not start:
             node.stop_service_gateway()
         node.mount_prepared_service(
