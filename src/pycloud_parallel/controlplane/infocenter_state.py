@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
 from pycloud_parallel.controlplane.infocenter.models import (
@@ -30,6 +31,40 @@ def _coerce_bool(value: object, *, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off"}:
         return False
     return bool(default)
+
+
+def _endpoint_from_url_or_addr(value: str) -> Tuple[str, int]:
+    text = str(value or "").strip()
+    if not text:
+        return "", 0
+    parsed = urlparse(text)
+    if parsed.hostname and parsed.port:
+        return parsed.hostname.strip().lower(), int(parsed.port)
+    if ":" not in text:
+        return "", 0
+    host, port = text.rsplit(":", 1)
+    try:
+        return host.strip("[]").lower(), int(port)
+    except ValueError:
+        return "", 0
+
+
+def _startup_service_endpoint(state: NodeState, svc: NodeServiceState) -> Tuple[str, int]:
+    endpoint = _endpoint_from_url_or_addr(str(svc.http_base_url or ""))
+    if endpoint[1] > 0:
+        return endpoint
+    return _endpoint_from_url_or_addr(str(state.control_addr or ""))
+
+
+def _endpoint_matches(left: Tuple[str, int], right: Tuple[str, int]) -> bool:
+    left_host, left_port = left
+    right_host, right_port = right
+    if left_port <= 0 or right_port <= 0 or left_port != right_port:
+        return False
+    wildcard_hosts = {"", "0.0.0.0", "::", "[::]"}
+    if left_host in wildcard_hosts or right_host in wildcard_hosts:
+        return True
+    return left_host == right_host
 
 
 class InfoCenterState:
@@ -85,32 +120,53 @@ class InfoCenterState:
         self,
         *,
         node_instance_id: str,
+        control_addr: str,
         metadata: Dict[str, str],
         services: Dict[str, NodeServiceState],
         now: datetime,
     ) -> None:
         if not _coerce_bool((metadata or {}).get("startup_service"), default=False):
             return
-        names: Dict[str, str] = {}
+        incoming_by_name: Dict[str, NodeServiceState] = {}
         for svc in services.values():
             name = str(svc.service_name or "").strip()
             if not name:
                 continue
-            existing_id = names.get(name)
-            if existing_id and existing_id != svc.service_id:
+            existing = incoming_by_name.get(name)
+            if existing is not None and str(existing.service_id or "").strip() != str(svc.service_id or "").strip():
                 raise ValueError(f"startup service_name already exists in node registration: {name}")
-            names[name] = str(svc.service_id or "").strip()
-        if not names:
+            incoming_by_name[name] = svc
+        if not incoming_by_name:
             return
+        replaced_keys: List[str] = []
         for key, state in self._nodes.items():
             if key == node_instance_id or not self._node_is_healthy_locked(state, now=now):
                 continue
-            if not _coerce_bool(state.metadata.get("startup_service"), default=False):
-                continue
             for svc in state.services.values():
                 name = str(svc.service_name or "").strip()
-                if name in names:
+                incoming = incoming_by_name.get(name)
+                if incoming is None:
+                    continue
+                if not _coerce_bool(state.metadata.get("startup_service"), default=False):
                     raise ValueError(f"startup service_name already exists: {name}")
+                incoming_endpoint = _startup_service_endpoint(
+                    NodeState(
+                        node_instance_id=node_instance_id,
+                        node_id="",
+                        control_addr=control_addr,
+                        capacity=1,
+                        queue_capacity=1,
+                        services={str(incoming.service_id or ""): incoming},
+                    ),
+                    incoming,
+                )
+                existing_endpoint = _startup_service_endpoint(state, svc)
+                if not _endpoint_matches(incoming_endpoint, existing_endpoint):
+                    raise ValueError(f"startup service_name already exists: {name}")
+                replaced_keys.append(key)
+                break
+        for key in replaced_keys:
+            self._nodes.pop(key, None)
 
     def _effective_service_state_locked(
         self,
@@ -185,6 +241,7 @@ class InfoCenterState:
             incoming_services = dict(services or {})
             self._validate_startup_service_names_locked(
                 node_instance_id=normalized_instance_id,
+                control_addr=control_addr,
                 metadata=incoming_metadata,
                 services=incoming_services,
                 now=now,

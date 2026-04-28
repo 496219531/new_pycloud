@@ -247,6 +247,9 @@ class NodeControlState(NodeRuntimeBase):
             )
             self._dispatcher.start()
 
+        self.start_node_service_gateway()
+
+    def start_node_service_gateway(self) -> None:
         if self.enable_service_session and self.service_http_bind:
             self.start_service_gateway(
                 invoke_handler=self._invoke_service_http,

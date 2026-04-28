@@ -667,6 +667,124 @@ def test_service_startup_installs_process_interrupt_shutdown(tmp_path, monkeypat
         node.close()
 
 
+def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path, monkeypatch):
+    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+    module_path = tmp_path / "startup_same_endpoint_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    events = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_service_routes(self, **kwargs):
+            assert kwargs["service_name"] == "startup-same-endpoint"
+            return [
+                SimpleNamespace(
+                    service_name="startup-same-endpoint",
+                    service_id="svc-old",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    node_healthy=True,
+                    node_id="startup-old",
+                    node_instance_id="startup-old",
+                    control_addr="",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-old",
+                )
+            ]
+
+    def _fake_infocenter(*_args, **_kwargs):
+        return _FakeInfoCenter()
+
+    def _fake_start_gateway(self):
+        if not self.service_http_bind:
+            return
+        events.append("bind")
+        self.service_http_base_url = "http://127.0.0.1:18081"
+
+    def _fake_start_registration(self, **_kwargs):
+        events.append("register")
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", _fake_infocenter)
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_node_service_gateway",
+        _fake_start_gateway,
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_infocenter_registration",
+        _fake_start_registration,
+    )
+
+    node = Service.startup(
+        infocenter_target="127.0.0.1:50051",
+        service_name="startup-same-endpoint",
+        entry_module="startup_same_endpoint_service",
+        bind="127.0.0.1:18081",
+    )
+    try:
+        assert events == ["bind", "register"]
+    finally:
+        node.close()
+
+
+def test_service_startup_different_endpoint_fails_before_bind(tmp_path, monkeypatch):
+    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+
+    module_path = tmp_path / "startup_other_endpoint_service.py"
+    module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    events = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_service_routes(self, **_kwargs):
+            return [
+                SimpleNamespace(
+                    service_name="startup-other-endpoint",
+                    service_id="svc-old",
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    node_healthy=True,
+                    node_id="startup-old",
+                    node_instance_id="startup-old",
+                    control_addr="",
+                    http_base_url="http://127.0.0.1:18082/svc/svc-old",
+                )
+            ]
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_node_service_gateway",
+        lambda self: events.append("bind") if self.service_http_bind else None,
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_infocenter_registration",
+        lambda self, **_kwargs: events.append("register"),
+    )
+
+    with pytest.raises(RuntimeError, match="different endpoint"):
+        Service.startup(
+            infocenter_target="127.0.0.1:50051",
+            service_name="startup-other-endpoint",
+            entry_module="startup_other_endpoint_service",
+            bind="127.0.0.1:18081",
+        )
+
+    assert events == []
+
+
 def test_service_startup_http_gateway_uses_large_accept_backlog(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_backlog_service.py"
     module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")

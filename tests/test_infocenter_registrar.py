@@ -327,6 +327,53 @@ def test_startup_service_registration_rejects_duplicate_service_name():
         )
 
 
+def test_startup_service_registration_replaces_same_endpoint_duplicate():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="startup-old",
+        node_id="startup-old",
+        control_addr="",
+        capacity=1,
+        queue_capacity=1,
+        metadata={"startup_service": "true"},
+        services={
+            "svc-old": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-old",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            )
+        },
+    )
+
+    info_state.register_node_record(
+        node_instance_id="startup-new",
+        node_id="startup-new",
+        control_addr="",
+        capacity=1,
+        queue_capacity=1,
+        metadata={"startup_service": "true"},
+        services={
+            "svc-new": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-new",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-new",
+            )
+        },
+    )
+
+    nodes = info_state.list_nodes(healthy_only=True, tags=(), limit=10)
+    routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=10)
+
+    assert [node.node_instance_id for node in nodes] == ["startup-new"]
+    assert [route["service_id"] for route in routes] == ["svc-new"]
+
+
 def test_infocenter_replaces_existing_node_with_same_control_addr():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(

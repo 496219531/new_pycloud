@@ -18,6 +18,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import urlparse
 
 from pycloud_parallel.controlplane.artifact import (
     Artifact,
@@ -109,6 +110,9 @@ from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 logger = logging.getLogger(__name__)
 
+_STARTUP_PREFLIGHT_RETRY_SEC = 5.0
+_STARTUP_PREFLIGHT_SLEEP_SEC = 0.2
+
 
 def _infocenter_client(*args, **kwargs):
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -120,6 +124,61 @@ def _node_control_client(*args, **kwargs):
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
     return NodeControlClient(*args, **kwargs)
+
+
+def _endpoint_from_url_or_addr(value: str) -> Tuple[str, int]:
+    text = str(value or "").strip()
+    if not text:
+        return "", 0
+    parsed = urlparse(text)
+    if parsed.hostname and parsed.port:
+        return parsed.hostname.strip().lower(), int(parsed.port)
+    if ":" not in text:
+        return "", 0
+    host, port = text.rsplit(":", 1)
+    try:
+        return host.strip("[]").lower(), int(port)
+    except ValueError:
+        return "", 0
+
+
+def _startup_expected_endpoint(*, service_http_base_url: str, service_http_bind: str) -> Tuple[str, int]:
+    endpoint = _endpoint_from_url_or_addr(service_http_base_url)
+    if endpoint[1] > 0:
+        return endpoint
+    return _endpoint_from_url_or_addr(service_http_bind)
+
+
+def _route_endpoint(route: InfoCenterServiceRoute) -> Tuple[str, int]:
+    endpoint = _endpoint_from_url_or_addr(str(getattr(route, "http_base_url", "") or ""))
+    if endpoint[1] > 0:
+        return endpoint
+    return _endpoint_from_url_or_addr(str(getattr(route, "control_addr", "") or ""))
+
+
+def _startup_endpoint_matches(left: Tuple[str, int], right: Tuple[str, int]) -> bool:
+    left_host, left_port = left
+    right_host, right_port = right
+    if left_port <= 0 or right_port <= 0 or left_port != right_port:
+        return False
+    wildcard_hosts = {"", "0.0.0.0", "::", "[::]"}
+    if left_host in wildcard_hosts or right_host in wildcard_hosts:
+        return True
+    return left_host == right_host
+
+
+def _startup_active_routes(routes: Sequence[InfoCenterServiceRoute]) -> List[InfoCenterServiceRoute]:
+    return [
+        route
+        for route in routes
+        if bool(getattr(route, "node_healthy", True))
+        and int(getattr(route, "status", 0) or 0)
+        in {
+            int(pb2.SERVICE_STATUS_STARTING),
+            int(pb2.SERVICE_STATUS_RUNNING),
+            int(pb2.SERVICE_STATUS_DRAINING),
+        }
+    ]
 
 
 def _route_attr(route: object, name: str, default: object = "") -> object:
@@ -1796,13 +1855,76 @@ class Service(ServiceExecutionSession):
             normalized_artifact,
             consumer_kind="service",
         )
+
+        def _bind_startup_gateway(startup_node) -> None:
+            deadline = time.monotonic() + _STARTUP_PREFLIGHT_RETRY_SEC
+            expected_endpoint = _startup_expected_endpoint(
+                service_http_base_url=str(service_http_base_url or "").strip(),
+                service_http_bind=service_http_bind,
+            )
+            while True:
+                try:
+                    startup_node.start_node_service_gateway()
+                    return
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        endpoint_text = (
+                            f"{expected_endpoint[0]}:{expected_endpoint[1]}"
+                            if expected_endpoint[1] > 0
+                            else service_http_bind
+                        )
+                        raise RuntimeError(
+                            "startup service endpoint is already in use after retry: "
+                            f"service_name={effective_service_name!r} endpoint={endpoint_text}"
+                        ) from exc
+                    time.sleep(_STARTUP_PREFLIGHT_SLEEP_SEC)
+
+        def _preflight_existing_startup_service() -> None:
+            if not start or not effective_infocenter_target:
+                return
+            expected_endpoint = _startup_expected_endpoint(
+                service_http_base_url=str(service_http_base_url or "").strip(),
+                service_http_bind=service_http_bind,
+            )
+            with _infocenter_client(effective_infocenter_target, timeout_sec=rpc_timeout_sec) as infocenter:
+                routes = _startup_active_routes(
+                    infocenter.list_service_routes(
+                        service_name=effective_service_name,
+                        healthy_only=True,
+                        limit=100,
+                    )
+                )
+            if not routes:
+                return
+            if expected_endpoint[1] <= 0:
+                raise RuntimeError(
+                    "startup service_name already exists and current startup has no fixed endpoint: "
+                    f"service_name={effective_service_name!r}"
+                )
+            mismatched = [
+                route
+                for route in routes
+                if not _startup_endpoint_matches(_route_endpoint(route), expected_endpoint)
+            ]
+            if mismatched:
+                details = ", ".join(
+                    f"{route.node_id or route.node_instance_id}@{route.http_base_url or route.control_addr or '-'}"
+                    for route in mismatched
+                )
+                raise RuntimeError(
+                    "startup service_name already exists on a different endpoint: "
+                    f"service_name={effective_service_name!r} current={expected_endpoint[0]}:{expected_endpoint[1]} "
+                    f"existing=[{details}]"
+                )
+
+        effective_infocenter_target = str(infocenter_target or target or "").strip()
         effective_worker_count = max(1, int(worker_count or 1))
         node = StartupServiceNode(
             node_id=effective_node_id,
             worker_capacity=effective_worker_count,
             service_worker_capacity=effective_worker_count,
             task_pool_worker_capacity=1,
-            service_http_bind=service_http_bind,
+            service_http_bind="",
             service_http_base_url=str(service_http_base_url or "").strip(),
             enable_internal_executor=False,
             enable_service_session=True,
@@ -1810,44 +1932,49 @@ class Service(ServiceExecutionSession):
         )
         node.close_on_registration_lost = True
         node.install_interrupt_shutdown_handlers()
-        if not start:
-            node.stop_service_gateway()
-        node.mount_prepared_service(
-            owner_client_id=f"{effective_node_id}-owner",
-            service_name=effective_service_name,
-            sha256=prepared_artifact.content_sha256,
-            runtime=prepared_artifact.runtime,
-            entry_module=prepared_artifact.entry_module,
-            entry_callable=prepared_artifact.entry_callable,
-            package_format=prepared_artifact.package_format,
-            export_mode=prepared_artifact.export_mode,
-            export_methods=list(prepared_artifact.export_methods),
-            export_decorator=prepared_artifact.export_decorator,
-            dependency_policy_mode=prepared_artifact.dependency_policy_mode,
-            dependency_allowlist=list(prepared_artifact.dependency_allowlist),
-            managed_global_names=list(prepared_artifact.managed_global_names),
-            policy_id=policy_id,
-            worker_count=effective_worker_count,
-            heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
-            idle_ttl_sec=0,
-            expose_http=bool(start),
-            chunks=[prepared_artifact.blob],
-            service_id=service_id,
-        )
-        effective_infocenter_target = str(infocenter_target or target or "").strip()
-        if effective_infocenter_target:
-            node.start_infocenter_registration(
-                infocenter_target=effective_infocenter_target,
-                control_addr=control_addr,
-                tags=tags,
-                metadata={
-                    "service_name": effective_service_name,
-                    "entry_module": module_name,
-                    **dict(metadata or {}),
-                },
-                heartbeat_sec=heartbeat_sec,
-                rpc_timeout_sec=rpc_timeout_sec,
+        try:
+            node.service_http_bind = service_http_bind
+            _preflight_existing_startup_service()
+            if start:
+                _bind_startup_gateway(node)
+            node.mount_prepared_service(
+                owner_client_id=f"{effective_node_id}-owner",
+                service_name=effective_service_name,
+                sha256=prepared_artifact.content_sha256,
+                runtime=prepared_artifact.runtime,
+                entry_module=prepared_artifact.entry_module,
+                entry_callable=prepared_artifact.entry_callable,
+                package_format=prepared_artifact.package_format,
+                export_mode=prepared_artifact.export_mode,
+                export_methods=list(prepared_artifact.export_methods),
+                export_decorator=prepared_artifact.export_decorator,
+                dependency_policy_mode=prepared_artifact.dependency_policy_mode,
+                dependency_allowlist=list(prepared_artifact.dependency_allowlist),
+                managed_global_names=list(prepared_artifact.managed_global_names),
+                policy_id=policy_id,
+                worker_count=effective_worker_count,
+                heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
+                idle_ttl_sec=0,
+                expose_http=bool(start),
+                chunks=[prepared_artifact.blob],
+                service_id=service_id,
             )
+            if effective_infocenter_target:
+                node.start_infocenter_registration(
+                    infocenter_target=effective_infocenter_target,
+                    control_addr=control_addr,
+                    tags=tags,
+                    metadata={
+                        "service_name": effective_service_name,
+                        "entry_module": module_name,
+                        **dict(metadata or {}),
+                    },
+                    heartbeat_sec=heartbeat_sec,
+                    rpc_timeout_sec=rpc_timeout_sec,
+                )
+        except Exception:
+            node.close()
+            raise
         return node
 
     @classmethod
