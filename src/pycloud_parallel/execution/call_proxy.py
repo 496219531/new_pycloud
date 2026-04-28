@@ -263,6 +263,24 @@ class _CallProxy:
             refresh_status=refresh_status if refresh_status is not None else self._refresh_status,
         )
 
+    def stream(self, *args, **kwargs):
+        payload = {}
+        if args:
+            payload["args"] = list(args)
+        if args and kwargs:
+            payload["kwargs"] = kwargs
+        final_payload = payload if args else kwargs
+        stream_call = getattr(self._group, "stream_call", None)
+        if not callable(stream_call):
+            raise AttributeError(f"{type(self._group).__name__} does not support stream_call()")
+        return stream_call(
+            self._method,
+            final_payload,
+            timeout_sec=self._timeout_sec,
+            strategy=self._strategy,
+            refresh_status=self._refresh_status,
+        )
+
     def map(
         self,
         values: Sequence[object],
@@ -446,6 +464,24 @@ class _SyncCallProxy:
             refresh_status=self._refresh_status,
         )
         return _resolve_high_level_service_data(self._group, node_id=node_id, response=resp)
+
+    def stream(self, *args, **kwargs):
+        payload = {}
+        if args:
+            payload["args"] = list(args)
+        if args and kwargs:
+            payload["kwargs"] = kwargs
+        final_payload = payload if args else kwargs
+        stream_call = getattr(self._group, "stream_call", None)
+        if not callable(stream_call):
+            raise AttributeError(f"{type(self._group).__name__} does not support stream_call()")
+        return stream_call(
+            self._method,
+            final_payload,
+            timeout_sec=self._timeout_sec,
+            strategy=self._strategy,
+            refresh_status=self._refresh_status,
+        )
 
 
 class _BroadcastProxy:

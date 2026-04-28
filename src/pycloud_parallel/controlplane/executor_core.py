@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Shared ProcessPool execution core for node executor backends."""
 
+import contextlib
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 import logging
@@ -40,6 +41,7 @@ def submit_callable_to_worker(executor: ProcessPoolExecutor, args: Dict[str, Any
         str(args.get("payload_mode", "task_submit") or "task_submit"),
         str(args.get("serialization_mode", "") or "").strip().lower(),
         args.get("use_transport_result", None),
+        args.get("stream_queue", None),
     )
 
 
@@ -140,8 +142,11 @@ class ExecutorCore:
         self._task_executor: Optional[ProcessPoolExecutor] = None
         self._inflight: Dict[object, Dict[str, Any]] = {}
         self._completed_futures: "queue.Queue[object]" = queue.Queue()
+        self._stream_state: Dict[object, Dict[str, Any]] = {}
 
     def close(self) -> None:
+        for state in list(self._stream_state.values()):
+            self._cleanup_stream_state(state)
         for executor in list(self._service_executors.values()):
             self._shutdown_executor(executor, wait=True)
         for executor in list(self._pool_executors.values()):
@@ -152,6 +157,7 @@ class ExecutorCore:
         self._pool_executors.clear()
         self._pool_workers.clear()
         self._task_executor = None
+        self._stream_state.clear()
 
     @staticmethod
     def _ensure_mp_context():
@@ -218,7 +224,43 @@ class ExecutorCore:
 
     def _track_inflight(self, future, meta: Dict[str, Any]) -> None:
         self._inflight[future] = meta
+        if meta.get("streaming"):
+            self._stream_state[future] = meta
         future.add_done_callback(self._enqueue_completed_future)
+
+    def _new_stream_queue(self):
+        manager = mp.Manager()
+        return manager, manager.Queue()
+
+    def _cleanup_stream_state(self, meta: Dict[str, Any]) -> None:
+        manager = meta.pop("stream_manager", None)
+        with contextlib.suppress(Exception):
+            if manager is not None:
+                manager.shutdown()
+
+    def _drain_stream_meta(self, meta: Dict[str, Any]) -> None:
+        request_id = str(meta.get("request_id", "") or "")
+        stream_queue = meta.get("stream_queue")
+        if not request_id or stream_queue is None:
+            return
+        emitted = int(meta.get("stream_emitted", 0) or 0)
+        while True:
+            try:
+                item = stream_queue.get_nowait()
+            except Exception:
+                break
+            if not isinstance(item, dict) or str(item.get("kind", "") or "") != "item":
+                continue
+            self._emit_event(
+                {
+                    "kind": "service_stream_item",
+                    "request_id": request_id,
+                    "item_index": int(item.get("item_index", emitted) or emitted),
+                    "result": item.get("result"),
+                }
+            )
+            emitted += 1
+        meta["stream_emitted"] = emitted
 
     def _emit_executor_workers(self, *, scope: str, key: str, executor: Optional[ProcessPoolExecutor]) -> None:
         if executor is None:
@@ -474,6 +516,33 @@ class ExecutorCore:
             )
             return True
 
+        if action == "call_service_stream":
+            service_id = str(payload.get("service_id", "") or "")
+            if service_id not in self._service_workers:
+                self._emit_response(request_id, ok=False, error="service executor missing")
+                return True
+            stream_manager, stream_queue = self._new_stream_queue()
+            stream_payload = dict(payload)
+            stream_payload["stream_queue"] = stream_queue
+            future = self._submit_service_future(service_id, stream_payload)
+            self._track_inflight(
+                future,
+                {
+                    "kind": "service",
+                    "service_id": service_id,
+                    "request_id": request_id,
+                    "start_at": time.monotonic(),
+                    "timeout_sec": max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)),
+                    "payload": dict(stream_payload),
+                    "recoveries": 0,
+                    "streaming": True,
+                    "stream_queue": stream_queue,
+                    "stream_manager": stream_manager,
+                    "stream_emitted": 0,
+                },
+            )
+            return True
+
         if action == "warmup_service":
             service_id = str(payload.get("service_id", "") or "")
             executor = self._service_executors.get(service_id)
@@ -611,8 +680,13 @@ class ExecutorCore:
 
     def poll_once(self) -> None:
         now = time.monotonic()
+        self._drain_stream_queues()
         self._drain_completed_futures()
         self._expire_service_timeouts(now=now)
+
+    def _drain_stream_queues(self) -> None:
+        for meta in list(self._stream_state.values()):
+            self._drain_stream_meta(meta)
 
     def _drain_completed_futures(self) -> None:
         while True:
@@ -626,9 +700,13 @@ class ExecutorCore:
             try:
                 status_text, result, err_type, err_message, timings = unpack_subprocess_result(future.result())
             except Exception as exc:
+                if meta.get("streaming"):
+                    self._stream_state.pop(future, None)
                 status_text, result, err_type, err_message, timings = self._recover_or_fail_future(exc, meta)
                 if status_text == "__RETRIED__":
                     continue
+            if meta.get("streaming"):
+                self._drain_stream_meta(meta)
             kind = str(meta.get("kind", "") or "")
             if kind == "pool":
                 self._emit_event(
@@ -660,6 +738,9 @@ class ExecutorCore:
                 )
                 continue
             if kind == "service":
+                if meta.get("streaming"):
+                    self._stream_state.pop(future, None)
+                    self._cleanup_stream_state(meta)
                 self._emit_response(
                     str(meta.get("request_id", "") or ""),
                     ok=True,
@@ -710,6 +791,8 @@ class ExecutorCore:
                 retry_meta["recoveries"] = recoveries + 1
                 self._track_inflight(retry_future, retry_meta)
                 return "__RETRIED__", None, "", "", {}
+        if meta.get("streaming"):
+            self._cleanup_stream_state(meta)
         return "FAILED_INFRA", None, "InfraException", repr(exc), {}
 
     def _expire_service_timeouts(self, *, now: float) -> None:
@@ -723,6 +806,9 @@ class ExecutorCore:
                 timed_out.append((future, meta))
         for future, meta in timed_out:
             self._inflight.pop(future, None)
+            if meta.get("streaming"):
+                self._stream_state.pop(future, None)
+                self._cleanup_stream_state(meta)
             service_id = str(meta.get("service_id", "") or "")
             if service_id:
                 executor = self._service_executors.pop(service_id, None)

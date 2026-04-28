@@ -10,6 +10,7 @@ from typing import Dict, Optional, Sequence, Tuple
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
+from pycloud_parallel.controlplane.scheduling_policy import deploy_candidate_block_reason, deploy_candidates
 from pycloud_parallel.execution.scheduler import (
     JOBQUEUE_DEFAULT,
     SchedulerCandidate,
@@ -38,6 +39,11 @@ class InfoCenterNodeService:
     service_id: str
     status: int
     policy_id: str = "default_safe"
+    owner_client_id: str = ""
+    code_version: str = ""
+    entry_module: str = ""
+    entry_callable: str = ""
+    serialization_mode: str = ""
     status_text: str = ""
     worker_count: int = 0
     alive_workers: int = 0
@@ -111,6 +117,14 @@ class InfoCenterServiceRoute:
     predicted_busy: float = 0.0
     capability: NodeCapability = NodeCapability()
     policy_id: str = "default_safe"
+    node_schedulable: bool = True
+    node_drain: bool = False
+    accept_service_deploy: bool = True
+    owner_client_id: str = ""
+    code_version: str = ""
+    entry_module: str = ""
+    entry_callable: str = ""
+    serialization_mode: str = ""
 
 
 @dataclass
@@ -247,6 +261,11 @@ class InfoCenterClient:
                     "service_id": str(item.service_id),
                     "status": int(item.status),
                     "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
+                    "owner_client_id": str(getattr(item, "owner_client_id", "") or ""),
+                    "code_version": str(getattr(item, "code_version", "") or ""),
+                    "entry_module": str(getattr(item, "entry_module", "") or ""),
+                    "entry_callable": str(getattr(item, "entry_callable", "") or ""),
+                    "serialization_mode": str(getattr(item, "serialization_mode", "") or ""),
                     "worker_count": int(item.worker_count),
                     "alive_workers": int(item.alive_workers),
                     "in_flight": int(item.in_flight),
@@ -312,6 +331,11 @@ class InfoCenterClient:
                     "service_id": str(item.service_id),
                     "status": int(item.status),
                     "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
+                    "owner_client_id": str(getattr(item, "owner_client_id", "") or ""),
+                    "code_version": str(getattr(item, "code_version", "") or ""),
+                    "entry_module": str(getattr(item, "entry_module", "") or ""),
+                    "entry_callable": str(getattr(item, "entry_callable", "") or ""),
+                    "serialization_mode": str(getattr(item, "serialization_mode", "") or ""),
                     "worker_count": int(item.worker_count),
                     "alive_workers": int(item.alive_workers),
                     "in_flight": int(item.in_flight),
@@ -374,6 +398,11 @@ class InfoCenterClient:
                         service_id=str(svc.get("service_id", "") or ""),
                         status=int(svc.get("status", 0) or 0),
                         policy_id=str(svc.get("policy_id", "") or "default_safe"),
+                        owner_client_id=str(svc.get("owner_client_id", "") or ""),
+                        code_version=str(svc.get("code_version", "") or ""),
+                        entry_module=str(svc.get("entry_module", "") or ""),
+                        entry_callable=str(svc.get("entry_callable", "") or ""),
+                        serialization_mode=str(svc.get("serialization_mode", "") or ""),
                         status_text=str(svc.get("status_text", "") or ""),
                         worker_count=int(svc.get("worker_count", 0) or 0),
                         alive_workers=int(svc.get("alive_workers", 0) or 0),
@@ -534,6 +563,7 @@ class InfoCenterClient:
         service_name: str = "",
         healthy_only: bool = True,
         limit: int = 500,
+        route_scope: str = "call",
     ) -> Sequence[InfoCenterServiceRoute]:
         
         params = "&".join(
@@ -541,6 +571,7 @@ class InfoCenterClient:
                 f"service_name={service_name}",
                 f"healthy_only={'true' if healthy_only else 'false'}",
                 f"limit={max(1, int(limit))}",
+                f"route_scope={str(route_scope or '').strip()}",
             ]
         )
         resp = http_json_request(
@@ -577,9 +608,56 @@ class InfoCenterClient:
                     predicted_busy=float(item.get("predicted_busy", 0.0) or 0.0),
                     capability=NodeCapability.from_dict(item.get("capability")),
                     policy_id=str(item.get("policy_id", "") or "default_safe"),
+                    node_schedulable=bool(item.get("node_schedulable", True)),
+                    node_drain=bool(item.get("node_drain", False)),
+                    accept_service_deploy=_coerce_bool(item.get("accept_service_deploy"), default=True),
+                    owner_client_id=str(item.get("owner_client_id", "") or ""),
+                    code_version=str(item.get("code_version", "") or ""),
+                    entry_module=str(item.get("entry_module", "") or ""),
+                    entry_callable=str(item.get("entry_callable", "") or ""),
+                    serialization_mode=str(item.get("serialization_mode", "") or ""),
                 )
             )
         return out
+
+    def list_service_routes_for_call(
+        self,
+        *,
+        service_name: str = "",
+        limit: int = 500,
+    ) -> Sequence[InfoCenterServiceRoute]:
+        return self.list_service_routes(
+            service_name=service_name,
+            healthy_only=True,
+            limit=limit,
+            route_scope="call",
+        )
+
+    def list_service_routes_for_owner_command(
+        self,
+        *,
+        service_name: str = "",
+        limit: int = 500,
+    ) -> Sequence[InfoCenterServiceRoute]:
+        return self.list_service_routes(
+            service_name=service_name,
+            healthy_only=True,
+            limit=limit,
+            route_scope="owner_command",
+        )
+
+    def list_service_routes_for_exclusive_check(
+        self,
+        *,
+        service_name: str = "",
+        limit: int = 500,
+    ) -> Sequence[InfoCenterServiceRoute]:
+        return self.list_service_routes(
+            service_name=service_name,
+            healthy_only=True,
+            limit=limit,
+            route_scope="exclusive_check",
+        )
 
     def select_task_nodes(
         self,
@@ -611,12 +689,28 @@ class InfoCenterClient:
             if missing:
                 raise RuntimeError(f"{label} do not expose control_addr and cannot host task pools: {missing}")
 
+        def _ensure_deployable_nodes(selected_nodes: Sequence[InfoCenterNode], *, label: str) -> None:
+            blocked = []
+            for node in selected_nodes:
+                reason = deploy_candidate_block_reason(
+                    healthy=bool(node.healthy),
+                    schedulable=bool(node.schedulable),
+                    drain=bool(node.drain),
+                    accept_service_deploy=bool(getattr(node, "accept_service_deploy", True)),
+                )
+                if reason:
+                    blocked.append((_node_instance_key_from_node(node) or node.node_id, reason))
+            if blocked:
+                details = ", ".join(f"{node_id}({reason})" for node_id, reason in blocked)
+                raise RuntimeError(f"{label} are not deployable task nodes: {details}")
+
         if requested_instance_ids:
             missing_instance_ids = [node_id for node_id in requested_instance_ids if node_id not in discovered_instance_map]
             if missing_instance_ids:
                 raise RuntimeError(f"requested node_instance_ids not found in current discovery scope: {missing_instance_ids}")
             selected = [discovered_instance_map[node_id] for node_id in requested_instance_ids]
             _ensure_control_addrs(selected, label="requested node_instance_ids")
+            _ensure_deployable_nodes(selected, label="requested node_instance_ids")
             if normalized_runtime:
                 incompatible = [
                     node
@@ -639,6 +733,7 @@ class InfoCenterClient:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
             selected = [discovered_node_map[node_id] for node_id in requested_node_ids]
             _ensure_control_addrs(selected, label="requested node_ids")
+            _ensure_deployable_nodes(selected, label="requested node_ids")
             if normalized_runtime:
                 incompatible = [
                     node
@@ -658,12 +753,16 @@ class InfoCenterClient:
             candidates = [
                 node
                 for node in nodes
-                if node.healthy
-                and node.schedulable
-                and not node.drain
-                and bool(getattr(node, "accept_service_deploy", True))
-                and str(node.control_addr or "").strip()
-                and (not require_credit or node.credit > 0)
+                if deploy_candidates(
+                    healthy=bool(node.healthy),
+                    schedulable=bool(node.schedulable),
+                    drain=bool(node.drain),
+                    accept_service_deploy=bool(getattr(node, "accept_service_deploy", True)),
+                    control_addr=str(node.control_addr or ""),
+                    require_control_addr=True,
+                    credit=int(node.credit or 0),
+                    require_credit=bool(require_credit),
+                )
             ]
             if normalized_runtime:
                 candidates = _filter_nodes_by_runtime(candidates, runtime=normalized_runtime)
@@ -702,7 +801,7 @@ class InfoCenterClient:
                             node_id=str(node.node_id or ""),
                             node_instance_id=_node_instance_key_from_node(node),
                             healthy=bool(node.healthy),
-                            schedulable=bool(node.schedulable and not node.drain and str(node.control_addr or "").strip()),
+                            schedulable=True,
                             drain=bool(node.drain),
                             breaker_state="closed",
                             predicted_busy=float(node.inflight) / float(

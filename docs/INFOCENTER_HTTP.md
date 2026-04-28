@@ -279,14 +279,37 @@ http://127.0.0.1:50051/ops
    - 新进程会获得新的 `node_instance_id`
    - 即使 `node_id` 相同，新实例也可以重新进入 service/taskpool 补偿候选
 
+实例 fencing 约定：
+
+1. 不再引入单独的 `epoch` 概念；`node_instance_id` 本身就是实例生命周期身份。
+2. `node_id` 可以持久化和复用，`node_instance_id` 不能在失效后复用。
+3. 当 InfoCenter 判定某个实例 heartbeat timeout、被 `mark-lost`、或收到其它失效信号时，会 fence 该 `node_instance_id`。
+4. fenced 实例后续 register/heartbeat 会收到 `reset_required=true` / `new_instance_required=true`，node 侧必须清理执行状态并用新的 `node_instance_id` 重新注册。
+5. 清理范围包括 service session、taskpool session、executor backend / executor host、worker 进程、service_token / pool_token 对应的执行状态。
+6. code cache / object cache 可以保留；它们不是执行租约身份的一部分。
+7. 新实例第一次注册时应上报空执行状态，再由 owner / deploy 流程重新下发 service 或 taskpool。
+
+`unhealthy` / `drain` / `cordon` 的区别：
+
+1. `unhealthy`：实例执行状态不可信，需要 fencing 和重置；它不应继续作为 service route、deploy candidate 或 task target。
+2. `drain`：不接新业务调用和新 task 分配，但仍接受 owner 控制命令，例如 `update_globals`、`close`、`shutdown`、heartbeat。
+3. `cordon`：不接新部署；已有服务是否继续对外服务取决于是否同时 `drain`。
+4. service 部署候选应过滤 `unhealthy`、`drain`、`cordon`、`accept_service_deploy=false`。
+5. service 调用路由应过滤 `unhealthy` 和 `drain`，但不应仅因 `cordon` 过滤已有 RUNNING 服务。
+6. owner 控制命令不应过滤 `drain` / `cordon`；否则旧版本服务可能被隐藏后无法退出或更新。
+7. 排他性独占 / 版本冲突检查只应忽略已 fenced 的 unhealthy 实例；drain/cordon 节点上的 STARTING/RUNNING/DRAINING 服务仍要参与冲突判断，避免版本混乱。
+
 ### 2.11 运维动作
 
 ```text
-POST /ops/nodes/{node_id}/cordon
-POST /ops/nodes/{node_id}/uncordon
-POST /ops/nodes/{node_id}/drain
-POST /ops/nodes/{node_id}/undrain
+POST /ops/nodes/{node_instance_id}/cordon
+POST /ops/nodes/{node_instance_id}/uncordon
+POST /ops/nodes/{node_instance_id}/drain
+POST /ops/nodes/{node_instance_id}/undrain
+POST /ops/nodes/{node_instance_id}/mark-lost
 ```
+
+说明：路径名仍是 `/ops/nodes/...`，但参数语义是 `node_instance_id`。页面上的操作按钮会自动使用对应实例 id；手写 curl 时不要只填可重复的 `node_id`。
 
 ## 3. Python 客户端
 
@@ -370,10 +393,11 @@ curl 'http://127.0.0.1:50051/services/routes?service_name=square-service&healthy
 ### 4.3 运维操作
 
 ```bash
-curl -X POST http://127.0.0.1:50051/ops/nodes/node-1/cordon
-curl -X POST http://127.0.0.1:50051/ops/nodes/node-1/uncordon
-curl -X POST http://127.0.0.1:50051/ops/nodes/node-1/drain
-curl -X POST http://127.0.0.1:50051/ops/nodes/node-1/undrain
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/cordon
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/uncordon
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/drain
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/undrain
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/mark-lost
 ```
 
 ## 5. 与 Gateway 的关系

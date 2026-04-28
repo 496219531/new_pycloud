@@ -3,6 +3,7 @@ from __future__ import annotations
 """Integration tests for NodeControl -> InfoCenter registrar sync."""
 
 import hashlib
+import json
 import time
 from urllib.request import Request, urlopen
 
@@ -527,6 +528,84 @@ def test_ops_page_marks_lost_service_instances(tmp_path):
         info_server.stop()
 
 
+def test_infocenter_http_rejects_fenced_instance_with_reset_required():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-fenced-http",
+                node_instance_id="node-fenced-http-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=2,
+                queue_capacity=16,
+                tags=["compute"],
+            )
+        info_state.mark_node_lost("node-fenced-http-inst", reason="test lost")
+
+        payload = json.dumps(
+            {
+                "node_id": "node-fenced-http",
+                "node_instance_id": "node-fenced-http-inst",
+                "healthy": True,
+            }
+        ).encode("utf-8")
+        req = Request(
+            f"{info_target}/nodes/heartbeat",
+            method="POST",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=5.0) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+
+        assert body["accepted"] is False
+        assert body["reset_required"] is True
+        assert body["new_instance_required"] is True
+        assert body["reason"] == "node_instance_id fenced"
+    finally:
+        info_server.stop()
+
+
+def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
+    node_state = NodeControlState(
+        node_id="node-self-fence",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_self_fence"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-self-fence",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+    )
+
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now - 10.0  # noqa: SLF001
+        registrar._lease_ttl_sec = 1  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.service_report_payloads(include_stopped=True) == []
+        assert node_state.task_pool_reports() == {}
+    finally:
+        registrar.close()
+        node_state.close()
+
+
 def test_infocenter_tracks_nodes_that_do_not_accept_service_deploy():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
@@ -803,6 +882,41 @@ def test_infocenter_client_select_task_nodes_accepts_explicit_node_ids():
                 )
             )
             assert [node.node_id for node in selected] == ["node-b"]
+    finally:
+        info_server.stop()
+
+
+def test_infocenter_client_select_task_nodes_rejects_explicit_cordon_or_drain_nodes():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-cordon",
+                node_instance_id="node-cordon-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            client.register_node(
+                node_id="node-drain-explicit",
+                node_instance_id="node-drain-inst",
+                control_addr="127.0.0.1:50062",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            info_state.update_node_schedule_state("node-cordon-inst", schedulable=False)
+            info_state.update_node_schedule_state("node-drain-inst", drain=True)
+
+            with pytest.raises(RuntimeError, match="not deployable.*cordon"):
+                list(client.select_task_nodes(healthy_only=True, node_ids=["node-cordon"], limit=10))
+            with pytest.raises(RuntimeError, match="not deployable.*drain"):
+                list(client.select_task_nodes(healthy_only=True, node_instance_ids=["node-drain-inst"], limit=10))
     finally:
         info_server.stop()
 

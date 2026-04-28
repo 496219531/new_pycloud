@@ -86,6 +86,32 @@ V1 公开概念固定为：
 6. InfoCenter `/ops` 必须显示每条失败 service/taskpool 的 `failure_reason`
 7. 健康服务路由查询仍只返回健康节点上的 `RUNNING` 服务，诊断记录不能污染调用路由
 
+### 6.1 node 实例身份与 fencing
+
+1. `node_id` 是逻辑名，可以持久化和复用
+2. `node_instance_id` 是执行实例身份，也是 service/taskpool token、DataRef 路由、动态补偿失败记录的 fencing 单位
+3. 不再引入额外 `epoch`；失效实例必须换新的 `node_instance_id`
+4. InfoCenter heartbeat timeout、`mark-lost`、node 自身发现 lease 过期、executor 状态不可恢复，都应使旧 `node_instance_id` 进入 fenced 状态
+5. fenced 实例不能带着旧 service/taskpool 状态恢复；node 侧必须清理执行状态并重新注册新实例
+6. code/object cache 可保留，但 runtime/service/taskpool/executor/worker/token 状态必须清空
+
+### 6.2 unhealthy / drain / cordon
+
+1. `unhealthy` 表示执行状态不可信，应触发 fencing/reset 语义
+2. `drain` 表示不接新业务流量和新 task，但仍接 owner 控制命令
+3. `cordon` 表示不接新部署；已有 RUNNING 服务是否继续路由由 `drain` 决定
+4. 排他性部署和版本冲突检查不能因为 drain/cordon 就隐藏已有服务；只有 fenced unhealthy 实例可以从冲突检查中移除
+5. owner 命令路径不要过滤 drain/cordon，否则旧版本服务可能无法被 update/close
+
+### 6.3 TaskPool inflight retry
+
+1. 已被 node 接收的 task 若要 infra retry，client/session 侧必须持有 replay record；不能依赖失联 node 上的 `TaskState.payload`
+2. replay record 应保存逻辑 index/key、原始 payload、当前 task_id、当前 node_instance_id、attempt、最近错误
+3. retry 到新 node 时重新执行 payload prepare，不复用旧 node 上的本地化 prepared payload
+4. `imap_unordered` 公共链路支持 `max_infra_retries`，默认 1 次；耗尽后返回 `FAILED_INFRA / NodeInstanceLost`
+5. 低层 submit/wait API 不应被假设有自动 replay；如果需要同等语义，应显式接入 replay ledger
+6. 必须保留 retry 可观测字段：重试次数、成功次数、耗尽次数、lost-node replay/fail 数、retry prepare/submit 耗时
+
 ## 7. 回归测试最小集合（改动前后必看）
 
 建议至少覆盖：
@@ -105,6 +131,12 @@ V1 公开概念固定为：
    - 同 `node_id` 新 `node_instance_id` 可重新加入
 5. `tests/test_infocenter_registrar.py`
    - `/ops` 展示 service/taskpool 失败原因
+   - fenced `node_instance_id` 要求新实例注册
+6. `tests/test_taskpool_execution.py`
+   - accepted task 在 node lost / `FAILED_INFRA` 后 replay 到健康 node
+   - `max_infra_retries=0` 时直接返回 infra failure
+   - retry exhausted 时返回 `NodeInstanceLost`
+   - 旧 task_id 的迟到结果不污染新 task
 
 ## 8. 新需求进入时的决策流程
 

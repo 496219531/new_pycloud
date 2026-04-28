@@ -2228,6 +2228,8 @@ class JobQueueManager:
                 wait_ms=int(payload.get("wait_ms", 500) or 500),
                 raise_on_error=True,
                 node_window_factor=float(payload.get("node_window_factor", 2.0) or 2.0),
+                max_infra_retries=max(0, int(payload.get("max_infra_retries", payload.get("task_max_infra_retries", 1)) or 0)),
+                retry_backoff_ms=max(0, int(payload.get("retry_backoff_ms", payload.get("task_retry_backoff_ms", 0)) or 0)),
             )
             for task_index, result in stream:
                 result_index = int(task_index)

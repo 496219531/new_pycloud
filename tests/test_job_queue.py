@@ -562,6 +562,8 @@ def test_run_job_with_hooks_uses_generator_handler_and_finalize() -> None:
 
         def imap_unordered(self, payloads, **kwargs):
             assert kwargs["max_in_flight"] >= 1
+            assert kwargs["max_infra_retries"] == 1
+            assert kwargs["retry_backoff_ms"] == 0
             items = list(payloads)
             assert items == [{"value": 2}, {"value": 3}, {"value": 4}]
             for idx, item in enumerate(items):
@@ -2445,6 +2447,7 @@ def test_run_job_with_hooks_uses_larger_default_worker_node_and_inflight(monkeyp
         def imap_unordered(self, payloads, **kwargs):
             assert kwargs["max_in_flight"] == 15
             assert kwargs["receive_batch"] == 10
+            assert kwargs["max_infra_retries"] == 1
             for idx, item in enumerate(list(payloads)):
                 yield idx, {"value": int(item["value"])}
 

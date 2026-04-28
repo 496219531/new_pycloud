@@ -112,7 +112,7 @@ def build_controlplane_server(
             if not control_addr:
                 continue
             try:
-                with NodeControlClient(control_addr, timeout_sec=5.0) as client:
+                with NodeControlClient(control_addr, timeout_sec=0.5) as client:
                     client.pin_object(
                         object_id=str(entry.storage_id or entry.ref_id or ""),
                         ref_id=str(entry.ref_id or ""),

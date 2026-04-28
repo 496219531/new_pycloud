@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Executor backend boundary used by NodeControl."""
 
-from typing import Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol
 
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 
@@ -58,6 +58,8 @@ class ExecutorBackend(Protocol):
 
     def call_service(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]) -> Dict[str, Any]: ...
 
+    def call_service_stream(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]): ...
+
     def warmup_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int: ...
 
     def preload_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int: ...
@@ -88,6 +90,19 @@ class SubprocessExecutorBackend:
         if self._closed:
             raise RuntimeError("executor backend is closed")
         return ExecutorHostClient(task_worker_capacity=self._task_worker_capacity)
+
+    @property
+    def _process(self):  # compatibility for tests/tools that still inspect the active host process
+        clients = list(self._service_clients.values()) + list(self._pool_clients.values())
+        if self._runtime_client is not None:
+            clients.append(self._runtime_client)
+        if self._prepare_client is not None:
+            clients.append(self._prepare_client)
+        for client in clients:
+            process = getattr(client, "_process", None)
+            if process is not None:
+                return process
+        return None
 
     def _ensure_runtime_client(self) -> ExecutorHostClient:
         if self._runtime_client is None or not self._runtime_client.is_alive():
@@ -222,6 +237,13 @@ class SubprocessExecutorBackend:
 
     def call_service(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]) -> Dict[str, Any]:
         return self._service_client(service_id).call_service(service_id=service_id, timeout_sec=timeout_sec, execute_spec=execute_spec)
+
+    def call_service_stream(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]):
+        return self._service_client(service_id).call_service_stream(
+            service_id=service_id,
+            timeout_sec=timeout_sec,
+            execute_spec=execute_spec,
+        )
 
     def warmup_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
         return self._service_client(service_id).warmup_service(service_id=service_id, fanout=fanout, execute_spec=execute_spec)

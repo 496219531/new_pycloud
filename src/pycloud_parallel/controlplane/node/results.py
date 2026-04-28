@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -719,6 +720,25 @@ def _normalize_result_value(
     )
 
 
+def _is_streaming_user_return(ret: Any) -> bool:
+    return isinstance(ret, Iterator)
+
+
+def _normalize_stream_item_value(
+    ret: Any,
+    *,
+    object_dir: str,
+    serialization_mode: str = "",
+    use_transport_result: Optional[bool] = None,
+) -> Any:
+    return _normalize_result_value(
+        ret,
+        object_dir=object_dir,
+        serialization_mode=serialization_mode,
+        use_transport_result=use_transport_result,
+    )
+
+
 def _normalize_user_return(
     ret: Any,
     *,
@@ -941,7 +961,9 @@ __all__ = [
     "_materialize_object_artifact",
     "_materialize_object_bytes",
     "_normalize_result_value",
+    "_normalize_stream_item_value",
     "_normalize_user_return",
+    "_is_streaming_user_return",
     "_object_artifact_from_meta",
     "_read_object_artifact_bytes",
     "_replace_file_with_retry",

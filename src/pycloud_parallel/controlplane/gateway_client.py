@@ -11,10 +11,16 @@ import uuid
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlencode, urlparse
 
-from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
+from pycloud_parallel.controlplane.policy_profile import (
+    get_default_mode_for_binding,
+    get_default_policy_id_for_binding,
+    get_policy_profile,
+)
 from .client_transport import (
     _call_route_http,
     _decode_http_response_body,
+    _iter_route_http_stream,
     _prefers_http_bytes_transport,
     _serialize_http_call_payload,
 )
@@ -32,6 +38,7 @@ client_mod = SimpleNamespace(
     _prepare_remote_call_payload=prepare_remote_call_payload,
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     _call_route_http=_call_route_http,
+    _iter_route_http_stream=_iter_route_http_stream,
     _prefers_http_bytes_transport=_prefers_http_bytes_transport,
     _serialize_http_call_payload=_serialize_http_call_payload,
     _http_json_request=http_json_request,
@@ -39,6 +46,29 @@ client_mod = SimpleNamespace(
     serialize_arrow_compatible=serialize_arrow_compatible,
     _decode_http_response_body=_decode_http_response_body,
 )
+
+
+_JOBQUEUE_BINDING_ID = "jobqueue_controlplane_transport"
+
+
+def _resolve_gateway_service_policy(
+    service_name: str,
+    *,
+    serialization_mode: str = "",
+    effective_policy: Optional[EffectivePolicy] = None,
+) -> Tuple[str, Optional[EffectivePolicy]]:
+    mode = str(serialization_mode or "").strip()
+    if effective_policy is not None or mode:
+        return mode, effective_policy
+    if str(service_name or "").strip() != "job-orchestrator":
+        return mode, effective_policy
+    default_mode = get_default_mode_for_binding(_JOBQUEUE_BINDING_ID)
+    policy = resolve_effective_policy(
+        get_policy_profile(get_default_policy_id_for_binding(_JOBQUEUE_BINDING_ID)),
+        requested_mode=default_mode,
+        context="jobqueue_session",
+    )
+    return str(policy.resolved_mode or default_mode).strip() or default_mode, policy
 
 
 class GatewayServiceClient:
@@ -77,6 +107,11 @@ class GatewayServiceClient:
             raise ValueError("service_name is required")
         if not method_name:
             raise ValueError("method is required")
+        serialization_mode, effective_policy = _resolve_gateway_service_policy(
+            name,
+            serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
+        )
         token = self.service_token if service_token is None else str(service_token or "").strip()
         headers: Dict[str, str] = {}
         if token:
@@ -175,6 +210,105 @@ class GatewayServiceClient:
                 headers=headers,
             )
         return self._attach_controlplane_locator(response)
+
+    def stream_call(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        payload: Optional[Dict[str, object]] = None,
+        timeout_sec: float = 60.0,
+        service_token: Optional[str] = None,
+        serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
+    ):
+        name = str(service_name or "").strip()
+        method_name = str(method or "").strip()
+        if not name:
+            raise ValueError("service_name is required")
+        if not method_name:
+            raise ValueError("method is required")
+        serialization_mode, effective_policy = _resolve_gateway_service_policy(
+            name,
+            serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
+        )
+        token = self.service_token if service_token is None else str(service_token or "").strip()
+        routes: List[Dict[str, object]] = []
+        status_error: Optional[Exception] = None
+        try:
+            status = self.get_status(service_name=name)
+            routes = list(status.get("routes", [])) if isinstance(status, dict) else []
+            if routes:
+                self._last_routes_by_service[name] = [dict(item) for item in routes if isinstance(item, dict)]
+        except Exception as exc:
+            status_error = exc
+            routes = list(self._last_routes_by_service.get(name, []))
+        if status_error is not None and not should_degrade(
+            STATUS_LOOKUP_FAILED,
+            has_cached_candidate=bool(routes),
+            requires_route_aware_staging=False,
+        ):
+            raise RuntimeError(f"gateway status lookup failed for service_name={name!r}: {status_error}") from status_error
+        clients: List[object] = []
+        prepared_payload = payload or {}
+        try:
+            for item in routes:
+                if not isinstance(item, dict):
+                    continue
+                control_addr = str(item.get("control_addr", "") or "").strip()
+                if not control_addr:
+                    continue
+                clients.append(client_mod.NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
+            if clients:
+                prepare_kwargs = {
+                    "object_threshold_bytes": client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+                }
+                if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
+                    prepare_kwargs["serialization_mode"] = serialization_mode
+                if effective_policy is not None:
+                    prepare_kwargs["effective_policy"] = effective_policy
+                prepared_payload = client_mod._prepare_remote_call_payload(
+                    clients,
+                    payload,
+                    **prepare_kwargs,
+                )
+            else:
+                try:
+                    prepared_payload = payload or {}
+                    client_mod._serialize_http_call_payload(
+                        prepared_payload,
+                        context="service call payload",
+                        mode=serialization_mode,
+                        effective_policy=effective_policy,
+                    )
+                except ValueError as exc:
+                    if status_error is not None and not should_degrade(
+                        STATUS_LOOKUP_FAILED,
+                        has_cached_candidate=bool(routes),
+                        requires_route_aware_staging=True,
+                    ):
+                        raise RuntimeError(
+                            "Gateway stream requires route-aware staging but gateway status lookup failed "
+                            "and no cached routes are available"
+                        ) from exc
+                    raise
+        finally:
+            for client in clients:
+                with contextlib.suppress(Exception):
+                    client.close()
+        return client_mod._iter_route_http_stream(
+            SimpleNamespace(
+                http_base_url=f"{self.base_url}/svc/{quote(name, safe='')}",
+                control_addr="",
+            ),
+            method=method_name,
+            payload=prepared_payload,
+            timeout_sec=max(0.1, float(timeout_sec)),
+            service_token=token,
+            serialization_mode=serialization_mode,
+            **({"effective_policy": effective_policy} if effective_policy is not None else {}),
+        )
 
     def upload_call(
         self,

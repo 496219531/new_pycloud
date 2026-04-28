@@ -9,7 +9,7 @@ import json
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import BinaryIO, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterable, Optional, Sequence, Tuple
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
@@ -28,10 +28,12 @@ from .client_transport import (
     _encode_http_transport_body,
     _encode_http_transport_response_body,
     _is_http_transport_content_type,
+    _iter_route_http_stream,
     _serialize_http_call_payload,
 )
 from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
+from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_upload import (
     collect_used_upload_slots,
@@ -45,7 +47,12 @@ from pycloud_parallel.controlplane.gateway_upload import (
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
+from pycloud_parallel.controlplane.serialization import (
+    INLINE_TRANSPORT_CARRIER_SENTINEL,
+    _adapt_blob_for_json_transport,
+    is_inline_transport_carrier,
+    serialize_arrow_compatible,
+)
 
 
 def _is_client_disconnect_error(exc: BaseException) -> bool:
@@ -64,6 +71,24 @@ def _split_host_port(bind: str) -> Tuple[str, int]:
         raise ValueError("bind must be host:port")
     host, port = bind.rsplit(":", 1)
     return host.strip(), int(port)
+
+
+def _stream_json_safe(value: Any) -> Any:
+    if is_inline_transport_carrier(value):
+        meta = dict(value.get(INLINE_TRANSPORT_CARRIER_SENTINEL) or {})
+        meta["content_bytes"] = _adapt_blob_for_json_transport(meta.get("content_bytes", b""))
+        return {INLINE_TRANSPORT_CARRIER_SENTINEL: meta}
+    if isinstance(value, dict):
+        return {key: _stream_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_stream_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_stream_json_safe(item) for item in value]
+    return value
+
+
+def _encode_stream_line(event: Dict[str, object]) -> bytes:
+    return json.dumps(serialize_arrow_compatible(_stream_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
 
 
 @dataclass
@@ -262,6 +287,16 @@ class GatewayHttpApp:
             except Exception:
                 timeout_sec = self.timeout_sec
         service_token = self._extract_token(headers)
+        stream_response = str((qs.get("stream", ["false"]) or ["false"])[0]).lower() in ("1", "true", "yes")
+        if stream_response:
+            return self._handle_stream_call(
+                service_name=service_name,
+                method=method,
+                payload=payload,
+                timeout_sec=timeout_sec,
+                service_token=service_token,
+                serialization_mode=serialization_mode,
+            )
 
         tried = set()
         attempt_count = 0
@@ -339,6 +374,126 @@ class GatewayHttpApp:
                 self.route_cache.release_route(route)
                 _record_observation()
                 return 502, {"ok": False, "error": f"gateway call failed: {exc}"}
+
+    def _handle_stream_call(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        payload: Dict[str, object],
+        timeout_sec: float,
+        service_token: str,
+        serialization_mode: str = "",
+    ) -> Tuple[Any, ...]:
+        tried = set()
+        attempt_count = 0
+        failed_count = 0
+        last_failed_route_id = ""
+        last_error: Exception | None = None
+
+        def _record_observation(*, selected_route_id: str = "") -> None:
+            recorder = getattr(self.route_cache, "record_call_observation", None)
+            if callable(recorder):
+                recorder(
+                    service_name,
+                    route_attempt_count=attempt_count,
+                    failed_route_count=failed_count,
+                    last_failed_route_id=last_failed_route_id,
+                    selected_route_id=selected_route_id,
+                )
+
+        while True:
+            try:
+                route = self.route_cache.select_route(service_name, exclude_service_ids=tried)
+            except Exception as exc:
+                _record_observation()
+                message = str(last_error or exc)
+                return 502, {"ok": False, "error": f"gateway stream failed: {message}"}
+            route_id = str(route.service_id or "")
+            if route_id in tried:
+                self.route_cache.release_route(route)
+                _record_observation()
+                message = str(last_error or f"no untried route for service_name={service_name}")
+                return 502, {"ok": False, "error": f"gateway stream failed: {message}"}
+            tried.add(route_id)
+            attempt_count += 1
+            try:
+                upstream = self._invoke_route_stream(
+                    route,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=timeout_sec,
+                    service_token=service_token,
+                    serialization_mode=serialization_mode,
+                )
+            except GatewayCallError as exc:
+                last_error = exc
+                if not self._is_route_failure(exc):
+                    self.route_cache.release_route(route)
+                    _record_observation()
+                    return exc.status_code, exc.data
+                failed_count += 1
+                last_failed_route_id = route_id
+                self.route_cache.mark_failure(route, str(exc))
+                with contextlib.suppress(Exception):
+                    self.route_cache.refresh(service_name, force=True)
+                continue
+            except Exception as exc:
+                last_error = exc
+                self.route_cache.release_route(route)
+                _record_observation()
+                return 502, {"ok": False, "error": f"gateway stream failed: {exc}"}
+
+            def _iter_stream():
+                saw_done = False
+                try:
+                    for event in upstream:
+                        if not isinstance(event, dict):
+                            continue
+                        event_name = str(event.get("event", "") or "")
+                        if event_name == "item":
+                            event = self._attach_stream_event_locator(event, route=route)
+                            yield _encode_stream_line(event)
+                            continue
+                        if event_name == "done":
+                            saw_done = True
+                            if bool(event.get("ok", False)):
+                                self.route_cache.mark_success(route)
+                                _record_observation(selected_route_id=route_id)
+                            else:
+                                status_code = 400 if "user" in str(event.get("error_type", "") or "").lower() else 502
+                                failure = GatewayCallError(status_code=status_code, data=dict(event))
+                                if self._is_route_failure(failure):
+                                    self.route_cache.mark_failure(route, str(failure))
+                                else:
+                                    self.route_cache.release_route(route)
+                                _record_observation()
+                            yield _encode_stream_line(event)
+                            return
+                    if not saw_done:
+                        self.route_cache.mark_failure(route, "service stream ended without final response")
+                        _record_observation()
+                        yield _encode_stream_line(
+                            {
+                                "event": "done",
+                                "ok": False,
+                                "error_type": "StreamClosed",
+                                "error": "service stream ended without final response",
+                            }
+                        )
+                except Exception as exc:
+                    self.route_cache.mark_failure(route, str(exc))
+                    _record_observation()
+                    yield _encode_stream_line(
+                        {
+                            "event": "done",
+                            "ok": False,
+                            "error_type": exc.__class__.__name__,
+                            "error": f"gateway stream failed: {exc}",
+                        }
+                    )
+
+            return (StreamingHttpResponse(status_code=200, body_iter=_iter_stream()),)
 
     def handle_get(self, *, path: str, headers) -> Optional[Tuple[int, Dict[str, object]]]:
         if self._stopped:
@@ -524,6 +679,52 @@ class GatewayHttpApp:
             _attach_result_ref_control_addr(data, control_addr=route.control_addr),
             route=route,
         )
+
+    def _invoke_route_stream(
+        self,
+        route: InfoCenterServiceRoute,
+        *,
+        method: str,
+        payload: Dict[str, object],
+        timeout_sec: float,
+        service_token: str,
+        serialization_mode: str = "",
+    ):
+        base_url = self._validate_route_url(route.http_base_url)
+        if not base_url:
+            raise GatewayCallError(status_code=502, data={"ok": False, "error": "invalid route http_base_url"})
+        try:
+            return _iter_route_http_stream(
+                route,
+                method=method,
+                payload=payload,
+                timeout_sec=timeout_sec,
+                service_token=service_token,
+                serialization_mode=serialization_mode,
+            )
+        except Exception as exc:
+            data = getattr(exc, "data", None)
+            if not isinstance(data, dict):
+                data = {"ok": False, "error": str(exc)}
+            raise GatewayCallError(
+                status_code=int(getattr(exc, "status_code", 502) or 502),
+                data=data,
+            ) from exc
+
+    def _attach_stream_event_locator(
+        self,
+        event: Dict[str, object],
+        *,
+        route: InfoCenterServiceRoute,
+    ) -> Dict[str, object]:
+        if str(event.get("event", "") or "") != "item":
+            return event
+        response = self._attach_controlplane_locator({"data": event.get("data")}, route=route)
+        if response.get("data") is event.get("data"):
+            return event
+        updated = dict(event)
+        updated["data"] = response.get("data")
+        return updated
 
     def _invoke_uploaded_route(
         self,
@@ -718,7 +919,9 @@ class GatewayHttpServer:
                     content_length=length,
                 )
                 if handled is not None:
-                    if len(handled) == 4:
+                    if len(handled) == 1 and isinstance(handled[0], StreamingHttpResponse):
+                        self._send_stream(handled[0])
+                    elif len(handled) == 4:
                         code, resp, content_type, extra_headers = handled
                         self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
                     else:
@@ -736,6 +939,8 @@ class GatewayHttpServer:
                 if len(handled) == 4:
                     code, resp, content_type, extra_headers = handled
                     self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
+                elif len(handled) == 1 and isinstance(handled[0], StreamingHttpResponse):
+                    self._send_stream(handled[0])
                 else:
                     code, resp = handled
                     self._send_json(code, resp)
@@ -750,6 +955,25 @@ class GatewayHttpServer:
 
             def log_message(self, fmt, *args):  # noqa: A003
                 return
+
+            def _send_stream(self, response: StreamingHttpResponse) -> None:
+                try:
+                    self.send_response(int(response.status_code or 200))
+                    self.send_header("Content-Type", str(response.content_type or "application/x-ndjson; charset=utf-8"))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    for key, value in dict(response.extra_headers or {}).items():
+                        self.send_header(str(key), str(value))
+                    self.end_headers()
+                    for chunk in response.body_iter:
+                        if not chunk:
+                            continue
+                        raw = chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8")
+                        self.wfile.write(raw)
+                        self.wfile.flush()
+                except Exception as exc:
+                    if not _is_client_disconnect_error(exc):
+                        raise
 
             def _send_json(self, status_code: int, data: Dict[str, object]) -> None:
                 raw = _encode_http_json_body(data)

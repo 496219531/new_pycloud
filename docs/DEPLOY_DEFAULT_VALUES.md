@@ -82,8 +82,9 @@ group = Service.deploy(
 2. 过滤 `healthy=false`。
 3. 过滤 `schedulable=false`。
 4. 过滤 `drain=true`。
-5. 按 `service_worker_available` 排序。
-6. 选出 `node_ids` / `node_count` / `min_success_nodes` 决定的节点数。
+5. 过滤 `accept_service_deploy=false`。
+6. 按 `service_worker_available` 排序。
+7. 选出 `node_ids` / `node_count` / `min_success_nodes` 决定的节点数。
 
 动态补偿：
 
@@ -92,6 +93,13 @@ group = Service.deploy(
 3. 失败副本按 `node_instance_id` 记录并跳过，不按可重复的 `node_id` 永久拉黑。
 4. 如果同一个 `node_id` 重启后获得新的 `node_instance_id`，它会重新进入补偿候选。
 5. 创建失败或 host 失败的原因会在 InfoCenter `/ops` 的 `failure_reason` 中显示。
+
+调度状态边界：
+
+1. `unhealthy` 表示实例执行状态不可信，应按 `node_instance_id` fence 并重置执行状态。
+2. `drain` 不接新业务调用和新 task，但仍应接收 owner 控制命令。
+3. `cordon` 不接新部署；已有服务是否继续路由由 `drain` 决定。
+4. 排他性部署和版本冲突检查不能因为 drain/cordon 就隐藏已有服务。
 
 ### 4.1 显式指定节点
 

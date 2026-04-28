@@ -55,6 +55,7 @@ from pycloud_parallel.controlplane.policy_profile import (
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
+from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier, is_inline_transport_carrier
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.execution.failover import (
@@ -1078,6 +1079,8 @@ class _ConnectedService:
         now = datetime.now(timezone.utc)
         lease_expire_at = now + timedelta(seconds=max(1.0, float(self.timeout_sec)))
         for node in nodes:
+            if bool(getattr(node, "drain", False)):
+                continue
             services = tuple(getattr(node, "services", ()) or ())
             for svc in services:
                 if str(getattr(svc, "service_name", "") or "").strip() != self.service_name:
@@ -1154,13 +1157,14 @@ class _ConnectedService:
 
     def _get_async_call_executor(self) -> ThreadPoolExecutor:
         capacity = max(1, int(self._default_max_in_flight()))
+        current_executor = getattr(self, "_async_call_executor", None)
         if (
-            self._async_call_executor is None
-            or self._async_call_executor_capacity != capacity
+            current_executor is None
+            or getattr(self, "_async_call_executor_capacity", 0) != capacity
         ):
-            if self._async_call_executor is not None:
+            if current_executor is not None:
                 with contextlib.suppress(Exception):
-                    self._async_call_executor.shutdown(wait=False, cancel_futures=True)
+                    current_executor.shutdown(wait=False, cancel_futures=True)
             self._async_call_executor = ThreadPoolExecutor(
                 max_workers=capacity,
                 thread_name_prefix="service-call",
@@ -1389,6 +1393,109 @@ class _ConnectedService:
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
         node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
+
+    def stream_call(
+        self,
+        method: str,
+        payload: Dict[str, object],
+        *,
+        timeout_sec: float = 60.0,
+        strategy: str = "predicted_busy",
+        refresh_status: bool = True,
+        serialization_mode: str = "",
+    ):
+        del refresh_status
+        self._ensure_effective_policy_loaded(force_refresh=True)
+        effective_serialization_mode = resolve_effective_serialization_mode(
+            request_mode=serialization_mode,
+            context="gateway_public" if self.transport == "gateway" else "service_call",
+            frozen_mode=self.serialization_mode,
+        )
+        if self.transport == "gateway":
+            def _gateway_iter():
+                for event in self._transport_client.stream_call(
+                    service_name=self.service_name,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=max(0.1, float(timeout_sec)),
+                    serialization_mode=effective_serialization_mode,
+                    effective_policy=self.effective_policy,
+                ):
+                    event_name = str(event.get("event", "") or "")
+                    if event_name == "item":
+                        item_data = event.get("data")
+                        if is_inline_transport_carrier(item_data):
+                            item_data = decode_inline_transport_carrier(
+                                item_data,
+                                context="service_result",
+                            )
+                        yield _resolve_high_level_service_data(
+                            self,
+                            node_id="gateway",
+                            response={"data": item_data},
+                        )
+                        continue
+                    if event_name == "done":
+                        if bool(event.get("ok", False)):
+                            return
+                        raise RuntimeError(str(event.get("error", "service stream failed")))
+
+            return _gateway_iter()
+
+        if self.transport != "discovery":
+            raise NotImplementedError(f"stream_call does not support transport={self.transport!r}")
+        route = (
+            self._route_cache.select_route(self.service_name, strategy=resolve_service_strategy(strategy)[0])
+            if self._route_cache is not None
+            else sorted(
+                self._discoverable_routes(force_refresh=True),
+                key=lambda item: _route_sort_key(item, strategy=resolve_service_strategy(strategy)[0]),
+            )[0]
+        )
+        prepared_payload = self._prepare_discovery_route_payload(route, payload)
+        token = getattr(self._transport_client, "service_token", "")
+
+        def _iter():
+            route_cache = self._route_cache
+            try:
+                for event in self._client_mod._iter_route_http_stream(
+                    route,
+                    method=method,
+                    payload=prepared_payload,
+                    timeout_sec=max(0.1, float(timeout_sec)),
+                    service_token=token,
+                    serialization_mode=effective_serialization_mode,
+                    effective_policy=self.effective_policy,
+                ):
+                    event_name = str(event.get("event", "") or "")
+                    if event_name == "item":
+                        item_data = event.get("data")
+                        if is_inline_transport_carrier(item_data):
+                            item_data = decode_inline_transport_carrier(
+                                item_data,
+                                context="service_result",
+                            )
+                        pseudo_response = {"data": item_data}
+                        yield _resolve_high_level_service_data(
+                            self,
+                            node_id=self._client_mod._node_instance_key_from_route(route),
+                            response=pseudo_response,
+                        )
+                        continue
+                    if event_name == "done":
+                        if bool(event.get("ok", False)):
+                            if route_cache is not None:
+                                with contextlib.suppress(Exception):
+                                    route_cache.mark_success(route)
+                            return
+                        raise RuntimeError(str(event.get("error", "service stream failed")))
+            except Exception:
+                if route_cache is not None:
+                    with contextlib.suppress(Exception):
+                        route_cache.mark_failure(route, "service stream failed")
+                raise
+
+        return _iter()
 
     def map_calls(
         self,
@@ -1738,6 +1845,9 @@ class Service(ServiceExecutionSession):
                 node
                 for node in candidate_nodes
                 if _node_instance_key_from_node(node) not in excluded
+                and bool(getattr(node, "healthy", True))
+                and bool(getattr(node, "schedulable", True))
+                and not bool(getattr(node, "drain", False))
                 and bool(getattr(node, "accept_service_deploy", True))
                 and str(getattr(node, "control_addr", "") or "").strip()
             ]
@@ -1912,13 +2022,19 @@ class Service(ServiceExecutionSession):
                 service_http_bind=service_http_bind,
             )
             with _infocenter_client(effective_infocenter_target, timeout_sec=rpc_timeout_sec) as infocenter:
-                routes = _startup_active_routes(
-                    infocenter.list_service_routes(
+                list_routes = getattr(infocenter, "list_service_routes_for_exclusive_check", None)
+                if callable(list_routes):
+                    raw_routes = list_routes(
+                        service_name=effective_service_name,
+                        limit=100,
+                    )
+                else:
+                    raw_routes = infocenter.list_service_routes(
                         service_name=effective_service_name,
                         healthy_only=True,
                         limit=100,
                     )
-                )
+                routes = _startup_active_routes(raw_routes)
             if not routes:
                 return
             if expected_endpoint[1] <= 0:
@@ -2288,11 +2404,18 @@ class Service(ServiceExecutionSession):
             with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
                 existing_routes: Sequence[InfoCenterServiceRoute] = ()
                 if ensure_unique_service_name:
-                    existing_routes = infocenter.list_service_routes(
-                        service_name=effective_service_name,
-                        healthy_only=True,
-                        limit=max(100, discovery_limit * 10),
-                    )
+                    list_routes = getattr(infocenter, "list_service_routes_for_exclusive_check", None)
+                    if callable(list_routes):
+                        existing_routes = list_routes(
+                            service_name=effective_service_name,
+                            limit=max(100, discovery_limit * 10),
+                        )
+                    else:
+                        existing_routes = infocenter.list_service_routes(
+                            service_name=effective_service_name,
+                            healthy_only=True,
+                            limit=max(100, discovery_limit * 10),
+                        )
                 discovered_nodes = infocenter.list_nodes(
                     healthy_only=healthy_only,
                     tags=tags,

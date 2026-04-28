@@ -14,10 +14,10 @@ import sys
 import threading
 import uuid
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlparse
 
-from pycloud_parallel.controlplane.http_gateway import ExtraGetHandler, MethodsHandler, ServiceHttpGateway
+from pycloud_parallel.controlplane.http_gateway import ExtraGetHandler, MethodsHandler, ServiceHttpGateway, StreamingHttpResponse
 from pycloud_parallel.controlplane.netutil import format_host_port, split_host_port
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
@@ -59,7 +59,7 @@ def _invoke_python_callable(
 class StaticServiceMount:
     service_id: str
     service_name: str
-    invoke_handler: Callable[[str, dict, str, float, str, bool], Tuple[int, Dict[str, object]]]
+    invoke_handler: Callable[[str, dict, str, float, str, bool, bool], Union[Tuple[int, Dict[str, object]], StreamingHttpResponse]]
     methods_handler: Callable[[bool], Tuple[int, Dict[str, object]]]
     status_handler: Optional[Callable[[], Tuple[int, Dict[str, object]]]] = None
     extra_get_handler: Optional[Callable[[List[str], Dict[str, List[str]]], Optional[Tuple[object, ...]]]] = None
@@ -103,7 +103,7 @@ class NodeRuntimeBase:
         self,
         *,
         service_name: str,
-        invoke_handler: Callable[[str, dict, str, float, str, bool], Tuple[int, Dict[str, object]]],
+        invoke_handler: Callable[[str, dict, str, float, str, bool, bool], Union[Tuple[int, Dict[str, object]], StreamingHttpResponse]],
         methods_handler: Callable[[bool], Tuple[int, Dict[str, object]]],
         status_handler: Optional[Callable[[], Tuple[int, Dict[str, object]]]] = None,
         extra_get_handler: Optional[Callable[[List[str], Dict[str, List[str]]], Optional[Tuple[object, ...]]]] = None,
@@ -283,7 +283,15 @@ class NodeRuntimeBase:
                 }
             )
 
-        def _invoke(method: str, payload: dict, token: str, timeout_sec: float, serialization_mode: str, use_transport_result: bool):
+        def _invoke(
+            method: str,
+            payload: dict,
+            token: str,
+            timeout_sec: float,
+            serialization_mode: str,
+            use_transport_result: bool,
+            stream_response: bool,
+        ):
             method_name = str(method or "").strip()
             fn = methods.get(method_name)
             if fn is None:
@@ -296,6 +304,7 @@ class NodeRuntimeBase:
                 "_timeout_sec": timeout_sec,
                 "_serialization_mode": serialization_mode,
                 "_use_transport_result": use_transport_result,
+                "_stream_response": stream_response,
             }
             for name, value in context_values.items():
                 if name in param_names and name not in effective_payload:
@@ -379,7 +388,7 @@ class NodeRuntimeBase:
     def start_service_gateway(
         self,
         *,
-        invoke_handler: Callable[[str, str, dict, str, float, str, bool], Tuple[int, Dict[str, object]]],
+        invoke_handler: Callable[[str, str, dict, str, float, str, bool, bool], Union[Tuple[int, Dict[str, object]], StreamingHttpResponse]],
         status_handler: Callable[[str], Tuple[int, Dict[str, object]]],
         methods_handler: Optional[MethodsHandler] = None,
         extra_get_handler: Optional[ExtraGetHandler] = None,
@@ -596,11 +605,20 @@ class NodeRuntimeBase:
         timeout_sec: float,
         serialization_mode: str = "",
         use_transport_result: bool = False,
-    ) -> Tuple[int, Dict[str, object]]:
+        stream_response: bool = False,
+    ) -> Union[Tuple[int, Dict[str, object]], StreamingHttpResponse]:
         mount = self._mounted_service(service_id)
         if mount is None:
             return 404, {"ok": False, "error": "service not found"}
-        return mount.invoke_handler(method, payload, service_token, timeout_sec, serialization_mode, use_transport_result)
+        return mount.invoke_handler(
+            method,
+            payload,
+            service_token,
+            timeout_sec,
+            serialization_mode,
+            use_transport_result,
+            stream_response,
+        )
 
     def _status_mounted_startup_service(self, service_id: str) -> Tuple[int, Dict[str, object]]:
         mount = self._mounted_service(service_id)

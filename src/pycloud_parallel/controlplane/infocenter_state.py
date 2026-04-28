@@ -10,12 +10,14 @@ from urllib.parse import urlparse
 from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
 from pycloud_parallel.controlplane.infocenter.models import (
     DataRegistryEntry,
+    FencedNodeInstance,
     NodeMetricsState,
     NodeCapability,
     NodeServiceState,
     NodeState,
     NodeTaskPoolInfo,
 )
+from pycloud_parallel.controlplane.scheduling_policy import call_routes, conflict_scope, owner_targets
 from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -74,6 +76,7 @@ class InfoCenterState:
         self._lock = threading.Lock()
         self._nodes: Dict[str, NodeState] = {}
         self._data_refs: Dict[str, DataRegistryEntry] = {}
+        self._fenced_instances: Dict[str, FencedNodeInstance] = {}
 
     def _node_is_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
         current_time = now or utc_now()
@@ -81,6 +84,38 @@ class InfoCenterState:
 
     def _node_is_healthy_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
         return bool(state.healthy) and not self._node_is_stale_locked(state, now=now)
+
+    def _fence_instance_locked(
+        self,
+        state: NodeState,
+        *,
+        now: Optional[datetime] = None,
+        reason: str = "",
+    ) -> None:
+        node_instance_id = str(getattr(state, "node_instance_id", "") or "").strip()
+        if not node_instance_id:
+            return
+        fenced_at = now or utc_now()
+        self._fenced_instances[node_instance_id] = FencedNodeInstance(
+            node_instance_id=node_instance_id,
+            fenced_at=fenced_at,
+            reason=str(reason or "node_instance_id fenced"),
+        )
+
+    def _fence_if_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> None:
+        current_time = now or utc_now()
+        if self._node_is_stale_locked(state, now=current_time):
+            self._fence_instance_locked(state, now=current_time, reason="node heartbeat timeout")
+            state.healthy = False
+            state.schedulable = False
+            state.reason = str(state.reason or "node heartbeat timeout")
+
+    def is_instance_fenced(self, node_instance_id: str) -> bool:
+        normalized_instance = str(node_instance_id or "").strip()
+        if not normalized_instance:
+            return False
+        with self._lock:
+            return normalized_instance in self._fenced_instances
 
     def _data_ref_is_expired_locked(self, entry: DataRegistryEntry, *, now: Optional[datetime] = None) -> bool:
         current_time = now or utc_now()
@@ -114,7 +149,9 @@ class InfoCenterState:
             and str(state.control_addr or "").strip() == normalized_control_addr
         ]
         for key in replaced_keys:
-            self._nodes.pop(key, None)
+            old_state = self._nodes.pop(key, None)
+            if old_state is not None:
+                self._fence_instance_locked(old_state, reason="node control_addr replaced")
 
     def _validate_startup_service_names_locked(
         self,
@@ -166,7 +203,9 @@ class InfoCenterState:
                 replaced_keys.append(key)
                 break
         for key in replaced_keys:
-            self._nodes.pop(key, None)
+            old_state = self._nodes.pop(key, None)
+            if old_state is not None:
+                self._fence_instance_locked(old_state, reason="startup service endpoint replaced")
 
     def _effective_service_state_locked(
         self,
@@ -239,6 +278,8 @@ class InfoCenterState:
             )
             incoming_metadata = dict(metadata or {})
             incoming_services = dict(services or {})
+            if normalized_instance_id in self._fenced_instances:
+                raise ValueError("node_instance_id fenced")
             self._validate_startup_service_names_locked(
                 node_instance_id=normalized_instance_id,
                 control_addr=control_addr,
@@ -324,6 +365,17 @@ class InfoCenterState:
             ttl_sec=max(1, int(ttl_sec or 3600)),
         )
         with self._lock:
+            instance_ids = [
+                str(entry.node_instance_id or "").strip(),
+                *[
+                    str(item.get("node_instance_id", "") or "").strip()
+                    for item in entry.replicas
+                    if str(item.get("node_instance_id", "") or "").strip()
+                ],
+            ]
+            fenced_ids = [instance_id for instance_id in instance_ids if instance_id in self._fenced_instances]
+            if fenced_ids:
+                raise ValueError(f"node_instance_id fenced: {', '.join(sorted(set(fenced_ids)))}")
             self._prune_expired_data_refs_locked(now=now)
             existing = self._data_refs.get(entry.ref_id)
             if existing is not None:
@@ -471,6 +523,8 @@ class InfoCenterState:
             state = self._nodes.get(normalized_instance_id)
             if state is None:
                 return None
+            if normalized_instance_id in self._fenced_instances:
+                return None
             state.node_instance_id = normalized_instance_id
             state.node_id = str(node_id or state.node_id or "").strip() or normalized_instance_id
             state.healthy = bool(healthy)
@@ -545,6 +599,11 @@ class InfoCenterState:
                 service_id=item.service_id,
                 status=int(item.status),
                 policy_id=str(getattr(item, "policy_id", "") or "default_safe"),
+                owner_client_id=str(getattr(item, "owner_client_id", "") or ""),
+                code_version=str(getattr(item, "code_version", "") or ""),
+                entry_module=str(getattr(item, "entry_module", "") or ""),
+                entry_callable=str(getattr(item, "entry_callable", "") or ""),
+                serialization_mode=str(getattr(item, "serialization_mode", "") or ""),
                 worker_count=max(0, int(item.worker_count)),
                 alive_workers=max(0, int(item.alive_workers)),
                 in_flight=max(0, int(item.in_flight)),
@@ -560,6 +619,7 @@ class InfoCenterState:
             state = self._nodes.get(node_instance_id)
             if state is None:
                 raise KeyError("node not found")
+            self._fence_instance_locked(state, now=now, reason=str(reason or "node lost"))
             state.healthy = False
             state.schedulable = False
             state.last_seen_at = now - timedelta(seconds=float(self.lease_ttl_sec) + 1.0)
@@ -571,6 +631,11 @@ class InfoCenterState:
                     service_id=svc.service_id,
                     status=int(pb2.SERVICE_STATUS_UNSPECIFIED),
                     policy_id=str(svc.policy_id or "").strip().lower() or "default_safe",
+                    owner_client_id=str(getattr(svc, "owner_client_id", "") or ""),
+                    code_version=str(getattr(svc, "code_version", "") or ""),
+                    entry_module=str(getattr(svc, "entry_module", "") or ""),
+                    entry_callable=str(getattr(svc, "entry_callable", "") or ""),
+                    serialization_mode=str(getattr(svc, "serialization_mode", "") or ""),
                     worker_count=max(0, int(svc.worker_count)),
                     alive_workers=0,
                     in_flight=0,
@@ -606,12 +671,21 @@ class InfoCenterState:
                 capability=NodeCapability.from_dict(state.capability.to_dict()),
             )
 
-    def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int) -> List[Dict[str, object]]:
+    def list_service_routes(
+        self,
+        *,
+        service_name: str,
+        healthy_only: bool,
+        limit: int,
+        route_scope: str = "call",
+    ) -> List[Dict[str, object]]:
         now = utc_now()
         name_filter = service_name.strip()
+        normalized_scope = str(route_scope or "call").strip().lower()
         with self._lock:
             out: List[Dict[str, object]] = []
             for state in self._nodes.values():
+                self._fence_if_stale_locked(state, now=now)
                 is_healthy = self._node_is_healthy_locked(state, now=now)
                 if healthy_only and not is_healthy:
                     continue
@@ -621,8 +695,18 @@ class InfoCenterState:
                     effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
                         self._effective_service_state_locked(state, svc, now=now)
                     )
-                    if healthy_only and int(effective_status) != int(pb2.SERVICE_STATUS_RUNNING):
-                        continue
+                    if healthy_only:
+                        if normalized_scope == "call":
+                            if not call_routes(service_status=effective_status, node_drain=bool(state.drain)):
+                                continue
+                        elif normalized_scope == "owner_command":
+                            if not owner_targets(service_status=effective_status):
+                                continue
+                        elif normalized_scope == "exclusive_check":
+                            if not conflict_scope(service_status=effective_status):
+                                continue
+                        elif not call_routes(service_status=effective_status, node_drain=False):
+                            continue
                     reported_inflight = max(0, int(svc.in_flight or 0))
                     received_count = max(0, int(svc.received_count or 0))
                     returned_count = max(0, int(svc.returned_count or 0))
@@ -644,12 +728,21 @@ class InfoCenterState:
                             "service_name": svc.service_name,
                             "service_id": svc.service_id,
                             "status": effective_status,
+                            "service_status": effective_status,
                             "status_text": status_text,
                             "policy_id": str(svc.policy_id or "").strip().lower() or "default_safe",
+                            "owner_client_id": str(getattr(svc, "owner_client_id", "") or ""),
+                            "code_version": str(getattr(svc, "code_version", "") or ""),
+                            "entry_module": str(getattr(svc, "entry_module", "") or ""),
+                            "entry_callable": str(getattr(svc, "entry_callable", "") or ""),
+                            "serialization_mode": str(getattr(svc, "serialization_mode", "") or ""),
                             "node_instance_id": state.node_instance_id,
                             "node_id": state.node_id,
                             "control_addr": state.control_addr,
                             "node_healthy": is_healthy,
+                            "node_schedulable": bool(state.schedulable),
+                            "node_drain": bool(state.drain),
+                            "accept_service_deploy": bool(getattr(state, "accept_service_deploy", True)),
                             "stale": stale,
                             "worker_count": svc.worker_count,
                             "alive_workers": effective_alive,
@@ -685,6 +778,7 @@ class InfoCenterState:
         with self._lock:
             out: List[NodeState] = []
             for state in self._nodes.values():
+                self._fence_if_stale_locked(state, now=now)
                 is_healthy = self._node_is_healthy_locked(state, now=now)
                 if healthy_only and not is_healthy:
                     continue

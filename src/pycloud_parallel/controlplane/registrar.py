@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, Iterable, Optional
@@ -68,7 +69,7 @@ class NodeInfoCenterRegistrar:
     ) -> None:
         self.infocenter_addr = infocenter_addr
         self.node_id = node_id
-        self.node_instance_id = f"{str(node_id or 'node').strip() or 'node'}-{uuid.uuid4().hex[:12]}"
+        self.node_instance_id = str(getattr(state, "node_instance_id", "") or "").strip() or f"{str(node_id or 'node').strip() or 'node'}-{uuid.uuid4().hex[:12]}"
         self.control_addr = control_addr
         self.state = state
         self.capacity = max(1, int(capacity))
@@ -85,6 +86,8 @@ class NodeInfoCenterRegistrar:
         self._thread: Optional[threading.Thread] = None
         self._registered = False
         self._next_hb_sec = self.fallback_heartbeat_sec
+        self._lease_ttl_sec = max(self.fallback_heartbeat_sec * 3, self.fallback_heartbeat_sec + 1)
+        self._last_successful_sync_at = 0.0
         self._sync_lock = threading.Lock()
 
     @staticmethod
@@ -143,6 +146,7 @@ class NodeInfoCenterRegistrar:
                 )
             with self._sync_lock:
                 self._registered = False
+            self._self_fence_if_lease_expired("infocenter heartbeat lease expired")
             if was_registered or not _is_expected_connect_failure(exc):
                 self._close_state_if_registration_lost(_error_summary(exc))
             return False
@@ -170,6 +174,31 @@ class NodeInfoCenterRegistrar:
                 self.node_id,
                 self.node_instance_id,
             )
+
+    def _reset_state_after_fence(self, reason: str) -> None:
+        reset = getattr(self.state, "reset_execution_state", None)
+        try:
+            if callable(reset):
+                reset(reason=reason or "node_instance_id fenced")
+        finally:
+            self._stop_event.set()
+            self._wake_event.set()
+
+    def _self_fence_if_lease_expired(self, reason: str) -> bool:
+        with self._sync_lock:
+            last_success = float(self._last_successful_sync_at or 0.0)
+            lease_ttl = max(1.0, float(self._lease_ttl_sec or self.fallback_heartbeat_sec))
+            if not last_success or (time.monotonic() - last_success) <= lease_ttl:
+                return False
+            self._registered = False
+        logger.warning(
+            "[Registrar] node self fence node_id=%s node_instance_id=%s reason=%s",
+            self.node_id,
+            self.node_instance_id,
+            str(reason or "infocenter heartbeat lease expired"),
+        )
+        self._reset_state_after_fence(reason or "infocenter heartbeat lease expired")
+        return True
 
     def _register_once(self) -> bool:
         metadata = dict(self.metadata)
@@ -214,9 +243,22 @@ class NodeInfoCenterRegistrar:
             python_version=self.state.python_version,
             capability=self.state.node_capability(),
         )
+        if not bool(resp.get("accepted", resp.get("ok", False))):
+            if bool(resp.get("reset_required", False)):
+                reason = str(resp.get("reason", resp.get("error", "")) or "node_instance_id fenced")
+                logger.warning(
+                    "[Registrar] node register reset required node_id=%s node_instance_id=%s reason=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    reason,
+                )
+                self._reset_state_after_fence(reason)
+            return False
         with self._sync_lock:
             self._registered = True
             self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
+            self._lease_ttl_sec = max(1, int(resp.get("lease_ttl_sec", self._lease_ttl_sec) or self._lease_ttl_sec))
+            self._last_successful_sync_at = time.monotonic()
         logger.info(
             "[Registrar] node register node_id=%s node_instance_id=%s control_addr=%s hb=%s service_count=%d task_pool_count=%d",
             self.node_id,
@@ -280,12 +322,18 @@ class NodeInfoCenterRegistrar:
             if not resp.get("accepted", False):
                 self._registered = False
                 logger.warning(
-                    "[Registrar] node heartbeat rejected node_id=%s node_instance_id=%s",
+                    "[Registrar] node heartbeat rejected node_id=%s node_instance_id=%s reset_required=%s reason=%s",
                     self.node_id,
                     self.node_instance_id,
+                    bool(resp.get("reset_required", False)),
+                    str(resp.get("reason", resp.get("error", "")) or ""),
                 )
+                if bool(resp.get("reset_required", False)):
+                    self._reset_state_after_fence(str(resp.get("reason", resp.get("error", "")) or "node_instance_id fenced"))
                 return False
             self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
+            self._lease_ttl_sec = max(1, int(resp.get("lease_ttl_sec", self._lease_ttl_sec) or self._lease_ttl_sec))
+            self._last_successful_sync_at = time.monotonic()
         return True
 
     def _loop(self) -> None:
@@ -471,6 +519,8 @@ class JobOrchestratorInfoCenterRegistrar:
             python_version="py3",
             capability=detect_local_node_capability(),
         )
+        if not bool(resp.get("accepted", resp.get("ok", False))):
+            return False
         with self._sync_lock:
             self._registered = True
             self._next_hb_sec = max(
@@ -501,16 +551,11 @@ class JobOrchestratorInfoCenterRegistrar:
             python_version="py3",
             capability=detect_local_node_capability(),
         )
-        with self._sync_lock:
-            if not resp.get("accepted", False):
+        if not bool(resp.get("accepted", False)):
+            with self._sync_lock:
                 self._registered = False
-                logger.warning(
-                    "[Registrar] job-orch heartbeat rejected node_id=%s node_instance_id=%s service_id=%s",
-                    self.node_id,
-                    self.node_instance_id,
-                    self.service_id,
-                )
-                return False
+            return False
+        with self._sync_lock:
             self._next_hb_sec = max(
                 1,
                 int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec),

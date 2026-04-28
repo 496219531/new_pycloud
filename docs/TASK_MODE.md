@@ -185,6 +185,26 @@ print(final["job"]["status"])
 3. 同一个 `node_id` 重启后如果生成新的 `node_instance_id`，可以重新进入补偿候选。
 4. 创建失败、executor host 重建失败、owner heartbeat 超时等原因会随 node heartbeat 上报，并显示在 InfoCenter `/ops` 的 `failure_reason` 列。
 
+节点失效与 inflight task 语义：
+
+1. `node_id` 是逻辑节点名，可以复用；`node_instance_id` 是执行实例身份，也是 service/taskpool token 与失败副本的 fencing 单位。
+2. 一旦 InfoCenter 或 node 自身判定某个 `node_instance_id` 失效，该实例上的执行状态不再可信，不能靠同一个 `node_instance_id` 恢复服务。
+3. 失效实例必须清理 service / taskpool / executor / worker 状态；同一个 `node_id` 后续重新加入时应使用新的 `node_instance_id`。
+4. `unhealthy` 表示实例失效，需要 fencing 和执行状态重置；`drain` / `cordon` 只是调度状态，不代表实例失效。
+5. `drain` 节点不接新业务流量或新 task 分配，但仍要接受 owner 控制命令，例如 `update_globals`、`close`、`shutdown`、heartbeat。
+6. `cordon` 节点不接新部署；其上已有服务是否继续服务由 `drain` 决定。
+
+已接收任务的 infra retry：
+
+1. `imap_unordered(...)` / `iter_items(...)` / `unordered(...)` / `map(...)` 这条公共批处理链路会为已被 node 接收的 task 记录 replay record。
+2. replay record 保存 `logical_index`、原始 payload、当前 `task_id`、当前 `node_instance_id`、attempt 等信息。
+3. 如果拉取结果时发现 node 失联，或远端返回 `FAILED_INFRA`，TaskPool 会先把该 node 从可提交集合移除，再按 replay record 把任务重提到其他健康 node。
+4. retry 时会重新对目标 node 执行 `_prepare_task_payload_for_submit(...)`，不复用旧 node 上可能已经本地化的 prepared payload / DataRef。
+5. `max_infra_retries` 控制每个逻辑任务的 infra retry 次数，默认 `1`；耗尽后返回本地合成的 `FAILED_INFRA / NodeInstanceLost`。
+6. 旧 `task_id` 的迟到结果会被丢弃，因为 replay 后当前逻辑任务已经绑定到新的 `task_id`。
+7. 仅 `submit_payloads(...)` 这类“先提交、后手动拉结果”的低层接口不保证自动 replay 已接收任务；它们更适合暴露原始 infra 失败给调用方处理。
+8. 相关观测字段包括 `task_retry_count`、`task_retry_success_count`、`task_retry_exhausted_count`、`node_lost_replayed_tasks`、`node_lost_failed_tasks`、`retry_prepare_payload_ms`、`retry_submit_ms`。
+
 补充说明：
 
 1. `TaskPool` 不强调 `join()` 这类 owner 常驻语义

@@ -62,6 +62,34 @@ def test_service_connect_gateway_returns_unified_service_object():
         client.close()
 
 
+def test_service_connect_gateway_stream_proxy_yields_items():
+    client = Service.connect(
+        target="127.0.0.1:50051",
+        service_name="svc-demo",
+        transport="gateway",
+        validate_on_init=False,
+    )
+    try:
+        with (
+            patch.object(type(client), "list_methods", return_value=[{"method": "count"}]),
+            patch.object(
+                GatewayServiceClient,
+                "stream_call",
+                return_value=iter(
+                    [
+                        {"event": "item", "index": 0, "data": 1},
+                        {"event": "item", "index": 1, "data": 2},
+                        {"event": "done", "ok": True, "item_count": 2},
+                    ]
+                ),
+            ) as mocked_stream,
+        ):
+            assert list(client.count.stream()) == [1, 2]
+        mocked_stream.assert_called_once()
+    finally:
+        client.close()
+
+
 def test_service_connect_discovery_retries_briefly_when_routes_are_not_ready():
     with (
         patch.object(DiscoveryServiceClient, "refresh_routes", return_value=[]) as mocked_refresh,

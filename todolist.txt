@@ -1,0 +1,9 @@
+确认排他性独占会过滤掉哪些(unhealthy ,drain ,cordon)? 这些不够的, 只能过滤unhealthy ,
+而且一旦被判定unhealthy ,该结点重连时必须把自己的所有进程全清掉,重新接受服务部署 
+至于drain 和cordon 的结点上的服务,只是不服务,同样会接受owner的命令 ,updateglobals ,退出 
+
+问ai ,怎么办合适
+
+所以你刚说的 函数每隔 1 秒 yield 1 到 10，接收端收到一个就打印一个，当前协议/调用层还没做。
+需要新增服务端响应流能力，或者先做 HTTP chunk/SSE 这一类通道。
+

@@ -34,6 +34,8 @@ from pycloud_parallel.controlplane.node.filesystem import (
 from pycloud_parallel.controlplane.node.results import (
     LargeResultError,
     ObjectResolutionError,
+    _is_streaming_user_return,
+    _normalize_stream_item_value,
     _normalize_user_return,
     _resolve_object_refs_in_payload,
 )
@@ -1211,6 +1213,7 @@ def _execute_payload_in_subprocess(
     payload_mode: str = "task_submit",
     serialization_mode: str = "",
     use_transport_result: Optional[bool] = None,
+    stream_queue: Optional[object] = None,
 ) -> Tuple[str, Optional[dict], str, str, Dict[str, float]]:
     decode_start = time.perf_counter()
     decode_end = decode_start
@@ -1320,6 +1323,57 @@ def _execute_payload_in_subprocess(
                     invoke_wrapper_ms = float(timed.get("invoke_wrapper_ms", 0.0) or 0.0)
                     user_fn_ms = float(timed.get("user_fn_ms", 0.0) or 0.0)
                     encode_start = invoke_end
+                if stream_queue is not None:
+                    emitted_count = 0
+                    try:
+                        if _is_streaming_user_return(ret):
+                            for emitted_count, item in enumerate(ret, start=1):
+                                normalized_item = _normalize_stream_item_value(
+                                    item,
+                                    object_dir=object_dir,
+                                    serialization_mode=serialization_mode,
+                                    use_transport_result=use_transport_result,
+                                )
+                                stream_queue.put(
+                                    {
+                                        "kind": "item",
+                                        "item_index": emitted_count - 1,
+                                        "result": normalized_item,
+                                    }
+                                )
+                        else:
+                            status_text, result, error_type, error_message = _normalize_user_return(
+                                ret,
+                                object_dir=object_dir,
+                                serialization_mode=serialization_mode,
+                                use_transport_result=use_transport_result,
+                            )
+                            if status_text != "SUCCEEDED":
+                                encode_end = time.perf_counter()
+                                return (status_text, result, error_type, error_message, _timings())
+                            stream_queue.put(
+                                {
+                                    "kind": "item",
+                                    "item_index": 0,
+                                    "result": result,
+                                }
+                            )
+                            emitted_count = 1
+                    except LargeResultError:
+                        raise
+                    except Exception:
+                        raise
+                    encode_end = time.perf_counter()
+                    return (
+                        "SUCCEEDED",
+                        {
+                            "streamed": True,
+                            "item_count": emitted_count,
+                        },
+                        "",
+                        "",
+                        _timings(),
+                    )
                 try:
                     status_text, result, error_type, error_message = _normalize_user_return(
                         ret,

@@ -807,12 +807,13 @@ pycloudctl status
 2. 如果你只是想让 node 暂时不接新任务，优先考虑 `drain` / `cordon`
 3. `drain` / `cordon` 是 HTTP 运维接口，不是 `pycloudctl` 子命令
 4. `stop-node` 现在也会先尽力把该 node 标记成 lost，再停进程
+5. `/ops/nodes/...` 的路径参数语义是 `node_instance_id`，不要只填可能重复的 `node_id`
 
 例如：
 
 ```bash
-curl -X POST http://127.0.0.1:50051/ops/nodes/node-1/drain
-curl -X POST http://127.0.0.1:50051/ops/nodes/node-1/cordon
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/drain
+curl -X POST http://127.0.0.1:50051/ops/nodes/node-1-xxxxxxxxxxxx/cordon
 ```
 
 ## 9. `restart`

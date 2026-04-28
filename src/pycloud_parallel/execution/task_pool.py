@@ -6,7 +6,7 @@ import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import inspect
 import logging
 import math
@@ -141,6 +141,18 @@ class _IndexedPayloadBuffer:
             self._retry_payloads.appendleft((int(index), dict(payload or {})))
 
 
+@dataclass
+class _TaskReplayRecord:
+    logical_index: int
+    logical_key: object
+    original_payload: Dict[str, object]
+    current_task_id: str
+    current_node_id: str
+    attempt: int
+    submitted_at: float
+    last_error: str = ""
+
+
 def _infocenter_client(*args, **kwargs):
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
@@ -243,6 +255,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._active_nodes: set[str] = set(self._pools.keys())
         self._pending_task_ids: set[str] = set()
         self._pending_task_node_ids: Dict[str, str] = {}
+        self._replay_records: Dict[str, _TaskReplayRecord] = {}
+        self._replay_node_index: Dict[str, Set[str]] = {}
         self._scheduler_state = SchedulerState()
         self._submit_breaker_states: Dict[str, CandidateBreakerState] = {
             str(node_id): CandidateBreakerState() for node_id in self._pools.keys()
@@ -257,6 +271,13 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._compensation_lock = threading.Lock()
         self._last_compensation_attempt_at = 0.0
         self._last_managed_globals: Optional[Dict[str, object]] = None
+        self.task_retry_count = 0
+        self.task_retry_success_count = 0
+        self.task_retry_exhausted_count = 0
+        self.node_lost_replayed_tasks = 0
+        self.node_lost_failed_tasks = 0
+        self.retry_prepare_payload_ms = 0.0
+        self.retry_submit_ms = 0.0
         self._init_execution_session_state()
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
@@ -674,6 +695,103 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         int(self._scheduler_state.local_inflight_by_candidate.get(normalized_node_id, 0) or 0) + 1
                     )
 
+    def _register_replay_record(
+        self,
+        *,
+        logical_index: int,
+        logical_key: object,
+        original_payload: Dict[str, object],
+        task_id: str,
+        node_id: str,
+        attempt: int,
+        last_error: str = "",
+    ) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_node_id = str(node_id or "").strip()
+        if not normalized_task_id:
+            return
+        record = _TaskReplayRecord(
+            logical_index=int(logical_index),
+            logical_key=logical_key,
+            original_payload=dict(original_payload or {}),
+            current_task_id=normalized_task_id,
+            current_node_id=normalized_node_id,
+            attempt=max(0, int(attempt or 0)),
+            submitted_at=time.time(),
+            last_error=str(last_error or ""),
+        )
+        with self._result_state_lock:
+            self._replay_records[normalized_task_id] = record
+            if normalized_node_id:
+                self._replay_node_index.setdefault(normalized_node_id, set()).add(normalized_task_id)
+
+    def _remove_replay_record_unlocked(self, task_id: str) -> Optional[_TaskReplayRecord]:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            return None
+        record = self._replay_records.pop(normalized, None)
+        if record is None:
+            return None
+        node_tasks = self._replay_node_index.get(record.current_node_id)
+        if node_tasks is not None:
+            node_tasks.discard(normalized)
+            if not node_tasks:
+                self._replay_node_index.pop(record.current_node_id, None)
+        return record
+
+    def _take_replay_record(self, task_id: str) -> Optional[_TaskReplayRecord]:
+        with self._result_state_lock:
+            return self._remove_replay_record_unlocked(task_id)
+
+    def _mark_taskpool_node_lost(self, node_id: str, *, error: object) -> Tuple[List[_TaskReplayRecord], List[str]]:
+        normalized_node_id = str(node_id or "").strip()
+        if not normalized_node_id:
+            return [], []
+        self._active_nodes.discard(normalized_node_id)
+        self._scheduler_state.disabled_candidates.add(normalized_node_id)
+        self.failures[normalized_node_id] = str(error or "task pool node lost")
+        self._mark_pool_submit_failure(normalized_node_id, failure_kind=REMOTE_INFRA_FAILED, error=error)
+        with self._result_state_lock:
+            task_ids = set(self._replay_node_index.get(normalized_node_id, set()))
+            task_ids.update(
+                task_id
+                for task_id, mapped_node_id in self._pending_task_node_ids.items()
+                if str(mapped_node_id or "").strip() == normalized_node_id
+            )
+            records: List[_TaskReplayRecord] = []
+            orphan_task_ids: List[str] = []
+            for task_id in task_ids:
+                self._pending_task_ids.discard(task_id)
+                self._pending_task_node_ids.pop(task_id, None)
+                record = self._remove_replay_record_unlocked(task_id)
+                if record is not None:
+                    records.append(record)
+                else:
+                    orphan_task_ids.append(str(task_id))
+            self._scheduler_state.local_inflight_by_candidate[normalized_node_id] = 0
+        return records, orphan_task_ids
+
+    @staticmethod
+    def _local_failed_task_result(task_id: str, *, error_message: str) -> pb2.TaskResult:
+        return pb2.TaskResult(
+            task_id=str(task_id or ""),
+            status=pb2.TASK_STATUS_FAILED_INFRA,
+            error=pb2.TaskError(type="NodeInstanceLost", message=str(error_message or "node lost")),
+        )
+
+    def _fail_pending_tasks_for_lost_node(self, node_id: str, *, error: object) -> None:
+        records, orphan_task_ids = self._mark_taskpool_node_lost(node_id, error=error)
+        message = str(error or "node lost before task completed")
+        failed_task_ids = [record.current_task_id for record in records] + list(orphan_task_ids)
+        with self._result_state_lock:
+            for task_id in failed_task_ids:
+                self._pending_task_ids.add(task_id)
+                self._pending_task_node_ids[task_id] = str(node_id or "")
+                self._buffered_result_items.append(
+                    (str(node_id or ""), self._local_failed_task_result(task_id, error_message=message))
+                )
+                self.node_lost_failed_tasks += 1
+
     def _submit_task_items_to_node(
         self,
         node_id: str,
@@ -766,6 +884,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         with self._result_state_lock:
             self._pending_task_ids.discard(normalized)
             node_id = self._pending_task_node_ids.pop(normalized, "")
+            self._remove_replay_record_unlocked(normalized)
             if node_id:
                 current = int(self._scheduler_state.local_inflight_by_candidate.get(node_id, 0) or 0)
                 self._scheduler_state.local_inflight_by_candidate[node_id] = max(0, current - 1)
@@ -789,6 +908,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             self._pending_task_ids.clear()
             self._pending_task_node_ids.clear()
             self._buffered_result_items.clear()
+            self._replay_records.clear()
+            self._replay_node_index.clear()
             self._scheduler_state.local_inflight_by_candidate.clear()
 
     def _buffered_result_count(self) -> int:
@@ -1016,7 +1137,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 per_pull_limit = max(1, int(limit or 100))
                 if remaining_by_max > 0:
                     per_pull_limit = max(1, min(per_pull_limit, remaining_by_max))
-                resp = pool.pull_results(limit=per_pull_limit, wait_ms=0, cursor="")
+                try:
+                    resp = pool.pull_results(limit=per_pull_limit, wait_ms=0, cursor="")
+                except Exception as exc:
+                    self._fail_pending_tasks_for_lost_node(node_id, error=exc)
+                    any_result = True
+                    continue
                 if not resp.results:
                     continue
                 any_result = True
@@ -1537,6 +1663,120 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             max_new_tasks -= 1
         return planned
 
+    def _replay_failure_item(self, record: _TaskReplayRecord, *, message: str) -> ExecutionItem:
+        self.task_retry_exhausted_count += 1
+        self.node_lost_failed_tasks += 1
+        return ExecutionItem(
+            index=int(record.logical_index),
+            ok=False,
+            result=None,
+            error_type="NodeInstanceLost",
+            error_message=str(message or "node lost before task completed"),
+            node_id=str(getattr(self.nodes.get(record.current_node_id), "node_id", "") or record.current_node_id),
+            key=record.logical_key,
+            status=int(pb2.TASK_STATUS_FAILED_INFRA),
+            task_id=str(record.current_task_id),
+            node_instance_id=str(record.current_node_id),
+        )
+
+    def _retry_replay_record(
+        self,
+        record: _TaskReplayRecord,
+        *,
+        reason: str,
+        disabled_submit_nodes: Set[str],
+        scheduler_failures: Dict[str, str],
+        inflight_by_node: Dict[str, int],
+        task_index_by_id: Dict[str, int],
+        max_infra_retries: int,
+        retry_backoff_ms: int,
+    ) -> Optional[ExecutionItem]:
+        if int(record.attempt or 0) >= max(0, int(max_infra_retries or 0)):
+            return self._replay_failure_item(record, message=reason or "node lost before task completed")
+        candidates = [
+            node_id
+            for node_id in self._available_pool_node_ids()
+            if node_id != record.current_node_id and node_id not in disabled_submit_nodes
+        ]
+        if not candidates:
+            return self._replay_failure_item(record, message="no healthy task pool node available for retry")
+        if retry_backoff_ms > 0:
+            time.sleep(max(0.0, float(retry_backoff_ms) / 1000.0))
+        last_error = reason or "node lost before task completed"
+        for target_node_id in candidates:
+            try:
+                prepare_start = time.perf_counter()
+                item = self._build_task_submit_item(
+                    node_id=target_node_id,
+                    payload=dict(record.original_payload or {}),
+                    timeout_hint_sec=0,
+                    priority=1,
+                )
+                self.retry_prepare_payload_ms += (time.perf_counter() - prepare_start) * 1000.0
+                submit_start = time.perf_counter()
+                resp = self._submit_task_items_to_node(target_node_id, [item], job_id=self.job_id)
+                self.retry_submit_ms += (time.perf_counter() - submit_start) * 1000.0
+                new_task_id = str(item.task_id or "").strip()
+                accepted_ids = {
+                    str(accepted.task_id or "").strip()
+                    for accepted in resp.accepted
+                    if str(accepted.task_id or "").strip()
+                }
+                if new_task_id not in accepted_ids:
+                    raise RuntimeError("retry submit was not accepted")
+            except Exception as exc:
+                last_error = repr(exc)
+                disabled_submit_nodes.add(target_node_id)
+                scheduler_failures[target_node_id] = last_error
+                self._mark_pool_submit_failure(target_node_id, failure_kind=SUBMIT_FAILED, error=exc)
+                continue
+            self.task_retry_count += 1
+            self.task_retry_success_count += 1
+            self.node_lost_replayed_tasks += 1
+            task_index_by_id.pop(str(record.current_task_id or ""), None)
+            task_index_by_id[new_task_id] = int(record.logical_index)
+            self._register_replay_record(
+                logical_index=int(record.logical_index),
+                logical_key=record.logical_key,
+                original_payload=dict(record.original_payload or {}),
+                task_id=new_task_id,
+                node_id=target_node_id,
+                attempt=int(record.attempt or 0) + 1,
+                last_error=reason,
+            )
+            inflight_by_node[target_node_id] = int(inflight_by_node.get(target_node_id, 0) or 0) + 1
+            self._mark_pool_submit_success(target_node_id)
+            return None
+        return self._replay_failure_item(record, message=last_error)
+
+    def _retry_replay_records(
+        self,
+        records: Sequence[_TaskReplayRecord],
+        *,
+        reason: str,
+        disabled_submit_nodes: Set[str],
+        scheduler_failures: Dict[str, str],
+        inflight_by_node: Dict[str, int],
+        task_index_by_id: Dict[str, int],
+        max_infra_retries: int,
+        retry_backoff_ms: int,
+    ) -> List[ExecutionItem]:
+        failed: List[ExecutionItem] = []
+        for record in records:
+            item = self._retry_replay_record(
+                record,
+                reason=reason,
+                disabled_submit_nodes=disabled_submit_nodes,
+                scheduler_failures=scheduler_failures,
+                inflight_by_node=inflight_by_node,
+                task_index_by_id=task_index_by_id,
+                max_infra_retries=max_infra_retries,
+                retry_backoff_ms=retry_backoff_ms,
+            )
+            if item is not None:
+                failed.append(item)
+        return failed
+
     def _submit_imap_entries_to_nodes(
         self,
         grouped: Dict[str, List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]],
@@ -1578,8 +1818,17 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             accepted_count = 0
             rejected_entries: List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]] = []
             for entry in entries:
-                if str(entry[2].task_id) in accepted_ids:
+                task_id = str(entry[2].task_id or "").strip()
+                if task_id in accepted_ids:
                     accepted_count += 1
+                    self._register_replay_record(
+                        logical_index=int(entry[0]),
+                        logical_key=int(entry[0]),
+                        original_payload=dict(entry[1] or {}),
+                        task_id=task_id,
+                        node_id=node_id,
+                        attempt=0,
+                    )
                 else:
                     rejected_entries.append(entry)
             if rejected_entries:
@@ -1597,17 +1846,35 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         scheduler_failures: Dict[str, str],
         infra_failures_by_node: Dict[str, int],
         task_index_by_id: Dict[str, int],
+        max_infra_retries: int,
+        retry_backoff_ms: int,
     ) -> Tuple[List[ExecutionItem], Dict[str, int]]:
         completed_items: List[ExecutionItem] = []
         freed_by_node: Dict[str, int] = {}
+
         for node_id in ordered_node_ids:
+            if node_id in disabled_submit_nodes and int(inflight_by_node.get(node_id, 0) or 0) <= 0:
+                continue
             pull_limit = max(1, int(inflight_by_node.get(node_id, 0) or 1))
             try:
                 resp = self._pools[node_id].pull_results(limit=pull_limit, wait_ms=0, cursor="")
             except Exception as exc:
                 disabled_submit_nodes.add(node_id)
-                self._mark_pool_submit_failure(node_id, failure_kind=SUBMIT_FAILED, error=exc)
+                records, _orphan_task_ids = self._mark_taskpool_node_lost(node_id, error=exc)
+                inflight_by_node[node_id] = 0
                 scheduler_failures[node_id] = repr(exc)
+                completed_items.extend(
+                    self._retry_replay_records(
+                        records,
+                        reason=repr(exc),
+                        disabled_submit_nodes=disabled_submit_nodes,
+                        scheduler_failures=scheduler_failures,
+                        inflight_by_node=inflight_by_node,
+                        task_index_by_id=task_index_by_id,
+                        max_infra_retries=max_infra_retries,
+                        retry_backoff_ms=retry_backoff_ms,
+                    )
+                )
                 continue
             if not resp.results:
                 continue
@@ -1615,6 +1882,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 normalized = str(result.task_id or "").strip()
                 if not self._is_pending_task_id(normalized):
                     continue
+                replay_record = self._take_replay_record(normalized)
                 self._mark_result_consumed(result.task_id)
                 inflight_by_node[node_id] = max(0, int(inflight_by_node.get(node_id, 0) or 0) - 1)
                 freed_by_node[node_id] = int(freed_by_node.get(node_id, 0) or 0) + 1
@@ -1627,6 +1895,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     )
                     if int(infra_failures_by_node.get(node_id, 0) or 0) >= 2:
                         disabled_submit_nodes.add(node_id)
+                    if replay_record is not None:
+                        completed_items.extend(
+                            self._retry_replay_records(
+                                [replay_record],
+                                reason=str(result.error.message or "remote infra failure"),
+                                disabled_submit_nodes=disabled_submit_nodes,
+                                scheduler_failures=scheduler_failures,
+                                inflight_by_node=inflight_by_node,
+                                task_index_by_id=task_index_by_id,
+                                max_infra_retries=max_infra_retries,
+                                retry_backoff_ms=retry_backoff_ms,
+                            )
+                        )
+                        continue
                 elif int(result.status) == int(pb2.TASK_STATUS_SUCCEEDED):
                     infra_failures_by_node.pop(node_id, None)
                     self._mark_pool_submit_success(node_id)
@@ -1715,6 +1997,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             result_timeout_sec = float(shared_kwargs.pop("result_timeout_sec", timeout_sec) or timeout_sec)
             wait_ms = int(shared_kwargs.pop("wait_ms", 500) or 500)
             raise_on_error = bool(shared_kwargs.pop("raise_on_error", True))
+            max_infra_retries = max(0, int(shared_kwargs.pop("max_infra_retries", 0) or 0))
+            retry_backoff_ms = max(0, int(shared_kwargs.pop("retry_backoff_ms", 0) or 0))
             _node_window_factor = float(shared_kwargs.pop("node_window_factor", 2.0) or 2.0)
             if shared_kwargs:
                 unexpected = ", ".join(sorted(shared_kwargs))
@@ -1790,6 +2074,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     if submitted_now > 0:
                         wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
                         continue
+                    if not payload_buffer.has_retry and not payload_buffer.exhausted:
+                        next_payload = payload_buffer.next()
+                        if next_payload is None:
+                            continue
+                        payload_buffer.requeue_front([(next_payload[0], next_payload[1], None)])
                     if payload_buffer.has_retry or not payload_buffer.exhausted:
                         failure_suffix = f"; failures={scheduler_failures}" if scheduler_failures else ""
                         raise RuntimeError(f"imap_unordered could not submit tasks to any active task pool node{failure_suffix}")
@@ -1804,6 +2093,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     scheduler_failures=scheduler_failures,
                     infra_failures_by_node=infra_failures_by_node,
                     task_index_by_id=task_index_by_id,
+                    max_infra_retries=max_infra_retries,
+                    retry_backoff_ms=retry_backoff_ms,
                 )
 
                 if completed_items:

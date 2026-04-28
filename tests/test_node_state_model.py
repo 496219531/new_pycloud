@@ -40,7 +40,7 @@ from pycloud_parallel.controlplane.node.filesystem import (
     _load_code_meta,
     _write_code_meta,
 )
-from pycloud_parallel.controlplane.node.models import CodeArtifact, StoredResultArtifact
+from pycloud_parallel.controlplane.node.models import CodeArtifact, ServiceSession, StoredResultArtifact, TaskPoolState, TaskState
 from pycloud_parallel.controlplane.node.results import (
     LargeResultError,
     ObjectResolutionError,
@@ -1120,6 +1120,108 @@ def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
     assert resolved.via_registry is True
 
 
+def test_data_registry_resolve_skips_unhealthy_instance_replicas(monkeypatch) -> None:
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.controlplane.data_registry import resolve_data_ref
+
+    class _FakeInfoCenterClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def resolve_data_ref(self, *, ref_id: str):
+            del ref_id
+            return {
+                "entry": {
+                    "ref_id": "sha256:" + ("4" * 64),
+                    "replicas": [
+                        {"control_addr": "127.0.0.1:50061", "node_id": "node-a", "node_instance_id": "node-a-old"},
+                        {"control_addr": "127.0.0.1:50062", "node_id": "node-a", "node_instance_id": "node-a-new"},
+                    ],
+                }
+            }
+
+        def list_nodes(self, *, healthy_only: bool = True, tags=None, limit: int = 100):
+            del healthy_only, tags, limit
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-old", control_addr="127.0.0.1:50061", healthy=False),
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-new", control_addr="127.0.0.1:50062", healthy=True),
+            ]
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient", _FakeInfoCenterClient)
+
+    resolved = resolve_data_ref(
+        DataRef(
+            ref_id="sha256:" + ("4" * 64),
+            storage_id="sha256:" + ("4" * 64),
+            format="dfbundle",
+            logical_type="dataframe",
+            locator_kind="controlplane",
+            locator_token="http://127.0.0.1:50051",
+        ),
+        timeout_sec=5.0,
+    )
+
+    assert resolved.control_addr == "127.0.0.1:50062"
+    assert resolved.node_instance_id == "node-a-new"
+    assert [item["node_instance_id"] for item in resolved.replicas] == ["node-a-new"]
+
+
+def test_data_registry_resolve_rejects_only_unhealthy_instance_replica(monkeypatch) -> None:
+    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.controlplane.data_registry import resolve_data_ref
+
+    class _FakeInfoCenterClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def resolve_data_ref(self, *, ref_id: str):
+            del ref_id
+            return {
+                "entry": {
+                    "ref_id": "sha256:" + ("5" * 64),
+                    "control_addr": "127.0.0.1:50061",
+                    "node_id": "node-a",
+                    "node_instance_id": "node-a-old",
+                }
+            }
+
+        def list_nodes(self, *, healthy_only: bool = True, tags=None, limit: int = 100):
+            del healthy_only, tags, limit
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-old", control_addr="127.0.0.1:50061", healthy=False)
+            ]
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.infocenter_client.InfoCenterClient", _FakeInfoCenterClient)
+
+    with pytest.raises(RuntimeError, match="data ref could not be resolved"):
+        resolve_data_ref(
+            DataRef(
+                ref_id="sha256:" + ("5" * 64),
+                storage_id="sha256:" + ("5" * 64),
+                format="dfbundle",
+                logical_type="dataframe",
+                locator_kind="controlplane",
+                locator_token="http://127.0.0.1:50051",
+                node_instance_id="node-a-old",
+            ),
+            timeout_sec=5.0,
+        )
+
+
 def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
     from pycloud_parallel.controlplane.data_ref import DataRef
     from pycloud_parallel.controlplane.data_registry import DataRegistryClient
@@ -1169,6 +1271,54 @@ def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
             client.resolve(ref)
     finally:
         controlplane.stop()
+
+
+def test_infocenter_rejects_data_ref_registration_from_fenced_instance() -> None:
+    from pycloud_parallel.controlplane.data_ref import DataRef
+
+    state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
+    state.register_node_record(
+        node_instance_id="node-dataref-old",
+        node_id="node-dataref",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+    )
+    state.mark_node_lost("node-dataref-old", reason="lost")
+
+    ref = DataRef(
+        ref_id="sha256:" + ("6" * 64),
+        storage_id="sha256:" + ("6" * 64),
+        logical_type="bytes",
+        format="bin",
+        size_bytes=8,
+        materialize_as="bytes",
+        locator_kind="controlplane",
+        locator_token="http://127.0.0.1:50051",
+        node_id="node-dataref",
+        node_instance_id="node-dataref-old",
+    )
+    with pytest.raises(ValueError, match="node_instance_id fenced"):
+        state.register_data_ref_record(
+            ref=ref,
+            node_id="node-dataref",
+            node_instance_id="node-dataref-old",
+            control_addr="127.0.0.1:50061",
+        )
+    with pytest.raises(ValueError, match="node_instance_id fenced"):
+        state.register_data_ref_record(
+            ref=ref,
+            node_id="node-dataref-new",
+            node_instance_id="node-dataref-new",
+            control_addr="127.0.0.1:50062",
+            replicas=[
+                {
+                    "node_id": "node-dataref",
+                    "node_instance_id": "node-dataref-old",
+                    "control_addr": "127.0.0.1:50061",
+                }
+            ],
+        )
 
 
 def test_data_registry_release_triggers_node_release_for_consume_on_read(monkeypatch) -> None:
@@ -3575,6 +3725,317 @@ def test_infocenter_stale_node_degrades_service_route_status():
     assert routes[0]["alive_workers"] == 0
     assert routes[0]["in_flight"] == 0
     assert state.list_service_routes(service_name="svc-stale", healthy_only=True, limit=10) == []
+
+
+def test_infocenter_route_scopes_respect_drain_and_owner_semantics():
+    state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    state.register_node_record(
+        node_instance_id="node-drain",
+        node_id="node-drain",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+        services={
+            "svc-drain": NodeServiceState(
+                service_name="svc-demo",
+                service_id="svc-drain",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                owner_client_id="owner-a",
+                code_version="sha256:aaa",
+                policy_id="trusted_internal",
+                worker_count=2,
+                alive_workers=2,
+                http_base_url="http://127.0.0.1:18081/svc/svc-drain",
+            )
+        },
+    )
+    state.update_node_schedule_state("node-drain", drain=True)
+
+    call_routes = state.list_service_routes(
+        service_name="svc-demo",
+        healthy_only=True,
+        limit=10,
+        route_scope="call",
+    )
+    owner_routes = state.list_service_routes(
+        service_name="svc-demo",
+        healthy_only=True,
+        limit=10,
+        route_scope="owner_command",
+    )
+    exclusive_routes = state.list_service_routes(
+        service_name="svc-demo",
+        healthy_only=True,
+        limit=10,
+        route_scope="exclusive_check",
+    )
+
+    assert call_routes == []
+    assert len(owner_routes) == 1
+    assert len(exclusive_routes) == 1
+    assert owner_routes[0]["node_drain"] is True
+    assert owner_routes[0]["node_instance_id"] == "node-drain"
+    assert owner_routes[0]["owner_client_id"] == "owner-a"
+    assert owner_routes[0]["code_version"] == "sha256:aaa"
+    assert owner_routes[0]["policy_id"] == "trusted_internal"
+
+
+def test_infocenter_fences_stale_instance_and_rejects_heartbeat():
+    state = InfoCenterState(lease_ttl_sec=1, heartbeat_interval_sec=1)
+    state.register_node_record(
+        node_instance_id="node-fenced",
+        node_id="node-fenced",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+    )
+    state._nodes["node-fenced"].last_seen_at = utc_now() - timedelta(seconds=5)  # noqa: SLF001
+
+    assert state.list_nodes(healthy_only=True, tags=(), limit=10) == []
+    assert state.is_instance_fenced("node-fenced") is True
+    assert (
+        state.heartbeat_record(
+            node_instance_id="node-fenced",
+            node_id="node-fenced",
+            healthy=True,
+        )
+        is None
+    )
+
+
+def test_infocenter_fenced_instance_cannot_re_register_but_new_instance_can():
+    state = InfoCenterState(lease_ttl_sec=1, heartbeat_interval_sec=1)
+    state.register_node_record(
+        node_instance_id="node-old-inst",
+        node_id="node-stable",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+    )
+    state.mark_node_lost("node-old-inst", reason="admin lost")
+
+    with pytest.raises(ValueError, match="node_instance_id fenced"):
+        state.register_node_record(
+            node_instance_id="node-old-inst",
+            node_id="node-stable",
+            control_addr="127.0.0.1:50061",
+            capacity=4,
+            queue_capacity=16,
+        )
+
+    new_state = state.register_node_record(
+        node_instance_id="node-new-inst",
+        node_id="node-stable",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+        services={},
+        task_pools={},
+        active_runtimes=[],
+    )
+
+    assert new_state.node_instance_id == "node-new-inst"
+    assert new_state.node_id == "node-stable"
+    assert new_state.services == {}
+    assert new_state.task_pools == {}
+    assert state.is_instance_fenced("node-old-inst") is True
+    assert state.is_instance_fenced("node-new-inst") is False
+
+
+def test_nodecontrol_tokens_are_bound_to_current_instance(tmp_path):
+    state = NodeControlState(
+        node_id="node-token-instance",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_token_instance"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    now = utc_now()
+    try:
+        service = ServiceSession(
+            service_id="svc-token",
+            owner_client_id="owner",
+            service_name="svc-token",
+            code_version="sha256:abc",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=True,
+            service_token="service-token",
+            http_base_url="",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            created_at=now,
+            last_heartbeat_at=now,
+            lease_expire_at=now + timedelta(seconds=30),
+            token_node_instance_id=state.node_instance_id,
+        )
+        pool = TaskPoolState(
+            pool_id="pool-token",
+            owner_client_id="owner",
+            pool_name="pool-token",
+            code_version="sha256:abc",
+            task_method="run",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            pool_token="pool-token",
+            status="RUNNING",
+            created_at=now,
+            last_heartbeat_at=now,
+            lease_expire_at=now + timedelta(seconds=30),
+            token_node_instance_id=state.node_instance_id,
+        )
+
+        state._require_service_token(service, "service-token")  # noqa: SLF001
+        state._require_pool_token(pool, "pool-token")  # noqa: SLF001
+
+        state.node_instance_id = f"{state.node_id}-replacement"
+        with pytest.raises(PermissionError, match="node_instance_id mismatch"):
+            state._require_service_token(service, "service-token")  # noqa: SLF001
+        with pytest.raises(PermissionError, match="node_instance_id mismatch"):
+            state._require_pool_token(pool, "pool-token")  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_nodecontrol_reset_fences_execution_until_process_restart(tmp_path):
+    state = NodeControlState(
+        node_id="node-reset-fence",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_reset_fence"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        assert state._executor_host is not None  # noqa: SLF001
+        state.reset_execution_state(reason="test fence")
+        assert state._executor_host is None  # noqa: SLF001
+
+        with state._cv:  # noqa: SLF001
+            state._ensure_executor_host_alive_locked()  # noqa: SLF001
+        assert state._executor_host is None  # noqa: SLF001
+
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        with pytest.raises(RuntimeError, match="execution is fenced"):
+            state.create_service(
+                owner_client_id="owner",
+                service_name="svc-fenced",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="svc_fenced",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=False,
+                chunks=[blob],
+            )
+        with pytest.raises(RuntimeError, match="execution is fenced"):
+            state.create_task_pool(
+                owner_client_id="owner",
+                pool_name="pool-fenced",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="pool_fenced",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                chunks=[blob],
+            )
+    finally:
+        state.close()
+
+
+def test_nodecontrol_discards_late_pool_event_for_stale_pool_id(tmp_path):
+    state = NodeControlState(
+        node_id="node-late-pool-event",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_late_pool_event"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def drain_events(self):
+            return [
+                {
+                    "kind": "pool_task_done",
+                    "pool_id": "old-pool",
+                    "task_id": "task-reused",
+                    "attempt": 1,
+                    "status_text": "SUCCEEDED",
+                    "result": {"value": "stale"},
+                }
+            ]
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        pool = TaskPoolState(
+            pool_id="new-pool",
+            owner_client_id="owner",
+            pool_name="new-pool",
+            code_version="sha256:abc",
+            task_method="run",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            pool_token="pool-token",
+            status="RUNNING",
+            created_at=now,
+            last_heartbeat_at=now,
+            lease_expire_at=now + timedelta(seconds=30),
+            token_node_instance_id=state.node_instance_id,
+        )
+        task = TaskState(
+            task_id="task-reused",
+            client_id="new-pool",
+            job_id="job-new",
+            code_version="sha256:abc",
+            runtime_key="",
+            execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+            payload={},
+            timeout_hint_sec=0,
+            priority=1,
+            status=pb2.TASK_STATUS_RUNNING,
+            attempt=1,
+            started_at=now,
+            last_heartbeat_at=now,
+        )
+        with state._cv:  # noqa: SLF001
+            state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+            state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+            state._pool_tasks[task.task_id] = task  # noqa: SLF001
+
+        state._drain_executor_events()  # noqa: SLF001
+
+        assert task.status == pb2.TASK_STATUS_RUNNING
+        assert task.result is None
+        assert pool.returned_count == 0
+        results, _cursor = state.pull_pool_results(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            limit=10,
+            wait_ms=0,
+            cursor="",
+        )
+        assert results == []
+    finally:
+        state.close()
 
 
 def test_infocenter_service_routes_compute_inflight_and_predicted_busy():

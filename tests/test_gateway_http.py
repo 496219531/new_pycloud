@@ -949,6 +949,40 @@ def test_gateway_call_failover_tries_all_candidate_routes():
     assert route_cache.observations[-1][1]["selected_route_id"] == "svc-gw-3"
 
 
+def test_gateway_stream_call_forwards_events_and_marks_success():
+    route = _gateway_route_variant(1, service_name="svc-gateway-stream")
+    route_cache = _SequenceRouteCache([route])
+    app = GatewayHttpApp(route_cache=route_cache)
+    attempts = []
+
+    def _fake_stream(self, route, *, method, payload, timeout_sec, service_token, serialization_mode=""):
+        del self
+        attempts.append((route.service_id, method, payload, timeout_sec, service_token, serialization_mode))
+        yield {"event": "item", "index": 0, "data": 1}
+        yield {"event": "item", "index": 1, "data": 2}
+        yield {"event": "done", "ok": True, "item_count": 2}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(GatewayHttpApp, "_invoke_route_stream", _fake_stream)
+        handled = app.handle_post(
+            path="/svc/svc-gateway-stream/call/count?timeout_sec=5.000&stream=1",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({}).encode("utf-8"),
+        )
+
+    assert handled is not None
+    response = handled[0]
+    events = [json.loads(chunk.decode("utf-8")) for chunk in response.body_iter]
+    assert events == [
+        {"event": "item", "index": 0, "data": 1},
+        {"event": "item", "index": 1, "data": 2},
+        {"event": "done", "ok": True, "item_count": 2},
+    ]
+    assert [item[0] for item in attempts] == ["svc-gw-1"]
+    assert route_cache.successes == ["svc-gw-1"]
+    assert route_cache.failures == []
+
+
 def test_gateway_call_user_error_does_not_failover():
     routes = [_gateway_route_variant(i) for i in range(1, 3)]
     route_cache = _SequenceRouteCache(routes)

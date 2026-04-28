@@ -26,6 +26,11 @@ class NodeServiceState:
     service_id: str
     status: int
     policy_id: str = "default_safe"
+    owner_client_id: str = ""
+    code_version: str = ""
+    entry_module: str = ""
+    entry_callable: str = ""
+    serialization_mode: str = ""
     worker_count: int = 0
     alive_workers: int = 0
     in_flight: int = 0
@@ -100,6 +105,13 @@ class NodeState:
         return max(0, capacity - used)
 
 
+@dataclass
+class FencedNodeInstance:
+    node_instance_id: str
+    fenced_at: datetime = field(default_factory=utc_now)
+    reason: str = ""
+
+
 @dataclass(frozen=True)
 class DataRegistryEntry:
     ref_id: str
@@ -122,6 +134,7 @@ class DataRegistryEntry:
 
 __all__ = [
     "DataRegistryEntry",
+    "FencedNodeInstance",
     "NodeMetricsState",
     "NodeCapability",
     "NodeServiceState",

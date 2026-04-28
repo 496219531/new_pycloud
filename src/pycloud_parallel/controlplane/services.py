@@ -868,8 +868,7 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
     def GetTaskPoolStatus(self, request: pb2.GetTaskPoolStatusRequest, context: grpc.ServicerContext) -> pb2.GetTaskPoolStatusResponse:
         try:
             pool = self._state.task_pool(request.pool_id)
-            if pool.pool_token != str(request.pool_token or "").strip():
-                raise PermissionError("pool_token mismatch")
+            self._state._require_pool_token(pool, request.pool_token)
             info = self._state.task_pool_status_info(request.pool_id)
             return pb2.GetTaskPoolStatusResponse(
                 ok=True,

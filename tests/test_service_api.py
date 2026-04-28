@@ -412,6 +412,94 @@ def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeyp
     assert "node-inst-old" in group.failures
 
 
+def test_service_compensation_rejects_requested_cordon_or_drain_nodes(monkeypatch):
+    node_cordon = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-cordon",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=False,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    node_drain = SimpleNamespace(
+        node_id="node-2",
+        node_instance_id="node-inst-drain",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=True,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    created = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node_cordon, node_drain]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            raise AssertionError("cordon/drain nodes must not receive compensation deploy")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._node_control_client", _FakeNodeControlClient)
+
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={},
+        nodes={},
+        failures={},
+    )
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_ids": ["node-1", "node-2"],
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    assert group.try_compensate_replicas() == 0
+    assert created == []
+
+
 def test_service_deploy_from_infocenter_creates_node_services_concurrently(tmp_path):
     from pycloud_parallel.execution.service_session import Service
     from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2

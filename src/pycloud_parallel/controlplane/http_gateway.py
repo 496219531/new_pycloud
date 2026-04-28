@@ -6,8 +6,9 @@ import errno
 import json
 import threading
 import traceback
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 from .client_transport import (
@@ -21,7 +22,18 @@ from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 
-InvokeHandler = Callable[[str, str, dict, str, float, str, bool], Tuple[int, Dict[str, object]]]
+@dataclass
+class StreamingHttpResponse:
+    status_code: int
+    body_iter: Iterable[bytes]
+    content_type: str = "application/x-ndjson; charset=utf-8"
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+
+
+InvokeHandler = Callable[
+    [str, str, dict, str, float, str, bool, bool],
+    Union[Tuple[int, Dict[str, object]], StreamingHttpResponse],
+]
 StatusHandler = Callable[[str], Tuple[int, Dict[str, object]]]
 MethodsHandler = Callable[[str, bool], Tuple[int, Dict[str, object]]]
 ExtraGetHandler = Callable[[str, list[str], Dict[str, list[str]]], Optional[Tuple[Any, ...]]]
@@ -125,7 +137,8 @@ class ServiceHttpGateway:
                         wants_transport_response = _is_http_transport_content_type(
                             str(self.headers.get("Content-Type", "") or "")
                         )
-                        code, resp = invoke_handler(
+                        stream_response = str((qs.get("stream", ["false"]) or ["false"])[0]).lower() in ("1", "true", "yes")
+                        handled = invoke_handler(
                             service_id,
                             method,
                             payload,
@@ -133,7 +146,12 @@ class ServiceHttpGateway:
                             timeout_sec,
                             serialization_mode,
                             wants_transport_response,
+                            stream_response,
                         )
+                        if isinstance(handled, StreamingHttpResponse):
+                            self._send_stream(handled)
+                            return
+                        code, resp = handled
                         if (
                             wants_transport_response
                             and int(code or 0) < 400
@@ -249,6 +267,25 @@ class ServiceHttpGateway:
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)
+                except Exception as exc:
+                    if not _is_client_disconnect_error(exc):
+                        raise
+
+            def _send_stream(self, response: StreamingHttpResponse) -> None:
+                try:
+                    self.send_response(int(response.status_code or 200))
+                    self.send_header("Content-Type", str(response.content_type or "application/x-ndjson; charset=utf-8"))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    for key, value in dict(response.extra_headers or {}).items():
+                        self.send_header(str(key), str(value))
+                    self.end_headers()
+                    for chunk in response.body_iter:
+                        if not chunk:
+                            continue
+                        raw = chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8")
+                        self.wfile.write(raw)
+                        self.wfile.flush()
                 except Exception as exc:
                     if not _is_client_disconnect_error(exc):
                         raise

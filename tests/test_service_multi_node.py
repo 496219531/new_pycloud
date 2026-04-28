@@ -133,6 +133,155 @@ def test_multi_node_group_deploy_and_call(tmp_path):
         n2_state.close()
 
 
+def test_service_deploy_connect_iter_items_accepts_generator_payload_stream(tmp_path):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-stream-01", str(tmp_path / "stream_n1_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-stream-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["stream"])
+
+        blob = (
+            b"from pycloud_parallel import export\n\n"
+            b"@export\n"
+            b"def square(x=0, **_kwargs):\n"
+            b"    x = int(x)\n"
+            b"    return {'x': x, 'square': x * x}\n"
+        )
+
+        group = Service.deploy(
+            target=info_target,
+            owner_client_id="owner-stream-test",
+            service_name="svc-stream-test",
+            source=blob,
+            runtime="py3",
+            entry_module="svc_stream_test",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["stream"],
+            min_success_nodes=1,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
+        )
+        try:
+            _sync_node_services(
+                info_target,
+                node_id="node-stream-01",
+                control_addr=n1_target,
+                tags=["stream"],
+                state=n1_state,
+            )
+
+            client = Service.connect(
+                target=info_target,
+                service_name="svc-stream-test",
+                transport="discovery",
+                timeout_sec=10.0,
+            )
+            produced = []
+
+            def payload_stream():
+                for idx in range(5):
+                    produced.append(idx)
+                    yield {"x": idx}
+
+            try:
+                stream = client.square.iter_items(payload_stream(), max_in_flight=2, timeout_sec=8.0)
+                results = sorted((item.index, item.result) for item in stream)
+            finally:
+                client.close()
+
+            assert produced == [0, 1, 2, 3, 4]
+            assert results == [
+                (0, {"x": 0, "square": 0}),
+                (1, {"x": 1, "square": 1}),
+                (2, {"x": 2, "square": 4}),
+                (3, {"x": 3, "square": 9}),
+                (4, {"x": 4, "square": 16}),
+            ]
+        finally:
+            group.close(end_services=True, reason="stream test done")
+    finally:
+        info_server.stop()
+        n1_server.stop(grace=0)
+        n1_state.close()
+
+
+def test_service_connect_streams_generator_results_incrementally(tmp_path, capsys):
+    info_server, info_target, _info_state = _start_infocenter_server()
+    n1_server, n1_target, n1_state = _start_nodecontrol_server("node-stream-out-01", str(tmp_path / "stream_out_n1_code"))
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=10.0) as infocenter:
+            infocenter.register_node(node_id="node-stream-out-01", control_addr=n1_target, capacity=16, queue_capacity=64, tags=["stream"])
+
+        blob = (
+            b"from pycloud_parallel import export\n"
+            b"import time\n\n"
+            b"@export\n"
+            b"def count(limit=3, delay_sec=0.05, **_kwargs):\n"
+            b"    limit = int(limit)\n"
+            b"    delay_sec = float(delay_sec)\n"
+            b"    for idx in range(1, limit + 1):\n"
+            b"        time.sleep(delay_sec)\n"
+            b"        yield idx\n"
+        )
+
+        group = Service.deploy(
+            target=info_target,
+            owner_client_id="owner-stream-out-test",
+            service_name="svc-stream-out-test",
+            source=blob,
+            runtime="py3",
+            entry_module="svc_stream_out_test",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            healthy_only=True,
+            tags=["stream"],
+            min_success_nodes=1,
+            allow_partial=False,
+            timeout_sec=10.0,
+            session_cache_dir=str(tmp_path / "session_cache"),
+        )
+        try:
+            _sync_node_services(
+                info_target,
+                node_id="node-stream-out-01",
+                control_addr=n1_target,
+                tags=["stream"],
+                state=n1_state,
+            )
+            client = Service.connect(
+                target=info_target,
+                service_name="svc-stream-out-test",
+                transport="discovery",
+                timeout_sec=10.0,
+            )
+            try:
+                received_at = []
+                started = time.perf_counter()
+                for value in client.count.stream(limit=3, delay_sec=0.05):
+                    received_at.append(time.perf_counter() - started)
+                    print(value)
+            finally:
+                client.close()
+
+            assert capsys.readouterr().out.strip().splitlines() == ["1", "2", "3"]
+            assert len(received_at) == 3
+            assert received_at[0] >= 0.03
+            assert received_at[1] - received_at[0] >= 0.03
+            assert received_at[2] - received_at[1] >= 0.03
+            assert received_at[2] - received_at[0] < 0.5
+        finally:
+            group.close(end_services=True, reason="stream output test done")
+    finally:
+        info_server.stop()
+        n1_server.stop(grace=0)
+        n1_state.close()
+
+
 def test_multi_node_group_circuit_breaker_recovery(tmp_path):
     info_server, info_target, _info_state = _start_infocenter_server()
     n1_server, n1_target, n1_state = _start_nodecontrol_server("node-cb-01", str(tmp_path / "cb_n1_code"))

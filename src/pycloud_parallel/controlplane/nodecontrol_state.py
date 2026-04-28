@@ -21,7 +21,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import unquote
 
 from pycloud_parallel.controlplane.artifact import (
@@ -37,6 +37,7 @@ from pycloud_parallel.controlplane.config import (
 from pycloud_parallel.controlplane.data_store import DataStore
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
 from pycloud_parallel.controlplane.executor_backend import ExecutorBackend, create_executor_backend, normalize_executor_backend
+from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.hooks import InMemoryResultHook
 from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
@@ -122,6 +123,8 @@ from pycloud_parallel.data.ref import (
 )
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.serialization import (
+    INLINE_TRANSPORT_CARRIER_SENTINEL,
+    _adapt_blob_for_json_transport,
     decode_transport_payload_bytes,
     detect_transport_mode,
     is_inline_transport_carrier,
@@ -197,6 +200,7 @@ class NodeControlState(NodeRuntimeBase):
         default_task_pool_capacity = max(1, int(os.cpu_count() or 1))
         self.task_pool_worker_capacity = max(1, int(task_pool_worker_capacity or default_task_pool_capacity))
         self.started_at = utc_now()
+        self.node_instance_id = f"{str(node_id or 'node').strip() or 'node'}-{uuid.uuid4().hex[:12]}"
 
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
@@ -207,6 +211,7 @@ class NodeControlState(NodeRuntimeBase):
         self._services: Dict[str, ServiceSession] = {}
         self._pool_result_hook = InMemoryResultHook()
         self._task_pools: Dict[str, TaskPoolState] = {}
+        self._execution_fenced = False
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
         self._code_write_locks: Dict[str, threading.Lock] = {}
@@ -417,6 +422,69 @@ class NodeControlState(NodeRuntimeBase):
         self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
         if self._executor_host is not None:
             self._executor_host.close(shutdown_timeout_sec=2.0)
+
+    def _token_node_instance_valid(self, token_node_instance_id: str) -> bool:
+        normalized = str(token_node_instance_id or "").strip()
+        return not normalized or normalized == str(self.node_instance_id or "").strip()
+
+    def _require_service_token(self, session: ServiceSession, service_token: str) -> None:
+        if not service_token or session.service_token != service_token:
+            raise PermissionError("service_token mismatch")
+        if not self._token_node_instance_valid(getattr(session, "token_node_instance_id", "")):
+            raise PermissionError("service_token node_instance_id mismatch")
+
+    def _service_token_allowed(self, session: ServiceSession, service_token: str) -> bool:
+        token = str(service_token or "").strip()
+        if token and token != session.service_token:
+            return False
+        if token and not self._token_node_instance_valid(getattr(session, "token_node_instance_id", "")):
+            return False
+        return True
+
+    def _require_pool_token(self, pool: TaskPoolState, pool_token: str) -> None:
+        if pool.pool_token != str(pool_token or "").strip():
+            raise PermissionError("pool_token mismatch")
+        if not self._token_node_instance_valid(getattr(pool, "token_node_instance_id", "")):
+            raise PermissionError("pool_token node_instance_id mismatch")
+
+    def reset_execution_state(self, *, reason: str = "node instance reset required") -> str:
+        old_executor = None
+        node_instance_id = str(self.node_instance_id or "")
+        with self._lock:
+            for session in self._services.values():
+                session.status = pb2.SERVICE_STATUS_STOPPED
+                session.executor_ready = False
+                session.alive_workers = 0
+                session.stop_reason = reason
+                session.lease_expire_at = utc_now()
+            for pool in self._task_pools.values():
+                pool.status = "STOPPED"
+                pool.executor_ready = False
+                pool.alive_workers = 0
+                pool.stop_reason = reason
+                pool.lease_expire_at = utc_now()
+            self._services.clear()
+            self._task_pools.clear()
+            self._pool_tasks.clear()
+            self._pool_task_reserved_ids.clear()
+            self._client_code_tokens.clear()
+            self._client_code_managed_globals.clear()
+            self._service_worker_reserved = 0
+            self._task_pool_worker_reserved = 0
+            self._execution_fenced = True
+            old_executor = self._executor_host
+            self._executor_host = None
+            self._cv.notify_all()
+        if old_executor is not None:
+            with contextlib.suppress(Exception):
+                old_executor.close(shutdown_timeout_sec=2.0)
+        logger.warning(
+            "[NodeControl] execution state reset node_id=%s node_instance_id=%s reason=%s",
+            self.node_id,
+            node_instance_id,
+            str(reason or ""),
+        )
+        return node_instance_id
 
     def _create_executor_backend(self) -> ExecutorBackend:
         return create_executor_backend(
@@ -709,7 +777,9 @@ class NodeControlState(NodeRuntimeBase):
         )
 
     def _executor_host_required(self) -> bool:
-        return bool(self.enable_internal_executor or self.enable_service_session)
+        return (not bool(getattr(self, "_execution_fenced", False))) and bool(
+            self.enable_internal_executor or self.enable_service_session
+        )
 
     def _executor_host_alive_locked(self) -> bool:
         return self._executor_host is not None and self._executor_host.is_alive()
@@ -926,6 +996,29 @@ class NodeControlState(NodeRuntimeBase):
             )
         self._objects[result.object_id] = artifact
         return result
+
+    def _stream_result_value_locked(self, result: Any) -> Any:
+        if isinstance(result, StoredResultArtifact):
+            self._register_stored_result_artifact_locked(result)
+            return self.data_store.result_ref_from_stored_artifact(result)
+        return result
+
+    @staticmethod
+    def _encode_stream_line(event: Dict[str, object]) -> bytes:
+        def _json_safe(value: Any) -> Any:
+            if is_inline_transport_carrier(value):
+                meta = dict(value.get(INLINE_TRANSPORT_CARRIER_SENTINEL) or {})
+                meta["content_bytes"] = _adapt_blob_for_json_transport(meta.get("content_bytes", b""))
+                return {INLINE_TRANSPORT_CARRIER_SENTINEL: meta}
+            if isinstance(value, dict):
+                return {key: _json_safe(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [_json_safe(item) for item in value]
+            if isinstance(value, tuple):
+                return [_json_safe(item) for item in value]
+            return value
+
+        return json.dumps(serialize_arrow_compatible(_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
 
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
         return _code_dependency_dir(self._artifact_dir, code_version=code_version)
@@ -1741,6 +1834,7 @@ class NodeControlState(NodeRuntimeBase):
             created_at=now,
             last_heartbeat_at=now,
             lease_expire_at=now,
+            token_node_instance_id=str(self.node_instance_id or ""),
             policy_id=str(policy_id or "").strip().lower() or "default_safe",
             executor_ready=False,
             alive_workers=0,
@@ -1780,6 +1874,7 @@ class NodeControlState(NodeRuntimeBase):
             created_at=now,
             last_heartbeat_at=now,
             lease_expire_at=now,
+            token_node_instance_id=str(self.node_instance_id or ""),
             managed_global_names=tuple(str(name) for name in managed_global_names or ()),
             executor_ready=False,
             alive_workers=0,
@@ -1834,6 +1929,8 @@ class NodeControlState(NodeRuntimeBase):
         chunks: Iterable[bytes],
         service_id: str = "",
     ) -> ServiceSession:
+        if bool(getattr(self, "_execution_fenced", False)):
+            raise RuntimeError("node instance execution is fenced; restart NodeControl to create a new node_instance_id")
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
@@ -1947,6 +2044,7 @@ class NodeControlState(NodeRuntimeBase):
                 created_at=now,
                 last_heartbeat_at=now,
                 lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
+                token_node_instance_id=str(self.node_instance_id or ""),
                 policy_id=str(policy_id or "").strip().lower() or "default_safe",
                 executor_ready=True,
                 alive_workers=actual_workers,
@@ -2036,6 +2134,8 @@ class NodeControlState(NodeRuntimeBase):
         idle_ttl_sec: int,
         chunks: Iterable[bytes],
     ) -> TaskPoolState:
+        if bool(getattr(self, "_execution_fenced", False)):
+            raise RuntimeError("node instance execution is fenced; restart NodeControl to create a new node_instance_id")
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
@@ -2155,6 +2255,7 @@ class NodeControlState(NodeRuntimeBase):
                 created_at=now,
                 last_heartbeat_at=now,
                 lease_expire_at=now + timedelta(seconds=max(5, int(heartbeat_timeout_sec or 30))),
+                token_node_instance_id=str(self.node_instance_id or ""),
                 managed_global_names=normalized_managed_global_names,
                 executor_ready=True,
                 alive_workers=actual_workers,
@@ -2219,8 +2320,7 @@ class NodeControlState(NodeRuntimeBase):
             pool = self._task_pools.get(normalized_pool_id)
             if pool is None:
                 raise KeyError("task pool not found")
-            if not pool.pool_token or pool.pool_token != str(pool_token or "").strip():
-                raise PermissionError("pool_token mismatch")
+            self._require_pool_token(pool, pool_token)
             if pool.status != "RUNNING":
                 raise RuntimeError("task pool not running")
             artifact = self._codes.get(pool.code_version)
@@ -2411,8 +2511,7 @@ class NodeControlState(NodeRuntimeBase):
         cursor: str = "",
     ) -> Tuple[List[pb2.TaskResult], str]:
         pool = self.task_pool(pool_id)
-        if pool.pool_token != str(pool_token or "").strip():
-            raise PermissionError("pool_token mismatch")
+        self._require_pool_token(pool, pool_token)
         results, next_cursor = self._pool_result_hook.pull(
             pool.pool_id,
             limit=max(1, int(limit or 100)),
@@ -2454,8 +2553,7 @@ class NodeControlState(NodeRuntimeBase):
                 raise KeyError("task pool not found")
             if pool.owner_client_id != str(owner_client_id or "").strip():
                 raise PermissionError("owner_client_id mismatch")
-            if pool.pool_token != str(pool_token or "").strip():
-                raise PermissionError("pool_token mismatch")
+            self._require_pool_token(pool, pool_token)
             if self._executor_host is not None and pool.executor_ready:
                 stop_executor = (self._executor_host, str(pool.pool_id))
             pool.executor_ready = False
@@ -2486,8 +2584,7 @@ class NodeControlState(NodeRuntimeBase):
             pool = self._task_pools.get(normalized_pool_id)
             if pool is None:
                 raise KeyError("task pool not found")
-            if pool.pool_token != str(pool_token or "").strip():
-                raise PermissionError("pool_token mismatch")
+            self._require_pool_token(pool, pool_token)
             queued_cancelled = 0
             running_marked = 0
             already_done = 0
@@ -2536,8 +2633,7 @@ class NodeControlState(NodeRuntimeBase):
                 raise KeyError("task pool not found")
             if pool.owner_client_id != str(owner_client_id or "").strip():
                 raise PermissionError("owner_client_id mismatch")
-            if pool.pool_token != str(pool_token or "").strip():
-                raise PermissionError("pool_token mismatch")
+            self._require_pool_token(pool, pool_token)
             if pool.status != "RUNNING":
                 raise RuntimeError("task pool not running")
             now = utc_now()
@@ -2554,8 +2650,7 @@ class NodeControlState(NodeRuntimeBase):
                 raise KeyError("service not found")
             if session.owner_client_id != owner_client_id:
                 raise PermissionError("owner_client_id mismatch")
-            if not service_token or session.service_token != service_token:
-                raise PermissionError("service_token mismatch")
+            self._require_service_token(session, service_token)
             if session.status == pb2.SERVICE_STATUS_STOPPED:
                 raise RuntimeError("service is stopped")
             session.last_heartbeat_at = now
@@ -2571,8 +2666,7 @@ class NodeControlState(NodeRuntimeBase):
                 raise KeyError("service not found")
             if session.owner_client_id != owner_client_id:
                 raise PermissionError("owner_client_id mismatch")
-            if not service_token or session.service_token != service_token:
-                raise PermissionError("service_token mismatch")
+            self._require_service_token(session, service_token)
             self._stop_service_locked(session, reason=reason or "owner requested")
             return session
 
@@ -2637,7 +2731,7 @@ class NodeControlState(NodeRuntimeBase):
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
                 return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
-            if service_token and service_token != session.service_token:
+            if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
             if requested_method not in session.methods:
                 return 404, {"ok": False, "error": f"method not found: {requested_method}"}
@@ -2836,7 +2930,18 @@ class NodeControlState(NodeRuntimeBase):
         timeout_sec: float,
         serialization_mode: str = "",
         use_transport_result: bool = False,
-    ) -> Tuple[int, Dict[str, object]]:
+        stream_response: bool = False,
+    ) -> Union[Tuple[int, Dict[str, object]], StreamingHttpResponse]:
+        if stream_response:
+            return self._invoke_service_stream_http(
+                service_id=service_id,
+                method=method,
+                payload=payload,
+                service_token=service_token,
+                timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
+                use_transport_result=use_transport_result,
+            )
         return self._invoke_service_call(
             service_id=service_id,
             method=method,
@@ -2846,6 +2951,169 @@ class NodeControlState(NodeRuntimeBase):
             serialization_mode=serialization_mode,
             use_transport_result=use_transport_result,
         )
+
+    def _invoke_service_stream_http(
+        self,
+        *,
+        service_id: str,
+        method: str,
+        payload: dict,
+        service_token: str,
+        timeout_sec: float,
+        serialization_mode: str = "",
+        use_transport_result: Optional[bool] = None,
+    ) -> Union[StreamingHttpResponse, Tuple[int, Dict[str, object]]]:
+        total_start = time.perf_counter()
+        requested_method = str(method or "").strip()
+        if not requested_method:
+            return 400, {"ok": False, "error": "method is required"}
+        with self._lock:
+            session = self._services.get(service_id)
+            if session is None:
+                return 404, {"ok": False, "error": "service not found"}
+            if session.status != pb2.SERVICE_STATUS_RUNNING:
+                return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
+            if not self._service_token_allowed(session, service_token):
+                return 401, {"ok": False, "error": "invalid service token"}
+            if requested_method not in session.methods:
+                return 404, {"ok": False, "error": f"method not found: {requested_method}"}
+            artifact = self._codes.get(session.code_version)
+            if artifact is None:
+                return 500, {"ok": False, "error": "artifact missing"}
+            touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
+            self._ensure_executor_host_alive_locked()
+            if not session.executor_ready or self._executor_host is None:
+                return 409, {"ok": False, "error": "service executor stopped"}
+            session.request_count += 1
+            session.in_flight = self._service_inflight_locked(session)
+            prepared_payload = (
+                payload
+                if is_inline_transport_carrier(payload)
+                else self._resolve_memory_object_refs_in_payload_locked(payload or {})
+            )
+        setup_end = time.perf_counter()
+        try:
+            build_start = time.perf_counter()
+            execute_spec = _build_execute_spec(
+                artifact,
+                object_dir=self._object_dir,
+                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                method_name=requested_method,
+                payload=prepared_payload,
+                payload_mode="http_call",
+                serialization_mode=str(serialization_mode or "").strip().lower(),
+                use_transport_result=use_transport_result,
+                managed_globals_scope_dir=session.managed_globals_scope_dir,
+                managed_globals_digest=session.managed_globals_digest,
+            )
+            build_end = time.perf_counter()
+        except Exception as exc:
+            with self._lock:
+                session = self._services.get(service_id)
+                if session is not None:
+                    session.returned_count += 1
+                    session.in_flight = self._service_inflight_locked(session)
+            return 500, {"ok": False, "error": repr(exc)}
+        build_execute_spec_ms = (build_end - build_start) * 1000.0
+        executor_start = build_end
+
+        def _iter_stream():
+            status_text = "FAILED_INFRA"
+            err_type = ""
+            err_message = ""
+            subprocess_timings: Dict[str, Any] = {}
+            item_count = 0
+            executor_end = executor_start
+            try:
+                stream = self._executor_host.call_service_stream(
+                    service_id=service_id,
+                    timeout_sec=max(0.1, timeout_sec),
+                    execute_spec=execute_spec,
+                )
+                for event in stream:
+                    kind = str(event.get("kind", "") or "")
+                    if kind == "service_stream_item":
+                        result = event.get("result")
+                        with self._lock:
+                            result = self._stream_result_value_locked(result)
+                        item_count += 1
+                        yield self._encode_stream_line(
+                            {
+                                "event": "item",
+                                "index": int(event.get("item_index", item_count - 1) or (item_count - 1)),
+                                "data": {} if result is None else result,
+                            }
+                        )
+                        continue
+                    if kind == "service_stream_done":
+                        status_text = str(event.get("status_text", "FAILED_INFRA") or "FAILED_INFRA")
+                        err_type = str(event.get("err_type", "") or "")
+                        err_message = str(event.get("err_message", "") or "")
+                        subprocess_timings = dict(event.get("timings") or {})
+                        result_meta = event.get("result")
+                        if isinstance(result_meta, dict):
+                            item_count = max(item_count, int(result_meta.get("item_count", item_count) or item_count))
+                        executor_end = time.perf_counter()
+                        break
+                else:
+                    executor_end = time.perf_counter()
+                    err_type = "StreamClosed"
+                    err_message = "service stream ended without final response"
+            except TimeoutError:
+                executor_end = time.perf_counter()
+                err_type = "Timeout"
+                err_message = "invoke timeout"
+            except Exception as exc:
+                executor_end = time.perf_counter()
+                err_type = exc.__class__.__name__
+                err_message = repr(exc)
+
+            finalize_start = time.perf_counter()
+            if status_text == "SUCCEEDED":
+                done_event = {"event": "done", "ok": True, "item_count": item_count}
+                http_status = 200
+                ok = True
+                normalized_error_type = ""
+                normalized_error_message = ""
+            else:
+                ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
+                    status_text,
+                    error_type=err_type,
+                    error_message=err_message,
+                    user_fallback="user error",
+                    infra_fallback="infra error",
+                )
+                done_event = {
+                    "event": "done",
+                    "ok": ok,
+                    "item_count": item_count,
+                    "error_type": normalized_error_type,
+                    "error": normalized_error_message,
+                }
+                http_status = 400 if status_text == "FAILED_USER" else 500
+            finalize_end = time.perf_counter()
+            with self._lock:
+                session = self._services.get(service_id)
+                if session is not None:
+                    session.returned_count += 1
+                    session.in_flight = self._service_inflight_locked(session)
+                    self._record_service_timing_locked(
+                        session,
+                        method=requested_method,
+                        ok=(status_text == "SUCCEEDED"),
+                        http_status=http_status,
+                        setup_ms=(setup_end - total_start) * 1000.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
+                        executor_ms=(executor_end - executor_start) * 1000.0,
+                        finalize_ms=(finalize_end - finalize_start) * 1000.0,
+                        total_ms=(finalize_end - total_start) * 1000.0,
+                        subprocess_timings=subprocess_timings or None,
+                        error_type=(normalized_error_type if status_text != "SUCCEEDED" else ""),
+                        error_message=(normalized_error_message if status_text != "SUCCEEDED" else ""),
+                    )
+            yield self._encode_stream_line(done_event)
+
+        return StreamingHttpResponse(status_code=200, body_iter=_iter_stream())
 
     def _service_extra_get_http(
         self,
@@ -2904,8 +3172,7 @@ class NodeControlState(NodeRuntimeBase):
                 raise KeyError("service not found")
             if session.owner_client_id != owner_client_id:
                 raise PermissionError("owner_client_id mismatch")
-            if not service_token or session.service_token != service_token:
-                raise PermissionError("service_token mismatch")
+            self._require_service_token(session, service_token)
             artifact = self._get_live_code_artifact_locked(session.code_version)
             if artifact is None:
                 raise KeyError("code artifact not found")
@@ -3166,6 +3433,8 @@ class NodeControlState(NodeRuntimeBase):
                     if task is None or task.attempt != attempt:
                         continue
                     pool = self._task_pools.get(pool_id)
+                    if pool is None or str(task.client_id or "").strip() != pool_id:
+                        continue
                     task.finished_at = now
                     task.last_heartbeat_at = now
                     total_ms = max(
@@ -3200,21 +3469,20 @@ class NodeControlState(NodeRuntimeBase):
                             task.result = {} if result is None else result
                         task.error_type = ""
                         task.error_message = ""
-                    if pool is not None:
-                        pool.returned_count += 1
-                        self._record_task_pool_timing_locked(
-                            pool,
-                            method=pool.task_method,
-                            ok=ok,
-                            setup_ms=0.0,
-                            build_execute_spec_ms=build_execute_spec_ms,
-                            executor_ms=executor_ms,
-                            finalize_ms=0.0,
-                            total_ms=total_ms,
-                            subprocess_timings=subprocess_timings,
-                            error_type=task.error_type,
-                            error_message=task.error_message,
-                        )
+                    pool.returned_count += 1
+                    self._record_task_pool_timing_locked(
+                        pool,
+                        method=pool.task_method,
+                        ok=ok,
+                        setup_ms=0.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
+                        executor_ms=executor_ms,
+                        finalize_ms=0.0,
+                        total_ms=total_ms,
+                        subprocess_timings=subprocess_timings,
+                        error_type=task.error_type,
+                        error_message=task.error_message,
+                    )
                     self._pool_result_hook.push(pool_id, task.as_result())
                     self._cv.notify_all()
                     continue

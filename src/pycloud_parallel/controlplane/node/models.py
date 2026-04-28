@@ -141,6 +141,7 @@ class ServiceSession:
     created_at: datetime
     last_heartbeat_at: datetime
     lease_expire_at: datetime
+    token_node_instance_id: str = ""
     policy_id: str = "default_safe"
     executor_ready: bool = False
     in_flight: int = 0
@@ -251,6 +252,7 @@ class TaskPoolState:
     created_at: datetime
     last_heartbeat_at: datetime
     lease_expire_at: datetime
+    token_node_instance_id: str = ""
     managed_global_names: Tuple[str, ...] = ()
     managed_globals_scope_dir: str = ""
     managed_globals_digest: str = ""

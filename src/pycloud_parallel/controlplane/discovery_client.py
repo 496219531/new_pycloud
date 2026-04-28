@@ -16,6 +16,7 @@ from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
     DiscoveryCallError,
     _call_route_http,
+    _iter_route_http_stream,
     _is_route_failure,
     _list_route_methods_http,
     _materialize_downloaded_result,
@@ -39,6 +40,7 @@ client_mod = SimpleNamespace(
     _prepare_remote_call_payload=prepare_remote_call_payload,
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     _call_route_http=_call_route_http,
+    _iter_route_http_stream=_iter_route_http_stream,
     DiscoveryCallError=DiscoveryCallError,
     _is_route_failure=_is_route_failure,
     _list_route_methods_http=_list_route_methods_http,

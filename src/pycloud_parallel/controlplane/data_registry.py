@@ -45,6 +45,17 @@ def _normalize_resolved_replicas(replicas: Sequence[Dict[str, object]]) -> Tuple
     return tuple(out)
 
 
+def _node_known_unhealthy(node: object) -> bool:
+    if not hasattr(node, "healthy"):
+        return False
+    return not bool(getattr(node, "healthy", False))
+
+
+def _replica_known_unhealthy(replica: Dict[str, str], healthy_map: Dict[str, bool]) -> bool:
+    node_instance_id = str(replica.get("node_instance_id", "") or "").strip()
+    return bool(node_instance_id) and healthy_map.get(node_instance_id) is False
+
+
 class DataRegistryClient:
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
         self.target = str(target or "").strip()
@@ -161,12 +172,17 @@ class DataRegistryClient:
                         }
                     )
                 replicas = list(_normalize_resolved_replicas(replicas))
+                had_registry_locator = bool(replicas)
                 if replicas:
                     nodes = list(client.list_nodes(healthy_only=False, limit=2000))
-                    healthy_map = {
-                        str(getattr(node, "node_instance_id", "") or "").strip(): bool(getattr(node, "healthy", False))
-                        for node in nodes
-                    }
+                    healthy_map = {}
+                    for node in nodes:
+                        node_instance_id = str(getattr(node, "node_instance_id", "") or "").strip()
+                        if not node_instance_id or not hasattr(node, "healthy"):
+                            continue
+                        healthy_map[node_instance_id] = bool(getattr(node, "healthy", False))
+                    replicas = [item for item in replicas if not _replica_known_unhealthy(item, healthy_map)]
+                if replicas:
                     replicas.sort(
                         key=lambda item: (
                             0 if healthy_map.get(str(item.get("node_instance_id", "") or "").strip(), True) else 1,
@@ -193,7 +209,7 @@ class DataRegistryClient:
                             for item in replicas
                         ),
                     )
-                if control_addr:
+                if control_addr and not had_registry_locator:
                     return ResolvedDataRef(
                         ref=data_ref,
                         control_addr=control_addr,
@@ -218,7 +234,12 @@ class DataRegistryClient:
             node_instance_id = str(data_ref.node_instance_id or "").strip()
             node_id = str(data_ref.node_id or "").strip()
             if node_instance_id:
-                matches = [node for node in nodes if str(getattr(node, "node_instance_id", "") or "").strip() == node_instance_id]
+                matches = [
+                    node
+                    for node in nodes
+                    if str(getattr(node, "node_instance_id", "") or "").strip() == node_instance_id
+                    and not _node_known_unhealthy(node)
+                ]
                 if len(matches) == 1:
                     node = matches[0]
                     control_addr = str(getattr(node, "control_addr", "") or "").strip()
@@ -245,7 +266,12 @@ class DataRegistryClient:
                     raise RuntimeError(f"data ref resolution is ambiguous for node_instance_id={node_instance_id!r}")
 
             if node_id:
-                matches = [node for node in nodes if str(getattr(node, "node_id", "") or "").strip() == node_id]
+                matches = [
+                    node
+                    for node in nodes
+                    if str(getattr(node, "node_id", "") or "").strip() == node_id
+                    and not _node_known_unhealthy(node)
+                ]
                 if len(matches) == 1:
                     node = matches[0]
                     control_addr = str(getattr(node, "control_addr", "") or "").strip()

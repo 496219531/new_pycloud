@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Communication-layer helpers extracted from controlplane client."""
 
+import contextlib
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -23,6 +24,8 @@ from pycloud_parallel.controlplane.payload_transport import (
     encode_payload_for_transport,
 )
 from pycloud_parallel.controlplane.serialization import (
+    INLINE_TRANSPORT_CARRIER_SENTINEL,
+    _restore_blob_from_json_transport,
     decode_transport_payload_bytes,
     encode_transport_payload_bytes,
     detect_transport_mode,
@@ -256,6 +259,20 @@ def _decode_http_response_with_headers(body: bytes, *, headers, control_addr: st
     return _decode_http_response_body(body, control_addr=control_addr)
 
 
+def _restore_stream_transport_carrier(value: Any) -> Any:
+    if isinstance(value, dict) and INLINE_TRANSPORT_CARRIER_SENTINEL in value:
+        meta = dict(value.get(INLINE_TRANSPORT_CARRIER_SENTINEL) or {})
+        content_bytes = meta.get("content_bytes", None)
+        if isinstance(content_bytes, dict):
+            meta["content_bytes"] = _restore_blob_from_json_transport(content_bytes)
+        return {INLINE_TRANSPORT_CARRIER_SENTINEL: meta}
+    if isinstance(value, dict):
+        return {key: _restore_stream_transport_carrier(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_restore_stream_transport_carrier(item) for item in value]
+    return value
+
+
 def _is_bundle_format(fmt: str, *, expected: str) -> bool:
     return str(fmt or "").strip().lower() == expected
 
@@ -447,6 +464,85 @@ def _call_route_http(
     if not data.get("ok", False):
         raise DiscoveryCallError(status_code=502, data=data)
     return data
+
+
+def _iter_route_http_stream(
+    route: Any,
+    *,
+    method: str,
+    payload: Dict[str, object],
+    timeout_sec: float,
+    service_token: str,
+    serialization_mode: str = "",
+    payload_policy: Optional[PayloadPolicy] = None,
+    effective_policy: Optional["EffectivePolicy"] = None,
+):
+    url = (
+        f"{route.http_base_url}/call/{quote(method, safe='')}"
+        f"?timeout_sec={max(0.1, timeout_sec):.3f}&stream=1"
+    )
+    headers: Dict[str, str] = {"Accept": "application/x-ndjson"}
+    if service_token:
+        headers["X-Service-Token"] = service_token
+    if _should_use_http_bytes_transport(
+        mode=serialization_mode,
+        effective_policy=effective_policy,
+    ):
+        request_body, transport_headers, _codec = _encode_http_transport_body(
+            payload,
+            context="service_internal",
+            mode=serialization_mode,
+            payload_policy=payload_policy,
+            effective_policy=effective_policy,
+        )
+        headers.update(transport_headers)
+    else:
+        headers["Content-Type"] = "application/json"
+        serialized_payload = _serialize_http_call_payload(
+            payload,
+            context="service call payload",
+            mode=serialization_mode,
+            payload_policy=payload_policy,
+            effective_policy=effective_policy,
+        )
+        request_body = json.dumps(serialized_payload).encode("utf-8")
+    req = Request(url=url, method="POST", headers=headers, data=request_body)
+    try:
+        resp = urlopen(req, timeout=max(2.0, timeout_sec + 1.0))
+    except HTTPError as exc:
+        try:
+            raw = exc.read() or b"{}"
+            data = _decode_http_response_with_headers(
+                raw,
+                headers=getattr(exc, "headers", {}) or {},
+            )
+        except Exception:
+            data = {"ok": False, "error": exc.reason}
+        raise DiscoveryCallError(status_code=exc.code, data=data) from exc
+    except Exception as exc:
+        raise DiscoveryCallError(status_code=502, data={"ok": False, "error": repr(exc)}) from exc
+
+    def _iter():
+        try:
+            while True:
+                raw_line = resp.readline()
+                if not raw_line:
+                    break
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line.decode("utf-8"))
+                except Exception as exc:
+                    raise DiscoveryCallError(status_code=502, data={"ok": False, "error": f"invalid stream event: {exc}"}) from exc
+                if not isinstance(event, dict):
+                    raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "invalid stream event payload"})
+                yield _restore_stream_transport_carrier(event)
+        finally:
+            with contextlib.suppress(Exception):
+                resp.close()
+
+    return _iter()
 
 
 def _list_route_methods_http(

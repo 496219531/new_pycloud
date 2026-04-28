@@ -114,6 +114,7 @@ finally:
    - 是 service group / task pool / InfoCenter 内部使用的唯一键
    - 当你需要精确指定某一个同名节点实例时，应优先使用 `node_instance_id`
    - 动态补偿会按它记录失败副本；同一个 `node_id` 重启后如果生成新的 `node_instance_id`，会重新进入候选
+   - 失效实例不能复用旧 `node_instance_id` 恢复执行状态；应清理 service/taskpool/executor/worker 后以新实例重新注册
 
 要点：
 
@@ -403,10 +404,17 @@ pycloudctl gc --scope all --older-than-hours 168
 2. 过滤 `healthy=false`
 3. 过滤 `schedulable=false`
 4. 过滤 `drain=true`
-5. 如果指定了 `runtime`，先按节点 `python_version` 过滤
-6. 按 `service_worker_available` 选节点
-7. 部署后如果新 node 加入或旧 node 重启为新实例，owner 会在 keepalive 后台尝试补齐目标副本数
-8. 创建失败或 host 失败的 service 会在 InfoCenter `/ops` 的 `failure_reason` 中显示原因
+5. 过滤 `accept_service_deploy=false`
+6. 如果指定了 `runtime`，先按节点 `python_version` 过滤
+7. 按 `service_worker_available` 选节点
+8. 部署后如果新 node 加入或旧 node 重启为新实例，owner 会在 keepalive 后台尝试补齐目标副本数
+9. 创建失败或 host 失败的 service 会在 InfoCenter `/ops` 的 `failure_reason` 中显示原因
+
+补充：
+
+1. `drain` 节点不接新 service 调用，但 owner 命令仍应能到达，例如 `update_globals`、`close`、`shutdown`。
+2. `cordon` 节点不接新部署；已有 RUNNING 服务是否继续路由由 `drain` 决定。
+3. 排他性部署和版本冲突检查要看 drain/cordon 节点上的已有服务，不能只看当前可路由服务。
 
 ## 7. 与轻量 caller 的区别
 

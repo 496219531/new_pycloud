@@ -13,6 +13,23 @@ from typing import Any, Deque, Dict, Optional
 from pycloud_parallel.controlplane.executor_core import ExecutorCore
 
 
+def _simple_queue_get_if_ready(simple_queue, *, timeout: float = 0.0):
+    reader = getattr(simple_queue, "_reader", None)
+    if reader is not None:
+        try:
+            if not reader.poll(max(0.0, float(timeout))):
+                return None
+            return simple_queue.get()
+        except (EOFError, OSError):
+            return None
+    try:
+        if simple_queue.empty():
+            return None
+        return simple_queue.get()
+    except (EOFError, OSError):
+        return None
+
+
 def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     os.environ["PYCLOUD_EXECUTOR_PARENT_KIND"] = "executor_host"
 
@@ -26,10 +43,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     )
     running = True
     while running:
-        if request_q.empty():
-            message = None
-        else:
-            message = request_q.get()
+        message = _simple_queue_get_if_ready(request_q, timeout=0.01)
         if isinstance(message, dict):
             running = core.handle_request(
                 str(message.get("request_id", "") or ""),
@@ -38,7 +52,7 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
             )
         core.poll_once()
         if message is None:
-            time.sleep(0.01)
+            time.sleep(0.001)
     core.close()
 
 
@@ -48,6 +62,7 @@ class ExecutorHostClient:
         self._request_q = self._ctx.SimpleQueue()
         self._event_q = self._ctx.SimpleQueue()
         self._responses: Dict[str, Dict[str, Any]] = {}
+        self._stream_events: Dict[str, Deque[Dict[str, Any]]] = {}
         self._expired_requests: set[str] = set()
         self._async_events: Deque[Dict[str, Any]] = deque()
         self._worker_pids: set[int] = set()
@@ -69,10 +84,9 @@ class ExecutorHostClient:
 
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
-            if self._event_q.empty():
-                time.sleep(0.05)
+            item = _simple_queue_get_if_ready(self._event_q, timeout=0.05)
+            if item is None:
                 continue
-            item = self._event_q.get()
             if not isinstance(item, dict):
                 continue
             kind = str(item.get("kind", "") or "")
@@ -93,6 +107,13 @@ class ExecutorHostClient:
                         self._expired_requests.discard(request_id)
                         continue
                     self._responses[request_id] = item
+                    self._cv.notify_all()
+                elif kind == "service_stream_item":
+                    request_id = str(item.get("request_id", "") or "")
+                    if request_id in self._expired_requests:
+                        self._expired_requests.discard(request_id)
+                        continue
+                    self._stream_events.setdefault(request_id, deque()).append(item)
                     self._cv.notify_all()
                 else:
                     self._async_events.append(item)
@@ -162,10 +183,19 @@ class ExecutorHostClient:
     def _request(self, action: str, *, payload: Optional[Dict[str, Any]] = None, timeout_sec: float = 10.0) -> Dict[str, Any]:
         if self._closed and action != "shutdown":
             raise RuntimeError("executor host is closed")
+        request_id = self._send_request(action, payload=payload)
+        return self._wait_response(request_id, action=action, timeout_sec=timeout_sec)
+
+    def _send_request(self, action: str, *, payload: Optional[Dict[str, Any]] = None) -> str:
+        if self._closed and action != "shutdown":
+            raise RuntimeError("executor host is closed")
         with self._cv:
             self._seq += 1
             request_id = f"req-{self._seq}"
         self._request_q.put({"request_id": request_id, "action": action, "payload": dict(payload or {})})
+        return request_id
+
+    def _wait_response(self, request_id: str, *, action: str, timeout_sec: float) -> Dict[str, Any]:
         deadline = time.monotonic() + max(0.1, float(timeout_sec))
         with self._cv:
             while request_id not in self._responses:
@@ -260,6 +290,54 @@ class ExecutorHostClient:
             timeout_sec=max(1.0, float(timeout_sec) + 2.0),
             raise_on_error=False,
         )
+
+    def call_service_stream(self, *, service_id: str, timeout_sec: float, execute_spec: Dict[str, Any]):
+        request_id = self._send_request(
+            "call_service_stream",
+            payload={"service_id": service_id, "timeout_sec": float(timeout_sec), **dict(execute_spec)},
+        )
+        deadline = time.monotonic() + max(1.0, float(timeout_sec) + 2.0)
+
+        def _iter():
+            try:
+                while True:
+                    with self._cv:
+                        while request_id not in self._responses and not self._stream_events.get(request_id):
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                self._responses.pop(request_id, None)
+                                self._stream_events.pop(request_id, None)
+                                self._expired_requests.add(request_id)
+                                raise TimeoutError("executor host request timed out: call_service_stream")
+                            if not self._process.is_alive():
+                                raise RuntimeError("executor host process died")
+                            self._cv.wait(timeout=min(0.1, remaining))
+                        queue = self._stream_events.get(request_id)
+                        if queue:
+                            item = queue.popleft()
+                            if not queue:
+                                self._stream_events.pop(request_id, None)
+                        else:
+                            item = None
+                        response = self._responses.pop(request_id, None)
+                    if item is not None:
+                        yield item
+                        if response is None:
+                            continue
+                    if response is None:
+                        continue
+                    if not response.get("ok", False):
+                        raise RuntimeError(str(response.get("error", "call_service_stream failed")))
+                    done_event = dict(response)
+                    done_event["kind"] = "service_stream_done"
+                    yield done_event
+                    return
+            finally:
+                with self._cv:
+                    self._stream_events.pop(request_id, None)
+                    self._responses.pop(request_id, None)
+
+        return _iter()
 
     def warmup_service(self, *, service_id: str, fanout: int, execute_spec: Dict[str, Any]) -> int:
         return self._warmup("warmup_service", identity={"service_id": service_id}, fanout=fanout, execute_spec=execute_spec)

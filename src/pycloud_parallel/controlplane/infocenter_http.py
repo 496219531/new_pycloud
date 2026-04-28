@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.data_ref import coerce_data_ref
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
+from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.node_capability import NodeCapability
@@ -105,6 +106,11 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             service_id=service_id,
             status=max(0, int(item.get("status", 0) or 0)),
             policy_id=str(item.get("policy_id", "") or "default_safe"),
+            owner_client_id=str(item.get("owner_client_id", "") or ""),
+            code_version=str(item.get("code_version", "") or ""),
+            entry_module=str(item.get("entry_module", "") or ""),
+            entry_callable=str(item.get("entry_callable", "") or ""),
+            serialization_mode=str(item.get("serialization_mode", "") or ""),
             worker_count=max(0, int(item.get("worker_count", 0) or 0)),
             alive_workers=max(0, int(item.get("alive_workers", 0) or 0)),
             in_flight=max(0, int(item.get("in_flight", 0) or 0)),
@@ -318,6 +324,11 @@ def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) 
         "status": int(service.status),
         "status_text": status_text,
         "policy_id": str(service.policy_id or "").strip().lower() or "default_safe",
+        "owner_client_id": str(getattr(service, "owner_client_id", "") or ""),
+        "code_version": str(getattr(service, "code_version", "") or ""),
+        "entry_module": str(getattr(service, "entry_module", "") or ""),
+        "entry_callable": str(getattr(service, "entry_callable", "") or ""),
+        "serialization_mode": str(getattr(service, "serialization_mode", "") or ""),
         "node_healthy": bool(node_healthy),
         "worker_count": int(service.worker_count),
         "alive_workers": int(service.alive_workers if node_healthy else 0),
@@ -969,9 +980,24 @@ class InfoCenterHttpServer:
                     payload = self._read_json()
                     if payload is None:
                         return
+                    node_instance_id = str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip()
+                    if state.is_instance_fenced(node_instance_id):
+                        self._send_json(
+                            200,
+                            {
+                                "ok": False,
+                                "accepted": False,
+                                "reset_required": True,
+                                "new_instance_required": True,
+                                "lease_ttl_sec": state.lease_ttl_sec,
+                                "reason": "node_instance_id fenced",
+                                "error": "node_instance_id fenced",
+                            },
+                        )
+                        return
                     try:
                         node = state.register_node_record(
-                            node_instance_id=str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip(),
+                            node_instance_id=node_instance_id,
                             node_id=str(payload.get("node_id", "")).strip(),
                             control_addr=str(payload.get("control_addr", "")).strip(),
                             capacity=max(1, int(payload.get("capacity", 1) or 1)),
@@ -996,15 +1022,40 @@ class InfoCenterHttpServer:
                     except ValueError as exc:
                         self._send_json(400, {"ok": False, "error": str(exc)})
                         return
-                    self._send_json(200, {"ok": True, "heartbeat_interval_sec": state.heartbeat_interval_sec, "node": _serialize_node(node)})
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "reset_required": False,
+                            "heartbeat_interval_sec": state.heartbeat_interval_sec,
+                            "lease_ttl_sec": state.lease_ttl_sec,
+                            "node": _serialize_node(node),
+                        },
+                    )
                     return
                 if parsed.path == "/nodes/heartbeat":
                     payload = self._read_json()
                     if payload is None:
                         return
+                    node_instance_id = str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip()
+                    if state.is_instance_fenced(node_instance_id):
+                        self._send_json(
+                            200,
+                            {
+                                "ok": False,
+                                "accepted": False,
+                                "reset_required": True,
+                                "new_instance_required": True,
+                                "lease_ttl_sec": state.lease_ttl_sec,
+                                "reason": "node_instance_id fenced",
+                                "error": "node_instance_id fenced",
+                            },
+                        )
+                        return
                     metrics_raw = payload.get("metrics") or {}
                     node = state.heartbeat_record(
-                        node_instance_id=str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip(),
+                        node_instance_id=node_instance_id,
                         node_id=str(payload.get("node_id", "")).strip(),
                         healthy=bool(payload.get("healthy", True)),
                         metrics=NodeMetricsState(
@@ -1033,7 +1084,15 @@ class InfoCenterHttpServer:
                     if node is None:
                         self._send_json(404, {"ok": False, "error": "unknown node"})
                         return
-                    self._send_json(200, {"ok": True, "accepted": True, "next_heartbeat_in_sec": state.heartbeat_interval_sec})
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "next_heartbeat_in_sec": state.heartbeat_interval_sec,
+                            "lease_ttl_sec": state.lease_ttl_sec,
+                        },
+                    )
                     return
                 if parsed.path == "/data/register":
                     payload = self._read_json()
@@ -1062,7 +1121,7 @@ class InfoCenterHttpServer:
                         if not control_addr:
                             continue
                         try:
-                            with NodeControlClient(control_addr, timeout_sec=5.0) as client:
+                            with NodeControlClient(control_addr, timeout_sec=0.5) as client:
                                 client.pin_object(
                                     object_id=str(entry.storage_id or entry.ref_id or ""),
                                     ref_id=str(entry.ref_id or ""),
@@ -1105,7 +1164,7 @@ class InfoCenterHttpServer:
                             if not control_addr:
                                 continue
                             try:
-                                with NodeControlClient(control_addr, timeout_sec=5.0) as client:
+                                with NodeControlClient(control_addr, timeout_sec=0.5) as client:
                                     client.release_object_ref(
                                         object_id=str(entry.storage_id or entry.ref_id or ""),
                                         ref_id=str(entry.ref_id or ""),
@@ -1208,7 +1267,9 @@ class InfoCenterHttpServer:
                         content_length=length,
                     )
                     if handled is not None:
-                        if len(handled) == 4:
+                        if len(handled) == 1 and isinstance(handled[0], StreamingHttpResponse):
+                            self._send_stream(handled[0])
+                        elif len(handled) == 4:
                             code, resp, content_type, extra_headers = handled
                             self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
                         else:
@@ -1220,7 +1281,9 @@ class InfoCenterHttpServer:
                         return
                     handled = gateway_app.handle_post(path=self.path, headers=self.headers, body=body)
                     if handled is not None:
-                        if len(handled) == 4:
+                        if len(handled) == 1 and isinstance(handled[0], StreamingHttpResponse):
+                            self._send_stream(handled[0])
+                        elif len(handled) == 4:
                             code, resp, content_type, extra_headers = handled
                             self._send_body(code, resp, content_type=content_type, extra_headers=extra_headers)
                         else:
@@ -1255,11 +1318,18 @@ class InfoCenterHttpServer:
                     service_name = str((qs.get("service_name", [""]) or [""])[0])
                     healthy_only = str((qs.get("healthy_only", ["true"]) or ["true"])[0]).lower() not in ("0", "false", "no")
                     limit = max(1, int((qs.get("limit", ["500"]) or ["500"])[0]))
-                    routes = state.list_service_routes(service_name=service_name, healthy_only=healthy_only, limit=limit)
+                    route_scope = str((qs.get("route_scope", ["call"]) or ["call"])[0] or "call")
+                    routes = state.list_service_routes(
+                        service_name=service_name,
+                        healthy_only=healthy_only,
+                        limit=limit,
+                        route_scope=route_scope,
+                    )
                     logger.info(
-                        "[InfoCenter] GET /services/routes service_name=%s healthy_only=%s limit=%d count=%d",
+                        "[InfoCenter] GET /services/routes service_name=%s healthy_only=%s route_scope=%s limit=%d count=%d",
                         service_name,
                         healthy_only,
+                        route_scope,
                         limit,
                         len(routes),
                     )
@@ -1385,6 +1455,27 @@ class InfoCenterHttpServer:
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
                     self.wfile.write(raw)
+                except Exception as exc:
+                    if not _is_client_disconnect_error(exc):
+                        raise
+
+            def _send_stream(self, response: StreamingHttpResponse) -> None:
+                try:
+                    self.send_response(int(response.status_code or 200))
+                    self.send_header("Content-Type", str(response.content_type or "application/x-ndjson; charset=utf-8"))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    for key, value in dict(response.extra_headers or {}).items():
+                        if str(key).lower() == "content-type":
+                            continue
+                        self.send_header(str(key), str(value))
+                    self.end_headers()
+                    for chunk in response.body_iter:
+                        if not chunk:
+                            continue
+                        raw = chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode("utf-8")
+                        self.wfile.write(raw)
+                        self.wfile.flush()
                 except Exception as exc:
                     if not _is_client_disconnect_error(exc):
                         raise
