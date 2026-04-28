@@ -11,6 +11,7 @@ import threading
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.error import HTTPError
@@ -171,6 +172,93 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
                 "duplicate_count": duplicate_count,
                 "service_ids": [str(item.service_id or "") for item in ordered],
             }
+        )
+    return merged
+
+
+def _merge_nodes_for_display(nodes: List[object]) -> List[object]:
+    grouped: Dict[str, List[object]] = {}
+    for node in nodes:
+        key = str(getattr(node, "control_addr", "") or "").strip()
+        if not key:
+            key = str(getattr(node, "node_instance_id", "") or getattr(node, "node_id", "") or "").strip()
+        grouped.setdefault(key, []).append(node)
+
+    merged: List[object] = []
+    for _endpoint, items in sorted(grouped.items(), key=lambda item: item[0]):
+        ordered = sorted(
+            items,
+            key=lambda node: (
+                bool(getattr(node, "healthy", False)),
+                getattr(node, "last_seen_at", utc_now()),
+                str(getattr(node, "node_instance_id", "") or ""),
+            ),
+            reverse=True,
+        )
+        primary = ordered[0]
+        if len(ordered) == 1:
+            merged.append(primary)
+            continue
+
+        services: Dict[str, NodeServiceState] = {}
+        task_pools: Dict[str, NodeTaskPoolInfo] = {}
+        active_runtimes = set()
+        node_ids = []
+        instance_ids = []
+        reasons = []
+        tags = set()
+        for node in ordered:
+            node_id = str(getattr(node, "node_id", "") or "").strip()
+            instance_id = str(getattr(node, "node_instance_id", "") or "").strip()
+            if node_id and node_id not in node_ids:
+                node_ids.append(node_id)
+            if instance_id and instance_id not in instance_ids:
+                instance_ids.append(instance_id)
+            reason = str(getattr(node, "reason", "") or "").strip()
+            if reason and reason not in reasons:
+                reasons.append(reason)
+            tags.update(str(tag) for tag in (getattr(node, "tags", []) or []) if str(tag))
+            active_runtimes.update(str(item) for item in (getattr(node, "active_runtimes", []) or []) if str(item))
+            services.update(dict(getattr(node, "services", {}) or {}))
+            task_pools.update(dict(getattr(node, "task_pools", {}) or {}))
+
+        merged.append(
+            SimpleNamespace(
+                node_instance_id=", ".join(instance_ids) or str(getattr(primary, "node_instance_id", "") or ""),
+                action_node_instance_id=str(getattr(primary, "node_instance_id", "") or ""),
+                node_id=", ".join(node_ids) or str(getattr(primary, "node_id", "") or ""),
+                control_addr=str(getattr(primary, "control_addr", "") or ""),
+                capacity=max(int(getattr(node, "capacity", 0) or 0) for node in ordered),
+                queue_capacity=max(int(getattr(node, "queue_capacity", 0) or 0) for node in ordered),
+                tags=sorted(tags),
+                version=str(getattr(primary, "version", "") or ""),
+                python_version=str(getattr(primary, "python_version", "") or ""),
+                metadata=dict(getattr(primary, "metadata", {}) or {}),
+                healthy=any(bool(getattr(node, "healthy", False)) for node in ordered),
+                last_seen_at=max(getattr(node, "last_seen_at", utc_now()) for node in ordered),
+                metrics=getattr(primary, "metrics"),
+                services=services,
+                task_pools=task_pools,
+                active_runtimes=sorted(active_runtimes),
+                service_worker_capacity=max(int(getattr(node, "service_worker_capacity", 0) or 0) for node in ordered),
+                service_worker_used=max(int(getattr(node, "service_worker_used", 0) or 0) for node in ordered),
+                task_pool_worker_capacity=max(int(getattr(node, "task_pool_worker_capacity", 0) or 0) for node in ordered),
+                task_pool_worker_used=max(int(getattr(node, "task_pool_worker_used", 0) or 0) for node in ordered),
+                accept_service_deploy=any(bool(getattr(node, "accept_service_deploy", True)) for node in ordered),
+                schedulable=any(bool(getattr(node, "schedulable", False)) for node in ordered),
+                drain=all(bool(getattr(node, "drain", False)) for node in ordered),
+                reason="; ".join(reasons + [f"merged_nodes={len(ordered)}"]),
+                capability=getattr(primary, "capability"),
+                service_worker_available=lambda nodes=tuple(ordered): max(
+                    0,
+                    max(int(getattr(node, "service_worker_available")()) for node in nodes),
+                ),
+                task_pool_worker_available=lambda nodes=tuple(ordered): max(
+                    0,
+                    max(int(getattr(node, "task_pool_worker_available")()) for node in nodes),
+                ),
+                active_runtime_count=lambda count=len(active_runtimes): count,
+            )
         )
     return merged
 
@@ -481,9 +569,10 @@ def _reorder_job_via_http(http_base_url: str, job_id: str, *, direction: str, au
 
 
 def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager] = None) -> str:
-    nodes = state.list_nodes(healthy_only=False, tags=(), limit=10000)
+    nodes = _merge_nodes_for_display(state.list_nodes(healthy_only=False, tags=(), limit=10000))
     node_rows: List[str] = []
     service_rows: List[str] = []
+    service_entries: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
     pool_entries: List[tuple] = []
     job_queue_rows: List[str] = []
     recent_job_rows: List[tuple] = []
@@ -593,41 +682,22 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
             "<td>"
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/uncordon' style='display:inline'><button type='submit'>uncordon</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/drain' style='display:inline'><button type='submit'>drain</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'node_instance_id', node.node_id))}/undrain' style='display:inline'><button type='submit'>undrain</button></form>"
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/uncordon' style='display:inline'><button type='submit'>uncordon</button></form> "
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/drain' style='display:inline'><button type='submit'>drain</button></form> "
+            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/undrain' style='display:inline'><button type='submit'>undrain</button></form>"
             "</td>"
             "</tr>"
         )
         for item in merged_services:
-            svc = item["primary"]
-            stale_row = "" if node_healthy else " class='stale-row'"
-            timing = timing_map.get(str(item["service_id"]), {})
-            service_id_text = html.escape(str(item["service_id"]) or "-")
-            if int(item["duplicate_count"]) > 1:
-                service_id_text = f"{service_id_text} (+{int(item['duplicate_count']) - 1})"
-            service_rows.append(
-                f"<tr{stale_row}>"
-                f"<td>{html.escape(node.node_id)}</td>"
-                f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
-                f"<td>{html.escape(str(item['service_name']))}</td>"
-                f"<td>{service_id_text}</td>"
-                f"<td>{'yes' if node_healthy else 'no'}</td>"
-                f"<td>{html.escape(_effective_service_status_text(node_healthy=node_healthy, service_status=int(item['status'])))}</td>"
-                f"<td>{int(item['worker_count'])}</td>"
-                f"<td>{int(item['alive_workers']) if node_healthy else 0}</td>"
-                f"<td>{int(item['in_flight']) if node_healthy else 0}</td>"
-                f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
-                f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
-                f"<td>{html.escape(_dt_text(item['lease_expire_at']))}</td>"
-                f"<td>{html.escape(str(item.get('stop_reason', '') or '-'))}</td>"
-                f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
-                "</tr>"
+            key = (str(item.get("service_name", "") or ""), _service_endpoint_key(str(item.get("http_base_url", "") or "")))
+            service_entries.setdefault(key, []).append(
+                {
+                    "node": node,
+                    "node_healthy": node_healthy,
+                    "item": item,
+                    "timing": timing_map.get(str(item["service_id"]), {}),
+                }
             )
         for pool in task_pools:
             stale_row = "" if node_healthy else " class='stale-row'"
@@ -723,6 +793,69 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                         "</tr>"
                     )
                 )
+    for (_service_name, _endpoint), entries in sorted(service_entries.items(), key=lambda item: item[0]):
+        ordered = sorted(
+            entries,
+            key=lambda entry: (
+                bool(entry["node_healthy"]),
+                int(entry["item"].get("status", 0) == pb2.SERVICE_STATUS_RUNNING),
+                getattr(entry["item"].get("primary"), "lease_expire_at", utc_now()),
+                int(entry["item"].get("alive_workers", 0) or 0),
+            ),
+            reverse=True,
+        )
+        primary = ordered[0]
+        item = primary["item"]
+        timing = dict(primary["timing"] or {})
+        any_healthy = any(bool(entry["node_healthy"]) for entry in ordered)
+        node_ids = sorted({str(entry["node"].node_id or "") for entry in ordered if str(entry["node"].node_id or "")})
+        instance_ids = sorted(
+            {
+                str(getattr(entry["node"], "node_instance_id", "") or "")
+                for entry in ordered
+                if str(getattr(entry["node"], "node_instance_id", "") or "")
+            }
+        )
+        service_ids = []
+        for entry in ordered:
+            service_ids.extend(str(value) for value in (entry["item"].get("service_ids") or ()) if str(value))
+        unique_service_ids = sorted(set(service_ids))
+        service_id_text = html.escape(str(item["service_id"]) or "-")
+        duplicate_count = len(unique_service_ids) or len(ordered)
+        if duplicate_count > 1:
+            service_id_text = f"{service_id_text} (+{duplicate_count - 1})"
+        stop_reason = "; ".join(
+            sorted(
+                {
+                    str(entry["item"].get("stop_reason", "") or "").strip()
+                    for entry in ordered
+                    if str(entry["item"].get("stop_reason", "") or "").strip()
+                }
+            )
+        )
+        stale_row = "" if any_healthy else " class='stale-row'"
+        service_rows.append(
+            f"<tr{stale_row}>"
+            f"<td>{html.escape(', '.join(node_ids) or '-')}</td>"
+            f"<td>{html.escape(', '.join(instance_ids) or '-')}</td>"
+            f"<td>{html.escape(str(item['service_name']))}</td>"
+            f"<td>{service_id_text}</td>"
+            f"<td>{'yes' if any_healthy else 'no'}</td>"
+            f"<td>{html.escape(_effective_service_status_text(node_healthy=any_healthy, service_status=int(item['status'])))}</td>"
+            f"<td>{max(int(entry['item'].get('worker_count', 0) or 0) for entry in ordered)}</td>"
+            f"<td>{max(int(entry['item'].get('alive_workers', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
+            f"<td>{max(int(entry['item'].get('in_flight', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
+            f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
+            f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
+            f"<td>{html.escape(str(timing.get('avg_total_ms', '-')))}</td>"
+            f"<td>{html.escape(str(timing.get('avg_child_decode_ms', '-')))}</td>"
+            f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
+            f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
+            f"<td>{html.escape(_dt_text(max(entry['item'].get('lease_expire_at', utc_now()) for entry in ordered)))}</td>"
+            f"<td>{html.escape(stop_reason or '-')}</td>"
+            f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
+            "</tr>"
+        )
     node_body = "\n".join(node_rows) or "<tr><td colspan='21'>no nodes</td></tr>"
     service_body = "\n".join(service_rows) or "<tr><td colspan='18'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)

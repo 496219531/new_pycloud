@@ -1,6 +1,6 @@
 # 长期上下文（Long-Term Context）
 
-最后更新：2026-04-25（Asia/Shanghai）
+最后更新：2026-04-28（Asia/Shanghai）
 适用范围：`new_pycloud` 主仓库（V1 公开面与控制面实现）
 
 ## 1. 这份文件的目的
@@ -76,7 +76,17 @@ V1 公开概念固定为：
 2. keepalive 不是纯本地状态刷新，会触发远端心跳与租约续期
 3. 任何绕过接收端上下文校验的“声明式 mode 信任”都应视为高风险设计
 
-## 6. 回归测试最小集合（改动前后必看）
+## 6. 动态补偿与失败可观测性基线
+
+1. Service / TaskPool 动态补偿由 owner client 侧驱动，不增加 InfoCenter 的调度职责
+2. 补偿按活跃副本数判断是否低于目标副本数，失败副本不占用目标数量
+3. 失败副本以 `node_instance_id` 为准记录和跳过，不按可重复的 `node_id` 永久排除
+4. 同一 `node_id` 重启后如果获得新的 `node_instance_id`，应重新进入补偿候选
+5. service/taskpool 创建失败或 executor host 失败时，node 侧应保留 STOPPED 诊断记录
+6. InfoCenter `/ops` 必须显示每条失败 service/taskpool 的 `failure_reason`
+7. 健康服务路由查询仍只返回健康节点上的 `RUNNING` 服务，诊断记录不能污染调用路由
+
+## 7. 回归测试最小集合（改动前后必看）
 
 建议至少覆盖：
 
@@ -89,8 +99,14 @@ V1 公开概念固定为：
    - `policy_id` 禁止路径
 3. `tests/test_effective_policy.py` / `tests/test_policy_profile.py`
    - 绑定与有效策略解析
+4. `tests/test_service_api.py` / `tests/test_taskpool_api.py`
+   - 动态补偿
+   - 失败旧实例跳过
+   - 同 `node_id` 新 `node_instance_id` 可重新加入
+5. `tests/test_infocenter_registrar.py`
+   - `/ops` 展示 service/taskpool 失败原因
 
-## 7. 新需求进入时的决策流程
+## 8. 新需求进入时的决策流程
 
 1. 先判断是“codec 问题”还是“policy 问题”
 2. 若涉及默认行为，优先改 binding/profile，不在业务调用链硬编码分支
@@ -100,11 +116,11 @@ V1 公开概念固定为：
    - 对应文档（本文件 + `ARCHITECTURE_OVERVIEW.md` + `CLIENT_SURFACE_OVERVIEW.md`）
    - 对应测试
 
-## 8. 近期精简路线
+## 9. 近期精简路线
 
 这部分不是行为边界，而是给 coder 的低风险重构顺序。目标是减少重复实现，降低后续继续加 timing / policy / transport 字段时的同步成本。
 
-### 8.1 优先级顺序
+### 9.1 优先级顺序
 
 1. `nodecontrol_state.py`：收口 service/task-pool timing recorder
 2. `node_control_client.py`：收口 object upload 的 file/bytes + precheck/single-pass 分支
@@ -112,7 +128,7 @@ V1 公开概念固定为：
 4. `job_queue.py`：收口 job staged refs 的 touch/release helpers
 5. `support.py` / `artifact.py`：集中 artifact packaging 默认值
 
-### 8.2 重构约束
+### 9.2 重构约束
 
 1. 第一轮只做结构精简，不改变对外 API 和默认行为
 2. `timing_metrics` 字段名保持兼容，`/ops` 页面展示不回归
@@ -120,14 +136,14 @@ V1 公开概念固定为：
 4. `JobQueue` 的 `pool_action`、`pool_prepare_ms`、`warmup_ms`、`running_tasks_ms`、`first_result_wait_ms` 等 timing 字段不能丢
 5. artifact packaging 的 `include_tests` 默认值先集中管理，是否切到 `False` 作为单独性能优化决策处理
 
-### 8.3 验收建议
+### 9.3 验收建议
 
 1. 跑现有 `JobQueue` / shared pool / mode switch 回归测试
 2. 跑 object upload 相关测试，覆盖 bytes 与 file 两类输入
-3. 手动或测试确认 `/ops` 仍能看到 service 与 task-pool timing 聚合
+3. 手动或测试确认 `/ops` 仍能看到 service 与 task-pool timing 聚合，以及失败原因
 4. 对 Windows 性能优化另开小步变更，不混入本轮精简
 
-## 9. 文档维护规则
+## 10. 文档维护规则
 
 1. 只有“会影响默认行为/边界”的决策才写入本文件
 2. 每次更新请改“最后更新”日期，并附一句变化摘要

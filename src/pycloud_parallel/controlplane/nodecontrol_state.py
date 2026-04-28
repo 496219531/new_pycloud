@@ -1790,6 +1790,23 @@ class NodeControlState(NodeRuntimeBase):
         with self._lock:
             return code_version in self._codes
 
+    def _ensure_service_name_available_locked(self, *, service_name: str, service_id: str) -> None:
+        normalized_name = str(service_name or "").strip()
+        if not normalized_name:
+            return
+        normalized_service_id = str(service_id or "").strip()
+        for existing in self._services.values():
+            if str(existing.service_id or "").strip() == normalized_service_id:
+                continue
+            if str(existing.service_name or "").strip() != normalized_name:
+                continue
+            if not existing.is_running():
+                continue
+            raise RuntimeError(
+                "service_name already exists on this node: "
+                f"service_name={normalized_name!r} existing_service_id={existing.service_id!r}"
+            )
+
     def create_service(
         self,
         *,
@@ -1819,6 +1836,9 @@ class NodeControlState(NodeRuntimeBase):
         normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
         service_id = str(service_id or "").strip() or uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
+        effective_service_name = str(service_name or f"service-{service_id[:8]}").strip() or f"service-{service_id[:8]}"
+        with self._lock:
+            self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
 
         try:
             artifact, cached_artifact = self.put_code(
@@ -1871,6 +1891,7 @@ class NodeControlState(NodeRuntimeBase):
 
         reserved = 0
         with self._lock:
+            self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
             active = sum(
                 max(0, int(session.worker_count))
                 for session in self._services.values()
@@ -1911,7 +1932,7 @@ class NodeControlState(NodeRuntimeBase):
             session = ServiceSession(
                 service_id=service_id,
                 owner_client_id=owner_client_id,
-                service_name=service_name or f"service-{service_id[:8]}",
+                service_name=effective_service_name,
                 code_version=artifact.code_version,
                 worker_count=actual_workers,
                 heartbeat_timeout_sec=actual_hb_timeout,
@@ -2898,25 +2919,40 @@ class NodeControlState(NodeRuntimeBase):
             executor_host = self._executor_host
             service_id = session.service_id
             worker_count = session.worker_count
-        if artifact is None or executor_host is None:
+            service_executor_ready = bool(session.is_running() and session.executor_ready)
+        if artifact is None or executor_host is None or not service_executor_ready:
             return globals_digest, updated_names
-        self._execute_warmup(
-            executor_host=executor_host,
-            scope="service",
-            key=service_id,
-            worker_count=worker_count,
-            execute_spec=_build_execute_spec(
-                artifact,
-                object_dir=self._object_dir,
-                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                method_name=next(iter(session.methods.keys()), artifact.entry_callable),
-                payload={},
-                payload_mode="http_call",
-                managed_globals_scope_dir=state.scope_dir,
-                managed_globals_digest=globals_digest,
-                warmup_only=True,
-            ),
+        execute_spec = _build_execute_spec(
+            artifact,
+            object_dir=self._object_dir,
+            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+            method_name=next(iter(session.methods.keys()), artifact.entry_callable),
+            payload={},
+            payload_mode="http_call",
+            managed_globals_scope_dir=state.scope_dir,
+            managed_globals_digest=globals_digest,
+            warmup_only=True,
         )
+        try:
+            self._execute_warmup(
+                executor_host=executor_host,
+                scope="service",
+                key=service_id,
+                worker_count=worker_count,
+                execute_spec=execute_spec,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if "service executor" not in message:
+                raise
+            executor_host.create_service(service_id=service_id, worker_count=worker_count)
+            self._execute_warmup(
+                executor_host=executor_host,
+                scope="service",
+                key=service_id,
+                worker_count=worker_count,
+                execute_spec=execute_spec,
+            )
         return globals_digest, updated_names
 
     def update_runtime_globals(

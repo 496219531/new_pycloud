@@ -91,6 +91,9 @@
 7. `in_flight`
 8. `lease_expire_at`
 9. `http_base_url`
+10. `stop_reason`
+
+其中 `stop_reason` 只在服务已停止或创建失败时有值，用于在 `/ops` 上显示失败原因。
 
 ### 2.4 `GET /services/routes`
 
@@ -114,6 +117,8 @@
 8. `in_flight`
 9. `http_base_url`
 
+当 `healthy_only=true` 时，路由列表只返回健康节点上的 `RUNNING` 服务。已停止或创建失败的服务仍可能出现在 `/nodes` 与 `/ops` 中，用于诊断，但不会进入健康路由。
+
 ### 2.5 `GET /ops`
 
 简单 Web 运维页。
@@ -132,8 +137,10 @@ http://127.0.0.1:50051/ops
 4. `avg_child_decode_ms`
 5. `avg_child_invoke_ms`
 6. `avg_child_encode_ms`
+7. `failure_reason`
 
 这些指标来自 node 侧服务调用 timing 聚合，并随 heartbeat 同步到 InfoCenter。
+`failure_reason` 用于显示某条 service/taskpool 的创建失败、executor host 重建失败、owner heartbeat 超时等原因。
 
 如果注册了独立 `job-orchestrator`，`/ops` 页面还会额外显示 `Job Queue` 区块：
 
@@ -263,9 +270,14 @@ http://127.0.0.1:50051/ops
 2. `node_instance_id`
    - 是 InfoCenter 内部真正的节点主键
    - `/ops` 运维动作（`cordon / drain / mark-lost`）现在都按它定位
+   - service/taskpool 动态补偿也按它记录失败副本
 3. 所以当两个 node 使用相同 `node_id` 时：
    - `/ops` 不会再互相覆盖
    - 页面会同时显示相同的 `node_id` 和各自不同的 `instance_id`
+4. 如果某个 node 重启后修复环境问题：
+   - 旧的失败记录仍绑定旧 `node_instance_id`
+   - 新进程会获得新的 `node_instance_id`
+   - 即使 `node_id` 相同，新实例也可以重新进入 service/taskpool 补偿候选
 
 ### 2.11 运维动作
 

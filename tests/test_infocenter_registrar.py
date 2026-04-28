@@ -10,7 +10,7 @@ import pytest
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _reorder_job_via_http
-from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeTaskPoolInfo
+from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeState, NodeTaskPoolInfo
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.server import build_job_orchestrator_server
@@ -167,6 +167,85 @@ def test_ops_page_merges_duplicate_services_with_same_endpoint():
     assert "merged×2" in raw
     assert raw.count("calc_asset_ratio") >= 1
     assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
+
+
+def test_ops_page_merges_duplicate_services_across_node_records_with_same_endpoint():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    for idx, instance_id in enumerate(("node-dup-a", "node-dup-b"), start=1):
+        service_id = f"svc-{idx}"
+        info_state.register_node_record(
+            node_instance_id=instance_id,
+            node_id="node-dup",
+            control_addr=f"127.0.0.1:5006{idx}",
+            capacity=4,
+            queue_capacity=32,
+            tags=["compute"],
+            services={
+                service_id: NodeServiceState(
+                    service_name="calc_asset_ratio",
+                    service_id=service_id,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    worker_count=2,
+                    alive_workers=2,
+                    in_flight=1,
+                    http_base_url=f"http://127.0.0.1:18081/svc/{service_id}",
+                )
+            },
+        )
+
+    raw = _render_ops_page(info_state)
+
+    assert "node-dup-a, node-dup-b" in raw
+    assert "svc-1 (+1)" in raw or "svc-2 (+1)" in raw
+    assert raw.count("<td>calc_asset_ratio</td>") == 1
+
+
+def test_ops_page_merges_duplicate_startup_nodes_with_same_control_addr():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state._nodes["startup-old"] = NodeState(  # noqa: SLF001
+        node_instance_id="startup-old",
+        node_id="calc_asset_ratio-startup",
+        control_addr="127.0.0.1:18081",
+        capacity=1,
+        queue_capacity=1,
+        metadata={"startup_service": "true"},
+        services={
+            "svc-old": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-old",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            )
+        },
+    )
+    info_state._nodes["startup-new"] = NodeState(  # noqa: SLF001
+        node_instance_id="startup-new",
+        node_id="calc_asset_ratio-startup",
+        control_addr="127.0.0.1:18081",
+        capacity=1,
+        queue_capacity=1,
+        metadata={"startup_service": "true"},
+        services={
+            "svc-new": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-new",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-new",
+            )
+        },
+    )
+
+    raw = _render_ops_page(info_state)
+
+    assert raw.count("127.0.0.1:18081") == 2
+    assert "startup-old" in raw
+    assert "startup-new" in raw
+    assert "merged_nodes=2" in raw
+    assert raw.count("<td>calc_asset_ratio</td>") == 1
 
 
 def test_ops_page_shows_service_and_taskpool_failure_reasons():

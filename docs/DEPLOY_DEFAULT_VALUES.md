@@ -85,6 +85,14 @@ group = Service.deploy(
 5. 按 `service_worker_available` 排序。
 6. 选出 `node_ids` / `node_count` / `min_success_nodes` 决定的节点数。
 
+动态补偿：
+
+1. 如果初次部署目标是 3 个 node，但当前只成功部署 2 个，owner 会先返回可用的 2 个。
+2. keepalive 后台会继续按目标副本数尝试补齐。
+3. 失败副本按 `node_instance_id` 记录并跳过，不按可重复的 `node_id` 永久拉黑。
+4. 如果同一个 `node_id` 重启后获得新的 `node_instance_id`，它会重新进入补偿候选。
+5. 创建失败或 host 失败的原因会在 InfoCenter `/ops` 的 `failure_reason` 中显示。
+
 ### 4.1 显式指定节点
 
 ```python

@@ -2402,6 +2402,7 @@ class Service(ServiceExecutionSession):
                         except RuntimeError as exc:
                             if "service is stopped" not in str(exc):
                                 raise
+                            session_cache_lock = None
                             with contextlib.suppress(Exception):
                                 session_cache_file.unlink()
                             _emit_owner_notice(
@@ -2415,24 +2416,59 @@ class Service(ServiceExecutionSession):
                             return group
 
                     else:
-                        raise RuntimeError(
-                            f"service_name already exists with different code_version and is still running: "
-                            f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}; "
-                            "stop the active service first, then redeploy with the same service_name"
+                        if not replace_existing_if_code_changed:
+                            raise RuntimeError(
+                                f"service_name already exists with different code_version and is still running: "
+                                f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}; "
+                                "stop the active service first, then redeploy with the same service_name"
+                            )
+                        if cached_session is None:
+                            raise RuntimeError(
+                                f"service_name already exists with different code_version but no local token cache was found: "
+                                f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}"
+                            )
+                        try:
+                            session_cache_lock = _acquire_service_session_lock_with_retry(
+                                session_cache_file,
+                                timeout_sec=timeout_sec,
+                                action=(
+                                    "another local deploy process is already active for "
+                                    f"owner_client_id={effective_owner_client_id!r} service_name={effective_service_name!r}"
+                                ),
+                            )
+                        except RuntimeError as exc:
+                            raise RuntimeError(str(exc)) from exc
+                        try:
+                            cls._end_existing_group(
+                                owner_client_id=effective_owner_client_id,
+                                cache_payload=cached_session,
+                                active_routes=existing_infos,
+                                timeout_sec=timeout_sec,
+                                reason="replace service with new code_version",
+                            )
+                        except Exception:
+                            session_cache_lock.close()
+                            session_cache_lock = None
+                            raise
+                        session_cache_lock.clear()
+                        _emit_owner_notice(
+                            f"stopped existing service before replace service_name={effective_service_name} "
+                            f"existing={existing_code_version} incoming={effective_code_version}"
                         )
 
         try:
-            try:
-                session_cache_lock = _acquire_service_session_lock_with_retry(
-                    session_cache_file,
-                    timeout_sec=timeout_sec,
-                    action=(
-                        "another local deploy process is already active for "
-                        f"owner_client_id={effective_owner_client_id!r} service_name={effective_service_name!r}"
-                    ),
-                )
-            except RuntimeError as exc:
-                raise RuntimeError(str(exc)) from exc
+            if session_cache_lock is None:
+                try:
+                    session_cache_lock = _acquire_service_session_lock_with_retry(
+                        session_cache_file,
+                        timeout_sec=timeout_sec,
+                        action=(
+                            "another local deploy process is already active for "
+                            f"owner_client_id={effective_owner_client_id!r} service_name={effective_service_name!r}"
+                        ),
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(str(exc)) from exc
             sessions: Dict[str, ServiceSessionClient] = {}
             clients: Dict[str, NodeControlClient] = {}
             nodes: Dict[str, InfoCenterNode] = {}

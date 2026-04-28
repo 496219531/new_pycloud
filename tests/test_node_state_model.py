@@ -2441,6 +2441,84 @@ def test_create_service_preloads_entry_module_for_spawn_workers(tmp_path, monkey
         state.close()
 
 
+def test_create_service_rejects_duplicate_running_service_name_on_node(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-dupe-01",
+        queue_capacity=16,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "code_cache_service_dupe"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def preload_service(self, **kwargs):
+            calls.append(("preload", kwargs))
+            return int(kwargs["fanout"])
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        first = state.create_service(
+            owner_client_id="owner-service",
+            service_name="svc-dupe",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_dupe",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        with pytest.raises(RuntimeError, match="service_name already exists on this node"):
+            state.create_service(
+                owner_client_id="owner-service",
+                service_name="svc-dupe",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="service_dupe",
+                entry_callable="serve",
+                package_format="py",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=False,
+                chunks=[blob],
+            )
+
+        assert [kind for kind, _payload in calls] == ["create"]
+        reports = [
+            report
+            for report in state.service_report_payloads(include_stopped=True)
+            if report["service_name"] == "svc-dupe"
+        ]
+        assert [report["service_id"] for report in reports] == [first.service_id]
+        assert reports[0]["status"] == pb2.SERVICE_STATUS_RUNNING
+    finally:
+        state.close()
+
+
 def test_pull_pool_results_prunes_completed_task_state(tmp_path):
     state = NodeControlState(
         node_id="node-pool-prune-01",

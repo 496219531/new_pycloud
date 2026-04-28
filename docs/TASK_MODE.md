@@ -178,6 +178,13 @@ print(final["job"]["status"])
 11. `iter_data(...) / collect_data(...)`
 12. `iter_items(...) / collect_items(...)`
 
+动态补偿语义：
+
+1. TaskPool 会按活跃副本数判断是否低于目标节点数。
+2. 失败副本按 `node_instance_id` 记录并跳过，不再占用目标副本数。
+3. 同一个 `node_id` 重启后如果生成新的 `node_instance_id`，可以重新进入补偿候选。
+4. 创建失败、executor host 重建失败、owner heartbeat 超时等原因会随 node heartbeat 上报，并显示在 InfoCenter `/ops` 的 `failure_reason` 列。
+
 补充说明：
 
 1. `TaskPool` 不强调 `join()` 这类 owner 常驻语义

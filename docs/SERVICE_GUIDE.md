@@ -113,6 +113,7 @@ finally:
 2. `node_instance_id`
    - 是 service group / task pool / InfoCenter 内部使用的唯一键
    - 当你需要精确指定某一个同名节点实例时，应优先使用 `node_instance_id`
+   - 动态补偿会按它记录失败副本；同一个 `node_id` 重启后如果生成新的 `node_instance_id`，会重新进入候选
 
 要点：
 
@@ -120,6 +121,7 @@ finally:
 2. `join()` 用于把 owner 进程挂住
 3. `Ctrl+C` 是正常退出路径
 4. 如果所有已部署 session 的 keepalive 连续失败，`join()` 会退出，并在 `stderr` 打印失败节点与原因
+5. 如果部署目标数未满足，owner keepalive 会定期尝试动态补偿；失败的旧实例不会占用目标副本数
 
 ## 3. 调用体验
 
@@ -403,6 +405,8 @@ pycloudctl gc --scope all --older-than-hours 168
 4. 过滤 `drain=true`
 5. 如果指定了 `runtime`，先按节点 `python_version` 过滤
 6. 按 `service_worker_available` 选节点
+7. 部署后如果新 node 加入或旧 node 重启为新实例，owner 会在 keepalive 后台尝试补齐目标副本数
+8. 创建失败或 host 失败的 service 会在 InfoCenter `/ops` 的 `failure_reason` 中显示原因
 
 ## 7. 与轻量 caller 的区别
 
