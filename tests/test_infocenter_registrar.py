@@ -601,6 +601,89 @@ def test_infocenter_http_rejects_fenced_instance_with_reset_required():
         info_server.stop()
 
 
+def test_infocenter_client_returns_fenced_reset_response_for_node_sync():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-fenced-client",
+                node_instance_id="node-fenced-client-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=2,
+                queue_capacity=16,
+                tags=["compute"],
+            )
+            info_state.mark_node_lost("node-fenced-client-inst", reason="test lost")
+
+            register_resp = client.register_node(
+                node_id="node-fenced-client",
+                node_instance_id="node-fenced-client-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=2,
+                queue_capacity=16,
+                tags=["compute"],
+            )
+            heartbeat_resp = client.heartbeat_node(
+                node_id="node-fenced-client",
+                node_instance_id="node-fenced-client-inst",
+                healthy=True,
+            )
+
+        for resp in (register_resp, heartbeat_resp):
+            assert resp["accepted"] is False
+            assert resp["reset_required"] is True
+            assert resp["new_instance_required"] is True
+            assert resp["reason"] == "node_instance_id fenced"
+    finally:
+        info_server.stop()
+
+
+def test_node_registrar_handles_fenced_register_response(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    node_state = NodeControlState(
+        node_id="node-fenced-reg",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_fenced_reg"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_target,
+        node_id="node-fenced-reg",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        tags=["compute"],
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=5.0,
+    )
+
+    try:
+        assert registrar.sync_now() is True
+        info_state.mark_node_lost(node_state.node_instance_id, reason="test lost")
+        registrar._registered = False  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.service_report_payloads(include_stopped=True) == []
+        assert node_state.task_pool_reports() == {}
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
 def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
     node_state = NodeControlState(
         node_id="node-self-fence",

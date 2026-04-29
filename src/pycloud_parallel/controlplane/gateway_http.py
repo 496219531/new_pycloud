@@ -92,7 +92,7 @@ def _encode_stream_line(event: Dict[str, object]) -> bytes:
     return json.dumps(serialize_arrow_compatible(_stream_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
 
 
-def _looks_like_legacy_data_ref_payload(value: Any) -> bool:
+def _looks_like_external_data_ref_locator(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
     keys = {str(key or "").strip() for key in value.keys()}
@@ -109,7 +109,7 @@ def _contains_external_data_ref(value: Any) -> bool:
     if isinstance(value, DataRef):
         return True
     if isinstance(value, dict):
-        if is_data_ref_payload(value) or _looks_like_legacy_data_ref_payload(value):
+        if is_data_ref_payload(value) or _looks_like_external_data_ref_locator(value):
             return True
         if maybe_data_ref(value) is not None:
             return True

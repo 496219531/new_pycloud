@@ -121,7 +121,7 @@ client.submit(
 5. 对 `JobQueue.submit(source=module, ...)`，`resource_paths=[...]` 只影响 job-orchestrator 侧的 module artifact；如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
 6. 如果你不想逐个列文件，也可以预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` / `submit_job_from_bytes(...)` 提交
 7. `JobQueue` 自己固定使用 `structured_v1 + default_safe`
-8. `job-orch` 作为 startup service 通过 `mount_python_module_service(...)` 挂载内置系统 module
+8. `job-orch` 作为系统内置 startup service 挂载
 9. `job-orch` 的 `taskpool_policy_id` 固定于启动时，通过 startup managed globals 注入，不接受 `submit(...)` 运行期覆盖
 10. `submit(...)` 里允许改的是 `task_serialization_mode`，它会作为后续 `TaskPool` 执行面的 mode 偏好，并在共享池的 job 边界软切；`submit(...)` 不再接受 `policy_id/taskpool_policy_id`
 11. `job-orch` 运行期维持单个共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先复用池，软切失败再回退重建池，空闲超过 idle TTL 后再主动关池

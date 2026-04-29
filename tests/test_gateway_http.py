@@ -223,6 +223,22 @@ def test_gateway_public_json_call_rejects_legacy_data_ref_payload() -> None:
     assert body["error"] == EXTERNAL_DATA_REF_ERROR
 
 
+def test_gateway_public_json_call_rejects_external_data_ref_locator_before_route_selection() -> None:
+    code, body = _gateway_public_post_payload(
+        {
+            "blob": {
+                "object_id": "sha256:edededededededededededededededededededededededededededededededed",
+                "locator_kind": "node_control",
+                "locator_token": "10.0.0.10:50061",
+                "control_addr": "10.0.0.10:50061",
+            }
+        }
+    )
+
+    assert code == 400
+    assert body["error"] == EXTERNAL_DATA_REF_ERROR
+
+
 def test_gateway_public_http_bytes_transport_rejects_data_ref() -> None:
     ref = DataRef(
         ref_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",

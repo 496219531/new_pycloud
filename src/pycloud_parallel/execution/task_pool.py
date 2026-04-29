@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
 from dataclasses import dataclass, replace
 import inspect
@@ -1995,7 +1995,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             result_timeout_sec = float(shared_kwargs.pop("result_timeout_sec", timeout_sec) or timeout_sec)
             wait_ms = int(shared_kwargs.pop("wait_ms", 500) or 500)
             raise_on_error = bool(shared_kwargs.pop("raise_on_error", True))
-            max_infra_retries = max(0, int(shared_kwargs.pop("max_infra_retries", 0) or 0))
+            max_infra_retries = max(0, int(shared_kwargs.pop("max_infra_retries", 1) or 0))
             retry_backoff_ms = max(0, int(shared_kwargs.pop("retry_backoff_ms", 0) or 0))
             _node_window_factor = float(shared_kwargs.pop("node_window_factor", 2.0) or 2.0)
             if shared_kwargs:
@@ -2517,43 +2517,59 @@ def _build_task_pool_from_infocenter(
 
     def _create_pool_on_node(node: InfoCenterNode) -> Tuple[InfoCenterNode, NativeTaskPoolClient]:
         client = _node_control_client(node.control_addr, timeout_sec=timeout_sec)
-        pool = client.create_task_pool_from_bytes(
-            owner_client_id=effective_owner,
-            pool_name=effective_pool_name,
-            blob=effective_blob,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=effective_package_format,
-            deps=prepared_artifact.dependency_policy,
-            managed_global_names=managed_global_names,
-            worker_count=worker_count,
-            heartbeat_timeout_sec=heartbeat_timeout_sec,
-            idle_ttl_sec=idle_ttl_sec,
-            chunk_size=chunk_size,
-        )
+        try:
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id=effective_owner,
+                pool_name=effective_pool_name,
+                blob=effective_blob,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=effective_package_format,
+                deps=prepared_artifact.dependency_policy,
+                managed_global_names=managed_global_names,
+                worker_count=worker_count,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                chunk_size=chunk_size,
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                client.close()
+            raise
         return node, pool
 
     created: List[Tuple[InfoCenterNode, NativeTaskPoolClient]] = []
+    create_failures: Dict[str, str] = {}
     if len(desired_nodes) == 1:
-        created.append(_create_pool_on_node(desired_nodes[0]))
+        try:
+            created.append(_create_pool_on_node(desired_nodes[0]))
+        except Exception as exc:
+            create_failures[_node_instance_key_from_node(desired_nodes[0])] = repr(exc)
     else:
         with ThreadPoolExecutor(max_workers=max(1, len(desired_nodes)), thread_name_prefix="taskpool-create") as executor:
-            futures = [executor.submit(_create_pool_on_node, node) for node in desired_nodes]
-            try:
-                for future in futures:
+            futures = {executor.submit(_create_pool_on_node, node): node for node in desired_nodes}
+            for future in as_completed(futures):
+                node = futures[future]
+                try:
                     created.append(future.result())
-            except Exception:
-                for future in futures:
-                    if not future.done():
-                        future.cancel()
-                for node, pool in created:
-                    _close_task_pool_replica(pool, reason="task pool multi-node create failed")
-                    client = getattr(pool, "_client", None)
-                    if client is not None:
-                        with contextlib.suppress(Exception):
-                            client.close()
-                raise
+                except Exception as exc:
+                    node_key = _node_instance_key_from_node(node)
+                    create_failures[node_key] = repr(exc)
+                    logger.warning(
+                        "task pool replica create failed pool_name=%s node_id=%s node_instance_id=%s err=%r",
+                        effective_pool_name,
+                        getattr(node, "node_id", ""),
+                        node_key,
+                        exc,
+                    )
+    if not created:
+        raise RuntimeError(f"task pool create failed on all selected nodes; failures={create_failures}")
+    desired_order = {
+        _node_instance_key_from_node(node): index
+        for index, node in enumerate(desired_nodes)
+    }
+    created.sort(key=lambda item: desired_order.get(_node_instance_key_from_node(item[0]), len(desired_order)))
 
     pools: Dict[str, NativeTaskPoolClient] = {}
     nodes: Dict[str, InfoCenterNode] = {}
@@ -2572,6 +2588,7 @@ def _build_task_pool_from_infocenter(
         policy_id=policy_id or get_default_policy_id_for_binding("taskpool_default"),
         effective_policy=effective_policy,
     )
+    session.failures.update(create_failures)
     session._configure_dynamic_compensation(
         {
             "infocenter_target": infocenter_target,

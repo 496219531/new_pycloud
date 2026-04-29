@@ -156,8 +156,8 @@
 1. `gateway_public` 即使后端节点支持 pickle，只要 profile 不允许，也会统一拒绝
 2. payload 准备链会优先遵守 session 的 effective payload limit，必要时转 `DataRef`
 3. `Service.connect(transport="gateway")` 默认绑定 `default_safe`，默认 mode 是 `legacy_v1`
-4. `Service.connect(transport="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `structured_v1`
-5. `TaskPool.open(...)` / `TaskPool.from_infocenter(...)` 默认绑定 `trusted_internal`，默认 mode 是 `structured_v1`
+4. `Service.connect(transport="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
+5. `TaskPool.open(...)` / `TaskPool.from_infocenter(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
 6. 重数据 task 场景建议显式切到 `pickle_internal_heavy`
 7. `JobQueue.connect()` 默认绑定 `jobqueue_controlplane_transport`，对应 profile=`default_safe`，默认 mode=`structured_v1`
 8. 节点差异由 `tags`、`healthy_only` 和 runtime 过滤表达，不再参与 effective policy 协商
@@ -175,7 +175,7 @@ carrier 选择也已经改成同一个原则：
 
 1. `JobQueue` 自己的 transport/session 默认绑定 `jobqueue_controlplane_transport -> default_safe`
 2. 这个 binding 的默认 mode 仍然是 `structured_v1`
-3. `job-orchestrator` 是 startup service，通过 `mount_python_module_service(...)` 挂载内置系统 module
+3. `job-orchestrator` 是系统内置 startup service，不作为用户 module deploy 入口暴露
 4. 用户在 `JobQueue.submit(...)` 里传的 `task_serialization_mode`，解释为未来 `TaskPool` 的执行策略；`policy_id/taskpool_policy_id` 不再允许由 submit 传入
 5. `job-orchestrator` 运行期维护单共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先软切 mode 复用，软切失败再回退重建
 6. 因此 job-orchestrator 的调用面和后续 task 执行面的策略边界是分开的

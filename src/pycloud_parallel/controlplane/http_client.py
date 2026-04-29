@@ -33,6 +33,7 @@ def http_json_request(
     timeout_sec: float,
     payload: Optional[Dict[str, object]] = None,
     headers: Optional[Dict[str, str]] = None,
+    raise_on_error_response: bool = True,
 ) -> Dict[str, object]:
     raw = None
     request_headers = dict(headers or {})
@@ -65,7 +66,7 @@ def http_json_request(
         except Exception:
             body = {"ok": False, "error": exc.reason}
         raise RuntimeError(str(body.get("error", exc.reason))) from exc
-    if data.get("ok", False) is False:
+    if data.get("ok", False) is False and raise_on_error_response:
         raise RuntimeError(str(data.get("error", "request failed")))
     return data
 

@@ -1,6 +1,6 @@
 # 长期上下文（Long-Term Context）
 
-最后更新：2026-04-28（Asia/Shanghai）
+最后更新：2026-04-29（Asia/Shanghai）
 适用范围：`new_pycloud` 主仓库（V1 公开面与控制面实现）
 
 ## 1. 这份文件的目的
@@ -39,8 +39,9 @@ V1 公开概念固定为：
 ### 3.2 当前默认绑定（重要）
 
 1. `jobqueue_controlplane_transport` -> `default_safe`，默认 mode=`structured_v1`
-2. `taskpool_default` -> `trusted_internal`，默认 mode=`structured_v1`
-3. `gateway_public` 走对外保守边界（默认不允许 pickle）
+2. `service_internal` -> `trusted_internal`，默认 mode=`pickle_stable_v1`
+3. `taskpool_default` -> `trusted_internal`，默认 mode=`pickle_stable_v1`
+4. `gateway_public` -> `default_safe`，默认 mode=`legacy_v1`，走对外保守边界（默认不允许 pickle）
 
 ### 3.3 变更约束
 
@@ -153,7 +154,9 @@ V1 公开概念固定为：
 3. 若涉及 JobQueue 与 TaskPool 边界，优先保持“queue transport policy”与“task execution policy”分离
 4. 所有默认值变更，必须同步：
    - `src/pycloud_parallel/controlplane/policy_profile.py`
+   - `src/pycloud_parallel/controlplane/config.py`（涉及运行时 env 默认值时）
    - 对应文档（本文件 + `ARCHITECTURE_OVERVIEW.md` + `CLIENT_SURFACE_OVERVIEW.md`）
+   - `docs/RUNTIME_LIMITS.md`（涉及 payload / DataRef / gRPC limit 时）
    - 对应测试
 
 ## 9. 近期精简路线
@@ -189,14 +192,14 @@ V1 公开概念固定为：
 2. 每次更新请改“最后更新”日期，并附一句变化摘要
 3. 如果与其他文档冲突，以本文件为优先修正源，再回补其他文档
 
-## 10. 更新准入规则（多人/多线程协作）
+## 11. 更新准入规则（多人/多线程协作）
 
-### 10.1 谁可以改
+### 11.1 谁可以改
 
 1. 任何有仓库写权限的维护者都可以修改本文件
 2. 但修改应遵循“明确指令 + 可验证依据 + 同步测试/文档”的最小流程
 
-### 10.2 何时允许改
+### 11.2 何时允许改
 
 满足任一条件可更新：
 
@@ -204,19 +207,19 @@ V1 公开概念固定为：
 2. 边界约束发生变化（例如 submit 参数权限、共享池生命周期、安全校验）
 3. 已有条目与代码事实不一致，需要纠偏
 
-### 10.3 何时不该改
+### 11.3 何时不该改
 
 1. 仅是临时排障结论、尚未定稿的讨论
 2. 仅当前线程上下文、不会影响全局行为的局部细节
 3. 尚无代码/测试佐证的猜测性结论
 
-### 10.4 自动化与触发方式
+### 11.4 自动化与触发方式
 
 1. 本文件不会被系统自动追加或自动改写
 2. 必须由维护者在对应线程中明确执行编辑动作（人工或 coder）
 3. 未经明确编辑动作，不应假设“对话内容已经自动沉淀到本文件”
 
-### 10.5 提交前检查清单（建议）
+### 11.5 提交前检查清单（建议）
 
 1. 是否更新“最后更新”日期与“本次更新摘要”
 2. 是否给出可核对的代码/测试依据
@@ -226,13 +229,13 @@ V1 公开概念固定为：
    - `docs/TASK_MODE.md` / `docs/TASK_CLIENT_GUIDE.md`（按需）
 4. 是否补充或更新了对应回归测试（至少最小集合）
 
-### 10.6 并发修改冲突处理
+### 11.6 并发修改冲突处理
 
 1. 以“更晚且有代码依据”的版本为主
 2. 冲突合并时优先保留约束性条款，删去重复叙述
 3. 若两条规则冲突，先在 PR/评审中做显式裁决，再落文档，不做隐式覆盖
 
-### 10.7 自动守卫（CI）
+### 11.7 自动守卫（CI）
 
 仓库已配置：
 
@@ -245,9 +248,9 @@ V1 公开概念固定为：
 
 ---
 
-本次更新摘要（2026-04-25）：
+本次更新摘要（2026-04-29）：
 
-1. 保留 JobQueue/job-orch 的长期边界：job-orch 通过 startup service module 挂载，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
-2. 明确近期代码精简路线：timing recorder、object upload、JobQueue shared-pool setup、staged refs、artifact packaging defaults
-3. 规定精简约束：第一轮不改 API、不改默认行为、不丢 timing 字段、不混入 Windows 性能默认值切换
-4. 保留多人协作更新准入规则与 CI 守卫要求
+1. 对齐 V1 默认绑定：JobQueue 控制面固定 `default_safe + structured_v1`，Service/TaskPool 内部可信默认 `trusted_internal + pickle_stable_v1`，gateway/public 保守禁止 pickle
+2. 保留 JobQueue/job-orch 的长期边界：job-orch 作为系统内置 startup service，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
+3. 确认内部可信 DataRef 主路径：`upload_once -> forward DataRef -> final worker/client remote_fetch`，gateway/public DataRef 边界后续单独收口
+4. 明确默认值变更同步范围：policy profile、runtime config、相关文档与测试必须一起更新

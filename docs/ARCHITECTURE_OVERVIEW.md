@@ -267,15 +267,15 @@
    - default mode=`legacy_v1`
 2. `service_internal`
    - profile=`trusted_internal`
-   - default mode=`structured_v1`
+   - default mode=`pickle_stable_v1`
 3. `taskpool_default`
    - profile=`trusted_internal`
-   - default mode=`structured_v1`
+   - default mode=`pickle_stable_v1`
 4. `taskpool_heavy_dataframe_numpy`
    - profile=`pickle_internal_heavy`
    - default mode=`pickle_stable_v1`
 5. `jobqueue_controlplane_transport`
-   - profile=`trusted_internal`
+   - profile=`default_safe`
    - default mode=`structured_v1`
 
 ### 9.2 Tags / Node Metadata
@@ -317,7 +317,7 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 
 1. queue 自己的 controlplane transport 固定绑定 `jobqueue_controlplane_transport`
 2. 这个 binding 当前固定落到 `default_safe + structured_v1`
-3. `job-orch` 作为 startup service 通过 `mount_python_module_service(...)` 挂载内置系统 module
+3. `job-orch` 作为系统内置 startup service 挂载，不作为用户 module deploy 入口暴露
 4. `job-orch` 在启动时通过 startup managed globals 冻结自己的 `taskpool_policy_id`
 5. 用户在 `submit(...)` 里只能改 `task_serialization_mode`；后续 `TaskPool` 会在 job 边界按这个 mode 软切
 6. session 对外可见的是 queue 自己冻结后的 `effective_policy`

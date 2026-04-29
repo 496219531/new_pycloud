@@ -278,6 +278,7 @@ class InfoCenterClient:
             path="/nodes/register",
             method="POST",
             timeout_sec=self.timeout_sec,
+            raise_on_error_response=False,
             payload={
                 "node_id": node_id,
                 "node_instance_id": str(node_instance_id or "").strip(),
@@ -348,6 +349,7 @@ class InfoCenterClient:
             path="/nodes/heartbeat",
             method="POST",
             timeout_sec=self.timeout_sec,
+            raise_on_error_response=False,
             payload={
                 "node_id": node_id,
                 "node_instance_id": str(node_instance_id or "").strip(),
