@@ -7,6 +7,7 @@ import os
 import html
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
@@ -878,7 +879,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     waiting_job_rows.sort(key=lambda item: item[0])
     waiting_job_body = "\n".join(row for _sort_key, row in waiting_job_rows) or "<tr><td colspan='7'>no waiting jobs</td></tr>"
     return (
-        "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='5'><title>InfoCenter Ops</title>"
+        "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
         "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
         "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}"
         "th{background:#f5f5f5;text-align:left;}"
@@ -886,7 +887,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
         "</head><body>"
         f"<h1>InfoCenter Ops</h1><div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
-        "<div class='section-note'>auto_refresh_sec=5</div>"
+        "<div class='section-note' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div>"
         "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
         "Service table below shows each deployed service instance, worker process counts, and reduced timing metrics. "
         "Task pool table shows native temporary pools running on each node. "
@@ -895,48 +896,93 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "<table><thead><tr>"
         "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>pycloud</th>"
         "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>pool cap</th><th>pool used</th><th>pool avail</th><th>pool inflight</th><th>pool count</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
-        "</tr></thead><tbody>"
+        "</tr></thead><tbody id='ops-nodes-body'>"
         f"{node_body}"
         "</tbody></table>"
         "<h2>Job Queue</h2>"
         "<div class='section-note'>Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.</div>"
         "<table><thead><tr>"
         "<th>owner</th><th>instance_id</th><th>healthy</th><th>pycloud</th><th>current_job_id</th><th>current_status</th><th>current_phase</th><th>pool_action</th><th>current_total_ms</th><th>waiting</th><th>running</th><th>terminal</th><th>job_count</th><th>http_base_url</th>"
-        "</tr></thead><tbody>"
+        "</tr></thead><tbody id='ops-job-queue-body'>"
         f"{job_queue_body}"
         "</tbody></table>"
         "<div class='section-note'>Job-orch timing is reduced timing for queue wait, pool prepare, globals fanout, task running, finalize, writeback and total. Windows-focused fields highlight executor create/rebuild, warmup, and first-result wait.</div>"
         "<table><thead><tr>"
-        "<th>scope</th><th>job_count</th><th>avg_queue_wait_ms</th><th>avg_pool_prepare_ms</th><th>avg_fanout_globals_ms</th><th>avg_running_tasks_ms</th><th>avg_finalize_ms</th><th>avg_terminal_writeback_ms</th><th>avg_total_ms</th><th>max_total_ms</th><th>executor_create_count</th><th>executor_rebuild_count</th><th>pool_reuse_count</th><th>pool_create_count</th><th>pool_rebuild_count</th><th>avg_first_result_wait_ms</th><th>avg_warmup_ms</th></tr></thead><tbody>"
+        "<th>scope</th><th>job_count</th><th>avg_queue_wait_ms</th><th>avg_pool_prepare_ms</th><th>avg_fanout_globals_ms</th><th>avg_running_tasks_ms</th><th>avg_finalize_ms</th><th>avg_terminal_writeback_ms</th><th>avg_total_ms</th><th>max_total_ms</th><th>executor_create_count</th><th>executor_rebuild_count</th><th>pool_reuse_count</th><th>pool_create_count</th><th>pool_rebuild_count</th><th>avg_first_result_wait_ms</th><th>avg_warmup_ms</th></tr></thead><tbody id='ops-job-timing-body'>"
         f"<tr><td>embedded-job-orch</td><td>{html.escape(str(queue_timing.get('job_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_queue_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_pool_prepare_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_fanout_globals_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_running_tasks_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_finalize_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_terminal_writeback_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('max_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_first_result_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_warmup_ms', '-')))}</td></tr>"
         f"<tr><td>current-job</td><td>1</td><td>{html.escape(str(current_job_timing.get('queue_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_prepare_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('fanout_globals_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('running_tasks_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('finalize_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('terminal_writeback_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'create' else 0))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'rebuild' else 0))}</td><td>{html.escape(str(current_job_timing.get('first_result_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('warmup_ms', '-')))}</td></tr>"
         "</tbody></table>"
         "<h2>Recent Jobs</h2>"
         "<table><thead><tr>"
         "<th>owner</th><th>instance_id</th><th>job_id</th><th>status</th><th>submitted_at</th><th>finished_at</th><th>final_result</th><th>error</th>"
-        "</tr></thead><tbody>"
+        "</tr></thead><tbody id='ops-recent-jobs-body'>"
         f"{recent_job_body}"
         "</tbody></table>"
         "<h2>Waiting Jobs</h2>"
         "<div class='section-note'>Only waiting jobs can be reordered. Running jobs keep their current slot.</div>"
         "<table><thead><tr>"
         "<th>owner</th><th>instance_id</th><th>job_id</th><th>priority</th><th>submitted_at</th><th>position</th><th>actions</th>"
-        "</tr></thead><tbody>"
+        "</tr></thead><tbody id='ops-waiting-jobs-body'>"
         f"{waiting_job_body}"
         "</tbody></table>"
         "<h2>Service Instances</h2>"
         "<table><thead><tr>"
         "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>lease_expire_at</th><th>failure_reason</th><th>http_base_url</th>"
-        "</tr></thead><tbody>"
+        "</tr></thead><tbody id='ops-services-body'>"
         f"{service_body}"
         "</tbody></table>"
         "<h2>Task Pools</h2>"
         "<table><thead><tr>"
         "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>last_executor_create_ms</th><th>avg_warmup_ms</th><th>executor_rebuild_count</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th><th>failure_reason</th>"
-        "</tr></thead><tbody>"
+        "</tr></thead><tbody id='ops-pools-body'>"
         f"{pool_body}"
-        "</tbody></table></body></html>"
+        "</tbody></table>"
+        "<script>"
+        "(function(){"
+        "const ids=['ops-nodes-body','ops-job-queue-body','ops-job-timing-body','ops-recent-jobs-body','ops-waiting-jobs-body','ops-services-body','ops-pools-body'];"
+        "async function refreshOps(){"
+        "const status=document.getElementById('ops-refresh-status');"
+        "try{const resp=await fetch('/ops/snapshot',{cache:'no-store',headers:{'Accept':'application/json'}});"
+        "if(!resp.ok){throw new Error('http '+resp.status);}"
+        "const data=await resp.json();if(!data.ok){throw new Error(data.error||'snapshot failed');}"
+        "const fragments=data.fragments||{};"
+        "ids.forEach(function(id){const el=document.getElementById(id);if(el&&Object.prototype.hasOwnProperty.call(fragments,id)){el.innerHTML=fragments[id];}});"
+        "if(status){status.textContent='auto_refresh_sec=5 mode=partial last_update='+new Date().toLocaleTimeString();}"
+        "}catch(err){if(status){status.textContent='auto_refresh_sec=5 mode=partial refresh_error='+(err&&err.message?err.message:err);}}"
+        "}"
+        "window.setInterval(refreshOps,5000);"
+        "})();"
+        "</script></body></html>"
     )
+
+
+_OPS_FRAGMENT_IDS = (
+    "ops-nodes-body",
+    "ops-job-queue-body",
+    "ops-job-timing-body",
+    "ops-recent-jobs-body",
+    "ops-waiting-jobs-body",
+    "ops-services-body",
+    "ops-pools-body",
+)
+
+
+def _render_ops_snapshot(state: InfoCenterState, job_queue: Optional[JobQueueManager] = None) -> Dict[str, object]:
+    raw = _render_ops_page(state, job_queue)
+    fragments: Dict[str, str] = {}
+    for fragment_id in _OPS_FRAGMENT_IDS:
+        match = re.search(
+            rf"<tbody id='{re.escape(fragment_id)}'>(.*?)</tbody>",
+            raw,
+            flags=re.DOTALL,
+        )
+        fragments[fragment_id] = match.group(1) if match else ""
+    return {
+        "ok": True,
+        "fragments": fragments,
+        "controlplane_version": _pycloud_version(),
+        "auto_refresh_sec": 5,
+    }
 
 
 class InfoCenterHttpServer:
@@ -1362,6 +1408,13 @@ class InfoCenterHttpServer:
                         self._send_json(404, {"ok": False, "error": "data ref not found"})
                         return
                     self._send_json(200, {"ok": True, "entry": _serialize_data_registry_entry(entry)})
+                    return
+                if parsed.path == "/ops/snapshot":
+                    if self._requires_auth(parsed.path):
+                        if not self._check_auth():
+                            self._send_json(401, {"ok": False, "error": "unauthorized"})
+                            return
+                    self._send_json(200, _render_ops_snapshot(state, self.server_ref.job_queue))
                     return
                 if parsed.path == "/ops":
                     if self._requires_auth(parsed.path):

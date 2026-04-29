@@ -1388,7 +1388,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return
         normalized_payloads = self._merge_payloads_with_shared_kwargs(payloads, shared_kwargs=dict(shared_kwargs))
         resolved_max_in_flight = self._resolve_max_in_flight(max_in_flight)
-        for index, result in self.imap_unordered(
+        for item in self.imap_unordered(
             normalized_payloads,
             task_method=task_method,
             strategy=strategy,
@@ -1399,23 +1399,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             wait_ms=wait_ms,
             raise_on_error=False,
             node_window_factor=2.0,
+            return_items=True,
         ):
-            if result is None:
+            if not isinstance(item, ExecutionItem):
+                index, result = item
                 yield ExecutionItem(
                     index=int(index),
-                    ok=False,
-                    result=None,
-                    error_type="TaskFailed",
-                    error_message="task failed",
-                    key=int(index),
-                )
-            else:
-                yield ExecutionItem(
-                    index=int(index),
-                    ok=True,
+                    ok=result is not None,
                     result=result,
+                    error_type="" if result is not None else "TaskFailed",
+                    error_message="" if result is not None else "task failed",
                     key=int(index),
                 )
+                continue
+            yield item
 
     def collect_items(
         self,
@@ -1984,8 +1981,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
+        return_items: bool = False,
         **shared_kwargs,
-    ) -> Iterator[Tuple[int, Any]]:
+    ) -> Iterator[Union[Tuple[int, Any], ExecutionItem]]:
         if self._closed:
             raise RuntimeError("task pool session is closed")
         self._enter_exclusive_mode("imap_unordered", require_clean=True)
@@ -2046,9 +2044,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                                     self.cancel_job(reason="imap_unordered task failure", job_id=self.job_id)
                                 cancelled_for_error = True
                             raise RuntimeError(item.error_message or f"task failed: {item.task_id}")
-                        yield item.index, None
+                        yield item if return_items else (item.index, None)
                     else:
-                        yield item.index, item.data
+                        yield item if return_items else (item.index, item.data)
                     yielded += 1
                 if yielded > 0:
                     continue
@@ -2135,8 +2133,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
+        return_items: bool = False,
         **shared_kwargs,
-    ) -> Iterator[Tuple[int, Any]]:
+    ) -> Iterator[Union[Tuple[int, Any], ExecutionItem]]:
         """Yield ``(index, result_or_none)`` in completion order for a submitted batch."""
         forbidden = sorted(_LEGACY_TASKPOOL_UNORDERED_KWARGS.intersection(shared_kwargs))
         if forbidden:
@@ -2152,7 +2151,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             timeout_sec=timeout_sec,
             **shared_kwargs,
         ):
-            yield item.index, item.result if item.ok else None
+            yield item if return_items else (item.index, item.result if item.ok else None)
 
     async def aunordered(
         self,
@@ -2162,8 +2161,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
+        return_items: bool = False,
         **shared_kwargs,
-    ) -> AsyncIterator[Tuple[int, Any]]:
+    ) -> AsyncIterator[Union[Tuple[int, Any], ExecutionItem]]:
         """Async counterpart of :meth:`unordered` with the same return shape."""
         forbidden = sorted(_LEGACY_TASKPOOL_UNORDERED_KWARGS.intersection(shared_kwargs))
         if forbidden:
@@ -2179,7 +2179,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             timeout_sec=timeout_sec,
             **shared_kwargs,
         ):
-            yield item.index, item.result if item.ok else None
+            yield item if return_items else (item.index, item.result if item.ok else None)
 
     def consume_unordered(
         self,
@@ -2212,6 +2212,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             wait_ms=wait_ms,
             raise_on_error=raise_on_error,
             node_window_factor=node_window_factor,
+            return_items=False,
         ):
             index: Union[int, str] = task_id
             if isinstance(task_id, str) and task_id.rsplit("-", 1)[-1].isdigit():

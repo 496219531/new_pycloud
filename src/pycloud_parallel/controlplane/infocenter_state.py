@@ -17,7 +17,7 @@ from pycloud_parallel.controlplane.infocenter.models import (
     NodeState,
     NodeTaskPoolInfo,
 )
-from pycloud_parallel.controlplane.scheduling_policy import call_routes, conflict_scope, owner_targets
+from pycloud_parallel.controlplane.scheduling_policy import is_call_route, is_conflict_scope, is_owner_target
 from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -697,15 +697,15 @@ class InfoCenterState:
                     )
                     if healthy_only:
                         if normalized_scope == "call":
-                            if not call_routes(service_status=effective_status, node_drain=bool(state.drain)):
+                            if not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain)):
                                 continue
                         elif normalized_scope == "owner_command":
-                            if not owner_targets(service_status=effective_status):
+                            if not is_owner_target(healthy=is_healthy, service_status=effective_status):
                                 continue
                         elif normalized_scope == "exclusive_check":
-                            if not conflict_scope(service_status=effective_status):
+                            if not is_conflict_scope(healthy=is_healthy, service_status=effective_status):
                                 continue
-                        elif not call_routes(service_status=effective_status, node_drain=False):
+                        elif not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=False):
                             continue
                     reported_inflight = max(0, int(svc.in_flight or 0))
                     received_count = max(0, int(svc.received_count or 0))

@@ -76,6 +76,14 @@ V1 公开概念固定为：
 2. keepalive 不是纯本地状态刷新，会触发远端心跳与租约续期
 3. 任何绕过接收端上下文校验的“声明式 mode 信任”都应视为高风险设计
 
+### 5.1 DataRef 内部可信链路
+
+1. 内部可信链路默认走少拷贝主路径：`upload_once -> forward DataRef -> final worker/client remote fetch`
+2. `PYCLOUD_DATAREF_UPLOAD_STRATEGY` 默认 `upload_once`，旧 `fanout` 只作为显式回滚模式保留
+3. `PYCLOUD_JOBQUEUE_RESOLVE_REFS` 默认 `defer_to_worker`，job-orch 不提前 materialize 业务 `DataRef`
+4. `PYCLOUD_DATAREF_RESOLUTION` 默认 `remote_fetch`，worker 本地 miss 后按 locator/registry 拉取、校验并缓存
+5. `PYCLOUD_GATEWAY_DATAREF_RELAY` 仍默认 `eager`；gateway_public 的外部 DataRef locator 信任边界后续单独收口
+
 ## 6. 动态补偿与失败可观测性基线
 
 1. Service / TaskPool 动态补偿由 owner client 侧驱动，不增加 InfoCenter 的调度职责

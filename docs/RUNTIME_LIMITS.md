@@ -19,6 +19,10 @@
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
 | `PYCLOUD_OBJECT_SEGMENT_MAX_BYTES` | `8388608` | 单个结果段文件允许的最大大小 |
 | `PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES` | `67108864` | 结果段文件滚动写入的目标大小 |
+| `PYCLOUD_DATAREF_UPLOAD_STRATEGY` | `upload_once` | 内部链路大对象默认只上传到一个 node，其他层转发 `DataRef` |
+| `PYCLOUD_DATAREF_RESOLUTION` | `remote_fetch` | worker/client 解析 `DataRef` 时允许按 locator/registry 远程拉取并本地缓存 |
+| `PYCLOUD_JOBQUEUE_RESOLVE_REFS` | `defer_to_worker` | JobQueue 默认不在 job-orch 实例化业务 `DataRef`，交给最终 worker 解析 |
+| `PYCLOUD_GATEWAY_DATAREF_RELAY` | `eager` | gateway 仍保持旧的 eager relay 默认，外部链路后续单独收口 |
 | `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条发送消息限制 |
 | `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条接收消息限制 |
 | `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role node` 的默认 worker capacity；`pycloudctl start` 未显式指定时优先读它 |
@@ -80,7 +84,28 @@
   - 默认：`67108864` (`64 MiB`)
   - 对象 / 结果分段写入时，单个段文件的目标滚动大小
 
-### 2.3 gRPC message size
+### 2.3 DataRef internal path
+
+- `PYCLOUD_DATAREF_UPLOAD_STRATEGY`
+  - 默认：`upload_once`
+  - 回滚：显式设为 `fanout`
+  - 含义：内部可信链路大对象只上传到一个 node，并把带 `node_control` locator 的 `DataRef` 继续向后转发
+
+- `PYCLOUD_DATAREF_RESOLUTION`
+  - 默认：`remote_fetch`
+  - 回滚：显式设为 `local_only`
+  - 含义：worker 先查本地 object cache，未命中时按 `control_addr` / registry 远程下载、校验 checksum 后写入本地缓存
+
+- `PYCLOUD_JOBQUEUE_RESOLVE_REFS`
+  - 默认：`defer_to_worker`
+  - 回滚：显式设为 `eager`
+  - 含义：JobQueue 不在 job-orch 提前 materialize 业务 `DataRef`，最终执行 worker 再解析
+
+- `PYCLOUD_GATEWAY_DATAREF_RELAY`
+  - 默认：`eager`
+  - 含义：gateway 仍使用旧默认；外部 gateway_public 的 DataRef locator 信任策略不在本轮调整
+
+### 2.4 gRPC message size
 
 - `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES`
   - 默认：`16777216` (`16 MiB`)
@@ -90,7 +115,7 @@
 
 当前 `NodeControlClient` 和 `build_nodecontrol_server(...)` 都会读取这两个值，统一设置 gRPC channel/server 的 message size 限制。
 
-### 2.4 node 默认进程/并发参数
+### 2.5 node 默认进程/并发参数
 
 - `PYCLOUD_NODE_WORKER_CAPACITY`
   - 默认：`32`

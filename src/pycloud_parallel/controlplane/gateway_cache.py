@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
 from pycloud_parallel.controlplane.gateway_source import RouteSource
+from pycloud_parallel.controlplane.scheduling_policy import is_call_route
 from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
     ROUTE_UNAVAILABLE,
@@ -226,8 +227,11 @@ class GatewayRouteCache:
         candidates = [
             route
             for route in routes
-            if route.node_healthy
-            and route.status == pb2.SERVICE_STATUS_RUNNING
+            if is_call_route(
+                healthy=bool(route.node_healthy),
+                service_status=int(route.status),
+                node_drain=bool(getattr(route, "node_drain", False)),
+            )
             and route.http_base_url
             and route.service_id not in excluded
             and self._route_available(name, route.service_id)
@@ -272,7 +276,7 @@ class GatewayRouteCache:
                     node_instance_id=str(route.node_instance_id or route.node_id or route.control_addr or ""),
                     healthy=bool(route.node_healthy),
                     schedulable=bool(route.http_base_url),
-                    drain=False,
+                    drain=bool(getattr(route, "node_drain", False)),
                     breaker_state=(local_state.state if local_state is not None else "closed"),
                     predicted_busy=float(getattr(route, "predicted_busy", 0.0) or 0.0),
                     node_inflight=int(getattr(route, "in_flight", 0) or 0),

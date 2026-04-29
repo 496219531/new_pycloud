@@ -12,16 +12,16 @@ ACTIVE_SERVICE_STATUSES = {
 }
 
 
-def call_routes(*, service_status: int, node_drain: bool) -> bool:
-    return int(service_status) == int(pb2.SERVICE_STATUS_RUNNING) and not bool(node_drain)
+def is_call_route(*, healthy: bool = True, service_status: int, node_drain: bool = False) -> bool:
+    return bool(healthy) and int(service_status) == int(pb2.SERVICE_STATUS_RUNNING) and not bool(node_drain)
 
 
-def owner_targets(*, service_status: int) -> bool:
-    return int(service_status) in ACTIVE_SERVICE_STATUSES
+def is_owner_target(*, healthy: bool = True, service_status: int) -> bool:
+    return bool(healthy) and int(service_status) in ACTIVE_SERVICE_STATUSES
 
 
-def conflict_scope(*, service_status: int) -> bool:
-    return int(service_status) in ACTIVE_SERVICE_STATUSES
+def is_conflict_scope(*, healthy: bool = True, service_status: int) -> bool:
+    return bool(healthy) and int(service_status) in ACTIVE_SERVICE_STATUSES
 
 
 def deploy_candidate_block_reason(
@@ -50,14 +50,34 @@ def deploy_candidate_block_reason(
     return ""
 
 
-def deploy_candidates(**kwargs: object) -> bool:
+def is_deploy_candidate(**kwargs: object) -> bool:
     return not deploy_candidate_block_reason(**kwargs)
 
 
+def call_routes(*, service_status: int, node_drain: bool) -> bool:
+    return is_call_route(service_status=service_status, node_drain=node_drain)
+
+
+def owner_targets(*, service_status: int) -> bool:
+    return is_owner_target(service_status=service_status)
+
+
+def conflict_scope(*, service_status: int) -> bool:
+    return is_conflict_scope(service_status=service_status)
+
+
+def deploy_candidates(**kwargs: object) -> bool:
+    return is_deploy_candidate(**kwargs)
+
+
 __all__ = [
+    "is_call_route",
+    "is_owner_target",
+    "is_conflict_scope",
+    "is_deploy_candidate",
+    "deploy_candidate_block_reason",
     "call_routes",
     "owner_targets",
     "conflict_scope",
-    "deploy_candidate_block_reason",
     "deploy_candidates",
 ]

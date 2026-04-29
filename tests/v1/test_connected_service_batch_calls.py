@@ -175,6 +175,57 @@ def test_connected_service_iter_items_exposes_full_execution_items():
         client.close()
 
 
+def test_connected_service_unordered_can_return_execution_items():
+    client = Service.connect(
+        target="127.0.0.1:50051",
+        service_name="svc-demo",
+        transport="discovery",
+        validate_on_init=False,
+    )
+
+    def _call(method, payload, **kwargs):
+        return ("node-1", {"ok": True, "data": {"value": int(payload["x"])}})
+
+    try:
+        client._discovered_methods = ["square"]
+        with patch.object(type(client), "call_balanced", side_effect=_call):
+            items = list(client.square.unordered([{"x": 1}], return_items=True))
+        assert len(items) == 1
+        assert items[0].index == 0
+        assert items[0].ok is True
+        assert items[0].result == {"value": 1}
+        assert items[0].node_id == "node-1"
+    finally:
+        client.close()
+
+
+def test_connected_service_aunordered_can_return_execution_items():
+    client = Service.connect(
+        target="127.0.0.1:50051",
+        service_name="svc-demo",
+        transport="discovery",
+        validate_on_init=False,
+    )
+
+    async def _call(method, payload, **kwargs):
+        return ("node-1", {"ok": True, "data": {"value": int(payload["x"])}})
+
+    async def _collect():
+        client._discovered_methods = ["square"]
+        with patch.object(type(client), "acall_balanced", side_effect=_call):
+            return [item async for item in client.square.aunordered([{"x": 1}], return_items=True)]
+
+    try:
+        items = asyncio.run(_collect())
+        assert len(items) == 1
+        assert items[0].index == 0
+        assert items[0].ok is True
+        assert items[0].result == {"value": 1}
+        assert items[0].node_id == "node-1"
+    finally:
+        client.close()
+
+
 def test_connected_service_collect_items_returns_input_order():
     client = Service.connect(
         target="127.0.0.1:50051",

@@ -1550,7 +1550,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
-    ) -> Iterator[Tuple[int, Optional[object]]]:
+        return_items: bool = False,
+    ) -> Iterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         for item in _service_iter_item_calls(
             self,
             method=method,
@@ -1560,7 +1561,7 @@ class _ConnectedService:
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
         ):
-            yield item.index, item.result if item.ok else None
+            yield item if return_items else (item.index, item.result if item.ok else None)
 
     async def aunordered_calls(
         self,
@@ -1571,7 +1572,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
-    ) -> AsyncIterator[Tuple[int, Optional[object]]]:
+        return_items: bool = False,
+    ) -> AsyncIterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         async for item in _service_aiter_item_calls(
             self,
             method=method,
@@ -1581,7 +1583,7 @@ class _ConnectedService:
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
         ):
-            yield item.index, item.result if item.ok else None
+            yield item if return_items else (item.index, item.result if item.ok else None)
 
     def iter_item_calls(
         self,
@@ -4230,7 +4232,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
-    ) -> Iterator[Tuple[int, Optional[object]]]:
+        return_items: bool = False,
+    ) -> Iterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         for item in _service_iter_item_calls(
             self,
             method=method,
@@ -4240,7 +4243,7 @@ class Service(ServiceExecutionSession):
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
         ):
-            yield item.index, item.result if item.ok else None
+            yield item if return_items else (item.index, item.result if item.ok else None)
 
     async def aunordered_calls(
         self,
@@ -4251,7 +4254,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
-    ) -> AsyncIterator[Tuple[int, Optional[object]]]:
+        return_items: bool = False,
+    ) -> AsyncIterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         async for item in _service_aiter_item_calls(
             self,
             method=method,
@@ -4261,7 +4265,7 @@ class Service(ServiceExecutionSession):
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
         ):
-            yield item.index, item.result if item.ok else None
+            yield item if return_items else (item.index, item.result if item.ok else None)
 
     def iter_item_calls(
         self,

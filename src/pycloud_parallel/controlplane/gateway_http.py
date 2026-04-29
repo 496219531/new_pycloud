@@ -31,7 +31,7 @@ from .client_transport import (
     _iter_route_http_stream,
     _serialize_http_call_payload,
 )
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
+from pycloud_parallel.controlplane.data_ref import DataRef, is_data_ref_payload, maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
@@ -64,6 +64,7 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
 
 
 MAX_BODY_BYTES = 64 * 1024 * 1024
+EXTERNAL_DATA_REF_ERROR = "external DataRef is not accepted; upload data to gateway first"
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -89,6 +90,38 @@ def _stream_json_safe(value: Any) -> Any:
 
 def _encode_stream_line(event: Dict[str, object]) -> bytes:
     return json.dumps(serialize_arrow_compatible(_stream_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
+
+
+def _looks_like_legacy_data_ref_payload(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    keys = {str(key or "").strip() for key in value.keys()}
+    if not keys:
+        return False
+    if not ({"ref_id", "storage_id", "object_id"} & keys):
+        return False
+    return bool(
+        {"locator_kind", "locator_token", "control_addr", "materialize_as", "size_bytes", "format", "logical_type"} & keys
+    )
+
+
+def _contains_external_data_ref(value: Any) -> bool:
+    if isinstance(value, DataRef):
+        return True
+    if isinstance(value, dict):
+        if is_data_ref_payload(value) or _looks_like_legacy_data_ref_payload(value):
+            return True
+        if maybe_data_ref(value) is not None:
+            return True
+        return any(_contains_external_data_ref(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_external_data_ref(item) for item in value)
+    return False
+
+
+def _reject_external_data_refs(payload: Any) -> None:
+    if _contains_external_data_ref(payload):
+        raise ValueError(EXTERNAL_DATA_REF_ERROR)
 
 
 @dataclass
@@ -177,6 +210,11 @@ class GatewayHttpApp:
             return 400, {"ok": False, "error": f"invalid upload-call request: {exc}"}
 
         request = parsed_upload.request
+        try:
+            _reject_external_data_refs(parsed_upload.payload)
+        except ValueError as exc:
+            self.stage_manager.cleanup(request)
+            return 400, {"ok": False, "error": str(exc)}
         try:
             parsed_upload.used_slots = tuple(
                 collect_used_upload_slots(
@@ -272,10 +310,20 @@ class GatewayHttpApp:
                     context="gateway_public",
                 )
             else:
+                try:
+                    raw_payload = json.loads(body.decode("utf-8") if body else "{}")
+                except Exception:
+                    raw_payload = None
+                if raw_payload is not None:
+                    _reject_external_data_refs(raw_payload)
                 payload, serialization_mode = _decode_http_request_body_with_mode(
                     body,
                     context="gateway_public",
                 )
+        except ValueError as exc:
+            return 400, {"ok": False, "error": str(exc)}
+        try:
+            _reject_external_data_refs(payload)
         except ValueError as exc:
             return 400, {"ok": False, "error": str(exc)}
 

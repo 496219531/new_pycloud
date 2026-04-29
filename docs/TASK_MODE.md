@@ -276,6 +276,37 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
 3. `put_data()/put_json()/put_ndarray()/put_dataframe()` 不显式传 mode 时，会继承当前 `TaskPool` session mode
 4. transport decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
 
+### 4.1 DataRef 默认链路
+
+内部可信链路的 `DataRef` 主路径现在是：
+
+```text
+client upload once -> node/job-orch forward ref -> final worker remote fetch/cache/materialize
+```
+
+默认行为：
+
+1. `PYCLOUD_DATAREF_UPLOAD_STRATEGY=upload_once`
+   - 大对象只上传到第一个选中 node
+   - 返回带 `locator_kind=node_control` / `control_addr` 的 `DataRef`
+2. `PYCLOUD_JOBQUEUE_RESOLVE_REFS=defer_to_worker`
+   - JobQueue 不在 job-orch 提前实例化业务 `DataRef`
+   - payload 保留引用进入 TaskPool
+3. `PYCLOUD_DATAREF_RESOLUTION=remote_fetch`
+   - worker 先查本地 object cache
+   - miss 后按 `control_addr` 或 registry 下载对象
+   - 下载后校验 checksum / size，再写入本地 cache 并 materialize
+
+旧行为仍可显式回滚：
+
+```bash
+export PYCLOUD_DATAREF_UPLOAD_STRATEGY=fanout
+export PYCLOUD_JOBQUEUE_RESOLVE_REFS=eager
+export PYCLOUD_DATAREF_RESOLUTION=local_only
+```
+
+`PYCLOUD_GATEWAY_DATAREF_RELAY` 仍默认 `eager`，gateway/public DataRef 信任边界后续单独处理。
+
 显式示例：
 
 ```python

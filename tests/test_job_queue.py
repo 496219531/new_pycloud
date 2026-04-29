@@ -1130,10 +1130,15 @@ def test_job_queue_manager_submit_job_tracks_controlplane_data_ref_in_nested_bus
     assert job.payload["job_payload"]["blob_ref"] == data_ref
 
 
-def test_resolve_payload_data_refs_falls_back_across_replicas(monkeypatch) -> None:
+def test_resolve_payload_data_refs_eager_falls_back_across_replicas(monkeypatch, request) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
     from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
     from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs
+
+    monkeypatch.setenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", "eager")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
 
     data_ref = DataRef(
         ref_id="sha256:" + ("c" * 64),
@@ -1203,12 +1208,12 @@ def test_resolve_payload_data_refs_falls_back_across_replicas(monkeypatch) -> No
     assert attempts == ["127.0.0.1:50061", "127.0.0.1:50062"]
 
 
-def test_resolve_payload_data_refs_can_defer_to_worker(monkeypatch, request) -> None:
+def test_resolve_payload_data_refs_defaults_to_defer_to_worker(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
     from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs
 
-    monkeypatch.setenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", "defer_to_worker")
+    monkeypatch.delenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", raising=False)
     config_mod.reload_config()
     request.addfinalizer(config_mod.reload_config)
 
@@ -1857,9 +1862,8 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
     assert captured["payload"]["job_payload"]["cfg"] == data_ref
 
 
-def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -> None:
+def _submit_oversized_job_payload(monkeypatch):
     from pycloud_parallel import DataRef, JobQueue
-    import pycloud_parallel.execution.support as client_mod
 
     monkeypatch.setattr("pycloud_parallel.execution.support.INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 32)
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1928,8 +1932,35 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch) -
         }
     )
 
+    return resp, captured, registered, replicas, DataRef
+
+
+def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, request) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    resp, captured, registered, replicas, data_ref_type = _submit_oversized_job_payload(monkeypatch)
+
     assert resp["job"]["job_id"] == "job-1"
-    assert isinstance(captured["payload"]["job_payload"], DataRef)
+    assert isinstance(captured["payload"]["job_payload"], data_ref_type)
+    assert captured["payload"]["job_payload"].locator_kind == "controlplane"
+    assert registered["replicas"] == [replicas[0]]
+
+
+def test_job_queue_client_submit_job_fanout_registers_all_replicas(monkeypatch, request) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "fanout")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    resp, captured, registered, replicas, data_ref_type = _submit_oversized_job_payload(monkeypatch)
+
+    assert resp["job"]["job_id"] == "job-1"
+    assert isinstance(captured["payload"]["job_payload"], data_ref_type)
     assert captured["payload"]["job_payload"].locator_kind == "controlplane"
     assert registered["replicas"] == replicas
 

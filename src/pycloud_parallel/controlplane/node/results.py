@@ -290,7 +290,9 @@ def _data_ref_remote_targets(data_ref: DataRef) -> tuple[str, ...]:
         try:
             resolved = DataRegistryClient(locator_token).resolve(data_ref)
         except Exception as exc:
-            raise ObjectResolutionError(f"data ref registry resolve failed: {exc}") from exc
+            raise ObjectResolutionError(
+                f"data ref registry resolve failed object_id={data_ref.object_id} registry_target={locator_token}: {exc}"
+            ) from exc
         candidates = [str(item.get("control_addr", "") or "").strip() for item in resolved.replicas]
         candidates.append(str(resolved.control_addr or "").strip())
         return tuple(dict.fromkeys(item for item in candidates if item))
@@ -301,8 +303,14 @@ def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) 
     started_at = time.perf_counter()
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
-    with NodeControlClient(target) as client:
-        blob = client.download_object_bytes(object_id=data_ref.object_id)
+    try:
+        with NodeControlClient(target) as client:
+            blob = client.download_object_bytes(object_id=data_ref.object_id)
+    except Exception as exc:
+        raise ObjectResolutionError(
+            f"remote fetch failed object_id={data_ref.object_id} control_addr={target} "
+            f"error_type={type(exc).__name__}: {exc}"
+        ) from exc
     fetch_ms = (time.perf_counter() - started_at) * 1000.0
 
     normalized_id = normalize_object_id(data_ref.object_id)

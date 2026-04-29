@@ -102,12 +102,12 @@ EXECUTOR_BACKEND = _env_choice(
 )
 DATAREF_RESOLUTION = _env_choice(
     PYCLOUD_DATAREF_RESOLUTION,
-    "local_only",
+    "remote_fetch",
     {"local_only", "remote_fetch"},
 )
 DATAREF_UPLOAD_STRATEGY = _env_choice(
     PYCLOUD_DATAREF_UPLOAD_STRATEGY,
-    "fanout",
+    "upload_once",
     {"fanout", "upload_once"},
 )
 GATEWAY_DATAREF_RELAY = _env_choice(
@@ -117,7 +117,7 @@ GATEWAY_DATAREF_RELAY = _env_choice(
 )
 JOBQUEUE_RESOLVE_REFS = _env_choice(
     PYCLOUD_JOBQUEUE_RESOLVE_REFS,
-    "eager",
+    "defer_to_worker",
     {"eager", "defer_to_worker"},
 )
 
@@ -233,11 +233,11 @@ def get_dependency_policy_mode() -> DependencyPolicyMode:
 
 
 def get_dataref_resolution() -> DataRefResolutionMode:
-    return str(DATAREF_RESOLUTION or "local_only").strip().lower()  # type: ignore[return-value]
+    return str(DATAREF_RESOLUTION or "remote_fetch").strip().lower()  # type: ignore[return-value]
 
 
 def get_dataref_upload_strategy() -> DataRefUploadStrategy:
-    return str(DATAREF_UPLOAD_STRATEGY or "fanout").strip().lower()  # type: ignore[return-value]
+    return str(DATAREF_UPLOAD_STRATEGY or "upload_once").strip().lower()  # type: ignore[return-value]
 
 
 def get_gateway_dataref_relay() -> GatewayDataRefRelayMode:
@@ -245,7 +245,7 @@ def get_gateway_dataref_relay() -> GatewayDataRefRelayMode:
 
 
 def get_jobqueue_resolve_refs() -> JobQueueResolveRefsMode:
-    return str(JOBQUEUE_RESOLVE_REFS or "eager").strip().lower()  # type: ignore[return-value]
+    return str(JOBQUEUE_RESOLVE_REFS or "defer_to_worker").strip().lower()  # type: ignore[return-value]
 
 
 def get_inline_transport_checksum() -> bool:
@@ -351,12 +351,12 @@ def reload_config() -> None:
         ),
         DATAREF_RESOLUTION=_env_choice(
             PYCLOUD_DATAREF_RESOLUTION,
-            "local_only",
+            "remote_fetch",
             {"local_only", "remote_fetch"},
         ),
         DATAREF_UPLOAD_STRATEGY=_env_choice(
             PYCLOUD_DATAREF_UPLOAD_STRATEGY,
-            "fanout",
+            "upload_once",
             {"fanout", "upload_once"},
         ),
         GATEWAY_DATAREF_RELAY=_env_choice(
@@ -366,7 +366,7 @@ def reload_config() -> None:
         ),
         JOBQUEUE_RESOLVE_REFS=_env_choice(
             PYCLOUD_JOBQUEUE_RESOLVE_REFS,
-            "eager",
+            "defer_to_worker",
             {"eager", "defer_to_worker"},
         ),
         GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),

@@ -36,6 +36,8 @@ These legacy categories are transitional and must not survive the V1 cleanup:
 - Large inputs and large results both converge on `DataRef`.
 - `DataRef` is the only public large-object reference type.
 - Object upload, gateway upload-call staging, job delayed resolve, and result materialization all converge on the same `DataRef` data plane.
+- Internal trusted `DataRef` flow is upload-once by default: the client uploads one object copy, intermediate control layers forward the reference, and the final worker or client fetches/materializes from the locator or registry.
+- Gateway/public `DataRef` trust and relay behavior remains a separate boundary; gateway relay keeps its eager default until that boundary is explicitly redesigned.
 
 ## Runtime Contract
 

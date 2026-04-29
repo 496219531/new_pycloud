@@ -19,8 +19,8 @@ def test_upload_once_ref_can_be_resolved_by_worker_remote_fetch(tmp_path, monkey
     from pycloud_parallel.controlplane import config as config_mod
     import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
 
-    monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "upload_once")
-    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
     config_mod.reload_config()
     request.addfinalizer(config_mod.reload_config)
 
@@ -71,7 +71,7 @@ def test_gateway_lazy_ref_can_be_resolved_by_worker_remote_fetch(tmp_path, monke
     import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
 
     monkeypatch.setenv("PYCLOUD_GATEWAY_DATAREF_RELAY", "lazy")
-    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
     config_mod.reload_config()
     request.addfinalizer(config_mod.reload_config)
 
@@ -133,8 +133,8 @@ def test_jobqueue_deferred_ref_can_be_resolved_by_worker_remote_fetch(tmp_path, 
     from pycloud_parallel.controlplane import config as config_mod
     import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
 
-    monkeypatch.setenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", "defer_to_worker")
-    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    monkeypatch.delenv("PYCLOUD_JOBQUEUE_RESOLVE_REFS", raising=False)
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
     config_mod.reload_config()
     request.addfinalizer(config_mod.reload_config)
 

@@ -69,6 +69,7 @@ class _UnorderedCallProxyStream:
         strategy: str,
         refresh_status: bool,
         max_in_flight: int,
+        return_items: bool = False,
     ) -> None:
         self._method = method
         self._group = group
@@ -77,6 +78,7 @@ class _UnorderedCallProxyStream:
         self._strategy = strategy
         self._refresh_status = refresh_status
         self._max_in_flight = max_in_flight
+        self._return_items = bool(return_items)
 
     def __repr__(self) -> str:
         return f"<UnorderedCallProxyStream method={self._method!r} count={len(self._payloads)}>"
@@ -89,6 +91,7 @@ class _UnorderedCallProxyStream:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=self._max_in_flight,
+            return_items=self._return_items,
         )
 
 
@@ -103,6 +106,7 @@ class _AUnorderedCallProxyStream:
         strategy: str,
         refresh_status: bool,
         max_in_flight: int,
+        return_items: bool = False,
     ) -> None:
         self._method = method
         self._group = group
@@ -111,6 +115,7 @@ class _AUnorderedCallProxyStream:
         self._strategy = strategy
         self._refresh_status = refresh_status
         self._max_in_flight = max_in_flight
+        self._return_items = bool(return_items)
 
     def __repr__(self) -> str:
         return f"<AUnorderedCallProxyStream method={self._method!r} count={len(self._payloads)}>"
@@ -123,6 +128,7 @@ class _AUnorderedCallProxyStream:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=self._max_in_flight,
+            return_items=self._return_items,
         )
 
 
@@ -323,6 +329,7 @@ class _CallProxy:
         *,
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
+        return_items: bool = False,
         **shared_kwargs,
     ) -> _UnorderedCallProxyStream:
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
@@ -334,6 +341,7 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
+            return_items=return_items,
         )
 
     def aunordered(
@@ -342,6 +350,7 @@ class _CallProxy:
         *,
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
+        return_items: bool = False,
         **shared_kwargs,
     ) -> _AUnorderedCallProxyStream:
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
@@ -353,6 +362,7 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
+            return_items=return_items,
         )
 
     def iter_items(

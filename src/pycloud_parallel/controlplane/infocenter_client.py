@@ -10,7 +10,7 @@ from typing import Dict, Optional, Sequence, Tuple
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
-from pycloud_parallel.controlplane.scheduling_policy import deploy_candidate_block_reason, deploy_candidates
+from pycloud_parallel.controlplane.scheduling_policy import deploy_candidate_block_reason, is_deploy_candidate
 from pycloud_parallel.execution.scheduler import (
     JOBQUEUE_DEFAULT,
     SchedulerCandidate,
@@ -753,7 +753,7 @@ class InfoCenterClient:
             candidates = [
                 node
                 for node in nodes
-                if deploy_candidates(
+                if is_deploy_candidate(
                     healthy=bool(node.healthy),
                     schedulable=bool(node.schedulable),
                     drain=bool(node.drain),

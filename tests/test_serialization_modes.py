@@ -57,25 +57,10 @@ class _FakeUploadClient:
         )
 
 
-def test_put_data_via_clients_defaults_to_fanout(monkeypatch, request):
+def test_put_data_via_clients_defaults_to_upload_once(monkeypatch, request):
     from pycloud_parallel.controlplane import config as config_mod
 
     monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
-    config_mod.reload_config()
-    request.addfinalizer(config_mod.reload_config)
-
-    clients = [_FakeUploadClient("node-a:50061"), _FakeUploadClient("node-b:50062")]
-    ref = _put_data_via_clients(clients, b"hello", serialization_mode="legacy_v1")
-
-    assert ref.locator_kind == "node_local"
-    assert len(clients[0].calls) == 1
-    assert len(clients[1].calls) == 1
-
-
-def test_put_data_via_clients_upload_once_sets_locator(monkeypatch, request):
-    from pycloud_parallel.controlplane import config as config_mod
-
-    monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "upload_once")
     config_mod.reload_config()
     request.addfinalizer(config_mod.reload_config)
 
@@ -87,6 +72,21 @@ def test_put_data_via_clients_upload_once_sets_locator(monkeypatch, request):
     assert ref.control_addr == "node-a:50061"
     assert len(clients[0].calls) == 1
     assert clients[1].calls == []
+
+
+def test_put_data_via_clients_fanout_uploads_to_all_nodes(monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "fanout")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    clients = [_FakeUploadClient("node-a:50061"), _FakeUploadClient("node-b:50062")]
+    ref = _put_data_via_clients(clients, b"hello", serialization_mode="legacy_v1")
+
+    assert ref.locator_kind == "node_local"
+    assert len(clients[0].calls) == 1
+    assert len(clients[1].calls) == 1
 
 
 def test_upload_once_replica_registration_keeps_only_upload_target(monkeypatch, request):

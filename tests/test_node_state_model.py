@@ -903,12 +903,12 @@ def test_data_ref_resolution_local_only_does_not_remote_fetch(tmp_path, monkeypa
         _resolve_single_data_ref(ref, object_dir=str(tmp_path))
 
 
-def test_data_ref_resolution_remote_fetches_and_caches(tmp_path, monkeypatch, request):
+def test_data_ref_resolution_defaults_to_remote_fetch_and_caches(tmp_path, monkeypatch, request):
     from pycloud_parallel.controlplane import config as config_mod
     import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
     from pycloud_parallel.data.ref import DataRef, object_storage_path
 
-    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
     config_mod.reload_config()
     request.addfinalizer(config_mod.reload_config)
 
@@ -1046,6 +1046,137 @@ def test_data_ref_resolution_remote_fetch_rejects_checksum_mismatch(tmp_path, mo
     with pytest.raises(ObjectResolutionError, match="checksum mismatch"):
         _resolve_single_data_ref(ref, object_dir=str(tmp_path))
     assert not object_storage_path(tmp_path, object_id=object_id, fmt="bin").exists()
+
+
+def test_data_ref_resolution_remote_fetch_error_names_object_and_target(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"missing remote payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+
+    class FakeClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def download_object_bytes(self, *, object_id):
+            raise FileNotFoundError(f"object missing: {object_id}")
+
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+    )
+
+    with pytest.raises(ObjectResolutionError) as exc_info:
+        _resolve_single_data_ref(ref, object_dir=str(tmp_path))
+
+    message = str(exc_info.value)
+    assert "remote fetch failed" in message
+    assert object_id in message
+    assert "127.0.0.1:50061" in message
+    assert "error_type=FileNotFoundError" in message
+    assert "object missing" in message
+
+
+def test_data_ref_resolution_remote_fetch_unreachable_is_distinct(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"unreachable remote payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+
+    class FakeClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def __enter__(self):
+            raise ConnectionError(f"cannot reach {self.target}")
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+    )
+
+    with pytest.raises(ObjectResolutionError) as exc_info:
+        _resolve_single_data_ref(ref, object_dir=str(tmp_path))
+
+    message = str(exc_info.value)
+    assert "remote fetch failed" in message
+    assert object_id in message
+    assert "127.0.0.1:50061" in message
+    assert "error_type=ConnectionError" in message
+    assert "cannot reach" in message
+
+
+def test_data_ref_resolution_registry_failure_is_distinct(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.data_registry as data_registry_mod
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"registry missing payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+
+    class FakeRegistryClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def resolve(self, ref):
+            raise LookupError(f"registry miss: {ref.object_id}")
+
+    monkeypatch.setattr(data_registry_mod, "DataRegistryClient", FakeRegistryClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="controlplane",
+        locator_token="infocenter:50051",
+    )
+
+    with pytest.raises(ObjectResolutionError) as exc_info:
+        _resolve_single_data_ref(ref, object_dir=str(tmp_path))
+
+    message = str(exc_info.value)
+    assert "data ref registry resolve failed" in message
+    assert object_id in message
+    assert "infocenter:50051" in message
+    assert "registry miss" in message
 
 
 def test_data_store_builds_result_and_data_refs() -> None:

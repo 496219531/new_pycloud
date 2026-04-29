@@ -15,10 +15,16 @@ from urllib.request import Request, urlopen
 import grpc
 import pytest
 
+from pycloud_parallel.controlplane.client_transport import (
+    _decode_http_request_body_with_mode,
+    _encode_http_json_body,
+    _encode_http_transport_body,
+    _serialize_http_call_payload,
+)
 from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, InfoCenterServiceRoute
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.controlplane.gateway_http import GatewayCallError, GatewayHttpApp
+from pycloud_parallel.controlplane.gateway_http import EXTERNAL_DATA_REF_ERROR, GatewayCallError, GatewayHttpApp
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.data_ref import DataRef
@@ -144,6 +150,128 @@ def test_gateway_attaches_result_ref_locator_without_materializing() -> None:
     assert updated.node_instance_id == route.node_instance_id
     assert calls
     assert calls[0]["control_addr"] == route.control_addr
+
+
+class _NeverRouteCache:
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def select_route(self, service_name: str, exclude_service_ids=None, force_refresh: bool = False):
+        raise AssertionError(f"route selection should not run: {service_name}")
+
+
+def _gateway_public_post_payload(payload: dict) -> tuple[int, dict]:
+    headers = Message()
+    headers["Content-Type"] = "application/json"
+    app = GatewayHttpApp(route_cache=_NeverRouteCache(), controlplane_target="127.0.0.1:50051")
+    app.start()
+    try:
+        return app.handle_post(
+            path="/svc/svc-public/call/run?timeout_sec=5.000",
+            headers=headers,
+            body=_encode_http_json_body(payload),
+        )
+    finally:
+        app.stop()
+
+
+def test_gateway_public_json_call_rejects_top_level_data_ref() -> None:
+    ref = DataRef(
+        ref_id="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        storage_id="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        format="bin",
+        size_bytes=3,
+    )
+
+    code, body = _gateway_public_post_payload(ref.to_payload())
+
+    assert code == 400
+    assert body["error"] == EXTERNAL_DATA_REF_ERROR
+
+
+def test_gateway_public_json_call_rejects_nested_data_ref() -> None:
+    ref = DataRef(
+        ref_id="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        storage_id="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        format="bin",
+        size_bytes=3,
+    )
+
+    code, body = _gateway_public_post_payload({"items": [{"blob": ref.to_payload()}]})
+
+    assert code == 400
+    assert body["error"] == EXTERNAL_DATA_REF_ERROR
+
+
+def test_gateway_public_json_call_rejects_legacy_data_ref_payload() -> None:
+    code, body = _gateway_public_post_payload(
+        {
+            "blob": {
+                "ref_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "storage_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "locator_kind": "node_control",
+                "control_addr": "127.0.0.1:50061",
+                "format": "bin",
+            }
+        }
+    )
+
+    assert code == 400
+    assert body["error"] == EXTERNAL_DATA_REF_ERROR
+
+
+def test_gateway_public_http_bytes_transport_rejects_data_ref() -> None:
+    ref = DataRef(
+        ref_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        storage_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        format="bin",
+        size_bytes=3,
+    )
+    body, transport_headers, _codec = _encode_http_transport_body(
+        {"blob": ref},
+        context="service_internal",
+        mode="structured_v1",
+    )
+    headers = Message()
+    for key, value in transport_headers.items():
+        headers[key] = value
+    app = GatewayHttpApp(route_cache=_NeverRouteCache(), controlplane_target="127.0.0.1:50051")
+    app.start()
+    try:
+        code, response = app.handle_post(
+            path="/svc/svc-public/call/run?timeout_sec=5.000",
+            headers=headers,
+            body=body,
+        )
+    finally:
+        app.stop()
+
+    assert code == 400
+    assert response["error"] == EXTERNAL_DATA_REF_ERROR
+
+
+def test_internal_http_decode_still_allows_system_data_ref() -> None:
+    ref = DataRef(
+        ref_id="sha256:abababababababababababababababababababababababababababababababab",
+        storage_id="sha256:abababababababababababababababababababababababababababababababab",
+        format="bin",
+        size_bytes=3,
+    )
+    payload = _serialize_http_call_payload(
+        {"blob": ref},
+        context="service call payload",
+        mode="legacy_v1",
+    )
+
+    decoded, _mode = _decode_http_request_body_with_mode(
+        _encode_http_json_body(payload),
+        context="service_internal",
+    )
+
+    assert decoded["blob"] == ref
 
 
 class _SequenceRouteCache:
@@ -539,6 +667,117 @@ def test_gateway_upload_call_rejects_invalid_payload_before_upload(
         assert not requests_dir.exists() or not any(requests_dir.iterdir())
     finally:
         app.stop()
+
+
+def _build_raw_upload_call(*, boundary: str, payload_obj: dict, file_map_obj: dict | None = None) -> bytes:
+    chunks = [
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload\"\r\nContent-Type: application/json\r\n\r\n".encode("utf-8"),
+        json.dumps(payload_obj).encode("utf-8"),
+        b"\r\n",
+    ]
+    if file_map_obj is not None:
+        chunks.extend(
+            [
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file_map\"\r\nContent-Type: application/json\r\n\r\n".encode("utf-8"),
+                json.dumps(file_map_obj).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.extend(
+        [
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[input_txt]\"; filename=\"input.txt\"\r\nContent-Type: text/plain\r\n\r\n".encode("utf-8"),
+            b"gateway uploaded file",
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    return b"".join(chunks)
+
+
+def test_gateway_upload_call_rejects_payload_data_ref_before_route_selection(tmp_path) -> None:
+    ref = DataRef(
+        ref_id="sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        storage_id="sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        format="bin",
+        size_bytes=3,
+    )
+    boundary = "upload-dataref-boundary"
+    raw = _build_raw_upload_call(boundary=boundary, payload_obj={"doc": ref.to_payload()})
+    headers = Message()
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    headers["Content-Length"] = str(len(raw))
+    stage_manager = GatewayStageManager(root_dir=str(tmp_path / "gateway_stage_dataref"), failure_ttl_sec=600, gc_interval_sec=60)
+    app = GatewayHttpApp(route_cache=_NeverRouteCache(), stage_manager=stage_manager, controlplane_target="127.0.0.1:50051")
+    app.start()
+    try:
+        code, body = app.handle_post_stream(
+            path="/svc/svc-public/upload-call/inspect?timeout_sec=5.000",
+            headers=headers,
+            stream=io.BytesIO(raw),
+            content_length=len(raw),
+        )
+    finally:
+        app.stop()
+
+    assert code == 400
+    assert body["error"] == EXTERNAL_DATA_REF_ERROR
+    assert not stage_manager.requests_dir.exists() or not any(stage_manager.requests_dir.iterdir())
+
+
+def test_gateway_upload_call_allows_raw_file_placeholder(tmp_path, monkeypatch) -> None:
+    route = _gateway_route_variant(1, service_name="svc-upload-public")
+    stage_manager = GatewayStageManager(root_dir=str(tmp_path / "gateway_stage_file"), failure_ttl_sec=600, gc_interval_sec=60)
+    app = GatewayHttpApp(route_cache=_SequenceRouteCache([route]), stage_manager=stage_manager, controlplane_target="127.0.0.1:50051")
+    captured = {}
+    generated_ref = DataRef(
+        ref_id="gateway-upload:req:svc:input_txt",
+        storage_id="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        format="txt",
+        size_bytes=21,
+        materialize_as="text",
+        locator_kind="node_control",
+        locator_token=route.control_addr,
+        control_addr=route.control_addr,
+    )
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.gateway_http.upload_staged_files_to_route",
+        lambda **kwargs: {"input_txt": generated_ref},
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.gateway_http.release_uploaded_refs_on_route",
+        lambda **kwargs: None,
+    )
+
+    def _fake_invoke(route_arg, **kwargs):
+        captured["route"] = route_arg
+        captured["payload"] = kwargs["payload"]
+        return {"ok": True, "data": {"accepted": True}}
+
+    monkeypatch.setattr(app, "_invoke_route", _fake_invoke)
+    boundary = "upload-file-boundary"
+    raw = _build_raw_upload_call(
+        boundary=boundary,
+        payload_obj={"doc": {"kind": "uploaded_file", "slot": "input_txt"}},
+    )
+    headers = Message()
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    headers["Content-Length"] = str(len(raw))
+
+    app.start()
+    try:
+        code, body = app.handle_post_stream(
+            path="/svc/svc-upload-public/upload-call/inspect?timeout_sec=5.000",
+            headers=headers,
+            stream=io.BytesIO(raw),
+            content_length=len(raw),
+        )
+    finally:
+        app.stop()
+
+    assert code == 200
+    assert body["data"] == {"accepted": True}
+    assert captured["payload"]["doc"] == generated_ref
 
 
 def test_gateway_upload_call_reuses_stage_file_on_route_retry(tmp_path):

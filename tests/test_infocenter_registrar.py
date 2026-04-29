@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
-from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _reorder_job_via_http
+from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _render_ops_snapshot, _reorder_job_via_http
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeState, NodeTaskPoolInfo
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
@@ -168,6 +168,37 @@ def test_ops_page_merges_duplicate_services_with_same_endpoint():
     assert "merged×2" in raw
     assert raw.count("calc_asset_ratio") >= 1
     assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
+
+
+def test_ops_snapshot_returns_partial_table_fragments():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-snapshot-inst",
+        node_id="node-snapshot",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-snapshot": NodeServiceState(
+                service_name="svc-snapshot",
+                service_id="svc-snapshot",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-snapshot",
+            )
+        },
+    )
+
+    snapshot = _render_ops_snapshot(info_state)
+
+    assert snapshot["ok"] is True
+    fragments = snapshot["fragments"]
+    assert "node-snapshot" in fragments["ops-nodes-body"]
+    assert "svc-snapshot" in fragments["ops-services-body"]
+    assert "<tbody" not in fragments["ops-nodes-body"]
 
 
 def test_ops_page_merges_duplicate_services_across_node_records_with_same_endpoint():
