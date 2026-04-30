@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Protocol, Tuple
+from typing import Deque, Dict, List, Tuple
 
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -20,41 +20,6 @@ class QueuedResult:
     """
     seq: int
     result: pb2.TaskResult
-
-
-class ResultHook(Protocol):
-    """结果钩子协议。
-
-    定义处理任务结果的接口。
-    """
-
-    def on_result(self, client_id: str, item: QueuedResult) -> None:
-        """处理单个完成的任务结果。
-
-        Args:
-            client_id: 客户端 ID
-            item: 队列结果项
-        """
-
-    def pull(
-        self,
-        client_id: str,
-        *,
-        limit: int,
-        wait_ms: int,
-        cursor: str,
-    ) -> Tuple[List[pb2.TaskResult], str]:
-        """返回一批结果和下一个游标。
-
-        Args:
-            client_id: 客户端 ID
-            limit: 批次大小限制
-            wait_ms: 等待时间（毫秒）
-            cursor: 当前游标
-
-        Returns:
-            Tuple[List[pb2.TaskResult], str]: (结果列表, 下一个游标)
-        """
 
 
 class InMemoryResultHook:

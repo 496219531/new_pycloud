@@ -195,7 +195,7 @@
 高层返回 data 则是：
 
 1. `TaskPool.wait_for_data()`
-2. `_resolve_task_results_data(...)`
+2. `fetch_result_data(...)`
 
 关键位置：
 

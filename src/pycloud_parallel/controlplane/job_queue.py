@@ -77,15 +77,6 @@ _JOB_ORCH_TASKPOOL_BINDING_ID = "taskpool_default"
 _DEFAULT_JOB_QUEUE_POOL_IDLE_TTL_SEC = 300
 
 
-@dataclass
-class _SharedTaskPoolState:
-    pool: TaskPool
-    artifact_key: str = ""
-    policy_id: str = ""
-    current_mode: str = ""
-    last_used_at: datetime = field(default_factory=utc_now)
-
-
 def _close_executor(executor: Any) -> None:
     if executor is None:
         return

@@ -164,10 +164,6 @@ def _node_control_client(*args, **kwargs):
     return NodeControlClient(*args, **kwargs)
 
 
-def _resolve_task_results_data(batch: Any, results: Sequence[pb2.TaskResult]) -> List[Any]:
-    return [batch.fetch_result_data(item) for item in results]
-
-
 def _close_task_pool_replica(pool: Any, *, reason: str) -> None:
     last_exc: Optional[Exception] = None
     for delay_sec in _TASK_POOL_CLOSE_RETRY_DELAYS_SEC:

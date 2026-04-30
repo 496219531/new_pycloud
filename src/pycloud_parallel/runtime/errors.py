@@ -3,7 +3,7 @@ from __future__ import annotations
 """Unified runtime compatibility errors for the V1 migration path."""
 
 from dataclasses import dataclass
-from typing import Sequence, Type
+from typing import Sequence
 
 
 class PycloudModelError(ValueError):
@@ -12,10 +12,6 @@ class PycloudModelError(ValueError):
 
 class RuntimeMismatchError(PycloudModelError):
     """Raised when requested python runtime cannot be satisfied."""
-
-
-class ArtifactModelError(PycloudModelError):
-    """Raised when artifact packaging/loading contract is invalid."""
 
 
 class DataRefPayloadError(PycloudModelError):
@@ -74,19 +70,3 @@ def normalize_invoke_error(
     if normalized_status == "FAILED_INFRA":
         return False, str(error_type or "InfraError"), str(error_message or infra_fallback)
     return True, "", ""
-
-
-def make_runtime_mismatch_error(
-    exc_type: Type[BaseException],
-    *,
-    requested_runtime: str,
-    candidates: Sequence[RuntimeMismatchCandidate],
-    scope: str = "nodes",
-) -> BaseException:
-    return exc_type(
-        format_runtime_mismatch_message(
-            requested_runtime=requested_runtime,
-            candidates=candidates,
-            scope=scope,
-        )
-    )
