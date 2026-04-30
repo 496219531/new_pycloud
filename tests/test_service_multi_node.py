@@ -14,7 +14,7 @@ from pycloud_parallel.artifact import Artifact
 from pycloud_parallel.execution.service_session import Service
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.infocenter.state import InfoCenterState
+from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc

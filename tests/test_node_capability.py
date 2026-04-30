@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
-from pycloud_parallel.controlplane.infocenter.state import InfoCenterState, utc_now
+from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
+from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 

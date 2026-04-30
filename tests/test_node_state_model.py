@@ -23,7 +23,7 @@ import pytest
 from pycloud_parallel.controlplane import serialization as serialization_mod
 from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
-from pycloud_parallel.controlplane.infocenter.state import InfoCenterState
+from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 from pycloud_parallel.controlplane.node.execution import (
     _build_execute_spec,
     _describe_artifact_error,
