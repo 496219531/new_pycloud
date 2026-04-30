@@ -570,33 +570,6 @@ def _code_version_from_digest(
     )
 
 
-def _exports_from_policy(
-    *,
-    consumer_kind: str,
-    export_mode: str = "",
-    export_methods: Optional[Sequence[str]] = None,
-    entry_callable: str = "run",
-) -> ArtifactExports:
-    normalized_mode = str(export_mode or "").strip().lower()
-    methods = _normalize_names(export_methods or ())
-    if normalized_mode not in _VALID_EXPORT_MODES:
-        normalized_mode = ""
-    if not normalized_mode:
-        if methods:
-            normalized_mode = "explicit"
-        elif str(consumer_kind or "").strip() in {"task", "job"}:
-            normalized_mode = "single"
-        else:
-            normalized_mode = "decorator"
-    if normalized_mode == "single":
-        return ArtifactExports.single(str(entry_callable or "").strip() or "run")
-    if normalized_mode == "explicit":
-        return ArtifactExports.explicit(methods)
-    if normalized_mode == "all":
-        return ArtifactExports.export_all()
-    return ArtifactExports.use_decorator()
-
-
 def _normalize_artifact_input(
     *,
     consumer_kind: str,

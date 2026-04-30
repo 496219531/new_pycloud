@@ -27,7 +27,6 @@ from pycloud_parallel.controlplane.artifact import (
     _default_artifact_filename,
     _default_entry_module_for_func,
     _default_entry_module_for_module,
-    _exports_from_policy,
     _normalize_artifact_input,
     _normalize_entry_callable_arg,
     _normalize_entry_module_arg,
@@ -2260,8 +2259,6 @@ class Service(ServiceExecutionSession):
         entry_module: Any = "",
         entry_callable: Any = "run",
         package_format: str = "",
-        export_mode: str = "decorator",
-        export_methods: Optional[Sequence[str]] = None,
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
@@ -2305,8 +2302,6 @@ class Service(ServiceExecutionSession):
             entry_module: 入口模块名，或可导入的真实模块对象
             entry_callable: 入口函数名，或真实函数对象
             package_format: 包格式 ("py", "zip", "tar.gz")
-            export_mode: 导出模式 ("decorator", "explicit", "all", "single")
-            export_methods: 显式导出的方法列表
             worker_count: 工作进程数
             heartbeat_timeout_sec: 心跳超时
             idle_ttl_sec: 空闲 TTL
@@ -2351,12 +2346,6 @@ class Service(ServiceExecutionSession):
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            exports=_exports_from_policy(
-                consumer_kind="service",
-                export_mode=export_mode,
-                export_methods=export_methods,
-                entry_callable=str(entry_callable or "run"),
-            ),
             managed_global_names=managed_global_names,
         )
         prepared_artifact = _prepare_artifact(
