@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
-from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
+from pycloud_parallel.data.ref import DataRef, coerce_data_ref
 from pycloud_parallel.controlplane.infocenter.models import (
     DataRegistryEntry,
     FencedNodeInstance,

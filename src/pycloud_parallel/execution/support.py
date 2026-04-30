@@ -39,7 +39,7 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_CHUNK_SIZE_BYTES,
     get_dataref_upload_strategy,
 )
-from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
     payload_policy_from_effective_policy,
@@ -204,21 +204,11 @@ def _retry_infocenter_request(
 def _resolve_public_target_arg(
     *,
     target: str = "",
-    kwargs: Optional[Dict[str, Any]] = None,
     action_name: str = "",
 ) -> str:
-    remaining_kwargs = kwargs if kwargs is not None else {}
     normalized_target = str(target or "").strip()
-    compatibility_target = str(remaining_kwargs.pop("infocenter_target", "") or "").strip()
-    if normalized_target and compatibility_target and normalized_target != compatibility_target:
-        label = str(action_name or "public API").strip()
-        raise ValueError(
-            f"{label} received both target={normalized_target!r} and "
-            f"infocenter_target={compatibility_target!r}; please pass only target"
-        )
-    effective_target = normalized_target or compatibility_target
-    if effective_target:
-        return effective_target
+    if normalized_target:
+        return normalized_target
     label = str(action_name or "public API").strip()
     raise TypeError(f"{label} requires target=...")
 

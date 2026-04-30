@@ -22,7 +22,7 @@ from pycloud_parallel.controlplane.config import (
     get_dataref_resolution,
     get_payload_policy,
 )
-from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref, maybe_data_ref, resolve_data_ref_materialize_as
+from pycloud_parallel.data.ref import DataRef, coerce_data_ref, maybe_data_ref, resolve_data_ref_materialize_as
 from pycloud_parallel.controlplane.data_store import DataStore
 from pycloud_parallel.controlplane.node.filesystem import (
     _materialized_objects_dir,
@@ -857,27 +857,6 @@ def _resolve_single_data_ref(ref: DataRef | object, *, object_dir: str) -> Any:
                 created_at=utc_now(),
                 storage_backend="file",
             )
-        else:
-            digest = normalize_object_id(data_ref.object_id).replace("sha256:", "", 1)
-            suffix = object_format_suffix(data_ref.format)
-            legacy_candidate = Path(root) / f"{digest}{suffix}"
-            fallback = []
-            if legacy_candidate.exists():
-                fallback = [legacy_candidate]
-            if not fallback:
-                subdir = Path(root) / digest[:2]
-                fallback = sorted(subdir.glob(f"{digest[2:]}*")) if subdir.exists() else []
-            if not fallback:
-                fallback = sorted(root.glob(f"{digest}*"))
-            if fallback:
-                artifact = ObjectArtifact(
-                    object_id=normalize_object_id(data_ref.object_id),
-                    path=str(fallback[0]),
-                    format=normalize_object_format("", source_name=fallback[0].name, default="bin"),
-                    size_bytes=fallback[0].stat().st_size,
-                    created_at=utc_now(),
-                    storage_backend="file",
-                )
     if artifact is not None:
         fallback_path = Path(artifact.path) if artifact.path else Path(artifact.segment_path)
         _touch_object_last_at(root, object_id=data_ref.object_id, fallback_path=fallback_path)
@@ -944,7 +923,7 @@ def _resolve_object_refs_in_payload(payload: Any, *, object_dir: str) -> Any:
         if data_ref is not None:
             return data_store.resolve_data_ref(data_ref)
         if isinstance(value, dict):
-            from pycloud_parallel.controlplane.data_ref import data_ref_from_payload, is_data_ref_payload
+            from pycloud_parallel.data.ref import data_ref_from_payload, is_data_ref_payload
 
             if is_data_ref_payload(value):
                 return _resolve(data_ref_from_payload(value))

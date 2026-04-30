@@ -5,7 +5,7 @@ import json
 
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.controlplane.config import get_payload_policy
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
     decode_payload_from_transport,

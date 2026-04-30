@@ -206,16 +206,6 @@ async def _aiter_from_sync_iterator(iterator) -> AsyncIterator[Any]:
         yield item
 
 
-_LEGACY_TASKPOOL_UNORDERED_KWARGS = {
-    "receive_batch",
-    "submit_timeout_sec",
-    "result_timeout_sec",
-    "wait_ms",
-    "raise_on_error",
-    "node_window_factor",
-}
-
-
 class _TaskPoolSessionBase(TaskExecutionSession):
     """Internal task-pool execution session backed by NodeControl task-pool RPCs."""
 
@@ -2134,22 +2124,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
-        **shared_kwargs,
     ) -> Iterator[Union[Tuple[int, Any], ExecutionItem]]:
         """Yield ``(index, result_or_none)`` in completion order for a submitted batch."""
-        forbidden = sorted(_LEGACY_TASKPOOL_UNORDERED_KWARGS.intersection(shared_kwargs))
-        if forbidden:
-            raise TypeError(
-                f"TaskPool.unordered() no longer accepts low-level control args: {', '.join(forbidden)}; "
-                "use TaskPool.imap_unordered() for low-level streaming controls"
-            )
         for item in self.iter_items(
             payloads,
             task_method=task_method,
             strategy=strategy,
             max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
-            **shared_kwargs,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -2162,22 +2144,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
-        **shared_kwargs,
     ) -> AsyncIterator[Union[Tuple[int, Any], ExecutionItem]]:
         """Async counterpart of :meth:`unordered` with the same return shape."""
-        forbidden = sorted(_LEGACY_TASKPOOL_UNORDERED_KWARGS.intersection(shared_kwargs))
-        if forbidden:
-            raise TypeError(
-                f"TaskPool.aunordered() no longer accepts low-level control args: {', '.join(forbidden)}; "
-                "use TaskPool.imap_unordered() for low-level streaming controls"
-            )
         async for item in self.aiter_items(
             payloads,
             task_method=task_method,
             strategy=strategy,
             max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
-            **shared_kwargs,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -2662,8 +2636,29 @@ class TaskPool(_TaskPoolSessionBase):
     def open(
         cls,
         *,
-        target: str = "",
-        **kwargs: Any,
+        target: str,
+        job_id: str = "",
+        source: Any = None,
+        owner_client_id: Optional[str] = None,
+        pool_name: Optional[str] = None,
+        artifact: Optional[Any] = None,
+        deps: Optional[Any] = None,
+        runtime: str = "py3",
+        package_format: str = "",
+        resource_paths: Optional[Sequence[Any]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        worker_count: int = 1,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        healthy_only: bool = True,
+        tags: Optional[Sequence[str]] = None,
+        node_ids: Optional[Sequence[str]] = None,
+        node_instance_ids: Optional[Sequence[str]] = None,
+        node_count: int = 0,
+        node_limit: int = 100,
+        timeout_sec: float = 10.0,
+        serialization_mode: str = "",
     ) -> "TaskPool":
         """Product-facing open action for V1 task pools.
 
@@ -2672,13 +2667,36 @@ class TaskPool(_TaskPoolSessionBase):
         """
         effective_target = _resolve_public_target_arg(
             target=target,
-            kwargs=kwargs,
             action_name="TaskPool.open()",
         )
-        return cls.from_infocenter(infocenter_target=effective_target, **kwargs)
+        return cls._from_infocenter(
+            infocenter_target=effective_target,
+            job_id=job_id,
+            source=source,
+            owner_client_id=owner_client_id,
+            pool_name=pool_name,
+            artifact=artifact,
+            deps=deps,
+            runtime=runtime,
+            package_format=package_format,
+            resource_paths=resource_paths,
+            managed_global_names=managed_global_names,
+            worker_count=worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            chunk_size=chunk_size,
+            healthy_only=healthy_only,
+            tags=tags,
+            node_ids=node_ids,
+            node_instance_ids=node_instance_ids,
+            node_count=node_count,
+            node_limit=node_limit,
+            timeout_sec=timeout_sec,
+            serialization_mode=serialization_mode,
+        )
 
     @classmethod
-    def from_infocenter(
+    def _from_infocenter(
         cls,
         *,
         infocenter_target: str,

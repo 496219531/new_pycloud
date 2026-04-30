@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
-from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
     decode_transport_value,

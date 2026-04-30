@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import base64
-import pickle
-
 import numpy as np
 import pandas as pd
 
 from pycloud_parallel.controlplane.pickle_stable_v1 import (
-    _decode_ndarray_v1,
     normalize_for_pickle_stable,
     stable_pickle_dumps,
     stable_pickle_loads,
@@ -98,38 +94,6 @@ def test_pickle_stable_v1_uses_compact_datetime_index_schema():
     assert normalized_index["payload"]["values"]["__codec__"] == "np.ndarray.v1"
     assert restored.equals(series)
     assert restored_index.equals(index)
-
-
-def test_pickle_stable_v1_decodes_legacy_data_b64_ndarray_payload():
-    array = np.array([[1, 2], [3, 4]], dtype=np.int64)
-    legacy_payload = {
-        "__codec__": "np.ndarray.v1",
-        "dtype": str(array.dtype),
-        "shape": [int(dim) for dim in array.shape],
-        "order": "C",
-        "data_b64": base64.b64encode(array.tobytes(order="C")).decode("ascii"),
-    }
-
-    restored = _decode_ndarray_v1(legacy_payload)
-
-    assert np.array_equal(restored, array)
-
-
-def test_pickle_stable_v1_loads_legacy_pickled_ndarray_schema():
-    array = np.array([[5, 6], [7, 8]], dtype=np.int64)
-    legacy_normalized = {
-        "array": {
-            "__codec__": "np.ndarray.v1",
-            "dtype": str(array.dtype),
-            "shape": [int(dim) for dim in array.shape],
-            "order": "C",
-            "data_b64": base64.b64encode(array.tobytes(order="C")).decode("ascii"),
-        }
-    }
-
-    restored = stable_pickle_loads(pickle.dumps(legacy_normalized, protocol=pickle.HIGHEST_PROTOCOL))
-
-    assert np.array_equal(restored["array"], array)
 
 
 def test_pickle_stable_v1_rejects_dataframe_object_dtype():

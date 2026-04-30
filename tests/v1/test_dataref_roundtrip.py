@@ -2,17 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from pycloud_parallel.controlplane.data_ref import DataRef as ControlplaneDataRef
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.data_store import DataStore, StoredDataArtifact
-from pycloud_parallel.controlplane.data_ref import coerce_data_ref, data_ref_to_payload
+from pycloud_parallel.data.ref import coerce_data_ref, data_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size, prepare_outbound_payload
 from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
 from pycloud_parallel.data.ref import DataRef, DATA_REF_SENTINEL, maybe_data_ref
-
-
-def test_dataref_module_is_authoritative():
-    assert ControlplaneDataRef is DataRef
 
 
 def test_prepare_outbound_payload_converts_large_object_uploads_to_dataref():

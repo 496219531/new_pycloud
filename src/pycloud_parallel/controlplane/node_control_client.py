@@ -30,7 +30,7 @@ from pycloud_parallel.controlplane.config import (
     resolve_object_transfer_mode,
     grpc_channel_options,
 )
-from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, should_use_transport_payload_bytes
 from pycloud_parallel.controlplane.object_digest_cache import invalidate_file_digest, lookup_file_digest, store_file_digest
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient, ServiceSessionClient

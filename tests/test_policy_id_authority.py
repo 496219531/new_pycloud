@@ -17,8 +17,8 @@ def test_public_api_signatures_do_not_expose_policy_id():
 
 
 def test_low_level_controlplane_entries_still_accept_policy_id():
-    assert "policy_id" in inspect.signature(Service.deploy_from_infocenter).parameters
-    assert "policy_id" in inspect.signature(TaskPool.from_infocenter).parameters
+    assert "policy_id" in inspect.signature(Service._deploy_from_infocenter).parameters
+    assert "policy_id" in inspect.signature(TaskPool._from_infocenter).parameters
 
 
 def test_runtime_sessions_do_not_expose_policy_id_as_public_field():

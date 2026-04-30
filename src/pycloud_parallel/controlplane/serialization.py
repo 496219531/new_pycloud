@@ -20,7 +20,7 @@ from pycloud_parallel.controlplane.config import (
     INLINE_RESULT_SOFT_LIMIT_BYTES,
     get_inline_transport_checksum,
 )
-from pycloud_parallel.controlplane.data_ref import (
+from pycloud_parallel.data.ref import (
     DataRef,
     coerce_data_ref,
     data_ref_from_payload,

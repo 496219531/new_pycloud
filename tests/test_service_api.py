@@ -569,7 +569,7 @@ def test_service_deploy_from_infocenter_creates_node_services_concurrently(tmp_p
         "_start_keepalive",
         lambda self, interval_sec=None: None,
     ):
-        group = Service.deploy_from_infocenter(
+        group = Service._deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             owner_client_id="owner-demo",
             service_name="svc-concurrent",
@@ -904,7 +904,7 @@ def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
         bind="127.0.0.1:0",
     )
     try:
-        from pycloud_parallel.controlplane.data_ref import DataRef
+        from pycloud_parallel.data.ref import DataRef
         from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
 
         session = next(iter(node._services.values()))  # noqa: SLF001
@@ -1448,7 +1448,7 @@ class TestOwnerServiceFacade:
         from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
-        with patch("pycloud_parallel.execution.service_session.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
+        with patch("pycloud_parallel.execution.service_session.Service._deploy_from_infocenter", return_value=sentinel) as mocked:
             result = OwnerServiceFacade.deploy_from_bytes(
                 infocenter_target="127.0.0.1:50051",
                 blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
@@ -1464,7 +1464,7 @@ class TestOwnerServiceFacade:
         from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
-        with patch("pycloud_parallel.execution.service_session.Service.deploy_from_infocenter", return_value=sentinel) as mocked:
+        with patch("pycloud_parallel.execution.service_session.Service._deploy_from_infocenter", return_value=sentinel) as mocked:
             result = OwnerServiceFacade.deploy_from_bytes(
                 infocenter_target="127.0.0.1:50051",
                 blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
@@ -1479,7 +1479,7 @@ class TestOwnerServiceFacade:
     def test_managed_global_large_value_uses_dataref_upload(self):
         """测试超阈值 managed global 会强制转成 DataRef。"""
         from pycloud_parallel.execution.support import _prepare_managed_global_value_for_upload
-        from pycloud_parallel.controlplane.data_ref import DataRef
+        from pycloud_parallel.data.ref import DataRef
         from pycloud_parallel.data.ref import DataRef
 
         ref = DataRef(
@@ -1725,7 +1725,7 @@ class TestOwnerServiceFacade:
             return_value=((), []),
         ):
             with pytest.raises(RuntimeError, match="no available nodes from InfoCenter"):
-                Service.deploy_from_infocenter(
+                Service._deploy_from_infocenter(
                     infocenter_target="127.0.0.1:50051",
                     owner_client_id="owner-demo",
                     service_name="demo-service",
@@ -1788,7 +1788,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-service",
@@ -1871,7 +1871,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-service",
@@ -1955,7 +1955,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-service",
@@ -2042,7 +2042,7 @@ class TestOwnerServiceFacade:
             "pycloud_parallel.execution.service_session.time.sleep",
             return_value=None,
         ) as mocked_sleep:
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-retry-service",
@@ -2113,7 +2113,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-module-service",
@@ -2189,7 +2189,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-module-service-resource",
@@ -2259,7 +2259,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-callable-service",
@@ -2521,7 +2521,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="svc-clamp",
@@ -2616,7 +2616,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-stopped-service",
@@ -2733,7 +2733,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-race-service",
@@ -2839,7 +2839,7 @@ class TestOwnerServiceFacade:
             "_start_keepalive",
             lambda self, interval_sec=None: None,
         ):
-            group = Service.deploy_from_infocenter(
+            group = Service._deploy_from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-replace-service",

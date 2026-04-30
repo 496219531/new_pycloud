@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
 from pycloud_parallel.controlplane.gateway_upload import (
     ensure_data_ref_on_route,

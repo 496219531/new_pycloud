@@ -24,7 +24,7 @@ from .client_transport import (
     _prefers_http_bytes_transport,
     _serialize_http_call_payload,
 )
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_locator
+from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient

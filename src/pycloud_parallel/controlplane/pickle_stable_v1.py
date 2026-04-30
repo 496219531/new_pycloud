@@ -16,12 +16,9 @@ Whether those bytes can travel through JSON / Struct / protobuf is a transport
 container concern handled by the caller. This module does not pre-encode raw
 bytes as base64 just to satisfy a future container.
 
-Backward compatibility:
-- decoding still accepts legacy ``data_b64`` ndarray payloads
-- encoding only emits raw ``data`` bytes
+Encoding and decoding use raw ``data`` bytes in the ndarray schema.
 """
 
-import base64  # backward compatibility for legacy data_b64 ndarray payloads
 import pickle
 from typing import Any
 
@@ -83,10 +80,8 @@ def _decode_ndarray_v1(payload):
             blob = bytes(raw_data)
         else:
             raise TypeError("np.ndarray.v1 data must be bytes-like")
-    elif "data_b64" in payload:
-        blob = base64.b64decode(str(payload.get("data_b64", "") or "").encode("ascii"))
     else:
-        raise ValueError("np.ndarray.v1 payload must include data or data_b64")
+        raise ValueError("np.ndarray.v1 payload must include data")
     array = np.frombuffer(blob, dtype=dtype)
     if shape:
         array = array.reshape(shape, order=order)

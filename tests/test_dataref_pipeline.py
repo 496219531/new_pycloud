@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from types import SimpleNamespace
 
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
 from pycloud_parallel.controlplane.gateway_upload import relay_data_ref_v1
 from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 import pycloud_parallel.api as api_pkg
 import pycloud_parallel.api.pool as api_pool_module
 import pycloud_parallel.api.queue as api_queue_module
@@ -90,7 +92,7 @@ def test_api_service_module_exposes_only_service():
 
 def test_api_service_connect_no_longer_exposes_policy_id():
     assert "policy_id" not in inspect.signature(ApiService.connect).parameters
-    assert "policy_id" in inspect.signature(ApiService.deploy_from_infocenter).parameters
+    assert "policy_id" not in inspect.signature(ApiService.deploy).parameters
 
 
 def test_api_pool_module_exposes_only_task_pool():
@@ -106,7 +108,7 @@ def test_service_deploy_public_api_uses_target_keyword(monkeypatch):
 
     monkeypatch.setattr(
         ApiService,
-        "deploy_from_infocenter",
+        "_deploy_from_infocenter",
         classmethod(lambda cls, **kwargs: captured.update(kwargs) or "service-session"),
     )
 
@@ -122,7 +124,7 @@ def test_service_deploy_public_api_forwards_resource_paths(monkeypatch):
 
     monkeypatch.setattr(
         ApiService,
-        "deploy_from_infocenter",
+        "_deploy_from_infocenter",
         classmethod(lambda cls, **kwargs: captured.update(kwargs) or "service-session"),
     )
 
@@ -141,7 +143,7 @@ def test_task_pool_open_public_api_uses_target_keyword(monkeypatch):
 
     monkeypatch.setattr(
         ApiTaskPool,
-        "from_infocenter",
+        "_from_infocenter",
         classmethod(lambda cls, **kwargs: captured.update(kwargs) or "task-pool-session"),
     )
 
@@ -157,7 +159,7 @@ def test_task_pool_open_public_api_forwards_resource_paths(monkeypatch):
 
     monkeypatch.setattr(
         ApiTaskPool,
-        "from_infocenter",
+        "_from_infocenter",
         classmethod(lambda cls, **kwargs: captured.update(kwargs) or "task-pool-session"),
     )
 
@@ -171,33 +173,19 @@ def test_task_pool_open_public_api_forwards_resource_paths(monkeypatch):
     assert captured["resource_paths"] == ["data/demo.csv"]
 
 
-def test_low_level_compat_entries_still_exist_but_are_not_api_module_surface():
-    assert hasattr(ApiService, "deploy_from_infocenter")
-    assert hasattr(ApiTaskPool, "from_infocenter")
+def test_low_level_compat_entries_are_not_public_class_surface():
+    assert not hasattr(ApiService, "deploy_from_infocenter")
+    assert not hasattr(ApiService, "deploy_from_func")
+    assert not hasattr(ApiService, "deploy_from_file")
+    assert not hasattr(ApiService, "deploy_from_bytes")
+    assert not hasattr(ApiTaskPool, "from_infocenter")
 
 
-def test_public_api_still_accepts_legacy_infocenter_target_keyword(monkeypatch):
-    captured_service = {}
-    captured_pool = {}
-
-    monkeypatch.setattr(
-        ApiService,
-        "deploy_from_infocenter",
-        classmethod(lambda cls, **kwargs: captured_service.update(kwargs) or "service-session"),
-    )
-    monkeypatch.setattr(
-        ApiTaskPool,
-        "from_infocenter",
-        classmethod(lambda cls, **kwargs: captured_pool.update(kwargs) or "task-pool-session"),
-    )
-
-    service_result = ApiService.deploy(infocenter_target="127.0.0.1:50051", source=b"svc")
-    pool_result = ApiTaskPool.open(infocenter_target="127.0.0.1:50051", source=b"pool")
-
-    assert service_result == "service-session"
-    assert pool_result == "task-pool-session"
-    assert captured_service["infocenter_target"] == "127.0.0.1:50051"
-    assert captured_pool["infocenter_target"] == "127.0.0.1:50051"
+def test_public_api_rejects_legacy_infocenter_target_keyword():
+    with pytest.raises(TypeError):
+        ApiService.deploy(infocenter_target="127.0.0.1:50051", source=b"svc")
+    with pytest.raises(TypeError):
+        ApiTaskPool.open(infocenter_target="127.0.0.1:50051", source=b"pool")
 
 
 def test_api_queue_module_exposes_only_job_queue():

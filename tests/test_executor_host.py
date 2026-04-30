@@ -76,6 +76,12 @@ def test_create_executor_backend_rejects_embedded():
         create_executor_backend(executor_backend="embedded", task_worker_capacity=1)
 
 
+def test_create_executor_backend_rejects_old_aliases():
+    for value in ("host", "executor_host", "subprocess", "subprocesshost"):
+        with pytest.raises(ValueError, match="subprocess_host"):
+            create_executor_backend(executor_backend=value, task_worker_capacity=1)
+
+
 def test_subprocess_backend_uses_distinct_hosts_per_session(tmp_path):
     state, artifact = _seed_artifact(
         tmp_path,

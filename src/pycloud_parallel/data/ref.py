@@ -312,21 +312,12 @@ def with_data_ref_locator(
     )
 
 
-def put_data(value: Any) -> DataRef:
-    return coerce_data_ref(value)
-
-
-def get_data(value: Any) -> DataRef:
-    return coerce_data_ref(value)
-
-
 __all__ = [
     "DATA_REF_SENTINEL",
     "DataRef",
     "coerce_data_ref",
     "data_ref_from_payload",
     "data_ref_to_payload",
-    "get_data",
     "is_data_ref_payload",
     "maybe_data_ref",
     "normalize_data_ref_id",
@@ -337,7 +328,6 @@ __all__ = [
     "object_format_suffix",
     "object_id_from_sha256_hex",
     "object_storage_path",
-    "put_data",
     "resolve_data_ref_materialize_as",
     "with_data_ref_control_addr",
     "with_data_ref_locator",

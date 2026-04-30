@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.job_staging import (
     collect_payload_data_refs,
     release_job_staged_refs,

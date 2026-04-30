@@ -13,7 +13,7 @@ import uuid
 
 from .client_transport import _decode_http_request_body_with_mode
 from pycloud_parallel.controlplane.config import get_gateway_dataref_relay
-from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref, with_data_ref_locator
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageFile, GatewayStageManager, GatewayStageRequest
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient

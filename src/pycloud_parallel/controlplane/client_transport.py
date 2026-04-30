@@ -12,7 +12,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
-from pycloud_parallel.controlplane.data_ref import (
+from pycloud_parallel.data.ref import (
     DataRef,
     maybe_data_ref,
     resolve_data_ref_materialize_as,

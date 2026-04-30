@@ -920,35 +920,12 @@ class NodeControlState(NodeRuntimeBase):
                     self._objects[normalized] = artifact
                 return artifact
         candidate = object_storage_path(self._object_dir, object_id=normalized, fmt="bin")
-        digest = normalized.replace("sha256:", "", 1)
-        legacy_candidate = Path(self._object_dir) / f"{digest}.bin"
-        fallback = []
         if candidate.exists():
             artifact = ObjectArtifact(
                 object_id=normalized,
                 path=str(candidate),
                 format=normalize_object_format(candidate.suffix, source_name=candidate.name, default="bin"),
                 size_bytes=candidate.stat().st_size,
-                created_at=utc_now(),
-                storage_backend="file",
-            )
-            with self._lock:
-                self._objects[normalized] = artifact
-            return artifact
-        if legacy_candidate.exists():
-            fallback = [legacy_candidate]
-        if not fallback:
-            subdir = Path(self._object_dir) / digest[:2]
-            fallback = sorted(path for path in subdir.glob(f"{digest[2:]}*") if path.is_file()) if subdir.exists() else []
-        if not fallback:
-            fallback = sorted(path for path in self._object_dir.glob(f"{digest}*") if path.is_file())
-        if fallback:
-            path = fallback[0]
-            artifact = ObjectArtifact(
-                object_id=normalized,
-                path=str(path),
-                format=normalize_object_format("", source_name=path.name, default="bin"),
-                size_bytes=path.stat().st_size,
                 created_at=utc_now(),
                 storage_backend="file",
             )

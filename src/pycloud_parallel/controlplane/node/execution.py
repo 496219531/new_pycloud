@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from pycloud_parallel.controlplane.artifact import _normalize_dependency_policy_mode
 from pycloud_parallel.controlplane.config import get_payload_policy
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref
+from pycloud_parallel.data.ref import maybe_data_ref
 from pycloud_parallel.controlplane.node.filesystem import (
     _managed_globals_manifest_path,
     _managed_globals_value_path,

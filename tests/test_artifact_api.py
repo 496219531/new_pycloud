@@ -97,7 +97,7 @@ def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None
         "_start_keepalive",
         lambda self, interval_sec=None: None,
     ):
-        group = Service.deploy_from_infocenter(
+        group = Service._deploy_from_infocenter(
             infocenter_target="127.0.0.1:50051",
             owner_client_id="owner-demo",
             service_name="demo-artifact-service",
@@ -160,7 +160,7 @@ def test_task_pool_session_from_infocenter_accepts_artifact() -> None:
         side_effect=_fake_create_task_pool_from_bytes,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-artifact",
             artifact=artifact,

@@ -80,7 +80,7 @@ def test_native_task_pool_end_to_end(tmp_path):
             b"    return {'value': value, 'square': value * value}\n"
         )
 
-        with TaskPool.from_infocenter(
+        with TaskPool._from_infocenter(
             infocenter_target=infocenter.base_url,
             job_id="job-pool-e2e",
             blob=blob,

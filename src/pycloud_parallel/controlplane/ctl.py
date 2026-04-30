@@ -32,7 +32,7 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port as _net_format_host_port
 from pycloud_parallel.controlplane.netutil import resolve_public_host, split_host_port as _net_split_host_port
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref
+from pycloud_parallel.data.ref import maybe_data_ref
 from pycloud_parallel.data.ref import normalize_object_format, normalize_object_id, object_format_suffix, object_storage_path
 from pycloud_parallel.controlplane.node.filesystem import (
     _code_index_link_path,
@@ -2289,7 +2289,6 @@ def _add_local_argument(parser: argparse.ArgumentParser, *, dest: str = "local")
 def _add_debug_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--debug",
-        "--dubug",
         dest="debug",
         action="store_true",
         default=False,

@@ -83,16 +83,18 @@ def test_ctl_parser_accepts_env_overrides_for_start_commands():
     ]
 
 
-def test_ctl_parser_accepts_debug_flag_and_typo_alias():
+def test_ctl_parser_accepts_debug_flag():
     parser = ctl.build_parser()
 
     args = parser.parse_args(["start", "--debug"])
     assert args.command == "start"
     assert args.debug is True
 
-    alias_args = parser.parse_args(["start-node", "--dubug"])
-    assert alias_args.command == "start-node"
-    assert alias_args.debug is True
+
+def test_ctl_parser_rejects_debug_typo_alias():
+    parser = ctl.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["start-node", "--dubug"])
 
 
 def test_ctl_parser_accepts_stop_node_command():

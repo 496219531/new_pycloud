@@ -88,7 +88,7 @@ def test_native_task_pool_session_submit_and_wait() -> None:
         return_value=fake_pool_client,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native",
             blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -162,7 +162,7 @@ def test_task_pool_from_infocenter_creates_node_pools_concurrently(monkeypatch) 
     monkeypatch.setattr(task_pool_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
     monkeypatch.setattr(task_pool_mod, "_node_control_client", lambda addr, **_kwargs: _FakeNodeClient(addr))
 
-    session = TaskPool.from_infocenter(
+    session = TaskPool._from_infocenter(
         infocenter_target="127.0.0.1:50051",
         job_id="job-native-parallel-create",
         blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -521,7 +521,7 @@ def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None
         return_value=fake_pool_client,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-cancel",
             blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -571,7 +571,7 @@ def test_task_pool_from_infocenter_includes_only_explicit_resource_paths(tmp_pat
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-resource",
             source=worker_module,
@@ -640,7 +640,7 @@ def test_native_task_pool_session_status_map() -> None:
         return_value=fake_pool_client,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-status",
             blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -711,7 +711,7 @@ def test_task_pool_from_infocenter_keeps_partial_create_success(monkeypatch) -> 
     monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
     monkeypatch.setattr("pycloud_parallel.execution.task_pool._node_control_client", _FakeNodeControlClient)
 
-    session = TaskPool.from_infocenter(
+    session = TaskPool._from_infocenter(
         infocenter_target="127.0.0.1:50051",
         job_id="job-partial-create",
         blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
@@ -759,7 +759,7 @@ def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeyp
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-module-entry",
             entry_module=worker_module,
@@ -810,7 +810,7 @@ def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, mon
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-callable-entry",
             entry_callable=worker_module.run,
@@ -861,7 +861,7 @@ def test_task_pool_session_packages_namespace_module_with_synthetic_init(tmp_pat
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-namespace-module-entry",
             entry_module=worker_module,
@@ -912,7 +912,7 @@ def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> N
         _fake_create_task_pool,
     ):
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-        session = TaskPool.from_infocenter(
+        session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-entry-func",
             entry_func=worker_module.run,

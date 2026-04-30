@@ -841,7 +841,7 @@ def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
     pd = pytest.importorskip("pandas")
     pytest.importorskip("pyarrow")
 
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.data.ref import object_storage_path
 
     frame = pd.DataFrame(
@@ -1208,7 +1208,7 @@ def test_data_store_builds_result_and_data_refs() -> None:
 
 
 def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 
     class _FakeInfoCenterClient:
@@ -1252,7 +1252,7 @@ def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
 
 
 def test_data_registry_resolve_skips_unhealthy_instance_replicas(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 
     class _FakeInfoCenterClient:
@@ -1305,7 +1305,7 @@ def test_data_registry_resolve_skips_unhealthy_instance_replicas(monkeypatch) ->
 
 
 def test_data_registry_resolve_rejects_only_unhealthy_instance_replica(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 
     class _FakeInfoCenterClient:
@@ -1354,7 +1354,7 @@ def test_data_registry_resolve_rejects_only_unhealthy_instance_replica(monkeypat
 
 
 def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import DataRegistryClient
     from pycloud_parallel.controlplane.server import build_controlplane_server
 
@@ -1405,7 +1405,7 @@ def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
 
 
 def test_infocenter_rejects_data_ref_registration_from_fenced_instance() -> None:
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
 
     state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5)
     state.register_node_record(
@@ -1453,7 +1453,7 @@ def test_infocenter_rejects_data_ref_registration_from_fenced_instance() -> None
 
 
 def test_data_registry_release_triggers_node_release_for_consume_on_read(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.data_ref import DataRef
+    from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import DataRegistryClient
     from pycloud_parallel.controlplane.server import build_controlplane_server
 
@@ -3660,7 +3660,6 @@ def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp
 
 
 def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
-    from pycloud_parallel.controlplane.data_ref import DataRef
     from pycloud_parallel.data.ref import DataRef
 
     captured = {}
@@ -4329,8 +4328,9 @@ def test_service_call_recovers_after_executor_host_restart(tmp_path):
         )
 
         assert state._executor_host is not None  # noqa: SLF001
-        state._executor_host._process.terminate()  # noqa: SLF001
-        state._executor_host._process.join(timeout=5.0)  # noqa: SLF001
+        host_client = state._executor_host._service_clients[session.service_id]  # noqa: SLF001
+        host_client._process.terminate()  # noqa: SLF001
+        host_client._process.join(timeout=5.0)  # noqa: SLF001
 
         code, body = state.call_service(
             service_id=session.service_id,

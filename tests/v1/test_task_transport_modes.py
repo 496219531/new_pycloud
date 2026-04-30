@@ -88,7 +88,7 @@ def test_task_pool_submit_payload_roundtrips_transport_modes():
             return_value=fake_pool_client,
         ):
             mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
-            session = TaskPool.from_infocenter(
+            session = TaskPool._from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 job_id=f"job-{mode}",
                 blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",

@@ -472,7 +472,7 @@ class InfoCenterClient:
         locator_token: str = "",
         replicas: Optional[Sequence[Dict[str, object]]] = None,
     ) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.data_ref import coerce_data_ref, data_ref_to_payload
+        from pycloud_parallel.data.ref import coerce_data_ref, data_ref_to_payload
 
         data_ref = coerce_data_ref(ref)
         payload = {

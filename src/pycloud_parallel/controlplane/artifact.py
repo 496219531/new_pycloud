@@ -224,26 +224,26 @@ def _coerce_artifact_deps(
     dependency_allowlist: Sequence[str] = (),
 ) -> "ArtifactDeps":
     normalized_allowlist = _normalize_names(dependency_allowlist)
-    legacy_mode = _normalize_dependency_policy_mode(
+    requested_mode = _normalize_dependency_policy_mode(
         dependency_policy_mode,
         dependency_allowlist=normalized_allowlist,
     )
     if deps is None:
-        if legacy_mode == "allow_install":
+        if requested_mode == "allow_install":
             return ArtifactDeps.allow_install(normalized_allowlist)
-        if legacy_mode == "node_preinstalled":
+        if requested_mode == "node_preinstalled":
             return ArtifactDeps.node_preinstalled()
         return ArtifactDeps.prebuilt()
     if not isinstance(deps, ArtifactDeps):
         raise TypeError("deps must be an ArtifactDeps instance")
     if dependency_policy_mode:
-        if legacy_mode != deps.mode:
+        if requested_mode != deps.mode:
             raise ValueError(
-                f"deps.mode={deps.mode!r} conflicts with legacy dependency_policy_mode={dependency_policy_mode!r}"
+                f"deps.mode={deps.mode!r} conflicts with dependency_policy_mode={dependency_policy_mode!r}"
             )
     if normalized_allowlist and deps.dependency_allowlist != normalized_allowlist:
         raise ValueError(
-            "deps.requirements conflicts with legacy dependency_allowlist"
+            "deps.requirements conflicts with dependency_allowlist"
         )
     return deps
 
@@ -591,7 +591,7 @@ def _code_version_from_digest(
     )
 
 
-def _legacy_exports_from_args(
+def _exports_from_policy(
     *,
     consumer_kind: str,
     export_mode: str = "",
@@ -650,7 +650,7 @@ def _normalize_artifact_input(
             if artifact is not None or func is not None or blob is not None or artifact_path:
                 raise ValueError("source cannot be combined with artifact, func, blob, or artifact_path")
             if inspect.ismodule(entry_module) or (not isinstance(entry_callable, str) and callable(entry_callable)):
-                raise ValueError("source cannot be combined with module/callable legacy entry inputs")
+                raise ValueError("source cannot be combined with module/callable entry inputs")
             if source_kind == "function":
                 func = source_value
             elif source_kind == "module":
@@ -678,10 +678,10 @@ def _normalize_artifact_input(
         if not isinstance(artifact, Artifact):
             raise TypeError("artifact must be an Artifact instance")
         if func is not None or blob is not None or artifact_path or source_module is not None or source_func is not None:
-            raise ValueError("artifact cannot be combined with legacy artifact source inputs")
+            raise ValueError("artifact cannot be combined with alternate artifact source inputs")
         effective_exports = artifact.exports
         if effective_exports is None:
-            effective_exports = _legacy_exports_from_args(
+            effective_exports = _exports_from_policy(
                 consumer_kind=normalized_consumer,
                 export_mode=export_mode,
                 export_methods=export_methods,
@@ -703,7 +703,7 @@ def _normalize_artifact_input(
         deps,
         dependency_allowlist=dependency_allowlist or (),
     )
-    exports = _legacy_exports_from_args(
+    exports = _exports_from_policy(
         consumer_kind=normalized_consumer,
         export_mode=export_mode,
         export_methods=export_methods,

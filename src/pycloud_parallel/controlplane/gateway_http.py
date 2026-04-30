@@ -31,7 +31,7 @@ from .client_transport import (
     _iter_route_http_stream,
     _serialize_http_call_payload,
 )
-from pycloud_parallel.controlplane.data_ref import DataRef, is_data_ref_payload, maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
+from pycloud_parallel.data.ref import DataRef, is_data_ref_payload, maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager

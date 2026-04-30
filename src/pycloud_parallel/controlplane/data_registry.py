@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
-from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
+from pycloud_parallel.data.ref import DataRef, coerce_data_ref
 
 
 @dataclass(frozen=True)

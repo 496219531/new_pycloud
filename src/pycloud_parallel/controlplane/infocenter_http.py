@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.data_ref import coerce_data_ref
+from pycloud_parallel.data.ref import coerce_data_ref
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.job_queue import JobQueueManager

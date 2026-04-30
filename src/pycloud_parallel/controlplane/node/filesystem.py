@@ -173,22 +173,12 @@ def _code_dependency_dir(base_dir: Path, *, code_version: str) -> Path:
     return _code_variant_dir(base_dir, code_version=code_version) / "deps"
 
 
-def _legacy_code_meta_path(base_dir: Path, *, code_version: str) -> Path:
-    return _code_scope_dir(base_dir, code_version=code_version) / "meta.json"
-
-
 def _code_meta_path(base_dir: Path, *, code_version: str) -> Path:
     return _code_variant_dir(base_dir, code_version=code_version) / "meta.json"
 
 
 def _existing_code_meta_path(base_dir: Path, *, code_version: str) -> Path:
-    preferred = _code_meta_path(base_dir, code_version=code_version)
-    if preferred.exists():
-        return preferred
-    legacy = _legacy_code_meta_path(base_dir, code_version=code_version)
-    if legacy.exists():
-        return legacy
-    return preferred
+    return _code_meta_path(base_dir, code_version=code_version)
 
 
 def _code_archive_path(base_dir: Path, *, code_version: str, package_format: str) -> Path:

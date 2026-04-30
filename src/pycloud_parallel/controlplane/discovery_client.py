@@ -22,7 +22,7 @@ from .client_transport import (
     _materialize_downloaded_result,
     _serialize_route,
 )
-from pycloud_parallel.controlplane.data_ref import maybe_data_ref, with_data_ref_locator
+from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
 from pycloud_parallel.controlplane.discovery_route_cache import _DiscoveryRouteCache
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, _node_instance_key_from_route

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from pycloud_parallel.controlplane.data_ref import DataRef, coerce_data_ref
+from pycloud_parallel.data.ref import DataRef, coerce_data_ref
 
 
 @dataclass(frozen=True)

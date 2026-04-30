@@ -285,7 +285,7 @@ def calc_fund_list_asset_ratio2(
 
     t0 = time.time()
     with TaskPool.open(
-        infocenter_target=CONTROLPLANE_TARGET,
+        target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
         source=calc_asset_ratio.get_fund_asset_ratio,
         worker_count=4,
@@ -515,11 +515,11 @@ if __name__ == "__main__":
 
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)

@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_jobqueue_resolve_refs, get_payload_policy
-from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
@@ -69,7 +69,7 @@ def _artifact_suffix(package_format: str) -> str:
 
 
 def _create_job_task_pool(**kwargs: Any) -> TaskPool:
-    return TaskPool.from_infocenter(**kwargs)
+    return TaskPool._from_infocenter(**kwargs)
 
 
 _JOB_ORCH_TASKPOOL_BINDING_ID = "taskpool_default"

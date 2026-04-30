@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.node.results import _materialize_object_bytes
 from pycloud_parallel.controlplane.serialization import deserialize_by_mode, serialize_by_mode
 from pycloud_parallel.execution.support import _put_data_via_clients, _replicas_for_uploaded_ref

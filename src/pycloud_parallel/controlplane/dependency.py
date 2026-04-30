@@ -1127,7 +1127,7 @@ def auto_deploy_function(
         # 上传并部署
         from pycloud_parallel.execution.task_pool import TaskPool
 
-        return TaskPool.from_infocenter(
+        return TaskPool._from_infocenter(
             infocenter_target=infocenter_target,
             job_id=f"auto-{func.__name__}",
             blob=blob,

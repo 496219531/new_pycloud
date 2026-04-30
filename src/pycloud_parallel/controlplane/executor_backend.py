@@ -14,13 +14,6 @@ def normalize_executor_backend(value: str) -> str:
     text = str(value or "").strip().lower().replace("-", "_")
     if not text:
         raise ValueError("executor_backend is required")
-    aliases = {
-        "subprocess": EXECUTOR_BACKEND_SUBPROCESS_HOST,
-        "host": EXECUTOR_BACKEND_SUBPROCESS_HOST,
-        "executor_host": EXECUTOR_BACKEND_SUBPROCESS_HOST,
-        "subprocesshost": EXECUTOR_BACKEND_SUBPROCESS_HOST,
-    }
-    text = aliases.get(text, text)
     if text not in VALID_EXECUTOR_BACKENDS:
         raise ValueError(
             f"executor_backend must be subprocess_host (got {value!r})"
@@ -90,19 +83,6 @@ class SubprocessExecutorBackend:
         if self._closed:
             raise RuntimeError("executor backend is closed")
         return ExecutorHostClient(task_worker_capacity=self._task_worker_capacity)
-
-    @property
-    def _process(self):  # compatibility for tests/tools that still inspect the active host process
-        clients = list(self._service_clients.values()) + list(self._pool_clients.values())
-        if self._runtime_client is not None:
-            clients.append(self._runtime_client)
-        if self._prepare_client is not None:
-            clients.append(self._prepare_client)
-        for client in clients:
-            process = getattr(client, "_process", None)
-            if process is not None:
-                return process
-        return None
 
     def _ensure_runtime_client(self) -> ExecutorHostClient:
         if self._runtime_client is None or not self._runtime_client.is_alive():

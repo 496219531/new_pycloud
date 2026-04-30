@@ -27,7 +27,7 @@ from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.gateway_http import EXTERNAL_DATA_REF_ERROR, GatewayCallError, GatewayHttpApp
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
 from pycloud_parallel.controlplane.policy_profile import get_policy_profile
 from pycloud_parallel.controlplane.server import (

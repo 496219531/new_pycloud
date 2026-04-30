@@ -18,7 +18,7 @@ from .client_transport import (
     _normalize_http_response_body,
     _serialize_http_call_payload,
 )
-from pycloud_parallel.controlplane.data_ref import DataRef, maybe_data_ref
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.session_model import (
     ExecutionReplicaSnapshot,

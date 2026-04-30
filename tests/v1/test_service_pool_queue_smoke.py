@@ -8,6 +8,7 @@ from unittest.mock import patch
 import grpc
 
 from pycloud_parallel import JobQueue
+from pycloud_parallel.artifact import Artifact, ArtifactExports
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.server import (
     build_gateway_server,
@@ -98,10 +99,12 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
         with TaskPool.open(
             target=infocenter.base_url,
             job_id="v1-smoke-pool",
-            source=pool_blob,
-            runtime="py3",
-            entry_module="v1_smoke_pool_demo",
-            entry_callable="run",
+            artifact=Artifact.from_bytes(
+                pool_blob,
+                package_format="py",
+                entry_module="v1_smoke_pool_demo",
+                entry_callable="run",
+            ),
             worker_count=2,
             node_count=1,
             tags=["compute"],
@@ -124,10 +127,13 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
             target=infocenter.base_url,
             owner_client_id="v1-smoke-owner",
             service_name="v1-smoke-service",
-            source=service_blob,
-            runtime="py3",
-            entry_module="v1_smoke_service_demo",
-            entry_callable="mul",
+            artifact=Artifact.from_bytes(
+                service_blob,
+                package_format="py",
+                entry_module="v1_smoke_service_demo",
+                entry_callable="mul",
+                exports=ArtifactExports.use_decorator(),
+            ),
             worker_count=1,
             node_count=1,
             tags=["compute"],
@@ -153,7 +159,7 @@ def test_service_task_pool_and_job_queue_smoke(tmp_path):
         )
         with patch(
             "pycloud_parallel.controlplane.job_queue._create_job_task_pool",
-            wraps=TaskPool.open,
+            wraps=TaskPool._from_infocenter,
         ) as mocked_create_pool:
             client = JobQueue.connect(infocenter.base_url, client_id="v1-smoke-job-client", timeout_sec=10.0)
             try:

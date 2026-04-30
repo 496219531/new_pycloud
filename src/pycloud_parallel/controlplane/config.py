@@ -92,8 +92,8 @@ SERIALIZATION_MODE = _env_choice(
 )
 DEPENDENCY_POLICY_MODE = _env_choice(
     PYCLOUD_DEPENDENCY_POLICY_MODE,
-    "legacy_v1",
-    {"legacy_v1", "prebuilt", "node_preinstalled", "allow_install"},
+    "prebuilt",
+    {"prebuilt", "node_preinstalled", "allow_install"},
 )
 EXECUTOR_BACKEND = _env_choice(
     PYCLOUD_EXECUTOR_BACKEND,
@@ -136,7 +136,7 @@ TrustMode = Literal["trusted", "balanced", "strict"]
 ObjectTransferMode = Literal["auto", "known_digest_precheck", "single_pass_authoritative"]
 SystemMode = Literal["trusted_default"]
 SerializationMode = Literal["legacy_v1", "structured_v1", "pickle_stable_v1"]
-DependencyPolicyMode = Literal["legacy_v1", "prebuilt", "node_preinstalled", "allow_install"]
+DependencyPolicyMode = Literal["prebuilt", "node_preinstalled", "allow_install"]
 ExecutorBackendMode = Literal["subprocess_host"]
 DataRefResolutionMode = Literal["local_only", "remote_fetch"]
 DataRefUploadStrategy = Literal["fanout", "upload_once"]
@@ -346,8 +346,8 @@ def reload_config() -> None:
         ),
         DEPENDENCY_POLICY_MODE=_env_choice(
             PYCLOUD_DEPENDENCY_POLICY_MODE,
-            "legacy_v1",
-            {"legacy_v1", "prebuilt", "node_preinstalled", "allow_install"},
+            "prebuilt",
+            {"prebuilt", "node_preinstalled", "allow_install"},
         ),
         DATAREF_RESOLUTION=_env_choice(
             PYCLOUD_DATAREF_RESOLUTION,

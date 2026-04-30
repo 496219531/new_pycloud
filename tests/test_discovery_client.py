@@ -20,7 +20,7 @@ from pycloud_parallel.controlplane.discovery_route_cache import _DiscoveryRouteC
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, InfoCenterServiceRoute
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.execution.call_proxy import _CallProxy
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.node.state import NodeControlState

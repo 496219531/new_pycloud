@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from pycloud_parallel.controlplane.data_ref import DataRef
+from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMIT_BYTES
 
 
