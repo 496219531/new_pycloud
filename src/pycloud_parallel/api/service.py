@@ -11,9 +11,3 @@ __all__ = [
 
 def __dir__() -> list[str]:
     return list(__all__)
-
-
-try:
-    del annotations
-except NameError:
-    pass
