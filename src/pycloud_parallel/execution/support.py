@@ -1580,92 +1580,8 @@ def _prepare_job_submit_payload_for_call(
                 client.close()
 
 
-def _auto_package_function(func: Callable) -> bytes:
-    from pycloud_parallel.controlplane.dependency import DependencyPackager
-
-    packager = DependencyPackager()
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        packager.package_function(func, output_file=tmp_path, **_packaging_kwargs())
-        with open(tmp_path, "rb") as f:
-            return f.read()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-
-def _package_directory_to_targz(dir_path: Path) -> Path:
-    from pycloud_parallel.controlplane.dependency import DependencyPackager
-
-    return Path(DependencyPackager().package_directory(dir_path, **_packaging_kwargs()))
-
-
-def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
-    from pycloud_parallel.controlplane.dependency import DependencyPackager
-
-    return Path(
-        DependencyPackager().package_paths(
-            root_dir=root_dir,
-            paths=paths,
-            **_packaging_kwargs(synthesize_missing_package_inits=True),
-        )
-    )
-
-
-class _PreparedLocalArtifact:
-    def __init__(
-        self,
-        *,
-        source_path: Path,
-        upload_path: Path,
-        filename: str,
-        package_format: str,
-        cleanup_path: Optional[Path] = None,
-    ) -> None:
-        self.source_path = source_path
-        self.upload_path = upload_path
-        self.filename = filename
-        self.package_format = package_format
-        self.cleanup_path = cleanup_path
-
-    def cleanup(self) -> None:
-        if self.cleanup_path is not None:
-            self.cleanup_path.unlink(missing_ok=True)
-
-
-def _prepare_local_artifact_for_upload(
-    artifact_path: Union[str, os.PathLike[str]],
-    *,
-    package_format: str = "",
-) -> _PreparedLocalArtifact:
-    path = Path(artifact_path)
-    if not path.exists():
-        raise FileNotFoundError(f"artifact_path not found: {artifact_path}")
-    if path.is_dir():
-        tar_path = _package_directory_to_targz(path)
-        return _PreparedLocalArtifact(
-            source_path=path,
-            upload_path=tar_path,
-            filename=f"{path.name}.tar.gz",
-            package_format="tar.gz",
-            cleanup_path=tar_path,
-        )
-    return _PreparedLocalArtifact(
-        source_path=path,
-        upload_path=path,
-        filename=path.name,
-        package_format=_resolve_package_format(package_format, path.name),
-    )
-
-
 def _prepare_code_blob(
-    func: Optional[Callable] = None,
     module: Optional[Any] = None,
-    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-    blob: Optional[bytes] = None,
     resource_paths: Optional[Sequence[Union[str, os.PathLike[str]]]] = None,
 ) -> Tuple[Optional[bytes], str]:
     from pycloud_parallel.controlplane.dependency import (
@@ -1739,43 +1655,7 @@ def _prepare_code_blob(
             except Exception:
                 pass
 
-    if func is not None:
-        if not callable(func):
-            raise ValueError("func must be callable")
-        blob = _auto_package_function(func)
-        filename = f"{func.__module__}_{func.__name__}.tar.gz"
-        return blob, filename
-
-    if blob is not None:
-        return blob, ""
-
-    if artifact_path:
-        if isinstance(artifact_path, (list, tuple)):
-            paths = [Path(str(p)) for p in artifact_path if str(p)]
-            if not paths:
-                raise ValueError("artifact_path list is empty")
-
-            tar_path: Optional[str] = None
-            try:
-                tar_path = packager.package_roots(
-                    paths,
-                    **_packaging_kwargs(synthesize_missing_package_inits=True),
-                )
-                with open(tar_path, "rb") as f:
-                    return f.read(), "artifact_bundle.tar.gz"
-            finally:
-                try:
-                    Path(tar_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        prepared = _prepare_local_artifact_for_upload(artifact_path)
-        try:
-            return prepared.upload_path.read_bytes(), prepared.filename
-        finally:
-            prepared.cleanup()
-
-    return None, ""
+    raise ValueError("module is required")
 
 
 def _default_job_auth_ttl_sec() -> int:
@@ -1947,9 +1827,7 @@ __all__ = [
     "_prepare_job_submit_payload_for_call",
     "_prepare_managed_global_value_for_upload",
     "_prepare_managed_globals_batches_for_upload",
-    "_prepare_local_artifact_for_upload",
     "_prepare_task_payload_for_submit",
-    "_package_paths_to_targz",
     "_put_data_via_clients",
     "_resolve_high_level_service_data",
     "_resolve_high_level_service_results",
