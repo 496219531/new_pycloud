@@ -41,7 +41,21 @@
 2. 真正的服务管理权限依赖 `service_token`。
 3. 当前方法调用权限不做复杂内建鉴权，必要时建议接外部网关。
 
-### 2.5 选点策略
+### 2.5 动态部署与 code version 一致性
+
+动态部署的服务采用强一致发布模型：
+
+1. 同一个动态服务由唯一发布者（owner deploy session）统一发布和管理。
+2. 同名服务的运行中副本必须属于同一个发布者控制域，并保持同一个 `code_version`。
+3. 如果某个 node 断开、被判定失效、或以新的 `node_instance_id` 重连，它不能带着旧进程继续算作已部署副本；owner keepalive 必须重新部署/补齐。
+4. `Service.startup(...)` / 系统启动时挂载的 startup service 只由自身进程管理，不允许被其他动态发布者接管。
+5. startup service 不能动态加入任何现有服务组；即使 `service_name/code_version` 完全一致，也不能作为已有动态服务的扩容副本，因为它自治运行，不在动态发布者的版本管控、回滚、keepalive 与 close 闭环内。
+6. 动态部署与 startup service 对同一个 `service_name` 是互斥的：任一方已经存在时，另一方即使 `code_version` 一致也必须拒绝启动/部署。
+7. 即使 startup service 的 `service_name` 和 `code_version` 与某个动态部署一致，也不能把它视为动态 owner 的可复用副本，因为它不在该 owner 的 token / keepalive / close 控制域内。
+
+动态扩容的正确路径是同一个动态发布者扩大目标副本数（例如提高 `node_count`）后重启/恢复 deploy session。部署端会用本地缓存的 `service_id/service_token` 接回自己已经发布的同 code version 服务，并由 keepalive 补齐新增节点；这仍然属于同一个 owner 控制域，不需要也不允许 startup service 参与扩容。
+
+### 2.6 选点策略
 
 当前已经改成统一 scheduler 框架：
 

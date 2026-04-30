@@ -1,8 +1,8 @@
-# V1 Architecture Target
+# V1 Architecture Release Baseline
 
 ## Final Public Concepts
 
-V1 freezes the user-facing model to five concepts only:
+V1 freezes the user-facing model to five public concepts:
 
 - `Service`
 - `TaskPool`
@@ -16,7 +16,7 @@ Local-only parallel helpers remain available under `pycloud_parallel.local`, not
 
 ## Concepts Removed From The Final Public Surface
 
-These legacy categories are transitional and must not survive the V1 cleanup:
+These legacy categories are not part of the V1 public surface:
 
 - legacy owner-side deploy facade
 - legacy gateway/direct caller facades
@@ -49,7 +49,7 @@ These legacy categories are transitional and must not survive the V1 cleanup:
 
 ## Package Layout Target
 
-V1 code is being split toward these stable package roles:
+V1 stable ownership is organized around these package roles:
 
 - `pycloud_parallel.api`
 - `pycloud_parallel.data`
@@ -57,12 +57,14 @@ V1 code is being split toward these stable package roles:
 - `pycloud_parallel.runtime`
 - `pycloud_parallel.execution`
 
-The current `controlplane/` package may continue to exist during migration, but the target ownership for new stable code is the directories above.
+The `controlplane/` package remains available for internal infrastructure and advanced integrations, but product-facing examples and docs should prefer the public concepts above.
 
-## Migration Sequence
+## Release Acceptance
 
-1. Freeze docs, validation rules, and V1 acceptance tests.
-2. Unify large payloads and large results under `DataRef`.
-3. Unify execution foundation under `ExecutorHost + ExecutionSession`.
-4. Switch the top-level package to the final public API.
-5. Remove legacy names and rewrite docs/examples to match the final surface.
+Before cutting a V1 release, keep these checks green:
+
+1. Top-level imports expose only `Service`, `TaskPool`, `JobQueue`, `DataRef`, and `export`.
+2. Public docs and examples use `Service.connect(...)`, `Service.deploy(...)`, `Service.startup(...)`, `TaskPool`, and `JobQueue.submit(source=...)` as the main paths.
+3. Compatibility helpers remain documented only as advanced or internal paths when they still exist.
+4. Large payload and large result examples converge on `DataRef`.
+5. Release docs match the default policy/mode bindings in `policy_profile.py` and runtime defaults in `config.py`.

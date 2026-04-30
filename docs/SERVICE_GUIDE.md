@@ -123,6 +123,7 @@ finally:
 3. `Ctrl+C` 是正常退出路径
 4. 如果所有已部署 session 的 keepalive 连续失败，`join()` 会退出，并在 `stderr` 打印失败节点与原因
 5. 如果部署目标数未满足，owner keepalive 会定期尝试动态补偿；失败的旧实例不会占用目标副本数
+6. 如果需要动态扩容，应由同一个部署端提高 `node_count` 后重启/恢复 deploy session；快速重启会接回本 owner 已经部署的同 code version 服务，再由 keepalive 补齐新增节点
 
 ## 3. 调用体验
 
@@ -311,11 +312,16 @@ group = Service.deploy(
 
 语义：
 
-1. 同 `owner_client_id + service_name + code_version` 时可复用
+1. 同 `owner_client_id + service_name + code_version` 且仍在同一 owner 控制域内时可复用
 2. 同名但代码变化时，如果旧服务仍在运行，会直接拒绝
 3. 要更新同名服务，先结束旧服务，再重新部署
-4. 客户端会本地缓存 `service_id/service_token`，便于重启后复用
+4. 客户端会本地缓存 `service_id/service_token`，便于 owner 进程重启后恢复自己的部署会话
 5. 同一台机器上，同一个 `owner_client_id + service_name` 只允许一个活跃 deployservice 持有该本地 session cache 锁
+6. 如果 node 断开后以新的 `node_instance_id` 重连，它必须重新接受 owner 部署，不能用旧 service 进程冒充仍在同一发布批次内
+7. startup service 由启动它的进程自行管理；即使 `service_name/code_version` 相同，也不能被动态 `Service.deploy(...)` owner 复用、接管或作为扩容副本加入，因为它不在该 owner 的版本管控、回滚、keepalive 与 close 闭环内
+8. startup service 不能动态加入任何现有服务组；动态服务已经占用同一个 `service_name` 时，startup service 必须拒绝启动
+9. 反过来 startup service 已存在时，动态 deploy 也必须拒绝，不能因为 code version 一致而合并为一个服务组
+10. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
 
 ## 5.1 依赖补装语义
 
@@ -409,6 +415,8 @@ pycloudctl gc --scope all --older-than-hours 168
 7. 按 `service_worker_available` 选节点
 8. 部署后如果新 node 加入或旧 node 重启为新实例，owner 会在 keepalive 后台尝试补齐目标副本数
 9. 创建失败或 host 失败的 service 会在 InfoCenter `/ops` 的 `failure_reason` 中显示原因
+
+这里的“补齐”是重新部署，不是信任 node 上残留的旧 service 状态。重连节点必须以新的 `node_instance_id` 进入 owner 的发布控制域后，才算当前部署的一部分。
 
 补充：
 

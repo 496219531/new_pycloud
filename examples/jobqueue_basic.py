@@ -17,8 +17,10 @@ job module 里同时定义：
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 
 REPO_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(REPO_SRC) not in sys.path:
@@ -31,24 +33,24 @@ from pycloud_parallel import JobQueue
 def main() -> None:
     target = "127.0.0.1:50051"
 
-    job_blob = (
-        b"JOB_CFG = None\n\n"
-        b"def run(value=0, **_kwargs):\n"
-        b"    value = int(value)\n"
-        b"    cfg = JOB_CFG or {}\n"
-        b"    return {'value': value, 'square': value * value, 'source': cfg.get('source', 'unknown')}\n\n"
-        b"def task_generator(value=0, count=4, **_kwargs):\n"
-        b"    return [{'value': value + i} for i in range(count)]\n\n"
-        b"def update_globals(**_kwargs):\n"
-        b"    return {'job_cfg': {'source': 'demo_job_queue'}}\n\n"
-        b"def apply_managed_globals(values, **_context):\n"
-        b"    global JOB_CFG\n"
-        b"    JOB_CFG = values.get('job_cfg')\n\n"
-        b"def handle_result(index, result, state=None, **_kwargs):\n"
-        b"    state.setdefault('squares', []).append(result['square'])\n\n"
-        b"def finalize(state=None, **_kwargs):\n"
-        b"    values = state.get('squares', [])\n"
-        b"    return {'count': len(values), 'sum_square': sum(values)}\n"
+    job_source = (
+        "JOB_CFG = None\n\n"
+        "def run(value=0, **_kwargs):\n"
+        "    value = int(value)\n"
+        "    cfg = JOB_CFG or {}\n"
+        "    return {'value': value, 'square': value * value, 'source': cfg.get('source', 'unknown')}\n\n"
+        "def task_generator(value=0, count=4, **_kwargs):\n"
+        "    return [{'value': value + i} for i in range(count)]\n\n"
+        "def update_globals(**_kwargs):\n"
+        "    return {'job_cfg': {'source': 'demo_job_queue'}}\n\n"
+        "def apply_managed_globals(values, **_context):\n"
+        "    global JOB_CFG\n"
+        "    JOB_CFG = values.get('job_cfg')\n\n"
+        "def handle_result(index, result, state=None, **_kwargs):\n"
+        "    state.setdefault('squares', []).append(result['square'])\n\n"
+        "def finalize(state=None, **_kwargs):\n"
+        "    values = state.get('squares', [])\n"
+        "    return {'count': len(values), 'sum_square': sum(values)}\n"
     )
 
     print("=" * 60)
@@ -56,45 +58,46 @@ def main() -> None:
     print("=" * 60)
     print(f"  InfoCenter: {target}")
     print()
-    print("可选提交方式：")
-    print("  1. submit(source=my_job_module)      推荐，直接提交模块对象")
-    print("  2. submit_job_from_bytes(...)        适合直接提交 job module blob")
+    print("提交方式：")
+    print("  submit(source=job_module, ...)       推荐，直接提交模块对象")
+    print("  submit_job_from_bytes(...)           仍可用，但仅作为兼容/高级路径")
     print()
 
-    with JobQueue.connect(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
-        resp = client.submit_job_from_bytes(
-            blob=job_blob,
-            entry_module="job_demo",
-            # job_payload={"value": 10, "count": 6},
-            runtime="py3",
-        )
-        job = resp["job"]
-        job_id = job["job_id"]
-        print(f"submitted job_id={job_id} status={job['status']}")
-        print()
-        print("模块对象写法：")
-        print(
-            "client.submit("
-            "source=my_job_module, "
-            "job_payload={'value': 10, 'count': 6})"
-        )
-        print()
+    with tempfile.TemporaryDirectory(prefix="pycloud-job-demo-") as tmpdir:
+        module_path = Path(tmpdir) / "job_demo.py"
+        module_path.write_text(job_source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("job_demo", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load job module from {module_path}")
+        job_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = job_module
+        spec.loader.exec_module(job_module)
 
-        deadline = time.time() + 30.0
-        while time.time() < deadline:
-            status = client.get_job_status(job_id)
-            job = status["job"]
-            print(
-                f"status={job['status']} "
-                f"results={len(job.get('results') or [])} "
-                f"final_result={job.get('final_result')}"
+        with JobQueue.connect(target, client_id=f"job-demo-{int(time.time())}", timeout_sec=10.0) as client:
+            resp = client.submit(
+                source=job_module,
+                job_payload={"value": 10, "count": 6},
             )
-            if job["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-                print(job)
-                break
-            time.sleep(1.0)
-        else:
-            print("job did not finish before timeout")
+            job = resp["job"]
+            job_id = job["job_id"]
+            print(f"submitted job_id={job_id} status={job['status']}")
+            print()
+
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                status = client.get_job_status(job_id)
+                job = status["job"]
+                print(
+                    f"status={job['status']} "
+                    f"results={len(job.get('results') or [])} "
+                    f"final_result={job.get('final_result')}"
+                )
+                if job["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                    print(job)
+                    break
+                time.sleep(1.0)
+            else:
+                print("job did not finish before timeout")
 
 
 if __name__ == "__main__":

@@ -95,7 +95,18 @@ V1 公开概念固定为：
 6. InfoCenter `/ops` 必须显示每条失败 service/taskpool 的 `failure_reason`
 7. 健康服务路由查询仍只返回健康节点上的 `RUNNING` 服务，诊断记录不能污染调用路由
 
-### 6.1 node 实例身份与 fencing
+### 6.1 动态部署 code version 一致性
+
+1. 动态部署服务由唯一发布者（owner deploy session）统一发布和管理
+2. 同名服务副本必须在同一 owner 控制域内保持同一个 `code_version`
+3. 同名但代码变化时，必须先结束旧服务，再由 owner 重新部署
+4. node 断开、被 fenced、或用新的 `node_instance_id` 重连后，旧执行状态不再可信；owner 必须重新部署/补齐
+5. startup service 只由启动它的进程自行管理；即使 `service_name/code_version` 与动态部署一致，也不能被动态 owner 复用、接管或作为扩容副本加入，因为它自治运行，不在该 owner 的版本管控、回滚、keepalive 与 close 闭环内
+6. startup service 不能动态加入任何现有服务组；同一个 `service_name` 上动态部署与 startup service 双向互斥
+7. 任一方已存在时，另一方不能因为 code version 一致而启动/部署
+8. 动态扩容由同一个动态 owner 调整目标副本数并重启/恢复 deploy session 完成；快速重启可接回该 owner 已部署的同 code version 服务，再由 keepalive 补齐新增节点
+
+### 6.2 node 实例身份与 fencing
 
 1. `node_id` 是逻辑名，可以持久化和复用
 2. `node_instance_id` 是执行实例身份，也是 service/taskpool token、DataRef 路由、动态补偿失败记录的 fencing 单位
@@ -104,7 +115,7 @@ V1 公开概念固定为：
 5. fenced 实例不能带着旧 service/taskpool 状态恢复；node 侧必须清理执行状态并重新注册新实例
 6. code/object cache 可保留，但 runtime/service/taskpool/executor/worker/token 状态必须清空
 
-### 6.2 unhealthy / drain / cordon
+### 6.3 unhealthy / drain / cordon
 
 1. `unhealthy` 表示执行状态不可信，应触发 fencing/reset 语义
 2. `drain` 表示不接新业务流量和新 task，但仍接 owner 控制命令
@@ -112,7 +123,7 @@ V1 公开概念固定为：
 4. 排他性部署和版本冲突检查不能因为 drain/cordon 就隐藏已有服务；只有 fenced unhealthy 实例可以从冲突检查中移除
 5. owner 命令路径不要过滤 drain/cordon，否则旧版本服务可能无法被 update/close
 
-### 6.3 TaskPool inflight retry
+### 6.4 TaskPool inflight retry
 
 1. 已被 node 接收的 task 若要 infra retry，client/session 侧必须持有 replay record；不能依赖失联 node 上的 `TaskState.payload`
 2. replay record 应保存逻辑 index/key、原始 payload、当前 task_id、当前 node_instance_id、attempt、最近错误

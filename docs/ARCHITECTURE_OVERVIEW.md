@@ -313,6 +313,16 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 3. 然后按 route 绑定的 profile 和 connect 上下文冻结出自己的 `effective_policy`
 4. 如果同名 service routes 的 `policy_id` 不一致，connect 会直接失败，避免普通调用面继续“选 profile”
 
+动态部署还有一个 code version / owner 控制域约束：
+
+1. 同名动态服务副本必须由唯一发布者统一发布管理
+2. 运行中的同名副本必须保持同一 `code_version`，代码变化必须先结束旧服务再重新部署
+3. node 断开后以新 `node_instance_id` 重连时，旧执行状态不再可信，必须由 owner 重新部署补齐
+4. startup service 自己管理自己的生命周期；即使和动态服务的 `service_name/code_version` 一致，也不能被动态 owner 复用、接管或作为扩容副本加入，因为它自治运行，不在该 owner 的版本管控、回滚、keepalive 与 close 闭环内
+5. startup service 不能动态加入任何现有服务组；同一个 `service_name` 上动态部署与 startup service 双向互斥
+6. 任一方已存在时，另一方不能因为 code version 一致而启动/部署
+7. 动态扩容由同一个动态 owner 调整目标副本数并重启/恢复 deploy session 完成；快速重启可接回该 owner 已部署的同 code version 服务，再补齐新增节点
+
 `JobQueue.connect()` 也遵循同样的边界：
 
 1. queue 自己的 controlplane transport 固定绑定 `jobqueue_controlplane_transport`
