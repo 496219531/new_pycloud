@@ -452,11 +452,9 @@ print(processed)
 2. 只有显式传 `deps=ArtifactDeps.allow_install(...)` 才允许节点补装
 3. 安装目录位于节点 `code_cache/codes/<sha>/deps`
 
-## 6. 兼容入口
+## 6. V1 会话边界
 
-兼容专属池实现已经进入收尾迁移阶段。
-
-最终目标保持：
+当前执行边界保持：
 
 1. `TaskPool` 是批量任务执行会话，不再单独宣称为“唯一执行内核”
 2. `Service` 与 `TaskPool` 共享 `ExecutorHost + ExecutionSession` 底座，但保留两类兄弟会话类型

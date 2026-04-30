@@ -34,4 +34,4 @@
 2. 共享任务池相关旧示例
 3. 函数级 `max_workers` 本地并行 demo
 4. Cloudpickle 诊断 demo
-5. legacy async transport demo
+5. 旧 async transport demo

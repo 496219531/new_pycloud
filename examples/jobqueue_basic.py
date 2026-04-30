@@ -60,7 +60,7 @@ def main() -> None:
     print()
     print("提交方式：")
     print("  submit(source=job_module, ...)       推荐，直接提交模块对象")
-    print("  submit_job_from_bytes(...)           仍可用，但仅作为兼容/高级路径")
+    print("  submit(source=source_bytes, ...)     也支持直接提交源码 bytes")
     print()
 
     with tempfile.TemporaryDirectory(prefix="pycloud-job-demo-") as tmpdir:

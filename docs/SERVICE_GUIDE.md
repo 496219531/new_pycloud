@@ -168,7 +168,7 @@ result = group.call_sync("square", x=7)
 result = group.call_sync("square", x=7, strategy="service_latency_first")
 ```
 
-兼容别名仍然支持：
+可选策略：
 
 1. `predicted_busy`
 2. `service_default`

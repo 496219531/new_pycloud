@@ -106,7 +106,7 @@ owner 推荐用法：
 1. 默认推荐路径：调用方直接走 `ControlPlane Gateway` 的 `POST /svc/{service_name}/call/{method}`
 2. Gateway 内部按 `service_name` 选 route，并转发到对应 `NodeControl`
 3. `service_id` 主要用于实例级管理，不是业务侧主发现名
-4. gRPC `CallService` 仍保留为内部兼容入口
+4. gRPC `CallService` 只作为内部低层入口
 
 如果不想经过 Gateway，也支持客户端自己做发现和选路：
 
