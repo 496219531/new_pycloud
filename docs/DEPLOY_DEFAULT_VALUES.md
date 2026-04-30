@@ -41,17 +41,16 @@ service-{本机IP}-{时间戳}
 当前顺序：
 
 1. 显式传入的 `entry_module`
-2. `func` / `module` 场景下，从对象自动推断
-3. `artifact_path` 是 `.py` 时，从路径推断
-4. `artifact_path` 是路径列表且首个元素是 `.py` 时，从第一个路径推断
-5. `blob` 直传且未指定 `entry_module` 时，不再依赖外部 `filename`，服务名回退到 `service-...`
+2. `source=module` / `source=function` 场景下，从对象自动推断
+3. `source=<path>` / `Artifact.from_paths(...)` 场景下，从路径推断
+4. `source=bytes` 且未指定 `entry_module` 时，服务名回退到 `service-...`
 
 ## 3. 当前最小部署示例
 
 ### 3.1 使用本地文件
 
 ```python
-from pycloud_parallel.execution.service_session import Service
+from pycloud_parallel import Service
 
 group = Service.deploy(
     target="127.0.0.1:50051",

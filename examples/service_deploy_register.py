@@ -9,7 +9,7 @@ import time
 from pycloud_parallel import Service
 
 def main():
-    # 你的业务代码（也可以用 artifact_path 指向本地 .py 文件）
+    # 你的业务代码也可以改成 source=<module/path/Artifact>
     blob = (
         b"from pycloud_parallel import export\n\n"
         b"@export\n"
