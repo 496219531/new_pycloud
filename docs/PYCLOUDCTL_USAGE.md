@@ -69,12 +69,10 @@ pycloudctl --help
    - `--node1-host`
    - `--node1-port`
    - `--node1-http-host`
-   - `--node1-http`
    - `--node1-http-port`
    - `--node2-host`
    - `--node2-port`
    - `--node2-http-host`
-   - `--node2-http`
    - `--node2-http-port`
    - `--node-worker-capacity`
 2. 子命令：
@@ -208,8 +206,6 @@ pycloudctl \
   --node2-http-port 18182 \
   start
 ```
-
-这里 `--node1-http` 和 `--node1-http-port` 是同一参数的两个别名；`node2` 同理。
 
 如果还想指定 host，也可以直接写：
 
@@ -812,9 +808,9 @@ pycloudctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
   --node1-port 51061 \
-  --node1-http 18181 \
+  --node1-http-port 18181 \
   --node2-port 51062 \
-  --node2-http 18182 \
+  --node2-http-port 18182 \
   restart
 ```
 
@@ -987,9 +983,9 @@ pycloudctl status
 pycloudctl \
   --controlplane-port 51051 \
   --node1-port 51061 \
-  --node1-http 18181 \
+  --node1-http-port 18181 \
   --node2-port 51062 \
-  --node2-http 18182 \
+  --node2-http-port 18182 \
   start
 ```
 
