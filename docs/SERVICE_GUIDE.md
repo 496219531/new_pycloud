@@ -317,9 +317,10 @@ group = Service.deploy(
 5. 同一台机器上，同一个 `owner_client_id + service_name` 只允许一个活跃 deployservice 持有该本地 session cache 锁
 6. 如果 node 断开后以新的 `node_instance_id` 重连，它必须重新接受 owner 部署，不能用旧 service 进程冒充仍在同一发布批次内
 7. startup service 由启动它的进程自行管理；即使 `service_name/code_version` 相同，也不能被动态 `Service.deploy(...)` owner 复用、接管或作为扩容副本加入，因为它不在该 owner 的版本管控、回滚、keepalive 与 close 闭环内
-8. startup service 不能动态加入任何现有服务组；动态服务已经占用同一个 `service_name` 时，startup service 必须拒绝启动
-9. 反过来 startup service 已存在时，动态 deploy 也必须拒绝，不能因为 code version 一致而合并为一个服务组
-10. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
+8. 如果 startup service 传入 `target` 并注册到 `InfoCenter`，它会参与 `service_name` 排他检查：动态服务已经占用同一个 `service_name` 时，startup service 必须拒绝启动
+9. 反过来，已注册 startup service 存在时，动态 deploy 也必须拒绝，不能因为 code version 一致而合并为一个服务组
+10. 如果 `Service.startup(target="")` 或不传 `target`，它是本地孤岛模式：不注册 `InfoCenter`，不参与全局 `service_name` 排他，可以在不同端口启动多个同名 startup service；这种实例不会被 `InfoCenter` / Gateway 自动发现，调用方需要直连对应本地 service HTTP 地址
+11. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
 
 ## 5.1 依赖补装语义
 

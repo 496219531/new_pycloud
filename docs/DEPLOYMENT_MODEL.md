@@ -30,9 +30,10 @@
 
 ### 2.3 服务命名
 
-1. 活跃 `service_name` 视为全局唯一。
+1. 注册到 `InfoCenter` 的活跃 `service_name` 视为全局唯一。
 2. 服务端不再兼容 `owner_client_id + service_name` 的多租户路由。
 3. 如果需要多租户隔离，应由客户端自己生成唯一名字。
+4. `Service.startup(target="")` 是本地孤岛模式，不注册 `InfoCenter`，因此不参与 `service_name` 全局排他；可以在不同端口启动多个同名 startup service，但调用方需要直接使用各自的本地 service HTTP 地址。
 
 ### 2.4 权限
 
@@ -49,7 +50,7 @@
 3. 如果某个 node 断开、被判定失效、或以新的 `node_instance_id` 重连，它不能带着旧进程继续算作已部署副本；owner keepalive 必须重新部署/补齐。
 4. `Service.startup(...)` / 系统启动时挂载的 startup service 只由自身进程管理，不允许被其他动态发布者接管。
 5. startup service 不能动态加入任何现有服务组；即使 `service_name/code_version` 完全一致，也不能作为已有动态服务的扩容副本，因为它自治运行，不在动态发布者的版本管控、回滚、keepalive 与 close 闭环内。
-6. 动态部署与 startup service 对同一个 `service_name` 是互斥的：任一方已经存在时，另一方即使 `code_version` 一致也必须拒绝启动/部署。
+6. 对已注册到同一个 `InfoCenter` 的服务，动态部署与 startup service 对同一个 `service_name` 是互斥的：任一方已经存在时，另一方即使 `code_version` 一致也必须拒绝启动/部署。
 7. 即使 startup service 的 `service_name` 和 `code_version` 与某个动态部署一致，也不能把它视为动态 owner 的可复用副本，因为它不在该 owner 的 token / keepalive / close 控制域内。
 
 动态扩容的正确路径是同一个动态发布者扩大目标副本数（例如提高 `node_count`）后重启/恢复 deploy session。部署端会用本地缓存的 `service_id/service_token` 接回自己已经发布的同 code version 服务，并由 keepalive 补齐新增节点；这仍然属于同一个 owner 控制域，不需要也不允许 startup service 参与扩容。

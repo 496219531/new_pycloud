@@ -122,6 +122,15 @@ node = Service.startup(
 
 这条路径不会接受 `Service.deploy(...)` 的动态部署；需要动态部署时仍使用普通 `NodeControl` 节点。
 
+不传 `target` 时，startup service 只在当前进程本地运行并暴露 service HTTP，不注册到 `InfoCenter`。这适合不想接受 `InfoCenter` 同名排他约束的场景，例如在不同端口上启动多个同名本地实例：
+
+```python
+Service.startup(service_name="calc", entry_module="my_package.calc_service", bind="127.0.0.1:18080")
+Service.startup(service_name="calc", entry_module="my_package.calc_service", bind="127.0.0.1:18081")
+```
+
+这种模式不会被 `InfoCenter` / Gateway 自动发现，调用方要直接使用对应实例的本地 service HTTP 地址。传入 `target` 后才会注册到 `InfoCenter`，并参与 `service_name` 排他检查。
+
 V1 不再提供本地单机并行入口；并行计算统一走 `TaskPool`、`Service` 或 `JobQueue`。
 
 ## 3. 并行执行
