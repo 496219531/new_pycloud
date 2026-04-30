@@ -603,8 +603,6 @@ def _normalize_artifact_input(
     source: Any = _SOURCE_UNSET,
     artifact: Optional[Artifact] = None,
     deps: Optional[ArtifactDeps] = None,
-    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-    blob: Optional[bytes] = None,
     runtime: str = "py3",
     entry_module: Any = "",
     entry_callable: Any = "run",
@@ -618,6 +616,8 @@ def _normalize_artifact_input(
         raise ValueError(f"unsupported artifact consumer kind: {consumer_kind!r}")
 
     source_func = None
+    source_blob = None
+    source_paths = None
     if source is not _SOURCE_UNSET and source is not None:
         source_kind, source_value = _coerce_source_input(source)
         if source_kind == "artifact":
@@ -625,8 +625,8 @@ def _normalize_artifact_input(
                 raise ValueError("source Artifact cannot be combined with artifact=")
             artifact = source_value
         else:
-            if artifact is not None or blob is not None or artifact_path:
-                raise ValueError("source cannot be combined with artifact, blob, or artifact_path")
+            if artifact is not None:
+                raise ValueError("source cannot be combined with artifact")
             if inspect.ismodule(entry_module) or (not isinstance(entry_callable, str) and callable(entry_callable)):
                 raise ValueError("source cannot be combined with module/callable entry inputs")
             if source_kind == "function":
@@ -634,18 +634,18 @@ def _normalize_artifact_input(
             elif source_kind == "module":
                 entry_module = source_value
             elif source_kind == "bytes":
-                blob = source_value
+                source_blob = source_value
             elif source_kind == "paths":
-                artifact_path = list(source_value)
+                source_paths = list(source_value)
             else:
-                artifact_path = source_value
+                source_paths = source_value
 
     raw_entry_module = entry_module
     raw_entry_callable = entry_callable
     source_module = None
-    if blob is None and not artifact_path and inspect.ismodule(raw_entry_module):
+    if source_blob is None and not source_paths and inspect.ismodule(raw_entry_module):
         source_module = raw_entry_module
-    if source_func is None and blob is None and not artifact_path and not isinstance(raw_entry_callable, str) and callable(raw_entry_callable):
+    if source_func is None and source_blob is None and not source_paths and not isinstance(raw_entry_callable, str) and callable(raw_entry_callable):
         source_func = raw_entry_callable
 
     normalized_entry_module = _normalize_entry_module_arg(raw_entry_module)
@@ -654,7 +654,7 @@ def _normalize_artifact_input(
     if artifact is not None:
         if not isinstance(artifact, Artifact):
             raise TypeError("artifact must be an Artifact instance")
-        if blob is not None or artifact_path or source_module is not None or source_func is not None:
+        if source_blob is not None or source_paths or source_module is not None or source_func is not None:
             raise ValueError("artifact cannot be combined with alternate artifact source inputs")
         effective_exports = artifact.exports
         if effective_exports is None:
@@ -693,13 +693,13 @@ def _normalize_artifact_input(
         return Artifact.from_function(source_func, **base_kwargs)
     if source_module is not None:
         return Artifact.from_module(source_module, **base_kwargs)
-    if blob is not None:
+    if source_blob is not None:
         effective_format = _resolve_package_format(package_format, default="py")
-        return Artifact.from_bytes(blob, package_format=effective_format, **{k: v for k, v in base_kwargs.items() if k != "package_format"})
-    if artifact_path:
-        return Artifact.from_paths(artifact_path, **base_kwargs)
+        return Artifact.from_bytes(source_blob, package_format=effective_format, **{k: v for k, v in base_kwargs.items() if k != "package_format"})
+    if source_paths:
+        return Artifact.from_paths(source_paths, **base_kwargs)
     raise ValueError(
-        "source, artifact, blob, artifact_path, module-object entry_module or callable-object entry_callable is required"
+        "source, artifact, module-object entry_module or callable-object entry_callable is required"
     )
 
 

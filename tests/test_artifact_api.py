@@ -187,7 +187,7 @@ def test_prepare_artifact_accepts_public_deps_override() -> None:
 
     normalized = _normalize_artifact_input(
         consumer_kind="task",
-        blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
+        source=b"def run(**_kwargs):\n    return {'ok': True}\n",
         runtime="py3",
         entry_module="demo_override",
         entry_callable="run",
