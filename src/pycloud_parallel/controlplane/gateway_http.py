@@ -19,7 +19,6 @@ from pycloud_parallel.controlplane.config import (
     GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
 )
 from .client_transport import (
-    _decode_http_request_body,
     _decode_http_request_body_with_mode,
     _decode_http_transport_request_body_with_mode,
     _decode_http_response_with_headers,

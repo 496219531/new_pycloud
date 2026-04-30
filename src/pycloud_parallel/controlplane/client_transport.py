@@ -200,11 +200,6 @@ def _decode_http_transport_request_body_with_mode(
     return decoded, effective_mode
 
 
-def _decode_http_request_body(body: bytes, *, context: str) -> Dict[str, object]:
-    decoded, _mode = _decode_http_request_body_with_mode(body, context=context)
-    return decoded
-
-
 def _encode_http_json_body(data: Dict[str, object]) -> bytes:
     return json.dumps(serialize_arrow_compatible(data), ensure_ascii=False).encode("utf-8")
 

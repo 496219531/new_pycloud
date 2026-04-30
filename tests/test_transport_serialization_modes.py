@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from pycloud_parallel.controlplane.client_transport import (
-    _decode_http_request_body,
+    _decode_http_request_body_with_mode,
     _normalize_http_response_body,
     _serialize_http_call_payload,
 )
@@ -82,8 +82,9 @@ def test_http_request_body_respects_structured_mode(monkeypatch):
     payload = {"blob": b"abc", "value": 1}
     encoded = _serialize_http_call_payload(payload, context="test payload")
     body = json.dumps(serialize_arrow_compatible(encoded), ensure_ascii=False).encode("utf-8")
-    decoded = _decode_http_request_body(body, context="test payload")
+    decoded, mode = _decode_http_request_body_with_mode(body, context="test payload")
     assert decoded == payload
+    assert mode == "structured_v1"
 
 
 def test_http_response_body_respects_pickle_stable_mode(monkeypatch):

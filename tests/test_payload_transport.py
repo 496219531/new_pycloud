@@ -15,7 +15,7 @@ from pycloud_parallel.controlplane.payload_transport import (
     prepare_outbound_payload,
 )
 
-_decode_http_request_body = client_transport_mod._decode_http_request_body
+_decode_http_request_body_with_mode = client_transport_mod._decode_http_request_body_with_mode
 
 
 def _fake_object_ref(*, object_id_suffix: str = "a", format: str = "bin", consume_on_read: bool = False) -> DataRef:
@@ -222,11 +222,12 @@ def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
         }
     ).encode("utf-8")
 
-    decoded = _decode_http_request_body(
+    decoded, mode = _decode_http_request_body_with_mode(
         body,
         context="service call payload",
     )
 
+    assert mode == "legacy_v1"
     assert isinstance(decoded["blob"], DataRef)
 
 
@@ -277,10 +278,11 @@ def test_decode_http_request_body_returns_data_ref_objects() -> None:
         }
     ).encode("utf-8")
 
-    decoded = _decode_http_request_body(
+    decoded, mode = _decode_http_request_body_with_mode(
         body,
         context="service call payload",
     )
 
+    assert mode == "legacy_v1"
     assert isinstance(decoded["blob"], DataRef)
     assert decoded["blob"].logical_type == "json"
