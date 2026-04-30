@@ -216,6 +216,15 @@ def test_service_startup_rejects_legacy_dependency_allowlist():
         )
 
 
+def test_service_startup_rejects_legacy_infocenter_target_keyword():
+    with pytest.raises(TypeError):
+        ApiService.startup(
+            source="startup_demo",
+            infocenter_target="127.0.0.1:50051",
+            start=False,
+        )
+
+
 def test_job_queue_public_submit_rejects_legacy_dependency_allowlist():
     queue = ApiJobQueue.connect("127.0.0.1:50051", client_id="surface-client")
     try:

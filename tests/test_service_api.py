@@ -810,7 +810,7 @@ def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path
     )
 
     node = Service.startup(
-        infocenter_target="127.0.0.1:50051",
+        target="127.0.0.1:50051",
         service_name="startup-same-endpoint",
         entry_module="startup_same_endpoint_service",
         bind="127.0.0.1:18081",
@@ -864,7 +864,7 @@ def test_service_startup_different_endpoint_fails_before_bind(tmp_path, monkeypa
 
     with pytest.raises(RuntimeError, match="different endpoint"):
         Service.startup(
-            infocenter_target="127.0.0.1:50051",
+            target="127.0.0.1:50051",
             service_name="startup-other-endpoint",
             entry_module="startup_other_endpoint_service",
             bind="127.0.0.1:18081",
@@ -946,7 +946,7 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
     )
 
     node = Service.startup(
-        infocenter_target="127.0.0.1:50051",
+        target="127.0.0.1:50051",
         service_name="startup-registered",
         entry_module="startup_registered_service",
         worker_count=3,

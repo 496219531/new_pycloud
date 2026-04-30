@@ -1933,7 +1933,6 @@ class Service(ServiceExecutionSession):
         export_methods: Optional[Sequence[str]] = None,
         bind: Optional[str] = None,
         target: str = "",
-        infocenter_target: str = "",
         control_addr: str = "",
         node_id: str = "",
         service_http_base_url: str = "",
@@ -2055,7 +2054,7 @@ class Service(ServiceExecutionSession):
                     f"existing=[{details}]"
                 )
 
-        effective_infocenter_target = str(infocenter_target or target or "").strip()
+        effective_infocenter_target = str(target or "").strip()
         effective_worker_count = max(1, int(worker_count or 1))
         node = StartupServiceNode(
             node_id=effective_node_id,
