@@ -723,21 +723,6 @@ def _wait_http_ready(bind: str, timeout_sec: float, *, path: str = "/") -> bool:
     return False
 
 
-def _wait_controlplane_ready(port: int, timeout_sec: float) -> bool:
-    deadline = time.time() + max(0.1, float(timeout_sec))
-    url = f"http://127.0.0.1:{int(port)}/nodes?healthy_only=false&limit=1"
-    while time.time() < deadline:
-        try:
-            with urlopen(url, timeout=1.0) as resp:
-                data = json.loads(resp.read().decode("utf-8") or "{}")
-            if isinstance(data, dict) and data.get("ok") is True:
-                return True
-        except Exception:
-            pass
-        time.sleep(0.2)
-    return False
-
-
 def _wait_node_registered(infocenter_target: str, node_id: str, timeout_sec: float) -> bool:
     target = str(infocenter_target or "").strip()
     if not target.startswith(("http://", "https://")):

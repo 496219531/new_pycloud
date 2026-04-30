@@ -71,23 +71,6 @@ def _service_info_to_pb(info: dict) -> pb2.ServiceStatusInfo:
     )
 
 
-def _service_route_to_pb(info: dict) -> pb2.ServiceRouteInfo:
-    return pb2.ServiceRouteInfo(
-        service_name=str(info.get("service_name", "")),
-        service_id=str(info.get("service_id", "")),
-        policy_id=str(info.get("policy_id", "") or "default_safe"),
-        status=int(info.get("status", pb2.SERVICE_STATUS_UNSPECIFIED)),
-        node_id=str(info.get("node_id", "")),
-        control_addr=str(info.get("control_addr", "")),
-        node_healthy=bool(info.get("node_healthy", False)),
-        worker_count=int(info.get("worker_count", 0)),
-        alive_workers=int(info.get("alive_workers", 0)),
-        in_flight=int(info.get("in_flight", 0)),
-        lease_expire_at=dt_to_ts(info["lease_expire_at"]),
-        http_base_url=str(info.get("http_base_url", "")),
-    )
-
-
 def _peer(context: grpc.ServicerContext) -> str:
     try:
         return context.peer()

@@ -85,17 +85,6 @@ def _code_digest_from_code_version(code_version: str) -> str:
     return _normalize_code_version(code_version)
 
 
-def _code_storage_key(code_version: str) -> str:
-    import hashlib
-
-    normalized = _code_digest_from_code_version(code_version)
-    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
-
-
-def _code_scope_dir(base_dir: Path, *, code_version: str) -> Path:
-    return Path(base_dir) / "codes" / _code_storage_key(code_version)
-
-
 def _code_subversion_key(code_version: str) -> str:
     _code_digest, variant_digest = _split_code_version(code_version)
     return variant_digest or "default"
