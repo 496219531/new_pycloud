@@ -50,8 +50,6 @@ def _exit_infocenter_unavailable(gateway_target: str, exc: BaseException) -> "No
 def main():
     gateway_target = "127.0.0.1:50051"
     service_name = "compat-demo"
-    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
-    dependency_allowlist = []
 
     print("=" * 60)
     print("  HTTP 风格兼容性演示")
@@ -75,12 +73,10 @@ def main():
 
     try:
         group = Service.deploy(
-            infocenter_target=gateway_target,
+            target=gateway_target,
             service_name=service_name,
             source=blob,
             runtime="py3",
-            entry_module="compat_demo",
-            dependency_allowlist=dependency_allowlist,
             worker_count=2,
             tags=["compute"],
             min_success_nodes=1,

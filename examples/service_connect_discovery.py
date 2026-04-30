@@ -41,12 +41,11 @@ def main() -> None:
     print()
 
     group = Service.deploy(
-        infocenter_target=infocenter_target,
+        target=infocenter_target,
         owner_client_id=f"discovery-demo-{int(time.time())}",
         service_name=service_name,
         source=blob,
         runtime="py3",
-        entry_module="square_service",
         worker_count=1,
         tags=["compute"],
         min_success_nodes=1,

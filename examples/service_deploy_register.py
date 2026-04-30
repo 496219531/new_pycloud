@@ -10,8 +10,6 @@ from pycloud_parallel import Service
 
 def main():
     # 你的业务代码（也可以用 artifact_path 指向本地 .py 文件）
-    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
-    dependency_allowlist = []
     blob = (
         b"from pycloud_parallel import export\n\n"
         b"@export\n"
@@ -21,15 +19,11 @@ def main():
 
     suffix = int(time.time())
     group = Service.deploy(
-        infocenter_target="127.0.0.1:50051",
+        target="127.0.0.1:50051",
         owner_client_id=f"client-owner-{suffix}",
         service_name=f"square-service-{suffix}",
-        blob=blob,
+        source=blob,
         runtime="py3",
-        entry_module="square_service",
-        entry_callable="square",
-        export_mode="decorator",
-        dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,
         healthy_only=True,

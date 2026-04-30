@@ -10,21 +10,6 @@
 - 需要先部署名为 "square-service" 的服务
 - 可以运行 `service_gateway_end_to_end.py` 自动完成部署和调用演示
 """
-    b"@export\n"
-    b"def square(x=0, **_kwargs):\n"
-    b"    x = int(x)\n"
-    b"    return {'x': x, 'y': x * x}\n"
-)
-
-group = Service.deploy(
-    infocenter_target="127.0.0.1:50051",
-    service_name="square-service",
-    blob=blob,
-    entry_module="square_service",
-    dependency_allowlist=["./third_party/my_local_pkg"],  # 可选
-)
-```
-"""
 
 from pathlib import Path
 import sys
@@ -89,12 +74,11 @@ def ensure_service(gateway_target: str, service_name: str):
         b"    return {'x': x, 'y': x * x}\n"
     )
     group = Service.deploy(
-        infocenter_target=gateway_target,
+        target=gateway_target,
         owner_client_id=f"gateway-client-demo-{int(time.time())}",
         service_name=service_name,
         source=blob,
         runtime="py3",
-        entry_module="square_service",
         worker_count=1,
         tags=["compute"],
         min_success_nodes=1,

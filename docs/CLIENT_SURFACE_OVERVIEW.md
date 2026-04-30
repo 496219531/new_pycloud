@@ -157,7 +157,7 @@
 2. payload 准备链会优先遵守 session 的 effective payload limit，必要时转 `DataRef`
 3. `Service.connect(transport="gateway")` 默认绑定 `default_safe`，默认 mode 是 `legacy_v1`
 4. `Service.connect(transport="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
-5. `TaskPool.open(...)` / `TaskPool.from_infocenter(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
+5. `TaskPool.open(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
 6. 重数据 task 场景建议显式切到 `pickle_internal_heavy`
 7. `JobQueue.connect()` 默认绑定 `jobqueue_controlplane_transport`，对应 profile=`default_safe`，默认 mode=`structured_v1`
 8. 节点差异由 `tags`、`healthy_only` 和 runtime 过滤表达，不再参与 effective policy 协商

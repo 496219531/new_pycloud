@@ -21,8 +21,6 @@ from pycloud_parallel import Service
 
 def main():
     # 服务代码
-    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
-    dependency_allowlist = []
     blob = (
         b"from pycloud_parallel import export\n\n"
         b"@export\n"
@@ -52,15 +50,11 @@ def main():
     # V1 公开入口使用 Service。
     import time
     group = Service.deploy(
-        infocenter_target="127.0.0.1:50051",
+        target="127.0.0.1:50051",
         owner_client_id=f"module-demo-{int(time.time())}",
         service_name=f"compute-service-1",
-        blob=blob,
+        source=blob,
         runtime="py3",
-        entry_module="compute",
-        entry_callable="square",
-        export_mode="decorator",
-        dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,
         healthy_only=True,

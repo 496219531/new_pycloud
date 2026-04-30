@@ -48,12 +48,10 @@ def main():
     print("-" * 60)
 
     group = Service.deploy(
-        infocenter_target=gateway_target,
+        target=gateway_target,
         service_name=service_name,
-        blob=blob,
+        source=blob,
         runtime="py3",
-        entry_module="dataframe_service",
-        export_mode="decorator",
         worker_count=2,
         tags=["compute"],  # 修改为 compute 标签
         min_success_nodes=1,

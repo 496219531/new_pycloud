@@ -16,6 +16,7 @@ if str(REPO_SRC) not in sys.path:
     sys.path.insert(0, str(REPO_SRC))
 
 from pycloud_parallel import Service
+from pycloud_parallel.artifact import Artifact
 
 
 def demo_service_code():
@@ -224,9 +225,9 @@ def main():
     service_name = f"compute-service-{service_suffix}"
     owner_client_id = f"demo-compute-{service_suffix}"
 
-    # 方式 1: 使用 artifact_path 列表部署
+    # 方式 1: 使用 Artifact.from_paths 部署
     print("-" * 60)
-    print("  方式 1: 使用 artifact_path 列表（推荐）")
+    print("  方式 1: 使用 Artifact.from_paths（推荐）")
     print("-" * 60)
     print()
 
@@ -252,28 +253,16 @@ def main():
         print()
 
         group = Service.deploy(
-            infocenter_target="127.0.0.1:50051",
+            target="127.0.0.1:50051",
             owner_client_id=owner_client_id,
             service_name=service_name,
-
-            # 使用 artifact_path 列表部署多个文件/文件夹
-            artifact_path=[
-                str(service_dir),
-            ],
-
-            # 入口配置
-            entry_module="compute_service.main",  # zip 内路径：compute_service/main.py
-            entry_callable="process",             # 默认函数
-
-            # 导出配置
-            export_mode="decorator",
-
-            # 运行时配置
+            artifact=Artifact.from_paths(
+                service_dir,
+                entry_module="compute_service.main",
+            ),
             runtime="py3",
             worker_count=4,
             heartbeat_timeout_sec=30,
-
-            # 部署配置
             expose_http=True,
             healthy_only=True,
             tags=["compute"],  # 只使用 "compute" 标签

@@ -55,7 +55,7 @@ with TaskPool.open(
 说明：
 
 1. `pool.methods` 当前只会返回一个方法名，也就是任务入口名
-2. `entry_func` 是更直接的 callable 入口口径；`entry_callable` 是字符串名口径
+2. `entry_callable` 是 artifact 里的字符串入口名
 3. `submit_payloads(..., task_method=...)` 可以显式传方法名，但只能等于这个单一入口
 4. 如果传了别的方法名，现在会直接抛 `AttributeError`，不再静默回退到默认入口
 

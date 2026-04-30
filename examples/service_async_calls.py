@@ -20,7 +20,6 @@ def main():
     suffix = int(time.time())
     # 这个示例关注异步调用模式本身，避免默认返回超大 DataFrame，
     # 否则高并发阶段会被大 payload 序列化成本淹没。
-    dependency_allowlist = []
     blob = (
         b"from pycloud_parallel import export\n\n"
         b"@export\n"
@@ -44,15 +43,11 @@ def main():
     print()
 
     group = Service.deploy(
-        infocenter_target="127.0.0.1:50051",
+        target="127.0.0.1:50051",
         owner_client_id=f"async-demo-{suffix}",
         service_name=f"compute-service-{suffix}",
-        blob=blob,
+        source=blob,
         runtime="py3",
-        entry_module="compute",
-        entry_callable="square",
-        export_mode="decorator",
-        dependency_allowlist=dependency_allowlist,
         worker_count=4,
         heartbeat_timeout_sec=30,
         healthy_only=True,

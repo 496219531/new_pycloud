@@ -31,11 +31,9 @@ def main() -> None:
     )
 
     with TaskPool.open(
-        infocenter_target="127.0.0.1:50051",
+        target="127.0.0.1:50051",
         job_id=f"demo-pool-{int(time.time())}",
         source=blob,
-        entry_module="task_pool_demo",
-        entry_callable="run",
         worker_count=2,
         node_count=1,
         tags=["compute"],

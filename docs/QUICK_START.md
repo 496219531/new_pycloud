@@ -249,7 +249,7 @@ with TaskPool.open(
 
 说明：
 
-1. `TaskPool` 当前是单入口模式，入口名就是 `entry_func / entry_callable`
+1. `TaskPool` 当前是单入口模式，入口名来自 artifact 的 `entry_callable`
 2. `submit_payloads(..., task_method=...)` 只能传这个方法名
 3. `runtime_key` 仍可用于 runtime 逻辑隔离，但不再表示独立 runtime-slot
 4. `pool.unordered(...)` / `pool.aunordered(...)` 是统一批量接口，返回 `(index, result_or_none)`

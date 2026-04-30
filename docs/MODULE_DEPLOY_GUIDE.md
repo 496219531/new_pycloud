@@ -12,7 +12,7 @@ from pycloud_parallel import Service
 
 group = Service.deploy(
     target="127.0.0.1:50051",
-    entry_module=my_job.main,
+    source=my_job.main,
     runtime="py3",
 )
 ```

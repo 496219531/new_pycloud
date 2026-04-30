@@ -396,19 +396,23 @@ for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in
 这只是 service RPC 的批量辅助能力，不会引入 `TaskPool` 的 `task_id / result cursor / cancel_job` 语义。
 
 默认推荐直接传模块对象 `source=my_service_module`。
-如果你的代码依赖节点上未预装的包，或你需要更细的打包/导出控制，再使用高级 `Artifact(...)` 或显式白名单：
+如果你的代码依赖节点上未预装的包，或你需要更细的打包/导出控制，再使用 `Artifact` / `ArtifactDeps`：
 
 ```python
+from pycloud_parallel.artifact import Artifact, ArtifactDeps
+
 group = Service.deploy(
     target="127.0.0.1:50051",
     service_name="dep-service",
-    artifact_path="./service_src",
+    artifact=Artifact.from_paths(
+        "./service_src",
+        entry_module="viewer",
+    ),
     runtime="py3",
-    entry_module="viewer",
-    dependency_allowlist=[
+    deps=ArtifactDeps.allow_install([
         "./third_party/my_local_pkg",
         "orjson==3.10.18",
-    ],
+    ]),
 )
 ```
 
@@ -433,8 +437,9 @@ group = Service.deploy(
 
 如果你必须一起带 `.csv / .json` 等资源：
 
-1. 预先自行构建 `zip / tar.gz / whl`
-2. 再通过 `artifact_path=<archive file>` 或 `blob=...` 上传
+1. 模块对象部署时优先用 `resource_paths=[...]`
+2. 多文件/目录场景使用 `Artifact.from_paths(...)`
+3. 预构建归档场景使用 `Artifact.from_bytes(...)` 并显式声明入口
 
 完整说明见 [MODULE_DEPLOY_GUIDE.md](docs/MODULE_DEPLOY_GUIDE.md)。
 
@@ -477,7 +482,7 @@ with TaskPool.open(
 
 说明：
 
-1. `TaskPool` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
+1. `TaskPool` 当前只暴露一个任务入口，也就是 artifact 的 `entry_callable`
 2. `pool.methods` 会返回这个单一方法名
 3. 如果你手动传 `task_method=...`，它现在会做严格校验；方法名不匹配会直接报错，不再静默回退
 
@@ -607,10 +612,10 @@ V1 删除旧的本地 `foreach/parallel_for` 辅助入口；请使用 `TaskPool`
 当前策略刻意保持保守：
 
 1. 默认不自动安装任何缺失模块
-2. 只有调用方显式传 `dependency_allowlist` 才允许节点补装
+2. 只有调用方显式传 `deps=ArtifactDeps.allow_install(...)` 才允许节点补装
 3. 节点不会猜测 `import 名 -> pip 包名`
 4. 白名单会安装到 `code_cache/codes/<sha>/deps`
-5. 同一个 `code_version` 如果使用不同的 `dependency_allowlist`，会直接拒绝，避免缓存语义混乱
+5. 同一个 `code_version` 如果使用不同的依赖策略，会直接拒绝，避免缓存语义混乱
 
 ## 运维接口
 

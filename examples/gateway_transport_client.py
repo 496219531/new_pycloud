@@ -43,12 +43,11 @@ def _ensure_service(target: str, service_name: str):
         b"    return {'x': x, 'y': x * x}\n"
     )
     group = Service.deploy(
-        infocenter_target=target,
+        target=target,
         owner_client_id=f"gateway-module-demo-{int(time.time())}",
         service_name=service_name,
         source=blob,
         runtime="py3",
-        entry_module="square_service",
         worker_count=1,
         tags=["compute"],
         min_success_nodes=1,

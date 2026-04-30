@@ -16,8 +16,6 @@ from pycloud_parallel import Service
 
 def main():
     # 服务代码
-    # 如果服务依赖节点未预装的包，可显式填 dependency_allowlist。
-    dependency_allowlist = []
     blob = (
         b"from pycloud_parallel import export\n\n"
         b"@export\n"
@@ -36,12 +34,10 @@ def main():
         print("方式 1：使用所有默认值")
         print("-" * 60)
         group1 = Service.deploy(
-            infocenter_target="127.0.0.1:50051",
+            target="127.0.0.1:50051",
             # service_name 和 owner_client_id 会自动生成
             source=blob,
             runtime="py3",
-            entry_module="compute",
-            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group1)
@@ -49,29 +45,26 @@ def main():
         print(f"  自动生成的 service_name: {group1.service_name}")
         print()
 
-        # 方式 2：只提供 entry_module，自动生成 service_name
-        print("方式 2：提供 entry_module")
+        # 方式 2：只提供 service_name，使用默认 owner_client_id
+        print("方式 2：提供 service_name")
         print("-" * 60)
         group2 = Service.deploy(
-            infocenter_target="127.0.0.1:50051",
-            # entry_module 会用于生成 service_name
+            target="127.0.0.1:50051",
+            service_name=f"simple-demo-{int(time.time())}",
             source=blob,
-            entry_module="my_service",  # 指定 entry_module
-            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group2)
-        print(f"  自动生成的 service_name: {group2.service_name}")
+        print(f"  使用的 service_name: {group2.service_name}")
         print()
 
         # 方式 3：只提供 owner_client_id，使用默认 service_name
         print("方式 3：只提供 owner_client_id")
         print("-" * 60)
         group3 = Service.deploy(
-            infocenter_target="127.0.0.1:50051",
+            target="127.0.0.1:50051",
             owner_client_id="my-custom-client",  # 自定义 owner
             source=blob,
-            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group3)
@@ -79,16 +72,15 @@ def main():
         print(f"  自动生成的 service_name: {group3.service_name}")
         print()
 
-        # 方式 4：只提供 service_name，使用默认 owner_client_id
+        # 方式 4：同时提供 owner_client_id 和 service_name
         # 固定 service_name 重新部署时，如果代码变化需要先结束旧服务。
         print("方式 4：只提供 service_name")
         print("-" * 60)
         custom_name = "my-custom-service"
         group4 = Service.deploy(
-            infocenter_target="127.0.0.1:50051",
+            target="127.0.0.1:50051",
             service_name=custom_name,  # 自定义 service_name
             source=blob,
-            dependency_allowlist=dependency_allowlist,
             worker_count=1,
         )
         groups.append(group4)

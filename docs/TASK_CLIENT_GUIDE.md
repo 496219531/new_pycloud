@@ -31,7 +31,7 @@ with TaskPool.open(
 
 说明：
 
-1. `TaskPool` 当前只暴露一个任务入口，也就是 `entry_func / entry_callable`
+1. `TaskPool` 当前只暴露一个任务入口，也就是 artifact 的 `entry_callable`
 2. 如果手动传 `task_method=...`，它必须和这个入口名一致
 3. `runtime_key` 保留为 runtime 逻辑隔离键，但不再表示独立 runtime-slot
 4. `TaskPool` 当前默认走统一 scheduler 的 `TASKPOOL_DEFAULT` profile
