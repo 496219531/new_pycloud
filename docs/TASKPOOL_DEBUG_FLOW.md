@@ -78,14 +78,14 @@
 1. 为每个 payload 生成 `task_id`
 2. `serialize_inline_payload(payload, context="task pool payload")`
 3. 先校验 `task_method` 是否等于当前唯一入口方法
-4. `_select_pool_node()` 选择一个 node pool
+4. `_plan_pool_node_targets()` 批量规划目标 node pool
 5. 按节点分组
 6. 调每个底层 `NativeTaskPoolClient.submit_tasks(...)`
 
 关键位置：
 
 1. `TaskPool.submit_payloads()` 在 `2155` 左右
-2. `_select_pool_node()` 在 `2147` 左右
+2. `_plan_pool_node_targets()` 在 `560` 左右
 
 这里最适合排查：
 

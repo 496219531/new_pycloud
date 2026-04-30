@@ -49,13 +49,11 @@ from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
     REMOTE_INFRA_FAILED,
     SUBMIT_FAILED,
-    before_probe,
     candidate_allowed,
     mark_candidate_failure,
     mark_candidate_success,
 )
 from pycloud_parallel.execution.scheduler import (
-    TASKPOOL_DEFAULT,
     SchedulerCandidate,
     SchedulerState,
     resolve_taskpool_strategy,
@@ -473,9 +471,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         _status, allowed = candidate_allowed(state)
         return allowed
 
-    def _pool_before_probe(self, node_id: str) -> bool:
-        return before_probe(self._pool_breaker_state(node_id))
-
     def _mark_pool_submit_success(self, node_id: str) -> None:
         mark_candidate_success(self._pool_breaker_state(node_id))
         self._scheduler_state.disabled_candidates.discard(str(node_id))
@@ -566,23 +561,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             if normalized > 0:
                 return normalized
         return self._default_max_in_flight()
-
-    def _select_pool_node(self, *, strategy: str = "taskpool_default") -> str:
-        node_ids = self._available_pool_node_ids()
-        if not node_ids:
-            raise RuntimeError("task pool has no active node pools")
-        candidates, state = self._build_pool_scheduler_candidates(allowed_node_ids=node_ids)
-        profile = resolve_taskpool_strategy(strategy)
-        with self._pool_lock:
-            idx = self._pool_cycle
-            self._pool_cycle += 1
-        selected = select_one_candidate(
-            candidates,
-            profile=profile,
-            state=state,
-            round_robin_counter=idx,
-        )
-        return str(selected.id)
 
     def _plan_pool_node_targets(
         self,
@@ -1028,66 +1006,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
     def _item_with_index(self, item: ExecutionItem, *, index: int, key: Union[int, str]) -> ExecutionItem:
         return replace(item, index=int(index), key=key)
-
-    def _submit_indexed_payloads(
-        self,
-        payloads: Sequence[Dict[str, object]],
-        *,
-        task_method: str = "",
-    ) -> Tuple[Set[str], Dict[str, int], List[ExecutionItem]]:
-        if self._closed:
-            raise RuntimeError("task pool session is closed")
-        normalized_method = str(task_method or self._task_method).strip() or self._task_method
-        self._ensure_method(normalized_method)
-        temp_state = SchedulerState(
-            local_inflight_by_candidate=dict(self._scheduler_state.local_inflight_by_candidate),
-            disabled_candidates=set(self._scheduler_state.disabled_candidates),
-            recent_submit_failures=dict(self._scheduler_state.recent_submit_failures),
-        )
-        grouped: Dict[str, List[Tuple[int, pb2.TaskSubmitItem]]] = {}
-        index_by_task_id: Dict[str, int] = {}
-        planned_targets = self._plan_pool_node_targets(
-            count=len(payloads),
-            strategy=TASKPOOL_DEFAULT.name,
-            state=temp_state,
-            allowed_node_ids=self._available_pool_node_ids(),
-        )
-        for idx, (payload, target_node_id) in enumerate(zip(payloads, planned_targets)):
-            item = self._build_task_submit_item(
-                node_id=target_node_id,
-                payload=dict(payload or {}),
-                timeout_hint_sec=0,
-                priority=1,
-            )
-            grouped.setdefault(target_node_id, []).append((idx, item))
-            index_by_task_id[str(item.task_id)] = idx
-
-        accepted_task_ids: Set[str] = set()
-        rejected_items: List[ExecutionItem] = []
-        for node_id, entries in grouped.items():
-            resp = self._submit_task_items_to_node(
-                node_id,
-                [item for _idx, item in entries],
-                job_id=self.job_id,
-            )
-            accepted_ids = {str(item.task_id) for item in resp.accepted if str(item.task_id).strip()}
-            accepted_task_ids.update(accepted_ids)
-            for rejected in resp.rejected:
-                task_id = str(rejected.task_id or "").strip()
-                index = int(index_by_task_id.get(task_id, -1))
-                rejected_items.append(
-                    ExecutionItem(
-                        index=index,
-                        ok=False,
-                        result=None,
-                        error_type="TaskRejected",
-                        error_message=str(rejected.message or "task rejected"),
-                        node_id="",
-                        key=task_id or index,
-                        task_id=task_id,
-                    )
-                )
-        return accepted_task_ids, index_by_task_id, rejected_items
 
     def _iter_raw_results(
         self,

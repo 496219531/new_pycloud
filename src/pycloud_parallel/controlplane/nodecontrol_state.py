@@ -108,8 +108,6 @@ from pycloud_parallel.controlplane.node.session_views import (
     build_task_pool_status_info as _build_task_pool_status_info,
     execute_warmup as _execute_session_warmup,
     log_warmup_result as _log_session_warmup_result,
-    normalize_warmup_result as _normalize_session_warmup_result,
-    warmup_fanout as _session_warmup_fanout,
 )
 from pycloud_parallel.controlplane.node.timing import (
     ExecutionTimingSample,
@@ -677,14 +675,6 @@ class NodeControlState(NodeRuntimeBase):
         if normalized_client_id and normalized_code_version:
             self._client_code_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = normalized_names
         return normalized_names
-
-    @staticmethod
-    def _warmup_fanout(worker_count: int) -> int:
-        return _session_warmup_fanout(worker_count)
-
-    @staticmethod
-    def _normalize_warmup_result(result: object, *, fanout: int) -> Tuple[int, List[int]]:
-        return _normalize_session_warmup_result(result, fanout=fanout)
 
     def _log_warmup_result(self, *, scope: str, key: str, worker_count: int, submitted_count: int, worker_pids: Sequence[int]) -> None:
         _log_session_warmup_result(

@@ -3439,21 +3439,12 @@ def test_runtime_managed_globals_scope_dirs_are_isolated_per_node(tmp_path):
         state_b.close()
 
 
-def test_normalize_warmup_result_accepts_submitted_count_only(tmp_path):
-    state = NodeControlState(
-        node_id="node-warmup-normalize",
-        queue_capacity=16,
-        worker_capacity=2,
-        artifact_dir=str(tmp_path / "code_cache_warmup_normalize"),
-        enable_internal_executor=False,
-        enable_service_session=False,
-    )
-    try:
-        submitted, worker_pids = state._normalize_warmup_result(4, fanout=8)  # noqa: SLF001
-        assert submitted == 4
-        assert worker_pids == []
-    finally:
-        state.close()
+def test_normalize_warmup_result_accepts_submitted_count_only():
+    from pycloud_parallel.controlplane.node.session_views import normalize_warmup_result
+
+    submitted, worker_pids = normalize_warmup_result(4, fanout=8)
+    assert submitted == 4
+    assert worker_pids == []
 
 
 def test_update_runtime_globals_for_pool_triggers_pool_warmup(tmp_path, monkeypatch):

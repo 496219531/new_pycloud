@@ -667,25 +667,6 @@ class JobQueueManager:
         self._summary_cache_revision += 1
         self._summary_cache = None
 
-    def _job_timing_set_locked(self, job_id: str, key: str, value: object) -> None:
-        state = self._job_state_locked(job_id)
-        if state is None:
-            return
-        timing = state.timing if isinstance(state.timing, dict) else _default_timing_summary()
-        state.timing = timing
-        timing[str(key)] = value
-        self._invalidate_summary_locked()
-
-    def _job_timing_add_locked(self, job_id: str, key: str, delta: float) -> None:
-        state = self._job_state_locked(job_id)
-        if state is None:
-            return
-        timing = state.timing if isinstance(state.timing, dict) else _default_timing_summary()
-        state.timing = timing
-        current = float(timing.get(str(key), 0.0) or 0.0)
-        timing[str(key)] = round(current + float(delta or 0.0), 3)
-        self._invalidate_summary_locked()
-
     def _job_timing_mark_locked(self, job_id: str, mark: str) -> None:
         state = self._job_state_locked(job_id)
         if state is None:
@@ -705,12 +686,6 @@ class JobQueueManager:
         timing[str(metric_key)] = elapsed_ms
         self._invalidate_summary_locked()
         return elapsed_ms
-
-    def _job_timing_snapshot_locked(self, job_id: str) -> Dict[str, object]:
-        state = self._job_state_locked(job_id)
-        if state is None:
-            return {}
-        return dict(state.timing or {})
 
     def _job_timing_finalize_locked(self, job_id: str) -> None:
         state = self._job_state_locked(job_id)
@@ -1594,10 +1569,6 @@ class JobQueueManager:
                 current.staged_ref_ids = [ref_id for ref_id in current.staged_ref_ids if ref_id not in snapshot]
                 if invalidate_summary:
                     self._invalidate_summary_locked()
-
-    def _touch_job_refs(self, state: JobState) -> None:
-        job_id, ref_ids = self._job_ref_snapshot(state)
-        self._touch_refs_for_job(job_id=job_id, ref_ids=ref_ids, invalidate_summary=True)
 
     def _touch_job_refs_snapshot(self, *, job_id: str, ref_ids: Sequence[str]) -> None:
         self._touch_refs_for_job(job_id=job_id, ref_ids=ref_ids, invalidate_summary=False)
