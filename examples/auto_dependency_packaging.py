@@ -17,7 +17,6 @@ if REPO_SRC not in sys.path:
 from pycloud_parallel.controlplane.dependency import (
     DependencyAnalyzer,
     DependencyPackager,
-    auto_deploy_function,
 )
 
 
@@ -294,7 +293,7 @@ def main():
     print()
     print("📋 下一步:")
     print("  - 集成到 TaskPool / JobQueue 的自动打包入口")
-    print("  - 添加 auto_deploy_function() 便捷 API")
+    print("  - 通过 Service.deploy(source=...) / TaskPool.open(source=...) 使用打包结果")
     print("  - 优化依赖查找算法（处理复杂情况）")
     print()
 
