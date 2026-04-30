@@ -23,9 +23,11 @@ from urllib.parse import urlparse
 from pycloud_parallel.controlplane.artifact import (
     Artifact,
     ArtifactDeps,
+    ArtifactExports,
     _default_artifact_filename,
     _default_entry_module_for_func,
     _default_entry_module_for_module,
+    _exports_from_policy,
     _normalize_artifact_input,
     _normalize_entry_callable_arg,
     _normalize_entry_module_arg,
@@ -1977,8 +1979,7 @@ class Service(ServiceExecutionSession):
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            export_mode="explicit" if export_methods else "all",
-            export_methods=export_methods,
+            exports=ArtifactExports.explicit(export_methods) if export_methods else ArtifactExports.export_all(),
             managed_global_names=managed_global_names,
         )
         prepared_artifact = _prepare_artifact(
@@ -2357,8 +2358,12 @@ class Service(ServiceExecutionSession):
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            export_mode=export_mode,
-            export_methods=export_methods,
+            exports=_exports_from_policy(
+                consumer_kind="service",
+                export_mode=export_mode,
+                export_methods=export_methods,
+                entry_callable=str(entry_callable or "run"),
+            ),
             managed_global_names=managed_global_names,
         )
         prepared_artifact = _prepare_artifact(

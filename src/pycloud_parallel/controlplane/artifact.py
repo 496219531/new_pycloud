@@ -607,8 +607,7 @@ def _normalize_artifact_input(
     entry_module: Any = "",
     entry_callable: Any = "run",
     package_format: str = "",
-    export_mode: str = "",
-    export_methods: Optional[Sequence[str]] = None,
+    exports: Optional[ArtifactExports] = None,
     managed_global_names: Optional[Sequence[str]] = None,
 ) -> Artifact:
     normalized_consumer = str(consumer_kind or "").strip().lower()
@@ -656,16 +655,15 @@ def _normalize_artifact_input(
             raise TypeError("artifact must be an Artifact instance")
         if source_blob is not None or source_paths or source_module is not None or source_func is not None:
             raise ValueError("artifact cannot be combined with alternate artifact source inputs")
-        effective_exports = artifact.exports
-        if effective_exports is None:
-            effective_exports = _exports_from_policy(
-                consumer_kind=normalized_consumer,
-                export_mode=export_mode,
-                export_methods=export_methods,
-                entry_callable=normalized_entry_callable or artifact.entry_callable,
-            )
         effective_deps = _coerce_artifact_deps(deps or artifact.deps)
         merged_globals = _normalize_names([*artifact.managed_global_names, *(managed_global_names or ())])
+        effective_exports = artifact.exports
+        if effective_exports is None:
+            effective_exports = _normalize_export_policy(
+                exports,
+                consumer_kind=normalized_consumer,
+                entry_callable=normalized_entry_callable or artifact.entry_callable,
+            )
         return replace(
             artifact,
             exports=effective_exports,
@@ -674,10 +672,9 @@ def _normalize_artifact_input(
         )
 
     resolved_deps = _coerce_artifact_deps(deps)
-    exports = _exports_from_policy(
+    effective_exports = _normalize_export_policy(
+        exports,
         consumer_kind=normalized_consumer,
-        export_mode=export_mode,
-        export_methods=export_methods,
         entry_callable=normalized_entry_callable,
     )
     base_kwargs = {
@@ -685,7 +682,7 @@ def _normalize_artifact_input(
         "entry_module": normalized_entry_module,
         "entry_callable": normalized_entry_callable,
         "package_format": package_format,
-        "exports": exports,
+        "exports": effective_exports,
         "deps": resolved_deps,
         "managed_global_names": tuple(managed_global_names or ()),
     }
