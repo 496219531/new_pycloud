@@ -686,64 +686,6 @@ def _prepare_payload_value_for_upload(
     )
 
 
-def _prepare_managed_global_value_for_upload(
-    clients: Sequence[Any],
-    value: Any,
-    *,
-    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-    serialization_mode: str = "",
-    effective_policy: Optional[EffectivePolicy] = None,
-) -> Any:
-    policy = _payload_policy_for_mode(
-        "managed_globals",
-        effective_policy=effective_policy,
-        object_threshold_bytes=object_threshold_bytes,
-    )
-    effective_threshold_bytes = max(1, int(policy.inline_payload_soft_limit_bytes))
-    inline_size = _estimate_managed_global_inline_size(value)
-    if inline_size <= effective_threshold_bytes:
-        log_payload_flow(
-            "managed_global_inline",
-            threshold_bytes=effective_threshold_bytes,
-            size_bytes=inline_size,
-            summary=summarize_payload_flow_value(value),
-        )
-        return value
-
-    try:
-        prepared = _prepare_payload_value_for_upload(
-            clients,
-            value,
-            object_threshold_bytes=effective_threshold_bytes,
-            upload_pathlike=True,
-            upload_string_file=True,
-            upload_bytes=True,
-            consume_on_read=False,
-            serialization_mode=serialization_mode,
-            effective_policy=effective_policy,
-        )
-        log_payload_flow(
-            "managed_global_objectref_ready",
-            threshold_bytes=effective_threshold_bytes,
-            size_bytes=inline_size,
-            summary=summarize_payload_flow_value(prepared),
-        )
-        return prepared
-    except Exception as exc:
-        log_payload_flow(
-            "managed_global_objectref_failed",
-            threshold_bytes=effective_threshold_bytes,
-            size_bytes=inline_size,
-            summary=summarize_payload_flow_value(value),
-            error=repr(exc),
-        )
-        raise ValueError(
-            "managed global exceeds inline threshold and large-object upload failed: "
-            f"size_bytes={inline_size} threshold_bytes={effective_threshold_bytes}; "
-            f"error={exc}"
-        ) from exc
-
-
 def _managed_globals_effective_inline_limit(
     *,
     effective_policy: Optional[EffectivePolicy] = None,
@@ -956,32 +898,6 @@ def _prepare_task_payload_for_submit(
     )
     return _prepare_payload_for_policy(
         [client],
-        payload,
-        policy=policy,
-        managed_global_policy=(
-            _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)
-            if effective_policy is not None
-            else None
-        ),
-        default_serialization_mode=serialization_mode,
-    )
-
-
-def _prepare_http_payload_for_call(
-    clients: Sequence[Any],
-    payload: Optional[Dict[str, object]],
-    *,
-    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-    serialization_mode: str = "",
-    effective_policy: Optional[EffectivePolicy] = None,
-) -> Dict[str, object]:
-    policy = _payload_policy_for_mode(
-        "http_call",
-        effective_policy=effective_policy,
-        object_threshold_bytes=object_threshold_bytes,
-    )
-    return _prepare_payload_for_policy(
-        clients,
         payload,
         policy=policy,
         managed_global_policy=(
@@ -1822,10 +1738,8 @@ __all__ = [
     "_load_job_client_session_cache",
     "_normalize_job_update_globals_arg",
     "_prepare_code_blob",
-    "_prepare_http_payload_for_call",
     "_prepare_job_blob_submit_fields",
     "_prepare_job_submit_payload_for_call",
-    "_prepare_managed_global_value_for_upload",
     "_prepare_managed_globals_batches_for_upload",
     "_prepare_task_payload_for_submit",
     "_put_data_via_clients",

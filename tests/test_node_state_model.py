@@ -61,7 +61,7 @@ from pycloud_parallel.controlplane.serialization import (
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.execution.service_session import Service
-from pycloud_parallel.execution.support import _prepare_http_payload_for_call, _serialize_data_for_object_ref
+from pycloud_parallel.execution.support import _serialize_data_for_object_ref
 from pycloud_parallel.execution.support import _prepare_code_blob
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
@@ -3648,40 +3648,6 @@ def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp
             )
     finally:
         state.close()
-
-
-def test_prepare_http_payload_for_call_objectifies_large_values(monkeypatch):
-    from pycloud_parallel.data.ref import DataRef
-
-    captured = {}
-
-    def fake_put(clients, data, *, format="", chunk_size=0):
-        captured["data"] = data
-        captured["format"] = format
-        return DataRef(
-            ref_id="sha256:" + ("f" * 64),
-            storage_id="sha256:" + ("f" * 64),
-            logical_type="json" if format == "json" else "bytes",
-            format=format or "json",
-            size_bytes=2048,
-            materialize_as="json" if format == "json" else "bytes",
-            locator_kind="node_local",
-            locator_token="",
-        )
-
-    monkeypatch.setattr("pycloud_parallel.execution.support._put_data_via_clients", fake_put)
-    monkeypatch.setattr(
-        "pycloud_parallel.execution.support._estimate_managed_global_inline_size",
-        lambda value: 2048 if isinstance(value, (dict, list)) else 16,
-    )
-
-    payload = {"small": 1, "big": {"x": [1, 2, 3]}}
-    prepared = _prepare_http_payload_for_call([object()], payload, object_threshold_bytes=1024)
-
-    assert prepared["small"] == 1
-    assert isinstance(prepared["big"], DataRef)
-    assert prepared["big"].consume_on_read is True
-    assert captured["format"] == "json"
 
 
 def test_service_and_task_pool_with_same_code_version_keep_independent_managed_globals(tmp_path):

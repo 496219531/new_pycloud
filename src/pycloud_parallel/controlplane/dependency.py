@@ -592,52 +592,6 @@ class DependencyAnalyzer:
 
         return imports
 
-    def _classify_imports(
-        self,
-        imports_ast: Iterable[Dict[str, str]],
-        result: Dict[str, Any],
-        *,
-        current_module_name: str,
-        current_package: str,
-    ) -> None:
-        seen_stdlib: Set[str] = set(result.get("stdlib_modules", []))
-        seen_third_party: Set[str] = set(result.get("third_party_modules", []))
-        seen_local_names: Set[str] = {item.get("name", "") for item in result.get("local_modules", [])}
-        seen_local_files: Set[str] = set(result.get("local_files", []))
-
-        for imp in imports_ast:
-            resolved_module = self._resolve_import_module(
-                imp,
-                current_module_name=current_module_name,
-                current_package=current_package,
-            )
-            module_name = str(resolved_module or imp.get("module") or "").strip()
-            if not module_name:
-                continue
-
-            if module_name.split(".")[0] in self.stdlib_modules:
-                if module_name not in seen_stdlib:
-                    result["stdlib_modules"].append(module_name)
-                    seen_stdlib.add(module_name)
-                continue
-
-            module_file = self._find_module_file(module_name)
-            if module_file and self._is_local_module(module_file):
-                if module_name not in seen_local_names:
-                    result["local_modules"].append({
-                        "name": module_name,
-                        "file": module_file,
-                    })
-                    seen_local_names.add(module_name)
-                if module_file not in seen_local_files:
-                    result["local_files"].append(module_file)
-                    seen_local_files.add(module_file)
-                continue
-
-            if module_name not in seen_third_party:
-                result["third_party_modules"].append(module_name)
-                seen_third_party.add(module_name)
-
     def _resolve_import_module(
         self,
         imp: Dict[str, str],
