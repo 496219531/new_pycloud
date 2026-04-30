@@ -1155,13 +1155,15 @@ class JobQueueManager:
 
         def _create_pool(mode: str) -> TaskPool:
             dependency_allowlist = list(kwargs.get("dependency_allowlist") or ())
+            source_value = kwargs.get("blob")
+            if source_value is None and artifact_path:
+                source_value = artifact_path
             return _create_job_task_pool(
                 infocenter_target=self._controlplane_target,
                 job_id=job_id_snapshot,
                 owner_client_id=kwargs.get("client_id") or client_id,
                 pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
-                blob=kwargs.get("blob"),
-                artifact_path=artifact_path,
+                source=source_value,
                 runtime=kwargs.get("runtime", "py3"),
                 entry_module=kwargs.get("entry_module", ""),
                 entry_callable=kwargs.get("entry_callable", "run"),

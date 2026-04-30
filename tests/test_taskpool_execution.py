@@ -91,7 +91,7 @@ def test_native_task_pool_session_submit_and_wait() -> None:
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native",
-            blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+            source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
             entry_module="task_demo",
             entry_callable="run",
             worker_count=2,
@@ -165,7 +165,7 @@ def test_task_pool_from_infocenter_creates_node_pools_concurrently(monkeypatch) 
     session = TaskPool._from_infocenter(
         infocenter_target="127.0.0.1:50051",
         job_id="job-native-parallel-create",
-        blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+        source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
         entry_module="task_demo",
         entry_callable="run",
         worker_count=2,
@@ -524,7 +524,7 @@ def test_native_task_pool_session_cancel_job_aggregates_pool_responses() -> None
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-cancel",
-            blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+            source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
             entry_module="task_demo",
             entry_callable="run",
             worker_count=2,
@@ -643,7 +643,7 @@ def test_native_task_pool_session_status_map() -> None:
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-status",
-            blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+            source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
             entry_module="task_demo",
             entry_callable="run",
             worker_count=2,
@@ -714,7 +714,7 @@ def test_task_pool_from_infocenter_keeps_partial_create_success(monkeypatch) -> 
     session = TaskPool._from_infocenter(
         infocenter_target="127.0.0.1:50051",
         job_id="job-partial-create",
-        blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+        source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
         entry_module="task_demo",
         entry_callable="run",
         worker_count=1,

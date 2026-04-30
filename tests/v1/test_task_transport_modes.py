@@ -91,7 +91,7 @@ def test_task_pool_submit_payload_roundtrips_transport_modes():
             session = TaskPool._from_infocenter(
                 infocenter_target="127.0.0.1:50051",
                 job_id=f"job-{mode}",
-                blob=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+                source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
                 entry_module="task_demo",
                 entry_callable="run",
                 worker_count=2,

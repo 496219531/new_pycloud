@@ -83,7 +83,7 @@ def test_native_task_pool_end_to_end(tmp_path):
         with TaskPool._from_infocenter(
             infocenter_target=infocenter.base_url,
             job_id="job-pool-e2e",
-            blob=blob,
+            source=blob,
             runtime="py3",
             entry_module="task_pool_demo",
             entry_callable="run",

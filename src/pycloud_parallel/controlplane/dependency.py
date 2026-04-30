@@ -1130,7 +1130,7 @@ def auto_deploy_function(
         return TaskPool._from_infocenter(
             infocenter_target=infocenter_target,
             job_id=f"auto-{func.__name__}",
-            blob=blob,
+            source=blob,
             runtime=runtime,
             entry_module=entry_module,
             entry_callable=entry_callable,

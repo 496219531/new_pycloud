@@ -10,7 +10,6 @@ from dataclasses import dataclass, replace
 import inspect
 import logging
 import math
-import os
 import sys
 import threading
 import time
@@ -2387,8 +2386,6 @@ def _build_task_pool_from_infocenter(
     pool_name: Optional[str] = None,
     artifact: Optional[Any] = None,
     deps: Optional[Any] = None,
-    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-    blob: Optional[bytes] = None,
     runtime: str = "py3",
     entry_module: Any = "",
     entry_callable: Any = "run",
@@ -2415,8 +2412,6 @@ def _build_task_pool_from_infocenter(
         and inspect.ismodule(entry_module)
         and source is None
         and artifact is None
-        and not artifact_path
-        and blob is None
     ):
         module_source = entry_module
     normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
@@ -2433,8 +2428,6 @@ def _build_task_pool_from_infocenter(
         source=source,
         artifact=artifact,
         deps=deps,
-        artifact_path=artifact_path,
-        blob=blob,
         runtime=runtime,
         entry_module=entry_module,
         entry_callable=entry_callable,
@@ -2700,8 +2693,6 @@ class TaskPool(_TaskPoolSessionBase):
         pool_name: Optional[str] = None,
         artifact: Optional[Any] = None,
         deps: Optional[Any] = None,
-        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-        blob: Optional[bytes] = None,
         runtime: str = "py3",
         entry_module: Any = "",
         entry_callable: Any = "run",
@@ -2737,8 +2728,6 @@ class TaskPool(_TaskPoolSessionBase):
             pool_name=pool_name,
             artifact=artifact,
             deps=deps,
-            artifact_path=artifact_path,
-            blob=blob,
             runtime=runtime,
             entry_module=entry_module,
             entry_callable=entry_callable,
