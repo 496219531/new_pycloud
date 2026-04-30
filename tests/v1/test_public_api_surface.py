@@ -14,7 +14,6 @@ from pycloud_parallel.api import JobQueue as ApiJobQueue
 from pycloud_parallel.api import Service as ApiService
 from pycloud_parallel.api import TaskPool as ApiTaskPool
 from pycloud_parallel.api import export as api_export
-from pycloud_parallel.local import configure, foreach, parallel_for
 
 
 def test_top_level_public_api_surface_is_v1_only():
@@ -43,12 +42,6 @@ def test_top_level_no_longer_exposes_legacy_or_local_runtime_names():
     ]
     for name in legacy_names:
         assert not hasattr(pycloud_parallel, name)
-
-
-def test_local_parallel_api_moves_under_pycloud_parallel_local():
-    assert callable(configure)
-    assert callable(foreach)
-    assert callable(parallel_for)
 
 
 def test_api_package_exports_only_v1_semantic_names():

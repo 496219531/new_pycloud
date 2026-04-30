@@ -23,11 +23,10 @@
 2. `NodeControl = gRPC`
 3. 节点内部服务数据面 = HTTP
 
-### 2.2 本地运行时收敛
+### 2.2 执行入口收敛
 
-1. `local_runtime` 只做单机多进程。
-2. 不再承担跨集群功能。
-3. 跨节点统一走 `controlplane`。
+1. V1 删除旧的 `local_runtime` 单机多进程入口。
+2. 跨节点和本机执行都统一走 `controlplane` / `NodeControl`。
 
 ### 2.3 服务命名
 

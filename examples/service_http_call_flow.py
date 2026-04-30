@@ -22,10 +22,9 @@ except ModuleNotFoundError as exc:
     missing = str(getattr(exc, "name", "") or "")
     message = str(exc)
     if (
-        missing in {"pycloud_parallel", "grpc", "cloudpickle", "google", "protobuf"}
+        missing in {"pycloud_parallel", "grpc", "google", "protobuf"}
         or missing.startswith("google.")
         or "Control-plane dependencies are missing." in message
-        or "Local runtime dependencies are missing." in message
     ):
         raise SystemExit(
             "无法导入 pycloud_parallel 依赖。\n"

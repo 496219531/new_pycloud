@@ -122,29 +122,11 @@ node = Service.startup(
 
 这条路径不会接受 `Service.deploy(...)` 的动态部署；需要动态部署时仍使用普通 `NodeControl` 节点。
 
-本地多进程入口改到：
+V1 不再提供本地单机并行入口；并行计算统一走 `TaskPool`、`Service` 或 `JobQueue`。
 
-```python
-from pycloud_parallel.local import foreach, parallel_for
-```
+## 3. 并行执行
 
-## 3. 本地多进程
-
-```python
-from pycloud_parallel.local import configure, foreach, parallel_for
-
-configure(max_workers=2, reset=True)
-print(foreach([1, 2, 3], lambda x: x * x).values)
-
-@parallel_for()
-def add_one(items):
-    out = []
-    for item in items:
-        out.append(item + 1)
-    return out
-
-print(add_one([1, 2, 3]))
-```
+使用 `TaskPool` 做批量函数执行，使用 `Service` 做长驻服务，使用 `JobQueue` 做任务编排。
 
 ## 4. 服务模式
 
@@ -341,12 +323,7 @@ print(final["job"]["status"])
 
 ## 6. 本地并行
 
-```python
-from pycloud_parallel.local import configure, foreach
-
-configure(max_workers=2, reset=True)
-print(foreach([1, 2, 3], lambda x: x * x).values)
-```
+旧的本地 `foreach/parallel_for` 辅助入口已删除；V1 主路径是控制面驱动的集群执行。
 
 ## 7. 常用脚本
 

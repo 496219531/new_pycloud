@@ -36,11 +36,7 @@ node = Service.startup(
 
 它的语义是“启动时部署”，不是运行期动态部署。返回对象是底层启动节点句柄，默认不接受运行期动态部署；普通 `NodeControl` 节点额外支持动态部署。
 
-本地并行入口单独放到：
-
-```python
-from pycloud_parallel.local import configure, foreach, parallel_for
-```
+V1 删除旧的本地 `foreach/parallel_for` 辅助入口；公开执行入口收敛到 `Service`、`TaskPool`、`JobQueue`。
 
 ## 不再作为 V1 公开概念的名字
 

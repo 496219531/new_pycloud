@@ -10,7 +10,7 @@ V1 freezes the user-facing model to five public concepts:
 - `DataRef`
 - `export`
 
-Local-only parallel helpers remain available under `pycloud_parallel.local`, not the top-level package.
+Old local-only parallel helpers are removed from V1; execution goes through `Service`, `TaskPool`, or `JobQueue`.
 
 `Service.startup(...)` is the product-level path for startup-mounted services. It returns an internal startup-node handle that supports services attached when the process starts and rejects dynamic service deployment by default. `NodeControlState` extends that internal base and adds dynamic deployment support.
 

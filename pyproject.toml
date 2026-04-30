@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pycloud-parallel"
 version = "0.1.38"
-description = "Cluster-first task/service orchestration with gRPC control plane, plus lightweight local parallel helpers."
+description = "Cluster-first task/service orchestration with gRPC control plane."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -38,7 +38,6 @@ classifiers = [
   "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-  "cloudpickle>=2.2.0",
   "grpcio>=1.80.0",
   "protobuf>=6.31.1,<7",
 ]

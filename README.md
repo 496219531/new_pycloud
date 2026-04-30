@@ -3,7 +3,7 @@
 `pycloud-parallel` 当前定位：
 
 1. 主功能：多节点/跨集群任务与服务调度（ControlPlane + NodeControl）
-2. 辅功能：本地多进程并行 API（轻量兜底）
+2. 执行入口：`Service`、`TaskPool`、`JobQueue`
 
 更细一点的边界建议这样理解：
 
@@ -231,11 +231,7 @@ node = Service.startup(
 
 这条路径和 `Service.deploy(...)` 的动态部署不同：`Service.startup(...)` 只在当前进程启动时挂载固定 module，不接受运行期动态部署；需要动态部署能力时使用普通 `NodeControl` 节点。
 
-本地并行入口不再从顶层包导出，请改用：
-
-```python
-from pycloud_parallel.local import configure, foreach, parallel_for
-```
+V1 不再提供本地单机并行入口；并行计算统一走 `TaskPool`、`Service` 或 `JobQueue`。
 
 如果你需要更底层的控制面类，请从 `pycloud_parallel.controlplane` 导入。
 
@@ -550,23 +546,9 @@ client = Service.connect(
 print(client.square.sync(x=9))
 ```
 
-### 5. 本地并行（辅助能力）
+### 5. 本地并行
 
-```python
-from pycloud_parallel.local import configure, foreach, parallel_for
-
-configure(max_workers=2, reset=True)
-print(foreach([1, 2, 3], lambda x: x * x).values)
-
-@parallel_for()
-def add_one(items):
-    out = []
-    for item in items:
-        out.append(item + 1)
-    return out
-
-print(add_one([1, 2, 3]))
-```
+V1 删除旧的本地 `foreach/parallel_for` 辅助入口；请使用 `TaskPool`、`Service` 或 `JobQueue`。
 
 ## 服务模式说明
 
