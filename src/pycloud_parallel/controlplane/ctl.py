@@ -1425,8 +1425,8 @@ def _cmd_start_infocenter(args: argparse.Namespace) -> int:
     _stop_named_process(root, "infocenter")
     bind = _resolve_bind_value(
         str(args.bind),
-        host=str(getattr(args, "host", "") or ""),
-        port=int(getattr(args, "port", 0) or 0),
+        host="",
+        port=0,
         label="infocenter bind",
         prefer_local=bool(getattr(args, "local", False)),
     )
@@ -1449,8 +1449,8 @@ def _cmd_start_gateway(args: argparse.Namespace) -> int:
         raise RuntimeError("start-gateway requires --infocenter-addr; pycloudctl no longer defaults to a local InfoCenter target")
     bind = _resolve_bind_value(
         str(args.bind),
-        host=str(getattr(args, "host", "") or ""),
-        port=int(getattr(args, "port", 0) or 0),
+        host="",
+        port=0,
         label="gateway bind",
         remote_hint=infocenter_addr,
         prefer_local=bool(getattr(args, "local", False)),
@@ -1475,8 +1475,8 @@ def _cmd_start_controlplane(args: argparse.Namespace) -> int:
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     bind = _resolve_bind_value(
         str(args.bind),
-        host=str(getattr(args, "host", "") or ""),
-        port=int(getattr(args, "port", 0) or 0),
+        host="",
+        port=0,
         label="controlplane bind",
         prefer_local=bool(getattr(args, "local", False)),
     )
@@ -1502,8 +1502,8 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
         raise RuntimeError("start-job-orchestrator requires --infocenter-addr")
     bind = _resolve_bind_value(
         str(args.bind),
-        host=str(getattr(args, "host", "") or ""),
-        port=int(getattr(args, "port", 0) or 0),
+        host="",
+        port=0,
         label="job orchestrator bind",
         remote_hint=infocenter_addr,
         prefer_local=bool(getattr(args, "local", False)),
@@ -2310,15 +2310,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_infocenter)
     _add_debug_argument(start_infocenter)
     start_infocenter.add_argument("--bind", default="0.0.0.0:50051", help="full bind address in host:port form for start-infocenter; wildcard hosts auto-resolve to the local IP")
-    start_infocenter.add_argument("--host", default="", help="optional bind host override for start-infocenter; default auto-detects local IP")
-    start_infocenter.add_argument("--port", type=int, default=0, help="optional bind port override for start-infocenter")
     start_gateway = subparsers.add_parser("start-gateway", help="start one local gateway process")
     _add_local_argument(start_gateway)
     _add_env_argument(start_gateway)
     _add_debug_argument(start_gateway)
     start_gateway.add_argument("--bind", default="0.0.0.0:50052", help="full bind address in host:port form for start-gateway; wildcard hosts auto-resolve to the local IP")
-    start_gateway.add_argument("--host", default="", help="optional bind host override for start-gateway; default auto-detects local IP")
-    start_gateway.add_argument("--port", type=int, default=0, help="optional bind port override for start-gateway")
     start_gateway.add_argument("--infocenter-addr", default="", help="InfoCenter target; required because pycloudctl no longer defaults to 127.0.0.1")
     start_gateway.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0, help="gateway route refresh interval in seconds")
     start_gateway.add_argument("--gateway-failure-threshold", type=int, default=3, help="circuit-breaker failure threshold for gateway route refresh")
@@ -2328,8 +2324,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_controlplane)
     _add_debug_argument(start_controlplane)
     start_controlplane.add_argument("--bind", default="0.0.0.0:50051", help="full bind address in host:port form for start-controlplane; wildcard hosts auto-resolve to the local IP")
-    start_controlplane.add_argument("--host", default="", help="optional bind host override for start-controlplane; default auto-detects local IP")
-    start_controlplane.add_argument("--port", type=int, default=0, help="optional bind port override for start-controlplane")
     start_controlplane.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0, help="gateway route refresh interval in seconds for embedded gateway state")
     start_controlplane.add_argument("--gateway-failure-threshold", type=int, default=3, help="circuit-breaker failure threshold for embedded gateway state")
     start_controlplane.add_argument("--gateway-open-sec", type=float, default=5.0, help="circuit-breaker open duration in seconds for embedded gateway state")
@@ -2338,8 +2332,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_job_orchestrator)
     _add_debug_argument(start_job_orchestrator)
     start_job_orchestrator.add_argument("--bind", default="0.0.0.0:50053", help="full bind address in host:port form for start-job-orchestrator; wildcard hosts auto-resolve to the local IP")
-    start_job_orchestrator.add_argument("--host", default="", help="optional bind host override for start-job-orchestrator; default auto-detects local IP")
-    start_job_orchestrator.add_argument("--port", type=int, default=0, help="optional bind port override for start-job-orchestrator")
     start_job_orchestrator.add_argument("--infocenter-addr", default="", help="InfoCenter target; required for job-orchestrator registration")
     start_job_orchestrator.add_argument("--node-id", default="job-orchestrator-01", type=_normalize_managed_name, help="managed node id advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--service-name", default="job-orchestrator", help="service name registered by job-orchestrator")
