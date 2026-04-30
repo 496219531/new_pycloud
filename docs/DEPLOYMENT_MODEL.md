@@ -127,7 +127,6 @@ owner 推荐用法：
 ```python
 worker_count=1
 node_count=1
-export_mode="decorator"
 reuse_existing_same_code=True
 replace_existing_if_code_changed=True
 ```

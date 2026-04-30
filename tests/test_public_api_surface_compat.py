@@ -5,6 +5,7 @@ from pycloud_parallel import TaskPool as TopLevelTaskPool
 from pycloud_parallel import export as TopLevelExport
 from pycloud_parallel.api.common import DataRef as ApiDataRef
 from pycloud_parallel.api.common import export as ApiExport
+import pycloud_parallel.artifact as artifact_module
 from pycloud_parallel.artifact import Artifact as PublicArtifact
 from pycloud_parallel.artifact import ArtifactDeps as PublicArtifactDeps
 from pycloud_parallel.artifact import ArtifactExports as PublicArtifactExports
@@ -37,6 +38,8 @@ def test_artifact_package_exposes_advanced_artifact_api_without_top_level_export
     assert PublicArtifact is ControlplaneArtifact
     assert PublicArtifactDeps is ControlplaneArtifactDeps
     assert PublicArtifactExports is ControlplaneArtifactExports
+    assert artifact_module.__all__ == ["Artifact", "ArtifactDeps", "ArtifactExports", "export"]
+    assert not hasattr(artifact_module, "pycloud_export")
 
 
 def test_proto_messages_expose_node_instance_id_fields():

@@ -44,7 +44,7 @@ def resolve_system_mode(system_mode: str = "", **overrides: Any) -> ResolvedSyst
         trust_mode="trusted",
         object_transfer_mode="auto",
         serialization_mode="legacy_v1",
-        dependency_policy_mode="legacy_v1",
+        dependency_policy_mode="prebuilt",
     )
 
     trust_mode = str(overrides.get("trust_mode") or get_trust_mode() or resolved.trust_mode).strip().lower()

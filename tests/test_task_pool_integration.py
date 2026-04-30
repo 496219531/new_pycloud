@@ -149,8 +149,8 @@ def test_job_queue_uses_native_task_pool_end_to_end(tmp_path):
         )
         client = JobQueue(infocenter.base_url, client_id="jobq-client", timeout_sec=10.0)
         try:
-            submit = client.submit_job_from_bytes(
-                blob=job_blob,
+            submit = client.submit(
+                source=job_blob,
                 entry_module="job_hooks_demo",
                 job_payload={"value": 5, "count": 3},
                 runtime="py3",
@@ -162,7 +162,7 @@ def test_job_queue_uses_native_task_pool_end_to_end(tmp_path):
             while time.time() < deadline:
                 status = client.get_job_status(job_id)
                 if status["job"]["status"] in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-                    final = status["job"]
+                    final = client.get_job_status(job_id, include_details=True)["job"]
                     break
                 time.sleep(0.2)
 

@@ -23,7 +23,6 @@ from urllib.parse import urlparse
 from pycloud_parallel.controlplane.artifact import (
     Artifact,
     ArtifactDeps,
-    _coerce_artifact_deps,
     _default_artifact_filename,
     _default_entry_module_for_func,
     _default_entry_module_for_module,
@@ -100,8 +99,6 @@ from pycloud_parallel.execution.support import (
     _resolve_high_level_service_results,
     _retry_infocenter_request,
     _sanitize_session_cache_part,
-    _source_func_from_entry_callable_arg,
-    _source_module_from_entry_module_arg,
     _summarize_discovered_nodes,
     _timestamp_to_datetime,
     _write_private_json,
@@ -1945,7 +1942,6 @@ class Service(ServiceExecutionSession):
         policy_id: str = "",
         runtime: str = "py3",
         package_format: str = "",
-        dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         tags: Optional[Sequence[str]] = None,
         metadata: Optional[Dict[str, str]] = None,
@@ -1985,7 +1981,6 @@ class Service(ServiceExecutionSession):
             package_format=package_format,
             export_mode="explicit" if export_methods else "all",
             export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
             managed_global_names=managed_global_names,
         )
         prepared_artifact = _prepare_artifact(
@@ -2262,7 +2257,6 @@ class Service(ServiceExecutionSession):
         service_name: Optional[str] = None,
         artifact: Optional[Any] = None,
         deps: Optional[Any] = None,
-        func: Optional[Callable] = None,
         artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
         runtime: str = "py3",
@@ -2272,7 +2266,6 @@ class Service(ServiceExecutionSession):
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
         serialization_mode: str = "",
-        dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 10,
@@ -2311,7 +2304,6 @@ class Service(ServiceExecutionSession):
             owner_client_id: 所有者 ID
             service_name: 服务名称
             artifact: 高级 Artifact 声明对象
-            func: 函数对象（自动打包依赖，优先级最高）
             artifact_path: 单个文件、单个文件夹或文件/文件夹路径列表
             blob: 直接提供代码内容
             runtime: 运行时版本
@@ -2351,7 +2343,6 @@ class Service(ServiceExecutionSession):
             and inspect.ismodule(entry_module)
             and source is None
             and artifact is None
-            and func is None
             and not artifact_path
             and blob is None
         ):
@@ -2370,7 +2361,6 @@ class Service(ServiceExecutionSession):
             source=source,
             artifact=artifact,
             deps=deps,
-            func=func,
             artifact_path=artifact_path,
             blob=blob,
             runtime=runtime,
@@ -2379,7 +2369,6 @@ class Service(ServiceExecutionSession):
             package_format=package_format,
             export_mode=export_mode,
             export_methods=export_methods,
-            dependency_allowlist=dependency_allowlist,
             managed_global_names=managed_global_names,
         )
         prepared_artifact = _prepare_artifact(

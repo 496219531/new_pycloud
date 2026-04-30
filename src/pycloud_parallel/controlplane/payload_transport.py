@@ -21,9 +21,7 @@ from pycloud_parallel.controlplane.serialization import (
 
 EstimateInlineSize = Callable[[Any], int]
 PutPayloadData = Callable[..., object]
-# Internal resolver hook retained for compatibility with earlier call sites.
 ResolveStoredData = Callable[[Any], Any]
-ResolveDataRefs = ResolveStoredData
 
 
 def _put_prepared_value(

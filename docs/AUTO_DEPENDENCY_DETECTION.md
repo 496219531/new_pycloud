@@ -19,7 +19,7 @@
 当前仍保持保守规则：
 
 1. 自动打包只收本地 Python 文件依赖
-2. 第三方依赖如果目标节点缺失，仍建议显式传 `dependency_allowlist`
+2. 第三方依赖如果目标节点缺失，仍建议显式传 `deps=ArtifactDeps.allow_install(...)`
 3. 不做盲目自动安装
 
 ## 当前自动打包边界
@@ -55,8 +55,8 @@
 建议做法：
 
 1. 预先自行构建 `zip / tar.gz / whl`
-2. 再通过 `artifact_path=<archive file>` 或 `blob=...` 上传
-3. 第三方依赖继续通过 `dependency_allowlist` 解决
+2. 再通过 `source=<archive file>` 上传
+3. 第三方依赖继续通过 `deps=ArtifactDeps.allow_install(...)` 解决
 
 ## 本地调试打包结果
 

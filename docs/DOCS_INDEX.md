@@ -72,7 +72,7 @@
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
   - `ControlPlane` 与 `NodeControl` 的职责划分
 - [../SERVICE_SESSION_PROTOCOL_V1.md](../SERVICE_SESSION_PROTOCOL_V1.md)
-  - 服务创建、导出、keepalive、`dependency_allowlist`
+  - 服务创建、导出、keepalive、依赖策略
 - [../API_CONTRACT_V1.md](../API_CONTRACT_V1.md)
   - HTTP/JSON 契约与管理面边界
 

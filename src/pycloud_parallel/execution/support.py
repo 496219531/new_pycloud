@@ -744,26 +744,6 @@ def _prepare_managed_global_value_for_upload(
         ) from exc
 
 
-def _prepare_managed_globals_values_for_upload(
-    clients: Sequence[Any],
-    values: Dict[str, object],
-    *,
-    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-    serialization_mode: str = "",
-    effective_policy: Optional[EffectivePolicy] = None,
-) -> Dict[str, object]:
-    return {
-        str(name): _prepare_managed_global_value_for_upload(
-            clients,
-            value,
-            object_threshold_bytes=object_threshold_bytes,
-            serialization_mode=serialization_mode,
-            effective_policy=effective_policy,
-        )
-        for name, value in (values or {}).items()
-    }
-
-
 def _managed_globals_effective_inline_limit(
     *,
     effective_policy: Optional[EffectivePolicy] = None,
@@ -1600,34 +1580,6 @@ def _prepare_job_submit_payload_for_call(
                 client.close()
 
 
-def _source_module_from_entry_module_arg(
-    entry_module: Any,
-    *,
-    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-    blob: Optional[bytes] = None,
-) -> Optional[Any]:
-    if blob is not None or artifact_path:
-        return None
-    if inspect.ismodule(entry_module):
-        return entry_module
-    return None
-
-
-def _source_func_from_entry_callable_arg(
-    entry_callable: Any,
-    *,
-    artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-    blob: Optional[bytes] = None,
-) -> Optional[Callable]:
-    if blob is not None or artifact_path:
-        return None
-    if isinstance(entry_callable, str):
-        return None
-    if callable(entry_callable):
-        return entry_callable
-    return None
-
-
 def _auto_package_function(func: Callable) -> bytes:
     from pycloud_parallel.controlplane.dependency import DependencyPackager
 
@@ -1966,9 +1918,6 @@ def _write_job_client_session_cache(
     _write_private_json(path, payload)
 
 
-_serialize_arrow_compatible = serialize_arrow_compatible
-
-
 __all__ = [
     "_DEFAULT_EXPORT_DECORATOR",
     "_JOB_UPDATE_GLOBALS_AUTO",
@@ -1998,7 +1947,6 @@ __all__ = [
     "_prepare_job_submit_payload_for_call",
     "_prepare_managed_global_value_for_upload",
     "_prepare_managed_globals_batches_for_upload",
-    "_prepare_managed_globals_values_for_upload",
     "_prepare_local_artifact_for_upload",
     "_prepare_task_payload_for_submit",
     "_package_paths_to_targz",
@@ -2008,9 +1956,6 @@ __all__ = [
     "_RetryableReadyError",
     "_retry_infocenter_request",
     "_sanitize_session_cache_part",
-    "_serialize_arrow_compatible",
-    "_source_func_from_entry_callable_arg",
-    "_source_module_from_entry_module_arg",
     "_stage_job_submit_payload_for_transport",
     "_summarize_discovered_nodes",
     "_target_to_base_url",

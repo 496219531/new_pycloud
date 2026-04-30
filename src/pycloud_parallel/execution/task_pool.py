@@ -1972,7 +1972,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
-        **shared_kwargs,
+        receive_batch: int = 1,
+        submit_timeout_sec: Optional[float] = None,
+        result_timeout_sec: Optional[float] = None,
+        wait_ms: int = 500,
+        raise_on_error: bool = True,
+        max_infra_retries: int = 1,
+        retry_backoff_ms: int = 0,
+        node_window_factor: float = 2.0,
     ) -> Iterator[Union[Tuple[int, Any], ExecutionItem]]:
         if self._closed:
             raise RuntimeError("task pool session is closed")
@@ -1980,17 +1987,13 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         try:
             self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
             max_pending = self._resolve_max_in_flight(max_in_flight)
-            max_receive = max(1, int(shared_kwargs.pop("receive_batch", 1) or 1))
-            submit_timeout_sec = float(shared_kwargs.pop("submit_timeout_sec", timeout_sec) or timeout_sec)
-            result_timeout_sec = float(shared_kwargs.pop("result_timeout_sec", timeout_sec) or timeout_sec)
-            wait_ms = int(shared_kwargs.pop("wait_ms", 500) or 500)
-            raise_on_error = bool(shared_kwargs.pop("raise_on_error", True))
-            max_infra_retries = max(0, int(shared_kwargs.pop("max_infra_retries", 1) or 0))
-            retry_backoff_ms = max(0, int(shared_kwargs.pop("retry_backoff_ms", 0) or 0))
-            _node_window_factor = float(shared_kwargs.pop("node_window_factor", 2.0) or 2.0)
-            if shared_kwargs:
-                unexpected = ", ".join(sorted(shared_kwargs))
-                raise TypeError(f"unexpected keyword arguments for imap_unordered(): {unexpected}")
+            max_receive = max(1, int(receive_batch or 1))
+            submit_timeout_sec = float(submit_timeout_sec if submit_timeout_sec is not None else timeout_sec)
+            result_timeout_sec = float(result_timeout_sec if result_timeout_sec is not None else timeout_sec)
+            wait_ms = int(wait_ms or 500)
+            max_infra_retries = max(0, int(max_infra_retries or 0))
+            retry_backoff_ms = max(0, int(retry_backoff_ms or 0))
+            _node_window_factor = float(node_window_factor or 2.0)
             profile = resolve_taskpool_strategy(strategy)
             payload_buffer = _IndexedPayloadBuffer(payloads)
             ready_items: "deque[ExecutionItem]" = deque()
@@ -2170,7 +2173,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         wait_ms: int = 500,
         raise_on_error: bool = True,
         node_window_factor: float = 2.0,
-        **shared_kwargs,
     ) -> int:
         if not callable(handle):
             raise TypeError("handle must be callable")
@@ -2386,14 +2388,12 @@ def _build_task_pool_from_infocenter(
     artifact: Optional[Any] = None,
     deps: Optional[Any] = None,
     entry_func: Optional[Callable] = None,
-    func: Optional[Callable] = None,
     artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
     blob: Optional[bytes] = None,
     runtime: str = "py3",
     entry_module: Any = "",
     entry_callable: Any = "run",
     package_format: str = "",
-    dependency_allowlist: Optional[Sequence[str]] = None,
     resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
     worker_count: int = 1,
@@ -2417,7 +2417,6 @@ def _build_task_pool_from_infocenter(
         and source is None
         and artifact is None
         and entry_func is None
-        and func is None
         and not artifact_path
         and blob is None
     ):
@@ -2431,20 +2430,18 @@ def _build_task_pool_from_infocenter(
         entry_module = _default_entry_module_for_module(module_source)
         package_format = _resolve_package_format(package_format, module_filename, default="py")
 
-    source_func = entry_func if entry_func is not None else func
     normalized_artifact = _normalize_artifact_input(
         consumer_kind="task",
         source=source,
         artifact=artifact,
         deps=deps,
-        func=source_func,
+        func=entry_func,
         artifact_path=artifact_path,
         blob=blob,
         runtime=runtime,
         entry_module=entry_module,
         entry_callable=entry_callable,
         package_format=package_format,
-        dependency_allowlist=dependency_allowlist,
         managed_global_names=managed_global_names,
     )
     prepared_artifact = _prepare_artifact(
@@ -2707,14 +2704,12 @@ class TaskPool(_TaskPoolSessionBase):
         artifact: Optional[Any] = None,
         deps: Optional[Any] = None,
         entry_func: Optional[Callable] = None,
-        func: Optional[Callable] = None,
         artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
         runtime: str = "py3",
         entry_module: Any = "",
         entry_callable: Any = "run",
         package_format: str = "",
-        dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 1,
@@ -2747,14 +2742,12 @@ class TaskPool(_TaskPoolSessionBase):
             artifact=artifact,
             deps=deps,
             entry_func=entry_func,
-            func=func,
             artifact_path=artifact_path,
             blob=blob,
             runtime=runtime,
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            dependency_allowlist=dependency_allowlist,
             resource_paths=resource_paths,
             managed_global_names=managed_global_names,
             worker_count=worker_count,

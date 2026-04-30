@@ -377,7 +377,6 @@ class QueueServiceClient:
         entry_module: Any = "",
         entry_callable: Any = "run",
         package_format: str = "",
-        dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
         task_serialization_mode: str = "",
@@ -412,7 +411,6 @@ class QueueServiceClient:
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            dependency_allowlist=dependency_allowlist,
         )
         bundled_module_resource_paths: list[Any] = []
         if module_source is not None:
@@ -437,7 +435,6 @@ class QueueServiceClient:
                 entry_module=_default_entry_module_for_module(module_source),
                 entry_callable=entry_callable,
                 package_format=_resolve_package_format(package_format, module_filename, default="py"),
-                dependency_allowlist=dependency_allowlist,
             )
         elif source is not None:
             normalized_artifact = _normalize_artifact_input(source=source, **normalize_kwargs)
@@ -539,7 +536,6 @@ class QueueServiceClient:
         entry_module: Any = "",
         entry_callable: Any = "run",
         package_format: str = "",
-        dependency_allowlist: Optional[Sequence[str]] = None,
         resource_paths: Optional[Sequence[Any]] = None,
         task_resource_paths: Optional[Sequence[Any]] = None,
         task_serialization_mode: str = "",
@@ -562,7 +558,6 @@ class QueueServiceClient:
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            dependency_allowlist=dependency_allowlist,
             resource_paths=resource_paths,
             task_resource_paths=task_resource_paths,
             task_serialization_mode=task_serialization_mode,
@@ -614,65 +609,6 @@ class QueueServiceClient:
                 effective_policy=effective_policy,
                 **call_kwargs,
             )
-        )
-
-    def submit_job_from_bytes(
-        self,
-        *,
-        blob: bytes,
-        entry_module: str,
-        job_payload: Optional[Dict[str, object]] = None,
-        runtime: str = "py3",
-        package_format: str = "py",
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        task_serialization_mode: str = "",
-        reset_pool: bool = False,
-        update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
-        handle_result_callable: str = "",
-        finalize_callable: str = "",
-    ) -> Dict[str, object]:
-        return self.submit(
-            source=blob,
-            job_payload=job_payload,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable="run",
-            package_format=_resolve_package_format(package_format, default="py"),
-            dependency_allowlist=dependency_allowlist,
-            task_serialization_mode=task_serialization_mode,
-            reset_pool=reset_pool,
-            update_globals=update_globals,
-            handle_result_callable=handle_result_callable,
-            finalize_callable=finalize_callable,
-        )
-
-    def submit_job_from_module(
-        self,
-        *,
-        module: Any,
-        job_payload: Optional[Dict[str, object]] = None,
-        runtime: str = "py3",
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        resource_paths: Optional[Sequence[Any]] = None,
-        task_resource_paths: Optional[Sequence[Any]] = None,
-        task_serialization_mode: str = "",
-        reset_pool: bool = False,
-        update_globals: Any = _JOB_UPDATE_GLOBALS_AUTO,
-        handle_result_callable: str = "",
-        finalize_callable: str = "",
-    ) -> Dict[str, object]:
-        return self.submit(
-            source=module,
-            job_payload=job_payload,
-            runtime=runtime,
-            dependency_allowlist=dependency_allowlist,
-            resource_paths=resource_paths,
-            task_resource_paths=task_resource_paths,
-            task_serialization_mode=task_serialization_mode,
-            reset_pool=reset_pool,
-            update_globals=update_globals,
-            handle_result_callable=handle_result_callable,
-            finalize_callable=finalize_callable,
         )
 
     def wait_for_terminal(

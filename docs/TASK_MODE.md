@@ -147,13 +147,6 @@ client.submit(
 5. 对 `JobQueue.submit(source=module, ...)`，如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
 6. 如果不想逐个列文件，也可以自行构建归档后再上传
 
-兼容 helper：
-
-1. `submit_job_from_module(...)`
-2. `submit_job_from_bytes(...)`
-
-仍然可用，但不再是文档主入口。
-
 等待 job 终态：
 
 ```python
@@ -456,7 +449,7 @@ print(processed)
 当前仍保持保守策略：
 
 1. 默认严格校验
-2. 只有显式传 `dependency_allowlist` 才允许节点补装
+2. 只有显式传 `deps=ArtifactDeps.allow_install(...)` 才允许节点补装
 3. 安装目录位于节点 `code_cache/codes/<sha>/deps`
 
 ## 6. 兼容入口

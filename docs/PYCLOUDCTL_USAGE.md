@@ -211,11 +211,6 @@ pycloudctl \
 
 这里 `--node1-http` 和 `--node1-http-port` 是同一参数的两个别名；`node2` 同理。
 
-兼容说明：
-
-1. CLI 也接受历史手误别名 `--dubug`
-2. 但文档和推荐写法统一使用 `--debug`
-
 如果还想指定 host，也可以直接写：
 
 ```bash

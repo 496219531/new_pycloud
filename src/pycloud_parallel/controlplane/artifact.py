@@ -219,32 +219,11 @@ def _coerce_source_input(source: Any) -> Tuple[str, Any]:
 
 def _coerce_artifact_deps(
     deps: "ArtifactDeps | None",
-    *,
-    dependency_policy_mode: str = "",
-    dependency_allowlist: Sequence[str] = (),
 ) -> "ArtifactDeps":
-    normalized_allowlist = _normalize_names(dependency_allowlist)
-    requested_mode = _normalize_dependency_policy_mode(
-        dependency_policy_mode,
-        dependency_allowlist=normalized_allowlist,
-    )
     if deps is None:
-        if requested_mode == "allow_install":
-            return ArtifactDeps.allow_install(normalized_allowlist)
-        if requested_mode == "node_preinstalled":
-            return ArtifactDeps.node_preinstalled()
         return ArtifactDeps.prebuilt()
     if not isinstance(deps, ArtifactDeps):
         raise TypeError("deps must be an ArtifactDeps instance")
-    if dependency_policy_mode:
-        if requested_mode != deps.mode:
-            raise ValueError(
-                f"deps.mode={deps.mode!r} conflicts with dependency_policy_mode={dependency_policy_mode!r}"
-            )
-    if normalized_allowlist and deps.dependency_allowlist != normalized_allowlist:
-        raise ValueError(
-            "deps.requirements conflicts with dependency_allowlist"
-        )
     return deps
 
 
@@ -633,7 +612,6 @@ def _normalize_artifact_input(
     package_format: str = "",
     export_mode: str = "",
     export_methods: Optional[Sequence[str]] = None,
-    dependency_allowlist: Optional[Sequence[str]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
 ) -> Artifact:
     normalized_consumer = str(consumer_kind or "").strip().lower()
@@ -687,10 +665,7 @@ def _normalize_artifact_input(
                 export_methods=export_methods,
                 entry_callable=normalized_entry_callable or artifact.entry_callable,
             )
-        effective_deps = _coerce_artifact_deps(
-            deps or artifact.deps,
-            dependency_allowlist=dependency_allowlist or (),
-        )
+        effective_deps = _coerce_artifact_deps(deps or artifact.deps)
         merged_globals = _normalize_names([*artifact.managed_global_names, *(managed_global_names or ())])
         return replace(
             artifact,
@@ -699,10 +674,7 @@ def _normalize_artifact_input(
             managed_global_names=merged_globals,
         )
 
-    resolved_deps = _coerce_artifact_deps(
-        deps,
-        dependency_allowlist=dependency_allowlist or (),
-    )
+    resolved_deps = _coerce_artifact_deps(deps)
     exports = _exports_from_policy(
         consumer_kind=normalized_consumer,
         export_mode=export_mode,

@@ -188,6 +188,49 @@ def test_public_api_rejects_legacy_infocenter_target_keyword():
         ApiTaskPool.open(infocenter_target="127.0.0.1:50051", source=b"pool")
 
 
+def test_public_deploy_open_reject_legacy_artifact_keywords():
+    legacy_kwargs = {
+        "blob": b"def run(): return 1\n",
+        "entry_module": "legacy_mod",
+        "entry_callable": "run",
+        "artifact_path": "legacy.py",
+        "dependency_allowlist": ["orjson==3.10.18"],
+        "export_mode": "single",
+        "export_methods": ["run"],
+        "func": lambda: None,
+    }
+
+    for name, value in legacy_kwargs.items():
+        with pytest.raises(TypeError):
+            ApiService.deploy(target="127.0.0.1:50051", source=b"svc", **{name: value})
+        with pytest.raises(TypeError):
+            ApiTaskPool.open(target="127.0.0.1:50051", source=b"pool", **{name: value})
+
+
+def test_service_startup_rejects_legacy_dependency_allowlist():
+    with pytest.raises(TypeError):
+        ApiService.startup(
+            source="startup_demo",
+            dependency_allowlist=["orjson==3.10.18"],
+            start=False,
+        )
+
+
+def test_job_queue_public_submit_rejects_legacy_dependency_allowlist():
+    queue = ApiJobQueue.connect("127.0.0.1:50051", client_id="surface-client")
+    try:
+        assert not hasattr(queue, "submit_job_from_bytes")
+        assert not hasattr(queue, "submit_job_from_module")
+        with pytest.raises(TypeError):
+            queue.submit(
+                source=b"def run(**_kwargs): return {}\n",
+                entry_module="job_demo",
+                dependency_allowlist=["orjson==3.10.18"],
+            )
+    finally:
+        queue.close()
+
+
 def test_api_queue_module_exposes_only_job_queue():
     assert api_queue_module.__all__ == ["JobQueue"]
     assert dir(api_queue_module) == ["JobQueue"]

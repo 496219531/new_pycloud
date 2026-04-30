@@ -55,7 +55,7 @@ from pycloud_parallel.execution.service_session import Service
 
 group = Service.deploy(
     target="127.0.0.1:50051",
-    artifact_path="service.py",
+    source="service.py",
 )
 ```
 
@@ -64,8 +64,8 @@ group = Service.deploy(
 ```python
 group = Service.deploy(
     target="127.0.0.1:50051",
-    blob=blob,
-    entry_module="service",
+    source=blob,
+    package_format="py",
 )
 ```
 
@@ -106,8 +106,8 @@ group = Service.deploy(
 ```python
 group = Service.deploy(
     target="127.0.0.1:50051",
-    blob=blob,
-    entry_module="service",
+    source=blob,
+    package_format="py",
     node_ids=["node-1", "node-3"],
 )
 ```
@@ -117,8 +117,8 @@ group = Service.deploy(
 ```python
 group = Service.deploy(
     target="127.0.0.1:50051",
-    blob=blob,
-    entry_module="service",
+    source=blob,
+    package_format="py",
     node_count=2,
 )
 ```
@@ -162,8 +162,8 @@ group = Service.deploy(
 ```python
 group = Service.deploy(
     target="127.0.0.1:50051",
-    blob=blob,
-    entry_module="square_service",
+    source=blob,
+    package_format="py",
     worker_count=1,
     node_count=1,
     reuse_existing_same_code=True,

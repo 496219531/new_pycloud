@@ -298,68 +298,15 @@ def test_package_module_for_debug_writes_local_tar_and_lists_entries(tmp_path, m
     ]
 
 
-def test_upload_code_from_file_directory_reuses_prepared_artifact(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane.artifact import ArtifactDeps
+def test_node_control_client_legacy_code_upload_wrappers_removed():
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
-    artifact_dir = tmp_path / "artifact_dir"
-    artifact_dir.mkdir()
-    (artifact_dir / "main.py").write_text("def run():\n    return 1\n", encoding="utf-8")
-
-    captured = {}
-    client = NodeControlClient.__new__(NodeControlClient)
-
-    def fake_upload(self, **kwargs):
-        captured.update(kwargs)
-        assert kwargs["file_path"].exists()
-        return "ok"
-
-    monkeypatch.setattr(NodeControlClient, "_upload_code_from_local_file", fake_upload)
-
-    result = client.upload_code_from_file(
-        client_id="client-1",
-        artifact_path=str(artifact_dir),
-        package_format="zip",
-        deps=ArtifactDeps.allow_install(["orjson==3.10.18"]),
-    )
-
-    assert result == "ok"
-    assert captured["package_format"] == "tar.gz"
-    assert captured["dependency_policy_mode"] == "allow_install"
-    assert captured["dependency_allowlist"] == ("orjson==3.10.18",)
-    assert captured["file_path"].name.endswith(".tar.gz")
-    assert not captured["file_path"].exists()
+    assert not hasattr(NodeControlClient, "upload_code_from_file")
+    assert not hasattr(NodeControlClient, "upload_code_from_bytes")
 
 
-def test_create_service_from_file_directory_reuses_prepared_artifact(tmp_path, monkeypatch):
-    from pycloud_parallel.controlplane.artifact import ArtifactDeps
+def test_node_control_client_legacy_service_file_wrappers_removed():
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
-    artifact_dir = tmp_path / "artifact_dir"
-    artifact_dir.mkdir()
-    (artifact_dir / "main.py").write_text("def run():\n    return 1\n", encoding="utf-8")
-
-    captured = {}
-    client = NodeControlClient.__new__(NodeControlClient)
-
-    def fake_create(self, **kwargs):
-        captured.update(kwargs)
-        assert kwargs["file_path"].exists()
-        return "service"
-
-    monkeypatch.setattr(NodeControlClient, "_create_service_from_local_file", fake_create)
-
-    result = client.create_service_from_file(
-        owner_client_id="owner-1",
-        artifact_path=str(artifact_dir),
-        service_name="svc",
-        package_format="zip",
-        deps=ArtifactDeps.node_preinstalled(),
-    )
-
-    assert result == "service"
-    assert captured["package_format"] == "tar.gz"
-    assert captured["dependency_policy_mode"] == "node_preinstalled"
-    assert captured["dependency_allowlist"] == ()
-    assert captured["file_path"].name.endswith(".tar.gz")
-    assert not captured["file_path"].exists()
+    assert not hasattr(NodeControlClient, "create_service_from_file")
+    assert not hasattr(NodeControlClient, "create_service_from_paths")

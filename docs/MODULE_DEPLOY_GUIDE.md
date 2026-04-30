@@ -41,7 +41,7 @@ group = Service.deploy(
 1. 不要依赖模块对象自动打包把资源文件一起带上
 2. 当前自动打包只会收 `.py / .pyd / .so`
 3. `.csv / .json / README / docs` 等非 Python 文件都不会自动进入包
-4. 如果必须带资源文件，请预先自行构建 `zip / tar.gz / whl`，再通过 `artifact_path=<archive file>` 或 `blob=...` 上传
+4. 如果必须带资源文件，请预先自行构建 `zip / tar.gz / whl`，再通过 `source=<archive file>` 上传
 5. 代码里如果仍要走相对路径，建议在你自己构建的归档里保留所需目录结构
 
 ## 4. 本地调试模块打包

@@ -1467,7 +1467,7 @@ def test_run_job_with_hooks_cleans_extracted_dir_without_scheduler_crash(tmp_pat
     assert not extract_dir.exists()
 
 
-def test_job_queue_client_submit_job_from_bytes_uses_minimal_payload() -> None:
+def test_job_queue_client_submit_source_bytes_uses_minimal_payload() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1478,8 +1478,8 @@ def test_job_queue_client_submit_job_from_bytes_uses_minimal_payload() -> None:
         return {"ok": True}
 
     client.submit_job = _fake_submit  # type: ignore[method-assign]
-    resp = client.submit_job_from_bytes(
-        blob=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
+    resp = client.submit(
+        source=b"def run(**_kwargs):\n    return {}\n\ndef task_generator(**_kwargs):\n    return []\n",
         entry_module="job_demo",
     )
     assert resp == {"ok": True}
@@ -1603,8 +1603,8 @@ def test_job_queue_public_submit_helpers_do_not_expose_policy_id() -> None:
     from pycloud_parallel import JobQueue
 
     assert "policy_id" not in inspect.signature(JobQueue.submit).parameters
-    assert "policy_id" not in inspect.signature(JobQueue.submit_job_from_bytes).parameters
-    assert "policy_id" not in inspect.signature(JobQueue.submit_job_from_module).parameters
+    assert not hasattr(JobQueue, "submit_job_from_bytes")
+    assert not hasattr(JobQueue, "submit_job_from_module")
 
 
 def test_job_queue_submit_job_rejects_policy_override_fields() -> None:
@@ -1676,7 +1676,7 @@ def test_job_queue_client_submit_rejects_callable_source() -> None:
         client.submit(source=_job_func)
 
 
-def test_job_queue_client_submit_job_from_bytes_auto_binds_update_globals() -> None:
+def test_job_queue_client_submit_source_bytes_auto_binds_update_globals() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1687,8 +1687,8 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_update_globals() -> N
         return {"ok": True}
 
     client.submit_job = _fake_submit  # type: ignore[method-assign]
-    resp = client.submit_job_from_bytes(
-        blob=(
+    resp = client.submit(
+        source=(
             b"def run(**_kwargs):\n    return {}\n\n"
             b"def task_generator(**_kwargs):\n    return []\n\n"
             b"def update_globals(**_kwargs):\n    return {'cfg': {'k': 'v'}}\n"
@@ -1699,7 +1699,7 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_update_globals() -> N
     assert captured["update_globals"] == "update_globals"
 
 
-def test_job_queue_client_submit_job_from_bytes_auto_binds_handle_data_alias() -> None:
+def test_job_queue_client_submit_source_bytes_auto_binds_handle_data_alias() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1710,8 +1710,8 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_handle_data_alias() -
         return {"ok": True}
 
     client.submit_job = _fake_submit  # type: ignore[method-assign]
-    resp = client.submit_job_from_bytes(
-        blob=(
+    resp = client.submit(
+        source=(
             b"def run(**_kwargs):\n    return {}\n\n"
             b"def task_generator(**_kwargs):\n    return []\n\n"
             b"def handle_data(index, result, state=None, **_kwargs):\n    return state\n"
@@ -1723,7 +1723,7 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_handle_data_alias() -
     assert "finalize_callable" not in captured
 
 
-def test_job_queue_client_submit_job_from_bytes_auto_binds_finalize_when_present() -> None:
+def test_job_queue_client_submit_source_bytes_auto_binds_finalize_when_present() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
@@ -1734,8 +1734,8 @@ def test_job_queue_client_submit_job_from_bytes_auto_binds_finalize_when_present
         return {"ok": True}
 
     client.submit_job = _fake_submit  # type: ignore[method-assign]
-    resp = client.submit_job_from_bytes(
-        blob=(
+    resp = client.submit(
+        source=(
             b"def run(**_kwargs):\n    return {}\n\n"
             b"def task_generator(**_kwargs):\n    return []\n\n"
             b"def finalize(state=None, **_kwargs):\n    return state\n"
@@ -2075,6 +2075,13 @@ def test_job_queue_client_recent_job_ids_tracks_and_restores(monkeypatch, tmp_pa
     monkeypatch.setenv("PYCLOUD_JOB_CLIENT_SESSION_DIR", str(tmp_path))
 
     from pycloud_parallel import JobQueue
+    from pycloud_parallel.execution import queue as queue_mod
+
+    monkeypatch.setattr(
+        queue_mod,
+        "_prepare_job_submit_payload_for_call",
+        lambda *, payload, **_kwargs: dict(payload),
+    )
 
     client = JobQueue("127.0.0.1:50051", client_id="client-recent")
     job_ids = iter(["job-1", "job-2", "job-1"])
@@ -2166,7 +2173,7 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
     assert captured["route"].http_base_url == "http://127.0.0.1:18080/svc/job-orch-1"
 
 
-def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
+def test_job_queue_client_submit_source_module_builds_payloads() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2194,7 +2201,7 @@ def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
     exec(module_blob.decode("utf-8"), module.__dict__)
 
     with patch("pycloud_parallel.execution.support._prepare_code_blob", return_value=(module_blob, f"{module_name}.tar.gz")):
-        resp = client.submit_job_from_module(module=module)
+        resp = client.submit(source=module)
     assert resp == {"ok": True}
     assert captured["client_id"] == "client-module"
     assert captured["entry_module"] == module_name
@@ -2206,7 +2213,7 @@ def test_job_queue_client_submit_job_from_module_builds_payloads() -> None:
     assert captured["blob_b64"]
 
 
-def test_job_queue_client_submit_job_from_module_forwards_resource_paths() -> None:
+def test_job_queue_client_submit_source_module_forwards_resource_paths() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2225,7 +2232,7 @@ def test_job_queue_client_submit_job_from_module_forwards_resource_paths() -> No
     )
 
     with patch.object(client, "submit", return_value={"ok": True}) as mocked_submit:
-        resp = client.submit_job_from_module(module=module, resource_paths=["fund_nav_df.csv"])
+        resp = client.submit(source=module, resource_paths=["fund_nav_df.csv"])
 
     assert resp == {"ok": True}
     mocked_submit.assert_called_once()
@@ -2233,7 +2240,7 @@ def test_job_queue_client_submit_job_from_module_forwards_resource_paths() -> No
     assert mocked_submit.call_args.kwargs["resource_paths"] == ["fund_nav_df.csv"]
 
 
-def test_job_queue_client_submit_job_from_module_forwards_task_resource_paths() -> None:
+def test_job_queue_client_submit_source_module_forwards_task_resource_paths() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2252,14 +2259,14 @@ def test_job_queue_client_submit_job_from_module_forwards_task_resource_paths() 
     )
 
     with patch.object(client, "submit", return_value={"ok": True}) as mocked_submit:
-        resp = client.submit_job_from_module(module=module, task_resource_paths=["worker/data.csv"])
+        resp = client.submit(source=module, task_resource_paths=["worker/data.csv"])
 
     assert resp == {"ok": True}
     mocked_submit.assert_called_once()
     assert mocked_submit.call_args.kwargs["task_resource_paths"] == ["worker/data.csv"]
 
 
-def test_job_queue_client_submit_job_from_module_bundles_task_resources_into_job_blob() -> None:
+def test_job_queue_client_submit_source_module_bundles_task_resources_into_job_blob() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2288,8 +2295,8 @@ def test_job_queue_client_submit_job_from_module_bundles_task_resources_into_job
         "pycloud_parallel.execution.queue._prepare_code_blob",
         return_value=(b"blob", "job_module_demo.tar.gz"),
     ) as mocked_blob:
-        resp = client.submit_job_from_module(
-            module=module,
+        resp = client.submit(
+            source=module,
             task_resource_paths=["worker/data.csv"],
         )
 
@@ -2298,7 +2305,7 @@ def test_job_queue_client_submit_job_from_module_bundles_task_resources_into_job
     assert mocked_blob.call_args.kwargs["resource_paths"] == ["worker/data.csv"]
 
 
-def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> None:
+def test_job_queue_client_submit_source_module_auto_binds_update_globals() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2331,12 +2338,12 @@ def test_job_queue_client_submit_job_from_module_auto_binds_update_globals() -> 
         "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_globals.tar.gz"),
     ):
-        resp = client.submit_job_from_module(module=module)
+        resp = client.submit(source=module)
     assert resp == {"ok": True}
     assert captured["update_globals"] == "update_globals"
 
 
-def test_job_queue_client_submit_job_from_module_auto_binds_handle_data_alias() -> None:
+def test_job_queue_client_submit_source_module_auto_binds_handle_data_alias() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2367,13 +2374,13 @@ def test_job_queue_client_submit_job_from_module_auto_binds_handle_data_alias() 
         "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_handle_data.tar.gz"),
     ):
-        resp = client.submit_job_from_module(module=module)
+        resp = client.submit(source=module)
     assert resp == {"ok": True}
     assert captured["handle_result_callable"] == "handle_data"
     assert "finalize_callable" not in captured
 
 
-def test_job_queue_client_submit_job_from_module_auto_binds_finalize_when_present() -> None:
+def test_job_queue_client_submit_source_module_auto_binds_finalize_when_present() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2404,12 +2411,12 @@ def test_job_queue_client_submit_job_from_module_auto_binds_finalize_when_presen
         "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_finalize.tar.gz"),
     ):
-        resp = client.submit_job_from_module(module=module)
+        resp = client.submit(source=module)
     assert resp == {"ok": True}
     assert captured["finalize_callable"] == "finalize"
 
 
-def test_job_queue_client_submit_job_from_module_accepts_update_globals_dict() -> None:
+def test_job_queue_client_submit_source_module_accepts_update_globals_dict() -> None:
     from pycloud_parallel import JobQueue
 
     client = JobQueue("127.0.0.1:50051", client_id="client-module")
@@ -2438,7 +2445,7 @@ def test_job_queue_client_submit_job_from_module_accepts_update_globals_dict() -
         "pycloud_parallel.execution.support._prepare_code_blob",
         return_value=(b"blob", "job_module_demo_with_explicit_globals.tar.gz"),
     ):
-        resp = client.submit_job_from_module(module=module, update_globals={"cfg": {"mode": "manual"}})
+        resp = client.submit(source=module, update_globals={"cfg": {"mode": "manual"}})
     assert resp == {"ok": True}
     assert captured["update_globals"] == {"cfg": {"mode": "manual"}}
 

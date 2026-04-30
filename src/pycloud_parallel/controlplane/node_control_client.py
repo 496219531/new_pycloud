@@ -18,8 +18,6 @@ from pycloud_parallel.controlplane.artifact import (
     _coerce_artifact_deps,
     _default_entry_module_for_package,
     _normalize_dependency_policy_mode,
-    _normalize_entry_module_arg,
-    _packaging_kwargs,
     _resolve_package_format,
 )
 from .client_transport import _materialize_downloaded_result
@@ -46,10 +44,7 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
-from pycloud_parallel.execution.support import (
-    _prepare_local_artifact_for_upload,
-    _prepare_managed_globals_batches_for_upload,
-)
+from pycloud_parallel.execution.support import _prepare_managed_globals_batches_for_upload
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
@@ -141,18 +136,6 @@ def _build_export_spec(
         mode=str(export_mode or "").strip(),
         methods=[x.strip() for x in (export_methods or []) if str(x).strip()],
         decorator="pycloud_export",
-    )
-
-
-def _package_paths_to_targz(*, root_dir: Path, paths: Sequence[str]) -> Path:
-    from pycloud_parallel.controlplane.dependency import DependencyPackager
-
-    return Path(
-        DependencyPackager().package_paths(
-            root_dir=root_dir,
-            paths=paths,
-            **_packaging_kwargs(),
-        )
     )
 
 
@@ -252,104 +235,6 @@ class NodeControlClient:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
-    def upload_code_from_file(
-        self,
-        *,
-        client_id: str,
-        artifact_path: str,
-        runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        deps: Optional[ArtifactDeps] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        code_token: str = "",
-        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> pb2.UploadCodeResponse:
-        resolved_deps = _coerce_artifact_deps(deps, dependency_allowlist=dependency_allowlist or ())
-        prepared = _prepare_local_artifact_for_upload(artifact_path, package_format=package_format)
-        try:
-            return self._upload_code_from_local_file(
-                client_id=client_id,
-                file_path=prepared.upload_path,
-                runtime=runtime,
-                entry_module=entry_module,
-                entry_callable=entry_callable,
-                package_format=prepared.package_format,
-                export_mode=export_mode,
-                export_methods=export_methods,
-                dependency_policy_mode=resolved_deps.mode,
-                dependency_allowlist=resolved_deps.dependency_allowlist,
-                managed_global_names=managed_global_names,
-                code_token=code_token,
-                chunk_size=chunk_size,
-            )
-        finally:
-            prepared.cleanup()
-
-    def upload_code_from_bytes(
-        self,
-        *,
-        client_id: str,
-        blob: bytes,
-        runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "single",
-        export_methods: Optional[Sequence[str]] = None,
-        deps: Optional[ArtifactDeps] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        code_token: str = "",
-        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> pb2.UploadCodeResponse:
-        if not client_id:
-            raise ValueError("client_id is required")
-        effective_format = _resolve_package_format(package_format, default="py")
-        effective_module = _default_entry_module_for_package(
-            package_format=effective_format,
-            entry_module=entry_module,
-            fallback_stem="artifact",
-        )
-        export_spec = _build_export_spec(
-            export_mode=export_mode,
-            export_methods=export_methods,
-        )
-        resolved_deps = _coerce_artifact_deps(deps, dependency_allowlist=dependency_allowlist or ())
-        normalized_dependency_policy_mode = _normalize_dependency_policy_mode(
-            resolved_deps.mode,
-            dependency_allowlist=resolved_deps.dependency_allowlist,
-        )
-        digest = hashlib.sha256(blob).hexdigest()
-
-        def _iter() -> Iterator[pb2.UploadCodeRequest]:
-            yield pb2.UploadCodeRequest(
-                meta=pb2.UploadCodeMeta(
-                    client_id=client_id,
-                    sha256=f"sha256:{digest}",
-                    runtime=runtime,
-                    entry_module=effective_module,
-                    entry_callable=entry_callable or "run",
-                    package_format=effective_format,
-                    export_spec=export_spec,
-                    dependency_allowlist=list(resolved_deps.dependency_allowlist),
-                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
-                    code_token=str(code_token or "").strip(),
-                    dependency_policy_mode=normalized_dependency_policy_mode,
-                )
-            )
-            for i in range(0, len(blob), max(1, int(chunk_size))):
-                yield pb2.UploadCodeRequest(chunk=blob[i : i + chunk_size])
-
-        resp = self.stub.UploadCode(_iter(), timeout=self.timeout_sec)
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "upload code failed"))
-        return resp
 
     def upload_object_from_file(
         self,
@@ -603,60 +488,6 @@ class NodeControlClient:
             locator_kind="node_local",
             locator_token="",
         )
-
-    def _upload_code_from_local_file(
-        self,
-        *,
-        client_id: str,
-        file_path: Path,
-        runtime: str,
-        entry_module: str,
-        entry_callable: str,
-        package_format: str,
-        export_mode: str,
-        export_methods: Optional[Sequence[str]],
-        dependency_policy_mode: str,
-        dependency_allowlist: Optional[Sequence[str]],
-        managed_global_names: Optional[Sequence[str]],
-        code_token: str,
-        chunk_size: int,
-    ) -> pb2.UploadCodeResponse:
-        effective_format = _resolve_package_format(package_format, file_path.name)
-        effective_module = _normalize_entry_module_arg(entry_module) or (
-            file_path.stem if effective_format == "py" else ""
-        )
-        export_spec = _build_export_spec(
-            export_mode=export_mode,
-            export_methods=export_methods,
-        )
-        normalized_dependency_policy_mode = _normalize_dependency_policy_mode(
-            dependency_policy_mode,
-            dependency_allowlist=dependency_allowlist or (),
-        )
-        digest = _sha256_file(file_path)
-
-        def _iter() -> Iterator[pb2.UploadCodeRequest]:
-            yield pb2.UploadCodeRequest(
-                meta=pb2.UploadCodeMeta(
-                    client_id=client_id,
-                    sha256=f"sha256:{digest}",
-                    runtime=runtime,
-                    entry_module=effective_module,
-                    entry_callable=entry_callable or "run",
-                    package_format=effective_format,
-                    export_spec=export_spec,
-                    dependency_allowlist=list(dependency_allowlist or ()),
-                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
-                    code_token=str(code_token or "").strip(),
-                    dependency_policy_mode=normalized_dependency_policy_mode,
-                )
-            )
-            yield from (pb2.UploadCodeRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
-
-        resp = self.stub.UploadCode(_iter(), timeout=self.timeout_sec)
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "upload code failed"))
-        return resp
 
     def download_object_to_file(
         self,
@@ -931,181 +762,6 @@ class NodeControlClient:
             raise RuntimeError(_err_msg(resp.error, "update runtime globals failed"))
         return resp
 
-    def create_service_from_file(
-        self,
-        *,
-        owner_client_id: str,
-        artifact_path: str,
-        service_name: str = "",
-        runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
-        package_format: str = "",
-        export_mode: str = "decorator",
-        export_methods: Optional[Sequence[str]] = None,
-        deps: Optional[ArtifactDeps] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        policy_id: str = "",
-        worker_count: int = 10,
-        heartbeat_timeout_sec: int = 30,
-        idle_ttl_sec: int = 0,
-        expose_http: bool = True,
-        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> ServiceSessionClient:
-        resolved_deps = _coerce_artifact_deps(deps, dependency_allowlist=dependency_allowlist or ())
-        prepared = _prepare_local_artifact_for_upload(artifact_path, package_format=package_format)
-        try:
-            return self._create_service_from_local_file(
-                owner_client_id=owner_client_id,
-                service_name=service_name,
-                file_path=prepared.upload_path,
-                runtime=runtime,
-                entry_module=entry_module,
-                entry_callable=entry_callable,
-                package_format=prepared.package_format,
-                export_mode=export_mode,
-                export_methods=export_methods,
-                dependency_policy_mode=resolved_deps.mode,
-                dependency_allowlist=resolved_deps.dependency_allowlist,
-                managed_global_names=managed_global_names,
-                policy_id=policy_id,
-                worker_count=worker_count,
-                heartbeat_timeout_sec=heartbeat_timeout_sec,
-                idle_ttl_sec=idle_ttl_sec,
-                expose_http=expose_http,
-                chunk_size=chunk_size,
-            )
-        finally:
-            prepared.cleanup()
-
-    def create_service_from_paths(
-        self,
-        *,
-        owner_client_id: str,
-        root_dir: str,
-        paths: Sequence[str],
-        service_name: str = "",
-        runtime: str = "py3",
-        entry_module: str = "",
-        entry_callable: str = "run",
-        export_mode: str = "decorator",
-        export_methods: Optional[Sequence[str]] = None,
-        deps: Optional[ArtifactDeps] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
-        managed_global_names: Optional[Sequence[str]] = None,
-        policy_id: str = "",
-        worker_count: int = 10,
-        heartbeat_timeout_sec: int = 30,
-        idle_ttl_sec: int = 0,
-        expose_http: bool = True,
-        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
-    ) -> ServiceSessionClient:
-        resolved_deps = _coerce_artifact_deps(deps, dependency_allowlist=dependency_allowlist or ())
-        tar_path = _package_paths_to_targz(root_dir=Path(root_dir), paths=paths)
-        try:
-            return self._create_service_from_local_file(
-                owner_client_id=owner_client_id,
-                service_name=service_name,
-                file_path=tar_path,
-                runtime=runtime,
-                entry_module=entry_module,
-                entry_callable=entry_callable,
-                package_format="tar.gz",
-                export_mode=export_mode,
-                export_methods=export_methods,
-                dependency_policy_mode=resolved_deps.mode,
-                dependency_allowlist=resolved_deps.dependency_allowlist,
-                managed_global_names=managed_global_names,
-                policy_id=policy_id,
-                worker_count=worker_count,
-                heartbeat_timeout_sec=heartbeat_timeout_sec,
-                idle_ttl_sec=idle_ttl_sec,
-                expose_http=expose_http,
-                chunk_size=chunk_size,
-            )
-        finally:
-            tar_path.unlink(missing_ok=True)
-
-    def _create_service_from_local_file(
-        self,
-        *,
-        owner_client_id: str,
-        service_name: str,
-        file_path: Path,
-        runtime: str,
-        entry_module: str,
-        entry_callable: str,
-        package_format: str,
-        export_mode: str,
-        export_methods: Optional[Sequence[str]],
-        dependency_policy_mode: str,
-        dependency_allowlist: Optional[Sequence[str]],
-        managed_global_names: Optional[Sequence[str]],
-        policy_id: str,
-        worker_count: int,
-        heartbeat_timeout_sec: int,
-        idle_ttl_sec: int,
-        expose_http: bool,
-        chunk_size: int,
-    ) -> ServiceSessionClient:
-        effective_module = _normalize_entry_module_arg(entry_module)
-        effective_format = _resolve_package_format(package_format, file_path.name)
-        if not effective_module and effective_format == "py":
-            effective_module = file_path.stem
-        digest = _sha256_file(file_path)
-        export_spec = _build_export_spec(
-            export_mode=export_mode,
-            export_methods=export_methods,
-        )
-        normalized_dependency_policy_mode = _normalize_dependency_policy_mode(
-            dependency_policy_mode,
-            dependency_allowlist=dependency_allowlist or (),
-        )
-
-        def _iter() -> Iterator[pb2.CreateServiceRequest]:
-            yield pb2.CreateServiceRequest(
-                meta=pb2.CreateServiceMeta(
-                    owner_client_id=owner_client_id,
-                    service_name=service_name,
-                    sha256=f"sha256:{digest}",
-                    runtime=runtime,
-                    entry_module=effective_module,
-                    entry_callable=entry_callable or "run",
-                    worker_count=max(1, int(worker_count)),
-                    heartbeat_timeout_sec=max(1, int(heartbeat_timeout_sec)),
-                    idle_ttl_sec=max(0, int(idle_ttl_sec)),
-                    expose_http=bool(expose_http),
-                    package_format=effective_format,
-                    export_spec=export_spec,
-                    dependency_allowlist=list(dependency_allowlist or ()),
-                    managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
-                    dependency_policy_mode=normalized_dependency_policy_mode,
-                    policy_id=str(policy_id or "").strip().lower() or "default_safe",
-                )
-            )
-            yield from (pb2.CreateServiceRequest(chunk=chunk) for chunk in _iter_file_chunks(file_path, chunk_size=chunk_size))
-
-        resp = self.stub.CreateService(_iter(), timeout=self.timeout_sec)
-        if not resp.ok:
-            raise RuntimeError(_err_msg(resp.error, "create service failed"))
-        return ServiceSessionClient(
-            owner_client_id=owner_client_id,
-            _client=self,
-            service_id=resp.service_id,
-            service_token=resp.service_token,
-            code_version=resp.code_version,
-            http_base_url=resp.http_base_url,
-            heartbeat_timeout_sec=resp.heartbeat_timeout_sec,
-            worker_count=resp.worker_count,
-            status=resp.status,
-            service_name=str(service_name or ""),
-            idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
-            created_at=_utc_now(),
-            last_heartbeat_at=_utc_now(),
-            lease_expire_at=_utc_now() + timedelta(seconds=max(1, int(resp.heartbeat_timeout_sec or 0))),
-        )
-
     def create_service_from_bytes(
         self,
         *,
@@ -1119,7 +775,6 @@ class NodeControlClient:
         export_mode: str = "decorator",
         export_methods: Optional[Sequence[str]] = None,
         deps: Optional[ArtifactDeps] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         policy_id: str = "",
         worker_count: int = 10,
@@ -1141,7 +796,7 @@ class NodeControlClient:
             export_mode=export_mode,
             export_methods=export_methods,
         )
-        resolved_deps = _coerce_artifact_deps(deps, dependency_allowlist=dependency_allowlist or ())
+        resolved_deps = _coerce_artifact_deps(deps)
         normalized_dependency_policy_mode = _normalize_dependency_policy_mode(
             resolved_deps.mode,
             dependency_allowlist=resolved_deps.dependency_allowlist,
@@ -1202,7 +857,6 @@ class NodeControlClient:
         entry_callable: str,
         package_format: str = "",
         deps: Optional[ArtifactDeps] = None,
-        dependency_allowlist: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
@@ -1228,7 +882,7 @@ class NodeControlClient:
             worker_count=max(1, int(worker_count)),
             blob_size=len(blob),
         )
-        resolved_deps = _coerce_artifact_deps(deps, dependency_allowlist=dependency_allowlist or ())
+        resolved_deps = _coerce_artifact_deps(deps)
         normalized_dependency_policy_mode = _normalize_dependency_policy_mode(
             resolved_deps.mode,
             dependency_allowlist=resolved_deps.dependency_allowlist,

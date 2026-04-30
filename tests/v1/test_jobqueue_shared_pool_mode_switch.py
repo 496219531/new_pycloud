@@ -39,7 +39,7 @@ def test_shared_pool_soft_switches_mode_without_rebuild():
         created.append(pool)
         return pool
 
-    with patch("pycloud_parallel.controlplane.job_queue._close_executor_async", side_effect=lambda executor: None):
+    with patch.object(manager, "_submit_executor_close", side_effect=lambda executor: None):
         first = manager._get_or_create_shared_pool(
             artifact_key="artifact-1",
             requested_mode="structured_v1",
@@ -67,7 +67,7 @@ def test_shared_pool_reset_pool_rebuilds_pool():
         created.append(pool)
         return pool
 
-    with patch("pycloud_parallel.controlplane.job_queue._close_executor_async", side_effect=lambda executor: None):
+    with patch.object(manager, "_submit_executor_close", side_effect=lambda executor: None):
         first = manager._get_or_create_shared_pool(
             artifact_key="artifact-1",
             requested_mode="structured_v1",
@@ -97,7 +97,7 @@ def test_shared_pool_soft_switch_failure_rebuilds_once():
         created.append(pool)
         return pool
 
-    with patch("pycloud_parallel.controlplane.job_queue._close_executor_async", side_effect=lambda executor: None):
+    with patch.object(manager, "_submit_executor_close", side_effect=lambda executor: None):
         manager._get_or_create_shared_pool(
             artifact_key="artifact-1",
             requested_mode="structured_v1",
@@ -126,7 +126,7 @@ def test_shared_pool_soft_switch_logs_reason_before_rebuild(caplog):
         created.append(pool)
         return pool
 
-    with patch("pycloud_parallel.controlplane.job_queue._close_executor_async", side_effect=lambda executor: None):
+    with patch.object(manager, "_submit_executor_close", side_effect=lambda executor: None):
         manager._get_or_create_shared_pool(
             artifact_key="artifact-1",
             requested_mode="structured_v1",

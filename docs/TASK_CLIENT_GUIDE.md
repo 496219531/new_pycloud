@@ -105,13 +105,6 @@ client.submit(
 
 这里推荐直接提交模块对象；`submit_job_from_func(...)` 已移除，避免把函数对象临时拼模块带来的不稳定依赖。
 
-兼容 helper：
-
-1. `submit_job_from_module(...)`
-2. `submit_job_from_bytes(...)`
-
-仍然可用，但不再是文档主入口。
-
 模块对象自动打包当前有两个关键约束：
 
 1. 依赖分析基于“已加载 module object + 真实 `__file__`”
@@ -119,7 +112,7 @@ client.submit(
 3. `.csv / .json / README / docs` 等非 Python 文件不会自动带上
 4. 如果 service/taskpool/job 依赖非 Python 资源，默认不会自动打包；你可以显式传 `resource_paths=[...]`
 5. 对 `JobQueue.submit(source=module, ...)`，`resource_paths=[...]` 只影响 job-orchestrator 侧的 module artifact；如果 worker/taskpool 也需要这些资源，再额外传 `task_resource_paths=[...]`
-6. 如果你不想逐个列文件，也可以预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` / `submit_job_from_bytes(...)` 提交
+6. 如果你不想逐个列文件，也可以预先自己构建 `zip / tar.gz / whl`，再通过 `submit(source=archive_path)` 或 `submit(source=bytes_payload)` 提交
 7. `JobQueue` 自己固定使用 `structured_v1 + default_safe`
 8. `job-orch` 作为系统内置 startup service 挂载
 9. `job-orch` 的 `taskpool_policy_id` 固定于启动时，通过 startup managed globals 注入，不接受 `submit(...)` 运行期覆盖

@@ -229,7 +229,7 @@ def get_serialization_mode() -> SerializationMode:
 
 
 def get_dependency_policy_mode() -> DependencyPolicyMode:
-    return str(DEPENDENCY_POLICY_MODE or "legacy_v1").strip().lower()  # type: ignore[return-value]
+    return str(DEPENDENCY_POLICY_MODE or "prebuilt").strip().lower()  # type: ignore[return-value]
 
 
 def get_dataref_resolution() -> DataRefResolutionMode:

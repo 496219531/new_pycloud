@@ -196,16 +196,17 @@ for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in
 这是 `Service` 侧的轻量 RPC 批量调用辅助能力，不是 `TaskPool` 任务模型。
 
 默认推荐直接传模块对象 `source=my_service_module`。
-如果你需要更细的打包、依赖或导出控制，再使用高级 `Artifact(...)` 或显式白名单：
+如果你需要更细的打包、依赖或导出控制，再使用高级 `Artifact(...)` 或显式依赖策略：
 
 ```python
+from pycloud_parallel.artifact import ArtifactDeps
+
 group = Service.deploy(
     target="127.0.0.1:50051",
     service_name="dep-service",
-    artifact_path="./service_src",
+    source="./service_src",
     runtime="py3",
-    entry_module="viewer",
-    dependency_allowlist=["./third_party/my_local_pkg"],
+    deps=ArtifactDeps.allow_install(["./third_party/my_local_pkg"]),
 )
 ```
 
@@ -381,7 +382,7 @@ python examples/service_deploy_basic.py
 ## 10. 依赖补装约定
 
 1. 默认严格校验，缺依赖直接报错
-2. 显式传 `dependency_allowlist` 后，节点才会尝试补装
+2. 显式传 `deps=ArtifactDeps.allow_install(...)` 后，节点才会尝试补装
 3. 支持本地路径、wheel 路径、普通 pip requirement 字符串
 4. 安装目录位于节点 `code_cache/codes/<sha>/deps`
 5. 同一 `code_version` 不允许混用不同白名单

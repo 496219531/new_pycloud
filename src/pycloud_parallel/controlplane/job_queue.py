@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import math
 from typing import Any, Dict, List, Optional, Sequence
 
+from pycloud_parallel.controlplane.artifact import ArtifactDeps
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_jobqueue_resolve_refs, get_payload_policy
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
@@ -92,12 +93,6 @@ def _close_executor(executor: Any) -> None:
         executor.close()
     except Exception:
         pass
-
-
-def _close_executor_async(executor: Any) -> None:
-    # Compatibility shim for older tests/callers; JobQueueManager now routes closes
-    # through its bounded maintenance executor instead of spawning a thread here.
-    _close_executor(executor)
 
 
 _TASKPOOL_SHARED_BINDING_ID = "taskpool_default"
@@ -1159,6 +1154,7 @@ class JobQueueManager:
         )
 
         def _create_pool(mode: str) -> TaskPool:
+            dependency_allowlist = list(kwargs.get("dependency_allowlist") or ())
             return _create_job_task_pool(
                 infocenter_target=self._controlplane_target,
                 job_id=job_id_snapshot,
@@ -1172,7 +1168,7 @@ class JobQueueManager:
                 package_format=kwargs.get("package_format", ""),
                 serialization_mode=pool_request.raw_requested_mode or "",
                 policy_id=self._taskpool_policy_id,
-                dependency_allowlist=kwargs.get("dependency_allowlist"),
+                deps=ArtifactDeps.allow_install(dependency_allowlist) if dependency_allowlist else None,
                 managed_global_names=kwargs.get("managed_global_names"),
                 worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", pool_request.default_worker_count)) or pool_request.default_worker_count)),
                 heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
@@ -1215,6 +1211,7 @@ class JobQueueManager:
         )
 
         def _create_pool(mode: str) -> TaskPool:
+            dependency_allowlist = list(payload.get("dependency_allowlist") or ())
             task_pool_kwargs = {
                 "infocenter_target": self._controlplane_target,
                 "job_id": job_id_snapshot,
@@ -1223,7 +1220,7 @@ class JobQueueManager:
                 "runtime": str(payload.get("runtime", "py3") or "py3"),
                 "serialization_mode": pool_request.raw_requested_mode or "",
                 "policy_id": self._taskpool_policy_id,
-                "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
+                "deps": ArtifactDeps.allow_install(dependency_allowlist) if dependency_allowlist else None,
                 "managed_global_names": list(effective_managed_global_names or ()),
                 "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", pool_request.default_worker_count)) or pool_request.default_worker_count)),
                 "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),

@@ -78,12 +78,10 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 ### 3.1 先部署服务
 
 ```python
-from pycloud_parallel import Service, export
+from pycloud_parallel import Service
 
 blob = (
-    b"def export(fn):\n"
-    b"    fn.__pycloud_export__ = True\n"
-    b"    return fn\n\n"
+    b"from pycloud_parallel import export\n\n"
     b"@export\n"
     b"def square(x=0, **_kwargs):\n"
     b"    x = int(x)\n"
@@ -93,10 +91,9 @@ blob = (
 group = Service.deploy(
     target="127.0.0.1:50051",
     service_name="square-service",
-    blob=blob,
+    source=blob,
     runtime="py3",
-    entry_module="square_service",
-    export_mode="decorator",
+    package_format="py",
     node_count=1,
 )
 ```

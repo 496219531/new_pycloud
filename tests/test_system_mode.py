@@ -19,7 +19,7 @@ def test_resolve_system_mode_defaults_to_trusted_default(monkeypatch):
     assert resolved.trust_mode == "trusted"
     assert resolved.object_transfer_mode == "auto"
     assert resolved.serialization_mode == "legacy_v1"
-    assert resolved.dependency_policy_mode == "legacy_v1"
+    assert resolved.dependency_policy_mode == "prebuilt"
 
 
 def test_resolve_system_mode_applies_env_and_explicit_overrides(monkeypatch):

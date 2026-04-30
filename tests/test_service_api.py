@@ -1441,34 +1441,21 @@ class TestBroadcastProxy:
 
 
 class TestOwnerServiceFacade:
-    """测试 OwnerServiceFacade 类。"""
+    """测试 V1 owner service facade。"""
 
-    def test_deploy_from_bytes_defaults_replace_changed_code(self):
-        """测试高层入口默认开启同名变更代码替换。"""
+    def test_legacy_deploy_from_bytes_facade_removed(self):
+        from pycloud_parallel import Service as OwnerServiceFacade
+
+        assert not hasattr(OwnerServiceFacade, "deploy_from_bytes")
+
+    def test_deploy_forwards_replace_changed_code_option(self):
         from pycloud_parallel import Service as OwnerServiceFacade
 
         sentinel = object()
         with patch("pycloud_parallel.execution.service_session.Service._deploy_from_infocenter", return_value=sentinel) as mocked:
-            result = OwnerServiceFacade.deploy_from_bytes(
-                infocenter_target="127.0.0.1:50051",
-                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
-                entry_module="demo_service",
-                service_name="demo-service",
-            )
-
-        assert result is sentinel
-        assert mocked.call_args.kwargs["replace_existing_if_code_changed"] is True
-
-    def test_deploy_from_bytes_can_disable_replace_changed_code(self):
-        """测试高层入口允许显式关闭同名变更代码替换。"""
-        from pycloud_parallel import Service as OwnerServiceFacade
-
-        sentinel = object()
-        with patch("pycloud_parallel.execution.service_session.Service._deploy_from_infocenter", return_value=sentinel) as mocked:
-            result = OwnerServiceFacade.deploy_from_bytes(
-                infocenter_target="127.0.0.1:50051",
-                blob=b"def run(**_kwargs):\n    return {'ok': True}\n",
-                entry_module="demo_service",
+            result = OwnerServiceFacade.deploy(
+                target="127.0.0.1:50051",
+                source=b"def run(**_kwargs):\n    return {'ok': True}\n",
                 service_name="demo-service",
                 replace_existing_if_code_changed=False,
             )

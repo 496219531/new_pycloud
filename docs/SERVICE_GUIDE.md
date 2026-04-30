@@ -17,7 +17,7 @@
 3. 自动 keepalive
 4. 需要时 `join()` 长驻
 5. 正常退出时 `EndService`
-6. 可选声明 `dependency_allowlist`
+6. 可选声明 `deps=ArtifactDeps.allow_install(...)`
 
 ## 1. 基本用法
 
@@ -42,18 +42,18 @@ print(group.square.sync(x=7))
 如果服务代码依赖节点未预装的包：
 
 ```python
+from pycloud_parallel.artifact import ArtifactDeps
+
 group = Service.deploy(
     target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="viewer-service",
-    artifact_path="./viewer_pkg",
+    source="./viewer_pkg",
     runtime="py3",
-    entry_module="viewer",
-    export_mode="decorator",
-    dependency_allowlist=[
+    deps=ArtifactDeps.allow_install([
         "./third_party/my_local_pkg",
         "orjson==3.10.18",
-    ],
+    ]),
     node_count=1,
 )
 ```
@@ -225,14 +225,14 @@ for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in
 
 服务已经不是单入口函数模型，而是模块导出模型：
 
-1. 指定 `entry_module`
-2. 决定 `export_mode`
+1. 传入 `source=` 模块、包或代码目录
+2. 使用 `export` 标记对外方法
 3. 调用时按 `method` 路由
 
 推荐默认：
 
-1. `export_mode="decorator"`
-2. 使用 `export`
+1. `Service.deploy(target=..., source=my_module)`
+2. 在模块里使用 `export`
 
 服务方法当前默认按 kwargs 调用：
 
@@ -299,10 +299,8 @@ group = Service.deploy(
     target="127.0.0.1:50051",
     owner_client_id="demo-owner",
     service_name="square-service",
-    artifact_path="./service_dir",
+    source="./service_dir",
     runtime="py3",
-    entry_module="viewer",
-    export_mode="decorator",
     worker_count=2,
     node_count=2,
     reuse_existing_same_code=True,
@@ -328,10 +326,10 @@ group = Service.deploy(
 当前策略：
 
 1. 默认严格校验，缺依赖直接失败
-2. 只有显式传 `dependency_allowlist` 才允许节点补装
+2. 只有显式传 `deps=ArtifactDeps.allow_install(...)` 才允许节点补装
 3. 节点把依赖安装到当前 `code_version` 的隔离目录
 4. 运行时调用服务方法时，也会把该依赖目录加入 `sys.path`
-5. 同一个 `code_version` 不允许混用不同 `dependency_allowlist`
+5. 同一个 `code_version` 不允许混用不同依赖策略
 
 ## 5.2 managed globals
 
@@ -341,8 +339,8 @@ group = Service.deploy(
 group = Service.deploy(
     target="127.0.0.1:50051",
     service_name="square-service",
-    blob=blob,
-    entry_module="square_service",
+    source=blob,
+    package_format="py",
     managed_global_names=["STATE", "MODEL_REF"],
 )
 

@@ -2127,7 +2127,7 @@ def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
     mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, wait_ms=500, limit=100, job_id="", raise_on_error=False, task_ids=None)
 
 
-def test_native_task_pool_session_unordered_rejects_legacy_control_params() -> None:
+def test_native_task_pool_session_unordered_has_strict_signature() -> None:
     from pycloud_parallel import TaskPool
 
     session = TaskPool(

@@ -10,12 +10,9 @@ def export(fn):
     return fn
 
 
-pycloud_export = export
-
 __all__ = [
     "Artifact",
     "ArtifactDeps",
     "ArtifactExports",
     "export",
-    "pycloud_export",
 ]
