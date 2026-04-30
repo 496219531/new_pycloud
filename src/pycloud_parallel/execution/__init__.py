@@ -1,7 +1,3 @@
-"""V1 execution package target."""
+"""Internal execution package."""
 
-__all__ = [
-    "ExecutionHost",
-    "Service",
-    "TaskPool",
-]
+__all__: list[str] = []
