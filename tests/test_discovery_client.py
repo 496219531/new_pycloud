@@ -23,7 +23,7 @@ from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 

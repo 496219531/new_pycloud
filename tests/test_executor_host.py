@@ -14,7 +14,7 @@ from pycloud_parallel.controlplane import executor_core as executor_core_mod
 from pycloud_parallel.controlplane.executor_core import ExecutorCore
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 from pycloud_parallel.controlplane.node.execution import _build_execute_spec
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 
 
 def _seed_artifact(tmp_path, *, blob: bytes, entry_module: str, entry_callable: str = "run"):

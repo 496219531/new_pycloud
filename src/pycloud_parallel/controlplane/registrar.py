@@ -11,7 +11,7 @@ from importlib import metadata as importlib_metadata
 from urllib.error import URLError
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 
 logger = logging.getLogger(__name__)
 

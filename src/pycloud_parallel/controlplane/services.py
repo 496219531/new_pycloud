@@ -15,7 +15,7 @@ import grpc
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_payload_policy
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.serialization import (
     decode_transport_payload_bytes,
     detect_transport_mode,

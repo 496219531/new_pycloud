@@ -12,7 +12,7 @@ import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.job_orchestrator import JobOrchestratorModule, JobOrchestratorServer
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.data.ref import DataRef, data_ref_to_payload

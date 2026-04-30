@@ -15,7 +15,7 @@ from pycloud_parallel.controlplane.server import (
     build_job_orchestrator_server,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 

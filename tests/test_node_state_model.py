@@ -49,7 +49,7 @@ from pycloud_parallel.controlplane.node.results import (
     _resolve_object_refs_in_payload,
     _resolve_single_data_ref,
 )
-from pycloud_parallel.controlplane.node.state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.serialization import (
     decode_inline_transport_carrier,
