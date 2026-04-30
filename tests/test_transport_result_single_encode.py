@@ -5,13 +5,13 @@ import pandas as pd
 import pytest
 
 from pycloud_parallel.controlplane.node.models import TaskState
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.serialization import (
     TRANSPORT_ENVELOPE_SENTINEL,
     encode_transport_payload_bytes,
     transport_payload_to_inline_carrier,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.execution.task_pool import _NativePoolResultAdapter
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -48,7 +48,7 @@ def test_task_result_pickle_decodes_directly_to_dataframe():
     )
 
     task_result = state.as_result()
-    restored = _NativePoolResultAdapter(serialization_mode="pickle_stable_v1").fetch_result_data(task_result)
+    restored = NodeControlClient.__new__(NodeControlClient).fetch_result_data(task_result)
 
     assert task_result.HasField("transport_result")
     assert restored.equals(frame)
@@ -134,7 +134,7 @@ def test_service_bytes_response_decodes_directly_to_ndarray():
 
     response = service.CallService(request, context)
 
-    restored = _NativePoolResultAdapter(serialization_mode="pickle_stable_v1").fetch_result_data(
+    restored = NodeControlClient.__new__(NodeControlClient).fetch_result_data(
         pb2.TaskResult(
             task_id="task-service-1",
             status=pb2.TASK_STATUS_SUCCEEDED,

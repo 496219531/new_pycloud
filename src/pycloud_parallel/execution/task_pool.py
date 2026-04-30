@@ -37,12 +37,7 @@ from pycloud_parallel.controlplane.serialization_mode import resolve_effective_s
 from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
-from pycloud_parallel.controlplane.serialization import detect_transport_mode, serialize_inline_payload, struct_to_python
-from pycloud_parallel.controlplane.serialization import (
-    decode_transport_payload_bytes,
-    encode_transport_payload_bytes,
-)
-from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
+from pycloud_parallel.controlplane.serialization import encode_transport_payload_bytes, serialize_inline_payload
 from pycloud_parallel.controlplane.task_backend import _TaskPoolCallProxy
 from pycloud_parallel.execution.base import ExecutionItem, TaskExecutionSession
 from pycloud_parallel.execution.failover import (
@@ -2490,35 +2485,7 @@ def _build_task_pool_from_infocenter(
     return session
 
 
-class _NativePoolResultAdapter:
-    def __init__(self, *, serialization_mode: str = "") -> None:
-        self.serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="taskpool_session",
-        )
-
-    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
-        del target_path
-        if task_result.HasField("transport_result") and str(task_result.transport_result.codec or "").strip():
-            return decode_transport_payload_bytes(
-                str(task_result.transport_result.codec or ""),
-                int(task_result.transport_result.version or 0),
-                task_result.transport_result.payload,
-                context="taskpool_session",
-            )
-        if task_result.result:
-            raw = struct_to_python(task_result.result)
-            return decode_result_from_transport(
-                raw,
-                mode=detect_transport_mode(raw, default=self.serialization_mode or "legacy_v1"),
-                context="taskpool_session",
-            )
-        raise RuntimeError(task_result.error.message or "task failed")
-
-
-
 __all__ = [
-    "_NativePoolResultAdapter",
     "TaskPool",
 ]
 

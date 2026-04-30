@@ -17,7 +17,7 @@ from pycloud_parallel.controlplane.serialization import (
     transport_payload_to_inline_carrier,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.execution.task_pool import _NativePoolResultAdapter, TaskPool
+from pycloud_parallel.execution.task_pool import TaskPool
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -246,7 +246,7 @@ def test_task_result_pickle_uses_transport_result_and_adapter_reads_it():
     assert task_result.HasField("transport_result")
     assert task_result.transport_result.codec == "pickle_stable_v1"
 
-    restored = _NativePoolResultAdapter(serialization_mode="pickle_stable_v1").fetch_result_data(task_result)
+    restored = NodeControlClient.__new__(NodeControlClient).fetch_result_data(task_result)
     assert np.array_equal(restored["array"], np.array([1, 2, 3], dtype=np.int64))
 
 
@@ -299,7 +299,7 @@ def test_task_result_can_follow_struct_lane_even_for_pickle_mode():
     )
 
     task_result = state.as_result()
-    restored = _NativePoolResultAdapter(serialization_mode="pickle_stable_v1").fetch_result_data(task_result)
+    restored = NodeControlClient.__new__(NodeControlClient).fetch_result_data(task_result)
 
     assert not task_result.HasField("transport_result")
     assert restored == {"value": 7}

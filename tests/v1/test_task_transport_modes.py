@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from pycloud_parallel.api import TaskPool
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.payload_transport import (
     decode_payload_from_transport,
@@ -19,7 +20,6 @@ from pycloud_parallel.controlplane.serialization import (
     encode_transport_payload_bytes,
     struct_to_python,
 )
-from pycloud_parallel.execution.task_pool import _NativePoolResultAdapter
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -145,7 +145,7 @@ def test_task_pool_wait_for_data_roundtrips_transport_modes():
         else:
             result_kwargs["result"] = dict_to_struct(encoded)
         task_result = pb2.TaskResult(**result_kwargs)
-        restored = _NativePoolResultAdapter(serialization_mode=mode).fetch_result_data(task_result)
+        restored = NodeControlClient.__new__(NodeControlClient).fetch_result_data(task_result)
         _assert_roundtrip(restored["frame"], result["frame"])
         _assert_roundtrip(restored["array"], result["array"])
         if mode != "legacy_v1":
