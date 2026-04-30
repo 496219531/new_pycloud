@@ -2333,13 +2333,6 @@ class Service(ServiceExecutionSession):
             Service: 部署的服务组
         """
         module_source = source if inspect.ismodule(source) else None
-        if (
-            module_source is None
-            and inspect.ismodule(entry_module)
-            and source is None
-            and artifact is None
-        ):
-            module_source = entry_module
         normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
         if normalized_resource_paths and module_source is None:
             raise ValueError("resource_paths requires a module source")

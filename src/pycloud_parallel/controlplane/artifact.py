@@ -615,6 +615,7 @@ def _normalize_artifact_input(
         raise ValueError(f"unsupported artifact consumer kind: {consumer_kind!r}")
 
     source_func = None
+    source_module = None
     source_blob = None
     source_paths = None
     if source is not _SOURCE_UNSET and source is not None:
@@ -631,6 +632,7 @@ def _normalize_artifact_input(
             if source_kind == "function":
                 source_func = source_value
             elif source_kind == "module":
+                source_module = source_value
                 entry_module = source_value
             elif source_kind == "bytes":
                 source_blob = source_value
@@ -639,21 +641,13 @@ def _normalize_artifact_input(
             else:
                 source_paths = source_value
 
-    raw_entry_module = entry_module
-    raw_entry_callable = entry_callable
-    source_module = None
-    if source_blob is None and not source_paths and inspect.ismodule(raw_entry_module):
-        source_module = raw_entry_module
-    if source_func is None and source_blob is None and not source_paths and not isinstance(raw_entry_callable, str) and callable(raw_entry_callable):
-        source_func = raw_entry_callable
-
-    normalized_entry_module = _normalize_entry_module_arg(raw_entry_module)
-    normalized_entry_callable = _normalize_entry_callable_arg(raw_entry_callable) or "run"
+    normalized_entry_module = _normalize_entry_module_arg(entry_module)
+    normalized_entry_callable = _normalize_entry_callable_arg(entry_callable) or "run"
 
     if artifact is not None:
         if not isinstance(artifact, Artifact):
             raise TypeError("artifact must be an Artifact instance")
-        if source_blob is not None or source_paths or source_module is not None or source_func is not None:
+        if source_blob is not None or source_paths or source_func is not None or source_module is not None:
             raise ValueError("artifact cannot be combined with alternate artifact source inputs")
         effective_deps = _coerce_artifact_deps(deps or artifact.deps)
         merged_globals = _normalize_names([*artifact.managed_global_names, *(managed_global_names or ())])
@@ -696,7 +690,7 @@ def _normalize_artifact_input(
     if source_paths:
         return Artifact.from_paths(source_paths, **base_kwargs)
     raise ValueError(
-        "source, artifact, module-object entry_module or callable-object entry_callable is required"
+        "source or artifact is required"
     )
 
 

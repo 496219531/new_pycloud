@@ -762,8 +762,7 @@ def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeyp
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-module-entry",
-            entry_module=worker_module,
-            entry_callable="run",
+            source=worker_module,
             worker_count=2,
             node_count=1,
         )
@@ -813,7 +812,7 @@ def test_task_pool_session_packages_callable_object_entry_callable(tmp_path, mon
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-callable-entry",
-            entry_callable=worker_module.run,
+            source=worker_module.run,
             worker_count=2,
             node_count=1,
         )
@@ -864,8 +863,7 @@ def test_task_pool_session_packages_namespace_module_with_synthetic_init(tmp_pat
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
             job_id="job-native-namespace-module-entry",
-            entry_module=worker_module,
-            entry_callable="run",
+            source=worker_module,
             worker_count=2,
             node_count=1,
         )

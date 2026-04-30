@@ -2104,8 +2104,7 @@ class TestOwnerServiceFacade:
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-module-service",
-                entry_module=worker_module,
-                entry_callable="run",
+                source=worker_module,
                 session_cache_dir=str(tmp_path),
             )
 
@@ -2250,7 +2249,7 @@ class TestOwnerServiceFacade:
                 infocenter_target="127.0.0.1:50051",
                 owner_client_id="owner-demo",
                 service_name="demo-callable-service",
-                entry_callable=worker_module.run,
+                source=worker_module.run,
                 session_cache_dir=str(tmp_path),
             )
 
