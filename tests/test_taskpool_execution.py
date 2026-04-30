@@ -883,7 +883,7 @@ def test_task_pool_session_packages_namespace_module_with_synthetic_init(tmp_pat
         session.close()
 
 
-def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> None:
+def test_task_pool_session_packages_callable_source(tmp_path, monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
     worker_module = _build_task_entry_module(tmp_path, monkeypatch)
@@ -914,8 +914,8 @@ def test_task_pool_session_packages_entry_func_alias(tmp_path, monkeypatch) -> N
         mocked_infocenter.return_value.__enter__.return_value.select_task_nodes.return_value = [fake_node]
         session = TaskPool._from_infocenter(
             infocenter_target="127.0.0.1:50051",
-            job_id="job-native-entry-func",
-            entry_func=worker_module.run,
+            job_id="job-native-callable-source",
+            source=worker_module.run,
             worker_count=2,
             node_count=1,
         )

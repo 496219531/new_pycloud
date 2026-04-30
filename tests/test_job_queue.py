@@ -648,7 +648,7 @@ def test_run_job_with_hooks_accepts_update_globals_callable_name() -> None:
     assert job.status == "SUCCEEDED"
 
 
-def test_run_job_with_hooks_uses_entryfunc_for_taskpool() -> None:
+def test_run_job_with_hooks_uses_module_source_for_taskpool() -> None:
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
     module_blob = (
@@ -695,11 +695,12 @@ def test_run_job_with_hooks_uses_entryfunc_for_taskpool() -> None:
         queue._run_job("job-hooks-entryfunc")  # noqa: SLF001
 
     call_kwargs = mocked.call_args.kwargs
-    assert callable(call_kwargs["entry_func"])
-    assert call_kwargs["entry_func"].__name__ == "run"
+    assert callable(getattr(call_kwargs["source"], "run", None))
+    assert call_kwargs["entry_callable"] == "run"
     assert "func" not in call_kwargs
     assert "blob" not in call_kwargs
     assert "entry_module" not in call_kwargs
+    assert "entry_func" not in call_kwargs
 
 
 def test_run_job_with_hooks_forwards_requested_taskpool_mode_and_fixed_policy() -> None:

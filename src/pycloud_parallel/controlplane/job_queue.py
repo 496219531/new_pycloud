@@ -1196,7 +1196,6 @@ class JobQueueManager:
         task_entry_callable: str,
         task_resource_paths: Sequence[str],
         module: Any,
-        task_entry: Any,
         effective_managed_global_names: Sequence[str],
     ) -> _JobTaskPoolSpec:
         artifact_key = self._shared_pool_artifact_key(
@@ -1233,13 +1232,11 @@ class JobQueueManager:
                 "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
             }
             if task_resource_paths:
-                task_pool_kwargs.update(
-                    source=module,
-                    entry_callable=task_entry_callable,
-                    resource_paths=list(task_resource_paths),
-                )
-            else:
-                task_pool_kwargs["entry_func"] = task_entry
+                task_pool_kwargs["resource_paths"] = list(task_resource_paths)
+            task_pool_kwargs.update(
+                source=module,
+                entry_callable=task_entry_callable,
+            )
             return _create_job_task_pool(**task_pool_kwargs)
 
         return _JobTaskPoolSpec(artifact_key=artifact_key, create_pool=_create_pool)
@@ -2160,7 +2157,6 @@ class JobQueueManager:
                 task_entry_callable=task_entry_callable,
                 task_resource_paths=task_resource_paths,
                 module=module,
-                task_entry=task_entry,
                 effective_managed_global_names=effective_managed_global_names,
             )
             executor = self._prepare_shared_pool_for_job(

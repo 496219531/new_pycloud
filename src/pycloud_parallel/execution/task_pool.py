@@ -2387,7 +2387,6 @@ def _build_task_pool_from_infocenter(
     pool_name: Optional[str] = None,
     artifact: Optional[Any] = None,
     deps: Optional[Any] = None,
-    entry_func: Optional[Callable] = None,
     artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
     blob: Optional[bytes] = None,
     runtime: str = "py3",
@@ -2416,7 +2415,6 @@ def _build_task_pool_from_infocenter(
         and inspect.ismodule(entry_module)
         and source is None
         and artifact is None
-        and entry_func is None
         and not artifact_path
         and blob is None
     ):
@@ -2435,7 +2433,6 @@ def _build_task_pool_from_infocenter(
         source=source,
         artifact=artifact,
         deps=deps,
-        func=entry_func,
         artifact_path=artifact_path,
         blob=blob,
         runtime=runtime,
@@ -2703,7 +2700,6 @@ class TaskPool(_TaskPoolSessionBase):
         pool_name: Optional[str] = None,
         artifact: Optional[Any] = None,
         deps: Optional[Any] = None,
-        entry_func: Optional[Callable] = None,
         artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
         blob: Optional[bytes] = None,
         runtime: str = "py3",
@@ -2741,7 +2737,6 @@ class TaskPool(_TaskPoolSessionBase):
             pool_name=pool_name,
             artifact=artifact,
             deps=deps,
-            entry_func=entry_func,
             artifact_path=artifact_path,
             blob=blob,
             runtime=runtime,
