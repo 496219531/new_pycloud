@@ -385,13 +385,6 @@ class DependencyAnalyzer:
 
         return result
 
-    def _get_function_source(self, func: Callable) -> Optional[str]:
-        """获取函数源码"""
-        try:
-            return inspect.getsource(func)
-        except (OSError, TypeError):
-            return None
-
     def _get_module_source(self, func: Callable) -> Optional[str]:
         """获取函数所在模块的源码"""
         try:
@@ -645,45 +638,6 @@ class DependencyAnalyzer:
                 result["third_party_modules"].append(module_name)
                 seen_third_party.add(module_name)
 
-    def _expand_local_dependencies(self, result: Dict[str, Any], *, current_package: str) -> None:
-        pending = [item for item in result.get("local_modules", []) if isinstance(item, dict)]
-        seen_modules = {str(item.get("name", "")).strip() for item in pending if str(item.get("name", "")).strip()}
-        seen_files = set(result.get("local_files", []))
-
-        while pending:
-            item = pending.pop()
-            module_name = str(item.get("name", "") or "").strip()
-            module_file = str(item.get("file", "") or "").strip()
-            if not module_name or not module_file:
-                continue
-            if module_file in seen_files:
-                continue
-            seen_files.add(module_file)
-
-            source = ""
-            if module_file.endswith(".py"):
-                try:
-                    with open(module_file, "r", encoding="utf-8") as f:
-                        source = f.read()
-                except Exception:
-                    source = ""
-            if not source:
-                continue
-
-            imports_ast = self._extract_imports_from_source(source)
-            local_before = {str(item.get("name", "")).strip() for item in result.get("local_modules", [])}
-            self._classify_imports(
-                imports_ast,
-                result,
-                current_module_name=module_name,
-                current_package=current_package,
-            )
-            for new_item in result.get("local_modules", []):
-                name = str(new_item.get("name", "") or "").strip()
-                if name and name not in seen_modules and name not in local_before:
-                    pending.append(new_item)
-                    seen_modules.add(name)
-
     def _resolve_import_module(
         self,
         imp: Dict[str, str],
@@ -905,84 +859,6 @@ class DependencyPackager:
         )
         _write_deterministic_targz(entries, output_file)
         return output_file
-
-    def _collect_function_roots(self, func: Callable, *, deps: Dict[str, Any]) -> List[Path]:
-        roots: List[Path] = []
-        module_name = str(func.__module__ or "").strip()
-        source_file = str(deps.get("source_file") or "").strip()
-        if source_file:
-            roots.append(self._module_root_from_name_and_file(module_name, source_file))
-
-        for item in deps.get("local_modules", []):
-            item_name = str(item.get("name", "") or "").strip()
-            item_file = str(item.get("file", "") or "").strip()
-            if not item_name or not item_file:
-                continue
-            roots.append(self._module_root_from_name_and_file(item_name, item_file))
-        return self._dedupe_roots(roots)
-
-    def _collect_module_roots(self, module_name: str, *, deps: Dict[str, Any]) -> List[Path]:
-        roots: List[Path] = []
-        module_file = str(deps.get("file") or "").strip()
-        if module_file:
-            roots.append(self._module_root_from_name_and_file(module_name, module_file))
-
-        for item in deps.get("local_modules", []):
-            item_name = str(item.get("name", "") or "").strip()
-            item_file = str(item.get("file", "") or "").strip()
-            if not item_name or not item_file:
-                continue
-            roots.append(self._module_root_from_name_and_file(item_name, item_file))
-        return self._dedupe_roots(roots)
-
-    def _module_root_from_name_and_file(self, module_name: str, module_file: str) -> Path:
-        path = Path(module_file).resolve()
-        parts = [part for part in str(module_name or "").split(".") if part]
-        if path.name == "__init__.py":
-            package_depth = len(parts)
-            current = path.parent
-            for _ in range(max(0, package_depth - 1)):
-                current = current.parent
-            return current
-        if len(parts) <= 1:
-            return path
-        current = path.parent
-        for _ in range(max(0, len(parts) - 2)):
-            current = current.parent
-        return current
-
-    def _dedupe_roots(self, roots: Iterable[Path]) -> List[Path]:
-        normalized: List[Path] = []
-        for raw in roots:
-            path = Path(raw).resolve()
-            if not path.exists():
-                continue
-            normalized.append(path)
-
-        normalized = sorted(set(normalized), key=lambda item: (len(item.parts), str(item)))
-        deduped: List[Path] = []
-        for path in normalized:
-            if any(path == existing or existing in path.parents for existing in deduped if existing.is_dir()):
-                continue
-            deduped.append(path)
-        return deduped
-
-    def _create_tar_package(
-        self,
-        roots: List[Path],
-        output_file: str,
-        *,
-        include_tests: bool = True,
-    ) -> None:
-        """创建 tar.gz 包。"""
-        self.package_roots(
-            roots,
-            output_file=output_file,
-            include_tests=include_tests,
-        )
-
-    def _should_skip_path(self, path: Path) -> bool:
-        return _should_skip_packaged_path(path, include_tests=True)
 
     def _build_function_entries(
         self,

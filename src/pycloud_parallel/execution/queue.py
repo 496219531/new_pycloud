@@ -119,17 +119,6 @@ class _JobOrchestratorDiscoveryClient:
         candidates.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
         return candidates
 
-    def _resolve_effective_policy_for_routes(
-        self,
-        routes: Sequence[object],
-        *,
-        requested_mode: str = "",
-    ) -> EffectivePolicy:
-        del routes, requested_mode
-        self.effective_policy = _jobqueue_effective_policy()
-        self.serialization_mode = self.effective_policy.resolved_mode
-        return self.effective_policy
-
     def resolve_effective_policy_for_service(
         self,
         *,
