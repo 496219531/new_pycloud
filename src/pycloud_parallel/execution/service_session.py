@@ -26,7 +26,6 @@ from pycloud_parallel.controlplane.artifact import (
     _default_artifact_filename,
     _default_entry_module_for_func,
     _default_entry_module_for_module,
-    _infer_entry_module_from_artifact_path,
     _normalize_artifact_input,
     _normalize_entry_callable_arg,
     _normalize_entry_module_arg,
@@ -2256,8 +2255,6 @@ class Service(ServiceExecutionSession):
         service_name: Optional[str] = None,
         artifact: Optional[Any] = None,
         deps: Optional[Any] = None,
-        artifact_path: Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]]] = "",
-        blob: Optional[bytes] = None,
         runtime: str = "py3",
         entry_module: Any = "",
         entry_callable: Any = "run",
@@ -2303,8 +2300,6 @@ class Service(ServiceExecutionSession):
             owner_client_id: 所有者 ID
             service_name: 服务名称
             artifact: 高级 Artifact 声明对象
-            artifact_path: 单个文件、单个文件夹或文件/文件夹路径列表
-            blob: 直接提供代码内容
             runtime: 运行时版本
             entry_module: 入口模块名，或可导入的真实模块对象
             entry_callable: 入口函数名，或真实函数对象
@@ -2342,8 +2337,6 @@ class Service(ServiceExecutionSession):
             and inspect.ismodule(entry_module)
             and source is None
             and artifact is None
-            and not artifact_path
-            and blob is None
         ):
             module_source = entry_module
         normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
@@ -2360,8 +2353,6 @@ class Service(ServiceExecutionSession):
             source=source,
             artifact=artifact,
             deps=deps,
-            artifact_path=artifact_path,
-            blob=blob,
             runtime=runtime,
             entry_module=entry_module,
             entry_callable=entry_callable,
@@ -2396,7 +2387,6 @@ class Service(ServiceExecutionSession):
             effective_owner_client_id = f"client-{local_ip}"
 
         # 先确定 entry_module（用于生成 service_name）
-        effective_entry_module = effective_entry_module or _infer_entry_module_from_artifact_path(artifact_path)
         if not effective_entry_module:
             if effective_filename:
                 # 优先使用推导出的 artifact 文件名
