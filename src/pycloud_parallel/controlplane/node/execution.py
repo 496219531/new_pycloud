@@ -816,41 +816,6 @@ def _discover_callable_methods(
         raise
 
 
-def _discover_callable_methods_or_raise_user_error(
-    artifact_path: str,
-    *,
-    entry_module: str,
-    package_format: str,
-    dependency_path: str,
-    export_mode: str,
-    export_methods: Sequence[str],
-    export_decorator: str,
-    entry_callable: str,
-) -> Tuple[Any, Dict[str, Tuple[str, str]]]:
-    try:
-        return _discover_callable_methods(
-            artifact_path,
-            entry_module=entry_module,
-            package_format=package_format,
-            dependency_path=dependency_path,
-            export_mode=export_mode,
-            export_methods=export_methods,
-            export_decorator=export_decorator,
-            entry_callable=entry_callable,
-        )
-    except Exception as exc:
-        if _is_user_artifact_error(exc):
-            raise ValueError(
-                _describe_artifact_error(
-                    exc,
-                    entry_module=entry_module,
-                    entry_callable=entry_callable,
-                    package_format=package_format,
-                )
-            ) from exc
-        raise
-
-
 def _resolve_apply_managed_globals_hook(module: Any) -> Optional[Any]:
     candidate = getattr(module, "apply_managed_globals", None)
     if candidate is None:
@@ -1435,7 +1400,6 @@ __all__ = [
     "_describe_artifact_error",
     "_describe_user_execution_error",
     "_discover_callable_methods",
-    "_discover_callable_methods_or_raise_user_error",
     "_execute_payload_in_subprocess",
     "_install_dependency_allowlist",
     "_invoke_local_user_callable",

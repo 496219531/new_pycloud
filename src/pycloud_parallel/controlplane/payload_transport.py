@@ -181,23 +181,6 @@ def prepare_outbound_payload(
     return prepared
 
 
-def prepare_outbound_value(
-    value: Any,
-    *,
-    put_data: PutPayloadData,
-    estimate_inline_size: EstimateInlineSize,
-    policy: PayloadPolicy,
-    preserve_container: bool = False,
-) -> Any:
-    return _prepare_value_for_transport(
-        value,
-        policy=policy,
-        estimate_inline_size=estimate_inline_size,
-        put_data=put_data,
-        preserve_container=preserve_container,
-    )
-
-
 def estimate_payload_inline_size(value: Any) -> int:
     serialized = serialize_arrow_compatible(value)
     return len(json.dumps(serialized, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))

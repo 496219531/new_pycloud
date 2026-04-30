@@ -50,7 +50,6 @@ from pycloud_parallel.data.ref import normalize_materialize_as, normalize_object
 from pycloud_parallel.controlplane.payload_transport import (
     estimate_payload_inline_size,
     prepare_outbound_payload,
-    prepare_outbound_value,
 )
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.serialization import (
@@ -627,62 +626,6 @@ def _prepare_payload_for_policy(
     return prepare_outbound_payload(
         payload,
         **prepare_kwargs,
-    )
-
-
-def _prepare_value_for_policy(
-    clients: Sequence[Any],
-    value: Any,
-    *,
-    policy,
-    preserve_container: bool = False,
-    default_serialization_mode: str = "",
-) -> Any:
-    put_kwargs = {}
-    if str(default_serialization_mode or "").strip() and str(default_serialization_mode).strip().lower() != "legacy_v1":
-        put_kwargs["default_serialization_mode"] = default_serialization_mode
-    return prepare_outbound_value(
-        value,
-        put_data=lambda data, *, format="": _put_data_via_clients(clients, data, format=format, **put_kwargs),
-        estimate_inline_size=_estimate_managed_global_inline_size,
-        policy=policy,
-        preserve_container=preserve_container,
-    )
-
-
-def _prepare_payload_value_for_upload(
-    clients: Sequence[Any],
-    value: Any,
-    *,
-    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-    preserve_container: bool = False,
-    recurse_containers: bool = False,
-    upload_pathlike: bool = False,
-    upload_string_file: bool = False,
-    upload_bytes: bool = False,
-    consume_on_read: bool = False,
-    serialization_mode: str = "",
-    effective_policy: Optional[EffectivePolicy] = None,
-) -> Any:
-    base_policy = _payload_policy_for_mode(
-        "managed_globals",
-        effective_policy=effective_policy,
-        object_threshold_bytes=object_threshold_bytes,
-    )
-    policy = replace(
-        base_policy,
-        objectify_pathlikes=bool(upload_pathlike),
-        objectify_strings_as_files=bool(upload_string_file),
-        objectify_bytes=bool(upload_bytes),
-        recurse_containers=bool(recurse_containers),
-        consume_on_read=bool(consume_on_read),
-    )
-    return _prepare_value_for_policy(
-        clients,
-        value,
-        policy=policy,
-        preserve_container=preserve_container,
-        default_serialization_mode=serialization_mode,
     )
 
 

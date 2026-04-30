@@ -827,10 +827,6 @@ def _data_store_for_object_dir(
     )
 
 
-def _stored_result_to_result_ref(result: StoredResultArtifact, *, node_id: str) -> DataRef:
-    return _data_store_for_object_dir("", node_id=node_id).result_ref_from_stored_artifact(result)
-
-
 def _resolve_single_data_ref(ref: DataRef | object, *, object_dir: str) -> Any:
     data_ref = ref if isinstance(ref, DataRef) else coerce_data_ref(ref)
     root = Path(str(object_dir or "")).resolve()
@@ -961,6 +957,5 @@ __all__ = [
     "_store_result_ndarray",
     "_store_result_path",
     "_store_result_series",
-    "_stored_result_to_result_ref",
     "_write_object_meta_with_retry",
 ]
