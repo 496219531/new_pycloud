@@ -1538,8 +1538,8 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
     infocenter_addr = str(infocenter_arg or "").strip()
     bind = _resolve_bind_value(
         str(args.bind),
-        host=str(getattr(args, "node_host", "") or ""),
-        port=int(getattr(args, "node_port", 0) or 0),
+        host="",
+        port=0,
         label="node bind",
         remote_hint=infocenter_addr,
         prefer_local=bool(getattr(args, "local", False)),
@@ -1549,21 +1549,18 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
         service_http_seed = _default_service_http_bind_for_node_bind(bind)
     service_http_bind = _resolve_bind_value(
         service_http_seed,
-        host=str(getattr(args, "service_http_host", "") or ""),
-        port=int(getattr(args, "service_http_port", 0) or 0),
+        host="",
+        port=0,
         label="service http bind",
         remote_hint=infocenter_addr,
         prefer_local=bool(getattr(args, "local", False)),
     )
     advertise_addr = str(args.advertise_addr or "").strip()
-    advertise_host = str(getattr(args, "advertise_host", "") or "")
-    advertise_port = int(getattr(args, "advertise_port", 0) or 0)
-    if advertise_addr or advertise_host or advertise_port:
-        advertise_seed = advertise_addr or bind
+    if advertise_addr:
         advertise_addr = _resolve_bind_value(
-            advertise_seed,
-            host=advertise_host,
-            port=advertise_port,
+            advertise_addr,
+            host="",
+            port=0,
             label="advertise addr",
             prefer_local=bool(getattr(args, "local", False)),
         )
@@ -2356,19 +2353,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_debug_argument(start_node)
     start_node.add_argument("--node-id", default="node-local-01", type=_normalize_managed_name, help="managed node name used for pid/log files and registration")
     start_node.add_argument("--bind", default="0.0.0.0:50061", help="full gRPC bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
-    start_node.add_argument("--node-host", default="", help="optional grpc bind host override for start-node; default auto-detects local IP")
-    start_node.add_argument("--node-port", type=int, default=0, help="optional grpc bind port override for start-node")
     start_node.add_argument("--service-http-bind", default="", help="full service HTTP bind address in host:port form for start-node; defaults to the node bind host and a port derived from the gRPC port, for example 50061 -> 18081")
-    start_node.add_argument("--service-http-host", default="", help="optional service http bind host override for start-node; default auto-detects local IP")
-    start_node.add_argument("--service-http-port", type=int, default=0, help="optional service http bind port override for start-node")
     start_node.add_argument(
         "--infocenter-addr",
         default=None,
         help='InfoCenter/ControlPlane target; required for registration, pass empty string ("") to disable registration',
     )
     start_node.add_argument("--advertise-addr", default="", help="full advertised control address in host:port form; defaults to the auto-resolved gRPC bind address")
-    start_node.add_argument("--advertise-host", default="", help="optional advertise host override for start-node; default auto-detects local IP")
-    start_node.add_argument("--advertise-port", type=int, default=0, help="optional advertise port override for start-node")
     start_node.add_argument("--worker-capacity", type=int, default=0, help="node runtime worker capacity; 0 means auto-calculate")
     start_node.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="node task queue capacity")
     start_node.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS, help="max gRPC server worker threads for nodecontrol")

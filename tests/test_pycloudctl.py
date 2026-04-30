@@ -112,36 +112,14 @@ def test_ctl_parser_accepts_start_node_command():
     assert args.bind == "0.0.0.0:51061"
 
 
-def test_ctl_parser_accepts_start_node_port_aliases():
-    parser = ctl.build_parser()
-    args = parser.parse_args(
-        [
-            "start-node",
-            "--node-id",
-            "node-a",
-            "--node-port",
-            "51061",
-            "--service-http-port",
-            "18181",
-            "--advertise-port",
-            "52061",
-        ]
-    )
-    assert args.command == "start-node"
-    assert args.node_port == 51061
-    assert args.service_http_port == 18181
-    assert args.advertise_port == 52061
-
-
-def test_ctl_start_node_help_mentions_bind_and_port_aliases():
+def test_ctl_start_node_help_mentions_canonical_bind_options():
     parser = ctl.build_parser()
     help_text = parser.format_help()
     start_node = parser._subparsers._group_actions[0].choices["start-node"]
     start_node_help = start_node.format_help()
     assert "--bind" in start_node_help
-    assert "--node-port" in start_node_help
     assert "--service-http-bind" in start_node_help
-    assert "--advertise-port" in start_node_help
+    assert "--advertise-addr" in start_node_help
     assert "start-node" in help_text
 
 
@@ -1312,7 +1290,7 @@ def test_cmd_start_node_can_disable_registration(tmp_path, monkeypatch):
     assert started[0]["advertise_addr"] == ""
 
 
-def test_cmd_start_node_port_aliases_override_bind_values(tmp_path, monkeypatch):
+def test_cmd_start_node_canonical_addresses(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(
         [
@@ -1321,16 +1299,12 @@ def test_cmd_start_node_port_aliases_override_bind_values(tmp_path, monkeypatch)
             "start-node",
             "--node-id",
             "node-green",
-            "--node-port",
-            "52061",
-            "--service-http-port",
-            "19181",
-            "--service-http-host",
-            "0.0.0.0",
-            "--advertise-host",
-            "10.0.0.9",
-            "--advertise-port",
-            "62061",
+            "--bind",
+            "0.0.0.0:52061",
+            "--service-http-bind",
+            "0.0.0.0:19181",
+            "--advertise-addr",
+            "10.0.0.9:62061",
             "--infocenter-addr",
             "10.0.0.8:51051",
         ]

@@ -412,25 +412,6 @@ pycloudctl start-node \
   --queue-capacity 1000
 ```
 
-如果你更习惯按“端口参数”来写，也可以直接用：
-
-```bash
-pycloudctl start-node \
-  --node-id node-1 \
-  --node-port 50061 \
-  --service-http-port 18081 \
-  --infocenter-addr 127.0.0.1:50051
-```
-
-可选地再配这些别名：
-
-1. `--node-host`
-2. `--service-http-host`
-3. `--advertise-host`
-4. `--advertise-port`
-
-这些参数会和原有的 `--bind` / `--service-http-bind` / `--advertise-addr` 合并，旧写法仍然可用。
-
 默认情况下，如果你没显式指定 host，`pycloudctl` 现在会自动探测本机 IP 来填充 bind / advertise / service-http 地址，不再默认回退到 `127.0.0.1`。
 
 如果你就是想强制走回环地址，也可以直接写：
