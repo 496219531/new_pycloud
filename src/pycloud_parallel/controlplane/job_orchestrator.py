@@ -11,10 +11,21 @@ from typing import Dict, List, Optional, Tuple
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.policy_profile import get_default_policy_id_for_binding
-from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 
 
 DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME = "job-orchestrator"
+JOB_ORCHESTRATOR_SERVICE_MODULE = "pycloud_parallel.controlplane.job_orchestrator_service"
+JOB_ORCHESTRATOR_EXPORT_METHODS = ("submit_job", "get_job_status", "cancel_job", "reorder_job")
+JOB_ORCHESTRATOR_MANAGED_GLOBALS = (
+    "service_id",
+    "service_name",
+    "queue_capacity",
+    "taskpool_policy_id",
+    "admin_token",
+    "controlplane_target",
+    "base_url",
+    "render_job_detail_page",
+)
 _JOB_ORCH_SUBMIT_TRANSPORT_MODE = "structured_v1"
 _SUBMIT_POLICY_FIELD_ERROR = (
     "job submit policy_id/taskpool_policy_id is not supported; "
@@ -159,7 +170,9 @@ class JobOrchestratorModule:
         return None
 
 
-class JobOrchestratorServer(StartupServiceNode):
+class JobOrchestratorServer:
+    """Process wrapper that starts the built-in job-orchestrator as a startup service."""
+
     def __init__(
         self,
         *,
@@ -177,18 +190,6 @@ class JobOrchestratorServer(StartupServiceNode):
         self.bind = str(bind or "").strip()
         self.infocenter_addr = str(infocenter_addr or "").strip()
         self.node_id = str(node_id or "job-orchestrator-01").strip() or "job-orchestrator-01"
-        super().__init__(
-            node_id=self.node_id,
-            service_http_bind=self.bind,
-            service_http_base_url="",
-            worker_capacity=1,
-            queue_capacity=queue_capacity,
-            service_worker_capacity=1,
-            task_pool_worker_capacity=1,
-            enable_internal_executor=False,
-            enable_service_session=False,
-            accept_service_deploy=False,
-        )
         self.service_name = str(service_name or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME).strip() or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME
         self.queue_capacity = max(1, int(queue_capacity or 1))
         self.tags = list(tags or ["job"])
@@ -206,31 +207,12 @@ class JobOrchestratorServer(StartupServiceNode):
         self.admin_token = str(admin_token or env_admin_token or fallback_admin_token or "").strip()
 
         self.service_id = uuid.uuid4().hex
-        service_module_name = "pycloud_parallel.controlplane.job_orchestrator_service"
-        self._service_module = importlib.import_module(service_module_name)
-        mount = self.mount_python_module_service(
-            service_name=self.service_name,
-            entry_module=service_module_name,
-            export_methods=("submit_job", "get_job_status", "cancel_job", "reorder_job"),
-            service_id=self.service_id,
-            worker_count=1,
-            policy_id=self.job_orch_policy_id,
-            managed_global_names=(
-                "service_id",
-                "service_name",
-                "queue_capacity",
-                "taskpool_policy_id",
-                "admin_token",
-                "controlplane_target",
-                "base_url",
-                "render_job_detail_page",
-            ),
-        )
-        self.service_id = mount.service_id
-        self.update_globals(self._managed_globals(), service_id=self.service_id)
-        self.module = self._service_module.business_module(self.service_id)
-        self.job_queue = self.module.job_queue
+        self._service_module_name = JOB_ORCHESTRATOR_SERVICE_MODULE
+        self._service_module = importlib.import_module(self._service_module_name)
         self.base_url = ""
+        self.module: Optional[JobOrchestratorModule] = None
+        self.job_queue: Optional[JobQueueManager] = None
+        self._node = None
         self._stopped = threading.Event()
 
     def _managed_globals(self) -> Dict[str, object]:
@@ -241,6 +223,7 @@ class JobOrchestratorServer(StartupServiceNode):
             "taskpool_policy_id": self.taskpool_policy_id,
             "admin_token": self.admin_token,
             "controlplane_target": self.infocenter_addr,
+            "base_url": self.base_url,
             "render_job_detail_page": self._render_job_detail_page,
         }
 
@@ -256,26 +239,35 @@ class JobOrchestratorServer(StartupServiceNode):
             self.job_orch_policy_id,
             self.taskpool_policy_id,
         )
-        self.start_mounted_service_gateway()
-        self.base_url = self.service_http_base_url
-        values = self._managed_globals()
-        if self.base_url:
-            values["base_url"] = self.base_url
-        self.update_globals(values, service_id=self.service_id)
+        from pycloud_parallel.execution.service_session import Service
+
+        self._node = Service.startup(
+            source=self._service_module,
+            service_name=self.service_name,
+            export_methods=JOB_ORCHESTRATOR_EXPORT_METHODS,
+            bind=self.bind,
+            target=self.infocenter_addr,
+            node_id=self.node_id,
+            service_id=self.service_id,
+            worker_count=1,
+            policy_id=self.job_orch_policy_id,
+            package_format="module",
+            managed_global_names=JOB_ORCHESTRATOR_MANAGED_GLOBALS,
+            tags=self.tags,
+            metadata={"component": "job-orchestrator"},
+            queue_capacity=self.queue_capacity,
+            version=self.version,
+            start=True,
+        )
+        self.service_id = self._node._local_service_id
+        self.base_url = self._node.service_http_base_url
+        self._node.update_globals(self._managed_globals(), service_id=self.service_id)
         self.module = self._service_module.business_module(self.service_id)
+        self.job_queue = self.module.job_queue
         self._service_module.start(
             controlplane_target=self.infocenter_addr,
             base_url=self.base_url,
             service_id=self.service_id,
-        )
-        self.start_infocenter_registration(
-            infocenter_target=self.infocenter_addr,
-            control_addr="",
-            capacity=1,
-            queue_capacity=self.queue_capacity,
-            tags=self.tags,
-            version=self.version,
-            metadata={"component": "job-orchestrator"},
         )
 
     def stop(self, grace: int = 0) -> None:
@@ -287,7 +279,9 @@ class JobOrchestratorServer(StartupServiceNode):
             self.service_id,
         )
         self._service_module.close(service_id=self.service_id)
-        super().close()
+        if self._node is not None:
+            self._node.close()
+            self._node = None
         self._stopped.set()
 
     def wait_for_termination(self) -> None:

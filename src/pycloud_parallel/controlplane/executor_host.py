@@ -317,13 +317,13 @@ class ExecutorHostClient:
                             item = queue.popleft()
                             if not queue:
                                 self._stream_events.pop(request_id, None)
+                            response = None
                         else:
                             item = None
-                        response = self._responses.pop(request_id, None)
+                            response = self._responses.pop(request_id, None)
                     if item is not None:
                         yield item
-                        if response is None:
-                            continue
+                        continue
                     if response is None:
                         continue
                     if not response.get("ok", False):

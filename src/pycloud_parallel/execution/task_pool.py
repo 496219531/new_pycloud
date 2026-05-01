@@ -7,10 +7,13 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
 from dataclasses import dataclass, replace
+import hashlib
 import inspect
 import logging
 import math
+from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -63,7 +66,7 @@ from pycloud_parallel.execution.support import (
     _put_data_via_clients,
     _resolve_public_target_arg,
 )
-from pycloud_parallel.data.ref import DataRef
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref, normalize_object_format, object_id_from_sha256_hex
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -155,6 +158,242 @@ def _node_control_client(*args, **kwargs):
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
     return NodeControlClient(*args, **kwargs)
+
+
+class _LocalTaskPoolNodeClient:
+    def __init__(self, state) -> None:
+        self._state = state
+        self.target = ""
+        self.node_id = str(getattr(state, "node_id", "") or "")
+        self.node_instance_id = str(getattr(state, "node_instance_id", "") or "")
+
+    def close(self) -> None:
+        self._state.close()
+
+    def upload_object_from_bytes(
+        self,
+        *,
+        blob: bytes,
+        format: str = "",
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        **kwargs: Any,
+    ) -> DataRef:
+        del chunk_size, kwargs
+        data = bytes(blob or b"")
+        digest = hashlib.sha256(data).hexdigest()
+        object_id = object_id_from_sha256_hex(digest)
+        fmt = normalize_object_format(format, default="bin")
+        tmp = tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="pycloud-local-object-",
+            suffix=f".{fmt}",
+            delete=False,
+            dir=str(self._state.artifact_dir),
+        )
+        try:
+            with tmp:
+                tmp.write(data)
+            artifact, _cached = self._state.put_object_from_uploaded_file(
+                object_id=object_id,
+                format=fmt,
+                uploaded_path=tmp.name,
+                actual_sha256=digest,
+                size_bytes=len(data),
+            )
+        except Exception:
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
+        return DataRef(
+            ref_id=artifact.object_id,
+            storage_id=artifact.object_id,
+            format=artifact.format,
+            size_bytes=artifact.size_bytes,
+            materialize_as="path",
+            locator_kind="node_local",
+            node_id=self.node_id,
+            node_instance_id=self.node_instance_id,
+        )
+
+    def upload_object_from_file(
+        self,
+        *,
+        file_path: str,
+        format: str = "",
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        **kwargs: Any,
+    ) -> DataRef:
+        del chunk_size, kwargs
+        path = Path(file_path)
+        data = path.read_bytes()
+        fmt = normalize_object_format(format, source_name=path.name, default="bin")
+        return self.upload_object_from_bytes(blob=data, format=fmt)
+
+    def submit_pool_tasks(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        tasks: Sequence[pb2.TaskSubmitItem],
+        job_id: str = "",
+    ) -> pb2.SubmitTasksResponse:
+        accepted, rejected = self._state.submit_pool_tasks(
+            pool_id=pool_id,
+            pool_token=pool_token,
+            tasks=list(tasks),
+            job_id=job_id,
+        )
+        return pb2.SubmitTasksResponse(ok=True, accepted=accepted, rejected=rejected, node_credit=0)
+
+    def pull_pool_results(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        limit: int = 100,
+        wait_ms: int = 0,
+        cursor: str = "",
+    ) -> pb2.PullResultsResponse:
+        results, next_cursor = self._state.pull_pool_results(
+            pool_id=pool_id,
+            pool_token=pool_token,
+            limit=limit,
+            wait_ms=wait_ms,
+            cursor=cursor,
+        )
+        return pb2.PullResultsResponse(ok=True, results=results, next_cursor=next_cursor)
+
+    def close_task_pool(
+        self,
+        *,
+        owner_client_id: str,
+        pool_id: str,
+        pool_token: str,
+        reason: str = "",
+    ) -> pb2.CloseTaskPoolResponse:
+        self._state.close_task_pool(
+            owner_client_id=owner_client_id,
+            pool_id=pool_id,
+            pool_token=pool_token,
+            reason=reason,
+        )
+        return pb2.CloseTaskPoolResponse(ok=True, accepted=True)
+
+    def heartbeat_task_pool(
+        self,
+        *,
+        owner_client_id: str,
+        pool_id: str,
+        pool_token: str,
+        seq: int = 0,
+    ) -> pb2.HeartbeatTaskPoolResponse:
+        del seq
+        pool = self._state.heartbeat_task_pool(
+            owner_client_id=owner_client_id,
+            pool_id=pool_id,
+            pool_token=pool_token,
+        )
+        return pb2.HeartbeatTaskPoolResponse(
+            ok=True,
+            accepted=True,
+            next_heartbeat_in_sec=max(1, int(pool.heartbeat_timeout_sec or 30) // 2),
+        )
+
+    def cancel_pool_job(
+        self,
+        *,
+        pool_id: str,
+        pool_token: str,
+        job_id: str,
+        reason: str = "",
+    ) -> pb2.CancelJobResponse:
+        queued, running, done, missing = self._state.cancel_pool_job(
+            pool_id=pool_id,
+            pool_token=pool_token,
+            job_id=job_id,
+            reason=reason,
+        )
+        return pb2.CancelJobResponse(
+            ok=True,
+            queued_cancelled=queued,
+            running_marked=running,
+            already_done=done,
+            not_found=missing,
+        )
+
+    def get_task_pool_status(self, *, pool_id: str, pool_token: str) -> pb2.TaskPoolStatusInfo:
+        from pycloud_parallel.controlplane.state_time import dt_to_ts
+
+        pool = self._state.task_pool(pool_id)
+        self._state._require_pool_token(pool, pool_token)  # noqa: SLF001
+        info = self._state.task_pool_status_info(pool_id)
+        return pb2.TaskPoolStatusInfo(
+            pool_id=str(info.get("pool_id", "")),
+            owner_client_id=str(info.get("owner_client_id", "")),
+            pool_name=str(info.get("pool_name", "")),
+            code_version=str(info.get("code_version", "")),
+            worker_count=int(info.get("worker_count", 0) or 0),
+            heartbeat_timeout_sec=int(info.get("heartbeat_timeout_sec", 0) or 0),
+            status=str(info.get("status", "")),
+            task_count=int(info.get("task_count", 0) or 0),
+            created_at=dt_to_ts(info["created_at"]),
+            last_heartbeat_at=dt_to_ts(info["last_heartbeat_at"]),
+            lease_expire_at=dt_to_ts(info["lease_expire_at"]),
+        )
+
+    def update_runtime_globals_prepared(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        runtime_key: str,
+        code_token: str,
+        prepared_values: Dict[str, object],
+        serialization_mode: str = "",
+        effective_policy: Optional[EffectivePolicy] = None,
+    ) -> pb2.UpdateRuntimeGlobalsResponse:
+        del effective_policy
+        digest, updated = self._state.update_runtime_globals(
+            client_id=client_id,
+            code_version=code_version,
+            runtime_key=runtime_key,
+            code_token=code_token,
+            values=dict(prepared_values or {}),
+            serialization_mode=serialization_mode,
+        )
+        return pb2.UpdateRuntimeGlobalsResponse(
+            ok=True,
+            code_version=code_version,
+            runtime_key=runtime_key or code_version,
+            globals_digest=digest,
+            updated_names=updated,
+        )
+
+    def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
+        if target_path:
+            raise ValueError("local task pool fetch_result_data does not support target_path")
+        if task_result.HasField("transport_result") and str(task_result.transport_result.codec or "").strip():
+            from pycloud_parallel.controlplane.serialization import decode_transport_payload_bytes
+
+            data = decode_transport_payload_bytes(
+                str(task_result.transport_result.codec or ""),
+                int(task_result.transport_result.version or 0),
+                task_result.transport_result.payload,
+                context="taskpool_session",
+            )
+        else:
+            from pycloud_parallel.controlplane.payload_transport import decode_result_from_transport
+            from pycloud_parallel.controlplane.serialization import detect_transport_mode, struct_to_python
+
+            raw = struct_to_python(task_result.result)
+            data = decode_result_from_transport(
+                raw,
+                mode=detect_transport_mode(raw, default="legacy_v1"),
+                context="taskpool_session",
+            )
+        ref = maybe_data_ref(data)
+        if ref is None:
+            return data
+        return self._state.data_store.resolve_data_ref(ref)
 
 
 def _close_task_pool_replica(pool: Any, *, reason: str) -> None:
@@ -2485,6 +2724,135 @@ def _build_task_pool_from_infocenter(
     return session
 
 
+def _build_local_task_pool(
+    cls,
+    *,
+    job_id: str = "",
+    source: Any = None,
+    owner_client_id: Optional[str] = None,
+    pool_name: Optional[str] = None,
+    artifact: Optional[Any] = None,
+    deps: Optional[Any] = None,
+    runtime: str = "py3",
+    package_format: str = "",
+    resource_paths: Optional[Sequence[Any]] = None,
+    managed_global_names: Optional[Sequence[str]] = None,
+    worker_count: int = 1,
+    heartbeat_timeout_sec: int = 30,
+    idle_ttl_sec: int = 0,
+    serialization_mode: str = "",
+) -> "TaskPool":
+    from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
+
+    module_source = source if inspect.ismodule(source) else None
+    normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
+    if normalized_resource_paths and module_source is None:
+        raise ValueError("resource_paths requires a module source")
+    entry_module: Any = ""
+    entry_callable: Any = "run"
+    if normalized_resource_paths and module_source is not None:
+        module_blob, module_filename = _prepare_code_blob(module=module_source, resource_paths=normalized_resource_paths)
+        source = module_blob
+        entry_module = _default_entry_module_for_module(module_source)
+        package_format = _resolve_package_format(package_format, module_filename, default="py")
+
+    normalized_artifact = _normalize_artifact_input(
+        consumer_kind="task",
+        source=source,
+        artifact=artifact,
+        deps=deps,
+        runtime=runtime,
+        entry_module=entry_module,
+        entry_callable=entry_callable,
+        package_format=package_format,
+        managed_global_names=managed_global_names,
+    )
+    prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="task")
+    effective_owner = str(owner_client_id or f"local-client-{_get_local_ip()}").strip()
+    effective_pool_name = str(pool_name or f"local-task-pool-{uuid.uuid4().hex[:10]}").strip()
+    effective_worker_count = max(1, int(worker_count or 1))
+    effective_policy = resolve_effective_policy(
+        get_policy_profile(get_default_policy_id_for_binding("taskpool_default")),
+        requested_mode=serialization_mode,
+        context="taskpool_session",
+    )
+    node = NodeControlState(
+        node_id=f"{effective_pool_name}-local",
+        worker_capacity=effective_worker_count,
+        service_worker_capacity=1,
+        task_pool_worker_capacity=effective_worker_count,
+        service_http_bind="",
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        pool = node.create_task_pool(
+            owner_client_id=effective_owner,
+            pool_name=effective_pool_name,
+            sha256=prepared_artifact.content_sha256,
+            runtime=prepared_artifact.runtime,
+            entry_module=prepared_artifact.entry_module,
+            entry_callable=prepared_artifact.entry_callable,
+            package_format=prepared_artifact.package_format,
+            dependency_policy_mode=prepared_artifact.dependency_policy_mode,
+            dependency_allowlist=list(prepared_artifact.dependency_allowlist),
+            managed_global_names=list(prepared_artifact.managed_global_names),
+            worker_count=effective_worker_count,
+            heartbeat_timeout_sec=heartbeat_timeout_sec,
+            idle_ttl_sec=idle_ttl_sec,
+            chunks=[prepared_artifact.blob],
+        )
+        adapter = _LocalTaskPoolNodeClient(node)
+        native = NativeTaskPoolClient(
+            _client=adapter,
+            owner_client_id=pool.owner_client_id,
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            code_version=pool.code_version,
+            worker_count=pool.worker_count,
+            heartbeat_timeout_sec=pool.heartbeat_timeout_sec,
+            pool_name=pool.pool_name,
+            idle_ttl_sec=pool.idle_ttl_sec,
+            node_instance_id=adapter.node_instance_id,
+            node_id=adapter.node_id,
+            status=pool.status,
+            created_at=pool.created_at,
+            last_heartbeat_at=pool.last_heartbeat_at,
+            lease_expire_at=pool.lease_expire_at,
+        )
+        node_info = InfoCenterNode(
+            node_instance_id=adapter.node_instance_id,
+            node_id=adapter.node_id,
+            control_addr="local",
+            healthy=True,
+            capacity=effective_worker_count,
+            queue_capacity=0,
+            queued=0,
+            inflight=0,
+            credit=effective_worker_count,
+            task_pool_worker_capacity=effective_worker_count,
+            task_pool_worker_available=effective_worker_count,
+        )
+        session = cls(
+            pools={adapter.node_instance_id: native},
+            nodes={adapter.node_instance_id: node_info},
+            task_method=prepared_artifact.entry_callable,
+            job_id=job_id,
+            serialization_mode=effective_policy.resolved_mode,
+            policy_id=get_default_policy_id_for_binding("taskpool_default"),
+            effective_policy=effective_policy,
+        )
+    except Exception:
+        node.close()
+        raise
+    session._start_keepalive()
+    _emit_taskpool_notice(
+        f"local open success pool_name={effective_pool_name} "
+        f"routes={_format_pool_route_summary(session.route_summary())}"
+    )
+    return session
+
+
 __all__ = [
     "TaskPool",
 ]
@@ -2526,6 +2894,24 @@ class TaskPool(_TaskPoolSessionBase):
         Default path: ``TaskPool.open(target=\"127.0.0.1:50051\", source=my_module, ...)``.
         Advanced path: ``TaskPool.open(artifact=Artifact(...), ...)``.
         """
+        if str(target or "").strip().lower() == "local":
+            return _build_local_task_pool(
+                cls,
+                job_id=job_id,
+                source=source,
+                owner_client_id=owner_client_id,
+                pool_name=pool_name,
+                artifact=artifact,
+                deps=deps,
+                runtime=runtime,
+                package_format=package_format,
+                resource_paths=resource_paths,
+                managed_global_names=managed_global_names,
+                worker_count=worker_count,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                serialization_mode=serialization_mode,
+            )
         effective_target = _resolve_public_target_arg(
             target=target,
             action_name="TaskPool.open()",

@@ -6,7 +6,7 @@ import inspect
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.artifact import (
     Artifact,
@@ -15,9 +15,7 @@ from pycloud_parallel.controlplane.artifact import (
     _prepare_artifact,
     _resolve_package_format,
 )
-from pycloud_parallel.controlplane import client_transport as _client_transport
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, resolve_effective_policy
-from pycloud_parallel.controlplane.infocenter_client import _route_sort_key
 from pycloud_parallel.controlplane.policy_profile import (
     get_default_mode_for_binding,
     get_default_policy_id_for_binding,
@@ -42,7 +40,6 @@ from pycloud_parallel.execution.support import (
     _stage_job_submit_payload_for_transport,
     _write_job_client_session_cache,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
 
@@ -50,19 +47,11 @@ _JOBQUEUE_BINDING_ID = "jobqueue_controlplane_transport"
 _JOBQUEUE_TRANSPORT_MODE = get_default_mode_for_binding(_JOBQUEUE_BINDING_ID)
 _JOBQUEUE_POLICY_ID = get_default_policy_id_for_binding(_JOBQUEUE_BINDING_ID)
 
-DiscoveryCallError = _client_transport.DiscoveryCallError
-_call_route_http = _client_transport._call_route_http
-_is_route_failure = _client_transport._is_route_failure
-
-
-def _infocenter_client(*args, **kwargs):
-    from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
-
-    return InfoCenterClient(*args, **kwargs)
-
-
 def _decode_job_response_payload(response: Dict[str, object]) -> Dict[str, object]:
     body = dict(response or {})
+    data = body.get("data")
+    if "job" not in body and isinstance(data, dict) and "job" in data:
+        body = dict(data)
     job = body.get("job")
     if isinstance(job, dict):
         body["job"] = convert_dict_to_arrow(job)
@@ -77,119 +66,8 @@ def _jobqueue_effective_policy() -> EffectivePolicy:
     )
 
 
-class _JobOrchestratorDiscoveryClient:
-    """Resolve job-orchestrator via InfoCenter and call its HTTP endpoint directly."""
-
-    def __init__(
-        self,
-        target: str,
-        *,
-        timeout_sec: float = 10.0,
-        service_token: str = "",
-        serialization_mode: str = "",
-        effective_policy: Optional[EffectivePolicy] = None,
-    ) -> None:
-        del serialization_mode
-        self.target = str(target or "").strip()
-        self.timeout_sec = max(0.1, float(timeout_sec))
-        self.service_token = str(service_token or "").strip()
-        self.effective_policy = effective_policy or _jobqueue_effective_policy()
-        self.serialization_mode = str(self.effective_policy.resolved_mode or _JOBQUEUE_TRANSPORT_MODE).strip() or _JOBQUEUE_TRANSPORT_MODE
-
-    def close(self) -> None:
-        return None
-
-    def _list_routes(self, *, service_name: str) -> List[object]:
-        try:
-            with _infocenter_client(self.target, timeout_sec=self.timeout_sec) as client:
-                routes = list(
-                    client.list_service_routes(
-                        service_name=str(service_name or "").strip(),
-                        healthy_only=True,
-                        limit=32,
-                    )
-                )
-        except Exception as exc:
-            raise RuntimeError(f"failed to query service routes from InfoCenter target={self.target}: {exc}") from exc
-        candidates = [
-            route
-            for route in routes
-            if route.status == pb2.SERVICE_STATUS_RUNNING and str(route.http_base_url or "").strip()
-        ]
-        candidates.sort(key=lambda route: _route_sort_key(route, strategy="predicted_busy"))
-        return candidates
-
-    def resolve_effective_policy_for_service(
-        self,
-        *,
-        service_name: str,
-        requested_mode: str = "",
-    ) -> EffectivePolicy:
-        del service_name, requested_mode
-        return _jobqueue_effective_policy()
-
-    def call(
-        self,
-        *,
-        service_name: str,
-        method: str,
-        payload: Optional[Dict[str, object]] = None,
-        timeout_sec: float = 60.0,
-        service_token: Optional[str] = None,
-        serialization_mode: str = "",
-        effective_policy: Optional[EffectivePolicy] = None,
-    ) -> Dict[str, object]:
-        name = str(service_name or "").strip()
-        method_name = str(method or "").strip()
-        if not name:
-            raise ValueError("JobQueue route lookup requires service_name")
-        if not method_name:
-            raise ValueError("JobQueue route lookup requires method")
-
-        token = self.service_token if service_token is None else str(service_token or "").strip()
-        tried: Set[str] = set()
-        routes = self._list_routes(service_name=name)
-        if not routes:
-            raise RuntimeError(
-                f"JobQueue could not find a running job-orchestrator route for service_name={name!r}"
-            )
-        del serialization_mode
-        route_effective_policy = _jobqueue_effective_policy()
-        effective_serialization_mode = route_effective_policy.resolved_mode
-
-        last_exc: Optional[Exception] = None
-        for route in routes:
-            if route.service_id in tried:
-                continue
-            tried.add(route.service_id)
-            try:
-                call_kwargs = {
-                    "method": method_name,
-                    "payload": payload or {},
-                    "timeout_sec": max(0.1, float(timeout_sec)),
-                    "service_token": token,
-                }
-                if (
-                    str(effective_serialization_mode or "").strip()
-                    and effective_serialization_mode != "legacy_v1"
-                ):
-                    call_kwargs["serialization_mode"] = effective_serialization_mode
-                call_kwargs["effective_policy"] = route_effective_policy
-                return _call_route_http(
-                    route,
-                    **call_kwargs,
-                )
-            except DiscoveryCallError as exc:
-                last_exc = exc
-                if not _is_route_failure(exc):
-                    raise RuntimeError(str(exc)) from exc
-                continue
-
-        if last_exc is not None:
-            raise RuntimeError(str(last_exc)) from last_exc
-        raise RuntimeError(
-            f"JobQueue could not find a usable job-orchestrator route for service_name={name!r}"
-        )
+def _is_local_target(target: str) -> bool:
+    return str(target or "").strip().lower() == "local"
 
 
 class QueueServiceClient:
@@ -237,12 +115,18 @@ class QueueServiceClient:
                 self.client_id = f"job-client-{uuid.uuid4().hex[:8]}"
             self.auth_token = explicit_auth_token or uuid.uuid4().hex
 
-        self._service_client = _JobOrchestratorDiscoveryClient(
-            self.target,
+        from pycloud_parallel.execution.service_session import Service
+
+        self._service = Service._connect_transport(
+            target=self.target,
+            service_name=self.service_name,
             timeout_sec=self.timeout_sec,
             service_token=self.auth_token,
+            transport="local" if _is_local_target(self.target) else "discovery",
             serialization_mode=self.serialization_mode,
-            effective_policy=self.effective_policy,
+            validate_on_init=False,
+            effective_policy_override=self.effective_policy,
+            prepare_discovery_payload=False,
         )
         self._persist_local_session()
 
@@ -253,26 +137,44 @@ class QueueServiceClient:
         return effective_policy
 
     def close(self) -> None:
-        self._service_client.close()
+        self._service.close()
 
-    def _call_service_client(
+    def _call_job_orchestrator(
         self,
         *,
         effective_policy: EffectivePolicy,
         **call_kwargs,
     ) -> Dict[str, object]:
-        try:
-            return self._service_client.call(
-                effective_policy=effective_policy,
-                **call_kwargs,
+        service_name = str(call_kwargs.get("service_name", "") or "").strip()
+        method = str(call_kwargs.get("method", "") or "").strip()
+        if service_name != self.service_name:
+            raise ValueError(
+                f"JobQueue service client is bound to service_name={self.service_name!r}, got {service_name!r}"
             )
-        except TypeError as exc:
-            message = str(exc)
-            if "effective_policy" not in message and "serialization_mode" not in message:
-                raise
-            fallback_kwargs = dict(call_kwargs)
-            fallback_kwargs.pop("serialization_mode", None)
-            return self._service_client.call(**fallback_kwargs)
+        if not method:
+            raise ValueError("JobQueue route lookup requires method")
+        self.effective_policy = effective_policy
+        self.serialization_mode = effective_policy.resolved_mode
+        self._service._fixed_effective_policy = effective_policy  # noqa: SLF001
+        self._service.effective_policy = effective_policy
+        self._service.serialization_mode = effective_policy.resolved_mode
+        payload = dict(call_kwargs.get("payload") or {})
+        if getattr(self._service, "transport", "") == "local" and self.auth_token:
+            payload.setdefault("_service_token", self.auth_token)
+        effective_serialization_mode = (
+            str(call_kwargs.get("serialization_mode", "") or "").strip()
+            or str(self.serialization_mode or "").strip()
+            or _JOBQUEUE_TRANSPORT_MODE
+        )
+        _node_key, response = self._service.call_balanced(
+            method,
+            payload,
+            timeout_sec=max(0.1, float(call_kwargs.get("timeout_sec", self.timeout_sec) or self.timeout_sec)),
+            strategy="predicted_busy",
+            refresh_status=True,
+            serialization_mode=effective_serialization_mode,
+        )
+        return response
 
     def _persist_local_session(self) -> None:
         try:
@@ -331,13 +233,14 @@ class QueueServiceClient:
         )
         if self.client_id and not str(prepared_payload.get("client_id", "") or "").strip():
             prepared_payload["client_id"] = self.client_id
-        prepared_payload = _prepare_job_submit_payload_for_call(
-            target=self.target,
-            payload=prepared_payload,
-            timeout_sec=self.timeout_sec,
-            serialization_mode=self.serialization_mode,
-            effective_policy=effective_policy,
-        )
+        if not _is_local_target(self.target):
+            prepared_payload = _prepare_job_submit_payload_for_call(
+                target=self.target,
+                payload=prepared_payload,
+                timeout_sec=self.timeout_sec,
+                serialization_mode=self.serialization_mode,
+                effective_policy=effective_policy,
+            )
         call_kwargs = {
             "service_name": self.service_name,
             "method": "submit_job",
@@ -346,7 +249,7 @@ class QueueServiceClient:
         }
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             call_kwargs["serialization_mode"] = self.serialization_mode
-        resp = self._call_service_client(
+        resp = self._call_job_orchestrator(
             effective_policy=effective_policy,
             **call_kwargs,
         )
@@ -574,7 +477,7 @@ class QueueServiceClient:
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             call_kwargs["serialization_mode"] = self.serialization_mode
         return _decode_job_response_payload(
-            self._call_service_client(
+            self._call_job_orchestrator(
                 effective_policy=effective_policy,
                 **call_kwargs,
             )
@@ -594,7 +497,7 @@ class QueueServiceClient:
         if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
             call_kwargs["serialization_mode"] = self.serialization_mode
         return _decode_job_response_payload(
-            self._call_service_client(
+            self._call_job_orchestrator(
                 effective_policy=effective_policy,
                 **call_kwargs,
             )
@@ -632,4 +535,4 @@ class JobQueue(QueueServiceClient):
         return cls(target, **kwargs)
 
 
-__all__ = ["QueueServiceClient", "JobQueue", "_JobOrchestratorDiscoveryClient"]
+__all__ = ["QueueServiceClient", "JobQueue"]

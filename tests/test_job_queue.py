@@ -4,6 +4,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
+import socket
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,7 +12,12 @@ import pandas as pd
 import pytest
 
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
-from pycloud_parallel.controlplane.job_orchestrator import JobOrchestratorModule, JobOrchestratorServer
+from pycloud_parallel.controlplane.job_orchestrator import (
+    JOB_ORCHESTRATOR_EXPORT_METHODS,
+    JOB_ORCHESTRATOR_SERVICE_MODULE,
+    JobOrchestratorModule,
+    JobOrchestratorServer,
+)
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
@@ -151,24 +157,62 @@ def test_startup_service_node_infocenter_registration_is_background(monkeypatch)
     assert [name for name, _payload in events] == ["init", "start"]
 
 
-def test_nodecontrol_and_job_orchestrator_use_startup_service_node_base() -> None:
+def test_nodecontrol_and_job_orchestrator_start_uses_service_startup(monkeypatch) -> None:
     server = JobOrchestratorServer(
         bind="127.0.0.1:0",
         infocenter_addr="127.0.0.1:50051",
         node_id="job-orchestrator-test",
+        queue_capacity=123,
+        version="job-orch-test-version",
     )
 
-    assert isinstance(server, StartupServiceNode)
     assert issubclass(StartupServiceNode, NodeControlState)
-    assert isinstance(server.module, JobOrchestratorModule)
-    assert server.accept_service_deploy is False
-    assert server.module.service_name == "job-orchestrator"
-    reports = server.service_report_payloads()
-    assert len(reports) == 1
-    assert reports[0]["service_name"] == "job-orchestrator"
-    assert reports[0]["service_id"] == server.service_id
-    assert reports[0]["policy_id"] == server.job_orch_policy_id
-    assert reports[0]["alive_workers"] == 1
+    assert server._service_module_name == JOB_ORCHESTRATOR_SERVICE_MODULE  # noqa: SLF001
+    assert server._node is None  # noqa: SLF001
+    assert server.module is None
+
+    calls = {}
+    globals_updates = []
+
+    fake_node = SimpleNamespace(
+        _local_service_id=server.service_id,
+        service_http_base_url="http://127.0.0.1:50053",
+        update_globals=lambda values, service_id="": globals_updates.append((service_id, values)),
+        close=lambda: None,
+    )
+    fake_module = SimpleNamespace(
+        business_module=lambda service_id="": JobOrchestratorModule(service_name="job-orchestrator"),
+        start=lambda **kwargs: calls.setdefault("module_start", kwargs),
+        close=lambda service_id="": calls.setdefault("module_close", service_id),
+    )
+    server._service_module = fake_module  # noqa: SLF001
+
+    def _fake_startup(**kwargs):
+        calls["startup"] = kwargs
+        return fake_node
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session.Service.startup", _fake_startup)
+
+    server.start()
+
+    startup_kwargs = calls["startup"]
+    assert startup_kwargs["source"] is fake_module
+    assert startup_kwargs["service_name"] == "job-orchestrator"
+    assert startup_kwargs["export_methods"] == JOB_ORCHESTRATOR_EXPORT_METHODS
+    assert startup_kwargs["bind"] == "127.0.0.1:0"
+    assert startup_kwargs["target"] == "127.0.0.1:50051"
+    assert startup_kwargs["node_id"] == "job-orchestrator-test"
+    assert startup_kwargs["service_id"] == server.service_id
+    assert startup_kwargs["worker_count"] == 1
+    assert startup_kwargs["policy_id"] == server.job_orch_policy_id
+    assert startup_kwargs["queue_capacity"] == 123
+    assert startup_kwargs["version"] == "job-orch-test-version"
+    assert startup_kwargs["start"] is True
+    assert globals_updates
+    assert globals_updates[0][0] == server.service_id
+    assert globals_updates[0][1]["service_name"] == "job-orchestrator"
+    assert calls["module_start"]["controlplane_target"] == "127.0.0.1:50051"
+    assert calls["module_start"]["base_url"] == "http://127.0.0.1:50053"
 
 
 def test_job_orchestrator_instances_have_independent_startup_service_ids() -> None:
@@ -185,8 +229,95 @@ def test_job_orchestrator_instances_have_independent_startup_service_ids() -> No
 
     assert first.node_id != second.node_id
     assert first.service_id != second.service_id
-    assert first.service_report_payloads()[0]["service_id"] == first.service_id
-    assert second.service_report_payloads()[0]["service_id"] == second.service_id
+    assert first._node is None  # noqa: SLF001
+    assert second._node is None  # noqa: SLF001
+
+
+def test_service_startup_preflight_rejects_same_service_on_different_endpoint(monkeypatch) -> None:
+    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    import pycloud_parallel.controlplane.job_orchestrator_service as job_orchestrator_service
+
+    route = SimpleNamespace(
+        service_name="job-orchestrator",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_healthy=True,
+        node_id="existing-job-orch",
+        node_instance_id="existing-job-orch-inst",
+        http_base_url="http://127.0.0.1:50054/svc/existing",
+        control_addr="",
+    )
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.list_service_routes",
+        lambda self, *, service_name="", healthy_only=True, limit=100, **kwargs: [route],
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.list_service_routes_for_exclusive_check",
+        lambda self, *, service_name="", limit=100, **kwargs: [route],
+        raising=False,
+    )
+
+    from pycloud_parallel.execution.service_session import Service
+
+    with pytest.raises(RuntimeError, match="different endpoint"):
+        Service.startup(
+            source=job_orchestrator_service,
+            service_name="job-orchestrator",
+            export_methods=JOB_ORCHESTRATOR_EXPORT_METHODS,
+            bind="127.0.0.1:50053",
+            target="127.0.0.1:50051",
+            node_id="job-orch-test",
+        )
+
+
+def test_service_startup_preflight_allows_same_endpoint(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    import importlib
+
+    module_path = tmp_path / "startup_same_endpoint_demo.py"
+    module_path.write_text(
+        "def submit_job(**_kwargs):\n"
+        "    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    startup_module = importlib.import_module("startup_same_endpoint_demo")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    route = SimpleNamespace(
+        service_name="job-orchestrator",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        node_healthy=True,
+        node_id="existing-job-orch",
+        node_instance_id="existing-job-orch-inst",
+        http_base_url=f"http://127.0.0.1:{port}/svc/existing",
+        control_addr="",
+    )
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.list_service_routes",
+        lambda self, *, service_name="", healthy_only=True, limit=100, **kwargs: [route],
+    )
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.list_service_routes_for_exclusive_check",
+        lambda self, *, service_name="", limit=100, **kwargs: [route],
+        raising=False,
+    )
+
+    from pycloud_parallel.execution.service_session import Service
+
+    node = Service.startup(
+        source=startup_module,
+        service_name="job-orchestrator",
+        export_methods=("submit_job",),
+        bind=f"127.0.0.1:{port}",
+        target="127.0.0.1:50051",
+        node_id="job-orch-test",
+    )
+    node.close()
 
 
 def test_job_queue_manager_default_shared_pool_idle_ttl_is_longer(monkeypatch) -> None:
@@ -207,18 +338,36 @@ def test_job_queue_manager_shared_pool_idle_ttl_can_be_overridden(monkeypatch) -
     assert explicit._pool_idle_ttl_sec == 120  # noqa: SLF001
 
 
+def _hook_job_payload(
+    *,
+    job_id: str,
+    client_id: str = "client-a",
+    priority: int = 0,
+    job_payload: dict | None = None,
+    **extra,
+) -> dict:
+    payload = {
+        "job_id": job_id,
+        "client_id": client_id,
+        "priority": priority,
+        "job_mode": "hooks",
+        "blob_b64": base64.b64encode(
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': value}\n\n"
+            b"def task_generator(items=None, **_kwargs):\n"
+            b"    return list(items or [{'value': 1}])\n"
+        ).decode("utf-8"),
+        "entry_module": "job_hook_demo",
+        "task_generator_callable": "task_generator",
+        "job_payload": dict(job_payload or {"items": [{"value": 1}]}),
+    }
+    payload.update(extra)
+    return payload
+
+
 def test_submit_and_cancel_waiting_job() -> None:
     queue = JobQueueManager()
-    job = queue.submit_job(
-        {
-            "job_id": "job-waiting-1",
-            "client_id": "client-a",
-            "priority": 2,
-            "code_version": "sha256:test",
-            "entry_module": "task_demo",
-            "subtasks": [{"value": 1}],
-        }
-    )
+    job = queue.submit_job(_hook_job_payload(job_id="job-waiting-1", priority=2))
     assert job.status == "WAITING"
 
     cancelled = queue.cancel_job("job-waiting-1")
@@ -230,12 +379,7 @@ def test_submit_and_cancel_waiting_job() -> None:
 def test_cancel_job_rejects_auth_token_mismatch() -> None:
     queue = JobQueueManager()
     queue.submit_job(
-        {
-            "job_id": "job-auth-1",
-            "client_id": "client-a",
-            "entry_module": "task_demo",
-            "subtasks": [{"value": 1}],
-        },
+        _hook_job_payload(job_id="job-auth-1"),
         auth_token="token-a",
     )
 
@@ -250,12 +394,7 @@ def test_cancel_job_rejects_auth_token_mismatch() -> None:
 def test_cancel_job_rejects_expired_auth_token() -> None:
     queue = JobQueueManager()
     job = queue.submit_job(
-        {
-            "job_id": "job-auth-expired",
-            "client_id": "client-a",
-            "entry_module": "task_demo",
-            "subtasks": [{"value": 1}],
-        },
+        _hook_job_payload(job_id="job-auth-expired"),
         auth_token="token-a",
     )
     job.owner_token_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -268,27 +407,23 @@ def test_submit_job_rejects_unresolvable_object_ref_payloads() -> None:
     queue = JobQueueManager()
     with pytest.raises(ValueError, match="resolvable locator"):
         queue.submit_job(
-            {
-                "job_id": "job-ref-1",
-                "client_id": "client-a",
-                "entry_module": "task_demo",
-                "subtasks": [
-                    {
-                        "blob": data_ref_to_payload(
-                            DataRef(
-                                ref_id="sha256:" + ("c" * 64),
-                                storage_id="sha256:" + ("c" * 64),
-                                logical_type="json",
-                                format="json",
-                                size_bytes=12,
-                                materialize_as="json",
-                                locator_kind="node_local",
-                                locator_token="",
-                            )
+            _hook_job_payload(
+                job_id="job-ref-1",
+                job_payload={
+                    "blob": data_ref_to_payload(
+                        DataRef(
+                            ref_id="sha256:" + ("c" * 64),
+                            storage_id="sha256:" + ("c" * 64),
+                            logical_type="json",
+                            format="json",
+                            size_bytes=12,
+                            materialize_as="json",
+                            locator_kind="node_local",
+                            locator_token="",
                         )
-                    }
-                ],
-            }
+                    )
+                },
+            )
         )
 
 
@@ -308,42 +443,17 @@ def test_job_queue_manager_submit_job_uses_unified_inbound_normalizer(monkeypatc
         _fake_normalize,
     )
 
-    job = queue.submit_job(
-        {
-            "job_id": "job-policy-1",
-            "client_id": "client-a",
-            "entry_module": "task_demo",
-            "subtasks": [{"value": 1}],
-        }
-    )
+    job = queue.submit_job(_hook_job_payload(job_id="job-policy-1"))
 
     assert job.job_id == "job-policy-1"
     assert captured["mode"] == "job_submit"
-    assert captured["payload"]["subtasks"] == [{"value": 1}]
+    assert captured["payload"]["job_payload"] == {"items": [{"value": 1}]}
 
 
 def test_pick_next_job_prefers_priority_then_submission_order() -> None:
     queue = JobQueueManager()
-    low = queue.submit_job(
-        {
-            "job_id": "job-low",
-            "client_id": "client-a",
-            "priority": 1,
-            "code_version": "sha256:test",
-            "entry_module": "task_demo",
-            "subtasks": [{"value": 1}],
-        }
-    )
-    high = queue.submit_job(
-        {
-            "job_id": "job-high",
-            "client_id": "client-b",
-            "priority": 9,
-            "code_version": "sha256:test",
-            "entry_module": "task_demo",
-            "subtasks": [{"value": 2}],
-        }
-    )
+    low = queue.submit_job(_hook_job_payload(job_id="job-low", priority=1))
+    high = queue.submit_job(_hook_job_payload(job_id="job-high", client_id="client-b", priority=9))
     with queue._lock:  # noqa: SLF001
         selected = queue._pick_next_job_locked()  # noqa: SLF001
     assert selected is not None
@@ -353,9 +463,9 @@ def test_pick_next_job_prefers_priority_then_submission_order() -> None:
 
 def test_reorder_waiting_job_updates_waiting_order() -> None:
     queue = JobQueueManager()
-    queue.submit_job({"job_id": "job-1", "client_id": "client-a", "priority": 1, "entry_module": "task_demo", "subtasks": [{"value": 1}]})
-    queue.submit_job({"job_id": "job-2", "client_id": "client-a", "priority": 1, "entry_module": "task_demo", "subtasks": [{"value": 2}]})
-    queue.submit_job({"job_id": "job-3", "client_id": "client-a", "priority": 1, "entry_module": "task_demo", "subtasks": [{"value": 3}]})
+    queue.submit_job(_hook_job_payload(job_id="job-1", priority=1))
+    queue.submit_job(_hook_job_payload(job_id="job-2", priority=1))
+    queue.submit_job(_hook_job_payload(job_id="job-3", priority=1))
 
     moved = queue.reorder_job("job-3", direction="up")
     assert moved is not None
@@ -368,8 +478,8 @@ def test_reorder_waiting_job_updates_waiting_order() -> None:
 
 def test_job_queue_summary_includes_timing_aggregate() -> None:
     queue = JobQueueManager()
-    first = queue.submit_job({"job_id": "job-timing-1", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 1}]})
-    second = queue.submit_job({"job_id": "job-timing-2", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 2}]})
+    first = queue.submit_job(_hook_job_payload(job_id="job-timing-1"))
+    second = queue.submit_job(_hook_job_payload(job_id="job-timing-2"))
     first.status = "SUCCEEDED"
     first.finished_at = datetime.now(timezone.utc)
     first.timing.update({"queue_wait_ms": 100.0, "running_tasks_ms": 300.0, "total_ms": 500.0, "pool_action": "reuse", "pool_reuse_count": 1})
@@ -390,137 +500,29 @@ def test_job_queue_summary_includes_timing_aggregate() -> None:
 
 
 def test_job_orchestrator_reorder_job_requires_admin_token() -> None:
-    server = JobOrchestratorServer(
-        bind="127.0.0.1:0",
-        infocenter_addr="127.0.0.1:50051",
-        node_id="job-orch-test",
+    module = JobOrchestratorModule(
+        service_name="job-orchestrator",
         admin_token="admin-token",
     )
-    queue = server.job_queue
-    queue.submit_job({"job_id": "job-1", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 1}]})
-    queue.submit_job({"job_id": "job-2", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 2}]})
-    queue.submit_job({"job_id": "job-3", "client_id": "client-a", "entry_module": "task_demo", "subtasks": [{"value": 3}]})
+    queue = module.job_queue
+    queue.submit_job(_hook_job_payload(job_id="job-1"))
+    queue.submit_job(_hook_job_payload(job_id="job-2"))
+    queue.submit_job(_hook_job_payload(job_id="job-3"))
     with queue._cv:  # noqa: SLF001
         queue._waiting_order = ["job-1", "job-2", "job-3"]  # noqa: SLF001
 
-    status, body = server.module.reorder_job("job-3", direction="up", token="")
+    status, body = module.reorder_job("job-3", direction="up", token="")
     assert status == 403
     assert body["error"] == "admin auth required"
 
-    status, body = server.module.reorder_job("job-3", direction="up", token="owner-token")
+    status, body = module.reorder_job("job-3", direction="up", token="owner-token")
     assert status == 403
     assert body["error"] == "admin auth required"
 
-    status, body = server.module.reorder_job("job-3", direction="up", token="admin-token")
+    status, body = module.reorder_job("job-3", direction="up", token="admin-token")
     assert status == 200
     waiting_ids = [item["job_id"] for item in body["queue"]["waiting_jobs"]]
     assert waiting_ids == ["job-1", "job-3", "job-2"]
-
-
-def test_expand_subtasks_from_driver_blob() -> None:
-    queue = JobQueueManager()
-    blob = (
-        b"def build(value=0, count=1, **_kwargs):\n"
-        b"    return [{'value': value + i} for i in range(count)]\n"
-    )
-    subtasks = queue._expand_subtasks(  # noqa: SLF001
-        {
-            "driver_blob_b64": base64.b64encode(blob).decode("utf-8"),
-            "driver_entry_module": "job_driver_demo",
-            "driver_entry_callable": "build",
-            "driver_payload": {"value": 10, "count": 3},
-            "driver_package_format": "py",
-        }
-    )
-    assert subtasks == [{"value": 10}, {"value": 11}, {"value": 12}]
-
-
-def test_expand_subtasks_purges_loaded_driver_modules() -> None:
-    queue = JobQueueManager()
-    blob = (
-        b"def build(value=0, count=1, **_kwargs):\n"
-        b"    return [{'value': value + i} for i in range(count)]\n"
-    )
-
-    with (
-        patch("pycloud_parallel.controlplane.job_queue._purge_loaded_artifact_modules") as mocked,
-        patch("pycloud_parallel.controlplane.job_queue.gc.collect") as mocked_gc,
-    ):
-        subtasks = queue._expand_subtasks(  # noqa: SLF001
-            {
-                "driver_blob_b64": base64.b64encode(blob).decode("utf-8"),
-                "driver_entry_module": "job_driver_demo",
-                "driver_entry_callable": "build",
-                "driver_payload": {"value": 1, "count": 2},
-                "driver_package_format": "py",
-            }
-        )
-
-    assert subtasks == [{"value": 1}, {"value": 2}]
-    mocked.assert_called_once()
-    mocked_gc.assert_called_once()
-    assert mocked.call_args.kwargs["entry_module"] == "job_driver_demo"
-    assert mocked.call_args.kwargs["package_format"] == "py"
-
-
-def test_run_job_prefers_task_pool_session() -> None:
-    queue = JobQueueManager()
-    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
-    state = queue.submit_job(  # noqa: SLF001
-        {
-            "job_id": "job-pool-1",
-            "client_id": "client-a",
-            "priority": 5,
-            "blob_b64": base64.b64encode(b"def run(value=0, **_kwargs):\n    return {'value': value}\n").decode("utf-8"),
-            "entry_module": "task_demo",
-            "entry_callable": "run",
-            "subtasks": [{"value": 1}, {"value": 2}],
-            "use_task_pool": True,
-        }
-    )
-    state.status = "RUNNING"
-
-    class _FakePool:
-        def __init__(self):
-            self.job_id = "job-pool-1"
-            self.submitted = []
-
-        def submit_payloads(self, payloads, **kwargs):
-            self.submitted.append((list(payloads), dict(kwargs)))
-            from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-
-            return pb2.SubmitTasksResponse(
-                ok=True,
-                accepted=[
-                    pb2.TaskAccepted(task_id="t-1", status=pb2.TASK_STATUS_QUEUED),
-                    pb2.TaskAccepted(task_id="t-2", status=pb2.TASK_STATUS_QUEUED),
-                ],
-            )
-
-        def wait_for_results(self, **kwargs):
-            from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-            from pycloud_parallel.controlplane.serialization import dict_to_struct
-
-            return [
-                pb2.TaskResult(task_id="t-1", job_id="job-pool-1", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1})),
-                pb2.TaskResult(task_id="t-2", job_id="job-pool-1", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 2})),
-            ]
-
-        def close(self):
-            return None
-
-        def cancel_job(self, **kwargs):
-            return None
-
-    fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
-        queue._run_job("job-pool-1")  # noqa: SLF001
-
-    mocked.assert_called_once()
-    job = queue.get_job("job-pool-1")
-    assert job is not None
-    assert job.status == "SUCCEEDED"
-    assert len(job.results) == 2
 
 
 def test_run_job_with_hooks_uses_generator_handler_and_finalize() -> None:
@@ -1319,14 +1321,7 @@ def test_job_queue_manager_close_releases_staged_refs(monkeypatch) -> None:
         locator_kind="controlplane",
         locator_token="http://127.0.0.1:50051",
     )
-    job = queue.submit_job(
-        {
-            "job_id": "job-close-release",
-            "client_id": "client-a",
-            "entry_module": "job_demo",
-            "subtasks": [{"cfg": data_ref}],
-        }
-    )
+    job = queue.submit_job(_hook_job_payload(job_id="job-close-release", job_payload={"cfg": data_ref}))
 
     monkeypatch.setattr(
         "pycloud_parallel.controlplane.job_queue.DataRegistryClient.release",
@@ -1851,7 +1846,9 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
         captured["payload"] = dict(payload or {})
         return {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}
 
-    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: _fake_call(
+        **{key: value for key, value in kwargs.items() if key != "serialization_mode"}
+    )  # type: ignore[method-assign]
     resp = client.submit_job(
         {
             "entry_module": "job_demo",
@@ -1924,7 +1921,9 @@ def _submit_oversized_job_payload(monkeypatch):
         captured["payload"] = dict(payload or {})
         return {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}
 
-    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: _fake_call(
+        **{key: value for key, value in kwargs.items() if key != "serialization_mode"}
+    )  # type: ignore[method-assign]
     resp = client.submit_job(
         {
             "entry_module": "job_demo",
@@ -1989,7 +1988,9 @@ def test_job_queue_client_submit_job_keeps_directory_root_dir_inline(monkeypatch
         captured["payload"] = dict(payload or {})
         return {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}
 
-    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: _fake_call(
+        **{key: value for key, value in kwargs.items() if key != "serialization_mode"}
+    )  # type: ignore[method-assign]
     resp = client.submit_job(
         {
             "entry_module": "job_demo",
@@ -2030,7 +2031,7 @@ def test_job_queue_client_submit_job_uses_unified_outbound_policy(monkeypatch) -
         _fake_prepare,
     )
 
-    client._service_client.call = lambda **kwargs: {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: {"ok": True, "job": {"job_id": "job-1", "status": "WAITING"}}  # type: ignore[method-assign]
     resp = client.submit_job({"entry_module": "job_demo", "update_globals": {"cfg": {"k": "v"}}})
 
     assert resp["job"]["job_id"] == "job-1"
@@ -2093,7 +2094,9 @@ def test_job_queue_client_recent_job_ids_tracks_and_restores(monkeypatch, tmp_pa
             return {"ok": True, "job": {"job_id": next(job_ids)}}
         raise AssertionError(f"unexpected method: {method}")
 
-    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: _fake_call(
+        **{key: value for key, value in kwargs.items() if key != "serialization_mode"}
+    )  # type: ignore[method-assign]
     client.submit_job({"entry_module": "job_demo"})
     client.submit_job({"entry_module": "job_demo"})
     client.submit_job({"entry_module": "job_demo"})
@@ -2155,7 +2158,7 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
         _fake_list_service_routes,
     )
     monkeypatch.setattr(
-        "pycloud_parallel.execution.queue._call_route_http",
+        "pycloud_parallel.controlplane.discovery_client.client_mod._call_route_http",
         _fake_call_route_http,
     )
 
@@ -2172,6 +2175,96 @@ def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch)
     assert captured["service_token"] == "token-discovery"
     assert captured["serialization_mode"] == "structured_v1"
     assert captured["route"].http_base_url == "http://127.0.0.1:18080/svc/job-orch-1"
+
+
+def test_job_queue_local_reuses_service_connect_local_transport(monkeypatch) -> None:
+    from pycloud_parallel import JobQueue
+    from pycloud_parallel.execution.service_session import Service
+
+    captured = {}
+
+    class _FakeConnectedService:
+        transport = "local"
+        service_name = "job-orchestrator"
+
+        def close(self):
+            captured["closed"] = True
+
+        def call_balanced(self, method, payload, **kwargs):
+            captured["method"] = method
+            captured["payload"] = dict(payload or {})
+            captured["call_kwargs"] = dict(kwargs)
+            return "local", {"ok": True, "job": {"job_id": "job-local", "status": "WAITING"}}
+
+    def _fake_connect(**kwargs):
+        captured["connect_kwargs"] = dict(kwargs)
+        return _FakeConnectedService()
+
+    monkeypatch.setattr(Service, "_connect_transport", staticmethod(_fake_connect))
+
+    client = JobQueue.connect("local", client_id="client-local", auth_token="token-local")
+    try:
+        resp = client.get_job_status("job-local")
+    finally:
+        client.close()
+
+    assert resp["job"]["job_id"] == "job-local"
+    assert captured["connect_kwargs"]["target"] == "local"
+    assert captured["connect_kwargs"]["service_name"] == "job-orchestrator"
+    assert captured["connect_kwargs"]["transport"] == "local"
+    assert captured["connect_kwargs"]["service_token"] == "token-local"
+    assert captured["connect_kwargs"]["effective_policy_override"].resolved_mode == "structured_v1"
+    assert captured["connect_kwargs"]["prepare_discovery_payload"] is False
+    assert captured["method"] == "get_job_status"
+    assert captured["payload"] == {
+        "job_id": "job-local",
+        "include_details": False,
+        "_service_token": "token-local",
+    }
+    assert captured["call_kwargs"]["serialization_mode"] == "structured_v1"
+
+
+def test_job_queue_local_calls_local_service_ipc_end_to_end(tmp_path, monkeypatch) -> None:
+    import importlib
+
+    from pycloud_parallel import JobQueue, Service
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    module_path = tmp_path / "local_job_orchestrator_demo.py"
+    module_path.write_text(
+        "def pycloud_export(fn):\n"
+        "    fn.__pycloud_export__ = True\n"
+        "    return fn\n\n"
+        "def _raw(job):\n"
+        "    return {'__pycloud_raw_response__': True, '__pycloud_status_code__': 200, 'ok': True, 'job': job}\n\n"
+        "@pycloud_export\n"
+        "def submit_job(_service_token='', **payload):\n"
+        "    return _raw({'job_id': payload.get('entry_module', 'job-local'), 'status': 'WAITING', 'token': _service_token})\n\n"
+        "@pycloud_export\n"
+        "def get_job_status(job_id='', include_details=False, **_payload):\n"
+        "    return _raw({'job_id': job_id, 'status': 'SUCCEEDED', 'include_details': bool(include_details)})\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    service = Service.deploy(
+        target="local",
+        service_name="job-orchestrator",
+        source=importlib.import_module("local_job_orchestrator_demo"),
+        worker_count=1,
+    )
+    try:
+        client = JobQueue.connect("local", client_id="client-local", auth_token="token-local", timeout_sec=5.0)
+        try:
+            submitted = client.submit_job({"entry_module": "job-local-1"})
+            status = client.get_job_status("job-local-1", include_details=True)
+        finally:
+            client.close()
+    finally:
+        service.close()
+
+    assert submitted["job"]["job_id"] == "job-local-1"
+    assert submitted["job"]["token"] == "token-local"
+    assert status["job"] == {"job_id": "job-local-1", "status": "SUCCEEDED", "include_details": True}
 
 
 def test_job_queue_client_submit_source_module_builds_payloads() -> None:
@@ -2513,129 +2606,6 @@ def test_run_job_with_hooks_uses_larger_default_worker_node_and_inflight(monkeyp
     assert mocked.call_args.kwargs["node_count"] == 2
 
 
-def test_run_job_non_hook_uses_larger_default_worker_and_all_nodes(monkeypatch) -> None:
-    from pycloud_parallel.controlplane.serialization import dict_to_struct
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-
-    queue = JobQueueManager()
-    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
-    state = queue.submit_job(  # noqa: SLF001
-        {
-            "job_id": "job-defaults-non-hook",
-            "client_id": "client-a",
-            "priority": 5,
-            "code_version": "sha256:test",
-            "entry_module": "task_demo",
-            "entry_callable": "run",
-            "subtasks": [{"value": 1}, {"value": 2}],
-        }
-    )
-    state.status = "RUNNING"
-
-    class _FakePool:
-        job_id = "job-defaults-non-hook"
-
-        def submit_payloads(self, subtasks, **kwargs):
-            return pb2.SubmitTasksResponse(
-                ok=True,
-                accepted=[
-                    pb2.TaskAccepted(task_id=f"t-{idx}", status=pb2.TASK_STATUS_QUEUED)
-                    for idx, _ in enumerate(subtasks, start=1)
-                ],
-                rejected=[],
-            )
-
-        def iter_results(self, **kwargs):
-            yield pb2.TaskResult(task_id="t-1", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1}))
-            yield pb2.TaskResult(task_id="t-2", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 2}))
-
-        def close(self):
-            return None
-
-        def cancel_job(self, **kwargs):
-            return None
-
-    monkeypatch.setattr("pycloud_parallel.controlplane.job_queue.os.cpu_count", lambda: 6)
-    monkeypatch.setattr(
-        "pycloud_parallel.controlplane.job_queue.InfoCenterClient.select_task_nodes",
-        lambda self, **kwargs: [SimpleNamespace(node_id="n1"), SimpleNamespace(node_id="n2"), SimpleNamespace(node_id="n3")],
-    )
-
-    fake_pool = _FakePool()
-    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool) as mocked:
-        queue._run_job("job-defaults-non-hook")  # noqa: SLF001
-
-    assert mocked.call_args.kwargs["worker_count"] == 3
-    assert mocked.call_args.kwargs["node_count"] == 3
-
-
-def test_run_job_non_hook_renders_results_while_polling(monkeypatch) -> None:
-    from pycloud_parallel.controlplane import job_queue as job_queue_module
-    from pycloud_parallel.controlplane.serialization import dict_to_struct
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-
-    queue = JobQueueManager()
-    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
-    state = queue.submit_job(  # noqa: SLF001
-        {
-            "job_id": "job-render-streaming",
-            "client_id": "client-a",
-            "code_version": "sha256:test",
-            "entry_module": "task_demo",
-            "entry_callable": "run",
-            "subtasks": [{"value": 1}, {"value": 2}],
-        }
-    )
-    state.status = "RUNNING"
-    rendered = {"count": 0}
-
-    class _FakePool:
-        job_id = "job-render-streaming"
-
-        def submit_payloads(self, subtasks, **kwargs):
-            return pb2.SubmitTasksResponse(
-                ok=True,
-                accepted=[
-                    pb2.TaskAccepted(task_id=f"t-{idx}", status=pb2.TASK_STATUS_QUEUED)
-                    for idx, _ in enumerate(subtasks, start=1)
-                ],
-                rejected=[],
-            )
-
-        def iter_results(self, **kwargs):
-            yield pb2.TaskResult(task_id="t-1", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 1}))
-            assert rendered["count"] == 1
-            yield pb2.TaskResult(task_id="t-2", status=pb2.TASK_STATUS_SUCCEEDED, result=dict_to_struct({"value": 2}))
-
-        def close(self):
-            return None
-
-        def cancel_job(self, **kwargs):
-            return None
-
-    def _wrapped_task_result_to_dict(*args, **kwargs):
-        rendered["count"] += 1
-        return original_task_result_to_dict(*args, **kwargs)
-
-    monkeypatch.setattr(
-        "pycloud_parallel.controlplane.job_queue.InfoCenterClient.select_task_nodes",
-        lambda self, **kwargs: [SimpleNamespace(node_id="n1")],
-    )
-    fake_pool = _FakePool()
-    original_task_result_to_dict = job_queue_module._task_result_to_dict  # noqa: SLF001
-    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=fake_pool), patch(
-        "pycloud_parallel.controlplane.job_queue._task_result_to_dict",
-        side_effect=_wrapped_task_result_to_dict,
-    ):
-        queue._run_job("job-render-streaming")  # noqa: SLF001
-
-    job = queue.get_job("job-render-streaming")
-    assert job is not None
-    assert job.status == "SUCCEEDED"
-    assert len(job.results) == 2
-    assert rendered["count"] == 2
-
-
 def test_job_queue_client_wait_for_terminal_polls_until_done() -> None:
     from pycloud_parallel import JobQueue
 
@@ -2683,7 +2653,9 @@ def test_job_queue_client_decodes_dataframe_final_result_from_job_response() -> 
             },
         }
 
-    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: _fake_call(
+        **{key: value for key, value in kwargs.items() if key != "serialization_mode"}
+    )  # type: ignore[method-assign]
     try:
         resp = client.get_job_status("job-1", include_details=True)
     finally:
@@ -2708,7 +2680,9 @@ def test_job_queue_client_get_job_status_defaults_to_metadata_only() -> None:
         captured["payload"] = dict(payload or {})
         return {"ok": True, "job": {"job_id": "job-1", "status": "SUCCEEDED"}}
 
-    client._service_client.call = _fake_call  # type: ignore[method-assign]
+    client._call_job_orchestrator = lambda *, effective_policy, **kwargs: _fake_call(
+        **{key: value for key, value in kwargs.items() if key != "serialization_mode"}
+    )  # type: ignore[method-assign]
     try:
         resp = client.get_job_status("job-1")
     finally:

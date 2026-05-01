@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import grpc
 import numpy as np
 
 from pycloud_parallel.controlplane.config import reload_config
 from pycloud_parallel.controlplane.node.models import TaskState
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
+from pycloud_parallel.controlplane import services as services_mod
 from pycloud_parallel.controlplane.serialization import (
     INLINE_TRANSPORT_CARRIER_SENTINEL,
     decode_inline_transport_carrier,
@@ -114,6 +116,63 @@ def test_node_control_client_update_runtime_globals_uses_transport_values_for_pi
     assert request.HasField("transport_values")
     assert request.transport_values.codec == "pickle_stable_v1"
     assert not request.values.fields
+
+
+def test_update_runtime_globals_auth_runs_before_decode(monkeypatch):
+    class _State:
+        def require_runtime_globals_update_authorized(self, **kwargs):
+            raise PermissionError("code_token mismatch")
+
+        def update_runtime_globals(self, **kwargs):
+            raise AssertionError("update_runtime_globals should not be called")
+
+    def _decode_should_not_run(*args, **kwargs):
+        raise AssertionError("decode should not run before auth")
+
+    monkeypatch.setattr(services_mod, "decode_transport_payload_bytes", _decode_should_not_run)
+    service = NodeControlService(_State())
+    context = _FakeContext()
+    request = pb2.UpdateRuntimeGlobalsRequest(
+        client_id="client-1",
+        code_version="cv",
+        runtime_key="rk",
+        code_token="bad-token",
+        transport_values=pb2.TransportPayload(codec="pickle_stable_v1", version=1, payload=b"not-a-pickle"),
+    )
+
+    response = service.UpdateRuntimeGlobals(request, context)
+
+    assert response.ok is False
+    assert context.code == grpc.StatusCode.PERMISSION_DENIED
+    assert "code_token mismatch" in context.details
+
+
+def test_update_service_globals_auth_runs_before_decode(monkeypatch):
+    class _State:
+        def require_service_globals_update_authorized(self, **kwargs):
+            raise PermissionError("service_token mismatch")
+
+        def update_service_globals(self, **kwargs):
+            raise AssertionError("update_service_globals should not be called")
+
+    def _decode_should_not_run(*args, **kwargs):
+        raise AssertionError("decode should not run before auth")
+
+    monkeypatch.setattr(services_mod, "decode_transport_payload_bytes", _decode_should_not_run)
+    service = NodeControlService(_State())
+    context = _FakeContext()
+    request = pb2.UpdateServiceGlobalsRequest(
+        owner_client_id="owner-1",
+        service_id="svc-1",
+        service_token="bad-token",
+        transport_values=pb2.TransportPayload(codec="pickle_stable_v1", version=1, payload=b"not-a-pickle"),
+    )
+
+    response = service.UpdateServiceGlobals(request, context)
+
+    assert response.ok is False
+    assert context.code == grpc.StatusCode.PERMISSION_DENIED
+    assert "service_token mismatch" in context.details
 
 
 def test_node_control_service_prefers_transport_payload_for_call_service():

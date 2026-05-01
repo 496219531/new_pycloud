@@ -12,7 +12,15 @@ V1 freezes the user-facing model to five public concepts:
 
 Old local-only parallel helpers are removed from V1; execution goes through `Service`, `TaskPool`, or `JobQueue`.
 
-`Service.startup(...)` is the product-level path for startup-mounted services. It returns an internal startup-node handle that supports services attached when the process starts and rejects dynamic service deployment by default. `NodeControlState` extends that internal base and adds dynamic deployment support.
+`Service.startup(...)` is the product-level path for startup-mounted services. It returns an internal startup-node handle that supports services attached when the process starts and rejects dynamic service deployment by default. `startup.foo.sync(...)` is an in-process convenience proxy to that node's mounted service: it calls the local executor queue through `StartupServiceNode.call_service(...)` and does not go through Discovery, Gateway, or service HTTP. Startup control methods such as `update_globals(...)` remain local node methods. `NodeControlState` extends that internal base and adds dynamic deployment support.
+
+`target="local"` is the explicit local IPC runtime. `Service.startup(target="local", ...)` and `Service.deploy(target="local", ...)` are intentionally almost the same at the runtime layer: both create a process-owned `StartupServiceNode`, return a local proxy, and publish a same-machine IPC registry entry for `Service.connect(target="local", service_name=...)`. Local mode keeps the same user-side method proxy shape, including streaming calls. Broadcast on a local or connected service is treated as a single-node call and returns one result entry. Switching between local IPC and a remote ControlPlane/InfoCenter target is normally just a `target` change. `JobQueue.connect("local", ...)` reuses the same service connect local IPC transport to call a local `job-orchestrator`. `TaskPool.open(target="local", ...)` creates a private opener-owned pool while reusing the normal TaskPool wrapper surface such as unordered iteration. Empty target remains startup-only unregistered mode and does not imply local mode.
+
+`Service.connect(...)` is always a caller-side client, for both local and remote transports. It does not expose owner/control operations such as `update_globals(...)`; those remain available only on handles returned by `Service.startup(...)` or `Service.deploy(...)`.
+
+Local TaskPool is a private single-machine pool. If its local worker or pool state is lost, it fails fast and leaves rebuild/retry to the opener instead of running the distributed accepted-task replay path. Windows named pipe, spawn behavior, and Ctrl+C cleanup are platform validation items and should be tested on Windows directly.
+
+`job-orchestrator` is implemented as a built-in startup service module, not as a separate communication stack. The server process hosts a `StartupServiceNode`, mounts `pycloud_parallel.controlplane.job_orchestrator_service`, and then exposes the normal startup service transports. The module owns queue business logic; the transport remains service startup transport.
 
 ## Concepts Removed From The Final Public Surface
 

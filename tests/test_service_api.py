@@ -1,8 +1,12 @@
 """Tests for the V1 service-facing API surface."""
 
 import asyncio
+import contextlib
 import importlib
 import io
+import os
+from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import threading
@@ -686,6 +690,21 @@ def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch
         session = next(iter(node._services.values()))  # noqa: SLF001
         assert session.worker_count == 2
         assert session.node_managed is True
+        assert node.methods == ["add"]
+        assert node.list_methods(include_docs=True)[0]["method"] == "add"
+
+        call_service_kwargs = []
+        original_call_service = node.call_service
+
+        def _record_call_service(**kwargs):
+            call_service_kwargs.append(dict(kwargs))
+            return original_call_service(**kwargs)
+
+        monkeypatch.setattr(node, "call_service", _record_call_service)
+        assert node.add.sync(x=1, y=2) == {"value": 3}
+        assert call_service_kwargs
+        assert call_service_kwargs[0]["service_id"] == session.service_id
+        assert call_service_kwargs[0]["service_token"] == session.service_token
 
         code, body = node.call_service(
             service_id=session.service_id,
@@ -707,6 +726,332 @@ def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch
         assert node.service_report_payloads()[0]["service_name"] == "startup-calc"
     finally:
         node.close()
+
+
+def test_service_startup_local_proxy_calls_executor_without_http(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_local_proxy_service.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="startup-local-proxy",
+        entry_module="startup_local_proxy_service",
+        export_methods=("add",),
+        worker_count=1,
+    )
+    try:
+        assert node.service_http_bind == ""
+        assert node.add.sync(x=4, y=6) == {"value": 10}
+        assert asyncio.run(node.add.broadcast(x=2, y=3))[0][1] == {"value": 5}
+    finally:
+        node.close()
+
+
+def test_service_startup_local_proxy_streams_from_executor(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_local_stream_service.py"
+    module_path.write_text(
+        "def count(limit=3):\n"
+        "    for value in range(1, int(limit) + 1):\n"
+        "        yield value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="startup-local-stream",
+        entry_module="startup_local_stream_service",
+        export_methods=("count",),
+        worker_count=1,
+    )
+    try:
+        assert list(node.count.stream(limit=3)) == [1, 2, 3]
+    finally:
+        node.close()
+
+
+def test_service_deploy_local_returns_direct_proxy(tmp_path, monkeypatch):
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+
+    service = Service.deploy(
+        target="local",
+        service_name="deploy-local-proxy",
+        source=worker_module,
+        worker_count=1,
+    )
+    try:
+        assert service.service_http_bind == ""
+        assert service.run.sync(value=7) == {"value": 7}
+    finally:
+        service.close()
+
+
+def test_service_connect_local_streams_via_ipc(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    module_path = tmp_path / "connect_local_stream_service.py"
+    module_path.write_text(
+        "def run(limit=3):\n"
+        "    for value in range(1, int(limit) + 1):\n"
+        "        yield value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    service = Service.deploy(
+        target="local",
+        service_name="connect-local-stream",
+        source=importlib.import_module("connect_local_stream_service"),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(target="local", service_name="connect-local-stream", timeout_sec=5.0)
+        try:
+            assert list(client.run.stream(limit=4)) == [1, 2, 3, 4]
+        finally:
+            client.close()
+    finally:
+        service.close()
+
+
+def test_service_connect_local_fetches_large_result_dataref_via_ipc(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    module_path = tmp_path / "connect_local_large_result_service.py"
+    module_path.write_text(
+        "from pathlib import Path\n"
+        "import tempfile\n\n"
+        "def run(size=1048576):\n"
+        "    path = Path(tempfile.gettempdir()) / 'pycloud-local-large-result.bin'\n"
+        "    path.write_bytes(b'x' * int(size))\n"
+        "    return path\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    service = Service.deploy(
+        target="local",
+        service_name="connect-local-large-result",
+        source=importlib.import_module("connect_local_large_result_service"),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(target="local", service_name="connect-local-large-result", timeout_sec=5.0)
+        try:
+            result_path = client.run.sync(size=1024 * 1024 + 17)
+            assert isinstance(result_path, Path)
+            assert result_path.read_bytes() == b"x" * (1024 * 1024 + 17)
+        finally:
+            client.close()
+    finally:
+        service.close()
+
+
+def test_service_connect_local_uses_ipc_registry(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.local_ipc import local_service_metadata_path
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+
+    service = Service.deploy(
+        target="local",
+        service_name="deploy-local-ipc",
+        source=worker_module,
+        worker_count=1,
+    )
+    try:
+        assert local_service_metadata_path("deploy-local-ipc").exists()
+        client = Service.connect(
+            target="local",
+            service_name="deploy-local-ipc",
+            transport="gateway",
+            validate_on_init=True,
+        )
+        try:
+            assert client.run.sync(value=11) == {"value": 11}
+            assert asyncio.run(client.run.broadcast(value=12))[0][1] == {"value": 12}
+            assert client.route_summary()[0]["control_addr"] == "local"
+        finally:
+            client.close()
+    finally:
+        service.close()
+    assert not local_service_metadata_path("deploy-local-ipc").exists()
+
+
+def test_service_local_duplicate_service_name_rejected(tmp_path, monkeypatch):
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+    first = Service.deploy(
+        target="local",
+        service_name="deploy-local-duplicate",
+        source=worker_module,
+        worker_count=1,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="local service_name already exists"):
+            Service.deploy(
+                target="local",
+                service_name="deploy-local-duplicate",
+                source=worker_module,
+                worker_count=1,
+            )
+    finally:
+        first.close()
+
+
+def test_service_connect_local_across_processes(tmp_path):
+    service_name = "deploy-local-cross-process"
+    module_path = tmp_path / "local_cross_process_worker.py"
+    module_path.write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': int(value) + 100}\n",
+        encoding="utf-8",
+    )
+    server_script = tmp_path / "local_cross_process_server.py"
+    server_script.write_text(
+        "import importlib, sys\n\n"
+        "from pycloud_parallel import Service\n"
+        "\n"
+        "def main():\n"
+        f"    sys.path.insert(0, {str(tmp_path)!r})\n"
+        "    importlib.invalidate_caches()\n"
+        "    worker = importlib.import_module('local_cross_process_worker')\n"
+        f"    svc = Service.deploy(target='local', service_name={service_name!r}, source=worker, worker_count=1)\n"
+        "    print('READY', flush=True)\n"
+        "    try:\n"
+        "        sys.stdin.readline()\n"
+        "    finally:\n"
+        "        svc.close()\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str((Path(__file__).resolve().parents[1] / "src")),
+        "PYCLOUD_LOCAL_IPC_DIR": str(tmp_path / "local-ipc"),
+    }
+    old_ipc_dir = os.environ.get("PYCLOUD_LOCAL_IPC_DIR")
+    os.environ["PYCLOUD_LOCAL_IPC_DIR"] = env["PYCLOUD_LOCAL_IPC_DIR"]
+    proc = subprocess.Popen(
+        [sys.executable, str(server_script)],
+        cwd=str(tmp_path),
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = proc.stdout.readline().strip() if proc.stdout is not None else ""
+        if ready != "READY":
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+            raise AssertionError(f"local service server did not become ready: stdout={ready!r} stderr={stderr}")
+        client = Service.connect(target="local", service_name=service_name, timeout_sec=5.0)
+        try:
+            assert client.run.sync(value=23) == {"value": 123}
+        finally:
+            client.close()
+    finally:
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.write("STOP\n")
+                proc.stdin.flush()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        if old_ipc_dir is None:
+            os.environ.pop("PYCLOUD_LOCAL_IPC_DIR", None)
+        else:
+            os.environ["PYCLOUD_LOCAL_IPC_DIR"] = old_ipc_dir
+
+
+def test_service_local_stale_registry_allows_same_name_restart_after_crash(tmp_path):
+    from pycloud_parallel.controlplane.local_ipc import local_service_metadata_path
+
+    service_name = "deploy-local-stale-restart"
+    module_path = tmp_path / "local_stale_worker.py"
+    module_path.write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': int(value) + 1}\n",
+        encoding="utf-8",
+    )
+    server_script = tmp_path / "local_stale_server.py"
+    server_script.write_text(
+        "import importlib, sys, time\n\n"
+        "from pycloud_parallel import Service\n"
+        "\n"
+        "def main():\n"
+        f"    sys.path.insert(0, {str(tmp_path)!r})\n"
+        "    importlib.invalidate_caches()\n"
+        "    worker = importlib.import_module('local_stale_worker')\n"
+        f"    svc = Service.deploy(target='local', service_name={service_name!r}, source=worker, worker_count=1)\n"
+        "    print('READY', flush=True)\n"
+        "    while True:\n"
+        "        time.sleep(1.0)\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str((Path(__file__).resolve().parents[1] / "src")),
+        "PYCLOUD_LOCAL_IPC_DIR": str(tmp_path / "local-ipc"),
+    }
+    old_ipc_dir = os.environ.get("PYCLOUD_LOCAL_IPC_DIR")
+    os.environ["PYCLOUD_LOCAL_IPC_DIR"] = env["PYCLOUD_LOCAL_IPC_DIR"]
+    proc = subprocess.Popen(
+        [sys.executable, str(server_script)],
+        cwd=str(tmp_path),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = proc.stdout.readline().strip() if proc.stdout is not None else ""
+        if ready != "READY":
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+            raise AssertionError(f"local stale server did not become ready: stdout={ready!r} stderr={stderr}")
+        assert local_service_metadata_path(service_name).exists()
+        proc.kill()
+        proc.wait(timeout=10)
+        assert local_service_metadata_path(service_name).exists()
+
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            monkeypatch.syspath_prepend(str(tmp_path))
+            importlib.invalidate_caches()
+            service = Service.deploy(
+                target="local",
+                service_name=service_name,
+                source=importlib.import_module("local_stale_worker"),
+                worker_count=1,
+            )
+            try:
+                assert service.run.sync(value=10) == {"value": 11}
+            finally:
+                service.close()
+        finally:
+            monkeypatch.undo()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if old_ipc_dir is None:
+            os.environ.pop("PYCLOUD_LOCAL_IPC_DIR", None)
+        else:
+            os.environ["PYCLOUD_LOCAL_IPC_DIR"] = old_ipc_dir
 
 
 def test_service_startup_defaults_to_dynamic_http_bind(tmp_path, monkeypatch):
@@ -960,13 +1305,15 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
         assert session.policy_id == "trusted_internal"
         assert session.node_managed is True
         assert calls == [
-            {
-                "infocenter_target": "127.0.0.1:50051",
-                "control_addr": "",
-                "tags": None,
-                "metadata": {
-                    "service_name": "startup-registered",
-                    "entry_module": "startup_registered_service",
+                {
+                    "infocenter_target": "127.0.0.1:50051",
+                    "control_addr": "",
+                    "queue_capacity": 0,
+                    "tags": None,
+                    "version": "",
+                    "metadata": {
+                        "service_name": "startup-registered",
+                        "entry_module": "startup_registered_service",
                 },
                 "heartbeat_sec": 10,
                 "rpc_timeout_sec": 5.0,
@@ -1090,6 +1437,16 @@ def test_connected_service_async_calls_are_gated():
 
     asyncio.run(_run())
     assert max_active == 2
+
+
+def test_connected_service_does_not_expose_owner_update_globals():
+    from pycloud_parallel.execution.service_session import _ConnectedService
+
+    service = _ConnectedService.__new__(_ConnectedService)
+    service._discovered_methods = ["update_globals"]
+
+    with pytest.raises(AttributeError, match="only available on owner service handles"):
+        _ = service.update_globals
 
 
 class TestCallProxy:

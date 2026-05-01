@@ -262,6 +262,6 @@ V1 公开概念固定为：
 本次更新摘要（2026-04-29）：
 
 1. 对齐 V1 默认绑定：JobQueue 控制面固定 `default_safe + structured_v1`，Service/TaskPool 内部可信默认 `trusted_internal + pickle_stable_v1`，gateway/public 保守禁止 pickle
-2. 保留 JobQueue/job-orch 的长期边界：job-orch 作为系统内置 startup service，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
+2. 保留 JobQueue/job-orch 的长期边界：job-orch 作为系统内置 startup service module，服务端复用 startup service transport，JobQueue client 复用 `Service.connect` 底层 transport，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
 3. 确认内部可信 DataRef 主路径：`upload_once -> forward DataRef -> final worker/client remote_fetch`，gateway/public DataRef 边界后续单独收口
 4. 明确默认值变更同步范围：policy profile、runtime config、相关文档与测试必须一起更新

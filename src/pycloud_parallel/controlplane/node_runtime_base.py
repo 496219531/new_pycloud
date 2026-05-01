@@ -126,6 +126,7 @@ class NodeRuntimeBase:
             module=module,
             managed_global_names=tuple(str(name).strip() for name in (managed_global_names or ()) if str(name).strip()),
         )
+        mount.http_base_url = f"{self.service_http_base_url}/svc/{mount.service_id}" if self.service_http_base_url else ""
         self._startup_services[normalized_service_id] = mount
         self._apply_pending_startup_globals(mount)
         return mount

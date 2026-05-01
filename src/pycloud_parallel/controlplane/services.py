@@ -532,7 +532,21 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.code_version,
             request.runtime_key,
         )
+        if not request.client_id or not request.code_version or not request.code_token:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("client_id, code_version and code_token are required")
+            return pb2.UpdateRuntimeGlobalsResponse(
+                ok=False,
+                code_version=request.code_version,
+                runtime_key=request.runtime_key or request.code_version,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "client_id, code_version and code_token are required"),
+            )
         try:
+            self._state.require_runtime_globals_update_authorized(
+                client_id=request.client_id,
+                code_version=request.code_version,
+                code_token=request.code_token,
+            )
             decode_started = time.monotonic()
             if request.HasField("transport_values") and str(request.transport_values.codec or "").strip():
                 serialization_mode = str(request.transport_values.codec or "").strip().lower()
@@ -1223,7 +1237,20 @@ class NodeControlService(pb2_grpc.NodeControlServiceServicer):
             request.service_id,
             request.owner_client_id,
         )
+        if not request.owner_client_id or not request.service_id or not request.service_token:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("owner_client_id, service_id and service_token are required")
+            return pb2.UpdateServiceGlobalsResponse(
+                ok=False,
+                service_id=request.service_id,
+                error=_err(pb2.ERROR_CODE_INVALID_REQUEST, "owner_client_id, service_id and service_token are required"),
+            )
         try:
+            self._state.require_service_globals_update_authorized(
+                owner_client_id=request.owner_client_id,
+                service_id=request.service_id,
+                service_token=request.service_token,
+            )
             decode_started = time.monotonic()
             if request.HasField("transport_values") and str(request.transport_values.codec or "").strip():
                 serialization_mode = str(request.transport_values.codec or "").strip().lower()

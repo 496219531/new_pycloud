@@ -41,7 +41,7 @@ def test_job_queue_tracks_session_serialization_mode_and_propagates_submit():
                 "pycloud_parallel.execution.queue._prepare_job_submit_payload_for_call",
                 side_effect=lambda **kwargs: dict(kwargs["payload"]),
             ),
-            patch.object(queue._service_client, "call", return_value={"job": {"job_id": "job-1"}}) as mocked_call,
+            patch.object(queue, "_call_job_orchestrator", return_value={"job": {"job_id": "job-1"}}) as mocked_call,
         ):
             queue.submit_job({"entry_module": "job_demo", "subtasks": [{"value": 1}]})
 

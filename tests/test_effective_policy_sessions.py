@@ -63,8 +63,8 @@ def test_jobqueue_transport_policy_stays_fixed_even_when_orchestrator_route_poli
                 side_effect=_capture_prepared_payload,
             ),
             patch.object(
-                client._service_client,
-                "call",
+                client,
+                "_call_job_orchestrator",
                 side_effect=lambda **kwargs: (
                     captured.setdefault("call_policy", kwargs.get("effective_policy")),
                     {"job": {"job_id": "job-1", "status": "WAITING"}},

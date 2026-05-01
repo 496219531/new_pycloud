@@ -451,6 +451,38 @@ class NodeControlState(NodeRuntimeBase):
         if not self._token_node_instance_valid(getattr(pool, "token_node_instance_id", "")):
             raise PermissionError("pool_token node_instance_id mismatch")
 
+    def require_runtime_globals_update_authorized(
+        self,
+        *,
+        client_id: str,
+        code_version: str,
+        code_token: str,
+    ) -> None:
+        normalized_client_id = str(client_id or "").strip()
+        normalized_code_version = str(code_version or "").strip()
+        normalized_code_token = str(code_token or "").strip()
+        with self._lock:
+            if self._get_live_code_artifact_locked(normalized_code_version) is None:
+                raise KeyError("code artifact not found")
+            expected_code_token = self._client_code_tokens.get((normalized_client_id, normalized_code_version), "")
+            if not normalized_code_token or not expected_code_token or expected_code_token != normalized_code_token:
+                raise PermissionError("code_token mismatch")
+
+    def require_service_globals_update_authorized(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+    ) -> None:
+        with self._lock:
+            session = self._services.get(service_id)
+            if session is None:
+                raise KeyError("service not found")
+            if session.owner_client_id != str(owner_client_id or "").strip():
+                raise PermissionError("owner_client_id mismatch")
+            self._require_service_token(session, service_token)
+
     def reset_execution_state(self, *, reason: str = "node instance reset required") -> str:
         old_executor = None
         node_instance_id = str(self.node_instance_id or "")

@@ -18,6 +18,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+import uuid
 from urllib.parse import urlparse
 
 from pycloud_parallel.controlplane.artifact import (
@@ -110,6 +111,7 @@ logger = logging.getLogger(__name__)
 
 _STARTUP_PREFLIGHT_RETRY_SEC = 5.0
 _STARTUP_PREFLIGHT_SLEEP_SEC = 0.2
+_CONNECTED_SERVICE_OWNER_ONLY_METHODS = frozenset({"update_globals"})
 
 
 def _infocenter_client(*args, **kwargs):
@@ -719,12 +721,16 @@ class _ConnectedService:
         timeout_sec: float,
         serialization_mode: str = "",
         validate_on_init: bool = True,
+        effective_policy_override: Optional[EffectivePolicy] = None,
+        prepare_discovery_payload: bool = True,
     ) -> None:
         self._transport_client = transport_client
         self.service_name = str(service_name or "").strip()
         self.transport = str(transport or "").strip().lower() or "discovery"
         self.timeout_sec = max(0.1, float(timeout_sec))
         self._requested_serialization_mode = str(serialization_mode or "").strip()
+        self._fixed_effective_policy = effective_policy_override
+        self._prepare_discovery_payload_enabled = bool(prepare_discovery_payload)
         self._default_policy_id = get_default_policy_id_for_binding(
             "gateway_public" if self.transport == "gateway" else "service_internal"
         )
@@ -751,6 +757,10 @@ class _ConnectedService:
         self._async_call_executor_capacity = 0
         self.effective_policy: Optional[EffectivePolicy] = None
         self.serialization_mode = str(serialization_mode or "").strip()
+        if self._fixed_effective_policy is not None:
+            self.effective_policy = self._fixed_effective_policy
+            self._default_policy_id = self._fixed_effective_policy.policy_id
+            self.serialization_mode = self._fixed_effective_policy.resolved_mode
         if not self.service_name:
             raise ValueError("Service.connect() requires service_name")
         if validate_on_init:
@@ -842,6 +852,11 @@ class _ConnectedService:
         return "gateway_public" if self.transport == "gateway" else "service_connect"
 
     def _refresh_effective_policy_from_routes(self, routes: Optional[Sequence[object]] = None) -> None:
+        if self._fixed_effective_policy is not None:
+            self.effective_policy = self._fixed_effective_policy
+            self._default_policy_id = self._fixed_effective_policy.policy_id
+            self.serialization_mode = self._fixed_effective_policy.resolved_mode
+            return
         candidates = list(routes or [])
         if not candidates:
             try:
@@ -1257,7 +1272,11 @@ class _ConnectedService:
                         )
 
             def _call_route(selected_route: object) -> Tuple[str, Dict[str, object]]:
-                prepared_payload = self._prepare_discovery_route_payload(selected_route, payload)
+                prepared_payload = (
+                    self._prepare_discovery_route_payload(selected_route, payload)
+                    if self._prepare_discovery_payload_enabled
+                    else dict(payload or {})
+                )
                 route_call_kwargs = {
                     "method": method,
                     "payload": prepared_payload,
@@ -1380,8 +1399,22 @@ class _ConnectedService:
         timeout_sec: float = 60.0,
         max_concurrency: int = 100,
     ):
-        del method, payload, timeout_sec, max_concurrency
-        raise NotImplementedError(f"{self.transport} connected service does not support broadcast")
+        del max_concurrency
+        if isinstance(payload, list):
+            if len(payload) != 1:
+                raise ValueError(f"{self.transport} connected service broadcast accepts exactly one payload")
+            payload = dict(payload[0] or {})
+        node_id = "local" if self.transport == "local" else self.service_name
+        try:
+            called_node_id, response = await self.acall_balanced(
+                method,
+                dict(payload or {}),
+                timeout_sec=timeout_sec,
+                refresh_status=False,
+            )
+            return [(called_node_id or node_id, response, None)]
+        except Exception as exc:
+            return [(node_id, None, exc)]
 
     async def call(self, method: str, **kwargs) -> Dict[str, object]:
         node_id, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
@@ -1438,6 +1471,36 @@ class _ConnectedService:
                         raise RuntimeError(str(event.get("error", "service stream failed")))
 
             return _gateway_iter()
+
+        if self.transport == "local":
+            def _local_iter():
+                for event in self._transport_client.stream_call(
+                    service_name=self.service_name,
+                    method=method,
+                    payload=payload,
+                    timeout_sec=max(0.1, float(timeout_sec)),
+                    serialization_mode=effective_serialization_mode,
+                ):
+                    event_name = str(event.get("event", "") or "")
+                    if event_name == "item":
+                        item_data = event.get("data")
+                        if is_inline_transport_carrier(item_data):
+                            item_data = decode_inline_transport_carrier(
+                                item_data,
+                                context="service_result",
+                            )
+                        yield _resolve_high_level_service_data(
+                            self,
+                            node_id="local",
+                            response={"data": item_data},
+                        )
+                        continue
+                    if event_name == "done":
+                        if bool(event.get("ok", False)):
+                            return
+                        raise RuntimeError(str(event.get("error", "service stream failed")))
+
+            return _local_iter()
 
         if self.transport != "discovery":
             raise NotImplementedError(f"stream_call does not support transport={self.transport!r}")
@@ -1670,6 +1733,11 @@ class _ConnectedService:
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        if name in _CONNECTED_SERVICE_OWNER_ONLY_METHODS:
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'; "
+                f"{name} is only available on owner service handles"
+            )
         if self._discovered_methods is None:
             self._ensure_methods_discovered()
         if self._discovered_methods is not None and name not in self._discovered_methods:
@@ -1944,6 +2012,8 @@ class Service(ServiceExecutionSession):
         managed_global_names: Optional[Sequence[str]] = None,
         tags: Optional[Sequence[str]] = None,
         metadata: Optional[Dict[str, str]] = None,
+        queue_capacity: int = 0,
+        version: str = "",
         heartbeat_sec: int = 10,
         rpc_timeout_sec: float = 5.0,
         start: bool = True,
@@ -1967,24 +2037,27 @@ class Service(ServiceExecutionSession):
         effective_service_name = str(service_name or module_name.rsplit(".", 1)[-1] or "startup-service").strip()
         effective_node_id = str(node_id or f"{effective_service_name}-startup").strip()
         service_http_bind = "0.0.0.0:0" if bind is None else str(bind).strip()
-        artifact_source = source
-        if artifact_source is None or isinstance(artifact_source, str):
-            artifact_source = importlib.import_module(module_name)
-        normalized_artifact = _normalize_artifact_input(
-            consumer_kind="service",
-            source=artifact_source,
-            deps=deps,
-            runtime=runtime,
-            entry_module=entry_module,
-            entry_callable=entry_callable,
-            package_format=package_format,
-            exports=ArtifactExports.explicit(export_methods) if export_methods else ArtifactExports.export_all(),
-            managed_global_names=managed_global_names,
-        )
-        prepared_artifact = _prepare_artifact(
-            normalized_artifact,
-            consumer_kind="service",
-        )
+        direct_module_mount = str(package_format or "").strip().lower() == "module"
+        prepared_artifact = None
+        if not direct_module_mount:
+            artifact_source = source
+            if artifact_source is None or isinstance(artifact_source, str):
+                artifact_source = importlib.import_module(module_name)
+            normalized_artifact = _normalize_artifact_input(
+                consumer_kind="service",
+                source=artifact_source,
+                deps=deps,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=package_format,
+                exports=ArtifactExports.explicit(export_methods) if export_methods else ArtifactExports.export_all(),
+                managed_global_names=managed_global_names,
+            )
+            prepared_artifact = _prepare_artifact(
+                normalized_artifact,
+                consumer_kind="service",
+            )
 
         def _bind_startup_gateway(startup_node) -> None:
             deadline = time.monotonic() + _STARTUP_PREFLIGHT_RETRY_SEC
@@ -1994,7 +2067,10 @@ class Service(ServiceExecutionSession):
             )
             while True:
                 try:
-                    startup_node.start_node_service_gateway()
+                    if direct_module_mount:
+                        startup_node.start_mounted_service_gateway()
+                    else:
+                        startup_node.start_node_service_gateway()
                     return
                 except OSError as exc:
                     if time.monotonic() >= deadline:
@@ -2053,7 +2129,10 @@ class Service(ServiceExecutionSession):
                     f"existing=[{details}]"
                 )
 
-        effective_infocenter_target = str(target or "").strip()
+        local_mode = str(target or "").strip().lower() == "local"
+        effective_infocenter_target = "" if local_mode else str(target or "").strip()
+        if local_mode:
+            service_http_bind = ""
         effective_worker_count = max(1, int(worker_count or 1))
         node = StartupServiceNode(
             node_id=effective_node_id,
@@ -2071,10 +2150,132 @@ class Service(ServiceExecutionSession):
         try:
             node.service_http_bind = service_http_bind
             _preflight_existing_startup_service()
-            if start:
+            if start and not local_mode:
                 _bind_startup_gateway(node)
+            if direct_module_mount:
+                node.mount_python_module_service(
+                    service_name=effective_service_name,
+                    entry_module=module_name,
+                    export_methods=export_methods,
+                    service_id=service_id,
+                    worker_count=effective_worker_count,
+                    policy_id=policy_id or (get_default_policy_id_for_binding("service_internal") if local_mode else ""),
+                    managed_global_names=managed_global_names or (),
+                )
+            else:
+                node.mount_prepared_service(
+                    owner_client_id=f"{effective_node_id}-owner",
+                    service_name=effective_service_name,
+                    sha256=prepared_artifact.content_sha256,
+                    runtime=prepared_artifact.runtime,
+                    entry_module=prepared_artifact.entry_module,
+                    entry_callable=prepared_artifact.entry_callable,
+                    package_format=prepared_artifact.package_format,
+                    export_mode=prepared_artifact.export_mode,
+                    export_methods=list(prepared_artifact.export_methods),
+                    export_decorator=prepared_artifact.export_decorator,
+                    dependency_policy_mode=prepared_artifact.dependency_policy_mode,
+                    dependency_allowlist=list(prepared_artifact.dependency_allowlist),
+                    managed_global_names=list(prepared_artifact.managed_global_names),
+                    policy_id=policy_id or (get_default_policy_id_for_binding("service_internal") if local_mode else ""),
+                    worker_count=effective_worker_count,
+                    heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
+                    idle_ttl_sec=0,
+                    expose_http=bool(start and not local_mode),
+                    chunks=[prepared_artifact.blob],
+                    service_id=service_id,
+                )
+            if local_mode:
+                node.start_local_ipc()
+            if effective_infocenter_target:
+                node.start_infocenter_registration(
+                    infocenter_target=effective_infocenter_target,
+                    control_addr=control_addr,
+                    queue_capacity=queue_capacity,
+                    tags=tags,
+                    version=version,
+                    metadata={
+                        "service_name": effective_service_name,
+                        "entry_module": module_name,
+                        **dict(metadata or {}),
+                    },
+                    heartbeat_sec=heartbeat_sec,
+                    rpc_timeout_sec=rpc_timeout_sec,
+                )
+        except Exception:
+            node.close()
+            raise
+        return node
+
+    @classmethod
+    def _deploy_local(
+        cls,
+        *,
+        source: Any = None,
+        owner_client_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        artifact: Optional[Any] = None,
+        deps: Optional[Any] = None,
+        runtime: str = "py3",
+        package_format: str = "",
+        serialization_mode: str = "",
+        resource_paths: Optional[Sequence[Any]] = None,
+        managed_global_names: Optional[Sequence[str]] = None,
+        worker_count: int = 10,
+        heartbeat_timeout_sec: int = 30,
+        idle_ttl_sec: int = 0,
+        chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        timeout_sec: float = 10.0,
+    ):
+        del serialization_mode, chunk_size, timeout_sec
+        from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+        module_source = source if inspect.ismodule(source) else None
+        normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
+        if normalized_resource_paths and module_source is None:
+            raise ValueError("resource_paths requires a module source")
+        entry_module: Any = ""
+        entry_callable: Any = "run"
+        if normalized_resource_paths and module_source is not None:
+            module_blob, module_filename = _prepare_code_blob(module=module_source, resource_paths=normalized_resource_paths)
+            source = module_blob
+            entry_module = _default_entry_module_for_module(module_source)
+            package_format = _resolve_package_format(package_format, module_filename, default="py")
+
+        normalized_artifact = _normalize_artifact_input(
+            consumer_kind="service",
+            source=source,
+            artifact=artifact,
+            deps=deps,
+            runtime=runtime,
+            entry_module=entry_module,
+            entry_callable=entry_callable,
+            package_format=package_format,
+            managed_global_names=managed_global_names,
+        )
+        prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="service")
+        effective_entry_module = prepared_artifact.entry_module
+        if not effective_entry_module and prepared_artifact.filename.endswith(".py"):
+            effective_entry_module = Path(prepared_artifact.filename).stem
+        local_ip = _get_local_ip()
+        effective_owner = str(owner_client_id or f"local-client-{local_ip}").strip()
+        effective_service_name = str(service_name or effective_entry_module or f"local-service-{uuid.uuid4().hex[:10]}").strip()
+        if not effective_service_name:
+            raise ValueError("service_name is required")
+        effective_worker_count = max(1, int(worker_count or 1))
+        node = StartupServiceNode(
+            node_id=f"{effective_service_name}-local",
+            worker_capacity=effective_worker_count,
+            service_worker_capacity=effective_worker_count,
+            task_pool_worker_capacity=1,
+            service_http_bind="",
+            enable_internal_executor=False,
+            enable_service_session=True,
+            service_default_worker_count=effective_worker_count,
+        )
+        try:
             node.mount_prepared_service(
-                owner_client_id=f"{effective_node_id}-owner",
+                owner_client_id=effective_owner,
                 service_name=effective_service_name,
                 sha256=prepared_artifact.content_sha256,
                 runtime=prepared_artifact.runtime,
@@ -2087,30 +2288,18 @@ class Service(ServiceExecutionSession):
                 dependency_policy_mode=prepared_artifact.dependency_policy_mode,
                 dependency_allowlist=list(prepared_artifact.dependency_allowlist),
                 managed_global_names=list(prepared_artifact.managed_global_names),
-                policy_id=policy_id,
+                policy_id=get_default_policy_id_for_binding("service_internal"),
                 worker_count=effective_worker_count,
-                heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
-                idle_ttl_sec=0,
-                expose_http=bool(start),
+                heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
+                idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+                expose_http=False,
                 chunks=[prepared_artifact.blob],
-                service_id=service_id,
             )
-            if effective_infocenter_target:
-                node.start_infocenter_registration(
-                    infocenter_target=effective_infocenter_target,
-                    control_addr=control_addr,
-                    tags=tags,
-                    metadata={
-                        "service_name": effective_service_name,
-                        "entry_module": module_name,
-                        **dict(metadata or {}),
-                    },
-                    heartbeat_sec=heartbeat_sec,
-                    rpc_timeout_sec=rpc_timeout_sec,
-                )
+            node.start_local_ipc()
         except Exception:
             node.close()
             raise
+        _emit_owner_notice(f"local deploy success service_name={effective_service_name} methods={node.methods}")
         return node
 
     @classmethod
@@ -2156,6 +2345,24 @@ class Service(ServiceExecutionSession):
         Default path: ``Service.deploy(target=\"127.0.0.1:50051\", source=my_module, ...)``.
         Advanced path: ``Service.deploy(artifact=Artifact(...), ...)``.
         """
+        if str(target or "").strip().lower() == "local":
+            return cls._deploy_local(
+                source=source,
+                owner_client_id=owner_client_id,
+                service_name=service_name,
+                artifact=artifact,
+                deps=deps,
+                runtime=runtime,
+                package_format=package_format,
+                serialization_mode=serialization_mode,
+                resource_paths=resource_paths,
+                managed_global_names=managed_global_names,
+                worker_count=worker_count,
+                heartbeat_timeout_sec=heartbeat_timeout_sec,
+                idle_ttl_sec=idle_ttl_sec,
+                chunk_size=chunk_size,
+                timeout_sec=timeout_sec,
+            )
         effective_target = _resolve_public_target_arg(
             target=target,
             action_name="Service.deploy()",
@@ -2209,7 +2416,47 @@ class Service(ServiceExecutionSession):
         validate_on_init: bool = False,
     ):
         """Product-facing connect action for an already deployed service."""
+        return cls._connect_transport(
+            target=target,
+            service_name=service_name,
+            timeout_sec=timeout_sec,
+            service_token=service_token,
+            transport=transport,
+            serialization_mode=serialization_mode,
+            validate_on_init=validate_on_init,
+        )
+
+    @classmethod
+    def _connect_transport(
+        cls,
+        *,
+        target: str,
+        service_name: str,
+        timeout_sec: float = 10.0,
+        service_token: str = "",
+        transport: str = "discovery",
+        serialization_mode: str = "",
+        validate_on_init: bool = False,
+        effective_policy_override: Optional[EffectivePolicy] = None,
+        prepare_discovery_payload: bool = True,
+    ):
         normalized_transport = str(transport or "discovery").strip().lower() or "discovery"
+        if normalized_transport == "local" or str(target or "").strip().lower() == "local":
+            from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
+
+            return _ConnectedService(
+                transport_client=LocalServiceClient(
+                    service_name=service_name,
+                    timeout_sec=timeout_sec,
+                ),
+                service_name=service_name,
+                transport="local",
+                timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
+                validate_on_init=validate_on_init,
+                effective_policy_override=effective_policy_override,
+                prepare_discovery_payload=prepare_discovery_payload,
+            )
         if normalized_transport == "gateway":
             from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
@@ -2224,6 +2471,8 @@ class Service(ServiceExecutionSession):
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
                 validate_on_init=validate_on_init,
+                effective_policy_override=effective_policy_override,
+                prepare_discovery_payload=prepare_discovery_payload,
             )
         if normalized_transport == "discovery":
             from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
@@ -2240,9 +2489,11 @@ class Service(ServiceExecutionSession):
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
                 validate_on_init=validate_on_init,
+                effective_policy_override=effective_policy_override,
+                prepare_discovery_payload=prepare_discovery_payload,
             )
         raise ValueError(
-            "Service.connect() transport must be one of: discovery, gateway"
+            "Service.connect() transport must be one of: discovery, gateway, local"
         )
 
     @classmethod

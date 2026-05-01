@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor
 import math
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -32,15 +32,9 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
 )
-from pycloud_parallel.controlplane.payload_transport import (
-    decode_result_from_transport,
-    normalize_inbound_payload,
-)
+from pycloud_parallel.controlplane.payload_transport import normalize_inbound_payload
 from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
-    decode_transport_payload_bytes,
-    detect_transport_mode,
-    struct_to_python,
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.node.execution import (
@@ -115,47 +109,6 @@ class _JobTaskPoolSpec:
     create_pool: Any
 
 
-def _task_result_to_dict(item: pb2.TaskResult, *, serialization_mode: str = "") -> Dict[str, object]:
-    detail: Dict[str, object] = {}
-    if item.HasField("transport_result") and str(item.transport_result.codec or "").strip():
-        detail = {
-            "result": decode_transport_payload_bytes(
-                str(item.transport_result.codec or ""),
-                int(item.transport_result.version or 0),
-                item.transport_result.payload,
-                context="jobqueue_session",
-            )
-        }
-    elif item.result:
-        raw_result = struct_to_python(item.result)
-        try:
-            resolved_result = decode_result_from_transport(
-                raw_result,
-                mode=detect_transport_mode(raw_result, default=serialization_mode or "legacy_v1"),
-                context="jobqueue_session",
-            )
-        except Exception:
-            resolved_result = raw_result
-        detail = {
-            "result": resolved_result
-        }
-    elif item.error and (item.error.type or item.error.message):
-        detail = {
-            "error": {
-                "type": str(item.error.type or ""),
-                "message": str(item.error.message or ""),
-            }
-        }
-    return {
-        "task_id": str(item.task_id or ""),
-        "job_id": str(item.job_id or ""),
-        "status": int(item.status),
-        "status_text": pb2.TaskStatus.Name(item.status),
-        "attempt": int(item.attempt or 0),
-        **detail,
-    }
-
-
 def _payload_object_ref(value: object) -> Optional[DataRef]:
     return maybe_data_ref(value)
 
@@ -164,9 +117,6 @@ _JOB_DELAYED_RESOLVE_SKIP_KEYS = {
     "blob_ref",
     "blob_b64",
     "blob_control_addr",
-    "driver_blob_ref",
-    "driver_blob_b64",
-    "driver_blob_control_addr",
 }
 
 
@@ -629,10 +579,6 @@ class JobQueueManager:
         self._stop = False
         self._thread: Optional[threading.Thread] = None
         self._maintenance_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobq-maint")
-        self._driver_executor = ThreadPoolExecutor(
-            max_workers=max(1, int(os.getenv("PYCLOUD_JOB_QUEUE_DRIVER_WORKERS", "1") or 1)),
-            thread_name_prefix="jobq-driver",
-        )
         self._summary_cache: Optional[Dict[str, object]] = None
         self._summary_cache_revision: int = 0
         self._summary_cache_built_at_monotonic: float = 0.0
@@ -783,7 +729,6 @@ class JobQueueManager:
             self._submit_executor_close(shared_executor)
         for state in release_states:
             self._release_job_refs(state)
-        self._driver_executor.shutdown(wait=False, cancel_futures=True)
         self._maintenance_executor.shutdown(wait=False, cancel_futures=True)
 
     def _resolve_requested_task_mode(self, payload: Dict[str, object]) -> str:
@@ -1096,61 +1041,6 @@ class JobQueueManager:
             )
         return warmup_ms
 
-    def _build_plain_job_task_pool_spec(
-        self,
-        *,
-        payload: Dict[str, object],
-        kwargs: Dict[str, object],
-        client_id: str,
-        job_id_snapshot: str,
-        pool_request: _JobSharedPoolRequest,
-        artifact_path: str,
-        task_resource_paths: Sequence[str],
-    ) -> _JobTaskPoolSpec:
-        artifact_key = self._shared_pool_artifact_key(
-            blob=kwargs.get("blob"),
-            artifact_path=artifact_path,
-            runtime=str(kwargs.get("runtime", "py3") or "py3"),
-            entry_module=str(kwargs.get("entry_module", "") or ""),
-            entry_callable=str(kwargs.get("entry_callable", "run") or "run"),
-            package_format=str(kwargs.get("package_format", "") or ""),
-            dependency_allowlist=list(kwargs.get("dependency_allowlist") or ()),
-            managed_global_names=list(kwargs.get("managed_global_names") or ()),
-            task_resource_paths=task_resource_paths,
-        )
-
-        def _create_pool(mode: str) -> TaskPool:
-            dependency_allowlist = list(kwargs.get("dependency_allowlist") or ())
-            source_value = kwargs.get("blob")
-            if source_value is None and artifact_path:
-                source_value = artifact_path
-            return _create_job_task_pool(
-                infocenter_target=self._controlplane_target,
-                job_id=job_id_snapshot,
-                owner_client_id=kwargs.get("client_id") or client_id,
-                pool_name=str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),
-                source=source_value,
-                runtime=kwargs.get("runtime", "py3"),
-                entry_module=kwargs.get("entry_module", ""),
-                entry_callable=kwargs.get("entry_callable", "run"),
-                package_format=kwargs.get("package_format", ""),
-                serialization_mode=pool_request.raw_requested_mode or "",
-                policy_id=self._taskpool_policy_id,
-                deps=ArtifactDeps.allow_install(dependency_allowlist) if dependency_allowlist else None,
-                managed_global_names=kwargs.get("managed_global_names"),
-                worker_count=max(1, int(payload.get("pool_worker_count", payload.get("worker_count", pool_request.default_worker_count)) or pool_request.default_worker_count)),
-                heartbeat_timeout_sec=max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
-                idle_ttl_sec=max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
-                healthy_only=kwargs.get("healthy_only", True),
-                tags=kwargs.get("tags"),
-                node_ids=kwargs.get("node_ids"),
-                node_count=max(0, int(payload.get("pool_node_count", kwargs.get("node_count", pool_request.default_node_count) or pool_request.default_node_count) or 0)),
-                node_limit=kwargs.get("node_limit", 100),
-                timeout_sec=kwargs.get("timeout_sec", 10.0),
-            )
-
-        return _JobTaskPoolSpec(artifact_key=artifact_key, create_pool=_create_pool)
-
     def _build_hook_job_task_pool_spec(
         self,
         *,
@@ -1222,6 +1112,11 @@ class JobQueueManager:
         if any(str(normalized_payload.get(field, "") or "").strip() for field in ("policy_id", "taskpool_policy_id")):
             raise ValueError(
                 "job submit policy_id/taskpool_policy_id is not supported; policy is owned by startup node/deployment"
+            )
+        if not _uses_job_hooks(normalized_payload):
+            raise ValueError(
+                "job submit requires hook mode; use JobQueue.submit(source=...) "
+                "or provide job_mode='hooks' with task_generator_callable"
             )
         _validate_delayed_resolve_refs(normalized_payload)
         job_id = str(normalized_payload.get("job_id", "") or "").strip() or f"jobq-{uuid.uuid4().hex}"
@@ -1666,69 +1561,6 @@ class JobQueueManager:
                 self._invalidate_summary_locked()
                 self._cv.notify_all()
 
-    def _expand_subtasks(self, payload: Dict[str, object]) -> List[Dict[str, object]]:
-        subtasks = payload.get("subtasks") or []
-        if isinstance(subtasks, list) and subtasks:
-            return [dict(item) for item in subtasks if isinstance(item, dict)]
-
-        driver_blob = _resolve_job_blob_bytes(
-            payload,
-            b64_key="driver_blob_b64",
-            ref_key="driver_blob_ref",
-            control_addr_key="driver_blob_control_addr",
-        )
-        if not driver_blob:
-            return []
-
-        package_format = str(payload.get("driver_package_format", "py") or "py").strip() or "py"
-        entry_module = str(payload.get("driver_entry_module", "") or "").strip()
-        entry_callable = str(payload.get("driver_entry_callable", "run") or "run").strip() or "run"
-        driver_payload = dict(payload.get("driver_payload") or {})
-
-        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-job-driver-", suffix=_artifact_suffix(package_format))
-        os.close(fd)
-        tmp_path = Path(tmp_name)
-        module = None
-        fn = None
-        produced = None
-        try:
-            tmp_path.write_bytes(driver_blob)
-            module = _load_user_module(
-                str(tmp_path),
-                entry_module=entry_module,
-                package_format=package_format,
-                dependency_path="",
-            )
-            fn = getattr(module, entry_callable, None)
-            if fn is None or not callable(fn):
-                raise RuntimeError(f"driver callable not found: {entry_callable}")
-            produced = _invoke_local_user_callable(fn, driver_payload)
-            if isinstance(produced, dict) and isinstance(produced.get("subtasks"), list):
-                produced = produced["subtasks"]
-            if not isinstance(produced, list):
-                raise RuntimeError("driver must return list[dict] or {'subtasks': list[dict]}")
-            subtasks = [dict(item) for item in produced if isinstance(item, dict)]
-            if not subtasks:
-                raise RuntimeError("driver returned no valid subtasks")
-            return subtasks
-        finally:
-            extracted_dir = str(getattr(module, "__pycloud_temp_extract_dir__", "") or "").strip() if module is not None else ""
-            produced = None
-            fn = None
-            module = None
-            try:
-                _purge_loaded_artifact_modules(
-                    str(tmp_path),
-                    entry_module=entry_module,
-                    package_format=package_format,
-                    dependency_path="",
-                    extra_prefixes=([extracted_dir] if extracted_dir else []),
-                )
-            except Exception:
-                pass
-            tmp_path.unlink(missing_ok=True)
-            gc.collect()
-
     def _run_job(self, job_id: str) -> None:
         with self._lock:
             state = self._jobs.get(job_id)
@@ -1776,240 +1608,14 @@ class JobQueueManager:
                 job_id_snapshot=job_id_snapshot,
             )
             return
-
-        try:
-            fut = self._driver_executor.submit(self._expand_subtasks, payload)
-            subtasks = fut.result(timeout=float(payload.get("driver_timeout_sec", 120.0) or 120.0))
-        except FutureTimeout as exc:
-            with contextlib.suppress(Exception):
-                fut.cancel()
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is not None:
-                    state.status = "FAILED"
-                    state.finished_at = utc_now()
-                    state.error = f"driver timed out after {float(payload.get('driver_timeout_sec', 120.0) or 120.0):.1f}s"
-                    self._invalidate_summary_locked()
-            return
-        except Exception as exc:
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is not None:
-                    state.status = "FAILED"
-                    state.finished_at = utc_now()
-                    state.error = f"driver failed: {exc}"
-                    self._invalidate_summary_locked()
-            return
-        if not subtasks:
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is not None:
-                    state.status = "FAILED"
-                    state.finished_at = utc_now()
-                    state.error = "job payload must provide non-empty subtasks list or valid driver"
-                    self._invalidate_summary_locked()
-            return
-
-        kwargs = {
-            "infocenter_target": self._controlplane_target,
-            "client_id": client_id,
-            "job_id": job_id_snapshot,
-            "runtime": str(payload.get("runtime", "py3") or "py3"),
-            "entry_module": str(payload.get("entry_module", "") or "").strip(),
-            "entry_callable": str(payload.get("entry_callable", "run") or "run").strip() or "run",
-            "package_format": str(payload.get("package_format", "") or "").strip(),
-            "export_mode": str(payload.get("export_mode", "single") or "single").strip() or "single",
-            "export_methods": list(payload.get("export_methods") or ()),
-            "dependency_allowlist": list(payload.get("dependency_allowlist") or ()),
-            "managed_global_names": list(payload.get("managed_global_names") or ()),
-            "healthy_only": bool(payload.get("healthy_only", True)),
-            "tags": list(payload.get("tags") or ()),
-            "node_ids": list(payload.get("node_ids") or ()),
-            "node_count": int(payload.get("node_count", 0) or 0),
-            "node_limit": int(payload.get("node_limit", 100) or 100),
-            "require_credit": bool(payload.get("require_credit", True)),
-            "preferred_runtime_key": str(payload.get("preferred_runtime_key", "") or "").strip(),
-            "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
-        }
-        prepared_update_globals = (
-            dict(payload.get("update_globals"))
-            if isinstance(payload.get("update_globals"), dict)
-            else {}
-        )
-        if prepared_update_globals and not kwargs["managed_global_names"]:
-            kwargs["managed_global_names"] = [
-                str(name).strip()
-                for name in prepared_update_globals.keys()
-                if str(name).strip()
-            ]
-
-        code_version = str(payload.get("code_version", "") or "").strip()
-        if code_version:
-            kwargs["code_version"] = code_version
-        else:
-            blob = _resolve_job_blob_bytes(
-                payload,
-                b64_key="blob_b64",
-                ref_key="blob_ref",
-                control_addr_key="blob_control_addr",
-            )
-            if not blob:
-                with self._lock:
-                    state = self._jobs.get(job_id)
-                    if state is not None:
-                        state.status = "FAILED"
-                        state.finished_at = utc_now()
-                        state.error = "job must provide either code_version or blob_b64/blob_ref"
-                return
-            kwargs["blob"] = blob
-        artifact_path = str(payload.get("artifact_path", "") or "").strip()
-        task_resource_paths = [str(item).strip() for item in list(payload.get("task_resource_paths") or ()) if str(item).strip()]
         with self._lock:
-            self._job_timing_mark_locked(job_id, "select_nodes")
-        pool_request = self._resolve_job_shared_pool_request(payload)
-        with self._lock:
-            self._job_timing_finish_locked(job_id, "select_nodes", "select_nodes_ms")
-
-        executor: Optional[Any] = None
-        try:
-            logger.info(
-                "[JobQueue] run job_id=%s mode=plain subtasks=%d requested_mode=%s reset_pool=%s",
-                job_id_snapshot,
-                len(subtasks),
-                pool_request.requested_mode,
-                pool_request.reset_pool,
-            )
-            pool_spec = self._build_plain_job_task_pool_spec(
-                payload=payload,
-                kwargs=kwargs,
-                client_id=client_id,
-                job_id_snapshot=job_id_snapshot,
-                pool_request=pool_request,
-                artifact_path=artifact_path,
-                task_resource_paths=task_resource_paths,
-            )
-            executor = self._prepare_shared_pool_for_job(
-                job_id=job_id,
-                job_id_snapshot=job_id_snapshot,
-                artifact_key=pool_spec.artifact_key,
-                requested_mode=pool_request.requested_mode,
-                reset_pool=pool_request.reset_pool,
-                create_pool=pool_spec.create_pool,
-            )
-            self._fanout_job_update_globals(
-                job_id=job_id,
-                job_id_snapshot=job_id_snapshot,
-                executor=executor,
-                prepared_update_globals=prepared_update_globals,
-                phase_log=False,
-            )
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is not None:
-                    state.checkpoint["phase"] = "running_tasks"
-                    state.timing["task_count"] = len(subtasks)
-            running_started = time.monotonic()
-            first_result_wait_ms = 0.0
-            submit_resp = executor.submit_payloads(
-                subtasks,
-                job_id=job_id_snapshot,
-                timeout_hint_sec=int(payload.get("timeout_hint_sec", 0) or 0),
-                priority=max(1, int(payload.get("task_priority", 1) or 1)),
-                runtime_key=str(payload.get("runtime_key", "") or "").strip(),
-            )
-            logger.info(
-                "[JobQueue] submit tasks job_id=%s accepted=%d rejected=%d",
-                job_id_snapshot,
-                len(list(submit_resp.accepted or ())),
-                len(list(submit_resp.rejected or ())),
-            )
-            pending = {str(item.task_id or "").strip() for item in submit_resp.accepted}
-            rendered_results: List[Dict[str, object]] = []
-            has_failed = False
-            deadline = time.monotonic() + float(payload.get("wait_timeout_sec", 3600.0) or 3600.0)
-            chunk_timeout = max(0.5, min(10.0, float(payload.get("wait_chunk_timeout_sec", 5.0) or 5.0)))
-            if pending and not hasattr(executor, "iter_results") and hasattr(executor, "wait_for_results"):
-                wait_results = executor.wait_for_results(
-                    expected_count=len(pending),
-                    timeout_sec=max(0.1, deadline - time.monotonic()),
-                    wait_ms=int(payload.get("wait_ms", 500) or 500),
-                    job_id=job_id_snapshot,
-                )
-                saw_result = False
-                for item in wait_results:
-                    saw_result = True
-                    tid = str(item.task_id or "").strip()
-                    if tid in pending:
-                        pending.discard(tid)
-                    if item.status != pb2.TASK_STATUS_SUCCEEDED:
-                        has_failed = True
-                    rendered_results.append(
-                        _task_result_to_dict(item, serialization_mode=pool_request.requested_mode)
-                    )
-                if saw_result:
-                    first_result_wait_ms = _ms(time.monotonic() - running_started)
-                pending.clear()
-            while pending:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"job wait timeout with pending={len(pending)}")
-                with self._lock:
-                    state = self._jobs.get(job_id)
-                    cancel_requested = bool(state.cancel_requested) if state is not None else False
-                if cancel_requested:
-                    try:
-                        executor.cancel_job(reason="job queue cancel", job_id=job_id_snapshot)
-                    except Exception:
-                        pass
-                    break
-                batch_count = 0
-                for item in executor.iter_results(
-                    max_count=min(len(pending), int(payload.get("result_limit", 100) or 100)),
-                    timeout_sec=chunk_timeout,
-                    wait_ms=int(payload.get("wait_ms", 500) or 500),
-                    job_id=job_id_snapshot,
-                ):
-                    batch_count += 1
-                    tid = str(item.task_id or "").strip()
-                    if tid in pending:
-                        pending.discard(tid)
-                    if item.status != pb2.TASK_STATUS_SUCCEEDED:
-                        has_failed = True
-                    rendered_results.append(
-                        _task_result_to_dict(item, serialization_mode=pool_request.requested_mode)
-                    )
-                if batch_count and first_result_wait_ms <= 0.0:
-                    first_result_wait_ms = _ms(time.monotonic() - running_started)
-                if not batch_count:
-                    time.sleep(0.05)
-            running_tasks_ms = _ms(time.monotonic() - running_started)
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is None:
-                    return
-                state.timing["result_count"] = len(rendered_results)
-                state.timing["first_result_wait_ms"] = first_result_wait_ms
-                state.timing["running_tasks_ms"] = running_tasks_ms
-                state.results = rendered_results
-                state.finished_at = utc_now()
-                if state.cancel_requested:
-                    state.status = "CANCELLED"
-                elif has_failed:
-                    state.status = "FAILED"
-                    state.error = "one or more subtasks failed"
-                else:
-                    state.status = "SUCCEEDED"
-                self._refresh_job_previews_locked(job_id)
+            state = self._jobs.get(job_id)
+            if state is not None:
                 self._job_timing_finalize_locked(job_id)
-        except Exception as exc:
-            logger.exception("[JobQueue] run job failed job_id=%s", job_id_snapshot)
-            with self._lock:
-                state = self._jobs.get(job_id)
-                if state is not None:
-                    self._job_timing_finalize_locked(job_id)
-                    state.status = "FAILED"
-                    state.finished_at = utc_now()
-                    state.error = str(exc)
-                    self._refresh_job_previews_locked(job_id)
+                state.status = "FAILED"
+                state.finished_at = utc_now()
+                state.error = "job submit requires hook mode"
+                self._refresh_job_previews_locked(job_id)
 
     def _run_job_with_hooks(
         self,

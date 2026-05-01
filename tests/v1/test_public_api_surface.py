@@ -74,10 +74,12 @@ def test_api_service_module_exposes_only_service():
         assert discovery.transport == "discovery"
         assert callable(discovery.status)
         assert isinstance(getattr(type(discovery), "methods", None), property)
+        assert not hasattr(discovery, "update_globals")
         assert gateway.service_name == "svc-demo"
         assert gateway.transport == "gateway"
         assert callable(gateway.status)
         assert isinstance(getattr(type(gateway), "methods", None), property)
+        assert not hasattr(gateway, "update_globals")
     finally:
         discovery.close()
     gateway.close()
@@ -94,6 +96,7 @@ def test_api_pool_module_exposes_only_task_pool():
     assert not hasattr(api_pool_module, "TaskPoolSession")
     assert not hasattr(api_pool_module, "create_task_pool_from_infocenter")
     assert callable(ApiTaskPool.open)
+    assert not hasattr(ApiTaskPool, "connect")
 
 
 def test_service_deploy_public_api_uses_target_keyword(monkeypatch):

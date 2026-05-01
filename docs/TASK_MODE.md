@@ -65,7 +65,7 @@ with TaskPool.open(
 
 1. 大任务先排队
 2. 同一时刻只允许一个大任务进入运行态
-3. `JobQueue` 会先向 `InfoCenter / controlplane` 查询 `job-orchestrator` route，再直连它自己的 HTTP 数据面
+3. `JobQueue` 复用 `Service.connect(...)` 的底层 route / transport 逻辑调用 `job-orchestrator`
 4. job 排到后，再自动创建 `TaskPool`
 
 这里更适合把 `JobQueue` 理解成“排队与单活编排入口”，而不是单纯的客户端 helper。
@@ -84,7 +84,7 @@ client.submit(
 )
 ```
 
-这里的 `target` 建议指向 `InfoCenter` 或带内嵌 `InfoCenter` 的 `controlplane`；`JobQueue` 会先发现唯一的 `job-orchestrator` route，再直连它。
+这里的 `target` 建议指向 `InfoCenter` 或带内嵌 `InfoCenter` 的 `controlplane`；`JobQueue` 会通过 service connect 底层发现 `job-orchestrator` route 并调用它。`target="local"` 时，JobQueue 使用同一套 local IPC service connect 语义连接本机已注册的 `job-orchestrator`。
 
 约定：
 
@@ -121,7 +121,7 @@ client.submit(
 4. `apply_managed_globals` 不通过 payload 传，worker 固定按约定名在入口模块 A 中查找
 5. 你也可以显式传 `update_globals=...`，支持 `dict`、callable 名称字符串，或 callable 对象
 6. `JobQueue` 自己固定使用 `structured_v1 + default_safe`
-7. `job-orch` 是系统启动时挂载的内置 startup service，自身 submit 入口固定 `structured_v1`
+7. `job-orch` 是系统启动时挂载的内置 startup service：服务端通信层就是 `StartupServiceNode` 挂载 `pycloud_parallel.controlplane.job_orchestrator_service`，自身 submit 入口固定 `structured_v1`
 8. `job-orch` 的 `taskpool_policy_id` 固定于启动时，通过 startup managed globals 注入，不接受 `submit(...)` 运行期覆盖
 9. 如果你在 `submit(...)` 里传 `task_serialization_mode`，它会作为后续 `TaskPool` 执行面的 mode 偏好；`submit(...)` 不再接受 `policy_id/taskpool_policy_id`
 10. `job-orch` 运行期维持单个共享 `TaskPool`（串行 job）；同 artifact/codeversion 优先在 job 边界软切 mode 复用池，软切失败才回退重建池，空闲超过 idle TTL 后再主动关池

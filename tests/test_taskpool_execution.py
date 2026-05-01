@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from pycloud_parallel.controlplane.artifact import Artifact
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.serialization import dict_to_struct
 
@@ -106,6 +107,223 @@ def test_native_task_pool_session_submit_and_wait() -> None:
         assert session.methods == ["run"]
     finally:
         session.close()
+
+
+def test_task_pool_open_local_uses_private_node_pool(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) * 3}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_demo",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        resp = pool.submit_payloads([{"value": 2}, {"value": 5}])
+        assert len(resp.accepted) == 2
+        values = pool.wait_for_data(expected_count=2, timeout_sec=10.0)
+        assert sorted(item["value"] for item in values) == [6, 15]
+        assert pool.route_summary()[0]["control_addr"] == "local"
+
+
+def test_task_pool_open_local_supports_unordered_wrappers(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) * 2}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_unordered",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        pairs = sorted(pool.unordered([{"value": 3}, {"value": 4}], timeout_sec=10.0))
+        assert pairs == [(0, {"value": 6}), (1, {"value": 8})]
+
+        items = sorted(
+            pool.unordered(
+                [{"value": 5}, {"value": 6}],
+                timeout_sec=10.0,
+                return_items=True,
+            ),
+            key=lambda item: item.index,
+        )
+        assert [item.result for item in items] == [{"value": 10}, {"value": 12}]
+        assert all(item.ok for item in items)
+        assert all(item.task_id for item in items)
+        assert all(item.node_instance_id for item in items)
+
+
+def test_task_pool_open_local_supports_imap_unordered_return_items(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) * 4}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_imap_unordered",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        items = sorted(
+            pool.imap_unordered(
+                [{"value": 2}, {"value": 3}],
+                timeout_sec=10.0,
+                return_items=True,
+            ),
+            key=lambda item: item.index,
+        )
+        assert [item.result for item in items] == [{"value": 8}, {"value": 12}]
+        assert all(item.ok for item in items)
+        assert all(item.task_id for item in items)
+
+
+def test_task_pool_open_local_supports_async_unordered_wrapper(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) + 10}\n"
+    )
+
+    async def _collect(pool):
+        return [
+            item
+            async for item in pool.aunordered(
+                [{"value": 1}, {"value": 2}],
+                timeout_sec=10.0,
+                return_items=True,
+            )
+        ]
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_async_unordered",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        items = sorted(asyncio.run(_collect(pool)), key=lambda item: item.index)
+        assert [item.result for item in items] == [{"value": 11}, {"value": 12}]
+        assert all(item.ok for item in items)
+
+
+def test_task_pool_open_local_resolves_dataref_payload_and_result(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"from pathlib import Path\n"
+        b"import tempfile\n\n"
+        b"def run(blob=None, result_size=0, **_kwargs):\n"
+        b"    payload_size = len(blob if isinstance(blob, (bytes, bytearray)) else Path(blob).read_bytes()) if blob is not None else 0\n"
+        b"    out = Path(tempfile.gettempdir()) / 'pycloud-local-task-result.bin'\n"
+        b"    out.write_bytes(b'r' * int(result_size))\n"
+        b"    return out if result_size else {'payload_size': payload_size}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_dataref",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        ref = pool.put_data(b"p" * (1024 * 1024 + 3), format="bin")
+        payload_items = list(pool.imap_unordered([{"blob": ref}], timeout_sec=10.0, return_items=True))
+        assert payload_items[0].ok is True
+        assert payload_items[0].result == {"payload_size": 1024 * 1024 + 3}
+
+        result_items = list(
+            pool.imap_unordered(
+                [{"result_size": 1024 * 1024 + 5}],
+                timeout_sec=10.0,
+                return_items=True,
+            )
+        )
+        assert result_items[0].ok is True
+        result_path = result_items[0].result
+        assert result_path.read_bytes() == b"r" * (1024 * 1024 + 5)
+
+
+def test_task_pool_open_local_applies_managed_globals(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"cfg = {}\n\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) + int(cfg.get('offset', 0))}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_globals",
+            entry_callable="run",
+            managed_global_names=["cfg"],
+        ),
+        worker_count=1,
+    ) as pool:
+        digest = pool.update_globals({"cfg": {"offset": 7}})
+        assert digest
+        items = list(pool.imap_unordered([{"value": 5}], timeout_sec=10.0, return_items=True))
+        assert items[0].ok is True
+        assert items[0].result == {"value": 12}
+
+
+def test_task_pool_open_local_includes_resource_paths(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    module_path = tmp_path / "local_task_pool_resource_worker.py"
+    module_path.write_text(
+        "from pathlib import Path\n\n"
+        "def run(**_kwargs):\n"
+        "    return {'text': Path(__file__).with_name('data.csv').read_text(encoding='utf-8').strip()}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "data.csv").write_text("hello-local-resource\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    worker = importlib.import_module("local_task_pool_resource_worker")
+
+    with TaskPool.open(
+        target="local",
+        source=worker,
+        resource_paths=["data.csv"],
+        worker_count=1,
+    ) as pool:
+        items = list(pool.imap_unordered([{}], timeout_sec=10.0, return_items=True))
+        assert items[0].ok is True
+        assert items[0].result == {"text": "hello-local-resource"}
 
 
 def test_task_pool_from_infocenter_creates_node_pools_concurrently(monkeypatch) -> None:
