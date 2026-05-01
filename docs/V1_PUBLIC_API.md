@@ -39,7 +39,9 @@ node.join()
 它的语义是“启动时部署”，不是运行期动态部署。返回对象是底层启动节点句柄，默认不接受运行期动态部署；普通 `NodeControl` 节点额外支持动态部署。
 如果启动脚本退出，startup service 也会随进程关闭；长驻服务应调用 `node.join()` 或用自己的主循环保持进程运行。
 
-如果 `target` 为空，`Service.startup(...)` 只在当前进程启动本地 HTTP service，不注册到 `InfoCenter`，也不参与 `InfoCenter` 的 `service_name` 全局排他检查。这是一种有用的本地孤岛模式：当你明确不想接受 `InfoCenter` 的排他性约束时，可以在不同端口启动多个同名 startup service。
+如果 `target` 为空，`Service.startup(...)` 只在当前进程启动本地 HTTP service，不注册到 `InfoCenter`，也不参与 `InfoCenter` 的 `service_name` 全局排他检查。这是 startup 专属的未注册模式，不等于 `target="local"` 的本地 IPC 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 等其它入口仍然必须显式传入 `target`；未来的 local 模式也必须显式写成 `target="local"`。
+
+未注册 startup 模式适合不想接受 `InfoCenter` 排他性约束的场景，可以在不同端口启动多个同名 startup service：
 
 ```python
 node_a = Service.startup(
@@ -56,7 +58,7 @@ node_b = Service.startup(
 
 这种模式的硬约束只来自本机端口绑定：同一台机器上的同一个 `bind` 地址不能被两个进程同时占用。由于没有注册到 `InfoCenter`，它也不会被 `Service.connect(target=<infocenter>, ...)` 或 Gateway 自动发现；调用方需要直接使用它暴露的本地 service HTTP 地址。
 
-如果传入 `target`，startup service 会先做 `InfoCenter` 排他检查并注册心跳。此时同名服务按已注册服务处理：同名不同 endpoint 会拒绝启动；同名同 endpoint 也必须先成功绑定端口，绑定失败说明已有进程在运行。
+如果传入普通 `InfoCenter` target，startup service 会先做 `InfoCenter` 排他检查并注册心跳。此时同名服务按已注册服务处理：同名不同 endpoint 会拒绝启动；同名同 endpoint 也必须先成功绑定端口，绑定失败说明已有进程在运行。显式 `target="local"` 将作为单独的本地 IPC 模式实现，不和空 target 混用。
 
 V1 删除旧的本地 `foreach/parallel_for` 辅助入口；公开执行入口收敛到 `Service`、`TaskPool`、`JobQueue`。
 

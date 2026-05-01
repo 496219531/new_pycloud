@@ -33,7 +33,8 @@
 1. 注册到 `InfoCenter` 的活跃 `service_name` 视为全局唯一。
 2. 服务端不再兼容 `owner_client_id + service_name` 的多租户路由。
 3. 如果需要多租户隔离，应由客户端自己生成唯一名字。
-4. `Service.startup(target="")` 是本地孤岛模式，不注册 `InfoCenter`，因此不参与 `service_name` 全局排他；可以在不同端口启动多个同名 startup service，但调用方需要直接使用各自的本地 service HTTP 地址。
+4. `Service.startup(target="")` 是 startup 专属的未注册模式，不注册 `InfoCenter`，因此不参与 `service_name` 全局排他；可以在不同端口启动多个同名 startup service，但调用方需要直接使用各自的本地 service HTTP 地址。
+5. 空 `target` 不表示通用 local 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`；未来本地 IPC 模式只通过 `target="local"` 触发。
 
 ### 2.4 权限
 
