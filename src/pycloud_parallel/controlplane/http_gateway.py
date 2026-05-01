@@ -193,6 +193,24 @@ class ServiceHttpGateway:
                     parsed = urlparse(self.path)
                     parts = [x for x in parsed.path.split("/") if x]
                     qs = parse_qs(parsed.query)
+                    if not parts:
+                        self._send_body(
+                            200,
+                            (
+                                "<!doctype html><html><head><meta charset='utf-8'>"
+                                "<title>PyCloud service HTTP gateway</title></head>"
+                                "<body><h1>PyCloud service HTTP gateway</h1>"
+                                "<p>This endpoint is running. Use a service URL such as:</p>"
+                                "<ul>"
+                                "<li><code>GET /svc/{service_id}/methods</code></li>"
+                                "<li><code>GET /svc/{service_id}/status</code></li>"
+                                "<li><code>POST /svc/{service_id}/call/{method}</code></li>"
+                                "</ul>"
+                                "</body></html>"
+                            ),
+                            content_type="text/html; charset=utf-8",
+                        )
+                        return
                     if len(parts) == 3 and parts[0] == "svc" and parts[2] == "methods":
                         if methods_handler is None:
                             self._send_json(404, {"ok": False, "error": "methods unavailable"})

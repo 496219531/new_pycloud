@@ -118,9 +118,12 @@ node = Service.startup(
     entry_module="my_package.calc_service",
     bind="0.0.0.0:18080",
 )
+
+node.join()
 ```
 
 这条路径不会接受 `Service.deploy(...)` 的动态部署；需要动态部署时仍使用普通 `NodeControl` 节点。
+如果脚本启动后立刻退出，本地 `18080` 端口也会随进程关闭，浏览器访问会看到连接被拒绝；长驻场景需要像上面一样调用 `node.join()` 或用自己的主循环保持进程运行。
 
 不传 `target` 时，startup service 只在当前进程本地运行并暴露 service HTTP，不注册到 `InfoCenter`。这适合不想接受 `InfoCenter` 同名排他约束的场景，例如在不同端口上启动多个同名本地实例：
 

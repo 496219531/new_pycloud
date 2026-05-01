@@ -32,9 +32,12 @@ node = Service.startup(
     entry_module="my_package.calc_service",
     bind="0.0.0.0:18080",
 )
+
+node.join()
 ```
 
 它的语义是“启动时部署”，不是运行期动态部署。返回对象是底层启动节点句柄，默认不接受运行期动态部署；普通 `NodeControl` 节点额外支持动态部署。
+如果启动脚本退出，startup service 也会随进程关闭；长驻服务应调用 `node.join()` 或用自己的主循环保持进程运行。
 
 如果 `target` 为空，`Service.startup(...)` 只在当前进程启动本地 HTTP service，不注册到 `InfoCenter`，也不参与 `InfoCenter` 的 `service_name` 全局排他检查。这是一种有用的本地孤岛模式：当你明确不想接受 `InfoCenter` 的排他性约束时，可以在不同端口启动多个同名 startup service。
 

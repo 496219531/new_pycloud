@@ -227,9 +227,12 @@ node = Service.startup(
     entry_module="my_package.calc_service",
     bind="0.0.0.0:18080",
 )
+
+node.join()
 ```
 
 这条路径和 `Service.deploy(...)` 的动态部署不同：`Service.startup(...)` 只在当前进程启动时挂载固定 module，不接受运行期动态部署；需要动态部署能力时使用普通 `NodeControl` 节点。
+如果启动脚本退出，startup service 也会随进程关闭；长驻服务应调用 `node.join()` 或用自己的主循环保持进程运行。
 
 V1 不再提供本地单机并行入口；并行计算统一走 `TaskPool`、`Service` 或 `JobQueue`。
 

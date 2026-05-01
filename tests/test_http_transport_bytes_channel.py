@@ -15,6 +15,25 @@ from pycloud_parallel.controlplane.http_gateway import ServiceHttpGateway
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
 
+def test_service_http_gateway_root_returns_help_page():
+    gateway = ServiceHttpGateway(
+        bind="127.0.0.1:0",
+        invoke_handler=lambda *_args: (200, {"ok": True}),
+        status_handler=lambda service_id: (200, {"ok": True, "service_id": service_id}),
+    )
+    gateway.start()
+    try:
+        with urlopen(f"{gateway.base_url}/", timeout=6.0) as resp:
+            body = resp.read().decode("utf-8")
+            content_type = resp.headers.get("Content-Type", "")
+        assert resp.status == 200
+        assert "text/html" in content_type
+        assert "PyCloud service HTTP gateway" in body
+        assert "/svc/{service_id}/call/{method}" in body
+    finally:
+        gateway.stop()
+
+
 def test_service_http_gateway_roundtrips_pickle_bytes_transport():
     captured = {}
 
