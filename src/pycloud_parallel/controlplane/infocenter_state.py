@@ -166,6 +166,8 @@ class InfoCenterState:
             return
         incoming_by_name: Dict[str, NodeServiceState] = {}
         for svc in services.values():
+            if not is_conflict_scope(healthy=True, service_status=int(svc.status or 0)):
+                continue
             name = str(svc.service_name or "").strip()
             if not name:
                 continue
@@ -180,6 +182,8 @@ class InfoCenterState:
             if key == node_instance_id or not self._node_is_healthy_locked(state, now=now):
                 continue
             for svc in state.services.values():
+                if not is_conflict_scope(healthy=True, service_status=int(svc.status or 0)):
+                    continue
                 name = str(svc.service_name or "").strip()
                 incoming = incoming_by_name.get(name)
                 if incoming is None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import unquote
 
@@ -39,6 +40,9 @@ class StartupServiceNode(NodeControlState):
         self._local_service_id = ""
         self._local_service_token = ""
         self._local_service_name = ""
+        self._local_owner_client_id = ""
+        self._local_code_version = ""
+        self._local_policy_id = ""
         self._local_service_methods: list[str] = []
         self._local_ipc_server = None
 
@@ -48,6 +52,9 @@ class StartupServiceNode(NodeControlState):
         self._local_service_id = str(session.service_id or "")
         self._local_service_token = str(session.service_token or "")
         self._local_service_name = str(session.service_name or "")
+        self._local_owner_client_id = str(session.owner_client_id or "")
+        self._local_code_version = str(session.code_version or "")
+        self._local_policy_id = str(session.policy_id or "")
         self._local_service_methods = sorted(str(name) for name in getattr(session, "methods", {}).keys())
         return session
 
@@ -56,6 +63,9 @@ class StartupServiceNode(NodeControlState):
         self._local_service_id = str(mount.service_id or "")
         self._local_service_token = ""
         self._local_service_name = str(mount.service_name or "")
+        self._local_owner_client_id = ""
+        self._local_code_version = ""
+        self._local_policy_id = str(mount.policy_id or "")
         status, body = mount.methods_handler(False)
         if int(status) == 200:
             self._local_service_methods = sorted(
@@ -78,8 +88,81 @@ class StartupServiceNode(NodeControlState):
         )
 
     @property
+    def service_id(self) -> str:
+        return self._local_service_id
+
+    @property
+    def service_name(self) -> str:
+        return self._local_service_name
+
+    @property
+    def service_token(self) -> str:
+        return self._local_service_token
+
+    @property
+    def owner_client_id(self) -> str:
+        return self._local_owner_client_id
+
+    @property
+    def code_version(self) -> str:
+        return self._local_code_version
+
+    @property
+    def policy_id(self) -> str:
+        return self._local_policy_id
+
+    @property
     def methods(self) -> list[str]:
         return list(self._local_service_methods)
+
+    def _local_node_key(self) -> str:
+        return str(self.node_instance_id or self.node_id or "local").strip()
+
+    @property
+    def sessions(self) -> dict[str, Any]:
+        if not self._local_service_id:
+            return {}
+        session = getattr(self, "_services", {}).get(self._local_service_id)
+        return {self._local_node_key(): session} if session is not None else {}
+
+    @property
+    def nodes(self) -> dict[str, Any]:
+        key = self._local_node_key()
+        return {
+            key: SimpleNamespace(
+                node_id=str(self.node_id or key),
+                node_instance_id=str(self.node_instance_id or key),
+                control_addr="local" if self._local_ipc_server is not None else "",
+                healthy=True,
+            )
+        }
+
+    @property
+    def failures(self) -> dict[str, str]:
+        return {}
+
+    def node_ids(self) -> list[str]:
+        return [str(self.node_id or self._local_node_key())]
+
+    def node_instance_ids(self) -> list[str]:
+        return [self._local_node_key()]
+
+    def route_summary(self) -> list[dict[str, object]]:
+        if not self._local_service_id:
+            return []
+        return [
+            {
+                "node_instance_id": self._local_node_key(),
+                "node_id": str(self.node_id or ""),
+                "control_addr": "local" if self._local_ipc_server is not None else "",
+                "service_name": self._local_service_name,
+                "service_id": self._local_service_id,
+                "http_base_url": str(self.service_http_base_url or ""),
+            }
+        ]
+
+    def routes(self) -> list[dict[str, object]]:
+        return self.route_summary()
 
     def list_methods(self, *, include_docs: bool = False) -> list[Any]:
         if include_docs:

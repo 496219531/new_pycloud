@@ -406,6 +406,51 @@ def test_startup_service_registration_replaces_same_endpoint_duplicate():
     assert [route["service_id"] for route in routes] == ["svc-new"]
 
 
+def test_startup_service_registration_ignores_stopped_duplicate_service_name():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="worker-a",
+        node_id="worker-a",
+        control_addr="127.0.0.1:50061",
+        capacity=1,
+        queue_capacity=1,
+        metadata={},
+        services={
+            "svc-old": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-old",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                worker_count=1,
+                alive_workers=0,
+                http_base_url="http://127.0.0.1:18081/svc/svc-old",
+            )
+        },
+    )
+
+    info_state.register_node_record(
+        node_instance_id="startup-new",
+        node_id="startup-new",
+        control_addr="",
+        capacity=1,
+        queue_capacity=1,
+        metadata={"startup_service": "true"},
+        services={
+            "svc-new": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-new",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18886/svc/svc-new",
+            )
+        },
+    )
+
+    routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=10)
+
+    assert [route["service_id"] for route in routes] == ["svc-new"]
+
+
 def test_infocenter_replaces_existing_node_with_same_control_addr():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(
@@ -836,9 +881,9 @@ def test_ops_job_queue_reorder_proxies_to_job_orchestrator():
         orchestrator.job_queue._stop = True  # noqa: SLF001
 
     try:
-        orchestrator.job_queue.submit_job({"job_id": "job-a", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 1}]})
-        orchestrator.job_queue.submit_job({"job_id": "job-b", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 2}]})
-        orchestrator.job_queue.submit_job({"job_id": "job-c", "client_id": "c", "entry_module": "m", "subtasks": [{"value": 3}]})
+        orchestrator.job_queue.submit_job({"job_id": "job-a", "client_id": "c", "entry_module": "m", "task_generator_callable": [{"value": 1}]})
+        orchestrator.job_queue.submit_job({"job_id": "job-b", "client_id": "c", "entry_module": "m", "task_generator_callable": [{"value": 2}]})
+        orchestrator.job_queue.submit_job({"job_id": "job-c", "client_id": "c", "entry_module": "m", "task_generator_callable": [{"value": 3}]})
         service_http_base = f"{orchestrator.base_url}/svc/{orchestrator.service_id}"
 
         with pytest.raises(RuntimeError, match="admin auth required"):

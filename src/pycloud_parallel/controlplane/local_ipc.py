@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import os
+import pickle
 from pathlib import Path
 import tempfile
 import threading
@@ -15,8 +16,35 @@ import uuid
 from multiprocessing.connection import Client, Listener
 from typing import Any, Dict, Optional
 
+from pycloud_parallel.data.ref import maybe_data_ref
+from pycloud_parallel.controlplane.config import get_payload_policy
+from pycloud_parallel.controlplane.node.results import _resolve_single_data_ref
+from pycloud_parallel.controlplane.serialization import (
+    INTERNAL_PICKLE_NATIVE_V1,
+    make_validated_inline_transport_carrier,
+    validate_inline_payload_size,
+)
+
 
 _REGISTRY_VERSION = 1
+LOCAL_IPC_BACKLOG = 1024
+LOCAL_IPC_CONNECT_RETRY_INTERVAL_SEC = 0.02
+
+
+def _make_local_pickle_payload_transport(payload: Dict[str, object]) -> Dict[str, object]:
+    raw_payload = pickle.dumps(dict(payload or {}), protocol=pickle.HIGHEST_PROTOCOL)
+    size = validate_inline_payload_size(
+        len(raw_payload),
+        limit_bytes=get_payload_policy("http_call").inline_payload_hard_limit_bytes,
+        context="local IPC service payload",
+    )
+    return make_validated_inline_transport_carrier(
+        codec=INTERNAL_PICKLE_NATIVE_V1,
+        payload=raw_payload,
+        content_size=size,
+        payload_mode="service_call",
+        context="service_owner",
+    )
 
 
 def _registry_dir() -> Path:
@@ -73,6 +101,16 @@ def _metadata_token(service_name: str) -> str:
     with contextlib.suppress(Exception):
         return str(_read_metadata(service_name).get("ipc_token", "") or "")
     return ""
+
+
+def _discard_metadata_if_current(service_name: str, meta: Dict[str, object]) -> None:
+    expected_token = str(meta.get("ipc_token", "") or "")
+    if expected_token and _metadata_token(service_name) != expected_token:
+        return
+    _remove_metadata(service_name)
+    if str(meta.get("family", "") or "") == "AF_UNIX":
+        with contextlib.suppress(OSError):
+            Path(str(meta.get("address", "") or "")).unlink(missing_ok=True)
 
 
 def _authkey_from_metadata(meta: Dict[str, object]) -> bytes:
@@ -144,7 +182,12 @@ class LocalServiceIpcServer:
         _remove_metadata(self.service_name)
         if self.family == "AF_UNIX":
             Path(self.address).unlink(missing_ok=True)
-        self._listener = Listener(self.address, family=self.family, authkey=self.authkey)
+        self._listener = Listener(
+            self.address,
+            family=self.family,
+            backlog=LOCAL_IPC_BACKLOG,
+            authkey=self.authkey,
+        )
         _write_metadata(
             self.service_name,
             {
@@ -157,6 +200,7 @@ class LocalServiceIpcServer:
                 "ipc_token": self.ipc_token,
                 "node_id": str(getattr(self.node, "node_id", "") or ""),
                 "node_instance_id": str(getattr(self.node, "node_instance_id", "") or ""),
+                "object_dir": str(getattr(self.node, "object_dir", "") or ""),
             },
         )
         self._thread = threading.Thread(
@@ -243,9 +287,12 @@ class LocalServiceIpcServer:
                 ],
             }
         if action == "call":
+            payload = request.get("payload_transport")
+            if payload is None:
+                payload = dict(request.get("payload", {}) or {})
             _node_key, body = self.node.call_balanced(
                 str(request.get("method", "") or ""),
-                dict(request.get("payload", {}) or {}),
+                payload,
                 timeout_sec=max(0.1, float(request.get("timeout_sec", 60.0) or 60.0)),
                 serialization_mode=str(request.get("serialization_mode", "") or ""),
             )
@@ -257,9 +304,12 @@ class LocalServiceIpcServer:
     def _handle_stream_request(self, conn: Any, request: Dict[str, object]) -> None:
         item_count = 0
         try:
+            payload = request.get("payload_transport")
+            if payload is None:
+                payload = dict(request.get("payload", {}) or {})
             for item in self.node.stream_call(
                 str(request.get("method", "") or ""),
-                dict(request.get("payload", {}) or {}),
+                payload,
                 timeout_sec=max(0.1, float(request.get("timeout_sec", 60.0) or 60.0)),
                 serialization_mode=str(request.get("serialization_mode", "") or ""),
             ):
@@ -284,22 +334,76 @@ class LocalServiceClient:
         self.timeout_sec = max(0.1, float(timeout_sec or 10.0))
         deadline = time.monotonic() + self.timeout_sec
         last_exc: Optional[BaseException] = None
+        saw_stale_registry = False
         while True:
             try:
-                self._meta = _read_metadata(self.service_name)
+                candidate_meta = _read_metadata(self.service_name)
+                response = _call_once(candidate_meta, {"action": "ping"}, timeout_sec=min(1.0, self.timeout_sec))
+                if not bool(response.get("ok", False)):
+                    raise RuntimeError(str(response.get("error", "local service IPC ping failed")))
+                self._meta = candidate_meta
                 break
             except FileNotFoundError as exc:
                 last_exc = exc
                 if time.monotonic() >= deadline:
-                    raise last_exc
+                    if saw_stale_registry:
+                        raise RuntimeError(
+                            f"local service IPC unavailable for service_name={self.service_name!r}; "
+                            "local service registry entry existed but the service is not accepting connections"
+                        ) from last_exc
+                    raise RuntimeError(
+                        f"local service IPC unavailable for service_name={self.service_name!r}; "
+                        "local service registry entry was not found"
+                    ) from last_exc
+                time.sleep(0.05)
+            except Exception as exc:
+                last_exc = exc
+                saw_stale_registry = True
+                with contextlib.suppress(Exception):
+                    _discard_metadata_if_current(self.service_name, candidate_meta)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"local service IPC unavailable for service_name={self.service_name!r}; "
+                        "local service registry entry exists but the service is not accepting connections"
+                    ) from last_exc
                 time.sleep(0.05)
 
     def _request(self, action: str, **kwargs: object) -> Dict[str, object]:
-        try:
-            response = _call_once(self._meta, {"action": action, **kwargs}, timeout_sec=self.timeout_sec)
-        except Exception:
-            self._meta = _read_metadata(self.service_name)
-            response = _call_once(self._meta, {"action": action, **kwargs}, timeout_sec=self.timeout_sec)
+        request = {"action": action, **kwargs}
+        deadline = time.monotonic() + self.timeout_sec
+        first_exc: Optional[BaseException] = None
+        while True:
+            try:
+                response = _call_once(self._meta, request, timeout_sec=self.timeout_sec)
+                break
+            except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
+                previous_meta = dict(self._meta)
+                try:
+                    refreshed_meta = _read_metadata(self.service_name)
+                except Exception:
+                    _discard_metadata_if_current(self.service_name, previous_meta)
+                    raise RuntimeError(
+                        f"local service IPC unavailable for service_name={self.service_name!r}; "
+                        "the local service process is not running"
+                    ) from first_exc
+                self._meta = refreshed_meta
+                if str(refreshed_meta.get("ipc_token", "") or "") == str(previous_meta.get("ipc_token", "") or ""):
+                    if time.monotonic() < deadline:
+                        time.sleep(LOCAL_IPC_CONNECT_RETRY_INTERVAL_SEC)
+                        continue
+                    _discard_metadata_if_current(self.service_name, previous_meta)
+                    raise RuntimeError(
+                        f"local service IPC unavailable for service_name={self.service_name!r}; "
+                        "removed stale local service registry entry after repeated connection failures"
+                    ) from first_exc
+                if time.monotonic() >= deadline:
+                    _discard_metadata_if_current(self.service_name, self._meta)
+                    raise RuntimeError(
+                        f"local service IPC unavailable for service_name={self.service_name!r}; "
+                        "the replacement local service process is not accepting connections"
+                    ) from first_exc
         if not bool(response.get("ok", False)):
             raise RuntimeError(str(response.get("error", "local service IPC request failed")))
         return response
@@ -323,10 +427,11 @@ class LocalServiceClient:
         **kwargs: object,
     ) -> Dict[str, object]:
         del service_name, kwargs
+        payload_transport = _make_local_pickle_payload_transport(payload)
         response = self._request(
             "call",
             method=method,
-            payload=dict(payload or {}),
+            payload_transport=payload_transport,
             timeout_sec=max(0.1, float(timeout_sec or self.timeout_sec)),
             serialization_mode=serialization_mode,
         )
@@ -348,23 +453,62 @@ class LocalServiceClient:
         **kwargs: object,
     ):
         del service_name, kwargs
+        payload_transport = _make_local_pickle_payload_transport(payload)
         request = {
             "action": "stream_call",
             "method": method,
-            "payload": dict(payload or {}),
+            "payload_transport": payload_transport,
             "timeout_sec": max(0.1, float(timeout_sec or self.timeout_sec)),
             "serialization_mode": serialization_mode,
         }
         try:
             yield from _stream_once(self._meta, request, timeout_sec=max(self.timeout_sec, float(timeout_sec or 0.0)))
-        except Exception:
-            self._meta = _read_metadata(self.service_name)
-            yield from _stream_once(self._meta, request, timeout_sec=max(self.timeout_sec, float(timeout_sec or 0.0)))
+        except Exception as first_exc:
+            previous_meta = dict(self._meta)
+            try:
+                refreshed_meta = _read_metadata(self.service_name)
+            except Exception:
+                _discard_metadata_if_current(self.service_name, previous_meta)
+                raise RuntimeError(
+                    f"local service IPC unavailable for service_name={self.service_name!r}; "
+                    "the local service process is not running"
+                ) from first_exc
+            self._meta = refreshed_meta
+            if str(refreshed_meta.get("ipc_token", "") or "") == str(previous_meta.get("ipc_token", "") or ""):
+                _discard_metadata_if_current(self.service_name, previous_meta)
+                raise RuntimeError(
+                    f"local service IPC unavailable for service_name={self.service_name!r}; "
+                    "removed stale local service registry entry"
+                ) from first_exc
+            try:
+                yield from _stream_once(self._meta, request, timeout_sec=max(self.timeout_sec, float(timeout_sec or 0.0)))
+            except Exception as second_exc:
+                _discard_metadata_if_current(self.service_name, self._meta)
+                raise RuntimeError(
+                    f"local service IPC unavailable for service_name={self.service_name!r}; "
+                    "the replacement local service process is not accepting connections"
+                ) from second_exc
 
     def fetch_result_data(self, response_or_data: object, *, target_path: str = ""):
         if target_path:
             raise ValueError("local service IPC fetch_result_data does not support target_path")
-        return self._request("fetch_result_data", value=response_or_data).get("data")
+        ref = maybe_data_ref(response_or_data)
+        if ref is None and isinstance(response_or_data, dict):
+            ref = maybe_data_ref(response_or_data.get("data"))
+            nested = response_or_data.get("data")
+            if ref is None and isinstance(nested, dict):
+                ref = maybe_data_ref(nested.get("data"))
+        if ref is None:
+            if isinstance(response_or_data, dict) and "data" in response_or_data:
+                return response_or_data["data"]
+            return response_or_data
+        object_dir = str(self._meta.get("object_dir", "") or "").strip()
+        if not object_dir:
+            raise RuntimeError(
+                f"local service IPC metadata for service_name={self.service_name!r} has no object_dir; "
+                "cannot materialize local DataRef directly"
+            )
+        return _resolve_single_data_ref(ref, object_dir=object_dir)
 
     def download_result_to_file(self, response_or_data: object, *, target_path: str):
         data = self.fetch_result_data(response_or_data)

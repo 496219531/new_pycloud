@@ -746,6 +746,9 @@ def test_service_startup_local_proxy_calls_executor_without_http(tmp_path, monke
         worker_count=1,
     )
     try:
+        assert node.service_name == "startup-local-proxy"
+        assert node.service_id
+        assert node.policy_id
         assert node.service_http_bind == ""
         assert node.add.sync(x=4, y=6) == {"value": 10}
         assert asyncio.run(node.add.broadcast(x=2, y=3))[0][1] == {"value": 5}
@@ -787,6 +790,14 @@ def test_service_deploy_local_returns_direct_proxy(tmp_path, monkeypatch):
         worker_count=1,
     )
     try:
+        assert service.service_name == "deploy-local-proxy"
+        assert service.service_id
+        assert service.owner_client_id.startswith("local-client-")
+        assert service.code_version
+        assert service.route_summary()[0]["service_name"] == "deploy-local-proxy"
+        assert list(service.sessions.keys()) == service.node_instance_ids()
+        assert service.node_ids() == ["deploy-local-proxy-local"]
+        assert service.failures == {}
         assert service.service_http_bind == ""
         assert service.run.sync(value=7) == {"value": 7}
     finally:
@@ -854,6 +865,40 @@ def test_service_connect_local_fetches_large_result_dataref_via_ipc(tmp_path, mo
         service.close()
 
 
+def test_service_connect_local_handles_many_concurrent_ipc_calls(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    module_path = tmp_path / "connect_local_many_calls_service.py"
+    module_path.write_text(
+        "import time\n\n"
+        "def run(value=0):\n"
+        "    time.sleep(0.01)\n"
+        "    return {'value': int(value)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    service = Service.deploy(
+        target="local",
+        service_name="connect-local-many-calls",
+        source=importlib.import_module("connect_local_many_calls_service"),
+        worker_count=1,
+    )
+
+    async def _run_many():
+        client = Service.connect(target="local", service_name="connect-local-many-calls", timeout_sec=10.0)
+        try:
+            tasks = [client.run(value=index) for index in range(80)]
+            return await asyncio.gather(*tasks)
+        finally:
+            client.close()
+
+    try:
+        assert asyncio.run(_run_many()) == [{"value": index} for index in range(80)]
+    finally:
+        service.close()
+
+
 def test_service_connect_local_uses_ipc_registry(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane.local_ipc import local_service_metadata_path
 
@@ -883,6 +928,108 @@ def test_service_connect_local_uses_ipc_registry(tmp_path, monkeypatch):
     finally:
         service.close()
     assert not local_service_metadata_path("deploy-local-ipc").exists()
+
+
+def test_service_connect_local_discards_stale_ipc_registry(tmp_path, monkeypatch):
+    import base64
+    import json
+
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceClient, local_service_metadata_path
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    service_name = "deploy-local-stale-ipc-client"
+    socket_path = tmp_path / "stale.sock"
+    metadata_path = local_service_metadata_path(service_name)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "service_name": service_name,
+                "pid": 999999,
+                "address": str(socket_path),
+                "family": "AF_UNIX",
+                "authkey": base64.b64encode(b"0" * 32).decode("ascii"),
+                "ipc_token": "stale-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="not accepting connections"):
+        LocalServiceClient(service_name=service_name, timeout_sec=0.1)
+    assert not metadata_path.exists()
+
+
+def test_service_local_ipc_sends_payload_as_inline_pickle_transport(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceClient, start_local_service_ipc
+    from pycloud_parallel.controlplane.serialization import (
+        INTERNAL_PICKLE_NATIVE_V1,
+        decode_inline_transport_carrier,
+        is_inline_transport_carrier,
+    )
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    captured = {}
+
+    class _FakeNode:
+        node_id = "fake-local-node"
+        node_instance_id = "fake-local-node-inst"
+        object_dir = tmp_path / "objects"
+        methods = ["run"]
+
+        def call_balanced(self, method, payload, **kwargs):
+            captured["method"] = method
+            captured["payload"] = payload
+            captured["kwargs"] = dict(kwargs)
+            return "fake-local-node-inst", {"ok": True, "data": {"value": 3}}
+
+    server = start_local_service_ipc(node=_FakeNode(), service_name="local-pickle-transport")
+    try:
+        client = LocalServiceClient(service_name="local-pickle-transport", timeout_sec=5.0)
+        assert client.call(method="run", payload={"x": 1, "y": 2}, serialization_mode="pickle_stable_v1")["data"] == {"value": 3}
+    finally:
+        server.close()
+
+    assert captured["method"] == "run"
+    assert is_inline_transport_carrier(captured["payload"])
+    assert captured["payload"]["__pycloud_inline_transport__"]["codec"] == INTERNAL_PICKLE_NATIVE_V1
+    assert decode_inline_transport_carrier(captured["payload"], context="service_owner") == {"x": 1, "y": 2}
+    with pytest.raises(ValueError, match="trusted internal"):
+        decode_inline_transport_carrier(captured["payload"], context="gateway_public")
+    assert captured["kwargs"]["serialization_mode"] == "pickle_stable_v1"
+
+
+def test_service_local_ipc_fetch_result_data_materializes_dataref_directly(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import local_ipc
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
+    from pycloud_parallel.data.ref import DataRef
+
+    client = object.__new__(LocalServiceClient)
+    client.service_name = "local-direct-dataref"
+    client.timeout_sec = 5.0
+    client._meta = {"object_dir": str(tmp_path / "objects")}  # noqa: SLF001
+
+    def _fail_request(*args, **kwargs):
+        raise AssertionError("fetch_result_data should not call back through IPC")
+
+    monkeypatch.setattr(client, "_request", _fail_request)
+    monkeypatch.setattr(
+        local_ipc,
+        "_resolve_single_data_ref",
+        lambda ref, *, object_dir: {"object_id": ref.object_id, "object_dir": object_dir},
+    )
+    ref = DataRef(
+        ref_id="sha256:" + "a" * 64,
+        storage_id="sha256:" + "a" * 64,
+        format="bin",
+        materialize_as="bytes",
+        locator_kind="node_local",
+    )
+
+    assert client.fetch_result_data({"data": ref}) == {
+        "object_id": "sha256:" + "a" * 64,
+        "object_dir": str(tmp_path / "objects"),
+    }
 
 
 def test_service_local_duplicate_service_name_rejected(tmp_path, monkeypatch):

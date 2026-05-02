@@ -7,6 +7,7 @@ from datetime import date, datetime, time, timedelta
 import hashlib
 import logging
 import json
+import pickle
 from typing import Any, Optional, Sequence
 
 from google.protobuf import struct_pb2
@@ -41,6 +42,13 @@ MAX_ARROW_RECURSION_DEPTH = 200
 TRANSPORT_ENVELOPE_SENTINEL = "__pycloud_transport__"
 INLINE_TRANSPORT_CARRIER_SENTINEL = "__pycloud_inline_transport__"
 TRANSPORT_PAYLOAD_VERSION = 1
+INTERNAL_PICKLE_NATIVE_V1 = "pickle_native_v1"
+_INTERNAL_PICKLE_NATIVE_CONTEXTS = {
+    "service_owner",
+    "taskpool_session",
+    "service_result",
+    "local_ipc",
+}
 
 
 def _format_payload_bytes(size_bytes: int) -> str:
@@ -369,6 +377,8 @@ def decode_transport_payload_bytes(
     )
     if normalized == "legacy_v1":
         decoded = convert_dict_to_arrow(json.loads(raw.decode("utf-8") if raw else "null"))
+    elif normalized == INTERNAL_PICKLE_NATIVE_V1:
+        decoded = pickle.loads(raw)
     elif normalized == "pickle_stable_v1":
         decoded = stable_pickle_loads(raw)
     elif normalized == "structured_v1":
@@ -465,12 +475,19 @@ def validate_transport_payload_bytes(
     trust_mode: str = "",
     limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
 ) -> tuple[str, bytes, int]:
-    normalized = resolve_received_transport_mode(
-        declared_mode=codec,
-        default_mode="legacy_v1",
-        context=context,
-        trust_mode=trust_mode,
-    )
+    declared_codec = str(codec or "").strip().lower()
+    if declared_codec == INTERNAL_PICKLE_NATIVE_V1:
+        normalized_context = str(context or "").strip().lower()
+        if normalized_context not in _INTERNAL_PICKLE_NATIVE_CONTEXTS:
+            raise ValueError(f"{INTERNAL_PICKLE_NATIVE_V1} is only allowed on trusted internal transport")
+        normalized = INTERNAL_PICKLE_NATIVE_V1
+    else:
+        normalized = resolve_received_transport_mode(
+            declared_mode=codec,
+            default_mode="legacy_v1",
+            context=context,
+            trust_mode=trust_mode,
+        )
     if int(version or 0) != TRANSPORT_PAYLOAD_VERSION:
         raise ValueError(f"unsupported transport payload version: {version!r}")
     raw = _coerce_payload_bytes(payload)

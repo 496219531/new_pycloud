@@ -19,7 +19,7 @@ from calc_asset_ratio.ok import calc_asset_ratio
 import calc_asset_ratio_job_module
 
 
-CONTROLPLANE_TARGET = "127.0.0.1:50051"
+CONTROLPLANE_TARGET = "local" #127.0.0.1:50051"
 SERVICE_NAME = "calc_asset_ratio"
 MANAGED_GLOBAL_NAMES = (
     "bench_mark_yield_df",
@@ -95,12 +95,13 @@ def _connect_service(*, transport: str):
         service_name=SERVICE_NAME,
         transport=transport,
         timeout_sec=300.0,
+        serialization_mode=SERVICE_HTTP_BYTES_SERIALIZATION_MODE,
     )
 
 
 def _call_service(payload: dict[str, object], *, transport: str):
     with _connect_service(transport=transport) as service:
-        return _normalize_result_item(service.call_sync("get_fund_asset_ratio", **payload))
+        return _normalize_result_item(service.get_fund_asset_ratio.sync(**payload))
 
 
 
@@ -112,13 +113,7 @@ def calc_fund_list_asset_ratio(
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
     async def async_calls():
-        with Service.connect(
-            target=CONTROLPLANE_TARGET,
-            service_name=SERVICE_NAME,
-            transport="discovery",
-            timeout_sec=300.0,
-            serialization_mode=SERVICE_HTTP_BYTES_SERIALIZATION_MODE,
-        ) as client:
+        with _connect_service(transport="discovery") as client:
             tasks = [
                 client.get_fund_asset_ratio(fund_net_value_series.dropna().copy(), strategy_type, 0)
                 for _, fund_net_value_series in fund_net_value_pvt.items()
@@ -217,13 +212,10 @@ def calc_fund_list_asset_ratio_gateway(
         for _, fund_net_value_series in fund_net_value_pvt.items():
             results.append(
                 _normalize_result_item(
-                    service.call_sync(
-                        "get_fund_asset_ratio",
-                        **{
-                            "fund_net_value_series": fund_net_value_series.dropna().copy(),
-                            "strategy_type": strategy_type,
-                            "frequency": 0,
-                        },
+                    service.get_fund_asset_ratio.sync(
+                        fund_net_value_series=fund_net_value_series.dropna().copy(),
+                        strategy_type=strategy_type,
+                        frequency=0,
                     )
                 )
             )
@@ -288,7 +280,7 @@ def calc_fund_list_asset_ratio2(
         target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
         source=calc_asset_ratio.get_fund_asset_ratio,
-        worker_count=4,
+        worker_count=10,
         node_count=2,
         tags=["compute"],
         timeout_sec=300.0,
@@ -351,7 +343,7 @@ def calc_fund_list_asset_ratio3(
 
     t0 = time.time()
     with TaskPool.open(
-        infocenter_target=CONTROLPLANE_TARGET,
+        target=CONTROLPLANE_TARGET,
         job_id=f"demo-pool-{int(time.time())}",
         source=calc_asset_ratio.get_fund_asset_ratio,
         worker_count=7,
@@ -387,13 +379,13 @@ def calc_fund_list_asset_ratio_job(
 ):
     t0 = time.time()
     client_id = f"asset-ratio-job-{int(t0)}"
-    with JobQueue(
+    with JobQueue.connect(
         CONTROLPLANE_TARGET,
         client_id=client_id,
         timeout_sec=300.0,
     ) as client:
-        resp = client.submit_job_from_module(
-            module=calc_asset_ratio_job_module,
+        resp = client.submit(
+            source=calc_asset_ratio_job_module,
             # resource_paths=["fund_nav_df.csv"],
             # task_resource_paths=[
             #     "bench_mark_closeprice_df.csv",
@@ -518,8 +510,8 @@ if __name__ == "__main__":
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)
