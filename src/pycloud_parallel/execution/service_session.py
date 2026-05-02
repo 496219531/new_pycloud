@@ -111,6 +111,7 @@ logger = logging.getLogger(__name__)
 
 _STARTUP_PREFLIGHT_RETRY_SEC = 5.0
 _STARTUP_PREFLIGHT_SLEEP_SEC = 0.2
+_LOCAL_SERVICE_EXECUTOR_POLL_INTERVAL_SEC = 0.25
 _CONNECTED_SERVICE_OWNER_ONLY_METHODS = frozenset({"update_globals"})
 
 
@@ -2139,6 +2140,11 @@ class Service(ServiceExecutionSession):
             worker_capacity=effective_worker_count,
             service_worker_capacity=effective_worker_count,
             task_pool_worker_capacity=1,
+            executor_poll_interval_sec=(
+                _LOCAL_SERVICE_EXECUTOR_POLL_INTERVAL_SEC
+                if local_mode
+                else 0.05
+            ),
             service_http_bind="",
             service_http_base_url=str(service_http_base_url or "").strip(),
             enable_internal_executor=False,
@@ -2268,6 +2274,7 @@ class Service(ServiceExecutionSession):
             worker_capacity=effective_worker_count,
             service_worker_capacity=effective_worker_count,
             task_pool_worker_capacity=1,
+            executor_poll_interval_sec=_LOCAL_SERVICE_EXECUTOR_POLL_INTERVAL_SEC,
             service_http_bind="",
             enable_internal_executor=False,
             enable_service_session=True,

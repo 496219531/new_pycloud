@@ -29,13 +29,14 @@ from pycloud_parallel.controlplane.serialization import (
 _REGISTRY_VERSION = 1
 LOCAL_IPC_BACKLOG = 1024
 LOCAL_IPC_CONNECT_RETRY_INTERVAL_SEC = 0.02
+HTTP_CALL_LIMIT_BYTES = get_payload_policy("http_call").inline_payload_hard_limit_bytes
 
 
 def _make_local_pickle_payload_transport(payload: Dict[str, object]) -> Dict[str, object]:
     raw_payload = pickle.dumps(dict(payload or {}), protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(
         len(raw_payload),
-        limit_bytes=get_payload_policy("http_call").inline_payload_hard_limit_bytes,
+        limit_bytes=HTTP_CALL_LIMIT_BYTES,
         context="local IPC service payload",
     )
     return make_validated_inline_transport_carrier(
