@@ -62,6 +62,8 @@ PYCLOUD_INLINE_TRANSPORT_CHECKSUM = "PYCLOUD_INLINE_TRANSPORT_CHECKSUM"
 INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
 INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024)
 INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024)
+LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 64 * 1024 * 1024)
+LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 256 * 1024 * 1024)
 JOB_PAYLOAD_MAX_BYTES = _env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024)
 JOB_STAGING_REPLICA_COUNT = _env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2)
 JOB_STAGED_REF_TTL_SEC = _env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60)
@@ -311,12 +313,35 @@ def get_payload_policy(mode: PayloadMode) -> PayloadPolicy:
     raise ValueError(f"unsupported payload policy mode: {mode!r}")
 
 
+def get_local_service_payload_policy() -> PayloadPolicy:
+    limits = get_runtime_limits()
+    local_hard = max(1, int(LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES))
+    local_soft = min(max(1, int(LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), local_hard)
+    return PayloadPolicy(
+        mode="http_call",
+        limits=PayloadLimits(
+            inline_payload_soft_limit_bytes=local_soft,
+            inline_payload_hard_limit_bytes=local_hard,
+            inline_payload_request_limit_bytes=local_hard,
+            inline_result_soft_limit_bytes=limits.inline_result_soft_limit_bytes,
+            inline_result_hard_limit_bytes=limits.inline_result_hard_limit_bytes,
+            object_chunk_size_bytes=limits.object_chunk_size_bytes,
+            file_hash_chunk_size_bytes=limits.file_hash_chunk_size_bytes,
+        ),
+        recurse_containers=True,
+        consume_on_read=True,
+        preserve_args_kwargs_container=True,
+    )
+
+
 def reload_config() -> None:
     """Reload environment-backed limits for tests or dynamic config."""
     globals().update(
         INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024),
         INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024),
         INLINE_PAYLOAD_REQUEST_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024),
+        LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 64 * 1024 * 1024),
+        LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 256 * 1024 * 1024),
         JOB_PAYLOAD_MAX_BYTES=_env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024),
         JOB_STAGING_REPLICA_COUNT=_env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2),
         JOB_STAGED_REF_TTL_SEC=_env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60),
@@ -413,6 +438,8 @@ __all__ = [
     "JOB_STAGING_REPLICA_COUNT",
     "JOBQUEUE_RESOLVE_REFS",
     "JobQueueResolveRefsMode",
+    "LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
+    "LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
     "NODE_MAX_WORKERS",
     "NODE_QUEUE_CAPACITY",
     "NODE_WORKER_CAPACITY",
@@ -450,6 +477,7 @@ __all__ = [
     "get_gateway_dataref_relay",
     "get_inline_transport_checksum",
     "get_jobqueue_resolve_refs",
+    "get_local_service_payload_policy",
     "get_object_transfer_mode",
     "get_payload_policy",
     "get_runtime_limits",

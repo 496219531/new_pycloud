@@ -4,7 +4,7 @@ from dataclasses import replace
 import json
 
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
-from pycloud_parallel.controlplane.config import get_payload_policy
+from pycloud_parallel.controlplane.config import get_local_service_payload_policy, get_payload_policy
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
@@ -37,9 +37,13 @@ def test_get_payload_policy_defaults() -> None:
     http_policy = get_payload_policy("http_call")
     job_policy = get_payload_policy("job_submit")
     managed_globals_policy = get_payload_policy("managed_globals")
+    local_policy = get_local_service_payload_policy()
 
     assert http_policy.preserve_args_kwargs_container is True
     assert http_policy.consume_on_read is True
+    assert local_policy.inline_payload_soft_limit_bytes == 64 * 1024 * 1024
+    assert local_policy.inline_payload_hard_limit_bytes == 256 * 1024 * 1024
+    assert local_policy.inline_payload_hard_limit_bytes > http_policy.inline_payload_hard_limit_bytes
     assert job_policy.managed_global_field_names == ("update_globals",)
     assert managed_globals_policy.objectify_pathlikes is True
     assert managed_globals_policy.objectify_strings_as_files is True

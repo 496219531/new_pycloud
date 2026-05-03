@@ -16,9 +16,14 @@ import uuid
 from multiprocessing.connection import Client, Listener
 from typing import Any, Dict, Optional
 
-from pycloud_parallel.data.ref import maybe_data_ref
-from pycloud_parallel.controlplane.config import get_payload_policy
-from pycloud_parallel.controlplane.node.results import _resolve_single_data_ref
+from pycloud_parallel.data.ref import DataRef, maybe_data_ref
+from pycloud_parallel.controlplane.config import OBJECT_SEGMENT_MAX_BYTES, get_local_service_payload_policy
+from pycloud_parallel.controlplane.node.results import (
+    _commit_result_file,
+    _commit_result_segment,
+    _resolve_single_data_ref,
+)
+from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size, prepare_outbound_payload
 from pycloud_parallel.controlplane.serialization import (
     INTERNAL_PICKLE_NATIVE_V1,
     make_validated_inline_transport_carrier,
@@ -29,14 +34,124 @@ from pycloud_parallel.controlplane.serialization import (
 _REGISTRY_VERSION = 1
 LOCAL_IPC_BACKLOG = 1024
 LOCAL_IPC_CONNECT_RETRY_INTERVAL_SEC = 0.02
-HTTP_CALL_LIMIT_BYTES = get_payload_policy("http_call").inline_payload_hard_limit_bytes
+PYCLOUD_LOCAL_IPC_AUTH = "PYCLOUD_LOCAL_IPC_AUTH"
 
 
-def _make_local_pickle_payload_transport(payload: Dict[str, object]) -> Dict[str, object]:
+def _local_ipc_auth_enabled() -> bool:
+    raw = str(os.environ.get(PYCLOUD_LOCAL_IPC_AUTH, "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _local_object_dir(meta: Dict[str, object]) -> str:
+    object_dir = str(meta.get("object_dir", "") or "").strip()
+    if not object_dir:
+        raise RuntimeError("local service IPC metadata has no object_dir")
+    return object_dir
+
+
+def _store_local_payload_blob(
+    blob: bytes,
+    *,
+    meta: Dict[str, object],
+    fmt: str,
+    materialize_as: str,
+) -> DataRef:
+    object_dir = _local_object_dir(meta)
+    if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
+        artifact = _commit_result_segment(blob, object_dir=object_dir, fmt=fmt, materialize_as=materialize_as)
+    else:
+        root = Path(object_dir).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-local-payload-", suffix=".bin", dir=str(root))
+        try:
+            with os.fdopen(fd, "wb") as fp:
+                fp.write(blob)
+            artifact = _commit_result_file(
+                Path(tmp_name),
+                object_dir=object_dir,
+                fmt=fmt,
+                size_bytes=len(blob),
+                materialize_as=materialize_as,
+            )
+        finally:
+            Path(tmp_name).unlink(missing_ok=True)
+    return DataRef(
+        ref_id=artifact.object_id,
+        storage_id=artifact.object_id,
+        logical_type="",
+        format=artifact.format,
+        size_bytes=artifact.size_bytes,
+        materialize_as=artifact.materialize_as,
+        locator_kind="node_local",
+        locator_token="",
+        consume_on_read=False,
+        node_id=str(meta.get("node_id", "") or ""),
+        node_instance_id=str(meta.get("node_instance_id", "") or ""),
+    )
+
+
+def _put_local_payload_data(
+    value: Any,
+    *,
+    meta: Dict[str, object],
+    format: str = "",
+    default_serialization_mode: str = "",
+) -> DataRef:
+    existing = maybe_data_ref(value)
+    if existing is not None:
+        return existing
+    from pycloud_parallel.execution.support import _serialize_data_for_object_ref
+
+    materialize_as, effective_format, blob = _serialize_data_for_object_ref(
+        value,
+        format=format,
+        default_serialization_mode=default_serialization_mode,
+    )
+    return _store_local_payload_blob(
+        blob,
+        meta=meta,
+        fmt=effective_format,
+        materialize_as=materialize_as,
+    )
+
+
+def _estimate_local_inline_size(value: Any) -> int:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    try:
+        return estimate_payload_inline_size(value)
+    except Exception:
+        return len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def _prepare_local_payload(payload: Dict[str, object], *, meta: Dict[str, object], serialization_mode: str = "") -> Dict[str, object]:
+    return prepare_outbound_payload(
+        payload,
+        put_data=lambda value, *, format="": _put_local_payload_data(
+            value,
+            meta=meta,
+            format=format,
+            default_serialization_mode=serialization_mode,
+        ),
+        estimate_inline_size=_estimate_local_inline_size,
+        policy=get_local_service_payload_policy(),
+    )
+
+
+def _make_local_pickle_payload_transport(
+    payload: Dict[str, object],
+    *,
+    meta: Dict[str, object],
+    serialization_mode: str = "",
+) -> Dict[str, object]:
+    policy = get_local_service_payload_policy()
     raw_payload = pickle.dumps(dict(payload or {}), protocol=pickle.HIGHEST_PROTOCOL)
+    if len(raw_payload) > max(1, int(policy.inline_payload_soft_limit_bytes)):
+        prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=serialization_mode)
+        raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(
         len(raw_payload),
-        limit_bytes=HTTP_CALL_LIMIT_BYTES,
+        limit_bytes=policy.inline_payload_hard_limit_bytes,
         context="local IPC service payload",
     )
     return make_validated_inline_transport_carrier(
@@ -114,16 +229,23 @@ def _discard_metadata_if_current(service_name: str, meta: Dict[str, object]) -> 
             Path(str(meta.get("address", "") or "")).unlink(missing_ok=True)
 
 
-def _authkey_from_metadata(meta: Dict[str, object]) -> bytes:
-    return base64.b64decode(str(meta.get("authkey", "") or "").encode("ascii"))
+def _authkey_from_metadata(meta: Dict[str, object]) -> Optional[bytes]:
+    raw = str(meta.get("authkey", "") or "").strip()
+    if not raw:
+        return None
+    return base64.b64decode(raw.encode("ascii"))
 
 
-def _call_once(meta: Dict[str, object], request: Dict[str, object], *, timeout_sec: float = 5.0) -> Dict[str, object]:
+def _connect_local_service(meta: Dict[str, object]):
     address = str(meta.get("address", "") or "")
     family = str(meta.get("family", "") or "")
     if not address or not family:
         raise RuntimeError("local service metadata is incomplete")
-    conn = Client(address, family=family, authkey=_authkey_from_metadata(meta))
+    return Client(address, family=family, authkey=_authkey_from_metadata(meta))
+
+
+def _call_once(meta: Dict[str, object], request: Dict[str, object], *, timeout_sec: float = 5.0) -> Dict[str, object]:
+    conn = _connect_local_service(meta)
     try:
         conn.send(dict(request or {}))
         if not conn.poll(max(0.1, float(timeout_sec or 5.0))):
@@ -171,7 +293,7 @@ class LocalServiceIpcServer:
         self.node = node
         self.service_name = str(service_name or "").strip()
         self.address, self.family = _local_service_address(self.service_name)
-        self.authkey = os.urandom(32)
+        self.authkey = os.urandom(32) if _local_ipc_auth_enabled() else None
         self.ipc_token = uuid.uuid4().hex
         self._listener: Optional[Listener] = None
         self._stop = threading.Event()
@@ -197,7 +319,7 @@ class LocalServiceIpcServer:
                 "pid": os.getpid(),
                 "address": self.address,
                 "family": self.family,
-                "authkey": base64.b64encode(self.authkey).decode("ascii"),
+                "authkey": base64.b64encode(self.authkey).decode("ascii") if self.authkey is not None else "",
                 "ipc_token": self.ipc_token,
                 "node_id": str(getattr(self.node, "node_id", "") or ""),
                 "node_instance_id": str(getattr(self.node, "node_instance_id", "") or ""),
@@ -241,17 +363,18 @@ class LocalServiceIpcServer:
 
     def _handle_conn(self, conn: Any) -> None:
         try:
-            request = conn.recv()
-            if not isinstance(request, dict):
-                raise ValueError("request must be a dict")
-            if str(request.get("action", "") or "").strip() == "stream_call":
-                self._handle_stream_request(conn, request)
-                return
-            response = self._handle_request(request)
+            while True:
+                request = conn.recv()
+                if not isinstance(request, dict):
+                    raise ValueError("request must be a dict")
+                if str(request.get("action", "") or "").strip() == "stream_call":
+                    self._handle_stream_request(conn, request)
+                    return
+                response = self._handle_request(request)
+                conn.send(response)
         except Exception as exc:
-            response = {"ok": False, "error": str(exc) or repr(exc), "error_type": exc.__class__.__name__}
-        try:
-            conn.send(response)
+            with contextlib.suppress(Exception):
+                conn.send({"ok": False, "error": str(exc) or repr(exc), "error_type": exc.__class__.__name__})
         finally:
             with contextlib.suppress(Exception):
                 conn.close()
@@ -333,6 +456,8 @@ class LocalServiceClient:
     def __init__(self, *, service_name: str, timeout_sec: float = 10.0) -> None:
         self.service_name = str(service_name or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec or 10.0))
+        self._conn_lock = threading.Lock()
+        self._thread_conns: dict[int, tuple[str, Any]] = {}
         deadline = time.monotonic() + self.timeout_sec
         last_exc: Optional[BaseException] = None
         saw_stale_registry = False
@@ -369,17 +494,47 @@ class LocalServiceClient:
                     ) from last_exc
                 time.sleep(0.05)
 
+    def _close_thread_conn(self, thread_id: int) -> None:
+        with self._conn_lock:
+            entry = self._thread_conns.pop(thread_id, None)
+        if entry is not None:
+            with contextlib.suppress(Exception):
+                entry[1].close()
+
+    def _get_thread_conn(self) -> Any:
+        thread_id = threading.get_ident()
+        current_token = str(self._meta.get("ipc_token", "") or "")
+        with self._conn_lock:
+            entry = self._thread_conns.get(thread_id)
+            if entry is not None and entry[0] == current_token:
+                return entry[1]
+        self._close_thread_conn(thread_id)
+        conn = _connect_local_service(self._meta)
+        with self._conn_lock:
+            self._thread_conns[thread_id] = (current_token, conn)
+        return conn
+
+    def _request_via_connection(self, conn: Any, request: Dict[str, object], *, timeout_sec: float) -> Dict[str, object]:
+        conn.send(dict(request or {}))
+        if not conn.poll(max(0.1, float(timeout_sec or self.timeout_sec))):
+            raise TimeoutError("local service IPC request timed out")
+        response = conn.recv()
+        if not isinstance(response, dict):
+            raise RuntimeError(f"invalid local service IPC response: {type(response).__name__}")
+        return response
+
     def _request(self, action: str, **kwargs: object) -> Dict[str, object]:
         request = {"action": action, **kwargs}
         deadline = time.monotonic() + self.timeout_sec
         first_exc: Optional[BaseException] = None
         while True:
             try:
-                response = _call_once(self._meta, request, timeout_sec=self.timeout_sec)
+                response = self._request_via_connection(self._get_thread_conn(), request, timeout_sec=self.timeout_sec)
                 break
             except Exception as exc:
                 if first_exc is None:
                     first_exc = exc
+                self._close_thread_conn(threading.get_ident())
                 previous_meta = dict(self._meta)
                 try:
                     refreshed_meta = _read_metadata(self.service_name)
@@ -409,6 +564,12 @@ class LocalServiceClient:
             raise RuntimeError(str(response.get("error", "local service IPC request failed")))
         return response
 
+    def close(self) -> None:
+        with self._conn_lock:
+            thread_ids = list(self._thread_conns.keys())
+        for thread_id in thread_ids:
+            self._close_thread_conn(thread_id)
+
     def list_methods(self, *, service_name: str = "", include_docs: bool = False) -> list[Dict[str, object]]:
         del service_name, include_docs
         return list(self._request("list_methods").get("methods", []) or [])
@@ -428,7 +589,11 @@ class LocalServiceClient:
         **kwargs: object,
     ) -> Dict[str, object]:
         del service_name, kwargs
-        payload_transport = _make_local_pickle_payload_transport(payload)
+        payload_transport = _make_local_pickle_payload_transport(
+            payload,
+            meta=self._meta,
+            serialization_mode=serialization_mode,
+        )
         response = self._request(
             "call",
             method=method,
@@ -454,7 +619,11 @@ class LocalServiceClient:
         **kwargs: object,
     ):
         del service_name, kwargs
-        payload_transport = _make_local_pickle_payload_transport(payload)
+        payload_transport = _make_local_pickle_payload_transport(
+            payload,
+            meta=self._meta,
+            serialization_mode=serialization_mode,
+        )
         request = {
             "action": "stream_call",
             "method": method,

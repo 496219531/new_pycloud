@@ -24,5 +24,6 @@ gateway_stage/
 calc_asset_ratio/
 test_calc_assset_ratio.py
 run_sync_calc_asset_ratio.py
+run_sync_calc_asset_ratio_old.py
 *.csv
 calc_asset_ratio_job_module.py

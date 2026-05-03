@@ -960,6 +960,66 @@ def test_service_connect_local_discards_stale_ipc_registry(tmp_path, monkeypatch
     assert not metadata_path.exists()
 
 
+def test_service_local_ipc_client_reuses_thread_connection(monkeypatch):
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
+
+    connect_count = 0
+
+    class _FakeConn:
+        def __init__(self):
+            self.request = {}
+            self.closed = False
+
+        def send(self, request):
+            self.request = dict(request or {})
+
+        def poll(self, timeout):
+            del timeout
+            return True
+
+        def recv(self):
+            action = self.request.get("action")
+            if action == "ping":
+                return {"ok": True}
+            if action == "list_methods":
+                return {"ok": True, "methods": []}
+            if action == "get_status":
+                return {"ok": True, "routes": []}
+            return {"ok": False, "error": f"unexpected action: {action}"}
+
+        def close(self):
+            self.closed = True
+
+    def _fake_read_metadata(service_name):
+        return {
+            "version": 1,
+            "service_name": service_name,
+            "address": "fake",
+            "family": "AF_UNIX",
+            "ipc_token": "token-1",
+            "authkey": "",
+        }
+
+    def _fake_connect(meta):
+        nonlocal connect_count
+        assert meta["ipc_token"] == "token-1"
+        connect_count += 1
+        return _FakeConn()
+
+    monkeypatch.setattr(local_ipc_mod, "_read_metadata", _fake_read_metadata)
+    monkeypatch.setattr(local_ipc_mod, "_connect_local_service", _fake_connect)
+
+    client = LocalServiceClient(service_name="reuse-test", timeout_sec=1.0)
+    try:
+        client.list_methods()
+        client.get_status()
+    finally:
+        client.close()
+
+    assert connect_count == 2
+
+
 def test_service_local_ipc_sends_payload_as_inline_pickle_transport(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane.local_ipc import LocalServiceClient, start_local_service_ipc
     from pycloud_parallel.controlplane.serialization import (
@@ -997,6 +1057,44 @@ def test_service_local_ipc_sends_payload_as_inline_pickle_transport(tmp_path, mo
     with pytest.raises(ValueError, match="trusted internal"):
         decode_inline_transport_carrier(captured["payload"], context="gateway_public")
     assert captured["kwargs"]["serialization_mode"] == "pickle_stable_v1"
+
+
+def test_service_local_ipc_uses_local_payload_thresholds_for_dataref(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import config
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceClient, start_local_service_ipc
+    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    monkeypatch.setenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "64")
+    monkeypatch.setenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", "16384")
+    config.reload_config()
+    captured = {}
+
+    class _FakeNode:
+        node_id = "fake-local-node"
+        node_instance_id = "fake-local-node-inst"
+        object_dir = tmp_path / "objects"
+        methods = ["run"]
+
+        def call_balanced(self, method, payload, **kwargs):
+            captured["payload"] = payload
+            return "fake-local-node-inst", {"ok": True, "data": {"value": 3}}
+
+    server = start_local_service_ipc(node=_FakeNode(), service_name="local-dataref-threshold")
+    try:
+        client = LocalServiceClient(service_name="local-dataref-threshold", timeout_sec=5.0)
+        assert client.call(method="run", payload={"blob": b"x" * 4096})["data"] == {"value": 3}
+    finally:
+        server.close()
+        monkeypatch.delenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
+        config.reload_config()
+
+    decoded = decode_inline_transport_carrier(captured["payload"], context="service_owner")
+    assert isinstance(decoded["blob"], DataRef)
+    assert decoded["blob"].locator_kind == "node_local"
+    assert decoded["blob"].node_instance_id == "fake-local-node-inst"
 
 
 def test_service_local_ipc_fetch_result_data_materializes_dataref_directly(tmp_path, monkeypatch):
