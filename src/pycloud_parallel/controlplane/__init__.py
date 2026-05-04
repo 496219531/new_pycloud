@@ -16,6 +16,8 @@ _INFRA_EXPORTS = {
     "NodeCircuitState",
     "NodeCapability",
     "NodeControlClient",
+    "HttpNodeObjectClient",
+    "HttpNodeControlClient",
     "PolicyProfile",
 }
 
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
     )
     from .node_capability import NodeCapability
     from .node_control_client import NodeControlClient
+    from .node_object_http import HttpNodeObjectClient
+    from .node_control_http import HttpNodeControlClient
     from .policy_profile import PolicyProfile
 
 
@@ -57,6 +61,8 @@ def _try_bind_infra_exports() -> None:
         )
         from .node_capability import NodeCapability
         from .node_control_client import NodeControlClient
+        from .node_object_http import HttpNodeObjectClient
+        from .node_control_http import HttpNodeControlClient
         from .policy_profile import PolicyProfile
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
@@ -77,6 +83,8 @@ def _try_bind_infra_exports() -> None:
             "NodeCircuitState": NodeCircuitState,
             "NodeCapability": NodeCapability,
             "NodeControlClient": NodeControlClient,
+            "HttpNodeObjectClient": HttpNodeObjectClient,
+            "HttpNodeControlClient": HttpNodeControlClient,
             "PolicyProfile": PolicyProfile,
         }
     )
@@ -110,5 +118,7 @@ __all__ = [
     "NodeCircuitState",
     "NodeCapability",
     "NodeControlClient",
+    "HttpNodeObjectClient",
+    "HttpNodeControlClient",
     "PolicyProfile",
 ]

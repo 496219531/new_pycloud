@@ -9,7 +9,11 @@ from pycloud_parallel.controlplane.effective_policy import (
     should_use_http_bytes_transport,
     should_use_transport_payload_bytes,
 )
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
+from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
+from pycloud_parallel.execution.task_pool import _node_control_target_for_node as _taskpool_nodecontrol_target
+from pycloud_parallel.execution.service_session import _node_control_target_for_node as _service_nodecontrol_target
 from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -203,3 +207,42 @@ def test_node_control_client_can_use_transport_lane_for_structured_mode():
     request = captured["request"]
     assert request.HasField("transport_payload")
     assert request.transport_payload.codec == "structured_v1"
+
+
+def test_nodecontrol_transport_auto_prefers_http_capability():
+    node = InfoCenterNode(
+        node_instance_id="node-inst",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        capacity=4,
+        queue_capacity=32,
+        queued=0,
+        inflight=0,
+        credit=32,
+        capability=NodeCapability(
+            supports_http_nodecontrol=True,
+            node_http_base_url="http://127.0.0.1:18061",
+        ),
+    )
+
+    assert _taskpool_nodecontrol_target(node, transport="auto") == "http://127.0.0.1:18061"
+    assert _service_nodecontrol_target(node, transport="http") == "http://127.0.0.1:18061"
+    assert node.capability.to_dict()["supports_http_nodecontrol"] is True
+
+
+def test_nodecontrol_transport_auto_falls_back_to_grpc_control_addr():
+    node = InfoCenterNode(
+        node_instance_id="node-inst",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        capacity=4,
+        queue_capacity=32,
+        queued=0,
+        inflight=0,
+        credit=32,
+    )
+
+    assert _taskpool_nodecontrol_target(node, transport="auto") == "127.0.0.1:50061"
+    assert _service_nodecontrol_target(node, transport="grpc") == "127.0.0.1:50061"

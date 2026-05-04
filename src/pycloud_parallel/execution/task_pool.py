@@ -155,9 +155,36 @@ def _infocenter_client(*args, **kwargs):
 
 
 def _node_control_client(*args, **kwargs):
+    transport = str(kwargs.pop("transport", "") or "").strip().lower()
+    target = str(args[0] if args else kwargs.get("target", "") or "").strip()
+    if transport in {"http", "nodecontrol_http"} or (not transport and target.startswith(("http://", "https://"))):
+        from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient
+
+        return HttpNodeControlClient(*args, **kwargs)
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
     return NodeControlClient(*args, **kwargs)
+
+
+def _node_control_target_for_node(node: InfoCenterNode, *, transport: str = "grpc") -> str:
+    normalized = str(transport or "grpc").strip().lower() or "grpc"
+    capability = getattr(node, "capability", None)
+    node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
+    supports_http = bool(getattr(capability, "supports_http_nodecontrol", False))
+    if normalized in {"http", "nodecontrol_http"}:
+        if not node_http_base_url:
+            raise RuntimeError(f"node does not expose HTTP NodeControl endpoint: node_id={getattr(node, 'node_id', '')}")
+        return node_http_base_url
+    if normalized == "auto" and supports_http and node_http_base_url:
+        return node_http_base_url
+    return str(getattr(node, "control_addr", "") or "").strip()
+
+
+def _new_node_control_client(target: str, *, timeout_sec: float, transport: str = "grpc"):
+    normalized = str(transport or "grpc").strip().lower() or "grpc"
+    if normalized in {"grpc", ""}:
+        return _node_control_client(target, timeout_sec=timeout_sec)
+    return _node_control_client(target, timeout_sec=timeout_sec, transport=normalized)
 
 
 class _LocalTaskPoolNodeClient:
@@ -596,7 +623,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             missing = max(0, desired - len(active))
 
             def _create_pool_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, NativeTaskPoolClient]:
-                client = _node_control_client(node.control_addr, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
+                transport = str(spec.get("nodecontrol_transport", "grpc") or "grpc")
+                target = _node_control_target_for_node(node, transport=transport)
+                client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0), transport=transport)
                 pool = client.create_task_pool_from_bytes(
                     owner_client_id=str(spec.get("owner_client_id", "") or ""),
                     pool_name=str(spec.get("pool_name", "") or ""),
@@ -2553,6 +2582,7 @@ def _build_task_pool_from_infocenter(
     timeout_sec: float = 10.0,
     serialization_mode: str = "",
     policy_id: str = "",
+    transport: str = "grpc",
 ) -> "TaskPool":
     module_source = source if inspect.ismodule(source) else None
     normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
@@ -2618,7 +2648,8 @@ def _build_task_pool_from_infocenter(
     )
 
     def _create_pool_on_node(node: InfoCenterNode) -> Tuple[InfoCenterNode, NativeTaskPoolClient]:
-        client = _node_control_client(node.control_addr, timeout_sec=timeout_sec)
+        target = _node_control_target_for_node(node, transport=transport)
+        client = _new_node_control_client(target, timeout_sec=timeout_sec, transport=transport)
         try:
             pool = client.create_task_pool_from_bytes(
                 owner_client_id=effective_owner,
@@ -2714,6 +2745,7 @@ def _build_task_pool_from_infocenter(
             "node_count": compensation_target_count,
             "node_limit": node_limit,
             "timeout_sec": timeout_sec,
+            "nodecontrol_transport": transport,
         }
     )
     session._start_keepalive()
@@ -2888,6 +2920,7 @@ class TaskPool(_TaskPoolSessionBase):
         node_limit: int = 100,
         timeout_sec: float = 10.0,
         serialization_mode: str = "",
+        transport: str = "grpc",
     ) -> "TaskPool":
         """Product-facing open action for V1 task pools.
 
@@ -2940,6 +2973,7 @@ class TaskPool(_TaskPoolSessionBase):
             node_limit=node_limit,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
+            transport=transport,
         )
 
     @classmethod
@@ -2972,6 +3006,7 @@ class TaskPool(_TaskPoolSessionBase):
         timeout_sec: float = 10.0,
         serialization_mode: str = "",
         policy_id: str = "",
+        transport: str = "grpc",
     ) -> "TaskPool":
         """Low-level entry; prefer ``TaskPool.open(...)``.
 
@@ -3007,4 +3042,5 @@ class TaskPool(_TaskPoolSessionBase):
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
             policy_id=policy_id,
+            transport=transport,
         )

@@ -33,6 +33,8 @@ class NodeCapability:
     supported_modes: Tuple[str, ...] = ()
     supports_transport_payload_bytes: bool = False
     supports_http_bytes_transport: bool = False
+    supports_http_nodecontrol: bool = False
+    node_http_base_url: str = ""
     max_grpc_send_bytes: int = 0
     max_grpc_recv_bytes: int = 0
     max_http_body_bytes: int = 0
@@ -43,6 +45,8 @@ class NodeCapability:
         object.__setattr__(self, "supported_modes", _normalize_modes(self.supported_modes))
         object.__setattr__(self, "supports_transport_payload_bytes", bool(self.supports_transport_payload_bytes))
         object.__setattr__(self, "supports_http_bytes_transport", bool(self.supports_http_bytes_transport))
+        object.__setattr__(self, "supports_http_nodecontrol", bool(self.supports_http_nodecontrol))
+        object.__setattr__(self, "node_http_base_url", str(self.node_http_base_url or "").strip())
         object.__setattr__(self, "max_grpc_send_bytes", max(0, int(self.max_grpc_send_bytes or 0)))
         object.__setattr__(self, "max_grpc_recv_bytes", max(0, int(self.max_grpc_recv_bytes or 0)))
         object.__setattr__(self, "max_http_body_bytes", max(0, int(self.max_http_body_bytes or 0)))
@@ -54,6 +58,8 @@ class NodeCapability:
             "supported_modes": list(self.supported_modes),
             "supports_transport_payload_bytes": bool(self.supports_transport_payload_bytes),
             "supports_http_bytes_transport": bool(self.supports_http_bytes_transport),
+            "supports_http_nodecontrol": bool(self.supports_http_nodecontrol),
+            "node_http_base_url": str(self.node_http_base_url or ""),
             "max_grpc_send_bytes": int(self.max_grpc_send_bytes),
             "max_grpc_recv_bytes": int(self.max_grpc_recv_bytes),
             "max_http_body_bytes": int(self.max_http_body_bytes),
@@ -69,6 +75,8 @@ class NodeCapability:
             supported_modes=tuple(payload.get("supported_modes") or ()),
             supports_transport_payload_bytes=bool(payload.get("supports_transport_payload_bytes", False)),
             supports_http_bytes_transport=bool(payload.get("supports_http_bytes_transport", False)),
+            supports_http_nodecontrol=bool(payload.get("supports_http_nodecontrol", False)),
+            node_http_base_url=str(payload.get("node_http_base_url", "") or ""),
             max_grpc_send_bytes=int(payload.get("max_grpc_send_bytes", 0) or 0),
             max_grpc_recv_bytes=int(payload.get("max_grpc_recv_bytes", 0) or 0),
             max_http_body_bytes=int(payload.get("max_http_body_bytes", 0) or 0),
@@ -93,6 +101,7 @@ class NodeCapability:
                 self.supported_modes,
                 bool(self.supports_transport_payload_bytes),
                 bool(self.supports_http_bytes_transport),
+                bool(self.supports_http_nodecontrol),
                 int(self.max_grpc_send_bytes or 0) > 0,
                 int(self.max_grpc_recv_bytes or 0) > 0,
                 int(self.max_http_body_bytes or 0) > 0,
@@ -107,6 +116,8 @@ def detect_local_node_capability(
     supported_modes: Sequence[str] | None = None,
     supports_transport_payload_bytes: Optional[bool] = None,
     supports_http_bytes_transport: Optional[bool] = None,
+    supports_http_nodecontrol: Optional[bool] = None,
+    node_http_base_url: str = "",
     max_grpc_send_bytes: Optional[int] = None,
     max_grpc_recv_bytes: Optional[int] = None,
     max_http_body_bytes: Optional[int] = None,
@@ -117,6 +128,8 @@ def detect_local_node_capability(
         supported_modes=tuple(supported_modes or SUPPORTED_SERIALIZATION_MODES),
         supports_transport_payload_bytes=True if supports_transport_payload_bytes is None else bool(supports_transport_payload_bytes),
         supports_http_bytes_transport=True if supports_http_bytes_transport is None else bool(supports_http_bytes_transport),
+        supports_http_nodecontrol=True if supports_http_nodecontrol is None else bool(supports_http_nodecontrol),
+        node_http_base_url=str(node_http_base_url or "").strip(),
         max_grpc_send_bytes=int(
             GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES if max_grpc_send_bytes is None else max_grpc_send_bytes
         ),
@@ -141,6 +154,8 @@ def capability_from_candidate(value: object) -> Optional[NodeCapability]:
             "supported_modes",
             "supports_transport_payload_bytes",
             "supports_http_bytes_transport",
+            "supports_http_nodecontrol",
+            "node_http_base_url",
             "max_grpc_send_bytes",
             "max_grpc_recv_bytes",
             "max_http_body_bytes",

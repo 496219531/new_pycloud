@@ -301,10 +301,10 @@ def _data_ref_remote_targets(data_ref: DataRef) -> tuple[str, ...]:
 
 def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) -> ObjectArtifact:
     started_at = time.perf_counter()
-    from pycloud_parallel.controlplane.node_control_client import NodeControlClient
+    from pycloud_parallel.controlplane.node_object_http import make_node_object_client
 
     try:
-        with NodeControlClient(target) as client:
+        with make_node_object_client(target) as client:
             blob = client.download_object_bytes(object_id=data_ref.object_id)
     except Exception as exc:
         raise ObjectResolutionError(

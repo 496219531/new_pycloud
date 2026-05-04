@@ -1,5 +1,0 @@
-优化local模式的通信 ,1.dataref 一律直接还原,不用再通过ipc拉取 
-
-2.数据通过ipc通信,只有service deploy 和 connect 之间, 都是用pickle传输吧,而且paylocal 都是二进制bytes ,直到worker才反序列化
-
-3.在我看来通过ipc的通信,性能要远比http快很多,但当前非常不明显.甚至更慢一点,请查明原因并进行修正

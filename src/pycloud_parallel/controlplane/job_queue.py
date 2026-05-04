@@ -280,7 +280,9 @@ def _resolve_job_blob_bytes(
     if not control_addr:
         raise RuntimeError(f"{ref_key} is missing {control_addr_key}")
     timeout_sec = max(0.1, float(payload.get("timeout_sec", 10.0) or 10.0))
-    with NodeControlClient(control_addr, timeout_sec=timeout_sec) as client:
+    from pycloud_parallel.controlplane.node_object_http import make_node_object_client
+
+    with make_node_object_client(control_addr, timeout_sec=timeout_sec) as client:
         return client.download_object_bytes(object_id=ref.object_id)
 
 

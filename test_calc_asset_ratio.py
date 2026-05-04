@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -270,6 +271,9 @@ def calc_fund_list_asset_ratio2(
     fund_list: Sequence[int] | None,
     strategy_type: int = 1,
     frequency: int = 1,
+    *,
+    transport: str = "grpc",
+    verbose: bool = True,
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
     payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
@@ -278,7 +282,7 @@ def calc_fund_list_asset_ratio2(
     t0 = time.time()
     with TaskPool.open(
         target=CONTROLPLANE_TARGET,
-        job_id=f"demo-pool-{int(time.time())}",
+        job_id=f"demo-pool-{transport}-{int(time.time())}",
         source=calc_asset_ratio.get_fund_asset_ratio,
         worker_count=10,
         node_count=2,
@@ -286,18 +290,64 @@ def calc_fund_list_asset_ratio2(
         timeout_sec=300.0,
         managed_global_names=MANAGED_GLOBAL_NAMES,
         serialization_mode=TASKPOOL_SERIALIZATION_MODE,
+        transport=transport,
     ) as pool:
         pool.update_globals(calc_asset_ratio.update_globals())
-        print("pool nodes:", pool.node_ids)
-        print("pool status:", {k: v.status for k, v in pool.status_map().items()})
+        if verbose:
+            print(f"transport: {transport}")
+            print("pool nodes:", pool.node_ids)
+            print("pool status:", {k: v.status for k, v in pool.status_map().items()})
         t1 = time.time()
-        print(t1 - t0)
+        if verbose:
+            print("open_sec:", t1 - t0)
         results = []
         for _task_id, data in pool.unordered(payloads, timeout_sec=300):
             results.append(_normalize_result_item(data))
         t2 = time.time()
-        print(t2 - t1)
+        if verbose:
+            print("compute_sec:", t2 - t1)
+            print("total_sec:", t2 - t0)
         return results
+
+
+def benchmark_taskpool_transport(
+    fund_list: Sequence[int] | None,
+    *,
+    transport: str,
+    strategy_type: int = 1,
+    frequency: int = 1,
+) -> dict[str, object]:
+    fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
+    payloads = _iter_payloads(fund_net_value_pvt, strategy_type=strategy_type, frequency=0)
+
+    t0 = time.time()
+    with TaskPool.open(
+        target=CONTROLPLANE_TARGET,
+        job_id=f"demo-pool-{transport}-{int(time.time())}",
+        source=calc_asset_ratio.get_fund_asset_ratio,
+        worker_count=10,
+        node_count=2,
+        tags=["compute"],
+        timeout_sec=300.0,
+        managed_global_names=MANAGED_GLOBAL_NAMES,
+        serialization_mode=TASKPOOL_SERIALIZATION_MODE,
+        transport=transport,
+    ) as pool:
+        pool.update_globals(calc_asset_ratio.update_globals())
+        t1 = time.time()
+        results = []
+        for _task_id, data in pool.unordered(payloads, timeout_sec=300):
+            results.append(_normalize_result_item(data))
+        t2 = time.time()
+        return {
+            "transport": transport,
+            "node_ids": list(pool.node_ids),
+            "open_sec": round(t1 - t0, 3),
+            "compute_sec": round(t2 - t1, 3),
+            "total_sec": round(t2 - t0, 3),
+            "count": len(results),
+            "dataframe_count": sum(isinstance(item, pd.DataFrame) for item in results),
+        }
 
 
 def calc_fund_list_asset_ratio_taskpool_aunordered(
@@ -420,6 +470,15 @@ def calc_fund_list_asset_ratio_job(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--transport",
+        choices=("grpc", "http", "both"),
+        default="grpc",
+        help="TaskPool transport to run.",
+    )
+    args = parser.parse_args()
+
     fund_list = [
         156695,
         157112,
@@ -502,20 +561,16 @@ if __name__ == "__main__":
         1624096,
         1652875,
     ]
-    t1 = time.time()
-    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
-
-    # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
-    # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
-    # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)
-    t2 = time.time()
-    # print(result)
-    print(sum([isinstance(r,pd.DataFrame) for  r in result]))
-    print(t2 - t1)
+    transports = ("grpc", "http") # if args.transport == "both" else (args.transport,)
+    summaries = []
+    for transport in transports:
+        summary = benchmark_taskpool_transport(
+            fund_list,
+            transport=transport,
+            strategy_type=1,
+            frequency=1,
+        )
+        summaries.append(summary)
+        print("RESULT", summary)
+    if len(summaries) > 1:
+        print("SUMMARY", summaries)

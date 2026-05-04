@@ -7,12 +7,50 @@ from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
 from pycloud_parallel.controlplane.gateway_upload import relay_data_ref_v1
 from pycloud_parallel.controlplane.job_queue import _resolve_payload_data_refs
+from pycloud_parallel.controlplane.node_object_http import HttpNodeObjectClient, NodeObjectHttpServer
+from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.node.results import _resolve_single_data_ref
 from pycloud_parallel.execution.support import _put_data_via_clients
 
 
 def _object_id(blob: bytes) -> str:
     return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def test_worker_remote_fetch_downloads_http_dataref(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_DATAREF_RESOLUTION", "remote_fetch")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    state = NodeControlState(
+        node_id="node-http-fetch",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "node_http_fetch"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    server = NodeObjectHttpServer(bind="127.0.0.1:0", state=state)
+    server.start()
+    try:
+        with HttpNodeObjectClient(server.base_url, timeout_sec=10.0) as client:
+            uploaded = client.upload_object_from_bytes(blob=b"http remote fetch", format="bin")
+        ref = DataRef(
+            ref_id=uploaded.object_id,
+            storage_id=uploaded.object_id,
+            format="bin",
+            size_bytes=uploaded.size_bytes,
+            materialize_as="bytes",
+            locator_kind="node_control",
+            locator_token=server.base_url,
+            control_addr=server.base_url,
+        )
+        assert _resolve_single_data_ref(ref, object_dir=str(tmp_path / "worker_objects")) == b"http remote fetch"
+    finally:
+        server.stop()
+        state.close()
 
 
 def test_upload_once_ref_can_be_resolved_by_worker_remote_fetch(tmp_path, monkeypatch, request):
