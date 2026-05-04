@@ -5,7 +5,7 @@ import tarfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def test_prepare_artifact_applies_service_and_task_defaults() -> None:

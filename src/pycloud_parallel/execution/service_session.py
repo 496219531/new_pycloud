@@ -48,6 +48,11 @@ from pycloud_parallel.controlplane.infocenter_client import (
     _node_instance_key_from_route,
     _route_sort_key,
 )
+from pycloud_parallel.controlplane.node_control_transport import (
+    new_node_control_client as _new_node_control_client,
+    node_control_client as _node_control_client,
+    node_control_target_for_node as _node_control_target_for_node,
+)
 from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
@@ -70,6 +75,7 @@ from pycloud_parallel.execution.failover import (
     mark_candidate_success,
     should_failover,
 )
+from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
@@ -88,12 +94,10 @@ from pycloud_parallel.execution.support import (
     _artifact_code_version,
     _default_service_session_cache_dir,
     _emit_owner_notice,
-    _encode_managed_globals_batches,
     _ensure_private_dir,
     _filter_nodes_by_runtime,
     _get_local_ip,
     _prepare_code_blob,
-    _prepare_managed_globals_batches_for_upload,
     _put_data_via_clients,
     _resolve_public_target_arg,
     _resolve_high_level_service_data,
@@ -119,33 +123,6 @@ def _infocenter_client(*args, **kwargs):
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
     return InfoCenterClient(*args, **kwargs)
-
-
-def _node_control_client(*args, **kwargs):
-    kwargs.pop("transport", None)
-    from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient
-
-    return HttpNodeControlClient(*args, **kwargs)
-
-
-def _node_control_target_for_node(node: InfoCenterNode) -> str:
-    capability = getattr(node, "capability", None)
-    node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    if node_http_base_url:
-        return node_http_base_url
-    return str(getattr(node, "control_addr", "") or "").strip()
-
-
-def _node_control_target_for_route(route: InfoCenterServiceRoute) -> str:
-    capability = getattr(route, "capability", None)
-    node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    if node_http_base_url:
-        return node_http_base_url
-    return str(getattr(route, "control_addr", "") or "").strip()
-
-
-def _new_node_control_client(target: str, *, timeout_sec: float):
-    return _node_control_client(target, timeout_sec=timeout_sec)
 
 
 def _endpoint_from_url_or_addr(value: str) -> Tuple[str, int]:
@@ -1807,7 +1784,7 @@ class Service(ServiceExecutionSession):
     breaker_failure_threshold: int = 3
     breaker_cooldown_sec: float = 5.0
     breaker_max_cooldown_sec: float = 120.0
-    _clients: Dict[str, NodeControlClient] = field(default_factory=dict, repr=False)
+    _clients: Dict[str, Any] = field(default_factory=dict, repr=False)
     _session_cache_file: Optional[Path] = field(default=None, repr=False)
     _session_cache_lock: Optional[_ServiceSessionFileLock] = field(default=None, repr=False)
     _delete_session_cache_on_close: bool = field(default=False, repr=False)
@@ -1944,7 +1921,7 @@ class Service(ServiceExecutionSession):
                 return 0
             missing = max(0, desired - len(active))
 
-            def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]:
+            def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]:
                 node_key = _node_instance_key_from_node(node)
                 try:
                     target = _node_control_target_for_node(node)
@@ -3060,11 +3037,11 @@ class Service(ServiceExecutionSession):
                 except RuntimeError as exc:
                     raise RuntimeError(str(exc)) from exc
             sessions: Dict[str, ServiceSessionClient] = {}
-            clients: Dict[str, NodeControlClient] = {}
+            clients: Dict[str, Any] = {}
             nodes: Dict[str, InfoCenterNode] = {}
             failures: Dict[str, str] = {}
 
-            def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]:
+            def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]:
                 node_key = _node_instance_key_from_node(node)
                 try:
                     target = _node_control_target_for_node(node)
@@ -3101,7 +3078,7 @@ class Service(ServiceExecutionSession):
                 session.node_id = str(node.node_id or "")
                 return node_key, node, client, session, ""
 
-            create_results: List[Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]] = []
+            create_results: List[Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]] = []
             if len(selected_nodes) == 1:
                 create_results.append(_create_service_on_node(selected_nodes[0]))
             else:
@@ -3284,7 +3261,7 @@ class Service(ServiceExecutionSession):
             raise RuntimeError("invalid local service session cache: nodes missing")
 
         sessions: Dict[str, ServiceSessionClient] = {}
-        clients: Dict[str, NodeControlClient] = {}
+        clients: Dict[str, Any] = {}
         nodes: Dict[str, InfoCenterNode] = {}
 
         try:
@@ -3429,7 +3406,7 @@ class Service(ServiceExecutionSession):
     def _cleanup_created_services(
         *,
         sessions: Dict[str, ServiceSessionClient],
-        clients: Dict[str, NodeControlClient],
+        clients: Dict[str, Any],
         reason: str,
     ) -> None:
         for session in sessions.values():
@@ -3663,23 +3640,6 @@ class Service(ServiceExecutionSession):
             sessions_snapshot = list(self.sessions.items())
             clients_snapshot = dict(self._clients)
         active_clients = [clients_snapshot[node_id] for node_id, _ in sessions_snapshot if node_id in clients_snapshot]
-        prepare_kwargs: Dict[str, object] = {}
-        if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
-            prepare_kwargs["serialization_mode"] = self.serialization_mode
-        prepared_batches, _ = _prepare_managed_globals_batches_for_upload(
-            active_clients,
-            values,
-            effective_policy=self.effective_policy,
-            context="service_owner",
-            **prepare_kwargs,
-        )
-        encoded_batches = _encode_managed_globals_batches(
-            prepared_batches,
-            serialization_mode=self.serialization_mode,
-            effective_policy=self.effective_policy,
-            context="service_owner",
-        )
-        digests: Dict[str, str] = {}
         failed_nodes: Dict[str, str] = {}
         update_targets: List[Tuple[str, ServiceSessionClient]] = []
         for node_id, session in sessions_snapshot:
@@ -3688,44 +3648,38 @@ class Service(ServiceExecutionSession):
                 continue
             update_targets.append((node_id, session))
 
-        def _update_node_globals(node_id: str, session: ServiceSessionClient) -> Tuple[str, str, str]:
-            try:
-                resp = None
-                for prepared_values, values_struct, transport_values in encoded_batches:
-                    update_encoded = getattr(session, "update_globals_encoded", None)
-                    if callable(update_encoded):
-                        resp = update_encoded(
-                            prepared_keys=sorted(str(key) for key in prepared_values.keys()),
-                            values=values_struct,
-                            transport_values=transport_values,
-                        )
-                    else:
-                        resp = session.update_globals_prepared(
-                            prepared_values,
-                            serialization_mode=self.serialization_mode,
-                            effective_policy=self.effective_policy,
-                        )
-                return (
-                    node_id,
-                    str(getattr(resp, "globals_digest", "") or ""),
-                    "",
+        def _update_batch(
+            _node_id: str,
+            session: ServiceSessionClient,
+            prepared_values: Dict[str, object],
+            values_struct: object,
+            transport_values: Optional[pb2.TransportPayload],
+        ) -> object:
+            update_encoded = getattr(session, "update_globals_encoded", None)
+            if callable(update_encoded):
+                return update_encoded(
+                    prepared_keys=sorted(str(key) for key in prepared_values.keys()),
+                    values=values_struct,
+                    transport_values=transport_values,
                 )
-            except Exception as exc:
-                return node_id, "", repr(exc)
+            return session.update_globals_prepared(
+                prepared_values,
+                serialization_mode=self.serialization_mode,
+                effective_policy=self.effective_policy,
+            )
 
-        if len(update_targets) == 1:
-            update_results = [_update_node_globals(*update_targets[0])]
-        else:
-            update_results = []
-            with ThreadPoolExecutor(max_workers=max(1, len(update_targets)), thread_name_prefix="service-update-globals") as executor:
-                futures = [executor.submit(_update_node_globals, node_id, session) for node_id, session in update_targets]
-                for future in futures:
-                    update_results.append(future.result())
-        for node_id, digest, error_message in update_results:
-            if error_message:
-                failed_nodes[node_id] = error_message
-            else:
-                digests[node_id] = digest
+        digests, update_failures = update_managed_globals_across_replicas(
+            upload_clients=active_clients,
+            values=values,
+            targets=update_targets,
+            serialization_mode=self.serialization_mode,
+            effective_policy=self.effective_policy,
+            context="service_owner",
+            thread_name_prefix="service-update-globals",
+            update_batch=_update_batch,
+            include_empty_digest=True,
+        )
+        failed_nodes.update(update_failures)
 
         for node_id, message in failed_nodes.items():
             with self._route_lock:

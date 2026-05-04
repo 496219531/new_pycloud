@@ -35,7 +35,7 @@ pip install pycloud-parallel
 当前默认部署形态：
 
 1. `ControlPlane = InfoCenter + Gateway`，对外 `HTTP + JSON`
-2. `NodeControl`，对外 `gRPC`
+2. `NodeControl`，对外 `HTTP`
 3. 服务实例数据面，节点内 `HTTP + JSON`
 
 可以把这三层关系理解成：
@@ -62,7 +62,7 @@ pip install pycloud-parallel
 1. `HTTP` 调服务时，底层仍然是 `JSON`
 2. 框架会把上面 3 种类型自动转成简单 JSON 结构
 3. 复杂对象不会自动兼容，直接报错
-4. `gRPC` 任务/服务控制面会对这 3 种类型做显式包装与还原
+4. 任务/服务控制面会对这 3 种类型做显式包装与还原
 5. `numpy.ndarray` 只接受简单 `dtype`：数值 / bool / 字符串
 
 如果业务参数里有更复杂的 Python 对象，当前建议用户自己先转成普通 JSON 结构，或落到外部存储后只传引用。
@@ -181,12 +181,12 @@ pycloudctl gc --scope all --older-than-hours 168
 ### 服务模式
 
 1. 对外推荐入口：`ControlPlane Gateway HTTP + JSON`
-2. 节点管理面：`NodeControl gRPC`
+2. 节点管理面：`NodeControl HTTP`
 3. 节点内服务执行：`POST /svc/{service_id}/call/{method}`
 
 ### 任务模式
 
-1. 高频任务链路仍然走 `NodeControl gRPC`
+1. 高频任务链路走 `NodeControl HTTP`
 2. `InfoCenter` 只提供节点事实，不代理任务
 3. `Gateway` 不代理任务
 

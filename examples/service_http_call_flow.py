@@ -22,7 +22,7 @@ except ModuleNotFoundError as exc:
     missing = str(getattr(exc, "name", "") or "")
     message = str(exc)
     if (
-        missing in {"pycloud_parallel", "grpc", "google", "protobuf"}
+        missing in {"pycloud_parallel", "google", "protobuf"}
         or missing.startswith("google.")
         or "Control-plane dependencies are missing." in message
     ):

@@ -19,7 +19,7 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRou
 from pycloud_parallel.controlplane.payload_transport import encode_result_for_transport
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 class _FakeHttpResponse:

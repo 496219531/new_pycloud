@@ -23,11 +23,11 @@
 | `PYCLOUD_DATAREF_RESOLUTION` | `remote_fetch` | worker/client 解析 `DataRef` 时允许按 locator/registry 远程拉取并本地缓存 |
 | `PYCLOUD_JOBQUEUE_RESOLVE_REFS` | `defer_to_worker` | JobQueue 默认不在 job-orch 实例化业务 `DataRef`，交给最终 worker 解析 |
 | `PYCLOUD_GATEWAY_DATAREF_RELAY` | `eager` | gateway 仍保持旧的 eager relay 默认，外部链路后续单独收口 |
-| `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条发送消息限制 |
-| `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `16777216` | gRPC 单条接收消息限制 |
+| `PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES` | `16777216` | NodeControl 单条发送消息限制 |
+| `PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `16777216` | NodeControl 单条接收消息限制 |
 | `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role node` 的默认 worker capacity；`pycloudctl start` 未显式指定时优先读它 |
 | `PYCLOUD_NODE_QUEUE_CAPACITY` | `4000` | `pycloud-control --role node` 的默认 queue capacity；`pycloudctl start-node` 默认值为 `1000`，也可被它覆盖 |
-| `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl gRPC server 的默认线程池大小 |
+| `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl HTTP server 的默认线程池大小 |
 | `PYCLOUD_SERVICE_DEFAULT_WORKERS` | `10` | 单个 service 默认 worker 数 |
 | `PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC` | `30` | service 默认 heartbeat timeout |
 
@@ -37,7 +37,7 @@
 
 1. 希望 inline payload 更小
    - 例如 1 MiB 内 inline，超过就走 `DataRef`
-2. 希望 gRPC 单条消息限制更大
+2. 希望 NodeControl 单条消息限制更大
 3. 希望对象上传分片更大或更小
 4. 希望 inline result 更保守，尽早走 `DataRef`
 
@@ -105,15 +105,15 @@
   - 默认：`eager`
   - 含义：gateway 仍使用旧默认；外部 gateway_public 的 DataRef locator 信任策略不在本轮调整
 
-### 2.4 gRPC message size
+### 2.4 control message size
 
-- `PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES`
+- `PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-- `PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES`
+- `PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-当前 `NodeControlClient` 和 `build_nodecontrol_server(...)` 都会读取这两个值，统一设置 gRPC channel/server 的 message size 限制。
+当前 `NodeControlClient` 和 `build_nodecontrol_server(...)` 都会读取这两个值，统一设置 NodeControl HTTP inline message size 限制。
 
 ### 2.5 node 默认进程/并发参数
 
@@ -129,7 +129,7 @@
 
 - `PYCLOUD_NODE_MAX_WORKERS`
   - 默认：`64`
-  - NodeControl gRPC server 线程池大小
+  - NodeControl HTTP server 线程池大小
 
 - `PYCLOUD_SERVICE_DEFAULT_WORKERS`
   - 默认：`10`
@@ -148,8 +148,8 @@
 ```bash
 pycloudctl start-controlplane \
   --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576 \
-  --env PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
-  --env PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+  --env PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
+  --env PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
 ```
 
 也同样适用于：
@@ -176,13 +176,13 @@ export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
 $env:PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
 ```
 
-### 3.2 放大 gRPC message limit
+### 3.2 放大 control message limit
 
-如果你确实需要更大的单条 gRPC 消息：
+如果你确实需要更大的单条 NodeControl 消息：
 
 ```bash
-export PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216
-export PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+export PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216
+export PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
 ```
 
 也就是 `16 MiB`。
@@ -219,11 +219,11 @@ pycloudctl start-node \
 1. 先调 `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
    - 让大对象更早走 `DataRef`
 2. 再考虑调 `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
-3. 最后才考虑直接放大 gRPC message limit
+3. 最后才考虑直接放大 control message limit
 
 原因：
 
-1. 直接放大 gRPC message limit 虽然简单
+1. 直接放大 control message limit 虽然简单
 2. 但容易把本来应该走对象路径的大对象继续塞进 inline
 3. 长期更难调试，也更容易把内存和带宽问题隐藏掉
 
@@ -246,14 +246,14 @@ export PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES=1048576
 适合：
 
 1. DataFrame / Series / ndarray 比较多
-2. 不希望 gRPC/HTTP inline 太重
+2. 不希望 HTTP inline 太重
 
 ```bash
 export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=131072
 export PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072
 ```
 
-### 组合 C：放大 gRPC message size 到 16 MiB
+### 组合 C：放大 control message size 到 16 MiB
 
 适合：
 
@@ -261,8 +261,8 @@ export PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072
 2. 你明确知道进程内存足够
 
 ```bash
-export PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216
-export PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+export PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216
+export PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
 ```
 
 ### 组合 D：提高对象分片大小到 512 KiB
@@ -282,8 +282,8 @@ export PYCLOUD_OBJECT_CHUNK_SIZE_BYTES=524288
 pycloudctl start \
   --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=131072 \
   --env PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072 \
-  --env PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
-  --env PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+  --env PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
+  --env PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
 ```
 
 ## 5. 备注

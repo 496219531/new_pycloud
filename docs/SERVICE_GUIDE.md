@@ -251,7 +251,7 @@ for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in
 并且分两层看：
 
 1. 小对象默认走 inline 传输
-2. `HTTP` / gRPC inline 数据面本质仍然是 `JSON/Struct`
+2. HTTP inline 数据面本质仍然是 `JSON/Struct`
 3. 框架会把这 3 种类型自动转成可传输结构再发送
 4. node 侧调用用户函数前再还原回 `DataFrame / Series / ndarray`
 5. 大 `DataFrame / Series / ndarray` 会自动转 `DataRef`

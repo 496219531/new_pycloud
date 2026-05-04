@@ -11,7 +11,7 @@ from pycloud_parallel.controlplane.node.session_views import (
     build_task_pool_status_info,
     execute_warmup,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _utc_now() -> datetime:

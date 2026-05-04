@@ -1,8 +1,9 @@
 # PyCloud HTTP / JSON 契约（V1）
 
-> 当前实现里，`HTTP + JSON` 主要覆盖两部分：
+> 当前实现里，`HTTP + JSON` 覆盖三部分：
 > 1. `InfoCenter` 控制面
-> 2. `NodeControl` 暴露的服务 HTTP 数据面
+> 2. `Gateway` 服务入口
+> 3. `NodeControl` 管理面与节点服务数据面
 
 ## 1. InfoCenter HTTP API
 
@@ -257,28 +258,27 @@ Header 可选：
 ## 3. 当前协议定位
 
 1. InfoCenter：HTTP 为当前正式协议。
-2. NodeControl 管理面：gRPC 为当前正式协议。
-3. 服务调用：gRPC 和 HTTP 都可用。
+2. NodeControl 管理面：HTTP 为当前正式协议。
+3. 服务调用：Gateway / discovery 是路由方式，底层都走 HTTP。
 
-## 4. 不在 HTTP 中暴露的管理面
+## 4. NodeControl 管理面
 
-以下能力当前仍建议走 NodeControl gRPC：
+以下能力当前由 NodeControl HTTP 管理面提供：
 
 1. `CreateService`
 2. `ListServiceMethods`
 3. `HeartbeatService`
 4. `EndService`
-5. `GetServiceStatus`（虽然 HTTP 也能查服务状态，但管理面主入口仍是 gRPC）
+5. `GetServiceStatus`
 
 这也包括：
 
 1. 上传代码时的 `dependency_allowlist`
 2. 创建服务时的 `dependency_allowlist`
 
-它们当前只在 NodeControl gRPC 管理面里提供，不在 HTTP 数据面里开放。
+它们属于 NodeControl 管理面，不是外部 service gateway 数据面。
 
 ## 5. 参考文档
 
-1. `GRPC_CONTRACT_V1.md`
-2. `SERVICE_SESSION_PROTOCOL_V1.md`
-3. `ARCHITECTURE_V1.md`
+1. `SERVICE_SESSION_PROTOCOL_V1.md`
+2. `ARCHITECTURE_V1.md`

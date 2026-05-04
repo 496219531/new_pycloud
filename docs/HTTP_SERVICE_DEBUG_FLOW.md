@@ -91,11 +91,11 @@ HTTP 请求真正发出前，关键函数顺序是：
 
 大概率都在这一层就能看出来。
 
-## 4. 节点 gRPC 入口
+## 4. 节点 NodeControl HTTP 入口
 
-Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
+Gateway 选到 route 后，会打到 NodeControl 的 `CallService` HTTP 入口：
 
-1. `NodeControlService.CallService()`
+1. `NodeControlHttpApp` 的 service call handler
 
 这里做的事：
 
@@ -112,7 +112,7 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 这里非常适合判断：
 
 1. Gateway 有没有成功把请求送到节点
-2. gRPC 层有没有把 payload 反序列化成功
+2. NodeControl HTTP 层有没有把 payload 反序列化成功
 3. service token 是否正确
 
 ## 5. NodeState 内部调用
@@ -210,7 +210,7 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` RPC：
 
 1. caller 侧序列化
 2. Gateway 路由
-3. 节点 gRPC
+3. 节点 NodeControl HTTP
 4. 用户函数执行
 5. 返回值归一化
 

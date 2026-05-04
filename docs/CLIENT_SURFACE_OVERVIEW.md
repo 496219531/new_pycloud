@@ -70,7 +70,7 @@
    - codec 层表达对象本身
    - transport 层表达“这个对象怎么进当前容器”
 
-当前 protobuf/gRPC 主链已经有两条并行 transport 通道：
+当前 NodeControl/protobuf 主链已经有两条并行 transport 通道：
 
 1. 旧 `Struct` 通道
    - 继续兼容 `legacy_v1`

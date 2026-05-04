@@ -6,7 +6,7 @@ from pycloud_parallel.controlplane.scheduling_policy import (
     is_deploy_candidate,
     is_owner_target,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def test_scheduling_predicates_capture_unhealthy_drain_cordon_semantics():

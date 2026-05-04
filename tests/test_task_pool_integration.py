@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from concurrent import futures
 import time
 from typing import Tuple
 
-import grpc
 
 from pycloud_parallel import JobQueue, TaskPool
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -14,9 +12,8 @@ from pycloud_parallel.controlplane.server import (
     build_infocenter_server,
     build_job_orchestrator_server,
 )
-from pycloud_parallel.controlplane.services import NodeControlService
+from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 
 def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) -> bool:
@@ -28,7 +25,7 @@ def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) 
     return False
 
 
-def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Server, str, NodeControlState]:
+def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[NodeControlHttpServer, str, NodeControlState]:
     state = NodeControlState(
         node_id=node_id,
         queue_capacity=32,
@@ -40,11 +37,9 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Ser
         monitor_interval_sec=1,
         executor_poll_interval_sec=0.02,
     )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=24))
-    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
-    port = server.add_insecure_port("127.0.0.1:0")
+    server = NodeControlHttpServer(bind="127.0.0.1:0", state=state)
     server.start()
-    return server, f"127.0.0.1:{port}", state
+    return server, server.base_url, state
 
 
 def _register_node(info_target: str, *, node_id: str, control_addr: str, state: NodeControlState) -> None:
@@ -104,7 +99,7 @@ def test_native_task_pool_end_to_end(tmp_path):
             cancel_resp = pool.cancel_job(job_id="job-pool-e2e", reason="post-finish-cancel")
             assert cancel_resp.already_done >= 0
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         infocenter.stop()
 
@@ -173,7 +168,7 @@ def test_job_queue_uses_native_task_pool_end_to_end(tmp_path):
         finally:
             client.close()
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         job_orchestrator.stop()
         gateway.stop()

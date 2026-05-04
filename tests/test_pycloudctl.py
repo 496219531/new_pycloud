@@ -73,13 +73,13 @@ def test_ctl_parser_accepts_env_overrides_for_start_commands():
             "--env",
             "PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576",
             "--env",
-            "PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216",
+            "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216",
         ]
     )
     assert args.command == "start-controlplane"
     assert args.env == [
         "PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576",
-        "PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216",
+        "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216",
     ]
 
 

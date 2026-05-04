@@ -248,7 +248,7 @@
 1. allowed modes
 2. default mode
 3. inline payload/result limits
-4. 是否启用 protobuf/grpc bytes transport
+4. 是否启用 control bytes transport
 5. 是否启用 HTTP bytes transport
 5. 是否允许 `pickle_stable_v1`
 6. soft limit 以上是否强制转 `DataRef`
@@ -371,7 +371,7 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
 
 另外，carrier 的运行时选择也已经收口到 effective policy：
 
-1. gRPC/protobuf 请求是否走 `transport_payload`
+1. NodeControl/protobuf 请求是否走 `transport_payload`
 2. HTTP/service call 是否走 bytes body
 3. `CallService` 响应是否回 `transport_data`
 4. `TaskResult` 是否回 `transport_result`
@@ -415,10 +415,10 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
    - `pickle_stable_v1`
 2. transport 容器层
    - JSON / Struct
-   - gRPC bytes payload
+   - NodeControl bytes payload
    - object upload blob
 
-当前 gRPC/protobuf 主链已经是并行双通道：
+当前 NodeControl/protobuf 主链已经是并行双通道：
 
 1. 旧通道
    - `google.protobuf.Struct`

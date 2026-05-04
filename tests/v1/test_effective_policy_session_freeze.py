@@ -26,8 +26,8 @@ def test_service_session_computes_frozen_effective_policy():
         supported_modes=("legacy_v1", "structured_v1"),
         supports_transport_payload_bytes=True,
         supports_http_bytes_transport=True,
-        max_grpc_send_bytes=2 * 1024 * 1024,
-        max_grpc_recv_bytes=2 * 1024 * 1024,
+        max_control_send_bytes=2 * 1024 * 1024,
+        max_control_recv_bytes=2 * 1024 * 1024,
         max_http_body_bytes=2 * 1024 * 1024,
         max_upload_file_bytes=64 * 1024 * 1024,
         max_upload_total_bytes=128 * 1024 * 1024,
@@ -41,8 +41,8 @@ def test_service_session_computes_frozen_effective_policy():
     )
 
     assert service.effective_policy is not None
-    assert service.effective_policy.resolved_mode == "structured_v1"
-    assert service.serialization_mode == "structured_v1"
+    assert service.effective_policy.resolved_mode == "pickle_stable_v1"
+    assert service.serialization_mode == "pickle_stable_v1"
 
 
 def test_task_pool_session_computes_frozen_effective_policy():
@@ -50,8 +50,8 @@ def test_task_pool_session_computes_frozen_effective_policy():
         supported_modes=("legacy_v1",),
         supports_transport_payload_bytes=True,
         supports_http_bytes_transport=True,
-        max_grpc_send_bytes=1024 * 1024,
-        max_grpc_recv_bytes=1024 * 1024,
+        max_control_send_bytes=1024 * 1024,
+        max_control_recv_bytes=1024 * 1024,
         max_http_body_bytes=2 * 1024 * 1024,
         max_upload_file_bytes=64 * 1024 * 1024,
         max_upload_total_bytes=128 * 1024 * 1024,
@@ -63,5 +63,5 @@ def test_task_pool_session_computes_frozen_effective_policy():
         policy_id="trusted_internal",
     )
 
-    assert pool.effective_policy.resolved_mode == "structured_v1"
-    assert pool.serialization_mode == "structured_v1"
+    assert pool.effective_policy.resolved_mode == "pickle_stable_v1"
+    assert pool.serialization_mode == "pickle_stable_v1"

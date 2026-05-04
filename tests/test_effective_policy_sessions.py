@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from pycloud_parallel.api import JobQueue
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _route(*, policy_id: str = "trusted_internal") -> InfoCenterServiceRoute:

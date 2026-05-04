@@ -16,7 +16,7 @@ from pycloud_parallel.controlplane.artifact import Artifact as ControlplaneArtif
 from pycloud_parallel.controlplane.artifact import ArtifactDeps as ControlplaneArtifactDeps
 from pycloud_parallel.controlplane.artifact import ArtifactExports as ControlplaneArtifactExports
 from pycloud_parallel.data.ref import DataRef as ControlplaneDataRef
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def test_top_level_v1_surface_reexports_api_classes():

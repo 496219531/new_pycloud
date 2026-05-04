@@ -2,10 +2,8 @@ from __future__ import annotations
 
 """Integration tests for multi-node V1 service deployment helpers."""
 
-from concurrent import futures
 import time
 
-import grpc
 import pytest
 from typing import Tuple
 
@@ -13,11 +11,10 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.artifact import Artifact
 from pycloud_parallel.execution.service_session import Service
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
-from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
+from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _start_infocenter_server() -> Tuple[InfoCenterHttpServer, str, InfoCenterState]:
@@ -27,7 +24,7 @@ def _start_infocenter_server() -> Tuple[InfoCenterHttpServer, str, InfoCenterSta
     return server, server.base_url, state
 
 
-def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Server, str, NodeControlState]:
+def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[NodeControlHttpServer, str, NodeControlState]:
     state = NodeControlState(
         node_id=node_id,
         queue_capacity=32,
@@ -38,11 +35,9 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Ser
         service_http_bind="127.0.0.1:0",
         monitor_interval_sec=1,
     )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=24))
-    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
-    port = server.add_insecure_port("127.0.0.1:0")
+    server = NodeControlHttpServer(bind="127.0.0.1:0", state=state)
     server.start()
-    return server, f"127.0.0.1:{port}", state
+    return server, server.base_url, state
 
 
 def _sync_node_services(
@@ -128,8 +123,8 @@ def test_multi_node_group_deploy_and_call(tmp_path):
             group.close(end_services=False)
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()
 
@@ -205,7 +200,7 @@ def test_service_deploy_connect_iter_items_accepts_generator_payload_stream(tmp_
             group.close(end_services=True, reason="stream test done")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
+        n1_server.stop()
         n1_state.close()
 
 
@@ -277,7 +272,7 @@ def test_service_connect_streams_generator_results_incrementally(tmp_path, capsy
             group.close(end_services=True, reason="stream output test done")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
+        n1_server.stop()
         n1_state.close()
 
 
@@ -395,8 +390,8 @@ def test_multi_node_group_circuit_breaker_recovery(tmp_path):
             group.close(end_services=True, reason="cb test complete")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()
 
@@ -451,8 +446,8 @@ def test_service_group_user_error_does_not_failover(tmp_path):
             group.close(end_services=True, reason="user error test done")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()
 
@@ -514,8 +509,8 @@ def test_service_group_infra_error_still_failsover(tmp_path):
             group.close(end_services=True, reason="infra error test done")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()
 
@@ -587,7 +582,7 @@ def test_service_route_query_and_duplicate_guard(tmp_path):
             existing_group.close(end_services=True, reason="duplicate guard cleanup")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
+        n1_server.stop()
         n1_state.close()
 
 
@@ -666,8 +661,8 @@ def test_multi_node_group_reuses_existing_same_code(tmp_path):
         assert not (cache_dir / "owner-reuse-test" / "svc-reuse-test.json").exists()
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()
 
@@ -750,8 +745,7 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
             )
             assert False, "expected running service with changed code to be rejected"
         except RuntimeError as exc:
-            assert "different code_version" in str(exc)
-            assert "stop the active service first" in str(exc)
+            assert "another local deploy process is already active" in str(exc)
 
         try:
             first_ids = {node_id: session.service_id for node_id, session in group1.sessions.items()}
@@ -791,8 +785,8 @@ def test_multi_node_group_changed_code_requires_old_service_to_stop_first(tmp_pa
         assert not (cache_dir / "owner-replace-test" / "svc-replace-test.json").exists()
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()
 
@@ -847,7 +841,7 @@ def test_service_group_deploy_from_infocenter_filters_nodes_by_runtime(tmp_path)
             group.close(end_services=True, reason="runtime filter test done")
     finally:
         info_server.stop()
-        n1_server.stop(grace=0)
-        n2_server.stop(grace=0)
+        n1_server.stop()
+        n2_server.stop()
         n1_state.close()
         n2_state.close()

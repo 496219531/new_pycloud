@@ -6,7 +6,7 @@ from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClien
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.serialization import encode_transport_payload_bytes
 from pycloud_parallel.controlplane.serialization import dict_to_struct, struct_to_dict
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _start_http_node(tmp_path):

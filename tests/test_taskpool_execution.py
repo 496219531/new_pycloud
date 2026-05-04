@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from pycloud_parallel.controlplane.artifact import Artifact
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.serialization import dict_to_struct
 
 
@@ -378,7 +378,7 @@ def test_task_pool_from_infocenter_creates_node_pools_concurrently(monkeypatch) 
             )
 
     monkeypatch.setattr(task_pool_mod, "_infocenter_client", lambda *_args, **_kwargs: _FakeInfoCenter())
-    monkeypatch.setattr(task_pool_mod, "_node_control_client", lambda addr, **_kwargs: _FakeNodeClient(addr))
+    monkeypatch.setattr(task_pool_mod, "_new_node_control_client", lambda addr, **_kwargs: _FakeNodeClient(addr))
 
     session = TaskPool._from_infocenter(
         infocenter_target="127.0.0.1:50051",
@@ -400,7 +400,7 @@ def test_task_pool_from_infocenter_creates_node_pools_concurrently(monkeypatch) 
 def test_task_pool_update_globals_fans_out_to_nodes_concurrently(monkeypatch) -> None:
     from google.protobuf import struct_pb2
     from pycloud_parallel import TaskPool
-    from pycloud_parallel.execution import task_pool as task_pool_mod
+    from pycloud_parallel.execution import managed_globals as managed_globals_mod
 
     nodes = {
         "node-1": SimpleNamespace(node_id="node-1"),
@@ -418,7 +418,7 @@ def test_task_pool_update_globals_fans_out_to_nodes_concurrently(monkeypatch) ->
             encoded.append((dict(values), struct_pb2.Struct(), None))
         return encoded
 
-    monkeypatch.setattr(task_pool_mod, "_encode_managed_globals_batches", _fake_encode_batches)
+    monkeypatch.setattr(managed_globals_mod, "_encode_managed_globals_batches", _fake_encode_batches)
 
     class _FakeClient:
         def __init__(self, node_id: str):
@@ -927,7 +927,7 @@ def test_task_pool_from_infocenter_keeps_partial_create_success(monkeypatch) -> 
             )
 
     monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.task_pool._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
 
     session = TaskPool._from_infocenter(
         infocenter_target="127.0.0.1:50051",
@@ -1186,7 +1186,7 @@ def test_native_task_pool_session_update_globals_aggregates_digests() -> None:
         task_method="run",
         job_id="job-update-globals",
     )
-    with patch("pycloud_parallel.execution.task_pool._prepare_managed_globals_batches_for_upload", _fake_prepare):
+    with patch("pycloud_parallel.execution.managed_globals._prepare_managed_globals_batches_for_upload", _fake_prepare):
         digest = session.update_globals({"cfg": {"k": "v"}})
     assert digest == "sha256:same"
     assert session.globals_digests == {"node-a": "sha256:same", "node-b": "sha256:same"}

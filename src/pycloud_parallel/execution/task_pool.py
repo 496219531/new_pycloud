@@ -32,6 +32,10 @@ from pycloud_parallel.controlplane.effective_policy import (
     should_use_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode, _node_instance_key_from_node
+from pycloud_parallel.controlplane.node_control_transport import (
+    new_node_control_client as _new_node_control_client,
+    node_control_target_for_node as _node_control_target_for_node,
+)
 from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
@@ -51,6 +55,7 @@ from pycloud_parallel.execution.failover import (
     mark_candidate_failure,
     mark_candidate_success,
 )
+from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
 from pycloud_parallel.execution.scheduler import (
     SchedulerCandidate,
     SchedulerState,
@@ -58,10 +63,8 @@ from pycloud_parallel.execution.scheduler import (
     select_one_candidate,
 )
 from pycloud_parallel.execution.support import (
-    _encode_managed_globals_batches,
     _get_local_ip,
     _prepare_code_blob,
-    _prepare_managed_globals_batches_for_upload,
     _prepare_task_payload_for_submit,
     _put_data_via_clients,
     _resolve_public_target_arg,
@@ -152,25 +155,6 @@ def _infocenter_client(*args, **kwargs):
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
     return InfoCenterClient(*args, **kwargs)
-
-
-def _node_control_client(*args, **kwargs):
-    kwargs.pop("transport", None)
-    from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient
-
-    return HttpNodeControlClient(*args, **kwargs)
-
-
-def _node_control_target_for_node(node: InfoCenterNode) -> str:
-    capability = getattr(node, "capability", None)
-    node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    if node_http_base_url:
-        return node_http_base_url
-    return str(getattr(node, "control_addr", "") or "").strip()
-
-
-def _new_node_control_client(target: str, *, timeout_sec: float):
-    return _node_control_client(target, timeout_sec=timeout_sec)
 
 
 class _LocalTaskPoolNodeClient:
@@ -1412,70 +1396,46 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             raise RuntimeError("task pool session is closed")
         pools_snapshot = list(self._pools.items())
         active_clients = [pool._client for _node_id, pool in pools_snapshot]  # noqa: SLF001
-        prepare_kwargs: Dict[str, object] = {}
-        if str(self._serialization_mode or "").strip() and self._serialization_mode != "legacy_v1":
-            prepare_kwargs["serialization_mode"] = self._serialization_mode
-        prepared_batches, _ = _prepare_managed_globals_batches_for_upload(
-            active_clients,
-            values,
-            effective_policy=self.effective_policy,
-            context="taskpool_session",
-            **prepare_kwargs,
-        )
-        encoded_batches = _encode_managed_globals_batches(
-            prepared_batches,
+
+        def _update_batch(
+            _node_id: str,
+            pool: NativeTaskPoolClient,
+            prepared_values: Dict[str, object],
+            values_struct: object,
+            transport_values: Optional[pb2.TransportPayload],
+        ) -> object:
+            update_encoded = getattr(pool._client, "update_runtime_globals_encoded", None)  # noqa: SLF001
+            if callable(update_encoded):
+                return update_encoded(
+                    client_id=pool.pool_id,
+                    code_version=pool.code_version,
+                    runtime_key=pool.pool_id,
+                    code_token=pool.pool_token,
+                    prepared_keys=sorted(str(key) for key in prepared_values.keys()),
+                    values=values_struct,
+                    transport_values=transport_values,
+                )
+            return pool._client.update_runtime_globals_prepared(  # noqa: SLF001
+                client_id=pool.pool_id,
+                code_version=pool.code_version,
+                runtime_key=pool.pool_id,
+                code_token=pool.pool_token,
+                prepared_values=prepared_values,
+                serialization_mode=self._serialization_mode,
+                effective_policy=self.effective_policy,
+            )
+
+        digests, failed_nodes = update_managed_globals_across_replicas(
+            upload_clients=active_clients,
+            values=values,
+            targets=pools_snapshot,
             serialization_mode=self._serialization_mode,
             effective_policy=self.effective_policy,
             context="taskpool_session",
+            thread_name_prefix="taskpool-update-globals",
+            update_batch=_update_batch,
+            include_empty_digest=False,
         )
-        digests: Dict[str, str] = {}
-        failed_nodes: Dict[str, str] = {}
-
-        def _update_node_globals(node_id: str, pool: NativeTaskPoolClient) -> Tuple[str, str, str]:
-            try:
-                resp = None
-                for prepared_values, values_struct, transport_values in encoded_batches:
-                    update_encoded = getattr(pool._client, "update_runtime_globals_encoded", None)  # noqa: SLF001
-                    if callable(update_encoded):
-                        resp = update_encoded(
-                            client_id=pool.pool_id,
-                            code_version=pool.code_version,
-                            runtime_key=pool.pool_id,
-                            code_token=pool.pool_token,
-                            prepared_keys=sorted(str(key) for key in prepared_values.keys()),
-                            values=values_struct,
-                            transport_values=transport_values,
-                        )
-                    else:
-                        resp = pool._client.update_runtime_globals_prepared(  # noqa: SLF001
-                            client_id=pool.pool_id,
-                            code_version=pool.code_version,
-                            runtime_key=pool.pool_id,
-                            code_token=pool.pool_token,
-                            prepared_values=prepared_values,
-                            serialization_mode=self._serialization_mode,
-                            effective_policy=self.effective_policy,
-                        )
-                return (
-                    node_id,
-                    str(getattr(resp, "globals_digest", "") or ""),
-                    "",
-                )
-            except Exception as exc:
-                return node_id, "", repr(exc)
-
-        if len(pools_snapshot) == 1:
-            update_results = [_update_node_globals(pools_snapshot[0][0], pools_snapshot[0][1])]
-        else:
-            with ThreadPoolExecutor(max_workers=max(1, len(pools_snapshot)), thread_name_prefix="taskpool-update-globals") as executor:
-                futures = [executor.submit(_update_node_globals, node_id, pool) for node_id, pool in pools_snapshot]
-                update_results = [future.result() for future in futures]
-
-        for node_id, digest, error_text in update_results:
-            if error_text:
-                failed_nodes[node_id] = error_text
-            elif digest:
-                digests[node_id] = digest
 
         if not digests:
             raise RuntimeError(f"update_globals failed on all nodes: {failed_nodes}")

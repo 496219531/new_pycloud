@@ -48,12 +48,12 @@ def main():
     print("若需常驻，可手动调用 group.join(...); 此 demo 默认执行后自动收尾。")
 
     try:
-        group.close(end_services=True, reason="grpc_register_service_client_demo cleanup")
+        group.close(end_services=True, reason="register_service_client_demo cleanup")
         joined = True
     finally:
         group.close(
             end_services=not joined,
-            reason="grpc_register_service_client_demo cleanup",
+            reason="register_service_client_demo cleanup",
         )
 
 if __name__ == "__main__":

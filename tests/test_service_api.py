@@ -88,7 +88,7 @@ def test_service_route_summary_reports_fixed_routes():
 
 
 def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     node_1 = SimpleNamespace(
         node_id="node-1",
@@ -148,7 +148,7 @@ def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):
             return None
 
     monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.service_session._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
 
     group = Service(
         owner_client_id="owner-1",
@@ -195,7 +195,7 @@ def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):
 
 
 def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatch):
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     node_1 = SimpleNamespace(
         node_id="node-1",
@@ -255,7 +255,7 @@ def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatc
             return None
 
     monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.service_session._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
 
     group = Service(
         owner_client_id="owner-1",
@@ -305,7 +305,7 @@ def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatc
 
 
 def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeypatch):
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     old_node = SimpleNamespace(
         node_id="node-1",
@@ -365,7 +365,7 @@ def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeyp
             return None
 
     monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.service_session._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
 
     group = Service(
         owner_client_id="owner-1",
@@ -468,7 +468,7 @@ def test_service_compensation_rejects_requested_cordon_or_drain_nodes(monkeypatc
             return None
 
     monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.service_session._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
 
     group = Service(
         owner_client_id="owner-1",
@@ -506,7 +506,7 @@ def test_service_compensation_rejects_requested_cordon_or_drain_nodes(monkeypatc
 
 def test_service_deploy_from_infocenter_creates_node_services_concurrently(tmp_path):
     from pycloud_parallel.execution.service_session import Service
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     nodes = [
         SimpleNamespace(
@@ -623,8 +623,10 @@ def test_service_update_globals_fans_out_to_nodes_concurrently(monkeypatch):
         def update_globals_prepared(self, *_args, **_kwargs):
             raise AssertionError("service update should use pre-encoded globals")
 
+    from pycloud_parallel.execution import managed_globals as managed_globals_mod
+
     monkeypatch.setattr(
-        service_session_mod,
+        managed_globals_mod,
         "_prepare_managed_globals_batches_for_upload",
         lambda _clients, values, **_kwargs: ([dict(values)], {
             "globals_batch_count": 1,
@@ -641,7 +643,7 @@ def test_service_update_globals_fans_out_to_nodes_concurrently(monkeypatch):
             encoded.append((dict(value), {"encoded": dict(value)}, None))
         return encoded
 
-    monkeypatch.setattr(service_session_mod, "_encode_managed_globals_batches", _fake_encode_batches)
+    monkeypatch.setattr(managed_globals_mod, "_encode_managed_globals_batches", _fake_encode_batches)
 
     group = Service(
         owner_client_id="owner-demo",
@@ -718,7 +720,7 @@ def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch
 
         from pycloud_parallel.controlplane.state_time import utc_now
         from datetime import timedelta
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         session.lease_expire_at = utc_now() - timedelta(seconds=1)
         node._handle_service_timeouts()  # noqa: SLF001
@@ -1381,7 +1383,7 @@ def test_service_startup_installs_process_interrupt_shutdown(tmp_path, monkeypat
 
 
 def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path, monkeypatch):
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     module_path = tmp_path / "startup_same_endpoint_service.py"
     module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
@@ -1447,7 +1449,7 @@ def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path
 
 
 def test_service_startup_different_endpoint_fails_before_bind(tmp_path, monkeypatch):
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     module_path = tmp_path / "startup_other_endpoint_service.py"
     module_path.write_text("def ping():\n    return {'ok': True}\n", encoding="utf-8")
@@ -2312,7 +2314,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_emits_success_message(self, tmp_path, capsys):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         fake_node = SimpleNamespace(
             node_id="node-1",
@@ -2378,7 +2380,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_filters_nodes_that_do_not_accept_service_deploy(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         deploy_node = SimpleNamespace(
             node_id="node-1",
@@ -2460,7 +2462,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_auto_keeps_duplicate_node_ids_by_instance(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         nodes = [
             SimpleNamespace(
@@ -2546,7 +2548,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_retries_briefly_until_nodes_register(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         fake_node = SimpleNamespace(
             node_id="node-1",
@@ -2634,7 +2636,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_packages_module_object_entry_module(self, tmp_path, monkeypatch):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module(tmp_path, monkeypatch)
         fake_node = SimpleNamespace(
@@ -2709,7 +2711,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_includes_only_explicit_resource_paths(self, tmp_path, monkeypatch):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module_with_resource(tmp_path, monkeypatch)
         fake_node = SimpleNamespace(
@@ -2779,7 +2781,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_packages_callable_object_entry_callable(self, tmp_path, monkeypatch):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         worker_module = _build_service_entry_module(tmp_path, monkeypatch)
         fake_node = SimpleNamespace(
@@ -2893,7 +2895,7 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            "pycloud_parallel.execution.managed_globals._prepare_managed_globals_batches_for_upload",
             return_value=(
                 [{"cfg": {"k": "v"}}],
                 {
@@ -2943,7 +2945,7 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            "pycloud_parallel.execution.managed_globals._prepare_managed_globals_batches_for_upload",
             return_value=(
                 [{"cfg": {"k": "v"}}],
                 {
@@ -2982,7 +2984,7 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            "pycloud_parallel.execution.managed_globals._prepare_managed_globals_batches_for_upload",
             return_value=(
                 [{"cfg": {"k": "v"}}],
                 {
@@ -3014,7 +3016,7 @@ class TestOwnerServiceFacade:
         )
 
         with patch(
-            "pycloud_parallel.execution.service_session._prepare_managed_globals_batches_for_upload",
+            "pycloud_parallel.execution.managed_globals._prepare_managed_globals_batches_for_upload",
             return_value=(
                 [{"cfg": {"k": "v"}}],
                 {
@@ -3031,7 +3033,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_clamps_worker_count_per_node_capacity(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         node_a = SimpleNamespace(
             node_id="node-a",
@@ -3116,7 +3118,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_ignores_inspected_stopped_routes(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         fake_node = SimpleNamespace(
             node_id="node-1",
@@ -3181,6 +3183,9 @@ class TestOwnerServiceFacade:
         ), patch(
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
+        ), patch(
+            "pycloud_parallel.execution.service_session._new_node_control_client",
+            _FakeNodeControlClient,
         ), patch.object(
             Service,
             "_start_keepalive",
@@ -3206,7 +3211,7 @@ class TestOwnerServiceFacade:
     def test_deploy_from_infocenter_redeploys_when_reuse_heartbeat_hits_stopped_service(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.execution.support import _artifact_code_version
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
         effective_code_version = _artifact_code_version(
@@ -3285,6 +3290,12 @@ class TestOwnerServiceFacade:
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
         ), patch(
+            "pycloud_parallel.execution.service_session._node_control_client",
+            _FakeNodeControlClient,
+        ), patch(
+            "pycloud_parallel.execution.service_session._new_node_control_client",
+            _FakeNodeControlClient,
+        ), patch(
             "pycloud_parallel.execution.service_session._load_service_session_cache",
             return_value={
                 "artifact_code_version": effective_code_version,
@@ -3322,7 +3333,7 @@ class TestOwnerServiceFacade:
 
     def test_deploy_from_infocenter_replaces_different_code_using_cached_token(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         fake_node = SimpleNamespace(
             node_id="node-1",
@@ -3391,6 +3402,9 @@ class TestOwnerServiceFacade:
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
         ), patch(
+            "pycloud_parallel.execution.service_session._new_node_control_client",
+            _FakeNodeControlClient,
+        ), patch(
             "pycloud_parallel.execution.service_session._load_service_session_cache",
             return_value={
                 "artifact_code_version": "sha256:old-code",
@@ -3430,7 +3444,7 @@ class TestOwnerServiceFacade:
 
     def test_inspect_existing_routes_rejects_startup_http_only_route(self):
         from pycloud_parallel.execution.service_session import Service
-        from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
         route = SimpleNamespace(
             service_name="calc_asset_ratio",

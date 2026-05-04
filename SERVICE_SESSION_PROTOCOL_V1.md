@@ -29,7 +29,7 @@
 
 ## 3. 协议拆分
 
-### 3.1 NodeControl gRPC
+### 3.1 NodeControl HTTP
 
 负责：
 
@@ -225,7 +225,7 @@ Python 客户端当前会在本地缓存：
 2. 把 `service_token` 落本地
 3. `ListServiceMethods`
 4. 开启 keepalive
-5. 通过 HTTP 或 gRPC 调方法
+5. 通过 Gateway 或 discovery 路由调用方法
 6. 完成后 `EndService`
 
 如果创建时收到类似：

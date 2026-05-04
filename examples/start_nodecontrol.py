@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Start a single PyCloud NodeControl node")
-    parser.add_argument("--bind", default=DEFAULT_CONFIG["bind"], help="gRPC bind address")
+    parser.add_argument("--bind", default=DEFAULT_CONFIG["bind"], help="NodeControl HTTP bind address")
     parser.add_argument("--node-id", default=DEFAULT_CONFIG["node_id"], help="logical node id")
     parser.add_argument("--infocenter-addr", default=DEFAULT_CONFIG["infocenter_addr"], help="InfoCenter address")
     parser.add_argument("--advertise-addr", default=DEFAULT_CONFIG["advertise_addr"], help="address advertised to InfoCenter")
@@ -128,7 +128,7 @@ def main() -> None:
         if registrar is not None:
             registrar.close()
         state.close()
-        server.stop(grace=3)
+        server.stop()
 
     for sig_name in ("SIGINT", "SIGTERM"):
         sig = getattr(signal, sig_name, None)

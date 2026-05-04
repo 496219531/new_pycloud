@@ -108,7 +108,7 @@ def test_task_pool_defaults_to_trusted_internal_binding():
     try:
         assert session.effective_policy is not None
         assert session.effective_policy.policy_id == "trusted_internal"
-        assert session.serialization_mode == "structured_v1"
+        assert session.serialization_mode == "pickle_stable_v1"
     finally:
         session.close()
 
@@ -143,7 +143,7 @@ def test_service_defaults_to_trusted_internal_binding():
     )
     assert service.effective_policy is not None
     assert service.effective_policy.policy_id == "trusted_internal"
-    assert service.serialization_mode == "structured_v1"
+    assert service.serialization_mode == "pickle_stable_v1"
 
 
 def test_gateway_public_rejects_pickle_even_when_trusted(monkeypatch):

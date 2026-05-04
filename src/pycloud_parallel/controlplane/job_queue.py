@@ -1055,7 +1055,6 @@ class JobQueueManager:
         entry_module: str,
         task_entry_callable: str,
         task_resource_paths: Sequence[str],
-        module: Any,
         effective_managed_global_names: Sequence[str],
     ) -> _JobTaskPoolSpec:
         artifact_key = self._shared_pool_artifact_key(
@@ -1094,8 +1093,10 @@ class JobQueueManager:
             if task_resource_paths:
                 task_pool_kwargs["resource_paths"] = list(task_resource_paths)
             task_pool_kwargs.update(
-                source=module,
+                source=blob,
+                entry_module=entry_module,
                 entry_callable=task_entry_callable,
+                package_format=package_format,
             )
             return _create_job_task_pool(**task_pool_kwargs)
 
@@ -1728,7 +1729,6 @@ class JobQueueManager:
                 entry_module=entry_module,
                 task_entry_callable=task_entry_callable,
                 task_resource_paths=task_resource_paths,
-                module=module,
                 effective_managed_global_names=effective_managed_global_names,
             )
             executor = self._prepare_shared_pool_for_job(

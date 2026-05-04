@@ -17,7 +17,7 @@ from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, n
 from pycloud_parallel.controlplane.server import build_job_orchestrator_server
 from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) -> bool:

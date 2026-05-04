@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import grpc
 import numpy as np
 
-from pycloud_parallel.controlplane.config import reload_config
+from pycloud_parallel.controlplane.config import get_payload_policy, reload_config
 from pycloud_parallel.controlplane.node.models import TaskState
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane import services as services_mod
@@ -16,11 +15,13 @@ from pycloud_parallel.controlplane.serialization import (
     encode_transport_payload_bytes,
     is_inline_transport_carrier,
     serialize_inline_payload,
+    struct_to_python,
     transport_payload_to_inline_carrier,
 )
+from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.execution.task_pool import TaskPool
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 class _FakeContext:
@@ -66,13 +67,16 @@ def test_node_control_service_close_task_pool_triggers_sync_callback():
 def test_node_control_client_call_service_uses_transport_payload_for_pickle():
     client = NodeControlClient.__new__(NodeControlClient)
     client.timeout_sec = 5.0
+    client.base_url = "http://node-control.test"
     captured = {}
 
-    def _fake_call_service(request, timeout):  # noqa: ARG001
-        captured["request"] = request
-        return pb2.CallServiceResponse(ok=True, service_id="svc-1", method="run")
+    def _fake_json(method, path, payload, *, timeout_sec=None):  # noqa: ARG001
+        captured["method"] = method
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"ok": True, "data": {"value": 7}}
 
-    client.stub = SimpleNamespace(CallService=_fake_call_service)
+    client._json = _fake_json
 
     resp = NodeControlClient.call_service(
         client,
@@ -82,24 +86,32 @@ def test_node_control_client_call_service_uses_transport_payload_for_pickle():
         serialization_mode="pickle_stable_v1",
     )
 
-    request = captured["request"]
     assert resp.ok is True
-    assert request.HasField("transport_payload")
-    assert request.transport_payload.codec == "pickle_stable_v1"
-    assert bytes(request.transport_payload.payload)
-    assert not request.payload.fields
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/services/svc-1/call/run"
+    assert captured["payload"]["serialization_mode"] == "pickle_stable_v1"
+    assert decode_payload_from_transport(
+        captured["payload"]["payload"],
+        policy=get_payload_policy("http_call"),
+        mode="pickle_stable_v1",
+        context="service call payload",
+    )["array"].tolist() == [1, 2, 3]
 
 
 def test_node_control_client_update_runtime_globals_uses_transport_values_for_pickle():
     client = NodeControlClient.__new__(NodeControlClient)
     client.timeout_sec = 5.0
+    client.base_url = "http://node-control.test"
     captured = {}
 
-    def _fake_update(request, timeout):  # noqa: ARG001
-        captured["request"] = request
-        return pb2.UpdateRuntimeGlobalsResponse(ok=True, code_version="cv", runtime_key="rk")
+    def _fake_binary_json(method, path, meta, chunks, *, timeout_sec=None):  # noqa: ARG001
+        captured["method"] = method
+        captured["path"] = path
+        captured["meta"] = dict(meta)
+        captured["chunks"] = list(chunks)
+        return {"ok": True, "code_version": "cv", "runtime_key": "rk"}
 
-    client.stub = SimpleNamespace(UpdateRuntimeGlobals=_fake_update)
+    client._binary_json = _fake_binary_json
 
     resp = NodeControlClient.update_runtime_globals_prepared(
         client,
@@ -111,11 +123,11 @@ def test_node_control_client_update_runtime_globals_uses_transport_values_for_pi
         serialization_mode="pickle_stable_v1",
     )
 
-    request = captured["request"]
     assert resp.ok is True
-    assert request.HasField("transport_values")
-    assert request.transport_values.codec == "pickle_stable_v1"
-    assert not request.values.fields
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/runtime-globals-bytes"
+    assert captured["meta"]["transport_values"]["codec"] == "pickle_stable_v1"
+    assert captured["chunks"]
 
 
 def test_update_runtime_globals_auth_runs_before_decode(monkeypatch):
@@ -143,7 +155,7 @@ def test_update_runtime_globals_auth_runs_before_decode(monkeypatch):
     response = service.UpdateRuntimeGlobals(request, context)
 
     assert response.ok is False
-    assert context.code == grpc.StatusCode.PERMISSION_DENIED
+    assert context.code == "PERMISSION_DENIED"
     assert "code_token mismatch" in context.details
 
 
@@ -171,7 +183,7 @@ def test_update_service_globals_auth_runs_before_decode(monkeypatch):
     response = service.UpdateServiceGlobals(request, context)
 
     assert response.ok is False
-    assert context.code == grpc.StatusCode.PERMISSION_DENIED
+    assert context.code == "PERMISSION_DENIED"
     assert "service_token mismatch" in context.details
 
 
@@ -337,7 +349,12 @@ def test_service_pickle_struct_request_keeps_struct_response_lane():
     assert captured["serialization_mode"] == "pickle_stable_v1"
     assert response.ok is True
     assert not response.HasField("transport_data")
-    assert client.fetch_service_result_data(response) == {"value": 7}
+    assert decode_payload_from_transport(
+        struct_to_python(response.data),
+        policy=get_payload_policy("result"),
+        mode="pickle_stable_v1",
+        context="service_result",
+    ) == {"value": 7}
 
 
 def test_task_result_can_follow_struct_lane_even_for_pickle_mode():

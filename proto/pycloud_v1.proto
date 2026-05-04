@@ -81,8 +81,8 @@ message NodeCapabilityInfo {
   repeated string supported_modes = 1;
   bool supports_transport_payload_bytes = 2;
   bool supports_http_bytes_transport = 3;
-  int64 max_grpc_send_bytes = 4;
-  int64 max_grpc_recv_bytes = 5;
+  int64 max_control_send_bytes = 4;
+  int64 max_control_recv_bytes = 5;
   int64 max_http_body_bytes = 6;
   int64 max_upload_file_bytes = 7;
   int64 max_upload_total_bytes = 8;

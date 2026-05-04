@@ -20,7 +20,7 @@
 ### 2.1 控制面拆分
 
 1. `ControlPlane = HTTP + JSON`
-2. `NodeControl = gRPC`
+2. `NodeControl = HTTP`
 3. 节点内部服务数据面 = HTTP
 
 ### 2.2 执行入口收敛
@@ -83,7 +83,7 @@
 ### 3.1 上传
 
 1. 目录或文件列表打包为 `tar.gz` / `zip`
-2. gRPC 流式上传到 NodeControl
+2. HTTP 上传到 NodeControl
 3. NodeControl 边收边写临时文件
 4. 校验 `sha256`
 5. 落地为 `code_version=sha256:<digest>`
@@ -108,7 +108,7 @@ owner 推荐用法：
 1. 默认推荐路径：调用方直接走 `ControlPlane Gateway` 的 `POST /svc/{service_name}/call/{method}`
 2. Gateway 内部按 `service_name` 选 route，并转发到对应 `NodeControl`
 3. `service_id` 主要用于实例级管理，不是业务侧主发现名
-4. gRPC `CallService` 只作为内部低层入口
+4. NodeControl HTTP `CallService` 只作为内部低层入口
 
 如果不想经过 Gateway，也支持客户端自己做发现和选路：
 

@@ -244,10 +244,7 @@ def _wait_until_stopped(
             return
         stop_called = True
         on_stop()
-        try:
-            server.stop(grace=3)
-        except TypeError:
-            server.stop()
+        server.stop()
 
     # Windows compatibility: not every signal is always available.
     for sig_name in ("SIGINT", "SIGTERM"):

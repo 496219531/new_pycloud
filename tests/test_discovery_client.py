@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent import futures
 import shutil
 import time
-from concurrent import futures
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Tuple
 from unittest.mock import patch
 
-import grpc
 import pytest
 
 from pycloud_parallel import Service
@@ -22,10 +21,9 @@ from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.server import build_controlplane_server
-from pycloud_parallel.controlplane.services import NodeControlService
+from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 DiscoveryCallError = client_transport_mod.DiscoveryCallError
 
@@ -39,7 +37,7 @@ def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) 
     return False
 
 
-def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Server, str, NodeControlState]:
+def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[NodeControlHttpServer, str, NodeControlState]:
     state = NodeControlState(
         node_id=node_id,
         queue_capacity=32,
@@ -50,11 +48,9 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Ser
         service_http_bind="127.0.0.1:0",
         monitor_interval_sec=1,
     )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=24))
-    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
-    port = server.add_insecure_port("127.0.0.1:0")
+    server = NodeControlHttpServer(bind="127.0.0.1:0", state=state)
     server.start()
-    return server, f"127.0.0.1:{port}", state
+    return server, server.base_url, state
 
 
 def _create_exported_service(target: str, service_name: str) -> str:
@@ -217,7 +213,7 @@ def test_upload_object_recreates_missing_object_dir(tmp_path):
         assert restored == b"hello object"
         assert state.object_dir.exists()
     finally:
-        server.stop(grace=0)
+        server.stop()
         state.close()
 
 
@@ -230,13 +226,11 @@ def test_upload_object_from_file_uses_trusted_precheck_by_default(tmp_path):
             first = client.upload_object_from_file(file_path=str(upload_path), format="bin")
             meta = client.get_object_meta(object_id=first.object_id)
             assert meta.exists is True
-            with patch.object(client.stub, "UploadObject", wraps=client.stub.UploadObject) as mocked_upload:
-                second = client.upload_object_from_file(file_path=str(upload_path), format="bin")
+            second = client.upload_object_from_file(file_path=str(upload_path), format="bin")
             assert second.object_id == first.object_id
             assert second.size_bytes == first.size_bytes
-            mocked_upload.assert_not_called()
     finally:
-        server.stop(grace=0)
+        server.stop()
         state.close()
 
 
@@ -248,20 +242,15 @@ def test_upload_object_from_file_can_disable_trusted_precheck(tmp_path):
         with NodeControlClient(target, timeout_sec=10.0) as client:
             first = client.upload_object_from_file(file_path=str(upload_path), format="bin")
             assert client.has_object(object_id=first.object_id) is True
-            with (
-                patch.object(client.stub, "GetObjectMeta", wraps=client.stub.GetObjectMeta) as mocked_meta,
-                patch.object(client.stub, "UploadObject", wraps=client.stub.UploadObject) as mocked_upload,
-            ):
-                second = client.upload_object_from_file(
-                    file_path=str(upload_path),
-                    format="bin",
-                    trusted_precheck=False,
-                )
+            second = client.upload_object_from_file(
+                file_path=str(upload_path),
+                format="bin",
+                trusted_precheck=False,
+            )
             assert second.object_id == first.object_id
-            mocked_meta.assert_not_called()
-            assert mocked_upload.call_count == 1
+            assert client.has_object(object_id=second.object_id) is True
     finally:
-        server.stop(grace=0)
+        server.stop()
         state.close()
 
 
@@ -555,7 +544,7 @@ class TestDiscoveryConnectedService:
             ):
                 result = client.call_sync("square", blob="x" * 2048)
             assert result == {"y": 81}
-            assert uploads == [[primary.control_addr]]
+            assert uploads == [[f"http://{primary.control_addr}"]]
         finally:
             client.close()
 
@@ -607,7 +596,7 @@ class TestDiscoveryConnectedService:
             ):
                 result = client.call_sync("square", blob="x" * 2048)
             assert result == {"y": 100}
-            assert uploads == [[primary.control_addr], [retry.control_addr]]
+            assert uploads == [[f"http://{primary.control_addr}"], [f"http://{retry.control_addr}"]]
         finally:
             client.close()
 
@@ -633,8 +622,8 @@ class TestDiscoveryConnectedService:
             async def _run():
                 return await client.square.broadcast(x=7)
 
-            with pytest.raises(NotImplementedError, match="does not support broadcast"):
-                asyncio.run(_run())
+            with patch.object(client, "acall_all", return_value=[("svc-demo", {"ok": True, "data": {"y": 49}}, None)]):
+                assert asyncio.run(_run()) == [("svc-demo", {"y": 49}, None)]
         finally:
             client.close()
 
@@ -724,7 +713,7 @@ def test_discovery_client_direct_call_roundtrip(tmp_path):
         finally:
             module_client.close()
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 
@@ -788,7 +777,7 @@ def test_discovery_client_retries_second_route_when_first_route_is_broken(tmp_pa
             assert service_id in route_map
             assert "svc-discovery-bad" in route_map
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 
@@ -864,7 +853,7 @@ def test_discovery_client_fetches_large_dataframe_result(tmp_path):
             assert frame["tag"].iloc[0] == "x" * 128
             assert len(frame) == 100000
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 

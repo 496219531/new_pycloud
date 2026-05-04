@@ -167,7 +167,7 @@ V1 公开概念固定为：
    - `src/pycloud_parallel/controlplane/policy_profile.py`
    - `src/pycloud_parallel/controlplane/config.py`（涉及运行时 env 默认值时）
    - 对应文档（本文件 + `ARCHITECTURE_OVERVIEW.md` + `CLIENT_SURFACE_OVERVIEW.md`）
-   - `docs/RUNTIME_LIMITS.md`（涉及 payload / DataRef / gRPC limit 时）
+   - `docs/RUNTIME_LIMITS.md`（涉及 payload / DataRef / control message limit 时）
    - 对应测试
 
 ## 9. 近期精简路线

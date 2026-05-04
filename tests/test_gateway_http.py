@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent import futures
+import base64
 from dataclasses import replace
 from datetime import datetime, timezone
 from email.message import Message
@@ -12,7 +12,6 @@ from typing import Tuple
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import grpc
 import pytest
 
 from pycloud_parallel.controlplane.client_transport import (
@@ -36,10 +35,9 @@ from pycloud_parallel.controlplane.server import (
     build_infocenter_server,
     build_job_orchestrator_server,
 )
-from pycloud_parallel.controlplane.services import NodeControlService
+from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _http_json(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]:
@@ -63,7 +61,7 @@ def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) 
     return False
 
 
-def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Server, str, NodeControlState]:
+def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[NodeControlHttpServer, str, NodeControlState]:
     state = NodeControlState(
         node_id=node_id,
         queue_capacity=32,
@@ -74,11 +72,9 @@ def _start_nodecontrol_server(node_id: str, artifact_dir: str) -> Tuple[grpc.Ser
         service_http_bind="127.0.0.1:0",
         monitor_interval_sec=1,
     )
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=24))
-    pb2_grpc.add_NodeControlServiceServicer_to_server(NodeControlService(state), server)
-    port = server.add_insecure_port("127.0.0.1:0")
+    server = NodeControlHttpServer(bind="127.0.0.1:0", state=state)
     server.start()
-    return server, f"127.0.0.1:{port}", state
+    return server, server.base_url, state
 
 
 def _gateway_route_variant(index: int, *, service_name: str = "svc-gateway-retry") -> InfoCenterServiceRoute:
@@ -491,7 +487,7 @@ def test_controlplane_embeds_gateway_for_service_calls(tmp_path):
             assert module_client.call(service_name="svc_gateway_controlplane", method="add", payload={"value": 10}, timeout_sec=5.0)["data"] == {"value": 10, "plus_one": 11}
             assert module_client.call(service_name="svc_gateway_controlplane", method="mul", payload={"value": 8}, timeout_sec=5.0)["data"] == {"value": 8, "square": 64}
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 
@@ -542,7 +538,7 @@ def test_controlplane_embeds_gateway_for_upload_call(tmp_path, monkeypatch):
         requests_dir = stage_dir / "requests"
         assert not requests_dir.exists() or not any(requests_dir.iterdir())
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 
@@ -595,7 +591,7 @@ def test_standalone_gateway_upload_call_supports_file_map(tmp_path, monkeypatch)
         requests_dir = stage_dir / "requests"
         assert not requests_dir.exists() or not any(requests_dir.iterdir())
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         gateway.stop()
         infocenter.stop()
@@ -1309,7 +1305,7 @@ def test_standalone_gateway_reads_routes_from_infocenter(tmp_path):
         assert sorted(item["method"] for item in methods_resp["methods"]) == ["add", "mul"]
         assert methods_resp["service_id"] == service_id
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         gateway.stop()
         infocenter.stop()
@@ -1387,7 +1383,7 @@ def test_gateway_service_client_fetches_large_dataframe_result(tmp_path):
 
         assert service_id
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 
@@ -1456,7 +1452,7 @@ def test_gateway_retries_second_route_when_first_route_is_broken(tmp_path):
         assert service_id in route_map
         assert "svc-bad-route" in route_map
     finally:
-        node_server.stop(grace=0)
+        node_server.stop()
         node_state.close()
         controlplane.stop()
 
@@ -1494,15 +1490,29 @@ def test_gateway_supports_http_only_job_orchestrator_service():
             assert sorted(item["method"] for item in methods) == ["cancel_job", "get_job_status", "reorder_job", "submit_job"]
 
         with GatewayServiceClient(gateway.base_url, timeout_sec=5.0, service_token="job-owner-token") as owner_client:
+            hook_blob = (
+                b"def run(value=0, **_kwargs):\n"
+                b"    return {'value': int(value)}\n\n"
+                b"def task_generator(value=0, **_kwargs):\n"
+                b"    return [{'value': value}]\n"
+            )
+
+            def _hook_payload(value: int) -> dict:
+                return {
+                    "client_id": "gw-job-test",
+                    "job_mode": "hooks",
+                    "blob_b64": base64.b64encode(hook_blob).decode("utf-8"),
+                    "entry_module": "gateway_job_demo",
+                    "entry_callable": "run",
+                    "package_format": "py",
+                    "task_generator_callable": "task_generator",
+                    "job_payload": {"value": value},
+                }
+
             submit = owner_client.call(
                 service_name="job-orchestrator",
                 method="submit_job",
-                payload={
-                    "client_id": "gw-job-test",
-                    "subtasks": [{"value": 1}],
-                    "entry_module": "task_demo",
-                    "code_version": "sha256:test",
-                },
+                payload=_hook_payload(1),
                 timeout_sec=5.0,
             )
             assert submit["ok"] is True
@@ -1511,24 +1521,14 @@ def test_gateway_supports_http_only_job_orchestrator_service():
             second = owner_client.call(
                 service_name="job-orchestrator",
                 method="submit_job",
-                payload={
-                    "client_id": "gw-job-test",
-                    "subtasks": [{"value": 2}],
-                    "entry_module": "task_demo",
-                    "code_version": "sha256:test",
-                },
+                payload=_hook_payload(2),
                 timeout_sec=5.0,
             )
             second_job_id = str(second["job"]["job_id"])
             third = owner_client.call(
                 service_name="job-orchestrator",
                 method="submit_job",
-                payload={
-                    "client_id": "gw-job-test",
-                    "subtasks": [{"value": 3}],
-                    "entry_module": "task_demo",
-                    "code_version": "sha256:test",
-                },
+                payload=_hook_payload(3),
                 timeout_sec=5.0,
             )
             third_job_id = str(third["job"]["job_id"])

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _utc_now():
@@ -123,10 +123,10 @@ def test_service_session_client_identity_and_snapshot() -> None:
 def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() -> None:
     from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 
-    grpc_client = MagicMock()
-    grpc_client.update_runtime_globals_prepared.return_value = SimpleNamespace(globals_digest="sha256:digest")
+    control_client = MagicMock()
+    control_client.update_runtime_globals_prepared.return_value = SimpleNamespace(globals_digest="sha256:digest")
     pool = NativeTaskPoolClient(
-        _client=grpc_client,
+        _client=control_client,
         owner_client_id="owner-a",
         pool_id="pool-1",
         pool_token="pool-token",
@@ -138,7 +138,7 @@ def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() ->
     resp = pool.update_globals_prepared({"cfg": {"k": "v"}})
 
     assert resp.globals_digest == "sha256:digest"
-    grpc_client.update_runtime_globals_prepared.assert_called_once_with(
+    control_client.update_runtime_globals_prepared.assert_called_once_with(
         client_id="pool-1",
         code_version="sha256:" + ("d" * 64),
         runtime_key="pool-1",
@@ -150,10 +150,10 @@ def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() ->
 def test_service_session_client_update_globals_prepared_uses_prepared_rpc() -> None:
     from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 
-    grpc_client = MagicMock()
-    grpc_client.update_service_globals_prepared.return_value = SimpleNamespace(globals_digest="sha256:digest")
+    control_client = MagicMock()
+    control_client.update_service_globals_prepared.return_value = SimpleNamespace(globals_digest="sha256:digest")
     service = ServiceSessionClient(
-        _client=grpc_client,
+        _client=control_client,
         owner_client_id="owner-a",
         service_id="svc-1",
         service_token="svc-token",
@@ -168,13 +168,13 @@ def test_service_session_client_update_globals_prepared_uses_prepared_rpc() -> N
     resp = service.update_globals_prepared({"cfg": {"k": "v"}})
 
     assert resp.globals_digest == "sha256:digest"
-    grpc_client.update_service_globals_prepared.assert_called_once_with(
+    control_client.update_service_globals_prepared.assert_called_once_with(
         owner_client_id="owner-a",
         service_id="svc-1",
         service_token="svc-token",
         prepared_values={"cfg": {"k": "v"}},
     )
-    grpc_client.update_service_globals.assert_not_called()
+    control_client.update_service_globals.assert_not_called()
 
 
 def test_service_group_exposes_replicas_and_snapshot() -> None:

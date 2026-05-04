@@ -12,7 +12,7 @@ from pycloud_parallel.controlplane.serialization import (
     transport_payload_to_inline_carrier,
 )
 from pycloud_parallel.controlplane.services import NodeControlService
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 class _FakeContext:

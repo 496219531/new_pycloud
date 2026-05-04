@@ -182,7 +182,7 @@ def main():
     print("  客户端: Arrow 对象")
     print("    ↓ dict_to_struct")
     print("  转换:   → JSON (DataFrame: records, Series: dict, ndarray: list)")
-    print("    ↓ gRPC 传输")
+    print("    ↓ HTTP 传输")
     print("  接收:   → JSON")
     print("    ↓ convert_dict_to_arrow")
     print("  服务端: Arrow 对象 (还原)")

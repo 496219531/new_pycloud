@@ -234,7 +234,7 @@ def test_job_orchestrator_instances_have_independent_startup_service_ids() -> No
 
 
 def test_service_startup_preflight_rejects_same_service_on_different_endpoint(monkeypatch) -> None:
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
     import pycloud_parallel.controlplane.job_orchestrator_service as job_orchestrator_service
 
     route = SimpleNamespace(
@@ -271,7 +271,7 @@ def test_service_startup_preflight_rejects_same_service_on_different_endpoint(mo
 
 
 def test_service_startup_preflight_allows_same_endpoint(tmp_path, monkeypatch) -> None:
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
     import importlib
 
     module_path = tmp_path / "startup_same_endpoint_demo.py"
@@ -697,11 +697,12 @@ def test_run_job_with_hooks_uses_module_source_for_taskpool() -> None:
         queue._run_job("job-hooks-entryfunc")  # noqa: SLF001
 
     call_kwargs = mocked.call_args.kwargs
-    assert callable(getattr(call_kwargs["source"], "run", None))
+    assert call_kwargs["source"] == module_blob
+    assert call_kwargs["entry_module"] == "job_hooks_entryfunc_demo"
     assert call_kwargs["entry_callable"] == "run"
+    assert call_kwargs["package_format"] == "py"
     assert "func" not in call_kwargs
     assert "blob" not in call_kwargs
-    assert "entry_module" not in call_kwargs
     assert "entry_func" not in call_kwargs
 
 
@@ -908,8 +909,10 @@ def test_run_job_with_hooks_forwards_task_resource_paths_to_task_pool() -> None:
         queue._run_job("job-hooks-task-resources")  # noqa: SLF001
 
     call_kwargs = mocked.call_args.kwargs
-    assert callable(getattr(call_kwargs["source"], "run", None))
+    assert call_kwargs["source"] == module_blob
+    assert call_kwargs["entry_module"] == "job_hooks_task_resources_demo"
     assert call_kwargs["entry_callable"] == "run"
+    assert call_kwargs["package_format"] == "py"
     assert call_kwargs["resource_paths"] == ["worker/data.csv"]
     assert call_kwargs["serialization_mode"] == "pickle_stable_v1"
     assert call_kwargs["policy_id"] == queue._taskpool_policy_id
@@ -2110,7 +2113,7 @@ def test_job_queue_client_recent_job_ids_tracks_and_restores(monkeypatch, tmp_pa
 def test_job_queue_client_discovers_job_orchestrator_via_infocenter(monkeypatch) -> None:
     from pycloud_parallel import JobQueue
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute
-    from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
     route = InfoCenterServiceRoute(
         service_name="job-orchestrator",

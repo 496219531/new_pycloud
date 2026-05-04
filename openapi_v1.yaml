@@ -4,7 +4,7 @@ info:
   version: "1.0.0"
   description: >
     Actual HTTP-facing surface implemented by the current control-plane runtime.
-    NodeControl gRPC methods are documented separately in `GRPC_CONTRACT_V1.md`.
+    NodeControl management endpoints use the same HTTP-only control transport.
 
 servers:
   - url: http://controlplane.internal

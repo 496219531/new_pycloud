@@ -100,7 +100,7 @@ def test_taskpool_try_compensate_replicas_adds_newly_available_node(monkeypatch)
             )
 
     monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.task_pool._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
 
     existing_pool = SimpleNamespace(
         owner_client_id="owner-1",
@@ -202,7 +202,7 @@ def test_taskpool_compensation_uses_active_count_and_skips_failed_node(monkeypat
             )
 
     monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.task_pool._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
 
     existing_pool = SimpleNamespace(
         owner_client_id="owner-1",
@@ -307,7 +307,7 @@ def test_taskpool_compensation_allows_restarted_node_with_new_instance_id(monkey
             )
 
     monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
-    monkeypatch.setattr("pycloud_parallel.execution.task_pool._node_control_client", _FakeNodeControlClient)
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
 
     existing_pool = SimpleNamespace(
         owner_client_id="owner-1",

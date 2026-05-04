@@ -69,7 +69,7 @@ def main() -> None:
         asyncio.run(_run())
     finally:
         module_client.close()
-        group.close(end_services=True, reason="grpc_existing_service_client_demo cleanup")
+        group.close(end_services=True, reason="discovery_service_client_demo cleanup")
 
 
 if __name__ == "__main__":

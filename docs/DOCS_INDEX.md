@@ -66,7 +66,7 @@
 - [PAYLOAD_FLOW_DEBUGGING.md](PAYLOAD_FLOW_DEBUGGING.md)
   - 如何通过 `pycloud_parallel.payload_flow` 判断 payload 走的是哪条路径
 - [RUNTIME_LIMITS.md](RUNTIME_LIMITS.md)
-  - inline / DataRef / gRPC 消息大小等运行时阈值的统一调参入口
+  - inline / DataRef / control message 大小等运行时阈值的统一调参入口
 - [RUNTIME_PARAMETER_ANALYSIS.md](RUNTIME_PARAMETER_ANALYSIS.md)
   - `runtime` 作为 Python 版本约束的当前语义
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)

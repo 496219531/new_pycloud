@@ -19,7 +19,7 @@
 1. `TaskPool`
    - 原生 task pool 会话
 2. `NativeTaskPoolClient`
-   - 单节点 pool 的低层 gRPC client
+   - 单节点 pool 的低层 NodeControl HTTP client
 
 当前语义先记住两点：
 
@@ -46,7 +46,7 @@
 创建 pool 的高层链路一般是：
 
 1. `NodeControlClient.create_task_pool_from_bytes()`
-2. gRPC `CreateTaskPool`
+2. NodeControl HTTP `CreateTaskPool`
 3. `NodeControlState.create_task_pool()`
 
 创建时做的事：
@@ -94,12 +94,12 @@
 3. task_id 是否重复
 4. `task_method` 是否写成了不是 `entry_callable` 的别名
 
-## 4. gRPC 提交到 NodeControl
+## 4. HTTP 提交到 NodeControl
 
 低层提交流程是：
 
 1. `NativeTaskPoolClient.submit_tasks(...)`
-2. gRPC `SubmitPoolTasks`
+2. NodeControl HTTP `SubmitPoolTasks`
 3. `NodeControlState.submit_pool_tasks()`
 
 `submit_pool_tasks()` 做的事：
@@ -116,7 +116,7 @@
 注意：
 
 1. pool 任务最终还是按 `artifact.entry_callable` 执行
-2. 也就是说，gRPC 提交层没有额外 method 路由
+2. 也就是说，NodeControl 提交层没有额外 method 路由
 3. `task_method` 的意义主要是高层 API 早失败校验，而不是在节点侧二次分发
 
 关键位置：

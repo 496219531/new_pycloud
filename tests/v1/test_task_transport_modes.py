@@ -20,7 +20,7 @@ from pycloud_parallel.controlplane.serialization import (
     encode_transport_payload_bytes,
     struct_to_python,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _assert_roundtrip(actual: object, expected: object) -> None:

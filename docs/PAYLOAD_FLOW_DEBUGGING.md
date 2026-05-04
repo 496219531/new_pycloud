@@ -53,30 +53,30 @@
     - caller 侧开始下载 `DataRef`
 11. `result_materialize`
     - caller 侧把结果文件 materialize 成 pandas / numpy / bytes / path
-12. `taskpool_create_grpc`
+12. `taskpool_create_control_http`
     - caller 侧发起 `CreateTaskPool`
-13. `taskpool_create_grpc_result`
+13. `taskpool_create_control_http_result`
     - caller 侧收到 `CreateTaskPool` 返回
-14. `taskpool_submit_grpc`
+14. `taskpool_submit_control_http`
     - caller 侧发起 `SubmitPoolTasks`
-15. `taskpool_submit_grpc_result`
+15. `taskpool_submit_control_http_result`
     - caller 侧收到 `SubmitPoolTasks` 返回
-16. `taskpool_submit_rpc`
-    - NodeControl gRPC 服务端收到 `SubmitPoolTasks`
-17. `taskpool_submit_rpc_result`
-    - NodeControl gRPC 服务端返回 `SubmitPoolTasks`
+16. `taskpool_submit_http`
+    - NodeControl HTTP 服务端收到 `SubmitPoolTasks`
+17. `taskpool_submit_http_result`
+    - NodeControl HTTP 服务端返回 `SubmitPoolTasks`
 18. `taskpool_submit_state`
     - NodeState 开始把 pool task 写入内部状态
 19. `taskpool_submit_state_result`
     - NodeState 完成 pool task 入队
-20. `taskpool_pull_results_grpc`
+20. `taskpool_pull_results_control_http`
     - caller 侧发起 `PullPoolResults`
-21. `taskpool_pull_results_grpc_result`
+21. `taskpool_pull_results_control_http_result`
     - caller 侧收到 `PullPoolResults` 返回
-22. `taskpool_pull_results_rpc`
-    - NodeControl gRPC 服务端收到 `PullPoolResults`
-23. `taskpool_pull_results_rpc_result`
-    - NodeControl gRPC 服务端返回 `PullPoolResults`
+22. `taskpool_pull_results_http`
+    - NodeControl HTTP 服务端收到 `PullPoolResults`
+23. `taskpool_pull_results_http_result`
+    - NodeControl HTTP 服务端返回 `PullPoolResults`
 24. `taskpool_pull_results_state`
     - NodeState 从 pool result hook 拉取结果
 25. `task_result_report`
@@ -94,10 +94,10 @@ event=user_invoke mode=args_kwargs args_summary=list(len=3) kwargs_summary=dict(
 event=result_ref_store path_type=dataframe summary=DataFrame(shape=(80000, 20), index=RangeIndex, columns=Index)
 event=result_ref_fetch format=dfbundle materialize_as=dataframe target_path=<temp> summary=DataRef(format=dfbundle, size_bytes=456789, materialize_as=dataframe, node_id=node-1)
 event=result_materialize materialize_as=dataframe format=dfbundle path=/tmp/pycloud-result-xxx.zip
-event=taskpool_submit_grpc pool_id=pool-1 task_count=10 job_id=pool-job-1
+event=taskpool_submit_control_http pool_id=pool-1 task_count=10 job_id=pool-job-1
 event=taskpool_submit_state_result pool_id=pool-1 accepted=10 rejected=0
 event=task_result_report task_id=pool-job-1-task-0001 status=SUCCEEDED result_summary=dict(len=1, keys=['value'])
-event=taskpool_pull_results_grpc_result pool_id=pool-1 result_count=10 next_cursor=10
+event=taskpool_pull_results_control_http_result pool_id=pool-1 result_count=10 next_cursor=10
 ```
 
 重点字段：
@@ -186,12 +186,12 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 
 它们会经过 HTTP transport，所以你除了 payload path 事件，还能结合普通 HTTP debug 看。
 
-但 `TaskPool` / `NativeTaskPoolClient` 走的是 gRPC，不会经过 `_http_json_request()`。
+`TaskPool` / `NativeTaskPoolClient` 走的是 NodeControl HTTP，不会经过 service gateway 的 `_http_json_request()`。
 
 因此 task/taskpool 调试时，更应该关注：
 
-1. `taskpool_*_grpc`
-2. `taskpool_*_rpc`
+1. `taskpool_*_control_http`
+2. `taskpool_*_http`
 3. `taskpool_*_state`
 4. `task_result_report`
 
@@ -350,13 +350,13 @@ summary=Series(len=200, index=DatetimeIndex, name='nav')
 
 如果你在查 taskpool，推荐看这一组组合：
 
-1. `taskpool_submit_grpc`
-2. `taskpool_submit_rpc`
+1. `taskpool_submit_control_http`
+2. `taskpool_submit_http`
 3. `taskpool_submit_state`
 4. `user_invoke`
 5. `task_result_report`
 6. `taskpool_pull_results_state`
-7. `taskpool_pull_results_grpc_result`
+7. `taskpool_pull_results_control_http_result`
 
 ## 8. 推荐排查顺序
 
@@ -373,18 +373,18 @@ summary=Series(len=200, index=DatetimeIndex, name='nav')
 
 排查一次 taskpool，则建议顺着：
 
-1. `taskpool_create_grpc`
-2. `taskpool_submit_grpc`
-3. `taskpool_submit_rpc`
+1. `taskpool_create_control_http`
+2. `taskpool_submit_control_http`
+3. `taskpool_submit_http`
 4. `taskpool_submit_state`
 5. `user_invoke`
 6. `task_result_report`
 7. `taskpool_pull_results_state`
-8. `taskpool_pull_results_grpc_result`
+8. `taskpool_pull_results_control_http_result`
 
 ## 9. 当前没有接入的地方
 
-这套日志目前重点覆盖了 payload 路径本身，还没有把每个中间 HTTP/gRPC hop 都变成 payload_flow 事件。
+这套日志目前重点覆盖了 payload 路径本身，还没有把每个中间 HTTP hop 都变成 payload_flow 事件。
 
 比如：
 
@@ -395,7 +395,7 @@ summary=Series(len=200, index=DatetimeIndex, name='nav')
 
 1. request id / trace id
 2. gateway 收到请求时的 payload_flow 事件
-3. gRPC 收到请求时的 payload_flow 事件
+3. NodeControl HTTP 收到请求时的 payload_flow 事件
 
 ## 10. 建议搭配阅读
 

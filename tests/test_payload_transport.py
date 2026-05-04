@@ -115,7 +115,7 @@ def test_prepare_outbound_payload_job_submit_applies_managed_globals_policy(tmp_
 def test_prepare_managed_globals_batches_splits_inline_keys(monkeypatch) -> None:
     from pycloud_parallel.execution import support
 
-    monkeypatch.setattr(support, "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
+    monkeypatch.setattr(support, "CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [],
@@ -140,7 +140,7 @@ def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch
             uploaded.append((bytes(blob), str(format), int(chunk_size)))
             return DataRef(ref_id="obj-1", storage_id="obj-1", format=format, size_bytes=len(blob))
 
-    monkeypatch.setattr(support, "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
+    monkeypatch.setattr(support, "CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [_Client()],

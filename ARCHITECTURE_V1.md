@@ -32,7 +32,7 @@
    - 简单运维接口和页面
    - 暴露节点 `python_version`
 2. `NodeControl`
-   - `gRPC`
+   - `HTTP`
    - 代码上传
    - 任务执行
    - 服务会话管理
@@ -64,7 +64,7 @@ InfoCenter 当前只保留 HTTP：
 
 ### 4.2 NodeControl
 
-NodeControl 当前保留 gRPC：
+NodeControl 当前使用 HTTP：
 
 1. `UploadCode`
 2. `UploadObject`
@@ -88,9 +88,9 @@ NodeControl 当前保留 gRPC：
 
 ### 4.3 已移除
 
-1. `InfoCenterService` gRPC service 已移除。
+1. `InfoCenterService` 已移除。
 2. `WorkerInternalService` 已移除。
-3. Worker 内部不再走一层 gRPC 壳子。
+3. Worker 内部不再走一层远程控制壳子。
 
 ## 5. 两种执行模型
 
@@ -103,7 +103,7 @@ NodeControl 当前保留 gRPC：
 5. NodeControl 用 TaskPool worker + 本机进程执行。
 6. 通过 `PullPoolResults` 拉取结果。
 
-这条链路适合高频任务提交，因此仍保留 gRPC。
+这条链路适合高频任务提交，当前统一走 NodeControl HTTP。
 
 ### 5.2 服务会话模式
 
@@ -112,7 +112,7 @@ NodeControl 当前保留 gRPC：
 3. 建立 `method -> callable` 路由。
 4. 返回 `service_id + service_token`。
 5. owner 通过心跳保活。
-6. 其他调用方可通过 gRPC 或 HTTP 调服务方法。
+6. 其他调用方可通过 Gateway 或 discovery 路由调服务方法。
 
 两种模式都支持 `runtime` 作为 Python 版本约束：
 
@@ -127,7 +127,7 @@ NodeControl 当前保留 gRPC：
 ### 6.1 上传
 
 1. 客户端把目录或文件列表打包成 `tar.gz` / `zip`。
-2. 通过 gRPC 流式上传到 NodeControl。
+2. 通过 HTTP 上传到 NodeControl。
 3. NodeControl 边收边写临时文件。
 4. 上传完成后校验 `sha256`。
 

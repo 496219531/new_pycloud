@@ -130,9 +130,9 @@ pycloudctl --help
 
 1. `controlplane`: `50051`
 2. `job-orchestrator`: `50053`
-3. `node-1 gRPC`: `50061`
+3. `node-1 NodeControl HTTP`: `50061`
 4. `node-1 service HTTP`: `18081`
-5. `node-2 gRPC`: `50062`
+5. `node-2 NodeControl HTTP`: `50062`
 6. `node-2 service HTTP`: `18082`
 
 默认 host：
@@ -357,13 +357,13 @@ pycloudctl start-controlplane --bind 0.0.0.0:51051
 
 ### 4.3.1 通过 `--env KEY=VALUE` 透传运行时限制
 
-如果你要调整 inline / DataRef / gRPC 大小限制，可以直接把环境变量透传给 `pycloudctl` 启动的子进程：
+如果你要调整 inline / DataRef / control message 大小限制，可以直接把环境变量透传给 `pycloudctl` 启动的子进程：
 
 ```bash
 pycloudctl start-controlplane \
   --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576 \
-  --env PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
-  --env PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+  --env PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
+  --env PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
 ```
 
 这个参数同样适用于：
@@ -539,7 +539,7 @@ PYTHONPATH=src python -m pycloud_parallel.controlplane.server \
 参数含义：
 
 1. `--bind`
-   - node gRPC 控制地址
+   - node HTTP 控制地址
 2. `--node-id`
    - 节点逻辑名
 3. `--worker-capacity`

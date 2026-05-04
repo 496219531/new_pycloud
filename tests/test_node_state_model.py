@@ -1,4 +1,4 @@
-"""中文说明：验证 gRPC 控制面的核心状态流转（内存后端）。"""
+"""中文说明：验证 HTTP 控制面的核心状态流转（内存后端）。"""
 
 import hashlib
 import importlib
@@ -63,7 +63,7 @@ from pycloud_parallel.controlplane import client_transport as client_transport_m
 from pycloud_parallel.execution.service_session import Service
 from pycloud_parallel.execution.support import _serialize_data_for_object_ref
 from pycloud_parallel.execution.support import _prepare_code_blob
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 _materialize_downloaded_result = client_transport_mod._materialize_downloaded_result
 
@@ -148,8 +148,8 @@ def test_nodecontrol_default_artifact_dir_isolated_by_bind_port(tmp_path, monkey
     finally:
         state_a.close()
         state_b.close()
-        server_a.stop(0)
-        server_b.stop(0)
+        server_a.stop()
+        server_b.stop()
 
 
 def test_nodecontrol_default_executor_backend_is_subprocess_host(tmp_path):
