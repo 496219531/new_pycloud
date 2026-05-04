@@ -142,10 +142,10 @@ def _resolve_bind_value(
 
 
 def _default_service_http_bind_for_node_bind(bind: str) -> str:
-    host, grpc_port = _split_host_port(bind)
+    host, control_port = _split_host_port(bind)
     http_port = 18081
-    if int(grpc_port) >= 50061:
-        http_port = int(grpc_port) - 31980
+    if int(control_port) >= 50061:
+        http_port = int(control_port) - 31980
     return _format_host_port(host, http_port)
 
 
@@ -314,9 +314,9 @@ def _default_named_ports(args: argparse.Namespace) -> Dict[str, int]:
     return {
         "controlplane": int(args.controlplane_port),
         "job-orchestrator": int(args.job_orchestrator_port),
-        "node-1-grpc": int(args.node1_port),
+        "node-1-control": int(args.node1_port),
         "node-1-http": int(args.node1_http),
-        "node-2-grpc": int(args.node2_port),
+        "node-2-control": int(args.node2_port),
         "node-2-http": int(args.node2_http),
     }
 
@@ -1144,12 +1144,12 @@ def _start_node(
         remote_hint=infocenter_target,
     )
     effective_advertise_host = str(advertise_host or "").strip() or resolve_public_host(effective_bind_host, remote_hint=infocenter_target)
-    grpc_bind = _format_host_port(effective_bind_host, int(port))
+    control_bind = _format_host_port(effective_bind_host, int(port))
     service_http_bind = _format_host_port(effective_service_http_host, int(http_port))
     advertise_addr = _format_host_port(effective_advertise_host, int(port))
-    _assert_bind_available(grpc_bind)
+    _assert_bind_available(control_bind)
     _assert_bind_available(service_http_bind)
-    _log("INFO", f"Starting {name} on {grpc_bind} (HTTP: {service_http_bind}, workers: {worker_capacity})...")
+    _log("INFO", f"Starting {name} on {control_bind} (HTTP: {service_http_bind}, workers: {worker_capacity})...")
     pid = _spawn_server(
         root,
         _logs_dir(root) / f"{name}.log",
@@ -1157,7 +1157,7 @@ def _start_node(
             "--role",
             "nodecontrol",
             "--bind",
-            grpc_bind,
+            control_bind,
             "--node-id",
             name,
             "--worker-capacity",
@@ -1188,7 +1188,7 @@ def _start_node(
         _remove_pid(_pid_file(root, name))
         raise RuntimeError(f"{name} failed to register to InfoCenter")
     _write_pid(_pid_file(root, name), pid)
-    _log("OK", f"{name} started (PID: {pid}, Bind: {grpc_bind}, HTTP: {service_http_bind}, workers: {worker_capacity})")
+    _log("OK", f"{name} started (PID: {pid}, Bind: {control_bind}, HTTP: {service_http_bind}, workers: {worker_capacity})")
 
 
 def _start_standalone_node(
@@ -1616,6 +1616,62 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for line in _query_loaded_services(target):
         print(line)
     return status_code
+
+
+def _cmd_local_services(args: argparse.Namespace) -> int:
+    from pycloud_parallel.controlplane.local_ipc import inspect_local_services
+
+    rows = inspect_local_services(timeout_sec=float(getattr(args, "timeout_sec", 0.5) or 0.5))
+    print("============================================")
+    print("  Local Services")
+    print("============================================")
+    print()
+    if not rows:
+        print("  (no local services)")
+        return 0
+    for row in rows:
+        service_name = str(row.get("service_name", "") or "")
+        pid = int(row.get("pid", 0) or 0)
+        alive = bool(row.get("alive", False))
+        node_id = str(row.get("node_id", "") or "")
+        node_instance_id = str(row.get("node_instance_id", "") or "")
+        status = "RUNNING" if alive else "STALE"
+        print(
+            f"  {'*' if alive else '-'} {service_name} "
+            f"pid={pid or '-'} node={node_id or '-'} instance={node_instance_id or '-'} {status}"
+        )
+        error = str(row.get("error", "") or "").strip()
+        if error and not alive:
+            print(f"      error: {error}")
+    return 0
+
+
+def _cmd_stop_local_service(args: argparse.Namespace) -> int:
+    from pycloud_parallel.controlplane.local_ipc import stop_local_service
+
+    service_name = str(getattr(args, "service_name", "") or "").strip()
+    result = stop_local_service(
+        service_name,
+        timeout_sec=float(getattr(args, "timeout_sec", 3.0) or 3.0),
+        force=bool(getattr(args, "force", False)),
+    )
+    if bool(result.get("stopped", False)):
+        _log("OK", f"Stopped local service {service_name} (pid={result.get('pid') or '-'})")
+        return 0
+    _log("ERROR", f"Failed to stop local service {service_name}: {result.get('error') or 'still running'}")
+    return 1
+
+
+def _cmd_gc_local_services(args: argparse.Namespace) -> int:
+    from pycloud_parallel.controlplane.local_ipc import cleanup_stale_local_services
+
+    removed = cleanup_stale_local_services(timeout_sec=float(getattr(args, "timeout_sec", 0.5) or 0.5))
+    if removed:
+        for row in removed:
+            _log("OK", f"Removed stale local service registry {row.get('service_name') or '-'} pid={row.get('pid') or '-'}")
+    else:
+        _log("OK", "No stale local service registry entries")
+    return 0
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -2290,12 +2346,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--controlplane-port", type=int, default=50051, help="bind port used by `pycloudctl start` for controlplane")
     parser.add_argument("--job-orchestrator-host", default="", help="bind host used by `pycloudctl start` for job-orchestrator; default auto-detects local IP")
     parser.add_argument("--job-orchestrator-port", type=int, default=50053, help="bind port used by `pycloudctl start` for job-orchestrator")
-    parser.add_argument("--node1-host", default="", help="bind host used by `pycloudctl start` for node-1 gRPC; default auto-detects local IP")
-    parser.add_argument("--node1-port", type=int, default=50061, help="bind port used by `pycloudctl start` for node-1 gRPC")
+    parser.add_argument("--node1-host", default="", help="bind host used by `pycloudctl start` for node-1 HTTP control; default auto-detects local IP")
+    parser.add_argument("--node1-port", type=int, default=50061, help="bind port used by `pycloudctl start` for node-1 HTTP control")
     parser.add_argument("--node1-http-host", default="", help="bind host used by `pycloudctl start` for node-1 service HTTP; default auto-detects local IP")
     parser.add_argument("--node1-http-port", dest="node1_http", type=int, default=18081, help="bind port used by `pycloudctl start` for node-1 service HTTP")
-    parser.add_argument("--node2-host", default="", help="bind host used by `pycloudctl start` for node-2 gRPC; default auto-detects local IP")
-    parser.add_argument("--node2-port", type=int, default=50062, help="bind port used by `pycloudctl start` for node-2 gRPC")
+    parser.add_argument("--node2-host", default="", help="bind host used by `pycloudctl start` for node-2 HTTP control; default auto-detects local IP")
+    parser.add_argument("--node2-port", type=int, default=50062, help="bind port used by `pycloudctl start` for node-2 HTTP control")
     parser.add_argument("--node2-http-host", default="", help="bind host used by `pycloudctl start` for node-2 service HTTP; default auto-detects local IP")
     parser.add_argument("--node2-http-port", dest="node2_http", type=int, default=18082, help="bind port used by `pycloudctl start` for node-2 service HTTP")
     parser.add_argument("--node-worker-capacity", type=int, default=0, help="worker capacity per nodecontrol; default auto-calculated from CPU or PYCLOUD_NODE_WORKER_CAPACITY")
@@ -2344,17 +2400,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_node)
     _add_debug_argument(start_node)
     start_node.add_argument("--node-id", default="node-local-01", type=_normalize_managed_name, help="managed node name used for pid/log files and registration")
-    start_node.add_argument("--bind", default="0.0.0.0:50061", help="full gRPC bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
-    start_node.add_argument("--service-http-bind", default="", help="full service HTTP bind address in host:port form for start-node; defaults to the node bind host and a port derived from the gRPC port, for example 50061 -> 18081")
+    start_node.add_argument("--bind", default="0.0.0.0:50061", help="full HTTP control bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
+    start_node.add_argument("--service-http-bind", default="", help="full service HTTP bind address in host:port form for start-node; defaults to the node bind host and a port derived from the control port, for example 50061 -> 18081")
     start_node.add_argument(
         "--infocenter-addr",
         default=None,
         help='InfoCenter/ControlPlane target; required for registration, pass empty string ("") to disable registration',
     )
-    start_node.add_argument("--advertise-addr", default="", help="full advertised control address in host:port form; defaults to the auto-resolved gRPC bind address")
+    start_node.add_argument("--advertise-addr", default="", help="full advertised control address in host:port form; defaults to the auto-resolved HTTP control bind address")
     start_node.add_argument("--worker-capacity", type=int, default=0, help="node runtime worker capacity; 0 means auto-calculate")
     start_node.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="node task queue capacity")
-    start_node.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS, help="max gRPC server worker threads for nodecontrol")
+    start_node.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS, help="max HTTP control server worker threads for nodecontrol")
     start_node.add_argument("--service-default-workers", type=int, default=SERVICE_DEFAULT_WORKERS, help="default worker count for deployed services on this node")
     start_node.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC, help="default heartbeat timeout in seconds for deployed services on this node")
     start_node.add_argument("--node-tags", default="compute", help="comma-separated node tags advertised during registration")
@@ -2362,7 +2418,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop_parser = subparsers.add_parser("stop", help="stop local services started by pycloudctl")
     stop_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
     stop_parser.add_argument("--scan-ports", action="store_true", help="after pid-based stop, scan configured ports and stop matching pycloud listener processes")
-    stop_parser.add_argument("--ports", default="", help="comma-separated ports for doctor/scan-ports; default uses controlplane/node http+grpc ports")
+    stop_parser.add_argument("--ports", default="", help="comma-separated ports for doctor/scan-ports; default uses controlplane/node HTTP ports")
     stop_node_parser = subparsers.add_parser("stop-node", help="stop one local nodecontrol process")
     stop_node_parser.add_argument("node_name", type=_normalize_managed_name, help="nodecontrol name to stop")
     stop_node_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
@@ -2372,9 +2428,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_debug_argument(restart_parser)
     status_parser = subparsers.add_parser("status", help="show local service status")
     status_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for node/service query (default: 127.0.0.1:<controlplane-port>)")
+    local_services_parser = subparsers.add_parser("local-services", help="list Service.startup(target='local') IPC services")
+    local_services_parser.add_argument("--timeout-sec", type=float, default=0.5, help="per-service IPC ping timeout")
+    stop_local_parser = subparsers.add_parser("stop-local-service", help="stop one Service.startup(target='local') IPC service")
+    stop_local_parser.add_argument("service_name", help="local service_name to stop")
+    stop_local_parser.add_argument("--timeout-sec", type=float, default=3.0, help="shutdown timeout before returning")
+    stop_local_parser.add_argument("--force", action="store_true", help="force kill if graceful IPC shutdown does not stop the process")
+    gc_local_parser = subparsers.add_parser("gc-local-services", help="remove stale local service IPC registry entries")
+    gc_local_parser.add_argument("--timeout-sec", type=float, default=0.5, help="per-service IPC ping timeout")
     doctor_parser = subparsers.add_parser("doctor", help="inspect runtime-root pid files and listener ports")
     doctor_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for context display (default: 127.0.0.1:<controlplane-port>)")
-    doctor_parser.add_argument("--ports", default="", help="comma-separated ports to inspect; default uses controlplane/node http+grpc ports")
+    doctor_parser.add_argument("--ports", default="", help="comma-separated ports to inspect; default uses controlplane/node HTTP ports")
     cache_list_parser = subparsers.add_parser("cache-list", help="list cached code artifacts and readable index paths")
     cache_list_parser.add_argument("--artifact-dir", default="", help="artifact/code cache directory (default: <runtime-root>/code_cache)")
     cache_list_parser.add_argument("--match", default="", help="substring filter for module/callable/code_version/path")
@@ -2419,6 +2483,12 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_restart(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "local-services":
+        return _cmd_local_services(args)
+    if args.command == "stop-local-service":
+        return _cmd_stop_local_service(args)
+    if args.command == "gc-local-services":
+        return _cmd_gc_local_services(args)
     if args.command == "doctor":
         return _cmd_doctor(args)
     if args.command == "cache-list":

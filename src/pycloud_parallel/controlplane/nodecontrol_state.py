@@ -141,7 +141,7 @@ from pycloud_parallel.controlplane.serialization import (
     validate_transport_payload_bytes,
 )
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.errors import normalize_invoke_error
 
 

@@ -780,6 +780,41 @@ def test_service_startup_local_proxy_streams_from_executor(tmp_path, monkeypatch
         node.close()
 
 
+def test_service_startup_local_replace_existing_stops_previous_service(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_local_replace_service.py"
+    module_path.write_text(
+        "def value():\n"
+        "    return {'value': 1}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    first = Service.startup(
+        target="local",
+        service_name="startup-local-replace",
+        entry_module="startup_local_replace_service",
+        export_methods=("value",),
+        worker_count=1,
+    )
+    second = None
+    try:
+        second = Service.startup(
+            target="local",
+            service_name="startup-local-replace",
+            entry_module="startup_local_replace_service",
+            export_methods=("value",),
+            worker_count=1,
+            replace_existing=True,
+        )
+        assert second.service_name == "startup-local-replace"
+        assert second.value.sync() == {"value": 1}
+    finally:
+        if second is not None:
+            second.close()
+        first.close()
+
+
 def test_service_deploy_local_returns_direct_proxy(tmp_path, monkeypatch):
     worker_module = _build_service_entry_module(tmp_path, monkeypatch)
 

@@ -104,7 +104,7 @@ from pycloud_parallel.execution.support import (
     _timestamp_to_datetime,
     _write_private_json,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 logger = logging.getLogger(__name__)
@@ -122,50 +122,30 @@ def _infocenter_client(*args, **kwargs):
 
 
 def _node_control_client(*args, **kwargs):
-    transport = str(kwargs.pop("transport", "") or "").strip().lower()
-    target = str(args[0] if args else kwargs.get("target", "") or "").strip()
-    if transport in {"http", "nodecontrol_http"} or (not transport and target.startswith(("http://", "https://"))):
-        from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient
+    kwargs.pop("transport", None)
+    from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient
 
-        return HttpNodeControlClient(*args, **kwargs)
-    from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-
-    return NodeControlClient(*args, **kwargs)
+    return HttpNodeControlClient(*args, **kwargs)
 
 
-def _node_control_target_for_node(node: InfoCenterNode, *, transport: str = "grpc") -> str:
-    normalized = str(transport or "grpc").strip().lower() or "grpc"
+def _node_control_target_for_node(node: InfoCenterNode) -> str:
     capability = getattr(node, "capability", None)
     node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    supports_http = bool(getattr(capability, "supports_http_nodecontrol", False))
-    if normalized in {"http", "nodecontrol_http"}:
-        if not node_http_base_url:
-            raise RuntimeError(f"node does not expose HTTP NodeControl endpoint: node_id={getattr(node, 'node_id', '')}")
-        return node_http_base_url
-    if normalized == "auto" and supports_http and node_http_base_url:
+    if node_http_base_url:
         return node_http_base_url
     return str(getattr(node, "control_addr", "") or "").strip()
 
 
-def _node_control_target_for_route(route: InfoCenterServiceRoute, *, transport: str = "grpc") -> str:
-    normalized = str(transport or "grpc").strip().lower() or "grpc"
+def _node_control_target_for_route(route: InfoCenterServiceRoute) -> str:
     capability = getattr(route, "capability", None)
     node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    supports_http = bool(getattr(capability, "supports_http_nodecontrol", False))
-    if normalized in {"http", "nodecontrol_http"}:
-        if not node_http_base_url:
-            raise RuntimeError(f"route does not expose HTTP NodeControl endpoint: service_id={getattr(route, 'service_id', '')}")
-        return node_http_base_url
-    if normalized == "auto" and supports_http and node_http_base_url:
+    if node_http_base_url:
         return node_http_base_url
     return str(getattr(route, "control_addr", "") or "").strip()
 
 
-def _new_node_control_client(target: str, *, timeout_sec: float, transport: str = "grpc"):
-    normalized = str(transport or "grpc").strip().lower() or "grpc"
-    if normalized in {"grpc", ""}:
-        return _node_control_client(target, timeout_sec=timeout_sec)
-    return _node_control_client(target, timeout_sec=timeout_sec, transport=normalized)
+def _new_node_control_client(target: str, *, timeout_sec: float):
+    return _node_control_client(target, timeout_sec=timeout_sec)
 
 
 def _endpoint_from_url_or_addr(value: str) -> Tuple[str, int]:
@@ -1967,9 +1947,8 @@ class Service(ServiceExecutionSession):
             def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]:
                 node_key = _node_instance_key_from_node(node)
                 try:
-                    transport = str(spec.get("nodecontrol_transport", "grpc") or "grpc")
-                    target = _node_control_target_for_node(node, transport=transport)
-                    client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0), transport=transport)
+                    target = _node_control_target_for_node(node)
+                    client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
                 except Exception as exc:
                     return node_key, node, None, None, repr(exc)
                 node_worker_count = max(1, int(spec.get("worker_count", 1) or 1))
@@ -2061,6 +2040,7 @@ class Service(ServiceExecutionSession):
         heartbeat_sec: int = 10,
         rpc_timeout_sec: float = 5.0,
         start: bool = True,
+        replace_existing: bool = False,
     ):
         """Product-facing startup-mounted service action.
 
@@ -2177,6 +2157,11 @@ class Service(ServiceExecutionSession):
         effective_infocenter_target = "" if local_mode else str(target or "").strip()
         if local_mode:
             service_http_bind = ""
+            if replace_existing:
+                from pycloud_parallel.controlplane.local_ipc import stop_local_service
+
+                with contextlib.suppress(FileNotFoundError):
+                    stop_local_service(effective_service_name, timeout_sec=rpc_timeout_sec, force=True)
         effective_worker_count = max(1, int(worker_count or 1))
         node = StartupServiceNode(
             node_id=effective_node_id,
@@ -2389,7 +2374,6 @@ class Service(ServiceExecutionSession):
         breaker_failure_threshold: int = 3,
         breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
-        nodecontrol_transport: str = "grpc",
     ) -> "Service":
         """Product-facing deploy action for V1 service sessions.
 
@@ -2452,7 +2436,6 @@ class Service(ServiceExecutionSession):
             breaker_failure_threshold=breaker_failure_threshold,
             breaker_cooldown_sec=breaker_cooldown_sec,
             breaker_max_cooldown_sec=breaker_max_cooldown_sec,
-            nodecontrol_transport=nodecontrol_transport,
         )
 
     @classmethod
@@ -2493,7 +2476,7 @@ class Service(ServiceExecutionSession):
         prepare_discovery_payload: bool = True,
     ):
         normalized_transport = str(transport or "discovery").strip().lower() or "discovery"
-        if normalized_transport == "local" or str(target or "").strip().lower() == "local":
+        if str(target or "").strip().lower() == "local":
             from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
 
             return _ConnectedService(
@@ -2526,26 +2509,26 @@ class Service(ServiceExecutionSession):
                 effective_policy_override=effective_policy_override,
                 prepare_discovery_payload=prepare_discovery_payload,
             )
-        if normalized_transport == "discovery":
-            from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
-
-            return _ConnectedService(
-                transport_client=DiscoveryServiceClient(
-                    target,
-                    timeout_sec=timeout_sec,
-                    service_token=service_token,
-                    shared_route_cache=True,
-                ),
-                service_name=service_name,
-                transport=normalized_transport,
-                timeout_sec=timeout_sec,
-                serialization_mode=serialization_mode,
-                validate_on_init=validate_on_init,
-                effective_policy_override=effective_policy_override,
-                prepare_discovery_payload=prepare_discovery_payload,
+        if normalized_transport != "discovery":
+            raise ValueError(
+                "Service.connect() transport must be one of: discovery, gateway"
             )
-        raise ValueError(
-            "Service.connect() transport must be one of: discovery, gateway, local"
+        from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
+
+        return _ConnectedService(
+            transport_client=DiscoveryServiceClient(
+                target,
+                timeout_sec=timeout_sec,
+                service_token=service_token,
+                shared_route_cache=True,
+            ),
+            service_name=service_name,
+            transport=normalized_transport,
+            timeout_sec=timeout_sec,
+            serialization_mode=serialization_mode,
+            validate_on_init=validate_on_init,
+            effective_policy_override=effective_policy_override,
+            prepare_discovery_payload=prepare_discovery_payload,
         )
 
     @classmethod
@@ -2587,7 +2570,6 @@ class Service(ServiceExecutionSession):
         breaker_failure_threshold: int = 3,
         breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
-        nodecontrol_transport: str = "grpc",
         policy_id: str = "",
     ) -> "Service":
         """Internal low-level deploy implementation behind ``Service.deploy(...)``.
@@ -3085,8 +3067,8 @@ class Service(ServiceExecutionSession):
             def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NodeControlClient], Optional[ServiceSessionClient], str]:
                 node_key = _node_instance_key_from_node(node)
                 try:
-                    target = _node_control_target_for_node(node, transport=nodecontrol_transport)
-                    client = _new_node_control_client(target, timeout_sec=timeout_sec, transport=nodecontrol_transport)
+                    target = _node_control_target_for_node(node)
+                    client = _new_node_control_client(target, timeout_sec=timeout_sec)
                 except Exception as exc:
                     return node_key, node, None, None, repr(exc)
                 node_worker_count = max(1, int(worker_count or 1))
@@ -3203,7 +3185,6 @@ class Service(ServiceExecutionSession):
                     "node_count": compensation_target_count,
                     "node_limit": node_limit,
                     "timeout_sec": timeout_sec,
-                    "nodecontrol_transport": nodecontrol_transport,
                 }
             )
             group._persist_session_cache()

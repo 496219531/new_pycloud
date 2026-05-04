@@ -16,3 +16,4 @@
 2026-05-04 10:23:48,900 WARNING pycloud_parallel.controlplane.registrar [Registrar] node heartbeat rejected node_id=job-orchestrator-01 node_instance_id=job-orchestrator-01-61596b94227b reset_required=True reason=node_instance_id fenced
 2026-05-04 10:23:48,908 WARNING pycloud_parallel.controlplane.nodecontrol_state [NodeControl] execution state reset node_id=job-orchestrator-01 node_instance_id=job-orchestrator-01-61596b94227b reason=node_instance_id fenced
 2026-05-04 10:23:48,908 WARNING pycloud_parallel.controlplane.registrar [Registrar] closing state after registration lost node_id=job-orchestrator-01 node_instance_id=job-orchestrator-01-61596b94227b reason=registration no longer accepted
+2026-05-04 11:07:31,138 INFO pycloud_parallel.controlplane.job_orchestrator [JobOrch] stop node_id=job-orchestrator-01 service_name=job-orchestrator service_id=747e6f9467d740219ea62fdc73c324ef

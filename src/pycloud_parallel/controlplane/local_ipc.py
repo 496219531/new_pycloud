@@ -9,6 +9,7 @@ import json
 import os
 import pickle
 from pathlib import Path
+import signal
 import tempfile
 import threading
 import time
@@ -229,6 +230,151 @@ def _discard_metadata_if_current(service_name: str, meta: Dict[str, object]) -> 
             Path(str(meta.get("address", "") or "")).unlink(missing_ok=True)
 
 
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import subprocess
+
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {int(pid)}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return str(int(pid)) in str(result.stdout or "")
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_pid(pid: int, *, force: bool = False) -> None:
+    if pid <= 0 or not _pid_running(pid):
+        return
+    if os.name == "nt":
+        import subprocess
+
+        cmd = ["taskkill", "/PID", str(int(pid))]
+        if force:
+            cmd.insert(1, "/F")
+        subprocess.run(cmd, check=False, capture_output=True, text=True)
+        return
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(int(pid), sig)
+
+
+def iter_local_service_metadata() -> list[Dict[str, object]]:
+    rows: list[Dict[str, object]] = []
+    for path in sorted(_registry_dir().glob("*.json")):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["_path"] = str(path)
+        service_name = str(meta.get("service_name", "") or "").strip()
+        if not service_name:
+            meta["service_name"] = path.stem
+        rows.append(meta)
+    return rows
+
+
+def inspect_local_services(*, timeout_sec: float = 0.5) -> list[Dict[str, object]]:
+    rows: list[Dict[str, object]] = []
+    for meta in iter_local_service_metadata():
+        service_name = str(meta.get("service_name", "") or "").strip()
+        pid = int(meta.get("pid", 0) or 0)
+        pid_running = _pid_running(pid)
+        ping_ok = False
+        error = ""
+        if service_name:
+            try:
+                resp = _call_once(meta, {"action": "ping"}, timeout_sec=timeout_sec)
+                ping_ok = bool(resp.get("ok", False))
+            except Exception as exc:
+                error = str(exc) or repr(exc)
+        row = dict(meta)
+        row["pid"] = pid
+        row["pid_running"] = pid_running
+        row["alive"] = bool(pid_running and ping_ok)
+        row["ping_ok"] = ping_ok
+        row["error"] = error
+        rows.append(row)
+    return rows
+
+
+def cleanup_stale_local_services(*, timeout_sec: float = 0.5) -> list[Dict[str, object]]:
+    removed: list[Dict[str, object]] = []
+    for row in inspect_local_services(timeout_sec=timeout_sec):
+        if bool(row.get("alive", False)):
+            continue
+        service_name = str(row.get("service_name", "") or "").strip()
+        if service_name:
+            _discard_metadata_if_current(service_name, row)
+        removed.append(dict(row))
+    return removed
+
+
+def stop_local_service(
+    service_name: str,
+    *,
+    timeout_sec: float = 3.0,
+    force: bool = False,
+    cleanup: bool = True,
+) -> Dict[str, object]:
+    meta = _read_metadata(service_name)
+    pid = int(meta.get("pid", 0) or 0)
+    current_pid = int(os.getpid())
+    stopped_by = ""
+    error = ""
+    with contextlib.suppress(Exception):
+        resp = _call_once(meta, {"action": "shutdown"}, timeout_sec=min(1.0, max(0.1, timeout_sec)))
+        if bool(resp.get("ok", False)):
+            stopped_by = "ipc"
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while (
+        pid > 0
+        and pid != current_pid
+        and _pid_running(pid)
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.05)
+    if pid > 0 and pid != current_pid and _pid_running(pid):
+        try:
+            _terminate_pid(pid, force=False)
+            stopped_by = stopped_by or "sigterm"
+        except Exception as exc:
+            error = str(exc) or repr(exc)
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while (
+        pid > 0
+        and pid != current_pid
+        and _pid_running(pid)
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.05)
+    if force and pid > 0 and pid != current_pid and _pid_running(pid):
+        try:
+            _terminate_pid(pid, force=True)
+            stopped_by = "sigkill"
+        except Exception as exc:
+            error = str(exc) or repr(exc)
+    if cleanup:
+        _discard_metadata_if_current(service_name, meta)
+    pid_still_running = pid > 0 and pid != current_pid and _pid_running(pid)
+    return {
+        "service_name": service_name,
+        "pid": pid,
+        "stopped": not pid_still_running,
+        "stopped_by": stopped_by,
+        "error": error,
+    }
+
+
 def _authkey_from_metadata(meta: Dict[str, object]) -> Optional[bytes]:
     raw = str(meta.get("authkey", "") or "").strip()
     if not raw:
@@ -301,7 +447,15 @@ class LocalServiceIpcServer:
 
     def start(self) -> None:
         if _is_metadata_alive(self.service_name):
-            raise RuntimeError(f"local service_name already exists: {self.service_name}")
+            meta = {}
+            with contextlib.suppress(Exception):
+                meta = _read_metadata(self.service_name)
+            pid = int(meta.get("pid", 0) or 0) if isinstance(meta, dict) else 0
+            raise RuntimeError(
+                f"local service_name already exists: {self.service_name}\n"
+                f"pid={pid or '-'}\n"
+                f"stop with: pycloudctl stop-local-service {self.service_name}"
+            )
         _remove_metadata(self.service_name)
         if self.family == "AF_UNIX":
             Path(self.address).unlink(missing_ok=True)
@@ -383,6 +537,9 @@ class LocalServiceIpcServer:
         action = str(request.get("action", "") or "").strip()
         if action == "ping":
             return {"ok": True, "pid": os.getpid(), "service_name": self.service_name}
+        if action == "shutdown":
+            threading.Thread(target=self.node.close, name=f"local-service-shutdown-{self.service_name}", daemon=True).start()
+            return {"ok": True, "pid": os.getpid(), "service_name": self.service_name, "stopping": True}
         if action == "list_methods":
             methods = [
                 {"method": str(name), "qualified_name": str(name), "doc": ""}
@@ -699,6 +856,9 @@ def start_local_service_ipc(*, node: Any, service_name: str) -> LocalServiceIpcS
 __all__ = [
     "LocalServiceClient",
     "LocalServiceIpcServer",
+    "cleanup_stale_local_services",
+    "inspect_local_services",
     "local_service_metadata_path",
     "start_local_service_ipc",
+    "stop_local_service",
 ]

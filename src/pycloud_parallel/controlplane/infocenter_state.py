@@ -19,7 +19,7 @@ from pycloud_parallel.controlplane.infocenter.models import (
 )
 from pycloud_parallel.controlplane.scheduling_policy import is_call_route, is_conflict_scope, is_owner_target
 from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
@@ -492,8 +492,8 @@ class InfoCenterState:
                 "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
                 "supports_transport_payload_bytes": bool(getattr(request.capability, "supports_transport_payload_bytes", False)),
                 "supports_http_bytes_transport": bool(getattr(request.capability, "supports_http_bytes_transport", False)),
-                "max_grpc_send_bytes": int(getattr(request.capability, "max_grpc_send_bytes", 0) or 0),
-                "max_grpc_recv_bytes": int(getattr(request.capability, "max_grpc_recv_bytes", 0) or 0),
+                "max_control_send_bytes": int(getattr(request.capability, "max_control_send_bytes", 0) or 0),
+                "max_control_recv_bytes": int(getattr(request.capability, "max_control_recv_bytes", 0) or 0),
                 "max_http_body_bytes": int(getattr(request.capability, "max_http_body_bytes", 0) or 0),
                 "max_upload_file_bytes": int(getattr(request.capability, "max_upload_file_bytes", 0) or 0),
                 "max_upload_total_bytes": int(getattr(request.capability, "max_upload_total_bytes", 0) or 0),
@@ -585,8 +585,8 @@ class InfoCenterState:
                 "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
                 "supports_transport_payload_bytes": bool(getattr(request.capability, "supports_transport_payload_bytes", False)),
                 "supports_http_bytes_transport": bool(getattr(request.capability, "supports_http_bytes_transport", False)),
-                "max_grpc_send_bytes": int(getattr(request.capability, "max_grpc_send_bytes", 0) or 0),
-                "max_grpc_recv_bytes": int(getattr(request.capability, "max_grpc_recv_bytes", 0) or 0),
+                "max_control_send_bytes": int(getattr(request.capability, "max_control_send_bytes", 0) or 0),
+                "max_control_recv_bytes": int(getattr(request.capability, "max_control_recv_bytes", 0) or 0),
                 "max_http_body_bytes": int(getattr(request.capability, "max_http_body_bytes", 0) or 0),
                 "max_upload_file_bytes": int(getattr(request.capability, "max_upload_file_bytes", 0) or 0),
                 "max_upload_total_bytes": int(getattr(request.capability, "max_upload_total_bytes", 0) or 0),

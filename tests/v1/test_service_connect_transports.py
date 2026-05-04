@@ -11,7 +11,7 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRou
 from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.execution.call_proxy import _CallProxy
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def test_service_connect_discovery_returns_unified_service_object():
@@ -125,8 +125,8 @@ def test_service_connect_inherits_deploy_bound_policy_from_routes():
         supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
         supports_transport_payload_bytes=True,
         supports_http_bytes_transport=True,
-        max_grpc_send_bytes=4 * 1024 * 1024,
-        max_grpc_recv_bytes=4 * 1024 * 1024,
+        max_control_send_bytes=4 * 1024 * 1024,
+        max_control_recv_bytes=4 * 1024 * 1024,
         max_http_body_bytes=4 * 1024 * 1024,
         max_upload_file_bytes=64 * 1024 * 1024,
         max_upload_total_bytes=128 * 1024 * 1024,
@@ -188,8 +188,8 @@ def test_service_connect_rejects_mixed_route_policy_metadata():
             supported_modes=("legacy_v1", "structured_v1"),
             supports_transport_payload_bytes=False,
             supports_http_bytes_transport=False,
-            max_grpc_send_bytes=4 * 1024 * 1024,
-            max_grpc_recv_bytes=4 * 1024 * 1024,
+            max_control_send_bytes=4 * 1024 * 1024,
+            max_control_recv_bytes=4 * 1024 * 1024,
             max_http_body_bytes=4 * 1024 * 1024,
             max_upload_file_bytes=64 * 1024 * 1024,
             max_upload_total_bytes=128 * 1024 * 1024,

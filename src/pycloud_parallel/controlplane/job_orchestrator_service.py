@@ -8,7 +8,7 @@ from pycloud_parallel.controlplane.job_orchestrator import (
     DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME,
     JobOrchestratorModule,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 _MODULES: Dict[str, JobOrchestratorModule] = {}

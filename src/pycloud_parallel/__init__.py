@@ -26,7 +26,7 @@ def _import_api() -> Any:
         return importlib.import_module(".api", __name__)
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
-        if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
+        if missing in {"google", "protobuf"} or missing.startswith("google."):
             raise ModuleNotFoundError(_API_DEP_HINT) from exc
         raise
 
@@ -40,7 +40,7 @@ def _try_bind_api_exports() -> None:
         from .api import DataRef, JobQueue, Service, TaskPool, export
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
-        if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
+        if missing in {"google", "protobuf"} or missing.startswith("google."):
             return
         raise
 

@@ -50,7 +50,7 @@ from pycloud_parallel.controlplane.serialization import (
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 MAX_NODECONTROL_HTTP_BODY_BYTES = 256 * 1024 * 1024
@@ -238,6 +238,8 @@ class NodeControlHttpApp:
                 return self._pull_pool_results_bytes(parts[1], payload)
             if parts == ["runtime-globals-bytes"]:
                 return self._update_runtime_globals_bytes(body)
+            if len(parts) == 3 and parts[0] == "services" and parts[2] == "globals-bytes":
+                return self._update_service_globals_bytes(parts[1], body)
             payload = _read_json(body)
             if parts == ["taskpools"]:
                 return self._create_task_pool(payload)
@@ -669,6 +671,41 @@ class NodeControlHttpApp:
             return self._err(400, str(exc))
         return self._ok({"ok": True, "service_id": service_id, "globals_digest": digest, "updated_names": updated_names})
 
+    def _update_service_globals_bytes(self, service_id: str, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
+        try:
+            payload, raw = _unpack_binary_sidecar(body)
+            owner_client_id = str(payload.get("owner_client_id", "") or "")
+            service_token = str(payload.get("service_token", "") or "")
+            transport_meta = payload.get("transport_values")
+            if not owner_client_id or not service_token:
+                return self._err(400, "owner_client_id and service_token are required")
+            if not isinstance(transport_meta, dict) or not str(transport_meta.get("codec", "") or "").strip():
+                raise ValueError("transport_values metadata is required")
+            expected_size = max(0, int(transport_meta.get("payload_size", 0) or 0))
+            if len(raw) != expected_size:
+                raise ValueError("binary service globals payload size mismatch")
+            serialization_mode = str(transport_meta.get("codec", "") or "").strip().lower()
+            decoded_values = decode_transport_payload_bytes(
+                serialization_mode,
+                int(transport_meta.get("version", 0) or 0),
+                raw,
+                context="service_owner",
+            )
+            digest, updated_names = self.state.update_service_globals(
+                owner_client_id=owner_client_id,
+                service_id=service_id,
+                service_token=service_token,
+                values=decoded_values if isinstance(decoded_values, dict) else {},
+                serialization_mode=serialization_mode,
+            )
+        except KeyError as exc:
+            return self._err(404, str(exc))
+        except PermissionError as exc:
+            return self._err(401, str(exc))
+        except ValueError as exc:
+            return self._err(400, str(exc))
+        return self._ok({"ok": True, "service_id": service_id, "globals_digest": digest, "updated_names": updated_names})
+
     def _heartbeat_service(self, service_id: str, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
         try:
             session = self.state.heartbeat_service(
@@ -757,6 +794,10 @@ class NodeControlHttpServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
 
+    def wait_for_termination(self) -> None:
+        if self._thread is not None:
+            self._thread.join()
+
 
 class HttpNodeControlClient:
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
@@ -796,6 +837,9 @@ class HttpNodeControlClient:
 
     def get_object_meta(self, **kwargs):
         return self._objects().get_object_meta(**kwargs)
+
+    def has_object(self, **kwargs) -> bool:
+        return self._objects().has_object(**kwargs)
 
     def pin_object(self, **kwargs) -> bool:
         return self._objects().pin_object(**kwargs)
@@ -1195,6 +1239,71 @@ class HttpNodeControlClient:
             {"owner_client_id": owner_client_id, "service_token": service_token, "serialization_mode": effective_mode, "values": encoded_values},
         )
         return _parse_message(pb2.UpdateServiceGlobalsResponse, data)
+
+    def update_service_globals_encoded(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        prepared_keys: Sequence[str],
+        values: Optional[object] = None,
+        transport_values: Optional[pb2.TransportPayload] = None,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        del prepared_keys
+        payload: Dict[str, object] = {
+            "owner_client_id": str(owner_client_id or "").strip(),
+            "service_token": str(service_token or "").strip(),
+        }
+        if transport_values is not None and str(getattr(transport_values, "codec", "") or "").strip():
+            payload["transport_values"] = _transport_payload_meta(transport_values)
+            data = self._binary_json(
+                "POST",
+                f"/services/{quote(str(service_id), safe='')}/globals-bytes",
+                payload,
+                [bytes(transport_values.payload or b"")],
+            )
+            return _parse_message(pb2.UpdateServiceGlobalsResponse, data)
+        elif values is not None:
+            raw_values = struct_to_python(values)
+            effective_mode = detect_transport_mode(raw_values, default="legacy_v1")
+            payload["serialization_mode"] = effective_mode
+            payload["values"] = raw_values
+        else:
+            payload["serialization_mode"] = "legacy_v1"
+            payload["values"] = {}
+        data = self._json(
+            "POST",
+            f"/services/{quote(str(service_id), safe='')}/globals",
+            payload,
+        )
+        return _parse_message(pb2.UpdateServiceGlobalsResponse, data)
+
+    def update_service_globals_prepared(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        prepared_values: Dict[str, object],
+        serialization_mode: str = "",
+        effective_policy=None,
+    ) -> pb2.UpdateServiceGlobalsResponse:
+        limit_bytes = int(getattr(effective_policy, "inline_payload_hard_limit_bytes", 0) or 0) if effective_policy is not None else 0
+        effective_mode = resolve_effective_serialization_mode(request_mode=serialization_mode, context="service_owner")
+        transport_values = encode_transport_payload_bytes(
+            prepared_values or {},
+            mode=effective_mode,
+            context="service_owner",
+            limit_bytes=limit_bytes,
+        )
+        return self.update_service_globals_encoded(
+            owner_client_id=owner_client_id,
+            service_id=service_id,
+            service_token=service_token,
+            prepared_keys=sorted(str(key) for key in prepared_values.keys()),
+            transport_values=transport_values,
+        )
 
     def heartbeat_service(self, *, owner_client_id: str, service_id: str, service_token: str, seq: int = 0) -> pb2.HeartbeatServiceResponse:
         data = self._json("POST", f"/services/{quote(str(service_id), safe='')}/heartbeat", {"owner_client_id": owner_client_id, "service_token": service_token, "seq": int(seq)})

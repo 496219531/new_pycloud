@@ -123,8 +123,8 @@ JOBQUEUE_RESOLVE_REFS = _env_choice(
     {"eager", "defer_to_worker"},
 )
 
-GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
-GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
+CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
+CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
 
 NODE_WORKER_CAPACITY = _env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32)
 NODE_QUEUE_CAPACITY = _env_int("PYCLOUD_NODE_QUEUE_CAPACITY", 4000)
@@ -394,8 +394,8 @@ def reload_config() -> None:
             "defer_to_worker",
             {"eager", "defer_to_worker"},
         ),
-        GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
-        GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
+        CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
+        CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
         NODE_WORKER_CAPACITY=_env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32),
         NODE_QUEUE_CAPACITY=_env_int("PYCLOUD_NODE_QUEUE_CAPACITY", 4000),
         NODE_MAX_WORKERS=_env_int("PYCLOUD_NODE_MAX_WORKERS", 64),
@@ -404,10 +404,10 @@ def reload_config() -> None:
     )
 
 
-def grpc_channel_options() -> list[tuple[str, int]]:
+def control_channel_options() -> list[tuple[str, int]]:
     return [
-        ("grpc.max_send_message_length", int(GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES)),
-        ("grpc.max_receive_message_length", int(GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES)),
+        ("http.max_send_message_length", int(CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES)),
+        ("http.max_receive_message_length", int(CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES)),
     ]
 
 
@@ -424,8 +424,8 @@ __all__ = [
     "GATEWAY_MAX_UPLOAD_TOTAL_BYTES",
     "GATEWAY_STAGE_GC_INTERVAL_SEC",
     "GATEWAY_STAGE_TTL_SEC",
-    "GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES",
-    "GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES",
+    "CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES",
+    "CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES",
     "GatewayDataRefRelayMode",
     "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",
@@ -484,7 +484,7 @@ __all__ = [
     "get_serialization_mode",
     "get_system_mode",
     "get_trust_mode",
-    "grpc_channel_options",
+    "control_channel_options",
     "reload_config",
     "resolve_object_transfer_mode",
 ]

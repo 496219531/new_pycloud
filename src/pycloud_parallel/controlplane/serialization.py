@@ -12,7 +12,7 @@ from typing import Any, Optional, Sequence
 
 from google.protobuf import struct_pb2
 
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.config import (
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     INLINE_PAYLOAD_REQUEST_LIMIT_BYTES,

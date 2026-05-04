@@ -82,12 +82,14 @@ def test_api_service_module_exposes_only_service():
         assert not hasattr(gateway, "update_globals")
     finally:
         discovery.close()
-    gateway.close()
+        gateway.close()
 
 
 def test_api_service_connect_no_longer_exposes_policy_id():
     assert "policy_id" not in inspect.signature(ApiService.connect).parameters
     assert "policy_id" not in inspect.signature(ApiService.deploy).parameters
+    assert "nodecontrol_transport" not in inspect.signature(ApiService.deploy).parameters
+    assert "replace_existing" in inspect.signature(ApiService.startup).parameters
 
 
 def test_api_pool_module_exposes_only_task_pool():

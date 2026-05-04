@@ -66,7 +66,7 @@ def _try_bind_infra_exports() -> None:
         from .policy_profile import PolicyProfile
     except ModuleNotFoundError as exc:
         missing = str(getattr(exc, "name", "") or "")
-        if missing in {"grpc", "google", "protobuf"} or missing.startswith("google."):
+        if missing in {"google", "protobuf"} or missing.startswith("google."):
             return
         raise
 

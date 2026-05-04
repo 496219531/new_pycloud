@@ -9,8 +9,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from pycloud_parallel.controlplane.config import (
     GATEWAY_MAX_UPLOAD_FILE_BYTES,
     GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
-    GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES,
-    GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES,
+    CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES,
+    CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES,
 )
 from pycloud_parallel.controlplane.http_gateway import MAX_BODY_BYTES as HTTP_MAX_BODY_BYTES
 from pycloud_parallel.controlplane.serialization_mode import SUPPORTED_SERIALIZATION_MODES, normalize_serialization_mode
@@ -35,8 +35,8 @@ class NodeCapability:
     supports_http_bytes_transport: bool = False
     supports_http_nodecontrol: bool = False
     node_http_base_url: str = ""
-    max_grpc_send_bytes: int = 0
-    max_grpc_recv_bytes: int = 0
+    max_control_send_bytes: int = 0
+    max_control_recv_bytes: int = 0
     max_http_body_bytes: int = 0
     max_upload_file_bytes: int = 0
     max_upload_total_bytes: int = 0
@@ -47,8 +47,8 @@ class NodeCapability:
         object.__setattr__(self, "supports_http_bytes_transport", bool(self.supports_http_bytes_transport))
         object.__setattr__(self, "supports_http_nodecontrol", bool(self.supports_http_nodecontrol))
         object.__setattr__(self, "node_http_base_url", str(self.node_http_base_url or "").strip())
-        object.__setattr__(self, "max_grpc_send_bytes", max(0, int(self.max_grpc_send_bytes or 0)))
-        object.__setattr__(self, "max_grpc_recv_bytes", max(0, int(self.max_grpc_recv_bytes or 0)))
+        object.__setattr__(self, "max_control_send_bytes", max(0, int(self.max_control_send_bytes or 0)))
+        object.__setattr__(self, "max_control_recv_bytes", max(0, int(self.max_control_recv_bytes or 0)))
         object.__setattr__(self, "max_http_body_bytes", max(0, int(self.max_http_body_bytes or 0)))
         object.__setattr__(self, "max_upload_file_bytes", max(0, int(self.max_upload_file_bytes or 0)))
         object.__setattr__(self, "max_upload_total_bytes", max(0, int(self.max_upload_total_bytes or 0)))
@@ -60,8 +60,8 @@ class NodeCapability:
             "supports_http_bytes_transport": bool(self.supports_http_bytes_transport),
             "supports_http_nodecontrol": bool(self.supports_http_nodecontrol),
             "node_http_base_url": str(self.node_http_base_url or ""),
-            "max_grpc_send_bytes": int(self.max_grpc_send_bytes),
-            "max_grpc_recv_bytes": int(self.max_grpc_recv_bytes),
+            "max_control_send_bytes": int(self.max_control_send_bytes),
+            "max_control_recv_bytes": int(self.max_control_recv_bytes),
             "max_http_body_bytes": int(self.max_http_body_bytes),
             "max_upload_file_bytes": int(self.max_upload_file_bytes),
             "max_upload_total_bytes": int(self.max_upload_total_bytes),
@@ -77,15 +77,15 @@ class NodeCapability:
             supports_http_bytes_transport=bool(payload.get("supports_http_bytes_transport", False)),
             supports_http_nodecontrol=bool(payload.get("supports_http_nodecontrol", False)),
             node_http_base_url=str(payload.get("node_http_base_url", "") or ""),
-            max_grpc_send_bytes=int(payload.get("max_grpc_send_bytes", 0) or 0),
-            max_grpc_recv_bytes=int(payload.get("max_grpc_recv_bytes", 0) or 0),
+            max_control_send_bytes=int(payload.get("max_control_send_bytes", 0) or 0),
+            max_control_recv_bytes=int(payload.get("max_control_recv_bytes", 0) or 0),
             max_http_body_bytes=int(payload.get("max_http_body_bytes", 0) or 0),
             max_upload_file_bytes=int(payload.get("max_upload_file_bytes", 0) or 0),
             max_upload_total_bytes=int(payload.get("max_upload_total_bytes", 0) or 0),
         )
 
-    def grpc_payload_limit_bytes(self) -> float:
-        limits = [value for value in (self.max_grpc_send_bytes, self.max_grpc_recv_bytes) if int(value or 0) > 0]
+    def control_payload_limit_bytes(self) -> float:
+        limits = [value for value in (self.max_control_send_bytes, self.max_control_recv_bytes) if int(value or 0) > 0]
         if not limits:
             return inf
         return float(min(limits))
@@ -102,8 +102,8 @@ class NodeCapability:
                 bool(self.supports_transport_payload_bytes),
                 bool(self.supports_http_bytes_transport),
                 bool(self.supports_http_nodecontrol),
-                int(self.max_grpc_send_bytes or 0) > 0,
-                int(self.max_grpc_recv_bytes or 0) > 0,
+                int(self.max_control_send_bytes or 0) > 0,
+                int(self.max_control_recv_bytes or 0) > 0,
                 int(self.max_http_body_bytes or 0) > 0,
                 int(self.max_upload_file_bytes or 0) > 0,
                 int(self.max_upload_total_bytes or 0) > 0,
@@ -118,8 +118,8 @@ def detect_local_node_capability(
     supports_http_bytes_transport: Optional[bool] = None,
     supports_http_nodecontrol: Optional[bool] = None,
     node_http_base_url: str = "",
-    max_grpc_send_bytes: Optional[int] = None,
-    max_grpc_recv_bytes: Optional[int] = None,
+    max_control_send_bytes: Optional[int] = None,
+    max_control_recv_bytes: Optional[int] = None,
     max_http_body_bytes: Optional[int] = None,
     max_upload_file_bytes: Optional[int] = None,
     max_upload_total_bytes: Optional[int] = None,
@@ -130,11 +130,11 @@ def detect_local_node_capability(
         supports_http_bytes_transport=True if supports_http_bytes_transport is None else bool(supports_http_bytes_transport),
         supports_http_nodecontrol=True if supports_http_nodecontrol is None else bool(supports_http_nodecontrol),
         node_http_base_url=str(node_http_base_url or "").strip(),
-        max_grpc_send_bytes=int(
-            GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES if max_grpc_send_bytes is None else max_grpc_send_bytes
+        max_control_send_bytes=int(
+            CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES if max_control_send_bytes is None else max_control_send_bytes
         ),
-        max_grpc_recv_bytes=int(
-            GRPC_MAX_RECEIVE_MESSAGE_LENGTH_BYTES if max_grpc_recv_bytes is None else max_grpc_recv_bytes
+        max_control_recv_bytes=int(
+            CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES if max_control_recv_bytes is None else max_control_recv_bytes
         ),
         max_http_body_bytes=int(HTTP_MAX_BODY_BYTES if max_http_body_bytes is None else max_http_body_bytes),
         max_upload_file_bytes=int(
@@ -156,8 +156,8 @@ def capability_from_candidate(value: object) -> Optional[NodeCapability]:
             "supports_http_bytes_transport",
             "supports_http_nodecontrol",
             "node_http_base_url",
-            "max_grpc_send_bytes",
-            "max_grpc_recv_bytes",
+            "max_control_send_bytes",
+            "max_control_recv_bytes",
             "max_http_body_bytes",
             "max_upload_file_bytes",
             "max_upload_total_bytes",

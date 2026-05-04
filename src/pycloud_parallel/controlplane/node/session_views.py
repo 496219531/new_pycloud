@@ -9,7 +9,7 @@ from typing import Dict, List, Sequence, Tuple
 from pycloud_parallel.controlplane.infocenter.models import NodeTaskPoolInfo
 from pycloud_parallel.controlplane.node.models import ServiceSession, TaskPoolState
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def warmup_fanout(worker_count: int) -> int:

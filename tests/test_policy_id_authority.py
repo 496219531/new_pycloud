@@ -12,6 +12,7 @@ def test_public_api_signatures_do_not_expose_policy_id():
     assert "policy_id" not in inspect.signature(Service.connect).parameters
     assert "policy_id" not in inspect.signature(Service.deploy).parameters
     assert "policy_id" not in inspect.signature(TaskPool.open).parameters
+    assert "nodecontrol_transport" not in inspect.signature(Service.deploy).parameters
     assert "policy_id" not in inspect.signature(JobQueue.__init__).parameters
     assert "policy_id" not in inspect.signature(JobQueue.connect).parameters
 

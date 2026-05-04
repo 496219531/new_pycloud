@@ -34,7 +34,7 @@ from pycloud_parallel.controlplane.infocenter.models import (
 )
 from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 from pycloud_parallel.controlplane.state_time import utc_now
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 MAX_BODY_BYTES = 64 * 1024 * 1024

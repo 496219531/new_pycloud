@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from urllib.request import Request
 
 from pycloud_parallel.controlplane.client_transport import _call_route_http
 from pycloud_parallel.controlplane.effective_policy import (
@@ -14,7 +15,7 @@ from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.execution.task_pool import _node_control_target_for_node as _taskpool_nodecontrol_target
 from pycloud_parallel.execution.service_session import _node_control_target_for_node as _service_nodecontrol_target
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _policy(
@@ -150,66 +151,74 @@ def test_call_route_http_can_use_bytes_for_structured_when_policy_enables(monkey
 
 
 def test_node_control_client_uses_struct_payload_when_transport_lane_disabled():
-    client = NodeControlClient.__new__(NodeControlClient)
-    client.timeout_sec = 5.0
     captured = {}
 
-    def _fake_call_service(request, timeout):  # noqa: ARG001
-        captured["request"] = request
-        return pb2.CallServiceResponse(ok=True, service_id="svc-1", method="run")
+    def _fake_urlopen(req: Request, timeout):  # noqa: ARG001
+        captured["request"] = req
+        captured["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+        body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
+        return _FakeHttpResponse(body, {"Content-Type": "application/json"})
 
-    client.stub = SimpleNamespace(CallService=_fake_call_service)
+    from pycloud_parallel.controlplane import node_control_http
 
-    NodeControlClient.call_service(
-        client,
-        service_id="svc-1",
-        method="run",
-        payload={"value": 1},
-        serialization_mode="pickle_stable_v1",
-        effective_policy=_policy(
-            resolved_mode="pickle_stable_v1",
-            allowed_modes=("pickle_stable_v1", "structured_v1"),
-            use_transport_payload_bytes=False,
-            use_http_bytes_transport=False,
-        ),
-    )
+    original_urlopen = node_control_http.urlopen
+    node_control_http.urlopen = _fake_urlopen
+    try:
+        client = NodeControlClient("http://127.0.0.1:18061", timeout_sec=5.0)
+        NodeControlClient.call_service(
+            client,
+            service_id="svc-1",
+            method="run",
+            payload={"value": 1},
+            serialization_mode="pickle_stable_v1",
+            effective_policy=_policy(
+                resolved_mode="pickle_stable_v1",
+                allowed_modes=("pickle_stable_v1", "structured_v1"),
+                use_transport_payload_bytes=False,
+                use_http_bytes_transport=False,
+            ),
+        )
+    finally:
+        node_control_http.urlopen = original_urlopen
 
-    request = captured["request"]
-    assert not request.HasField("transport_payload")
-    assert request.payload.fields
+    assert captured["request"].full_url.endswith("/services/svc-1/call/run")
+    assert captured["body"]["payload"]["__pycloud_transport__"]["codec"] == "pickle_stable_v1"
 
 
 def test_node_control_client_can_use_transport_lane_for_structured_mode():
-    client = NodeControlClient.__new__(NodeControlClient)
-    client.timeout_sec = 5.0
     captured = {}
 
-    def _fake_call_service(request, timeout):  # noqa: ARG001
-        captured["request"] = request
-        return pb2.CallServiceResponse(ok=True, service_id="svc-1", method="run")
+    def _fake_urlopen(req: Request, timeout):  # noqa: ARG001
+        captured["body"] = json.loads((req.data or b"{}").decode("utf-8"))
+        body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
+        return _FakeHttpResponse(body, {"Content-Type": "application/json"})
 
-    client.stub = SimpleNamespace(CallService=_fake_call_service)
+    from pycloud_parallel.controlplane import node_control_http
 
-    NodeControlClient.call_service(
-        client,
-        service_id="svc-1",
-        method="run",
-        payload={"value": 1},
-        serialization_mode="structured_v1",
-        effective_policy=_policy(
-            resolved_mode="structured_v1",
-            allowed_modes=("structured_v1", "legacy_v1"),
-            use_transport_payload_bytes=True,
-            use_http_bytes_transport=True,
-        ),
-    )
+    original_urlopen = node_control_http.urlopen
+    node_control_http.urlopen = _fake_urlopen
+    try:
+        client = NodeControlClient("http://127.0.0.1:18061", timeout_sec=5.0)
+        NodeControlClient.call_service(
+            client,
+            service_id="svc-1",
+            method="run",
+            payload={"value": 1},
+            serialization_mode="structured_v1",
+            effective_policy=_policy(
+                resolved_mode="structured_v1",
+                allowed_modes=("structured_v1", "legacy_v1"),
+                use_transport_payload_bytes=True,
+                use_http_bytes_transport=True,
+            ),
+        )
+    finally:
+        node_control_http.urlopen = original_urlopen
 
-    request = captured["request"]
-    assert request.HasField("transport_payload")
-    assert request.transport_payload.codec == "structured_v1"
+    assert captured["body"]["payload"]["__pycloud_transport__"]["codec"] == "structured_v1"
 
 
-def test_nodecontrol_transport_auto_prefers_http_capability():
+def test_nodecontrol_target_uses_http_capability():
     node = InfoCenterNode(
         node_instance_id="node-inst",
         node_id="node-1",
@@ -226,12 +235,12 @@ def test_nodecontrol_transport_auto_prefers_http_capability():
         ),
     )
 
-    assert _taskpool_nodecontrol_target(node, transport="auto") == "http://127.0.0.1:18061"
-    assert _service_nodecontrol_target(node, transport="http") == "http://127.0.0.1:18061"
+    assert _taskpool_nodecontrol_target(node) == "http://127.0.0.1:18061"
+    assert _service_nodecontrol_target(node) == "http://127.0.0.1:18061"
     assert node.capability.to_dict()["supports_http_nodecontrol"] is True
 
 
-def test_nodecontrol_transport_auto_falls_back_to_grpc_control_addr():
+def test_nodecontrol_target_falls_back_to_control_addr_when_http_missing():
     node = InfoCenterNode(
         node_instance_id="node-inst",
         node_id="node-1",
@@ -244,5 +253,5 @@ def test_nodecontrol_transport_auto_falls_back_to_grpc_control_addr():
         credit=32,
     )
 
-    assert _taskpool_nodecontrol_target(node, transport="auto") == "127.0.0.1:50061"
-    assert _service_nodecontrol_target(node, transport="grpc") == "127.0.0.1:50061"
+    assert _taskpool_nodecontrol_target(node) == "127.0.0.1:50061"
+    assert _service_nodecontrol_target(node) == "127.0.0.1:50061"

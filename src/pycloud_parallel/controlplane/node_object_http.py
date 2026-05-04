@@ -18,13 +18,12 @@ from urllib.request import Request, urlopen
 from pycloud_parallel.controlplane.http_client import target_to_base_url
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.controlplane.services import _expected_object_id
 from pycloud_parallel.data.ref import (
     DataRef,
     normalize_object_format,
     object_id_from_sha256_hex,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 MAX_OBJECT_HTTP_BODY_BYTES = 512 * 1024 * 1024
@@ -60,6 +59,25 @@ def _object_ref(*, object_id: str, format: str, size_bytes: int, control_addr: s
         locator_token=str(control_addr or "").strip(),
         control_addr=str(control_addr or "").strip(),
     )
+
+
+def _normalize_object_integrity_mode(meta: pb2.UploadObjectMeta) -> str:
+    requested = str(getattr(meta, "integrity_mode", "") or "").strip().lower()
+    if requested in {"client_declared", "server_authoritative"}:
+        return requested
+    if str(getattr(meta, "object_id", "") or "").strip():
+        return "client_declared"
+    return "server_authoritative"
+
+
+def _expected_object_id(meta: pb2.UploadObjectMeta, actual_sha256: str) -> str:
+    authoritative_object_id = object_id_from_sha256_hex(str(actual_sha256 or "").strip().lower())
+    if _normalize_object_integrity_mode(meta) == "server_authoritative":
+        return authoritative_object_id
+    declared_object_id = str(getattr(meta, "object_id", "") or "").strip()
+    if not declared_object_id:
+        raise ValueError("object_id is required when integrity_mode=client_declared")
+    return declared_object_id
 
 
 class NodeObjectHttpApp:

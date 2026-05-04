@@ -8,10 +8,7 @@ import logging
 from pathlib import Path
 import re
 import signal
-from concurrent import futures
 from typing import Callable, Optional, Tuple
-
-import grpc
 
 from pycloud_parallel.controlplane.config import (
     NODE_MAX_WORKERS,
@@ -20,7 +17,6 @@ from pycloud_parallel.controlplane.config import (
     EXECUTOR_BACKEND,
     SERVICE_DEFAULT_WORKERS,
     SERVICE_HEARTBEAT_TIMEOUT_SEC,
-    grpc_channel_options,
 )
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp, GatewayHttpServer
@@ -34,10 +30,8 @@ from pycloud_parallel.controlplane.job_queue import JobQueueManager
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port, resolve_public_host, split_host_port
 from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
-from pycloud_parallel.controlplane.services import NodeControlService
 from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +197,8 @@ def build_nodecontrol_server(
     service_default_worker_count: int = SERVICE_DEFAULT_WORKERS,
     service_default_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
     on_service_routes_changed: Optional[Callable[[], None]] = None,
-) -> Tuple[grpc.Server, NodeControlState]:
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=max(1, max_workers)),
-        options=grpc_channel_options(),
-    )
+) -> Tuple[NodeControlHttpServer, NodeControlState]:
+    del max_workers
     state = NodeControlState(
         node_id=node_id,
         artifact_dir=artifact_dir or _default_nodecontrol_artifact_dir(bind=bind, node_id=node_id),
@@ -220,11 +211,11 @@ def build_nodecontrol_server(
         service_default_worker_count=service_default_worker_count,
         service_default_heartbeat_timeout_sec=service_default_heartbeat_timeout_sec,
     )
-    pb2_grpc.add_NodeControlServiceServicer_to_server(
-        NodeControlService(state, on_service_routes_changed=on_service_routes_changed),
-        server,
+    server = NodeControlHttpServer(
+        bind=bind,
+        state=state,
+        on_service_routes_changed=on_service_routes_changed,
     )
-    server.add_insecure_port(bind)
     return server, state
 
 
@@ -239,7 +230,7 @@ def _wait_until_stopped(
     设置信号处理器，在收到 SIGINT/SIGTERM 时优雅关闭服务器。
 
     Args:
-        server: gRPC 服务器
+        server: control-plane server
         on_stop: 停止前调用的回调函数
     """
     server.start()
@@ -253,7 +244,10 @@ def _wait_until_stopped(
             return
         stop_called = True
         on_stop()
-        server.stop(grace=3)
+        try:
+            server.stop(grace=3)
+        except TypeError:
+            server.stop()
 
     # Windows compatibility: not every signal is always available.
     for sig_name in ("SIGINT", "SIGTERM"):
@@ -286,7 +280,7 @@ def main() -> None:
     parser.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS)
     parser.add_argument("--service-http-bind", default="")
     parser.add_argument("--service-http-base-url", default="")
-    parser.add_argument("--node-http-bind", default="", help="optional HTTP NodeControl bind address; disabled when empty")
+    parser.add_argument("--node-http-bind", default="", help="HTTP NodeControl bind address; defaults to --bind for nodecontrol")
     parser.add_argument("--node-http-base-url", default="", help="public base URL for HTTP NodeControl; derived from --node-http-bind when omitted")
     parser.add_argument(
         "--executor-backend",
@@ -309,7 +303,7 @@ def main() -> None:
         default_port = (
             50051
             if args.role in ("infocenter", "controlplane")
-            else (50052 if args.role == "gateway" else (50053 if args.role == "joborchestrator" else 50061))
+            else (50052 if args.role == "gateway" else (50053 if args.role == "joborchestrator" else 18061))
         )
         args.bind = format_host_port(detect_local_ip(remote_hint=str(args.infocenter_addr or "")), default_port)
     if args.role == "nodecontrol" and not str(args.service_http_bind or "").strip():
@@ -388,29 +382,25 @@ def main() -> None:
     bind = _resolve_bind(args.bind, remote_hint=args.infocenter_addr)
     service_http_bind = _resolve_bind(args.service_http_bind, remote_hint=args.infocenter_addr)
     advertise_addr = str(args.advertise_addr or "").strip()
-    if not advertise_addr:
-        advertise_host, advertise_port = split_host_port(bind)
-        advertise_addr = format_host_port(resolve_public_host(advertise_host, remote_hint=args.infocenter_addr), advertise_port)
     service_http_base_url = str(args.service_http_base_url or "").strip()
     if not service_http_base_url:
-        advertise_host, _advertise_port = split_host_port(advertise_addr)
+        advertise_host, _advertise_port = split_host_port(bind)
         _service_host, service_port = split_host_port(service_http_bind)
         service_http_base_url = f"http://{resolve_public_host(advertise_host, remote_hint=args.infocenter_addr)}:{int(service_port)}"
-    node_http_bind = str(args.node_http_bind or "").strip()
+    node_http_bind = str(args.node_http_bind or "").strip() or bind
     node_http_base_url = str(args.node_http_base_url or "").strip()
-    if node_http_bind:
-        node_http_bind = _resolve_bind(node_http_bind, remote_hint=args.infocenter_addr)
-        if not node_http_base_url:
-            advertise_host, _advertise_port = split_host_port(advertise_addr)
-            _node_http_host, node_http_port = split_host_port(node_http_bind)
-            node_http_base_url = f"http://{resolve_public_host(advertise_host, remote_hint=args.infocenter_addr)}:{int(node_http_port)}"
+    node_http_bind = _resolve_bind(node_http_bind, remote_hint=args.infocenter_addr)
+    if not node_http_base_url:
+        node_http_host, node_http_port = split_host_port(node_http_bind)
+        node_http_base_url = f"http://{resolve_public_host(node_http_host, remote_hint=args.infocenter_addr)}:{int(node_http_port)}"
+    if not advertise_addr:
+        advertise_addr = node_http_base_url
     logger.info(
-        "[Server] starting NodeControl bind=%s node_id=%s infocenter=%s advertise=%s node_http=%s log_level=%s",
-        bind,
+        "[Server] starting NodeControl HTTP bind=%s node_id=%s infocenter=%s advertise=%s log_level=%s",
+        node_http_bind,
         args.node_id,
         args.infocenter_addr,
         advertise_addr,
-        node_http_base_url or "-",
         level_name,
     )
     node_tags = [x.strip() for x in args.node_tags.split(",") if x.strip()]
@@ -423,7 +413,7 @@ def main() -> None:
             registrar.request_sync()
 
     server, state = build_nodecontrol_server(
-        bind,
+        node_http_bind,
         node_id=args.node_id,
         artifact_dir=str(args.artifact_dir or "").strip(),
         queue_capacity=args.queue_capacity,
@@ -437,23 +427,14 @@ def main() -> None:
         service_default_heartbeat_timeout_sec=args.service_heartbeat_timeout_sec,
         on_service_routes_changed=_sync_routes_now,
     )
-    node_http_server: Optional[NodeControlHttpServer] = None
-    if node_http_bind:
-        node_http_server = NodeControlHttpServer(
-            bind=node_http_bind,
-            state=state,
-            on_service_routes_changed=_sync_routes_now,
-        )
-        node_http_server.start()
-        if not state.node_http_base_url:
-            state.node_http_base_url = node_http_server.base_url
+    node_http_server: Optional[NodeControlHttpServer] = server
 
     registrar: Optional[NodeInfoCenterRegistrar] = None
     if args.infocenter_addr:
         registrar = NodeInfoCenterRegistrar(
             infocenter_addr=args.infocenter_addr,
             node_id=args.node_id,
-            control_addr=advertise_addr,
+            control_addr=node_http_base_url,
             state=state,
             capacity=args.worker_capacity,
             queue_capacity=args.queue_capacity,
@@ -464,8 +445,7 @@ def main() -> None:
         registrar_holder["value"] = registrar
 
     def _on_start() -> None:
-        if node_http_server is not None:
-            logger.info("[Server] HTTP NodeControl started base_url=%s", node_http_server.base_url)
+        logger.info("[Server] HTTP NodeControl started base_url=%s", node_http_server.base_url)
         if registrar is not None:
             logger.info(
                 "[Server] NodeControl registrar start node_id=%s infocenter=%s advertise=%s",
@@ -479,9 +459,7 @@ def main() -> None:
         if registrar is not None:
             logger.info("[Server] NodeControl registrar stop node_id=%s", args.node_id)
             registrar.close()
-        if node_http_server is not None:
-            logger.info("[Server] HTTP NodeControl stop base_url=%s", node_http_server.base_url)
-            node_http_server.stop()
+        logger.info("[Server] HTTP NodeControl stop base_url=%s", node_http_server.base_url)
         state.close()
 
     _wait_until_stopped(server, on_stop=_on_stop, on_start=_on_start)

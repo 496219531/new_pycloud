@@ -21,7 +21,7 @@ from pycloud_parallel.controlplane.serialization import (
     dict_to_struct,
     value_to_transport_payload,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 StoredResultArtifact = StoredDataArtifact
 

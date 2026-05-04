@@ -15,7 +15,7 @@ from pycloud_parallel.controlplane.session_model import (
     ExecutionSessionStatus,
     SessionLease,
 )
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 @dataclass(frozen=True)

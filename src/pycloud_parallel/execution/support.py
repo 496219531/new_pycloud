@@ -30,7 +30,7 @@ from pycloud_parallel.controlplane.artifact import (
 )
 from pycloud_parallel.controlplane.config import (
     FILE_HASH_CHUNK_SIZE_BYTES,
-    GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES,
+    CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES,
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
@@ -638,7 +638,7 @@ def _managed_globals_effective_inline_limit(
         1,
         min(
             int(policy.inline_payload_hard_limit_bytes),
-            int(GRPC_MAX_SEND_MESSAGE_LENGTH_BYTES),
+            int(CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES),
         ),
     )
 
@@ -754,7 +754,7 @@ def _prepare_managed_globals_batches_for_upload(
             "batch_bytes": [empty_size],
             "staged_keys": [],
             "inline_keys": [],
-            "effective_grpc_limit_bytes": limit_bytes,
+            "effective_control_limit_bytes": limit_bytes,
         }
 
     for raw_name, raw_value in (values or {}).items():
@@ -786,7 +786,7 @@ def _prepare_managed_globals_batches_for_upload(
             )
             if single_size > limit_bytes:
                 raise ValueError(
-                    "managed global remains above effective gRPC limit after staging: "
+                    "managed global remains above effective control-plane limit after staging: "
                     f"key={name!r} size_bytes={single_size} limit_bytes={limit_bytes}"
                 )
 
@@ -822,7 +822,7 @@ def _prepare_managed_globals_batches_for_upload(
         "batch_bytes": batch_bytes,
         "staged_keys": sorted(staged_keys),
         "inline_keys": sorted(inline_keys),
-        "effective_grpc_limit_bytes": limit_bytes,
+        "effective_control_limit_bytes": limit_bytes,
     }
 
 

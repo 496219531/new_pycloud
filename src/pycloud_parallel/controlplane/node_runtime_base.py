@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from pycloud_parallel.controlplane.http_gateway import ExtraGetHandler, MethodsHandler, ServiceHttpGateway, StreamingHttpResponse
 from pycloud_parallel.controlplane.netutil import format_host_port, split_host_port
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 def _invoke_python_callable(

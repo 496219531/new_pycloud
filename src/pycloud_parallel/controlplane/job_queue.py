@@ -43,7 +43,7 @@ from pycloud_parallel.controlplane.node.execution import (
     _purge_loaded_artifact_modules,
 )
 from pycloud_parallel.execution.task_pool import TaskPool
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
 

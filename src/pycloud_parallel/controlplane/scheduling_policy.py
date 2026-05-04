@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Shared scheduling predicates for node and service routing."""
 
-from pycloud_parallel.grpc.v1 import pycloud_v1_pb2 as pb2
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 ACTIVE_SERVICE_STATUSES = {
