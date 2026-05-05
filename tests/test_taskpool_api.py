@@ -2,10 +2,14 @@ from __future__ import annotations
 
 """Tests for the V1 task-pool-facing API helpers."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.execution.task_pool import TaskPool
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_taskpool_route_summary_reports_fixed_routes():
@@ -42,6 +46,23 @@ def test_taskpool_route_summary_reports_fixed_routes():
             "owner_client_id": "owner-1",
         }
     ]
+
+
+def test_taskpool_runtime_boundary_does_not_use_service_discovery_surface() -> None:
+    text = (ROOT / "src/pycloud_parallel/execution/task_pool.py").read_text(encoding="utf-8")
+    assert "service_name=" not in text
+    assert "list_service_routes(" not in text
+    assert ".call_service(" not in text
+    assert "/services/" not in text
+
+
+def test_taskpool_runtime_boundary_keeps_taskpool_protocol_and_capacity_account() -> None:
+    taskpool_text = (ROOT / "src/pycloud_parallel/execution/task_pool.py").read_text(encoding="utf-8")
+    node_text = (ROOT / "src/pycloud_parallel/controlplane/nodecontrol_state.py").read_text(encoding="utf-8")
+    assert "submit_pool_tasks" in taskpool_text
+    assert "pull_pool_results" in taskpool_text
+    assert "task_pool_worker_capacity" in node_text
+    assert "service_worker_capacity" in node_text
 
 
 def test_taskpool_try_compensate_replicas_adds_newly_available_node(monkeypatch) -> None:

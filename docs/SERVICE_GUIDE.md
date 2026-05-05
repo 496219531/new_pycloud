@@ -19,6 +19,14 @@
 5. 正常退出时 `EndService`
 6. 可选声明 `deps=ArtifactDeps.allow_install(...)`
 
+`Service` 的边界：
+
+1. `Service` 是 public、discovery-aware 的 remote service
+2. 运行时协议是 `call / stream`
+3. 它不会改成 taskpool 的 `submit / results` 模型
+4. 虽然它和 `TaskPool` 共享一些底座，但不共享 runtime protocol
+5. startup service 可以复用 service route/call/status 模型，但不等于中心统一 deploy 的多副本 service
+
 ## 1. 基本用法
 
 ```python
@@ -124,6 +132,10 @@ finally:
 4. 如果所有已部署 session 的 keepalive 连续失败，`join()` 会退出，并在 `stderr` 打印失败节点与原因
 5. 如果部署目标数未满足，owner keepalive 会定期尝试动态补偿；失败的旧实例不会占用目标副本数
 6. 如果需要动态扩容，应由同一个部署端提高 `node_count` 后重启/恢复 deploy session；快速重启会接回本 owner 已经部署的同 code version 服务，再由 keepalive 补齐新增节点
+
+更多边界说明见：
+
+- [SERVICE_TASKPOOL_BOUNDARY.md](SERVICE_TASKPOOL_BOUNDARY.md)
 
 ## 3. 调用体验
 

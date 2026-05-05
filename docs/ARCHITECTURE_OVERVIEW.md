@@ -339,6 +339,12 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 
 client/controlplane 侧允许 `service` 和 `taskpool` 共享一套轻量会话视图模型：`SessionIdentity`、`SessionLease`、`SessionBinding`、`ExecutionReplicaSnapshot`、`ExecutionSessionStatus`。这只用于表达身份、租约、绑定和副本状态。
 
+可以把这层理解成 shared substrate，而不是 shared protocol：
+
+1. 共享底座回答的是“这个远端会话是谁、活着没有、租约多久、有哪些 replica”
+2. 业务协议回答的是“怎么发现它、怎么调用它、怎么提交任务、怎么拿结果”
+3. `service` 和 `taskpool` 只共享前者，故意不共享后者
+
 边界：
 
 1. `service` 仍然是 public、discovery-aware 的 remote session

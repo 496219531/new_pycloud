@@ -81,6 +81,14 @@ client.submit(
 10. queue / pool / 并发窗口等调度细节由 `job-orchestrator` 负责，不再从 client helper 暴露
 11. `JobQueue` 在真正创建 `TaskPool` 时，会按统一 scheduler 的 `JOBQUEUE_DEFAULT` profile 选节点
 
+`TaskPool` 的边界：
+
+1. `TaskPool` 是 private、owner-only 的 remote worker pool
+2. 运行时协议是 `submit / results / map`
+3. 它不会注册成 service route，也不会进入 `service_name` discovery 空间
+4. 它保留 bytes batch submit/results 协议，因为这条链路服务于批量异步和性能
+5. 虽然它和 `Service` 共享一些底座，但不共享 runtime call 协议
+
 补充边界：
 
 1. `JobQueue` 高层 hook 现在统一以 `index` 标识子任务
@@ -137,3 +145,4 @@ print(final["job"]["status"])
 - [QUICK_START.md](QUICK_START.md)
 - [TASK_MODE.md](TASK_MODE.md)
 - [SERVICE_GUIDE.md](SERVICE_GUIDE.md)
+- [SERVICE_TASKPOOL_BOUNDARY.md](SERVICE_TASKPOOL_BOUNDARY.md)

@@ -17,6 +17,14 @@
 5. `Service / TaskPool / JobQueue` 当前共用统一 scheduler 核心来回答“这次该选谁”
 6. `TaskPool` 的批量 refill / `Service` 的 RPC 发送循环仍然各自保留，不强行混成一套
 
+边界：
+
+1. `Service` 面向 `call / stream`
+2. `TaskPool` 面向 `submit / map / results`
+3. 两者共享的是 session/status model、transport helper、create pipeline 和 node create skeleton
+4. 两者不共享 runtime protocol、service discovery、`service_name` namespace 或资源账户
+5. `TaskPool` 不是 `Service` 的别名，`Service` 也不是 pool task submit 的包装
+
 分工：
 
 | 类 | 模式 | 用途 |
@@ -32,6 +40,7 @@
 - [QUICK_START.md](QUICK_START.md)
 - [TASK_CLIENT_GUIDE.md](TASK_CLIENT_GUIDE.md)
 - [SERVICE_GUIDE.md](SERVICE_GUIDE.md)
+- [SERVICE_TASKPOOL_BOUNDARY.md](SERVICE_TASKPOOL_BOUNDARY.md)
 - [SERVICE_GATEWAY_GUIDE.md](SERVICE_GATEWAY_GUIDE.md)
 
 ## 序列化模式

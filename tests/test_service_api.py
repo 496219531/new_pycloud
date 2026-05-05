@@ -20,6 +20,9 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.execution.service_session import Service
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def _build_service_entry_module(tmp_path, monkeypatch):
     package_name = "demo_service_pkg_entry"
     sys.modules.pop(package_name, None)
@@ -85,6 +88,19 @@ def test_service_route_summary_reports_fixed_routes():
             "http_base_url": "http://10.0.0.1:18081/svc/svc-1",
         }
     ]
+
+
+def test_service_runtime_boundary_does_not_use_taskpool_protocol_surface() -> None:
+    text = (ROOT / "src/pycloud_parallel/execution/service_session.py").read_text(encoding="utf-8")
+    assert "/taskpools/" not in text
+    assert "submit_pool_tasks" not in text
+    assert "pull_pool_results" not in text
+
+
+def test_service_runtime_boundary_keeps_service_discovery_and_namespace() -> None:
+    text = (ROOT / "src/pycloud_parallel/execution/service_session.py").read_text(encoding="utf-8")
+    assert "service_name" in text
+    assert "list_service_routes" in text
 
 
 def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):

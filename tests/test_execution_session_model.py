@@ -338,6 +338,68 @@ def test_build_execution_session_status_is_shared_for_service_and_task_pool() ->
     assert task_status.alive is True
     assert service_status.kind == "service"
     assert task_status.kind == "task_pool"
+    assert service_status.replicas["node-inst-1"].session_id == "svc-1"
+    assert task_status.replicas["node-inst-1"].session_id == "pool-1"
+
+
+def test_shared_session_model_does_not_imply_shared_runtime_protocol() -> None:
+    from pycloud_parallel.controlplane.session_model import ExecutionReplicaSnapshot, SessionLease, build_execution_session_status
+
+    now = _utc_now()
+    lease = SessionLease(
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+    )
+    service_status = build_execution_session_status(
+        kind="service",
+        replicas={
+            "node-inst-1": ExecutionReplicaSnapshot(
+                kind="service",
+                node_instance_id="node-inst-1",
+                node_id="node-1",
+                session_id="svc-1",
+                session_name="svc-demo",
+                code_version="sha256:" + ("3" * 64),
+                worker_count=1,
+                alive=True,
+                status="RUNNING",
+                lease_expire_at=lease.lease_expire_at,
+            )
+        },
+        failures={},
+        failed=False,
+        closed=False,
+        leases={"node-inst-1": lease},
+    )
+    task_status = build_execution_session_status(
+        kind="task_pool",
+        replicas={
+            "node-inst-1": ExecutionReplicaSnapshot(
+                kind="task_pool",
+                node_instance_id="node-inst-1",
+                node_id="node-1",
+                session_id="pool-1",
+                session_name="pool-demo",
+                code_version="sha256:" + ("4" * 64),
+                worker_count=1,
+                alive=True,
+                status="RUNNING",
+                lease_expire_at=lease.lease_expire_at,
+            )
+        },
+        failures={},
+        failed=False,
+        closed=False,
+        leases={"node-inst-1": lease},
+    )
+
+    assert service_status.kind == "service"
+    assert task_status.kind == "task_pool"
+    assert service_status.replicas["node-inst-1"].session_name == "svc-demo"
+    assert task_status.replicas["node-inst-1"].session_name == "pool-demo"
 
 
 def test_task_pool_session_put_data_uses_shared_client_upload_path(monkeypatch) -> None:
