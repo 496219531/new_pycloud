@@ -5,12 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Dict, Optional, Sequence
 
-from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
-from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, payload_policy_from_effective_policy
+from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES, resolve_payload_policy
+from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from pycloud_parallel.controlplane.payload_transport import prepare_outbound_payload
 from pycloud_parallel.execution.support import (
     _estimate_managed_global_inline_size,
-    _policy_with_soft_limit,
     _put_data_via_clients,
 )
 
@@ -24,13 +23,10 @@ def prepare_remote_call_payload(
     serialization_mode: str = "",
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> Dict[str, object]:
-    policy = payload_policy_from_effective_policy("http_call", effective_policy)
-    policy = _policy_with_soft_limit(
-        policy,
-        min(
-            max(1, int(object_threshold_bytes)),
-            max(1, int(policy.inline_payload_soft_limit_bytes)),
-        ),
+    policy = resolve_payload_policy(
+        "http_call",
+        effective_policy=effective_policy,
+        object_threshold_bytes=object_threshold_bytes,
     )
     if managed_global_field_names:
         policy = replace(policy, managed_global_field_names=tuple(str(name) for name in managed_global_field_names))
@@ -43,7 +39,10 @@ def prepare_remote_call_payload(
         "policy": policy,
     }
     if effective_policy is not None:
-        prepare_kwargs["managed_global_policy"] = payload_policy_from_effective_policy("managed_globals", effective_policy)
+        prepare_kwargs["managed_global_policy"] = resolve_payload_policy(
+            "managed_globals",
+            effective_policy=effective_policy,
+        )
     return prepare_outbound_payload(
         payload,
         **prepare_kwargs,

@@ -2,7 +2,7 @@
 
 `pycloud_parallel.controlplane.config` 是运行时 limit 的唯一 authority。
 
-本 PR 只整理归类与 loader，不改变默认值、不迁移调用点、不删除旧常量。
+PR1 已完成归类与 loader。PR2 继续收口 payload policy resolver 与 `support.py` limit authority，不改变默认值、不删除旧常量。
 
 ## 分层
 
@@ -25,7 +25,10 @@
 3. `get_config_limit_authority()`
    - 返回只读分层 dataclass
    - 用来阅读和测试 authority 结构
-4. 旧常量
+4. `resolve_payload_policy(...)`
+   - payload policy 的统一入口
+   - 负责合并 effective policy，并把 object threshold 与 policy soft limit 对齐
+5. 旧常量
    - 继续导出
    - 继续作为外部兼容入口
 
@@ -39,20 +42,24 @@
    - 负责把 runtime payload limit 和 session effective policy 合并
 3. `merge_object_threshold_with_policy_soft_limit(...)`
    - 负责 objectify threshold 与 policy soft limit 的取小
-4. `get_node_control_http_body_limit_bytes(...)`
+4. `policy_with_soft_limit(...)`
+   - 负责把已合成的 soft limit 写回 `PayloadPolicy`
+5. `resolve_payload_policy(...)`
+   - 负责统一 `get_payload_policy(...)`、effective policy merge、object threshold 合成
+6. `get_node_control_http_body_limit_bytes(...)`
    - 负责 NodeControl HTTP body 与 object body 下限合成
-5. `get_managed_globals_control_limit_bytes(...)`
+7. `get_managed_globals_control_limit_bytes(...)`
    - 负责 managed globals 的 policy hard limit 与 control send bound 合成
-6. `get_job_staging_replica_count(...)`
+8. `get_job_staging_replica_count(...)`
    - 负责 job staged refs 的副本数默认值和下限修正
-7. `get_job_staged_ref_ttl_sec(...)`
+9. `get_job_staged_ref_ttl_sec(...)`
    - 负责 job staged refs 的 TTL 默认值和下限修正
 
 ## 不做
 
 1. 不改变默认值
 2. 不改变 Service / TaskPool / JobQueue API
-3. 不迁移 `support.py` 的 limit 合成逻辑
+3. 不迁移 client transport / node HTTP body limit 逻辑
 4. 不重构 serialization / scheduler / DataRef 主流程
 5. 不删除旧常量导出
 

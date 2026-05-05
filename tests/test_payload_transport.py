@@ -18,6 +18,7 @@ from pycloud_parallel.controlplane.config import (
     merge_object_threshold_with_policy_soft_limit,
     merge_payload_limits_with_effective_policy,
     normalize_policy_limit_values,
+    resolve_payload_policy,
 )
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
@@ -141,6 +142,41 @@ def test_config_limit_helpers_merge_effective_policy() -> None:
     assert merged.inline_payload_request_limit_bytes == 256
     assert merged.inline_result_hard_limit_bytes == 512
     assert effective_limits_from_profile(effective) == (128, 256, 512)
+
+
+def test_resolve_payload_policy_merges_effective_policy_and_object_threshold() -> None:
+    from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, payload_policy_from_effective_policy
+
+    effective = EffectivePolicy(
+        policy_id="test",
+        version=1,
+        resolved_mode="structured_v1",
+        allowed_modes=("structured_v1",),
+        inline_payload_soft_limit_bytes=512,
+        inline_payload_hard_limit_bytes=2048,
+        inline_result_hard_limit_bytes=4096,
+        use_raw_bytes_payload=False,
+        use_http_raw_bytes_body=False,
+        allow_pickle_stable=False,
+    )
+
+    resolved = resolve_payload_policy("http_call", effective_policy=effective, object_threshold_bytes=256)
+    legacy = payload_policy_from_effective_policy("http_call", effective)
+
+    assert resolved.mode == legacy.mode
+    assert resolved.inline_payload_soft_limit_bytes == 256
+    assert resolved.inline_payload_hard_limit_bytes == legacy.inline_payload_hard_limit_bytes
+    assert resolved.inline_result_hard_limit_bytes == legacy.inline_result_hard_limit_bytes
+    assert resolved.consume_on_read == legacy.consume_on_read
+    assert resolved.preserve_args_kwargs_container == legacy.preserve_args_kwargs_container
+
+
+def test_resolve_payload_policy_keeps_default_soft_limit_when_threshold_is_zero() -> None:
+    policy = resolve_payload_policy("task_submit", object_threshold_bytes=0)
+    base = get_payload_policy("task_submit")
+
+    assert policy.inline_payload_soft_limit_bytes == base.inline_payload_soft_limit_bytes
+    assert policy.inline_payload_hard_limit_bytes == base.inline_payload_hard_limit_bytes
 
 
 def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:

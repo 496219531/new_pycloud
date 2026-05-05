@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Centralized runtime limits for controlplane client/server paths."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 from typing import Literal
@@ -395,6 +395,37 @@ def merge_object_threshold_with_policy_soft_limit(*, object_threshold_bytes: int
     return min(threshold, soft_limit)
 
 
+def policy_with_soft_limit(policy: PayloadPolicy, object_threshold_bytes: int) -> PayloadPolicy:
+    threshold = max(1, int(object_threshold_bytes or 1))
+    if int(threshold) == int(policy.inline_payload_soft_limit_bytes):
+        return policy
+    return replace(
+        policy,
+        limits=replace(
+            policy.limits,
+            inline_payload_soft_limit_bytes=threshold,
+        ),
+    )
+
+
+def resolve_payload_policy(
+    mode: PayloadMode,
+    *,
+    effective_policy: object = None,
+    object_threshold_bytes: int = 0,
+) -> PayloadPolicy:
+    policy = get_payload_policy(mode)
+    if effective_policy is not None:
+        policy = replace(policy, limits=merge_payload_limits_with_effective_policy(policy.limits, effective_policy))
+    if int(object_threshold_bytes or 0) <= 0:
+        return policy
+    threshold = merge_object_threshold_with_policy_soft_limit(
+        object_threshold_bytes=object_threshold_bytes,
+        policy_soft_limit_bytes=policy.inline_payload_soft_limit_bytes,
+    )
+    return policy_with_soft_limit(policy, threshold)
+
+
 def get_node_control_http_body_limit_bytes(node_control_body_bytes: int = 0) -> int:
     control_limit = int(node_control_body_bytes or NODE_CONTROL_HTTP_BODY_MAX_BYTES)
     return max(1, control_limit, int(OBJECT_HTTP_BODY_MAX_BYTES))
@@ -688,6 +719,7 @@ __all__ = [
     "merge_object_threshold_with_policy_soft_limit",
     "merge_payload_limits_with_effective_policy",
     "normalize_policy_limit_values",
+    "policy_with_soft_limit",
     "get_object_transfer_mode",
     "get_payload_policy",
     "get_policy_limit_defaults",
@@ -699,4 +731,5 @@ __all__ = [
     "control_http_limits",
     "reload_config",
     "resolve_object_transfer_mode",
+    "resolve_payload_policy",
 ]

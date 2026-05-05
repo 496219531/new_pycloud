@@ -40,12 +40,11 @@ from pycloud_parallel.controlplane.config import (
     get_job_staged_ref_ttl_sec,
     get_job_staging_replica_count,
     get_managed_globals_control_limit_bytes,
-    merge_object_threshold_with_policy_soft_limit,
+    resolve_payload_policy,
 )
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
-    payload_policy_from_effective_policy,
     should_use_raw_bytes_payload,
 )
 from pycloud_parallel.controlplane.netutil import detect_local_ip
@@ -580,32 +579,17 @@ def _estimate_managed_global_inline_size(value: Any) -> int:
     return estimate_payload_inline_size(value)
 
 
-def _policy_with_soft_limit(policy, object_threshold_bytes: int):
-    if int(object_threshold_bytes) == int(policy.inline_payload_soft_limit_bytes):
-        return policy
-    return replace(
-        policy,
-        limits=replace(
-            policy.limits,
-            inline_payload_soft_limit_bytes=max(1, int(object_threshold_bytes)),
-        ),
-    )
-
-
 def _payload_policy_for_mode(
     mode: str,
     *,
     effective_policy: Optional[EffectivePolicy] = None,
     object_threshold_bytes: int = 0,
 ):
-    policy = payload_policy_from_effective_policy(mode, effective_policy)
-    if int(object_threshold_bytes or 0) > 0:
-        threshold = merge_object_threshold_with_policy_soft_limit(
-            object_threshold_bytes=object_threshold_bytes,
-            policy_soft_limit_bytes=policy.inline_payload_soft_limit_bytes,
-        )
-        policy = _policy_with_soft_limit(policy, threshold)
-    return policy
+    return resolve_payload_policy(
+        mode,  # type: ignore[arg-type]
+        effective_policy=effective_policy,
+        object_threshold_bytes=object_threshold_bytes,
+    )
 
 
 def _prepare_payload_for_policy(
