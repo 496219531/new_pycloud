@@ -34,11 +34,11 @@ from pycloud_parallel.controlplane.config import (
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
-    JOB_STAGED_REF_TTL_SEC,
-    JOB_STAGING_REPLICA_COUNT,
     OBJECT_CHUNK_SIZE_BYTES,
     get_dataref_upload_strategy,
     get_job_blob_inline_threshold_bytes,
+    get_job_staged_ref_ttl_sec,
+    get_job_staging_replica_count,
     get_managed_globals_control_limit_bytes,
     merge_object_threshold_with_policy_soft_limit,
 )
@@ -949,7 +949,7 @@ def _select_job_staging_clients(
 ) -> Tuple[List[Any], List[Dict[str, object]]]:
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
-    desired = max(1, int(replica_count or JOB_STAGING_REPLICA_COUNT))
+    desired = get_job_staging_replica_count(replica_count)
     with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
         nodes = list(
             infocenter.select_task_nodes(
@@ -1109,7 +1109,7 @@ def _stage_job_value_as_data_ref(
 
         DataRegistryClient(target, timeout_sec=timeout_sec).register(
             staged_ref,
-            ttl_sec=max(1, int(ttl_sec or JOB_STAGED_REF_TTL_SEC)),
+            ttl_sec=get_job_staged_ref_ttl_sec(ttl_sec),
             replicas=effective_replicas,
             locator_kind="controlplane",
             locator_token=target,
@@ -1290,8 +1290,8 @@ def _stage_job_submit_payload_for_transport(
 ) -> Dict[str, object]:
     prepared = dict(payload or {})
     runtime = str(prepared.get("runtime", "py3") or "py3")
-    replica_count = max(1, int(prepared.get("staging_replica_count", JOB_STAGING_REPLICA_COUNT) or JOB_STAGING_REPLICA_COUNT))
-    ttl_sec = max(1, int(prepared.get("staging_ttl_sec", JOB_STAGED_REF_TTL_SEC) or JOB_STAGED_REF_TTL_SEC))
+    replica_count = get_job_staging_replica_count(int(prepared.get("staging_replica_count", 0) or 0))
+    ttl_sec = get_job_staged_ref_ttl_sec(int(prepared.get("staging_ttl_sec", 0) or 0))
     for field_name in ("job_payload", "update_globals"):
         if field_name not in prepared:
             continue

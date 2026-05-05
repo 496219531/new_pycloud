@@ -43,6 +43,10 @@
    - 负责 NodeControl HTTP body 与 object body 下限合成
 5. `get_managed_globals_control_limit_bytes(...)`
    - 负责 managed globals 的 policy hard limit 与 control send bound 合成
+6. `get_job_staging_replica_count(...)`
+   - 负责 job staged refs 的副本数默认值和下限修正
+7. `get_job_staged_ref_ttl_sec(...)`
+   - 负责 job staged refs 的 TTL 默认值和下限修正
 
 ## 不做
 

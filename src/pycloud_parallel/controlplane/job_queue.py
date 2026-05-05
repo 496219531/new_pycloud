@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
-from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_jobqueue_resolve_refs, get_payload_policy
+from pycloud_parallel.controlplane.config import get_job_staged_ref_ttl_sec, get_jobqueue_resolve_refs, get_payload_policy
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -1421,7 +1421,7 @@ class JobQueueManager:
     def _job_ref_touch_interval_sec(self, state: JobState) -> float:
         ttl_sec = max(
             1,
-            int((state.payload or {}).get("staging_ttl_sec", JOB_STAGED_REF_TTL_SEC) or JOB_STAGED_REF_TTL_SEC),
+            get_job_staged_ref_ttl_sec(int((state.payload or {}).get("staging_ttl_sec", 0) or 0)),
         )
         return max(1.0, min(float(ttl_sec) / 3.0, 300.0))
 

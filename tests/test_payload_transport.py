@@ -9,6 +9,8 @@ from pycloud_parallel.controlplane.config import (
     get_config_limit_authority,
     get_http_object_body_limit_bytes,
     get_job_blob_inline_threshold_bytes,
+    get_job_staged_ref_ttl_sec,
+    get_job_staging_replica_count,
     get_local_service_payload_policy,
     get_managed_globals_control_limit_bytes,
     get_node_control_http_body_limit_bytes,
@@ -105,6 +107,12 @@ def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
     assert merge_object_threshold_with_policy_soft_limit(object_threshold_bytes=500, policy_soft_limit_bytes=200) == 200
     assert merge_object_threshold_with_policy_soft_limit(object_threshold_bytes=100, policy_soft_limit_bytes=200) == 100
     assert get_job_blob_inline_threshold_bytes() == max(256 * 1024, int((2 * 1024 * 1024) / 1.5))
+    assert get_job_staging_replica_count(0) == 2
+    assert get_job_staging_replica_count(-3) == 1
+    assert get_job_staging_replica_count(5) == 5
+    assert get_job_staged_ref_ttl_sec(0) == 24 * 60 * 60
+    assert get_job_staged_ref_ttl_sec(-5) == 1
+    assert get_job_staged_ref_ttl_sec(10) == 10
     assert get_http_object_body_limit_bytes(123) == 123
     assert get_node_control_http_body_limit_bytes(123) == 512 * 1024 * 1024
 

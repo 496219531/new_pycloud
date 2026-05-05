@@ -381,6 +381,14 @@ def get_job_blob_inline_threshold_bytes() -> int:
     return max(256 * 1024, int(INLINE_PAYLOAD_HARD_LIMIT_BYTES / 1.5))
 
 
+def get_job_staging_replica_count(value: int = 0) -> int:
+    return max(1, int(value or JOB_STAGING_REPLICA_COUNT))
+
+
+def get_job_staged_ref_ttl_sec(value: int = 0) -> int:
+    return max(1, int(value or JOB_STAGED_REF_TTL_SEC))
+
+
 def merge_object_threshold_with_policy_soft_limit(*, object_threshold_bytes: int, policy_soft_limit_bytes: int) -> int:
     threshold = max(1, int(object_threshold_bytes or 1))
     soft_limit = max(1, int(policy_soft_limit_bytes or 1))
@@ -669,6 +677,8 @@ __all__ = [
     "get_inline_transport_checksum",
     "get_jobqueue_resolve_refs",
     "get_job_blob_inline_threshold_bytes",
+    "get_job_staged_ref_ttl_sec",
+    "get_job_staging_replica_count",
     "get_local_inline_limits",
     "get_local_service_payload_policy",
     "get_managed_globals_control_limit_bytes",
