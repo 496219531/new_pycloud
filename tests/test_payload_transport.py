@@ -5,10 +5,17 @@ import json
 
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.controlplane.config import (
+    effective_limits_from_profile,
     get_config_limit_authority,
+    get_http_object_body_limit_bytes,
+    get_job_blob_inline_threshold_bytes,
     get_local_service_payload_policy,
     get_managed_globals_control_limit_bytes,
+    get_node_control_http_body_limit_bytes,
     get_payload_policy,
+    merge_object_threshold_with_policy_soft_limit,
+    merge_payload_limits_with_effective_policy,
+    normalize_policy_limit_values,
 )
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
@@ -91,6 +98,41 @@ def test_managed_globals_control_limit_clamps_policy_and_control_bounds() -> Non
     assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=1000, control_send_bytes=2000) == 1000
     assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=2000, control_send_bytes=1000) == 1000
     assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=0, control_send_bytes=0) >= 1
+
+
+def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
+    assert normalize_policy_limit_values(soft=200, hard=100, result_hard=0) == (100, 100, 1)
+    assert merge_object_threshold_with_policy_soft_limit(object_threshold_bytes=500, policy_soft_limit_bytes=200) == 200
+    assert merge_object_threshold_with_policy_soft_limit(object_threshold_bytes=100, policy_soft_limit_bytes=200) == 100
+    assert get_job_blob_inline_threshold_bytes() == max(256 * 1024, int((2 * 1024 * 1024) / 1.5))
+    assert get_http_object_body_limit_bytes(123) == 123
+    assert get_node_control_http_body_limit_bytes(123) == 512 * 1024 * 1024
+
+
+def test_config_limit_helpers_merge_effective_policy() -> None:
+    from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
+
+    base = get_payload_policy("http_call").limits
+    effective = EffectivePolicy(
+        policy_id="test",
+        version=1,
+        resolved_mode="structured_v1",
+        allowed_modes=("structured_v1",),
+        inline_payload_soft_limit_bytes=128,
+        inline_payload_hard_limit_bytes=256,
+        inline_result_hard_limit_bytes=512,
+        use_raw_bytes_payload=False,
+        use_http_raw_bytes_body=False,
+        allow_pickle_stable=False,
+    )
+
+    merged = merge_payload_limits_with_effective_policy(base, effective)
+
+    assert merged.inline_payload_soft_limit_bytes == 128
+    assert merged.inline_payload_hard_limit_bytes == 256
+    assert merged.inline_payload_request_limit_bytes == 256
+    assert merged.inline_result_hard_limit_bytes == 512
+    assert effective_limits_from_profile(effective) == (128, 256, 512)
 
 
 def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:

@@ -29,6 +29,21 @@
    - 继续导出
    - 继续作为外部兼容入口
 
+## 合成 helper
+
+`config.py` 内的合成 helper 是 limit authority 的边界函数。
+
+1. `normalize_policy_limit_values(...)`
+   - 负责修正 policy soft/hard/result hard 的基本关系
+2. `merge_payload_limits_with_effective_policy(...)`
+   - 负责把 runtime payload limit 和 session effective policy 合并
+3. `merge_object_threshold_with_policy_soft_limit(...)`
+   - 负责 objectify threshold 与 policy soft limit 的取小
+4. `get_node_control_http_body_limit_bytes(...)`
+   - 负责 NodeControl HTTP body 与 object body 下限合成
+5. `get_managed_globals_control_limit_bytes(...)`
+   - 负责 managed globals 的 policy hard limit 与 control send bound 合成
+
 ## 不做
 
 1. 不改变默认值
