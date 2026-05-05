@@ -20,6 +20,8 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 
 ## 代码入口
 
+### 推荐新代码入口
+
 1. `load_config_from_env()`
    - 唯一 env loader
    - 每个 env 默认值只在 setting 表里定义一次
@@ -34,9 +36,37 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
    - 负责合并 effective policy，并把 object threshold 与 policy soft limit 对齐
 5. `get_transport_bounds()` / `get_object_store_bounds()`
    - transport/http 与 object/store 消费侧读取分层默认值的入口
-6. 旧常量
-   - 继续导出
-   - 继续作为外部兼容入口
+6. body / upload helper
+   - `get_service_http_body_limit_bytes(...)`
+   - `get_gateway_http_body_limit_bytes(...)`
+   - `get_infocenter_http_body_limit_bytes(...)`
+   - `get_node_control_http_body_limit_bytes(...)`
+   - `get_http_object_body_limit_bytes(...)`
+   - `get_gateway_upload_limits(...)`
+
+新代码应优先使用以上入口，不要直接 import 裸 limit 常量。
+
+### 兼容桥接入口
+
+以下名字继续导出，作为外部用户和旧调用点的兼容桥接，不作为新代码首选入口：
+
+1. payload/result threshold 常量
+   - `INLINE_*`
+   - `LOCAL_INLINE_*`
+   - `DEFAULT_SAFE_*`
+   - `TRUSTED_INTERNAL_*`
+2. transport/body 常量
+   - `CONTROL_HTTP_*`
+   - `*_HTTP_BODY_MAX_BYTES`
+3. object/store/job/capacity 常量
+   - `OBJECT_*`
+   - `GATEWAY_MAX_UPLOAD_*`
+   - `JOB_*`
+   - `NODE_*`
+   - `SERVICE_*`
+4. mode/env 兼容名
+   - `PYCLOUD_*`
+   - `*_MODE`
 
 ## 合成 helper
 
@@ -81,4 +111,8 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 2. 只在 `_INT_SETTINGS` / `_BOOL_SETTINGS` / `_CHOICE_SETTINGS` 中定义默认值
 3. 如果需要旧名兼容，把旧 env 名放进同一个 setting 的 `names`
 4. 在 `get_config_limit_authority()` 中放进对应 dataclass
-5. 更新 `docs/RUNTIME_LIMITS.md`
+5. 如果消费侧需要组合逻辑，新增 helper，不在消费模块里手写合成规则
+6. 把新 helper 加入 `STABLE_CONFIG_API_EXPORTS`
+7. 如果必须保留旧常量，把旧名放入 `COMPATIBILITY_CONFIG_EXPORTS`
+8. 更新 `docs/RUNTIME_LIMITS.md`
+9. 补测试确认推荐入口和兼容常量一致，且 `reload_config()` 后同步

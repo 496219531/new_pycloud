@@ -10,6 +10,8 @@
 
 - [CONFIG_LIMIT_AUTHORITY.md](CONFIG_LIMIT_AUTHORITY.md)
 
+新代码应优先使用 `config.py` 的推荐入口，例如 `resolve_payload_policy(...)`、`get_transport_bounds()`、`get_object_store_bounds()` 和 body/upload helper。裸常量继续保留是为了兼容旧代码和外部 import。
+
 ## 0. 默认值速查
 
 | 环境变量 | 默认值 | 说明 |
