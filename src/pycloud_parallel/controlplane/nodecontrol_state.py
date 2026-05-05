@@ -21,7 +21,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.parse import unquote
 
 from pycloud_parallel.controlplane.artifact import (
@@ -1894,6 +1894,60 @@ class NodeControlState(NodeRuntimeBase):
         with self._lock:
             self._task_pools[pool_id] = pool
 
+    def _reserve_worker_slots_for_create(
+        self,
+        *,
+        capacity: int,
+        reserved_attr: str,
+        active_worker_count: int,
+        requested_workers: int,
+        exhausted_message: str,
+        now: datetime,
+    ) -> Tuple[int, Any]:
+        with self._lock:
+            reserved_workers = max(0, int(getattr(self, reserved_attr, 0) or 0))
+            available_workers = max(0, int(capacity) - int(active_worker_count + reserved_workers))
+            if available_workers <= 0:
+                raise RuntimeError(exhausted_message)
+            actual_workers = min(max(1, int(requested_workers or 1)), available_workers)
+            setattr(self, reserved_attr, reserved_workers + actual_workers)
+            self._ensure_executor_host_alive_locked(now=now)
+            executor_host = self._executor_host
+        if executor_host is None:
+            self._release_reserved_worker_slots(reserved_attr=reserved_attr, reserved=actual_workers)
+            raise RuntimeError("executor host unavailable")
+        return actual_workers, executor_host
+
+    def _release_reserved_worker_slots(self, *, reserved_attr: str, reserved: int) -> None:
+        if reserved <= 0:
+            return
+        with self._lock:
+            setattr(self, reserved_attr, max(0, int(getattr(self, reserved_attr, 0) or 0) - int(reserved)))
+
+    def _create_executor_session_skeleton(
+        self,
+        *,
+        create_executor: Callable[[], None],
+        preload_executor: Optional[Callable[[], None]],
+        stop_executor: Callable[[], None],
+        reserved_attr: str,
+        reserved: int,
+    ) -> float:
+        # Low-frequency create skeleton only: reserve, create, optional preload,
+        # rollback on failure. Submit/call/result hot paths intentionally stay
+        # outside this helper to avoid node runtime coupling and perf risk.
+        executor_create_started = time.monotonic()
+        try:
+            create_executor()
+            if preload_executor is not None:
+                preload_executor()
+        except Exception:
+            self._release_reserved_worker_slots(reserved_attr=reserved_attr, reserved=reserved)
+            with contextlib.suppress(Exception):
+                stop_executor()
+            raise
+        return (time.monotonic() - executor_create_started) * 1000.0
+
     def has_code_version(self, code_version: str) -> bool:
         with self._lock:
             return code_version in self._codes
@@ -1999,7 +2053,6 @@ class NodeControlState(NodeRuntimeBase):
         now = utc_now()
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
 
-        reserved = 0
         with self._lock:
             self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
             active = sum(
@@ -2011,34 +2064,39 @@ class NodeControlState(NodeRuntimeBase):
                     pb2.SERVICE_STATUS_DRAINING,
                 )
             )
-            available_workers = max(0, int(self.service_worker_capacity) - int(active + self._service_worker_reserved))
-            if available_workers <= 0:
-                raise RuntimeError("service worker capacity exhausted")
-            actual_workers = min(requested_workers, available_workers)
-            self._service_worker_reserved += actual_workers
-            reserved = actual_workers
-            self._ensure_executor_host_alive_locked(now=now)
-            executor_host = self._executor_host
-        if executor_host is None:
-            with self._lock:
-                self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
-            raise RuntimeError("executor host unavailable")
+        actual_workers, executor_host = self._reserve_worker_slots_for_create(
+            capacity=int(self.service_worker_capacity),
+            reserved_attr="_service_worker_reserved",
+            active_worker_count=active,
+            requested_workers=requested_workers,
+            exhausted_message="service worker capacity exhausted",
+            now=now,
+        )
+        reserved = actual_workers
         try:
-            executor_host.create_service(service_id=service_id, worker_count=actual_workers)
-            if self._preload_after_create_required():
-                executor_host.preload_service(
-                    service_id=service_id,
-                    fanout=actual_workers,
-                    execute_spec=_build_execute_spec(
-                        artifact,
-                        object_dir=self._object_dir,
-                        work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                        method_name=next(iter(method_info.keys()), artifact.entry_callable),
-                        payload={},
-                        payload_mode="http_call",
-                        warmup_only=True,
-                    ),
-                )
+            self._create_executor_session_skeleton(
+                create_executor=lambda: executor_host.create_service(service_id=service_id, worker_count=actual_workers),
+                preload_executor=(
+                    None
+                    if not self._preload_after_create_required()
+                    else lambda: executor_host.preload_service(
+                        service_id=service_id,
+                        fanout=actual_workers,
+                        execute_spec=_build_execute_spec(
+                            artifact,
+                            object_dir=self._object_dir,
+                            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                            method_name=next(iter(method_info.keys()), artifact.entry_callable),
+                            payload={},
+                            payload_mode="http_call",
+                            warmup_only=True,
+                        ),
+                    )
+                ),
+                stop_executor=lambda: executor_host.stop_service(service_id=service_id),
+                reserved_attr="_service_worker_reserved",
+                reserved=reserved,
+            )
             session = ServiceSession(
                 service_id=service_id,
                 owner_client_id=owner_client_id,
@@ -2067,13 +2125,10 @@ class NodeControlState(NodeRuntimeBase):
                 session.managed_globals_digest = managed_state.globals_digest
             with self._lock:
                 self._services[service_id] = session
-                if reserved:
-                    self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
+            self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
             return session
         except Exception as exc:
-            with self._lock:
-                if reserved:
-                    self._service_worker_reserved = max(0, self._service_worker_reserved - reserved)
+            self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
             with contextlib.suppress(Exception):
                 executor_host.stop_service(service_id=service_id)
             self._remember_failed_service_create(
@@ -2194,45 +2249,47 @@ class NodeControlState(NodeRuntimeBase):
 
         requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
         now = utc_now()
-        reserved = 0
         with self._lock:
             active = sum(
                 max(0, int(pool.worker_count))
                 for pool in self._task_pools.values()
                 if str(pool.status or "").strip().upper() == "RUNNING"
             )
-            available_workers = max(0, int(self.task_pool_worker_capacity) - int(active + self._task_pool_worker_reserved))
-            if available_workers <= 0:
-                raise RuntimeError("task pool worker capacity exhausted")
-            actual_workers = min(requested_workers, available_workers)
-            self._task_pool_worker_reserved += actual_workers
-            reserved = actual_workers
-            self._ensure_executor_host_alive_locked(now=now)
-            executor_host = self._executor_host
-        if executor_host is None:
-            with self._lock:
-                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
-            raise RuntimeError("executor host unavailable")
-        executor_create_started = time.monotonic()
+        actual_workers, executor_host = self._reserve_worker_slots_for_create(
+            capacity=int(self.task_pool_worker_capacity),
+            reserved_attr="_task_pool_worker_reserved",
+            active_worker_count=active,
+            requested_workers=requested_workers,
+            exhausted_message="task pool worker capacity exhausted",
+            now=now,
+        )
+        reserved = actual_workers
         try:
-            executor_host.create_task_pool(pool_id=pool_id, worker_count=actual_workers)
-            if self._preload_after_create_required():
-                executor_host.preload_pool(
-                    pool_id=pool_id,
-                    fanout=actual_workers,
-                    execute_spec=_build_execute_spec(
-                        artifact,
-                        object_dir=self._object_dir,
-                        work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                        method_name=str(entry_callable or "run").strip() or "run",
-                        payload={},
-                        payload_mode="task_submit",
-                        warmup_only=True,
-                    ),
-                )
+            executor_create_ms = self._create_executor_session_skeleton(
+                create_executor=lambda: executor_host.create_task_pool(pool_id=pool_id, worker_count=actual_workers),
+                preload_executor=(
+                    None
+                    if not self._preload_after_create_required()
+                    else lambda: executor_host.preload_pool(
+                        pool_id=pool_id,
+                        fanout=actual_workers,
+                        execute_spec=_build_execute_spec(
+                            artifact,
+                            object_dir=self._object_dir,
+                            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                            method_name=str(entry_callable or "run").strip() or "run",
+                            payload={},
+                            payload_mode="task_submit",
+                            warmup_only=True,
+                        ),
+                    )
+                ),
+                stop_executor=lambda: executor_host.stop_task_pool(pool_id=pool_id),
+                reserved_attr="_task_pool_worker_reserved",
+                reserved=reserved,
+            )
         except Exception as exc:
-            with self._lock:
-                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+            self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             with contextlib.suppress(Exception):
                 executor_host.stop_task_pool(pool_id=pool_id)
             self._remember_failed_task_pool_create(
@@ -2249,7 +2306,6 @@ class NodeControlState(NodeRuntimeBase):
                 reason=repr(exc),
             )
             raise
-        executor_create_ms = (time.monotonic() - executor_create_started) * 1000.0
         try:
             pool = TaskPoolState(
                 pool_id=pool_id,
@@ -2281,7 +2337,6 @@ class NodeControlState(NodeRuntimeBase):
                 pool.managed_globals_scope_dir = managed_state.scope_dir
                 pool.managed_globals_digest = managed_state.globals_digest
             with self._lock:
-                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
                 self._task_pools[pool_id] = pool
                 self._record_task_pool_lifecycle_timing_locked(
                     pool,
@@ -2299,10 +2354,10 @@ class NodeControlState(NodeRuntimeBase):
                     runtime_key=pool.pool_id,
                     managed_global_names=pool.managed_global_names,
                 )
+            self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             return pool
         except Exception:
-            with self._lock:
-                self._task_pool_worker_reserved = max(0, self._task_pool_worker_reserved - reserved)
+            self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             with contextlib.suppress(Exception):
                 executor_host.stop_task_pool(pool_id=pool_id)
             raise
