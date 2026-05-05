@@ -240,6 +240,7 @@
 3. policy 由中心统一管理
 4. effective policy 在会话创建时冻结
 5. 执行期不允许同一 session 内 policy 漂移
+6. node 本地 env 不参与 session policy / limit 决策，只能作为启动默认、物理执行边界或兼容入口
 
 ### 9.1 Policy Profile
 
@@ -287,6 +288,14 @@
 3. runtime 兼容
 
 InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断使用；但运行时 `effective_policy` 不再与 candidate capability 做交集协商。
+
+新的长期口径：
+
+1. node 不作为 capability/tag/limit/policy 的 authority
+2. `NodeCapability` 是兼容/观测字段，不是未来节点筛选的主 authority
+3. 后续节点选择由 controlplane 节点管理服务统筹
+4. 节点管理服务基于中心配置、标签、运维信息、健康状态和 runtime 兼容筛选 node
+5. 同一物理机器可能有多个 node，不能把单个 node 的本地 capability 等同于 machine capability
 
 ### 9.3 Effective Policy
 

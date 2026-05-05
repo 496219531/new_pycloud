@@ -125,6 +125,8 @@
 
 当前 node control HTTP client/server 都会读取这两个值，统一设置 HTTP body 大小限制。这里的 `control HTTP` 指协议边界；如果内部仍经过 `TransportPayload` adapter，那只是兼容 carrier，不代表 gRPC。
 
+node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。业务 payload threshold、session effective policy 和最终 limit 仍以中心/session 分配为准，node 不自行协商或改写。
+
 - `PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES`
   - 默认：`67108864` (`64 MiB`)
   - service HTTP endpoint 的 request body 上限

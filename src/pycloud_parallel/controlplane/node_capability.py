@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-"""Node capability models and local capability discovery helpers."""
+"""Node capability models and local capability discovery helpers.
+
+This module is a compatibility/observability surface. A node capability record
+is not the authority for session policy, effective limits, or future node
+selection rules; those belong to the controlplane/session authority.
+"""
 
 from dataclasses import dataclass
 from math import inf
@@ -28,6 +33,14 @@ def _normalize_modes(values: Sequence[str] | None) -> Tuple[str, ...]:
 
 @dataclass(frozen=True)
 class NodeCapability:
+    """Compatibility and observability metadata reported with node/service routes.
+
+    This model must not be treated as the authority for effective policy or
+    payload/body limits. Nodes execute the limits assigned by the central
+    controlplane/session path. Future tag, capability, grouping, and selection
+    rules should live in a controlplane node-management service, not here.
+    """
+
     supported_modes: Tuple[str, ...] = ()
     supports_raw_bytes_payload: bool = False
     supports_http_raw_bytes_body: bool = False

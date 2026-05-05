@@ -97,6 +97,20 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 12. `get_job_staged_ref_ttl_sec(...)`
    - 负责 job staged refs 的 TTL 默认值和下限修正
 
+## Node 侧职责边界
+
+node 不是 policy / limit / capability authority。
+
+1. node 只严格执行中心/session 分配下来的 effective policy 和 limit
+2. node 不自行合成 effective policy，也不根据本地 env 改写 session limit
+3. node 本地 env 只属于进程启动默认值、物理 HTTP body 边界或兼容路径
+4. `NodeCapability` 当前只是兼容/观测模型，供 route metadata、诊断和旧协议字段使用
+5. `NodeCapability` 不作为未来节点筛选、标签、分组或能力管理的主 authority
+6. 后续节点标签、能力、分组和筛选应由 controlplane 节点管理服务统一维护
+7. 同一物理机器可以启动多个 node，单个 node 的局部信息不能代表整台机器的资源/能力
+
+因此，node 上报或本地检测到的能力不能参与 session policy 协商；运行时最终口径以 controlplane/session 分配为准。
+
 ## 不做
 
 1. 不改变默认值
