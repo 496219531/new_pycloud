@@ -107,6 +107,33 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 
 ## 增加新 limit 的规则
 
+### 新增代码规则
+
+1. payload policy 相关代码优先使用 `resolve_payload_policy(...)`
+2. transport/http body bound 优先使用：
+   - `get_transport_bounds()`
+   - `get_service_http_body_limit_bytes(...)`
+   - `get_gateway_http_body_limit_bytes(...)`
+   - `get_infocenter_http_body_limit_bytes(...)`
+   - `get_node_control_http_body_limit_bytes(...)`
+   - `get_http_object_body_limit_bytes(...)`
+3. object/store 和 gateway upload 优先使用：
+   - `get_object_store_bounds()`
+   - `get_gateway_upload_limits(...)`
+4. 不要在核心 transport/http 新代码里直接 import body/upload 裸常量：
+   - `SERVICE_HTTP_BODY_MAX_BYTES`
+   - `GATEWAY_HTTP_BODY_MAX_BYTES`
+   - `INFOCENTER_HTTP_BODY_MAX_BYTES`
+   - `NODE_CONTROL_HTTP_BODY_MAX_BYTES`
+   - `OBJECT_HTTP_BODY_MAX_BYTES`
+   - `CONTROL_HTTP_MAX_SEND_BYTES`
+   - `CONTROL_HTTP_MAX_RECEIVE_BYTES`
+   - `GATEWAY_MAX_UPLOAD_FILE_BYTES`
+   - `GATEWAY_MAX_UPLOAD_TOTAL_BYTES`
+5. 这些裸常量只作为兼容桥接保留。需要改历史代码时，可以逐步迁移；不要让新路径继续扩散它们。
+
+### 新增 limit 流程
+
 1. 先判断属于哪一层
 2. 只在 `_INT_SETTINGS` / `_BOOL_SETTINGS` / `_CHOICE_SETTINGS` 中定义默认值
 3. 如果需要旧名兼容，把旧 env 名放进同一个 setting 的 `names`
