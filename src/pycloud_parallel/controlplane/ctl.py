@@ -837,6 +837,29 @@ def _normalize_http_target(target: str) -> str:
     return f"http://{text}".rstrip("/")
 
 
+def _strip_target_scheme(target: str) -> str:
+    text = str(target or "").strip()
+    for prefix in ("http://", "https://"):
+        if text.startswith(prefix):
+            return text[len(prefix) :].strip().rstrip("/")
+    return text
+
+
+def _resolve_controlplane_target_for_start(args: argparse.Namespace) -> Tuple[str, int, str]:
+    target = _strip_target_scheme(str(getattr(args, "target", "") or "").strip())
+    if target:
+        if _is_local_target(target):
+            raise RuntimeError('pycloudctl start/dev-start --target expects a ControlPlane host:port, not "local"')
+        target_host, target_port = _split_host_port(target)
+        controlplane_host = resolve_public_host(target_host)
+        controlplane_port = int(target_port)
+        return controlplane_host, controlplane_port, _format_host_port(controlplane_host, controlplane_port)
+
+    controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    controlplane_port = int(getattr(args, "controlplane_port", 50051))
+    return controlplane_host, controlplane_port, _format_host_port(controlplane_host, controlplane_port)
+
+
 def _best_effort_mark_node_lost(target: str, node_name: str) -> bool:
     normalized_target = _normalize_http_target(target)
     if not normalized_target or not str(node_name or "").strip():
@@ -1382,19 +1405,17 @@ def _cmd_start(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
     _ensure_runtime_dirs(root)
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
-    controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    controlplane_host, controlplane_port, infocenter_target = _resolve_controlplane_target_for_start(args)
     job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
 
     _log("INFO", "Stopping existing core services...")
     _stop_core_processes(root)
     time.sleep(1.0)
 
-    default_target = _format_host_port(controlplane_host, int(args.controlplane_port))
-    infocenter_target = str(getattr(args, "target", "") or "").strip() or default_target
     debug = bool(getattr(args, "debug", False))
     controlplane_kwargs = dict(
         bind_host=controlplane_host,
-        remote_hint=default_target,
+        remote_hint=infocenter_target,
         extra_env=extra_env,
     )
     job_orchestrator_kwargs = dict(
@@ -1404,7 +1425,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     if debug:
         controlplane_kwargs["debug"] = True
         job_orchestrator_kwargs["debug"] = True
-    _start_controlplane(root, args.controlplane_port, **controlplane_kwargs)
+    _start_controlplane(root, controlplane_port, **controlplane_kwargs)
     _start_job_orchestrator(
         root,
         bind=_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port)),
@@ -1415,7 +1436,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     print("  Core Services Started!")
     print("============================================")
     print()
-    print(f"  ControlPlane: {default_target}")
+    print(f"  ControlPlane: {infocenter_target}")
     print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
     print(f"  Logs:        {_logs_dir(root)}")
     print(f"  PIDs:        {_pids_dir(root)}")
@@ -1426,19 +1447,17 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
     _ensure_runtime_dirs(root)
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
-    controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    controlplane_host, controlplane_port, infocenter_target = _resolve_controlplane_target_for_start(args)
     job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
 
     _log("INFO", "Stopping existing managed dev services...")
     _stop_all_managed_processes(root)
     time.sleep(1.0)
 
-    default_target = _format_host_port(controlplane_host, int(args.controlplane_port))
-    infocenter_target = str(getattr(args, "target", "") or "").strip() or default_target
     debug = bool(getattr(args, "debug", False))
     controlplane_kwargs = dict(
         bind_host=controlplane_host,
-        remote_hint=default_target,
+        remote_hint=infocenter_target,
         extra_env=extra_env,
     )
     job_orchestrator_kwargs = dict(
@@ -1448,7 +1467,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     if debug:
         controlplane_kwargs["debug"] = True
         job_orchestrator_kwargs["debug"] = True
-    _start_controlplane(root, args.controlplane_port, **controlplane_kwargs)
+    _start_controlplane(root, controlplane_port, **controlplane_kwargs)
     _start_job_orchestrator(
         root,
         bind=_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port)),
@@ -1501,7 +1520,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     print("  Dev Services Started!")
     print("============================================")
     print()
-    print(f"  ControlPlane: {default_target}")
+    print(f"  ControlPlane: {infocenter_target}")
     print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
     for index in range(node_count):
         print(
@@ -2591,12 +2610,18 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     start_parser = subparsers.add_parser("start", help="start controlplane and job-orchestrator")
     _add_local_argument(start_parser)
-    _add_target_argument(start_parser)
+    _add_target_argument(
+        start_parser,
+        help="ControlPlane host:port for this core stack; --infocenter-addr is a compatibility alias",
+    )
     _add_env_argument(start_parser)
     _add_debug_argument(start_parser)
     dev_start_parser = subparsers.add_parser("dev-start", help="start controlplane, job-orchestrator, and a configurable local node set")
     _add_local_argument(dev_start_parser)
-    _add_target_argument(dev_start_parser)
+    _add_target_argument(
+        dev_start_parser,
+        help="ControlPlane host:port for this dev stack; --infocenter-addr is a compatibility alias",
+    )
     _add_env_argument(dev_start_parser)
     _add_debug_argument(dev_start_parser)
     _add_dev_node_arguments(dev_start_parser)
@@ -2677,12 +2702,18 @@ def build_parser() -> argparse.ArgumentParser:
     stop_node_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
     restart_parser = subparsers.add_parser("restart", help="restart local core controlplane and job-orchestrator services")
     _add_local_argument(restart_parser)
-    _add_target_argument(restart_parser)
+    _add_target_argument(
+        restart_parser,
+        help="ControlPlane host:port for this core stack; --infocenter-addr is a compatibility alias",
+    )
     _add_env_argument(restart_parser)
     _add_debug_argument(restart_parser)
     dev_restart_parser = subparsers.add_parser("dev-restart", help="restart local dev profile services")
     _add_local_argument(dev_restart_parser)
-    _add_target_argument(dev_restart_parser)
+    _add_target_argument(
+        dev_restart_parser,
+        help="ControlPlane host:port for this dev stack; --infocenter-addr is a compatibility alias",
+    )
     _add_env_argument(dev_restart_parser)
     _add_debug_argument(dev_restart_parser)
     _add_dev_node_arguments(dev_restart_parser, restart=True)

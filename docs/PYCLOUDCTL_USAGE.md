@@ -87,7 +87,7 @@ pycloudctl --help
 3. `--loopback` / `--local` 只表示 bind 到 `127.0.0.1`
 4. `target="local"` / `--target local` 表示 local IPC runtime，两者不要混用语义
 5. `--target` 是主参数名，`--infocenter-addr` 与它等价，只保留给旧脚本
-6. `start` / `dev-start` / `restart` / `dev-restart` 的 `--target` 只覆盖 job-orchestrator 和 dev nodes 的注册/连接目标，不改变 controlplane 自己的 bind 地址
+6. `start` / `dev-start` / `restart` / `dev-restart` 的 `--target` 表示这次 core ControlPlane 的 host:port；controlplane 按它绑定，job-orchestrator 和 dev nodes 自动注册到同一个 target
 
 命令层术语：
 
@@ -219,16 +219,14 @@ pycloudctl \
   start
 ```
 
-如果 controlplane bind 地址和组件注册目标不是同一个地址，可以显式传 `--target`：
+如果想直接用一个地址指定 controlplane bind 和组件注册目标，可以显式传 `--target`：
 
 ```bash
 pycloudctl \
-  --controlplane-host 0.0.0.0 \
-  --controlplane-port 51051 \
   start --target 192.168.10.7:51051
 ```
 
-这里 `--target` 只表示 job-orchestrator 连接/注册到哪里，不会把 controlplane bind 改成 `192.168.10.7`。
+这里 controlplane 会绑定到 `192.168.10.7:51051`，job-orchestrator 也会注册到同一个 target。若需要 wildcard bind，请继续使用 `--controlplane-host 0.0.0.0 --controlplane-port ...`。
 
 如果还想指定 host，也可以直接写：
 
@@ -278,11 +276,13 @@ pycloudctl dev-start \
 pycloudctl dev-start --nodes 2
 ```
 
-也可以显式覆盖 dev profile 内部组件要连接的 ControlPlane target：
+也可以显式指定 dev profile 的 ControlPlane target：
 
 ```bash
 pycloudctl dev-start --nodes 2 --target 192.168.10.7:50051
 ```
+
+这里 controlplane 会绑定到 `192.168.10.7:50051`，job-orchestrator 与 `node-1 ... node-N` 自动注册到这个地址。
 
 自定义 node 端口和容量：
 

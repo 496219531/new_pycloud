@@ -399,16 +399,12 @@ def test_cmd_dev_start_propagates_host_overrides(tmp_path, monkeypatch):
     assert started_nodes[1]["http_port"] == 18182
 
 
-def test_cmd_dev_start_uses_explicit_target_for_job_orchestrator_and_nodes(tmp_path, monkeypatch):
+def test_cmd_dev_start_uses_explicit_target_for_controlplane_and_registered_components(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(
         [
             "--runtime-root",
             str(tmp_path),
-            "--controlplane-host",
-            "127.0.0.1",
-            "--controlplane-port",
-            "51051",
             "dev-start",
             "--target",
             "10.8.0.5:50051",
@@ -452,7 +448,9 @@ def test_cmd_dev_start_uses_explicit_target_for_job_orchestrator_and_nodes(tmp_p
     )
 
     assert ctl._cmd_dev_start(args) == 0
-    assert controlplane_calls[0]["remote_hint"] == "127.0.0.1:51051"
+    assert controlplane_calls[0]["bind_host"] == "10.8.0.5"
+    assert controlplane_calls[0]["port"] == 50051
+    assert controlplane_calls[0]["remote_hint"] == "10.8.0.5:50051"
     assert job_orchestrator_calls[0]["infocenter_addr"] == "10.8.0.5:50051"
     assert started_nodes[0]["infocenter_target"] == "10.8.0.5:50051"
 
@@ -501,19 +499,15 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
     assert controlplane_calls[0]["bind_host"] == "127.0.0.1"
 
 
-def test_cmd_start_uses_explicit_target_for_job_orchestrator_only(tmp_path, monkeypatch):
+def test_cmd_start_uses_explicit_target_for_controlplane_and_job_orchestrator(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(
         [
             "--runtime-root",
             str(tmp_path),
-            "--controlplane-host",
-            "127.0.0.1",
-            "--controlplane-port",
-            "51051",
             "start",
-            "--target",
-            "10.8.0.5:50051",
+            "--infocenter-addr",
+            "http://10.8.0.5:50051",
         ]
     )
     controlplane_calls: list[dict[str, object]] = []
@@ -536,7 +530,9 @@ def test_cmd_start_uses_explicit_target_for_job_orchestrator_only(tmp_path, monk
     )
 
     assert ctl._cmd_start(args) == 0
-    assert controlplane_calls[0]["remote_hint"] == "127.0.0.1:51051"
+    assert controlplane_calls[0]["bind_host"] == "10.8.0.5"
+    assert controlplane_calls[0]["port"] == 50051
+    assert controlplane_calls[0]["remote_hint"] == "10.8.0.5:50051"
     assert job_orchestrator_calls[0]["infocenter_addr"] == "10.8.0.5:50051"
 
 
