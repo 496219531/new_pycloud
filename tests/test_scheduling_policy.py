@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pycloud_parallel.controlplane.scheduling_policy import (
+    node_admission_block_reason,
     is_call_route,
     is_conflict_scope,
     is_deploy_candidate,
@@ -46,3 +47,31 @@ def test_scheduling_predicates_capture_unhealthy_drain_cordon_semantics():
     assert is_conflict_scope(healthy=True, service_status=pb2.SERVICE_STATUS_STARTING)
     assert is_conflict_scope(healthy=True, service_status=pb2.SERVICE_STATUS_DRAINING)
     assert not is_conflict_scope(healthy=False, service_status=pb2.SERVICE_STATUS_RUNNING)
+
+
+def test_node_admission_block_reason_matches_deploy_candidate_rules():
+    class Node:
+        healthy = True
+        schedulable = True
+        drain = False
+        accept_service_deploy = True
+        control_addr = "127.0.0.1:50061"
+        credit = 1
+
+    node = Node()
+    assert node_admission_block_reason(node, require_control_addr=True, require_credit=True) == ""
+
+    node.drain = True
+    assert node_admission_block_reason(node, require_control_addr=True, require_credit=True) == "drain"
+    node.drain = False
+    node.schedulable = False
+    assert node_admission_block_reason(node, require_control_addr=True, require_credit=True) == "cordon"
+    node.schedulable = True
+    node.accept_service_deploy = False
+    assert node_admission_block_reason(node, require_control_addr=True, require_credit=True) == "accept_service_deploy=false"
+    node.accept_service_deploy = True
+    node.control_addr = ""
+    assert node_admission_block_reason(node, require_control_addr=True, require_credit=True) == "missing_control_addr"
+    node.control_addr = "127.0.0.1:50061"
+    node.credit = 0
+    assert node_admission_block_reason(node, require_control_addr=True, require_credit=True) == "no_credit"

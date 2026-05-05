@@ -297,6 +297,8 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 4. 节点管理服务基于中心配置、标签、运维信息、健康状态和 runtime 兼容筛选 node
 5. 同一物理机器可能有多个 node，不能把单个 node 的本地 capability 等同于 machine capability
 
+当前中心准入字段是 `healthy / schedulable / drain / accept_service_deploy / control_addr / credit`。task/job 选点和 service deploy/补副本应复用同一套基础准入 helper；runtime 兼容、tags 过滤和排序打分仍留在各自调用处。
+
 ### 9.3 Effective Policy
 
 `Effective Policy` 当前至少冻结：

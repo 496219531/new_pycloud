@@ -2509,6 +2509,8 @@ def _build_task_pool_from_infocenter(
     artifact: Optional[Any] = None,
     deps: Optional[Any] = None,
     runtime: str = "py3",
+    entry_module: Any = "",
+    entry_callable: Any = "run",
     package_format: str = "",
     resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,

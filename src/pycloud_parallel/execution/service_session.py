@@ -57,6 +57,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
 )
+from pycloud_parallel.controlplane.scheduling_policy import is_admitted_node, node_admission_block_reason
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
@@ -1895,11 +1896,7 @@ class Service(ServiceExecutionSession):
                 candidate_nodes = [
                     node
                     for node in discovered_nodes
-                    if node.healthy
-                    and node.schedulable
-                    and not node.drain
-                    and bool(getattr(node, "accept_service_deploy", True))
-                    and str(getattr(node, "control_addr", "") or "").strip()
+                    if is_admitted_node(node, require_control_addr=True)
                 ]
                 runtime = normalize_python_runtime_spec(str(spec.get("runtime", "") or ""))
                 if runtime:
@@ -1916,11 +1913,7 @@ class Service(ServiceExecutionSession):
                 node
                 for node in candidate_nodes
                 if _node_instance_key_from_node(node) not in excluded
-                and bool(getattr(node, "healthy", True))
-                and bool(getattr(node, "schedulable", True))
-                and not bool(getattr(node, "drain", False))
-                and bool(getattr(node, "accept_service_deploy", True))
-                and str(getattr(node, "control_addr", "") or "").strip()
+                and is_admitted_node(node, require_control_addr=True)
             ]
             if not candidates:
                 return 0
@@ -2743,18 +2736,15 @@ class Service(ServiceExecutionSession):
             discovered_instance_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
 
             def _reject_non_deploy_nodes(nodes: Sequence[InfoCenterNode], *, scope: str) -> None:
-                rejected = [
-                    node
-                    for node in nodes
-                    if not bool(getattr(node, "accept_service_deploy", True))
-                    or not str(getattr(node, "control_addr", "") or "").strip()
-                ]
+                rejected = [(node, node_admission_block_reason(node, require_control_addr=True)) for node in nodes]
+                rejected = [(node, reason) for node, reason in rejected if reason]
                 if rejected:
                     details = ", ".join(
                         f"{node.node_id}/{_node_instance_key_from_node(node)}"
                         f"(accept_deploy={'yes' if getattr(node, 'accept_service_deploy', True) else 'no'},"
-                        f" control_addr={str(getattr(node, 'control_addr', '') or '') or '-'})"
-                        for node in rejected
+                        f" control_addr={str(getattr(node, 'control_addr', '') or '') or '-'},"
+                        f" reason={reason})"
+                        for node, reason in rejected
                     )
                     raise RuntimeError(f"{scope} contains nodes that do not accept service deployment: {details}")
 
@@ -2814,9 +2804,7 @@ class Service(ServiceExecutionSession):
             candidate_nodes = [
                 node
                 for node in discovered_nodes
-                if node.healthy and node.schedulable and not node.drain
-                and bool(getattr(node, "accept_service_deploy", True))
-                and str(getattr(node, "control_addr", "") or "").strip()
+                if is_admitted_node(node, require_control_addr=True)
             ]
             if normalized_runtime:
                 candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=normalized_runtime)

@@ -10,7 +10,7 @@ from typing import Dict, Optional, Sequence, Tuple
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
-from pycloud_parallel.controlplane.scheduling_policy import deploy_candidate_block_reason, is_deploy_candidate
+from pycloud_parallel.controlplane.scheduling_policy import node_admission_block_reason, is_admitted_node
 from pycloud_parallel.execution.scheduler import (
     JOBQUEUE_DEFAULT,
     SchedulerCandidate,
@@ -682,24 +682,10 @@ class InfoCenterClient:
         normalized_runtime = normalize_python_runtime_spec(runtime)
         discovered_instance_map = {_node_instance_key_from_node(node): node for node in nodes}
 
-        def _ensure_control_addrs(selected_nodes: Sequence[InfoCenterNode], *, label: str) -> None:
-            missing = [
-                _node_instance_key_from_node(node) or node.node_id
-                for node in selected_nodes
-                if not str(node.control_addr or "").strip()
-            ]
-            if missing:
-                raise RuntimeError(f"{label} do not expose control_addr and cannot host task pools: {missing}")
-
         def _ensure_deployable_nodes(selected_nodes: Sequence[InfoCenterNode], *, label: str) -> None:
             blocked = []
             for node in selected_nodes:
-                reason = deploy_candidate_block_reason(
-                    healthy=bool(node.healthy),
-                    schedulable=bool(node.schedulable),
-                    drain=bool(node.drain),
-                    accept_service_deploy=bool(getattr(node, "accept_service_deploy", True)),
-                )
+                reason = node_admission_block_reason(node, require_control_addr=True)
                 if reason:
                     blocked.append((_node_instance_key_from_node(node) or node.node_id, reason))
             if blocked:
@@ -711,7 +697,6 @@ class InfoCenterClient:
             if missing_instance_ids:
                 raise RuntimeError(f"requested node_instance_ids not found in current discovery scope: {missing_instance_ids}")
             selected = [discovered_instance_map[node_id] for node_id in requested_instance_ids]
-            _ensure_control_addrs(selected, label="requested node_instance_ids")
             _ensure_deployable_nodes(selected, label="requested node_instance_ids")
             if normalized_runtime:
                 incompatible = [
@@ -734,7 +719,6 @@ class InfoCenterClient:
             if missing_node_ids:
                 raise RuntimeError(f"requested node_ids not found in current discovery scope: {missing_node_ids}")
             selected = [discovered_node_map[node_id] for node_id in requested_node_ids]
-            _ensure_control_addrs(selected, label="requested node_ids")
             _ensure_deployable_nodes(selected, label="requested node_ids")
             if normalized_runtime:
                 incompatible = [
@@ -755,14 +739,9 @@ class InfoCenterClient:
             candidates = [
                 node
                 for node in nodes
-                if is_deploy_candidate(
-                    healthy=bool(node.healthy),
-                    schedulable=bool(node.schedulable),
-                    drain=bool(node.drain),
-                    accept_service_deploy=bool(getattr(node, "accept_service_deploy", True)),
-                    control_addr=str(node.control_addr or ""),
+                if is_admitted_node(
+                    node,
                     require_control_addr=True,
-                    credit=int(node.credit or 0),
                     require_credit=bool(require_credit),
                 )
             ]

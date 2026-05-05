@@ -50,6 +50,44 @@ def deploy_candidate_block_reason(
     return ""
 
 
+def node_admission_block_reason(
+    node: object,
+    *,
+    require_control_addr: bool = False,
+    require_credit: bool = False,
+) -> str:
+    """Return why a node cannot accept new centrally scheduled work.
+
+    This is the shared base admission predicate for task and service deploy
+    candidates. Runtime compatibility, tags, and scoring stay at call sites.
+    Node capability is observability/compat metadata and is not consulted here.
+    """
+
+    return deploy_candidate_block_reason(
+        healthy=bool(getattr(node, "healthy", True)),
+        schedulable=bool(getattr(node, "schedulable", True)),
+        drain=bool(getattr(node, "drain", False)),
+        accept_service_deploy=bool(getattr(node, "accept_service_deploy", True)),
+        control_addr=str(getattr(node, "control_addr", "") or ""),
+        require_control_addr=bool(require_control_addr),
+        credit=int(getattr(node, "credit", 0) or 0),
+        require_credit=bool(require_credit),
+    )
+
+
+def is_admitted_node(
+    node: object,
+    *,
+    require_control_addr: bool = False,
+    require_credit: bool = False,
+) -> bool:
+    return not node_admission_block_reason(
+        node,
+        require_control_addr=require_control_addr,
+        require_credit=require_credit,
+    )
+
+
 def is_deploy_candidate(**kwargs: object) -> bool:
     return not deploy_candidate_block_reason(**kwargs)
 
@@ -75,7 +113,9 @@ __all__ = [
     "is_owner_target",
     "is_conflict_scope",
     "is_deploy_candidate",
+    "is_admitted_node",
     "deploy_candidate_block_reason",
+    "node_admission_block_reason",
     "call_routes",
     "owner_targets",
     "conflict_scope",
