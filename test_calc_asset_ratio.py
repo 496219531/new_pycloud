@@ -19,7 +19,7 @@ from calc_asset_ratio.ok import calc_asset_ratio
 import calc_asset_ratio_job_module
 
 
-CONTROLPLANE_TARGET = 'local'#"127.0.0.1:50051"
+CONTROLPLANE_TARGET = 'local' #"127.0.0.1:50051"
 SERVICE_NAME = "calc_asset_ratio"
 MANAGED_GLOBAL_NAMES = (
     "bench_mark_yield_df",
@@ -502,7 +502,7 @@ if __name__ == "__main__":
         1652875,
     ]
     t1 = time.time()
-    result = calc_fund_list_asset_ratio(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
 
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
@@ -510,7 +510,7 @@ if __name__ == "__main__":
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)

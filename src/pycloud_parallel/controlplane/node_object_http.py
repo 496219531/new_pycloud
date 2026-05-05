@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.http_client import target_to_base_url
+from pycloud_parallel.controlplane.config import OBJECT_HTTP_BODY_MAX_BYTES, get_http_object_body_limit_bytes
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.data.ref import (
@@ -26,7 +27,7 @@ from pycloud_parallel.data.ref import (
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
-MAX_OBJECT_HTTP_BODY_BYTES = 512 * 1024 * 1024
+MAX_OBJECT_HTTP_BODY_BYTES = int(OBJECT_HTTP_BODY_MAX_BYTES)
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:
@@ -83,7 +84,7 @@ def _expected_object_id(meta: pb2.UploadObjectMeta, actual_sha256: str) -> str:
 class NodeObjectHttpApp:
     def __init__(self, state: NodeControlState, *, max_body_bytes: int = MAX_OBJECT_HTTP_BODY_BYTES) -> None:
         self.state = state
-        self.max_body_bytes = max(1, int(max_body_bytes or MAX_OBJECT_HTTP_BODY_BYTES))
+        self.max_body_bytes = get_http_object_body_limit_bytes(max_body_bytes)
 
     def handle_get(self, path: str) -> Tuple[int, Dict[str, str], bytes]:
         parsed = urlparse(path)

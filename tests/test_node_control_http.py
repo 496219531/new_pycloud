@@ -104,7 +104,7 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
         state.close()
 
 
-def test_http_taskpool_uses_binary_transport_payload_lane(tmp_path):
+def test_http_taskpool_uses_transport_payload_adapter(tmp_path):
     server, state = _start_http_node(tmp_path)
     blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) * 3}\n"
     try:

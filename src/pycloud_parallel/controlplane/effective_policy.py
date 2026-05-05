@@ -5,7 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
-from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
+from pycloud_parallel.controlplane.config import (
+    PayloadPolicy,
+    effective_limits_from_profile,
+    get_payload_policy,
+    merge_payload_limits_with_effective_policy,
+    normalize_policy_limit_values,
+)
 from pycloud_parallel.controlplane.policy_profile import PolicyProfile
 from pycloud_parallel.controlplane.serialization_mode import normalize_serialization_mode
 
@@ -19,8 +25,8 @@ class EffectivePolicy:
     inline_payload_soft_limit_bytes: int
     inline_payload_hard_limit_bytes: int
     inline_result_hard_limit_bytes: int
-    use_transport_payload_bytes: bool
-    use_http_bytes_transport: bool
+    use_raw_bytes_payload: bool
+    use_http_raw_bytes_body: bool
     allow_pickle_stable: bool
 
     def __post_init__(self) -> None:
@@ -36,11 +42,16 @@ class EffectivePolicy:
         object.__setattr__(self, "version", max(1, int(self.version or 1)))
         object.__setattr__(self, "resolved_mode", normalized_mode)
         object.__setattr__(self, "allowed_modes", normalized_allowed)
-        object.__setattr__(self, "inline_payload_soft_limit_bytes", max(1, int(self.inline_payload_soft_limit_bytes or 1)))
-        object.__setattr__(self, "inline_payload_hard_limit_bytes", max(1, int(self.inline_payload_hard_limit_bytes or 1)))
-        object.__setattr__(self, "inline_result_hard_limit_bytes", max(1, int(self.inline_result_hard_limit_bytes or 1)))
-        object.__setattr__(self, "use_transport_payload_bytes", bool(self.use_transport_payload_bytes))
-        object.__setattr__(self, "use_http_bytes_transport", bool(self.use_http_bytes_transport))
+        soft_limit, hard_limit, result_hard_limit = normalize_policy_limit_values(
+            soft=int(self.inline_payload_soft_limit_bytes or 1),
+            hard=int(self.inline_payload_hard_limit_bytes or 1),
+            result_hard=int(self.inline_result_hard_limit_bytes or 1),
+        )
+        object.__setattr__(self, "inline_payload_soft_limit_bytes", soft_limit)
+        object.__setattr__(self, "inline_payload_hard_limit_bytes", hard_limit)
+        object.__setattr__(self, "inline_result_hard_limit_bytes", result_hard_limit)
+        object.__setattr__(self, "use_raw_bytes_payload", bool(self.use_raw_bytes_payload))
+        object.__setattr__(self, "use_http_raw_bytes_body", bool(self.use_http_raw_bytes_body))
         object.__setattr__(self, "allow_pickle_stable", bool(self.allow_pickle_stable))
 
     def assert_frozen_mode(self, request_mode: str = "") -> str:
@@ -89,12 +100,13 @@ def resolve_effective_policy(
     else:
         resolved_mode = allowed_modes[0]
 
-    inline_payload_hard_limit_bytes = int(profile.inline_payload_hard_limit_bytes)
-    inline_payload_soft_limit_bytes = min(int(profile.inline_payload_soft_limit_bytes), inline_payload_hard_limit_bytes)
-    inline_result_hard_limit_bytes = int(profile.inline_result_hard_limit_bytes)
-    use_transport_payload_bytes = bool(profile.use_transport_payload_bytes) and resolved_mode != "legacy_v1"
-    use_http_bytes_transport = use_transport_payload_bytes and bool(profile.use_http_bytes_transport) and (
-        str(context or "").strip().lower() in {"gateway_public", "service_connect", "http_call", "jobqueue_session"}
+    inline_payload_soft_limit_bytes, inline_payload_hard_limit_bytes, inline_result_hard_limit_bytes = (
+        effective_limits_from_profile(profile)
+    )
+    use_raw_bytes_payload = bool(profile.use_raw_bytes_payload) and resolved_mode != "legacy_v1"
+    use_http_raw_bytes_body = use_raw_bytes_payload and bool(profile.use_http_raw_bytes_body) and (
+        str(context or "").strip().lower()
+        in {"gateway_public", "service_connect", "http_call", "jobqueue_session", "taskpool_owner"}
     )
     allow_pickle_stable = "pickle_stable_v1" in allowed_modes and bool(profile.allow_pickle_stable)
 
@@ -106,8 +118,8 @@ def resolve_effective_policy(
         inline_payload_soft_limit_bytes=inline_payload_soft_limit_bytes,
         inline_payload_hard_limit_bytes=inline_payload_hard_limit_bytes,
         inline_result_hard_limit_bytes=inline_result_hard_limit_bytes,
-        use_transport_payload_bytes=use_transport_payload_bytes,
-        use_http_bytes_transport=use_http_bytes_transport,
+        use_raw_bytes_payload=use_raw_bytes_payload,
+        use_http_raw_bytes_body=use_http_raw_bytes_body,
         allow_pickle_stable=allow_pickle_stable,
     )
 
@@ -116,47 +128,33 @@ def payload_policy_from_effective_policy(mode: str, effective_policy: Optional[E
     base = get_payload_policy(mode)  # type: ignore[arg-type]
     if effective_policy is None:
         return base
-    limits = replace(
-        base.limits,
-        inline_payload_soft_limit_bytes=min(
-            int(base.inline_payload_soft_limit_bytes),
-            int(effective_policy.inline_payload_soft_limit_bytes),
-        ),
-        inline_payload_hard_limit_bytes=min(
-            int(base.inline_payload_hard_limit_bytes),
-            int(effective_policy.inline_payload_hard_limit_bytes),
-        ),
-        inline_result_hard_limit_bytes=min(
-            int(base.inline_result_hard_limit_bytes),
-            int(effective_policy.inline_result_hard_limit_bytes),
-        ),
-    )
+    limits = merge_payload_limits_with_effective_policy(base.limits, effective_policy)
     return replace(base, limits=limits)
 
 
-def should_use_transport_payload_bytes(
+def should_use_raw_bytes_payload(
     *,
     mode: str = "",
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> bool:
     if effective_policy is not None:
-        return bool(effective_policy.use_transport_payload_bytes)
-    from pycloud_parallel.controlplane.serialization import prefers_transport_payload_bytes
+        return bool(effective_policy.use_raw_bytes_payload)
+    from pycloud_parallel.controlplane.serialization import prefers_raw_bytes_payload
 
-    return bool(prefers_transport_payload_bytes(mode))
+    return bool(prefers_raw_bytes_payload(mode))
 
 
-def should_use_http_bytes_transport(
+def should_use_http_raw_bytes_body(
     *,
     mode: str = "",
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> bool:
     if effective_policy is not None:
-        return bool(effective_policy.use_http_bytes_transport)
+        return bool(effective_policy.use_http_raw_bytes_body)
     normalized_mode = str(mode or "").strip().lower() or "legacy_v1"
     if normalized_mode == "legacy_v1":
         return False
-    return should_use_transport_payload_bytes(
+    return should_use_raw_bytes_payload(
         mode=mode,
         effective_policy=None,
     )
@@ -166,6 +164,6 @@ __all__ = [
     "EffectivePolicy",
     "payload_policy_from_effective_policy",
     "resolve_effective_policy",
-    "should_use_http_bytes_transport",
-    "should_use_transport_payload_bytes",
+    "should_use_http_raw_bytes_body",
+    "should_use_raw_bytes_payload",
 ]

@@ -182,12 +182,7 @@ class NodeControlService:
         else:
             raw_payload = struct_to_python(request.payload)
             request_serialization_mode = detect_transport_mode(raw_payload, default="legacy_v1")
-            decoded_payload = decode_payload_from_transport(
-                raw_payload,
-                policy=get_payload_policy("http_call"),
-                mode=request_serialization_mode,
-                context="service_owner",
-            )
+            decoded_payload = raw_payload if isinstance(raw_payload, dict) else {}
 
         code, body = self._state.call_service(
             service_id=request.service_id,

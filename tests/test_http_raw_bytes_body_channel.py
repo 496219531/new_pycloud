@@ -34,7 +34,7 @@ def test_service_http_gateway_root_returns_help_page():
         gateway.stop()
 
 
-def test_service_http_gateway_roundtrips_pickle_bytes_transport():
+def test_service_http_gateway_roundtrips_pickle_raw_bytes_body():
     captured = {}
 
     def _invoke(service_id, method, payload, token, timeout_sec, serialization_mode, use_transport_result, stream_response):
@@ -105,7 +105,7 @@ def test_service_http_gateway_keeps_json_transport_compatible():
         gateway.stop()
 
 
-def test_gateway_public_rejects_pickle_bytes_transport():
+def test_gateway_public_rejects_pickle_raw_bytes_body():
     class _RouteCache:
         def start(self) -> None:
             return None

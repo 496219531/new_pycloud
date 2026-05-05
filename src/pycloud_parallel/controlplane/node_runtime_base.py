@@ -20,6 +20,13 @@ from urllib.parse import urlparse
 from pycloud_parallel.controlplane.http_gateway import ExtraGetHandler, MethodsHandler, ServiceHttpGateway, StreamingHttpResponse
 from pycloud_parallel.controlplane.netutil import format_host_port, split_host_port
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
+from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport, normalize_inbound_payload
+from pycloud_parallel.controlplane.config import get_payload_policy
+from pycloud_parallel.controlplane.serialization import (
+    TRANSPORT_ENVELOPE_SENTINEL,
+    decode_inline_transport_carrier,
+    is_inline_transport_carrier,
+)
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
@@ -297,7 +304,36 @@ class NodeRuntimeBase:
             fn = methods.get(method_name)
             if fn is None:
                 return 404, {"ok": False, "error": f"method not found: {method}"}
-            effective_payload = dict(payload or {})
+            payload_policy = get_payload_policy("http_call")
+            if is_inline_transport_carrier(payload):
+                inbound_payload = decode_inline_transport_carrier(
+                    payload,
+                    context="service_owner",
+                    trust_mode="trusted_internal",
+                    limit_bytes=payload_policy.inline_payload_hard_limit_bytes,
+                )
+            elif (
+                str(serialization_mode or "").strip().lower() != "legacy_v1"
+                and not (isinstance(payload, dict) and TRANSPORT_ENVELOPE_SENTINEL in payload)
+            ):
+                inbound_payload = payload or {}
+            else:
+                inbound_payload = decode_payload_from_transport(
+                    payload or {},
+                    policy=payload_policy,
+                    mode=serialization_mode,
+                    context="service_owner",
+                    trust_mode="trusted_internal",
+                )
+            effective_payload = dict(
+                normalize_inbound_payload(
+                    inbound_payload or {},
+                    object_dir="",
+                    policy=payload_policy,
+                    resolve_object_refs=lambda value: value,
+                )
+                or {}
+            )
             param_names = method_param_names.get(method_name, set())
             context_values = {
                 "_service_id": normalized_service_id,

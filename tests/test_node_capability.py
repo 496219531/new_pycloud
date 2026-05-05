@@ -12,32 +12,32 @@ def test_detect_local_node_capability_has_transport_support():
 
     assert "legacy_v1" in capability.supported_modes
     assert "structured_v1" in capability.supported_modes
-    assert capability.supports_transport_payload_bytes is True
-    assert capability.supports_http_bytes_transport is True
+    assert capability.supports_raw_bytes_payload is True
+    assert capability.supports_http_raw_bytes_body is True
     assert capability.max_control_send_bytes > 0
     assert capability.max_http_body_bytes > 0
 
 
-def test_node_capability_roundtrips_http_nodecontrol_fields():
+def test_node_capability_roundtrips_http_control_fields():
     capability = NodeCapability(
-        supports_http_nodecontrol=True,
-        node_http_base_url="http://127.0.0.1:18061",
+        supports_http_control=True,
+        control_base_url="http://127.0.0.1:18061",
     )
 
     restored = NodeCapability.from_dict(capability.to_dict())
 
-    assert restored.supports_http_nodecontrol is True
-    assert restored.node_http_base_url == "http://127.0.0.1:18061"
+    assert restored.supports_http_control is True
+    assert restored.control_base_url == "http://127.0.0.1:18061"
 
 
 def test_infocenter_roundtrips_node_capability():
     state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     capability = NodeCapability(
         supported_modes=("legacy_v1", "structured_v1"),
-        supports_transport_payload_bytes=True,
-        supports_http_bytes_transport=False,
-        supports_http_nodecontrol=True,
-        node_http_base_url="http://127.0.0.1:18061",
+        supports_raw_bytes_payload=True,
+        supports_http_raw_bytes_body=False,
+        supports_http_control=True,
+        control_base_url="http://127.0.0.1:18061",
         max_control_send_bytes=8 * 1024 * 1024,
         max_control_recv_bytes=8 * 1024 * 1024,
         max_http_body_bytes=2 * 1024 * 1024,

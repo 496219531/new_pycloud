@@ -186,6 +186,7 @@ class JobOrchestratorServer:
         job_orch_policy_id: str = "",
         taskpool_policy_id: str = "",
         admin_token: str = "",
+        replace_existing: bool = False,
     ) -> None:
         self.bind = str(bind or "").strip()
         self.infocenter_addr = str(infocenter_addr or "").strip()
@@ -205,6 +206,7 @@ class JobOrchestratorServer:
         env_admin_token = str(os.getenv("PYCLOUD_JOB_ORCHESTRATOR_ADMIN_TOKEN", "") or "").strip()
         fallback_admin_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
         self.admin_token = str(admin_token or env_admin_token or fallback_admin_token or "").strip()
+        self.replace_existing = bool(replace_existing)
 
         self.service_id = uuid.uuid4().hex
         self._service_module_name = JOB_ORCHESTRATOR_SERVICE_MODULE
@@ -258,6 +260,7 @@ class JobOrchestratorServer:
             queue_capacity=self.queue_capacity,
             version=self.version,
             start=True,
+            replace_existing=self.replace_existing,
         )
         self.service_id = self._node._local_service_id
         self.base_url = self._node.service_http_base_url

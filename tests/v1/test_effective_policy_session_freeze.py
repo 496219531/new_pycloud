@@ -24,8 +24,8 @@ def _node(node_id: str, capability: NodeCapability) -> InfoCenterNode:
 def test_service_session_computes_frozen_effective_policy():
     capability = NodeCapability(
         supported_modes=("legacy_v1", "structured_v1"),
-        supports_transport_payload_bytes=True,
-        supports_http_bytes_transport=True,
+        supports_raw_bytes_payload=True,
+        supports_http_raw_bytes_body=True,
         max_control_send_bytes=2 * 1024 * 1024,
         max_control_recv_bytes=2 * 1024 * 1024,
         max_http_body_bytes=2 * 1024 * 1024,
@@ -48,8 +48,8 @@ def test_service_session_computes_frozen_effective_policy():
 def test_task_pool_session_computes_frozen_effective_policy():
     capability = NodeCapability(
         supported_modes=("legacy_v1",),
-        supports_transport_payload_bytes=True,
-        supports_http_bytes_transport=True,
+        supports_raw_bytes_payload=True,
+        supports_http_raw_bytes_body=True,
         max_control_send_bytes=1024 * 1024,
         max_control_recv_bytes=1024 * 1024,
         max_http_body_bytes=2 * 1024 * 1024,

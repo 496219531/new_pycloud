@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import socket
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -57,6 +58,79 @@ def test_startup_service_node_mounts_python_module_service(tmp_path, monkeypatch
     )
     assert code == 200
     assert body["data"] == {"value": 5}
+
+
+def test_startup_service_node_call_balanced_uses_python_module_mount(tmp_path, monkeypatch) -> None:
+    module_path = tmp_path / "startup_calc_call.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    node.mount_python_module_service(service_name="startup-calc", entry_module="startup_calc_call")
+
+    _node_key, body = node.call_balanced("add", {"x": 4, "y": 6}, timeout_sec=5.0)
+
+    assert body["ok"] is True
+    assert body["data"] == {"value": 10}
+
+
+def test_startup_module_mount_decodes_inline_transport_adapter_at_invoke(tmp_path, monkeypatch) -> None:
+    module_path = tmp_path / "startup_payload_call.py"
+    module_path.write_text(
+        "def echo(**payload):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    from pycloud_parallel.controlplane.local_ipc import (
+        _make_local_pickle_payload_transport,
+    )
+
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    node.mount_python_module_service(service_name="startup-payload", entry_module="startup_payload_call")
+    payload_transport = _make_local_pickle_payload_transport(
+        {"job_mode": "hooks", "task_generator_callable": "task_generator"},
+        meta={"object_dir": str(tmp_path)},
+    )
+
+    _node_key, body = node.call_balanced("echo", payload_transport, timeout_sec=5.0)
+
+    assert body["ok"] is True
+    assert body["data"]["job_mode"] == "hooks"
+    assert body["data"]["task_generator_callable"] == "task_generator"
+
+
+def test_startup_module_mount_decodes_transport_envelope_payload_at_invoke(tmp_path, monkeypatch) -> None:
+    module_path = tmp_path / "startup_envelope_call.py"
+    module_path.write_text(
+        "def echo(**payload):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    from pycloud_parallel.controlplane.payload_transport import encode_payload_for_transport
+    from pycloud_parallel.controlplane.config import get_payload_policy
+
+    node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    node.mount_python_module_service(service_name="startup-envelope", entry_module="startup_envelope_call")
+    payload = encode_payload_for_transport(
+        {"job_mode": "hooks", "task_generator_callable": "task_generator"},
+        policy=get_payload_policy("http_call"),
+        context="service_owner",
+        mode="legacy_v1",
+    )
+
+    _node_key, body = node.call_balanced("echo", payload, timeout_sec=5.0, serialization_mode="legacy_v1")
+
+    assert body["ok"] is True
+    assert body["data"]["job_mode"] == "hooks"
+    assert body["data"]["task_generator_callable"] == "task_generator"
 
 
 def test_startup_service_node_updates_python_module_managed_globals(tmp_path, monkeypatch) -> None:
@@ -2268,6 +2342,67 @@ def test_job_queue_local_calls_local_service_ipc_end_to_end(tmp_path, monkeypatc
     assert submitted["job"]["job_id"] == "job-local-1"
     assert submitted["job"]["token"] == "token-local"
     assert status["job"] == {"job_id": "job-local-1", "status": "SUCCEEDED", "include_details": True}
+
+
+def test_job_queue_manager_local_creates_local_taskpool(monkeypatch) -> None:
+    import base64
+
+    from pycloud_parallel.controlplane.job_queue import JobQueueManager
+
+    captured: dict[str, object] = {}
+
+    class _FakePool:
+        def update_globals(self, values):
+            del values
+
+        def unordered(self, items, **kwargs):
+            del kwargs
+            for item in items:
+                yield {"value": item}
+
+        def imap_unordered(self, items, **kwargs):
+            del kwargs
+            for item in items:
+                yield {"value": item}
+
+        def close(self):
+            return None
+
+    def _fake_open(**kwargs):
+        captured.update(kwargs)
+        return _FakePool()
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.job_queue.TaskPool.open", _fake_open)
+    queue = JobQueueManager()
+    queue.start(controlplane_target="local")
+    try:
+        payload = {
+            "entry_module": "demo_job",
+            "task_generator_callable": [{"x": 1}],
+            "task_entry_callable": "run",
+            "package_format": "py",
+            "blob_b64": base64.b64encode(b"def run(**payload):\n    return payload\n").decode("ascii"),
+            "pool_name": "local-job-pool",
+        }
+        state = queue.submit_job(payload, auth_token="token")
+        deadline = time.monotonic() + 2.0
+        while not captured and time.monotonic() < deadline:
+            current = queue.get_job(state.job_id)
+            if current is not None and current.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(0.01)
+    finally:
+        queue.close()
+
+    assert captured["target"] == "local"
+    assert "infocenter_target" not in captured
+    assert "entry_module" not in captured
+    assert "entry_callable" not in captured
+    assert "source" not in captured
+    assert captured["artifact"].entry_module == "demo_job"
+    assert captured["artifact"].entry_callable == "run"
+    assert captured["node_count"] == 0
+    assert state.status in {"WAITING", "RUNNING", "SUCCEEDED", "FAILED"}
 
 
 def test_job_queue_client_submit_source_module_builds_payloads() -> None:

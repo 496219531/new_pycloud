@@ -63,31 +63,32 @@
 分层原则：
 
 1. `legacy_v1 / structured_v1 / pickle_stable_v1` 首先是对象 codec 层
-2. JSON / Struct / protobuf bytes / object upload blob 属于 transport 容器层
-3. `pickle_stable_v1` 不会为了 JSON/Struct 预先把 schema 里的 raw bytes 文本化
-4. 如果当前 transport 是 JSON/Struct-only，base64 或拒绝都由 transport 适配层决定
-5. 因此：
+2. JSON carrier / HTTP raw-bytes body / object upload blob 属于当前主线 transport 容器层
+3. Struct carrier / `TransportPayload` adapter 属于旧内部兼容层
+4. `pickle_stable_v1` 不会为了 JSON/Struct 预先把 schema 里的 raw bytes 文本化
+5. 如果当前 transport 是 JSON/Struct-only，base64 或拒绝都由 transport 适配层决定
+6. 因此：
    - codec 层表达对象本身
    - transport 层表达“这个对象怎么进当前容器”
 
-当前 NodeControl/protobuf 主链已经有两条并行 transport 通道：
+当前 NodeControl 消息主链仍有两条兼容路径：
 
 1. 旧 `Struct` 通道
    - 继续兼容 `legacy_v1`
-2. 新 `TransportPayload(codec, version, payload)` 通道
-   - `pickle_stable_v1` 优先走这条 bytes 通道
+2. `TransportPayload(codec, version, payload)` adapter
+   - 旧内部 state/proto 路径仍会用
    - 旧字段仍保留以保证兼容
 
-当前 HTTP 主链也有两条并行 transport 通道：
+当前 HTTP 主线有两种 body：
 
 1. 旧 JSON 通道
    - `Content-Type: application/json`
    - 继续兼容 `legacy_v1`
-2. 新 bytes 通道
+2. HTTP raw-bytes body
    - `Content-Type: application/x-pycloud-transport`
    - `X-Pycloud-Codec`
    - `X-Pycloud-Transport-Version`
-   - `pickle_stable_v1` 优先走这条 bytes 通道
+   - `pickle_stable_v1` 在 policy 允许时优先走这条 raw body
 
 这些 mode 当前已经统一作用于：
 
@@ -137,7 +138,7 @@
 
 1. 客户端可以表达 `serialization_mode` 偏好，但不能直接挑 `policy profile`
 2. node 不会再各自凭本机 env 选默认 mode 或 payload limit
-3. 会话建成以后，`serialization_mode`、payload limits、protobuf bytes lane、HTTP bytes lane 都按冻结后的 `effective_policy` 走
+3. 会话建成以后，`serialization_mode`、payload limits、HTTP raw-bytes body，以及旧内部 `TransportPayload` adapter 都按冻结后的 `effective_policy` 走
 
 `policy_id` 现在属于控制面/部署层输入，而不是普通客户端输入。
 普通用户在主路径上只会看到最终冻结的 `effective_policy`，不会被引导去直接选择 profile。
@@ -164,8 +165,8 @@
 
 carrier 选择也已经改成同一个原则：
 
-1. 主判断来自 `effective_policy.use_transport_payload_bytes`
-2. HTTP 主判断来自 `effective_policy.use_http_bytes_transport`
+1. 主判断来自 `effective_policy.use_raw_bytes_payload`
+2. HTTP 主判断来自 `effective_policy.use_http_raw_bytes_body`
 3. 只有当前调用没有 effective policy 时，才 fallback 到 mode helper
 
 所以现在不要再把 “`pickle_stable_v1` 一定走 bytes” 当成固定规则；

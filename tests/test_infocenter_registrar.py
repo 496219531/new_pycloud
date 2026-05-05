@@ -132,7 +132,7 @@ def test_node_registrar_syncs_service_routes(tmp_path):
         info_server.stop()
 
 
-def test_node_registrar_advertises_http_nodecontrol_capability(tmp_path):
+def test_node_registrar_advertises_http_control_capability(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
     info_server.start()
@@ -143,7 +143,7 @@ def test_node_registrar_advertises_http_nodecontrol_capability(tmp_path):
         artifact_dir=str(tmp_path / "code_cache_http_cap"),
         enable_internal_executor=False,
         enable_service_session=False,
-        node_http_base_url="http://127.0.0.1:18061",
+        control_base_url="http://127.0.0.1:18061",
     )
     registrar = NodeInfoCenterRegistrar(
         infocenter_addr=info_server.base_url,
@@ -161,8 +161,8 @@ def test_node_registrar_advertises_http_nodecontrol_capability(tmp_path):
         with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
             nodes = infocenter.list_nodes(healthy_only=True, tags=["compute"], limit=20)
         assert len(nodes) == 1
-        assert nodes[0].capability.supports_http_nodecontrol is True
-        assert nodes[0].capability.node_http_base_url == "http://127.0.0.1:18061"
+        assert nodes[0].capability.supports_http_control is True
+        assert nodes[0].capability.control_base_url == "http://127.0.0.1:18061"
     finally:
         registrar.close()
         node_state.close()

@@ -23,9 +23,9 @@
 | `PYCLOUD_DATAREF_RESOLUTION` | `remote_fetch` | worker/client 解析 `DataRef` 时允许按 locator/registry 远程拉取并本地缓存 |
 | `PYCLOUD_JOBQUEUE_RESOLVE_REFS` | `defer_to_worker` | JobQueue 默认不在 job-orch 实例化业务 `DataRef`，交给最终 worker 解析 |
 | `PYCLOUD_GATEWAY_DATAREF_RELAY` | `eager` | gateway 仍保持旧的 eager relay 默认，外部链路后续单独收口 |
-| `PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES` | `16777216` | NodeControl 单条发送消息限制 |
-| `PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` | `16777216` | NodeControl 单条接收消息限制 |
-| `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role node` 的默认 worker capacity；`pycloudctl start` 未显式指定时优先读它 |
+| `PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES` | `16777216` | node control HTTP 单条发送消息限制；旧名 `PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES` 仍兼容 |
+| `PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES` | `16777216` | node control HTTP 单条接收消息限制；旧名 `PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES` 仍兼容 |
+| `PYCLOUD_NODE_WORKER_CAPACITY` | `32` | `pycloud-control --role node` 与 `pycloudctl dev-start` 的默认 worker capacity；`pycloudctl start` 不启动 node |
 | `PYCLOUD_NODE_QUEUE_CAPACITY` | `4000` | `pycloud-control --role node` 的默认 queue capacity；`pycloudctl start-node` 默认值为 `1000`，也可被它覆盖 |
 | `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl HTTP server 的默认线程池大小 |
 | `PYCLOUD_SERVICE_DEFAULT_WORKERS` | `10` | 单个 service 默认 worker 数 |
@@ -107,20 +107,21 @@
 
 ### 2.4 control message size
 
-- `PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES`
+- `PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-- `PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES`
+- `PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-当前 `NodeControlClient` 和 `build_nodecontrol_server(...)` 都会读取这两个值，统一设置 NodeControl HTTP inline message size 限制。
+当前 node control HTTP client/server 都会读取这两个值，统一设置 inline message size 限制。
 
 ### 2.5 node 默认进程/并发参数
 
 - `PYCLOUD_NODE_WORKER_CAPACITY`
   - 默认：`32`
   - 影响 `pycloud-control --role node` 默认 worker capacity
-  - `pycloudctl start` / `start-node` 如果没有显式给 `--node-worker-capacity` / `--worker-capacity`，也会优先使用它
+  - `pycloudctl dev-start` / `dev-restart` 如果没有显式给 `--node-worker-capacity`，也会优先使用它
+  - `pycloudctl start-node` 如果没有显式给 `--worker-capacity`，也会优先使用它
 
 - `PYCLOUD_NODE_QUEUE_CAPACITY`
   - 默认：`4000`
@@ -148,8 +149,8 @@
 ```bash
 pycloudctl start-controlplane \
   --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576 \
-  --env PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
-  --env PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+  --env PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216 \
+  --env PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES=16777216
 ```
 
 也同样适用于：
@@ -157,6 +158,8 @@ pycloudctl start-controlplane \
 ```bash
 pycloudctl start
 pycloudctl restart
+pycloudctl dev-start
+pycloudctl dev-restart
 pycloudctl start-gateway
 pycloudctl start-node
 pycloudctl start-infocenter
@@ -181,8 +184,8 @@ $env:PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
 如果你确实需要更大的单条 NodeControl 消息：
 
 ```bash
-export PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216
-export PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+export PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216
+export PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES=16777216
 ```
 
 也就是 `16 MiB`。
@@ -261,8 +264,8 @@ export PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072
 2. 你明确知道进程内存足够
 
 ```bash
-export PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216
-export PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+export PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216
+export PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES=16777216
 ```
 
 ### 组合 D：提高对象分片大小到 512 KiB
@@ -282,8 +285,8 @@ export PYCLOUD_OBJECT_CHUNK_SIZE_BYTES=524288
 pycloudctl start \
   --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=131072 \
   --env PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072 \
-  --env PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216 \
-  --env PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=16777216
+  --env PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216 \
+  --env PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES=16777216
 ```
 
 ## 5. 备注

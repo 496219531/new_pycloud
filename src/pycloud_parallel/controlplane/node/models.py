@@ -8,7 +8,7 @@ from typing import Any, ClassVar, Dict, Optional, Tuple
 
 from pycloud_parallel.controlplane.config import get_payload_policy
 from pycloud_parallel.controlplane.data_store import StoredDataArtifact
-from pycloud_parallel.controlplane.effective_policy import should_use_transport_payload_bytes
+from pycloud_parallel.controlplane.effective_policy import should_use_raw_bytes_payload
 from pycloud_parallel.controlplane.session_model import (
     ExecutionReplicaSnapshot,
     SessionBinding,
@@ -103,7 +103,7 @@ class TaskState:
             "error": pb2.TaskError(type=self.error_type, message=self.error_message),
         }
         use_transport_result = (
-            should_use_transport_payload_bytes(mode=self.serialization_mode)
+            should_use_raw_bytes_payload(mode=self.serialization_mode)
             if self.use_transport_result is None
             else bool(self.use_transport_result)
         )

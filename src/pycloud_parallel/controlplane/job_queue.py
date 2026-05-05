@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 from typing import Any, Dict, List, Optional, Sequence
 
-from pycloud_parallel.controlplane.artifact import ArtifactDeps
+from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.config import JOB_STAGED_REF_TTL_SEC, get_jobqueue_resolve_refs, get_payload_policy
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
@@ -64,7 +64,31 @@ def _artifact_suffix(package_format: str) -> str:
 
 
 def _create_job_task_pool(**kwargs: Any) -> TaskPool:
-    return TaskPool._from_infocenter(**kwargs)
+    data = dict(kwargs or {})
+    target = str(data.pop("target", "") or data.pop("infocenter_target", "") or "").strip()
+    source = data.pop("source", None)
+    entry_module = str(data.pop("entry_module", "") or "").strip()
+    entry_callable = str(data.pop("entry_callable", "") or "run").strip() or "run"
+    package_format = str(data.pop("package_format", "") or "").strip()
+    runtime = str(data.get("runtime", "py3") or "py3")
+    managed_global_names = tuple(data.get("managed_global_names") or ())
+    deps = data.get("deps")
+    if source is not None and "artifact" not in data:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            if not package_format:
+                package_format = "py"
+            data["artifact"] = Artifact.from_bytes(
+                bytes(source),
+                package_format=package_format,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                deps=deps,
+                managed_global_names=managed_global_names,
+            )
+        else:
+            data["source"] = source
+    return TaskPool.open(target=target, **data)
 
 
 _JOB_ORCH_TASKPOOL_BINDING_ID = "taskpool_default"

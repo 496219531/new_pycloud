@@ -55,6 +55,8 @@ class _CtlArgumentParser(argparse.ArgumentParser):
                 "start-controlplane",
                 "start-job-orchestrator",
                 "start-node",
+                "dev-start",
+                "dev-restart",
                 "restart",
             }
             command_index = next((idx for idx, token in enumerate(argv) if token in local_commands), -1)
@@ -291,7 +293,7 @@ def _process_sort_key(name: str) -> Tuple[int, str]:
 
 
 def _managed_process_names(root: Path) -> List[str]:
-    names = {"controlplane", "job-orchestrator", "node-1", "node-2"}
+    names = {"controlplane", "job-orchestrator"}
     names.update(_pid_names(root))
     return sorted(names, key=_process_sort_key)
 
@@ -310,14 +312,26 @@ def _stop_all_managed_processes(root: Path) -> None:
         _stop_named_process(root, name)
 
 
+def _core_process_names(root: Path) -> List[str]:
+    del root
+    return ["job-orchestrator", "controlplane"]
+
+
+def _stop_core_processes(root: Path) -> None:
+    for name in _core_process_names(root):
+        _stop_named_process(root, name)
+
+
 def _default_named_ports(args: argparse.Namespace) -> Dict[str, int]:
+    node_control_port = int(getattr(args, "node_control_port", 50061) or 50061)
+    node_service_http_port = int(getattr(args, "node_service_http_port", 18081) or 18081)
     return {
         "controlplane": int(args.controlplane_port),
         "job-orchestrator": int(args.job_orchestrator_port),
-        "node-1-control": int(args.node1_port),
-        "node-1-http": int(args.node1_http),
-        "node-2-control": int(args.node2_port),
-        "node-2-http": int(args.node2_http),
+        "node-1-control": node_control_port,
+        "node-1-http": node_service_http_port,
+        "node-2-control": node_control_port + 1,
+        "node-2-http": node_service_http_port + 1,
     }
 
 
@@ -764,6 +778,56 @@ def _wait_service_registered(infocenter_target: str, service_name: str, timeout_
     return False
 
 
+def _is_local_target(target: str) -> bool:
+    return str(target or "").strip().lower() == "local"
+
+
+def _wait_local_service_registered(service_name: str, timeout_sec: float) -> bool:
+    from pycloud_parallel.controlplane.local_ipc import inspect_local_services
+
+    deadline = time.time() + max(0.1, float(timeout_sec))
+    normalized = str(service_name or "").strip()
+    while time.time() < deadline:
+        try:
+            rows = inspect_local_services(timeout_sec=0.2)
+            for row in rows:
+                if str(row.get("service_name", "") or "").strip() == normalized and bool(row.get("alive", False)):
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _stop_existing_local_ipc_service(service_name: str, *, timeout_sec: float = 3.0) -> None:
+    from pycloud_parallel.controlplane.local_ipc import cleanup_stale_local_services, stop_local_service
+
+    with contextlib.suppress(FileNotFoundError):
+        stop_local_service(str(service_name or "").strip(), timeout_sec=timeout_sec, force=True, cleanup=True)
+    with contextlib.suppress(Exception):
+        cleanup_stale_local_services(timeout_sec=0.2)
+
+
+def _find_local_service_pid(service_name: str) -> int:
+    from pycloud_parallel.controlplane.local_ipc import inspect_local_services
+
+    normalized = str(service_name or "").strip()
+    try:
+        rows = inspect_local_services(timeout_sec=0.2)
+    except Exception:
+        return 0
+    for row in rows:
+        if str(row.get("service_name", "") or "").strip() != normalized:
+            continue
+        if not bool(row.get("alive", False)):
+            continue
+        try:
+            return int(row.get("pid", 0) or 0)
+        except Exception:
+            return 0
+    return 0
+
+
 def _normalize_http_target(target: str) -> str:
     text = str(target or "").strip()
     if not text:
@@ -1048,7 +1112,7 @@ def _start_gateway(
             "gateway",
             "--bind",
             bind,
-            "--infocenter-addr",
+            "--target",
             infocenter_addr,
             "--gateway-refresh-interval-sec",
             f"{float(gateway_refresh_interval_sec):.3f}",
@@ -1081,8 +1145,24 @@ def _start_job_orchestrator(
     node_version: str = "v1",
     extra_env: Dict[str, str] | None = None,
     debug: bool = False,
+    force: bool = False,
 ) -> None:
     _assert_bind_available(bind)
+    local_target = _is_local_target(infocenter_addr)
+    if local_target:
+        existing_pid = _find_local_service_pid(service_name)
+        if force:
+            if existing_pid:
+                _log("WARN", f"Replacing existing local IPC service {service_name} (PID: {existing_pid}) because --force was set")
+            _stop_existing_local_ipc_service(service_name)
+        else:
+            if existing_pid:
+                raise RuntimeError(
+                    f"local service_name already exists: {service_name}\n"
+                    f"pid={existing_pid}\n"
+                    f"stop with: pycloudctl stop-local-service {service_name}\n"
+                    f"or re-run with: pycloudctl start-job-orchestrator --target local --force"
+                )
     _log("INFO", f"Starting JobOrchestrator on {bind} (InfoCenter: {infocenter_addr}, service: {service_name})...")
     pid = _spawn_server(
         root,
@@ -1092,7 +1172,7 @@ def _start_job_orchestrator(
             "joborchestrator",
             "--bind",
             bind,
-            "--infocenter-addr",
+            "--target",
             infocenter_addr,
             "--node-id",
             node_id,
@@ -1106,13 +1186,20 @@ def _start_job_orchestrator(
             node_version,
             "--log-level",
             "DEBUG" if debug else "INFO",
+            *(["--force"] if force else []),
         ],
         extra_env=extra_env,
         debug=debug,
     )
-    if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_service_registered(infocenter_addr, service_name, 0.2)):
+    if local_target:
+        is_ready = _wait_ready_with_pid(pid, 15.0, lambda: _wait_local_service_registered(service_name, 0.2))
+        error_message = "JobOrchestrator failed to start local IPC service"
+    else:
+        is_ready = _wait_ready_with_pid(pid, 15.0, lambda: _wait_service_registered(infocenter_addr, service_name, 0.2))
+        error_message = "JobOrchestrator failed to register to InfoCenter"
+    if not is_ready:
         _remove_pid(_pid_file(root, "job-orchestrator"))
-        raise RuntimeError("JobOrchestrator failed to register to InfoCenter")
+        raise RuntimeError(error_message)
     _write_pid(_pid_file(root, "job-orchestrator"), pid)
     _log("OK", f"JobOrchestrator started (PID: {pid}, Bind: {bind}, InfoCenter: {infocenter_addr})")
 
@@ -1172,7 +1259,7 @@ def _start_node(
             str(int(service_heartbeat_timeout_sec)),
             "--service-http-bind",
             service_http_bind,
-            "--infocenter-addr",
+            "--target",
             infocenter_target,
             "--advertise-addr",
             advertise_addr,
@@ -1243,7 +1330,7 @@ def _start_standalone_node(
         "DEBUG" if debug else "INFO",
     ]
     if infocenter_addr:
-        args.extend(["--infocenter-addr", infocenter_addr])
+        args.extend(["--target", infocenter_addr])
     if advertise_addr:
         args.extend(["--advertise-addr", advertise_addr])
     pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=extra_env, debug=debug)
@@ -1297,12 +1384,51 @@ def _cmd_start(args: argparse.Namespace) -> int:
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
     job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
-    node1_host = resolve_public_host(str(getattr(args, "node1_host", "") or "") or _default_host_for_args(args))
-    node1_http_host = resolve_public_host(str(getattr(args, "node1_http_host", "") or "") or _default_host_for_args(args))
-    node2_host = resolve_public_host(str(getattr(args, "node2_host", "") or "") or _default_host_for_args(args))
-    node2_http_host = resolve_public_host(str(getattr(args, "node2_http_host", "") or "") or _default_host_for_args(args))
 
-    _log("INFO", "Stopping existing services...")
+    _log("INFO", "Stopping existing core services...")
+    _stop_core_processes(root)
+    time.sleep(1.0)
+
+    infocenter_target = _format_host_port(controlplane_host, int(args.controlplane_port))
+    debug = bool(getattr(args, "debug", False))
+    controlplane_kwargs = dict(
+        bind_host=controlplane_host,
+        remote_hint=infocenter_target,
+        extra_env=extra_env,
+    )
+    job_orchestrator_kwargs = dict(
+        infocenter_addr=infocenter_target,
+        extra_env=extra_env,
+    )
+    if debug:
+        controlplane_kwargs["debug"] = True
+        job_orchestrator_kwargs["debug"] = True
+    _start_controlplane(root, args.controlplane_port, **controlplane_kwargs)
+    _start_job_orchestrator(
+        root,
+        bind=_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port)),
+        **job_orchestrator_kwargs,
+    )
+
+    print("============================================")
+    print("  Core Services Started!")
+    print("============================================")
+    print()
+    print(f"  ControlPlane: {_format_host_port(controlplane_host, int(args.controlplane_port))}")
+    print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
+    print(f"  Logs:        {_logs_dir(root)}")
+    print(f"  PIDs:        {_pids_dir(root)}")
+    return 0
+
+
+def _cmd_dev_start(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    _ensure_runtime_dirs(root)
+    extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
+    controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
+
+    _log("INFO", "Stopping existing managed dev services...")
     _stop_all_managed_processes(root)
     time.sleep(1.0)
 
@@ -1327,6 +1453,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         **job_orchestrator_kwargs,
     )
     time.sleep(2.0)
+
     worker_capacity = int(args.node_worker_capacity or _env_override_int(extra_env, "PYCLOUD_NODE_WORKER_CAPACITY", _default_node_worker_capacity()))
     queue_capacity = _env_override_int(extra_env, "PYCLOUD_NODE_QUEUE_CAPACITY", NODE_QUEUE_CAPACITY)
     max_workers = _env_override_int(extra_env, "PYCLOUD_NODE_MAX_WORKERS", NODE_MAX_WORKERS)
@@ -1345,52 +1472,83 @@ def _cmd_start(args: argparse.Namespace) -> int:
     )
     if debug:
         node_kwargs["debug"] = True
-    _start_node(
-        root,
-        "node-1",
-        args.node1_port,
-        args.node1_http,
-        infocenter_target,
-        worker_capacity,
-        bind_host=node1_host,
-        service_http_host=node1_http_host,
-        advertise_host=node1_host,
-        **node_kwargs,
-    )
-    _start_node(
-        root,
-        "node-2",
-        args.node2_port,
-        args.node2_http,
-        infocenter_target,
-        worker_capacity,
-        bind_host=node2_host,
-        service_http_host=node2_http_host,
-        advertise_host=node2_host,
-        **node_kwargs,
-    )
+
+    node_count = max(0, int(getattr(args, "nodes", 2) or 0))
+    node_base_port = int(getattr(args, "node_control_port", 50061) or 50061)
+    service_http_base_port = int(getattr(args, "node_service_http_port", 18081) or 18081)
+    node_host_seed = str(getattr(args, "node_host", "") or "") or _default_host_for_args(args)
+    service_http_host_seed = str(getattr(args, "node_service_http_host", "") or "") or _default_host_for_args(args)
+    node_host = resolve_public_host(node_host_seed)
+    service_http_host = resolve_public_host(service_http_host_seed)
+    for index in range(node_count):
+        node_name = f"node-{index + 1}"
+        _start_node(
+            root,
+            node_name,
+            node_base_port + index,
+            service_http_base_port + index,
+            infocenter_target,
+            worker_capacity,
+            bind_host=node_host,
+            service_http_host=service_http_host,
+            advertise_host=node_host,
+            **node_kwargs,
+        )
 
     print("============================================")
-    print("  All Services Started!")
+    print("  Dev Services Started!")
     print("============================================")
     print()
     print(f"  ControlPlane: {_format_host_port(controlplane_host, int(args.controlplane_port))}")
     print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
-    print(
-        f"  Node-1:      {_format_host_port(node1_host, int(args.node1_port))} "
-        f"(HTTP: {_format_host_port(node1_http_host, int(args.node1_http))})"
-    )
-    print(
-        f"  Node-2:      {_format_host_port(node2_host, int(args.node2_port))} "
-        f"(HTTP: {_format_host_port(node2_http_host, int(args.node2_http))})"
-    )
-    print(f"  Worker cap:  {worker_capacity} per node")
+    for index in range(node_count):
+        print(
+            f"  Node-{index + 1}:      {_format_host_port(node_host, node_base_port + index)} "
+            f"(HTTP: {_format_host_port(service_http_host, service_http_base_port + index)})"
+        )
+    if node_count:
+        print(f"  Worker cap:  {worker_capacity} per node")
     print(f"  Logs:        {_logs_dir(root)}")
     print(f"  PIDs:        {_pids_dir(root)}")
     return 0
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    target = str(getattr(args, "target", "") or f"127.0.0.1:{int(args.controlplane_port)}")
+    del target
+    _stop_core_processes(root)
+    if bool(getattr(args, "scan_ports", False)):
+        scanned_ports = _collect_scan_ports(args)
+        scanned = _kill_scanned_port_processes(target=f"127.0.0.1:{int(args.controlplane_port)}", ports=scanned_ports)
+        if scanned:
+            _log("OK", f"Stopped {len(scanned)} additional scanned listener process(es)")
+    _log("OK", "Core services stopped")
+    return 0
+
+
+def _stop_local_ipc_services(*, timeout_sec: float = 3.0, force: bool = True) -> Tuple[int, int]:
+    from pycloud_parallel.controlplane.local_ipc import cleanup_stale_local_services, iter_local_service_metadata, stop_local_service
+
+    stopped = 0
+    failed = 0
+    for meta in iter_local_service_metadata():
+        service_name = str(meta.get("service_name", "") or "").strip()
+        if not service_name:
+            continue
+        try:
+            result = stop_local_service(service_name, timeout_sec=timeout_sec, force=force, cleanup=True)
+            if bool(result.get("stopped", False)):
+                stopped += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    cleanup_stale_local_services(timeout_sec=0.2)
+    return stopped, failed
+
+
+def _cmd_stopall(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
     target = str(getattr(args, "target", "") or f"127.0.0.1:{int(args.controlplane_port)}")
     for name in _managed_process_names(root):
@@ -1400,12 +1558,31 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     killed = _kill_machine_pycloud_processes(root=root, target=target)
     if killed:
         _log("OK", f"Stopped {len(killed)} additional machine-wide pycloud process(es)")
+    stopped_local, failed_local = _stop_local_ipc_services(
+        timeout_sec=float(getattr(args, "timeout_sec", 3.0) or 3.0),
+        force=True,
+    )
+    if stopped_local:
+        _log("OK", f"Stopped {stopped_local} local IPC service(s)")
+    if failed_local:
+        _log("ERROR", f"Failed to stop {failed_local} local IPC service(s)")
     if bool(getattr(args, "scan_ports", False)):
         scanned_ports = _collect_scan_ports(args)
         scanned = _kill_scanned_port_processes(target=target, ports=scanned_ports)
         if scanned:
             _log("OK", f"Stopped {len(scanned)} additional scanned listener process(es)")
-    _log("OK", "All services stopped")
+    _log("OK", "All pycloud services stopped")
+    return 1 if failed_local else 0
+
+
+def _cmd_dev_stop(args: argparse.Namespace) -> int:
+    root = _runtime_root(args.runtime_root)
+    target = str(getattr(args, "target", "") or f"127.0.0.1:{int(args.controlplane_port)}")
+    for name in _managed_process_names(root):
+        if name not in {"controlplane", "gateway", "infocenter", "job-orchestrator"}:
+            _best_effort_mark_node_lost(target, name)
+    _stop_all_managed_processes(root)
+    _log("OK", "Dev services stopped")
     return 0
 
 
@@ -1446,7 +1623,7 @@ def _cmd_start_gateway(args: argparse.Namespace) -> int:
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     infocenter_addr = str(getattr(args, "infocenter_addr", "") or "").strip()
     if not infocenter_addr:
-        raise RuntimeError("start-gateway requires --infocenter-addr; pycloudctl no longer defaults to a local InfoCenter target")
+        raise RuntimeError("start-gateway requires --target; pycloudctl no longer defaults to a local InfoCenter target")
     bind = _resolve_bind_value(
         str(args.bind),
         host="",
@@ -1499,7 +1676,7 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     infocenter_addr = str(getattr(args, "infocenter_addr", "") or "").strip()
     if not infocenter_addr:
-        raise RuntimeError("start-job-orchestrator requires --infocenter-addr")
+        raise RuntimeError("start-job-orchestrator requires --target")
     bind = _resolve_bind_value(
         str(args.bind),
         host="",
@@ -1518,6 +1695,7 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
         node_tags=str(getattr(args, "node_tags", "") or "job"),
         node_version=str(getattr(args, "node_version", "") or "v1"),
         extra_env=extra_env,
+        force=bool(getattr(args, "force", False)),
         **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0
@@ -1533,7 +1711,7 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
     infocenter_arg = getattr(args, "infocenter_addr", None)
     if infocenter_arg is None:
         raise RuntimeError(
-            'start-node requires an explicit --infocenter-addr target; pass --infocenter-addr "" to start a standalone node without registration'
+            'start-node requires an explicit --target; pass --target "" to start a standalone node without registration'
         )
     infocenter_addr = str(infocenter_arg or "").strip()
     bind = _resolve_bind_value(
@@ -1593,6 +1771,14 @@ def _cmd_restart(args: argparse.Namespace) -> int:
         return stop_code
     time.sleep(2.0)
     return _cmd_start(args)
+
+
+def _cmd_dev_restart(args: argparse.Namespace) -> int:
+    stop_code = _cmd_dev_stop(args)
+    if stop_code != 0:
+        return stop_code
+    time.sleep(2.0)
+    return _cmd_dev_start(args)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -2316,11 +2502,12 @@ def _add_env_argument(parser: argparse.ArgumentParser) -> None:
 
 def _add_local_argument(parser: argparse.ArgumentParser, *, dest: str = "local") -> None:
     parser.add_argument(
+        "--loopback",
         "--local",
         dest=dest,
         action="store_true",
         default=argparse.SUPPRESS,
-        help="force default bind hosts to 127.0.0.1 for local-only startup",
+        help='bind managed HTTP services to 127.0.0.1 by default; unrelated to target="local" local IPC',
     )
 
 
@@ -2337,6 +2524,43 @@ def _add_debug_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dev_node_arguments(parser: argparse.ArgumentParser, *, restart: bool = False) -> None:
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        default=2,
+        help=(
+            "number of local node control processes to start after restart; supports 0, 1, or N"
+            if restart
+            else "number of local node control processes to start; supports 0, 1, or N"
+        ),
+    )
+    parser.add_argument("--node-host", default="", help="bind host used by dev node control endpoints; default auto-detects local IP")
+    parser.add_argument(
+        "--node-control-port",
+        type=int,
+        default=50061,
+        help="base bind port for dev node control endpoints; node-N increments from this value",
+    )
+    parser.add_argument(
+        "--node-service-http-host",
+        default="",
+        help="bind host used by dev node service HTTP endpoints; default auto-detects local IP",
+    )
+    parser.add_argument(
+        "--node-service-http-port",
+        type=int,
+        default=18081,
+        help="base bind port for dev node service HTTP endpoints; node-N increments from this value",
+    )
+    parser.add_argument(
+        "--node-worker-capacity",
+        type=int,
+        default=0,
+        help="worker capacity per dev node; default auto-calculated from CPU or PYCLOUD_NODE_WORKER_CAPACITY",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _CtlArgumentParser(description="PyCloud local service manager")
     parser.set_defaults(local=False, _global_local=False)
@@ -2346,21 +2570,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--controlplane-port", type=int, default=50051, help="bind port used by `pycloudctl start` for controlplane")
     parser.add_argument("--job-orchestrator-host", default="", help="bind host used by `pycloudctl start` for job-orchestrator; default auto-detects local IP")
     parser.add_argument("--job-orchestrator-port", type=int, default=50053, help="bind port used by `pycloudctl start` for job-orchestrator")
-    parser.add_argument("--node1-host", default="", help="bind host used by `pycloudctl start` for node-1 HTTP control; default auto-detects local IP")
-    parser.add_argument("--node1-port", type=int, default=50061, help="bind port used by `pycloudctl start` for node-1 HTTP control")
-    parser.add_argument("--node1-http-host", default="", help="bind host used by `pycloudctl start` for node-1 service HTTP; default auto-detects local IP")
-    parser.add_argument("--node1-http-port", dest="node1_http", type=int, default=18081, help="bind port used by `pycloudctl start` for node-1 service HTTP")
-    parser.add_argument("--node2-host", default="", help="bind host used by `pycloudctl start` for node-2 HTTP control; default auto-detects local IP")
-    parser.add_argument("--node2-port", type=int, default=50062, help="bind port used by `pycloudctl start` for node-2 HTTP control")
-    parser.add_argument("--node2-http-host", default="", help="bind host used by `pycloudctl start` for node-2 service HTTP; default auto-detects local IP")
-    parser.add_argument("--node2-http-port", dest="node2_http", type=int, default=18082, help="bind port used by `pycloudctl start` for node-2 service HTTP")
-    parser.add_argument("--node-worker-capacity", type=int, default=0, help="worker capacity per nodecontrol; default auto-calculated from CPU or PYCLOUD_NODE_WORKER_CAPACITY")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    start_parser = subparsers.add_parser("start", help="start controlplane and two nodecontrol processes")
+    start_parser = subparsers.add_parser("start", help="start controlplane and job-orchestrator")
     _add_local_argument(start_parser)
     _add_env_argument(start_parser)
     _add_debug_argument(start_parser)
+    dev_start_parser = subparsers.add_parser("dev-start", help="start controlplane, job-orchestrator, and a configurable local node set")
+    _add_local_argument(dev_start_parser)
+    _add_env_argument(dev_start_parser)
+    _add_debug_argument(dev_start_parser)
+    _add_dev_node_arguments(dev_start_parser)
     start_infocenter = subparsers.add_parser("start-infocenter", help="start one local infocenter process")
     _add_local_argument(start_infocenter)
     _add_env_argument(start_infocenter)
@@ -2371,7 +2591,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_gateway)
     _add_debug_argument(start_gateway)
     start_gateway.add_argument("--bind", default="0.0.0.0:50052", help="full bind address in host:port form for start-gateway; wildcard hosts auto-resolve to the local IP")
-    start_gateway.add_argument("--infocenter-addr", default="", help="InfoCenter target; required because pycloudctl no longer defaults to 127.0.0.1")
+    start_gateway.add_argument(
+        "--target",
+        "--infocenter-addr",
+        dest="infocenter_addr",
+        default="",
+        help='InfoCenter/ControlPlane target; use "local" only for commands that explicitly support local IPC',
+    )
     start_gateway.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0, help="gateway route refresh interval in seconds")
     start_gateway.add_argument("--gateway-failure-threshold", type=int, default=3, help="circuit-breaker failure threshold for gateway route refresh")
     start_gateway.add_argument("--gateway-open-sec", type=float, default=5.0, help="circuit-breaker open duration in seconds for gateway route refresh")
@@ -2388,14 +2614,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_job_orchestrator)
     _add_debug_argument(start_job_orchestrator)
     start_job_orchestrator.add_argument("--bind", default="0.0.0.0:50053", help="full bind address in host:port form for start-job-orchestrator; wildcard hosts auto-resolve to the local IP")
-    start_job_orchestrator.add_argument("--infocenter-addr", default="", help="InfoCenter target; required for job-orchestrator registration")
+    start_job_orchestrator.add_argument(
+        "--target",
+        "--infocenter-addr",
+        dest="infocenter_addr",
+        default="",
+        help='InfoCenter/ControlPlane target; "local" starts the job-orchestrator as a local IPC service',
+    )
     start_job_orchestrator.add_argument("--node-id", default="job-orchestrator-01", type=_normalize_managed_name, help="managed node id advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--service-name", default="job-orchestrator", help="service name registered by job-orchestrator")
     start_job_orchestrator.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="queue capacity advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--node-tags", default="job", help="comma-separated node tags advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--node-version", default="v1", help="node version string advertised by job-orchestrator")
+    start_job_orchestrator.add_argument("--force", action="store_true", help="replace an existing local IPC job-orchestrator with the same service name when --target local")
     start_job_orchestrator.add_argument("--admin-token", default="", help="admin token required for reorder_job; defaults to PYCLOUD_JOB_ORCHESTRATOR_ADMIN_TOKEN or PYCLOUD_INFOCENTER_TOKEN")
-    start_node = subparsers.add_parser("start-node", help="start one local nodecontrol process")
+    start_node = subparsers.add_parser("start-node", help="start one local node control process")
     _add_local_argument(start_node)
     _add_env_argument(start_node)
     _add_debug_argument(start_node)
@@ -2403,29 +2636,43 @@ def build_parser() -> argparse.ArgumentParser:
     start_node.add_argument("--bind", default="0.0.0.0:50061", help="full HTTP control bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
     start_node.add_argument("--service-http-bind", default="", help="full service HTTP bind address in host:port form for start-node; defaults to the node bind host and a port derived from the control port, for example 50061 -> 18081")
     start_node.add_argument(
+        "--target",
         "--infocenter-addr",
+        dest="infocenter_addr",
         default=None,
-        help='InfoCenter/ControlPlane target; required for registration, pass empty string ("") to disable registration',
+        help='InfoCenter/ControlPlane target for registration; pass empty string ("") to disable registration',
     )
     start_node.add_argument("--advertise-addr", default="", help="full advertised control address in host:port form; defaults to the auto-resolved HTTP control bind address")
     start_node.add_argument("--worker-capacity", type=int, default=0, help="node runtime worker capacity; 0 means auto-calculate")
     start_node.add_argument("--queue-capacity", type=int, default=NODE_QUEUE_CAPACITY, help="node task queue capacity")
-    start_node.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS, help="max HTTP control server worker threads for nodecontrol")
+    start_node.add_argument("--max-workers", type=int, default=NODE_MAX_WORKERS, help="max HTTP control server worker threads for this node")
     start_node.add_argument("--service-default-workers", type=int, default=SERVICE_DEFAULT_WORKERS, help="default worker count for deployed services on this node")
     start_node.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC, help="default heartbeat timeout in seconds for deployed services on this node")
     start_node.add_argument("--node-tags", default="compute", help="comma-separated node tags advertised during registration")
     start_node.add_argument("--node-version", default="v1", help="node version string advertised during registration")
-    stop_parser = subparsers.add_parser("stop", help="stop local services started by pycloudctl")
+    stop_parser = subparsers.add_parser("stop", help="stop local core controlplane and job-orchestrator services")
     stop_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
     stop_parser.add_argument("--scan-ports", action="store_true", help="after pid-based stop, scan configured ports and stop matching pycloud listener processes")
     stop_parser.add_argument("--ports", default="", help="comma-separated ports for doctor/scan-ports; default uses controlplane/node HTTP ports")
-    stop_node_parser = subparsers.add_parser("stop-node", help="stop one local nodecontrol process")
-    stop_node_parser.add_argument("node_name", type=_normalize_managed_name, help="nodecontrol name to stop")
+    stopall_parser = subparsers.add_parser("stopall", help="stop all local pycloud managed/server/local IPC processes")
+    stopall_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
+    stopall_parser.add_argument("--scan-ports", action="store_true", help="after process stop, scan configured ports and stop matching pycloud listener processes")
+    stopall_parser.add_argument("--ports", default="", help="comma-separated ports for scan-ports; default uses controlplane/node HTTP ports")
+    stopall_parser.add_argument("--timeout-sec", type=float, default=3.0, help="local IPC service shutdown timeout")
+    dev_stop_parser = subparsers.add_parser("dev-stop", help="stop local dev profile services")
+    dev_stop_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
+    stop_node_parser = subparsers.add_parser("stop-node", help="stop one local node control process")
+    stop_node_parser.add_argument("node_name", type=_normalize_managed_name, help="node control process name to stop")
     stop_node_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
-    restart_parser = subparsers.add_parser("restart", help="restart local services")
+    restart_parser = subparsers.add_parser("restart", help="restart local core controlplane and job-orchestrator services")
     _add_local_argument(restart_parser)
     _add_env_argument(restart_parser)
     _add_debug_argument(restart_parser)
+    dev_restart_parser = subparsers.add_parser("dev-restart", help="restart local dev profile services")
+    _add_local_argument(dev_restart_parser)
+    _add_env_argument(dev_restart_parser)
+    _add_debug_argument(dev_restart_parser)
+    _add_dev_node_arguments(dev_restart_parser, restart=True)
     status_parser = subparsers.add_parser("status", help="show local service status")
     status_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for node/service query (default: 127.0.0.1:<controlplane-port>)")
     local_services_parser = subparsers.add_parser("local-services", help="list Service.startup(target='local') IPC services")
@@ -2453,7 +2700,7 @@ def build_parser() -> argparse.ArgumentParser:
     gc_parser.add_argument("--force", action="store_true", help="allow destructive gc even if managed local processes are still running")
     parser.epilog = (
         "Environment overrides:\n"
-        "  start / start-infocenter / start-gateway / start-controlplane / start-job-orchestrator / start-node / restart\n"
+        "  start / dev-start / start-infocenter / start-gateway / start-controlplane / start-job-orchestrator / start-node / restart / dev-restart\n"
         "  support repeated '--env KEY=VALUE' arguments. Example:\n"
         "    pycloudctl start --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576"
     )
@@ -2465,6 +2712,8 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "start":
         return _cmd_start(args)
+    if args.command == "dev-start":
+        return _cmd_dev_start(args)
     if args.command == "start-infocenter":
         return _cmd_start_infocenter(args)
     if args.command == "start-gateway":
@@ -2477,10 +2726,16 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_start_node(args)
     if args.command == "stop":
         return _cmd_stop(args)
+    if args.command == "stopall":
+        return _cmd_stopall(args)
+    if args.command == "dev-stop":
+        return _cmd_dev_stop(args)
     if args.command == "stop-node":
         return _cmd_stop_node(args)
     if args.command == "restart":
         return _cmd_restart(args)
+    if args.command == "dev-restart":
+        return _cmd_dev_restart(args)
     if args.command == "status":
         return _cmd_status(args)
     if args.command == "local-services":

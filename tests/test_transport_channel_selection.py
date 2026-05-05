@@ -7,8 +7,8 @@ from urllib.request import Request
 from pycloud_parallel.controlplane.client_transport import _call_route_http
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
-    should_use_http_bytes_transport,
-    should_use_transport_payload_bytes,
+    should_use_http_raw_bytes_body,
+    should_use_raw_bytes_payload,
 )
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.controlplane.node_capability import NodeCapability
@@ -22,8 +22,8 @@ def _policy(
     *,
     resolved_mode: str,
     allowed_modes: tuple[str, ...],
-    use_transport_payload_bytes: bool,
-    use_http_bytes_transport: bool,
+    use_raw_bytes_payload: bool,
+    use_http_raw_bytes_body: bool,
 ) -> EffectivePolicy:
     return EffectivePolicy(
         policy_id="trusted_internal",
@@ -33,8 +33,8 @@ def _policy(
         inline_payload_soft_limit_bytes=256,
         inline_payload_hard_limit_bytes=1024,
         inline_result_hard_limit_bytes=1024,
-        use_transport_payload_bytes=use_transport_payload_bytes,
-        use_http_bytes_transport=use_http_bytes_transport,
+        use_raw_bytes_payload=use_raw_bytes_payload,
+        use_http_raw_bytes_body=use_http_raw_bytes_body,
         allow_pickle_stable="pickle_stable_v1" in allowed_modes,
     )
 
@@ -56,16 +56,16 @@ class _FakeHttpResponse:
 
 
 def test_transport_lane_follows_effective_policy_before_mode():
-    assert should_use_transport_payload_bytes(mode="pickle_stable_v1") is True
-    assert should_use_transport_payload_bytes(mode="legacy_v1") is False
+    assert should_use_raw_bytes_payload(mode="pickle_stable_v1") is True
+    assert should_use_raw_bytes_payload(mode="legacy_v1") is False
     assert (
-        should_use_transport_payload_bytes(
+        should_use_raw_bytes_payload(
             mode="pickle_stable_v1",
             effective_policy=_policy(
                 resolved_mode="pickle_stable_v1",
                 allowed_modes=("pickle_stable_v1", "structured_v1"),
-                use_transport_payload_bytes=False,
-                use_http_bytes_transport=False,
+                use_raw_bytes_payload=False,
+                use_http_raw_bytes_body=False,
             ),
         )
         is False
@@ -73,15 +73,15 @@ def test_transport_lane_follows_effective_policy_before_mode():
 
 
 def test_http_lane_follows_effective_policy_before_mode():
-    assert should_use_http_bytes_transport(mode="pickle_stable_v1") is True
+    assert should_use_http_raw_bytes_body(mode="pickle_stable_v1") is True
     assert (
-        should_use_http_bytes_transport(
+        should_use_http_raw_bytes_body(
             mode="pickle_stable_v1",
             effective_policy=_policy(
                 resolved_mode="pickle_stable_v1",
                 allowed_modes=("pickle_stable_v1", "structured_v1"),
-                use_transport_payload_bytes=False,
-                use_http_bytes_transport=False,
+                use_raw_bytes_payload=False,
+                use_http_raw_bytes_body=False,
             ),
         )
         is False
@@ -109,8 +109,8 @@ def test_call_route_http_uses_json_when_effective_policy_disables_http_bytes(mon
         effective_policy=_policy(
             resolved_mode="pickle_stable_v1",
             allowed_modes=("pickle_stable_v1", "structured_v1"),
-            use_transport_payload_bytes=False,
-            use_http_bytes_transport=False,
+            use_raw_bytes_payload=False,
+            use_http_raw_bytes_body=False,
         ),
     )
 
@@ -140,8 +140,8 @@ def test_call_route_http_can_use_bytes_for_structured_when_policy_enables(monkey
         effective_policy=_policy(
             resolved_mode="structured_v1",
             allowed_modes=("structured_v1", "legacy_v1"),
-            use_transport_payload_bytes=True,
-            use_http_bytes_transport=True,
+            use_raw_bytes_payload=True,
+            use_http_raw_bytes_body=True,
         ),
     )
 
@@ -174,8 +174,8 @@ def test_node_control_client_uses_struct_payload_when_transport_lane_disabled():
             effective_policy=_policy(
                 resolved_mode="pickle_stable_v1",
                 allowed_modes=("pickle_stable_v1", "structured_v1"),
-                use_transport_payload_bytes=False,
-                use_http_bytes_transport=False,
+                use_raw_bytes_payload=False,
+                use_http_raw_bytes_body=False,
             ),
         )
     finally:
@@ -208,8 +208,8 @@ def test_node_control_client_can_use_transport_lane_for_structured_mode():
             effective_policy=_policy(
                 resolved_mode="structured_v1",
                 allowed_modes=("structured_v1", "legacy_v1"),
-                use_transport_payload_bytes=True,
-                use_http_bytes_transport=True,
+                use_raw_bytes_payload=True,
+                use_http_raw_bytes_body=True,
             ),
         )
     finally:
@@ -230,14 +230,14 @@ def test_nodecontrol_target_uses_http_capability():
         inflight=0,
         credit=32,
         capability=NodeCapability(
-            supports_http_nodecontrol=True,
-            node_http_base_url="http://127.0.0.1:18061",
+            supports_http_control=True,
+            control_base_url="http://127.0.0.1:18061",
         ),
     )
 
     assert _taskpool_nodecontrol_target(node) == "http://127.0.0.1:18061"
     assert _service_nodecontrol_target(node) == "http://127.0.0.1:18061"
-    assert node.capability.to_dict()["supports_http_nodecontrol"] is True
+    assert node.capability.to_dict()["supports_http_control"] is True
 
 
 def test_nodecontrol_target_falls_back_to_control_addr_when_http_missing():

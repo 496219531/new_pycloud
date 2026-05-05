@@ -48,7 +48,7 @@ def test_transport_payload_modes_roundtrip():
             assert decoded["blob"] == payload["blob"]
 
 
-def test_transport_payload_bytes_modes_roundtrip():
+def test_transport_payload_raw_bytes_modes_roundtrip():
     payload = {"frame": pd.DataFrame({"a": [1, 2]}), "value": 3}
     for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
         transport = encode_transport_payload_bytes(payload, mode=mode, context="service_owner")
@@ -122,7 +122,7 @@ def test_gateway_public_decode_rejects_pickle_transport():
         raise AssertionError("expected gateway_public pickle decode to be rejected")
 
 
-def test_gateway_public_decode_rejects_pickle_transport_payload_bytes():
+def test_gateway_public_decode_rejects_pickle_transport_payload_raw_bytes():
     transport = encode_transport_payload_bytes(
         {"value": 1},
         mode="pickle_stable_v1",

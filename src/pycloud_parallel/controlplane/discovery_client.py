@@ -25,11 +25,11 @@ from .client_transport import (
 from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
 from pycloud_parallel.controlplane.discovery_route_cache import _DiscoveryRouteCache
+from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient, _node_instance_key_from_route
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
-from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
 from pycloud_parallel.execution.failover import STAGING_FAILED, classify_service_error, should_failover
 
 client_mod = SimpleNamespace(

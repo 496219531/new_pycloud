@@ -78,7 +78,7 @@ def test_jobqueue_transport_policy_stays_fixed_even_when_orchestrator_route_poli
     assert resp["job"]["job_id"] == "job-1"
     assert captured["prepare_policy"].resolved_mode == "structured_v1"
     assert captured["prepare_policy"].policy_id == "default_safe"
-    assert captured["prepare_policy"].use_transport_payload_bytes is False
+    assert captured["prepare_policy"].use_raw_bytes_payload is False
     assert captured["call_policy"].resolved_mode == "structured_v1"
     assert captured["call_policy"].policy_id == "default_safe"
     assert client.effective_policy.resolved_mode == "structured_v1"

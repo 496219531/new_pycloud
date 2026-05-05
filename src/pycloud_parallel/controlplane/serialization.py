@@ -313,7 +313,7 @@ def encode_transport_value(value: Any, *, mode: str = "", context: str = "payloa
     raise ValueError(f"unsupported serialization mode: {normalized!r}")
 
 
-def prefers_transport_payload_bytes(mode: str = "") -> bool:
+def prefers_raw_bytes_payload(mode: str = "") -> bool:
     normalized = resolve_effective_serialization_mode(
         request_mode=mode,
         context="transport_encode",

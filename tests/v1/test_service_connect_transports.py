@@ -123,8 +123,8 @@ def test_service_connect_discovery_retries_briefly_when_routes_are_not_ready():
 def test_service_connect_inherits_deploy_bound_policy_from_routes():
     capability = NodeCapability(
         supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
-        supports_transport_payload_bytes=True,
-        supports_http_bytes_transport=True,
+        supports_raw_bytes_payload=True,
+        supports_http_raw_bytes_body=True,
         max_control_send_bytes=4 * 1024 * 1024,
         max_control_recv_bytes=4 * 1024 * 1024,
         max_http_body_bytes=4 * 1024 * 1024,
@@ -186,8 +186,8 @@ def test_service_connect_rejects_mixed_route_policy_metadata():
         "lease_expire_at": datetime.now(timezone.utc).isoformat(),
         "capability": NodeCapability(
             supported_modes=("legacy_v1", "structured_v1"),
-            supports_transport_payload_bytes=False,
-            supports_http_bytes_transport=False,
+            supports_raw_bytes_payload=False,
+            supports_http_raw_bytes_body=False,
             max_control_send_bytes=4 * 1024 * 1024,
             max_control_recv_bytes=4 * 1024 * 1024,
             max_http_body_bytes=4 * 1024 * 1024,

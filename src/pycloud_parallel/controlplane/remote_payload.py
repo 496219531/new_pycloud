@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Dict, Optional, Sequence
 
+from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy, payload_policy_from_effective_policy
 from pycloud_parallel.controlplane.payload_transport import prepare_outbound_payload
-from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
 from pycloud_parallel.execution.support import (
     _estimate_managed_global_inline_size,
     _policy_with_soft_limit,

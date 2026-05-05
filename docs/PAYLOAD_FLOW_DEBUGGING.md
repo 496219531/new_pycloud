@@ -208,7 +208,7 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 
 这表示：
 
-1. payload 直接编码进 JSON / protobuf Struct
+1. payload 直接编码进 JSON / Struct carrier
 2. 没有走 `DataRef`
 
 ### 5.2 请求参数走对象上传

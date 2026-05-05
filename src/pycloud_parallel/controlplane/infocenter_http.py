@@ -19,6 +19,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.data.ref import coerce_data_ref
+from pycloud_parallel.controlplane.config import INFOCENTER_HTTP_BODY_MAX_BYTES
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
@@ -37,7 +38,7 @@ from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
-MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_BODY_BYTES = int(INFOCENTER_HTTP_BODY_MAX_BYTES)
 logger = logging.getLogger(__name__)
 
 

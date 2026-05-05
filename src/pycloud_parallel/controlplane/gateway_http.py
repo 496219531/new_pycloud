@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 from pycloud_parallel.controlplane.config import (
     GATEWAY_MAX_UPLOAD_FILE_BYTES,
     GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
+    GATEWAY_HTTP_BODY_MAX_BYTES,
 )
 from .client_transport import (
     _decode_http_request_body_with_mode,
@@ -62,7 +63,7 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     return False
 
 
-MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_BODY_BYTES = int(GATEWAY_HTTP_BODY_MAX_BYTES)
 EXTERNAL_DATA_REF_ERROR = "external DataRef is not accepted; upload data to gateway first"
 
 

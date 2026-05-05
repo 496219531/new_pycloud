@@ -26,7 +26,9 @@ from pycloud_parallel.controlplane.payload_transport import (
 from pycloud_parallel.controlplane.serialization import (
     INLINE_TRANSPORT_CARRIER_SENTINEL,
     _restore_blob_from_json_transport,
+    convert_dict_to_arrow,
     decode_transport_payload_bytes,
+    decode_transport_value,
     encode_transport_payload_bytes,
     detect_transport_mode,
     deserialize_dataframe_bundle,
@@ -74,18 +76,18 @@ def _header_get(headers: Any, name: str) -> str:
     return ""
 
 
-def _prefers_http_bytes_transport(mode: str = "", effective_policy: Optional["EffectivePolicy"] = None) -> bool:
-    return _should_use_http_bytes_transport(mode=mode, effective_policy=effective_policy)
+def _prefers_http_raw_bytes_body(mode: str = "", effective_policy: Optional["EffectivePolicy"] = None) -> bool:
+    return _should_use_http_raw_bytes_body(mode=mode, effective_policy=effective_policy)
 
 
-def _should_use_http_bytes_transport(
+def _should_use_http_raw_bytes_body(
     *,
     mode: str = "",
     effective_policy: Optional["EffectivePolicy"] = None,
 ) -> bool:
-    from pycloud_parallel.controlplane.effective_policy import should_use_http_bytes_transport
+    from pycloud_parallel.controlplane.effective_policy import should_use_http_raw_bytes_body
 
-    return should_use_http_bytes_transport(
+    return should_use_http_raw_bytes_body(
         mode=mode,
         effective_policy=effective_policy,
     )
@@ -125,6 +127,18 @@ def _serialize_http_call_payload(
     )
 
 
+def _convert_http_json_payload_preserving_data_refs(value: Any) -> Any:
+    if isinstance(value, dict):
+        if "__pycloud_data_ref__" in value:
+            return dict(value)
+        if "__type__" in value:
+            return convert_dict_to_arrow(value)
+        return {key: _convert_http_json_payload_preserving_data_refs(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_convert_http_json_payload_preserving_data_refs(item) for item in value]
+    return value
+
+
 def _encode_http_transport_body(
     payload: Optional[Dict[str, object]],
     *,
@@ -159,14 +173,21 @@ def _decode_http_request_body_with_mode(body: bytes, *, context: str) -> tuple[D
     if not isinstance(payload, dict):
         raise ValueError("json body must be object")
     transport_mode = detect_transport_mode(payload)
-    decoded = decode_payload_from_transport(
-        payload,
-        policy=get_payload_policy("http_call"),
-        mode=transport_mode,
-        context=context,
-    )
+    if transport_mode != "legacy_v1":
+        decoded = decode_transport_value(
+            payload,
+            mode=transport_mode,
+            context=context,
+        )
+        if not isinstance(decoded, dict):
+            raise ValueError("http request payload must decode to object")
+        return decoded, transport_mode
+    if str(context or "").strip().lower() == "service_internal":
+        decoded = convert_dict_to_arrow(payload)
+    else:
+        decoded = _convert_http_json_payload_preserving_data_refs(payload)
     if not isinstance(decoded, dict):
-        raise ValueError("json body must decode to object")
+        raise ValueError("http request payload must decode to object")
     return decoded, transport_mode
 
 
@@ -189,14 +210,16 @@ def _decode_http_transport_request_body_with_mode(
         default_mode="legacy_v1",
         context=context,
     )
+    policy = get_payload_policy("http_call")
     decoded = decode_transport_payload_bytes(
         codec,
         version,
         body,
         context=context,
+        limit_bytes=policy.inline_payload_hard_limit_bytes,
     )
     if not isinstance(decoded, dict):
-        raise ValueError("transport body must decode to object")
+        raise ValueError("transport request payload must decode to object")
     return decoded, effective_mode
 
 
@@ -408,7 +431,7 @@ def _call_route_http(
     headers: Dict[str, str] = {}
     if service_token:
         headers["X-Service-Token"] = service_token
-    if _should_use_http_bytes_transport(
+    if _should_use_http_raw_bytes_body(
         mode=serialization_mode,
         effective_policy=effective_policy,
     ):
@@ -479,7 +502,7 @@ def _iter_route_http_stream(
     headers: Dict[str, str] = {"Accept": "application/x-ndjson"}
     if service_token:
         headers["X-Service-Token"] = service_token
-    if _should_use_http_bytes_transport(
+    if _should_use_http_raw_bytes_body(
         mode=serialization_mode,
         effective_policy=effective_policy,
     ):

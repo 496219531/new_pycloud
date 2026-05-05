@@ -490,8 +490,20 @@ class InfoCenterState:
             python_version=metadata.get("python_version", ""),
             capability=NodeCapability.from_dict(getattr(request, "capability", None) and {
                 "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
-                "supports_transport_payload_bytes": bool(getattr(request.capability, "supports_transport_payload_bytes", False)),
-                "supports_http_bytes_transport": bool(getattr(request.capability, "supports_http_bytes_transport", False)),
+                "supports_raw_bytes_payload": bool(
+                    getattr(
+                        request.capability,
+                        "supports_raw_bytes_payload",
+                        getattr(request.capability, "supports_transport_payload_bytes", False),
+                    )
+                ),
+                "supports_http_raw_bytes_body": bool(
+                    getattr(
+                        request.capability,
+                        "supports_http_raw_bytes_body",
+                        getattr(request.capability, "supports_http_bytes_transport", False),
+                    )
+                ),
                 "max_control_send_bytes": int(getattr(request.capability, "max_control_send_bytes", 0) or 0),
                 "max_control_recv_bytes": int(getattr(request.capability, "max_control_recv_bytes", 0) or 0),
                 "max_http_body_bytes": int(getattr(request.capability, "max_http_body_bytes", 0) or 0),
@@ -583,8 +595,20 @@ class InfoCenterState:
             services=self._parse_services(request.services),
             capability=NodeCapability.from_dict(getattr(request, "capability", None) and {
                 "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
-                "supports_transport_payload_bytes": bool(getattr(request.capability, "supports_transport_payload_bytes", False)),
-                "supports_http_bytes_transport": bool(getattr(request.capability, "supports_http_bytes_transport", False)),
+                "supports_raw_bytes_payload": bool(
+                    getattr(
+                        request.capability,
+                        "supports_raw_bytes_payload",
+                        getattr(request.capability, "supports_transport_payload_bytes", False),
+                    )
+                ),
+                "supports_http_raw_bytes_body": bool(
+                    getattr(
+                        request.capability,
+                        "supports_http_raw_bytes_body",
+                        getattr(request.capability, "supports_http_bytes_transport", False),
+                    )
+                ),
                 "max_control_send_bytes": int(getattr(request.capability, "max_control_send_bytes", 0) or 0),
                 "max_control_recv_bytes": int(getattr(request.capability, "max_control_recv_bytes", 0) or 0),
                 "max_http_body_bytes": int(getattr(request.capability, "max_http_body_bytes", 0) or 0),

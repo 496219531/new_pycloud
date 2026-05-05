@@ -197,14 +197,24 @@ class StartupServiceNode(NodeControlState):
         del strategy, refresh_status, kwargs
         if not self._local_service_id:
             raise RuntimeError("startup service is not mounted")
-        status, body = self.call_service(
-            service_id=self._local_service_id,
-            method=method,
-            payload=dict(payload or {}),
-            service_token=self._local_service_token,
-            timeout_sec=timeout_sec,
-            serialization_mode=serialization_mode,
-        )
+        if self._mounted_service(self._local_service_id) is not None:
+            status, body = self._invoke_mounted_startup_service(
+                self._local_service_id,
+                method,
+                dict(payload or {}),
+                self._local_service_token,
+                timeout_sec,
+                serialization_mode,
+            )
+        else:
+            status, body = self.call_service(
+                service_id=self._local_service_id,
+                method=method,
+                payload=dict(payload or {}),
+                service_token=self._local_service_token,
+                timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
+            )
         if int(status) >= 400 or not bool(body.get("ok", False)):
             raise RuntimeError(str(body.get("error") or body.get("error_type") or "startup service call failed"))
         return str(self.node_instance_id or self.node_id or "startup"), body

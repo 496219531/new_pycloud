@@ -235,7 +235,7 @@ def test_gateway_public_json_call_rejects_external_data_ref_locator_before_route
     assert body["error"] == EXTERNAL_DATA_REF_ERROR
 
 
-def test_gateway_public_http_bytes_transport_rejects_data_ref() -> None:
+def test_gateway_public_http_raw_bytes_body_rejects_data_ref() -> None:
     ref = DataRef(
         ref_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         storage_id="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",

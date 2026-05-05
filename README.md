@@ -246,30 +246,32 @@ V1 不再提供本地单机并行入口；并行计算统一走 `TaskPool`、`Se
 
 ```bash
 pycloudctl start
+pycloudctl dev-start --nodes 2
 pycloudctl start-controlplane
 pycloudctl start-infocenter
-pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
-pycloudctl start-job-orchestrator --infocenter-addr 127.0.0.1:50051
-pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
-pycloudctl start-node --node-id node-1 --node-port 50061 --service-http-port 18081 --infocenter-addr 127.0.0.1:50051
+pycloudctl start-gateway --target 127.0.0.1:50051
+pycloudctl start-job-orchestrator --target 127.0.0.1:50051
+pycloudctl start-node --node-id node-1 --target 127.0.0.1:50051
+pycloudctl start-node --node-id node-1 --bind 127.0.0.1:50061 --service-http-bind 127.0.0.1:18081 --target 127.0.0.1:50051
 pycloudctl status
 pycloudctl doctor
 pycloudctl stop-node node-1
 ```
 
-`start` 支持指定运行目录、端口和 worker 容量，只是这些是全局参数，要写在 `start` 前面：
+`start` 只启动 `controlplane + job-orchestrator`。需要本地节点时用 `dev-start`：
 
 ```bash
 pycloudctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
   --job-orchestrator-port 51053 \
-  --node1-port 51061 \
-  --node1-http-port 18181 \
-  --node2-port 51062 \
-  --node2-http-port 18182 \
-  --node-worker-capacity 4 \
   start
+
+pycloudctl dev-start \
+  --nodes 2 \
+  --node-control-port 51061 \
+  --node-service-http-port 18181 \
+  --node-worker-capacity 4
 ```
 
 不要写成：
@@ -282,15 +284,15 @@ pycloudctl start --runtime-root /tmp/pycloud-dev
 
 - [docs/PYCLOUDCTL_USAGE.md](docs/PYCLOUDCTL_USAGE.md)
 
-`pycloudctl start` 现在会默认把独立 `job-orchestrator` 也一起拉起，方便直接走 `gateway -> job-orchestrator -> TaskPool` 这条任务链路。
+`pycloudctl start` 会把独立 `job-orchestrator` 一起拉起，方便直接走 `gateway -> job-orchestrator -> TaskPool` 这条任务链路，但不会启动 node。
 
-如果你要单独起 `infocenter`、`gateway(http)`、`job-orchestrator`、`nodecontrol` 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
+如果你要单独起 `infocenter`、`gateway(http)`、`job-orchestrator`、node control 或独立 `controlplane`，现在也可以直接用上面的 `pycloudctl start-*` 子命令；更底层的 `pycloud-control` 示例见这份文档里的“单独起各角色”一节。
 
 如果升级后怀疑旧服务没停掉，先看：
 
 ```bash
 pycloudctl doctor
-pycloudctl stop --scan-ports
+pycloudctl stopall --scan-ports
 ```
 
 macOS / Linux:
@@ -310,8 +312,8 @@ scripts\start_services.bat status
 默认端口：
 
 1. `ControlPlane`: `<auto-detected-local-ip>:50051`
-2. `NodeControl node-1`: `<auto-detected-local-ip>:50061`
-3. `NodeControl node-2`: `<auto-detected-local-ip>:50062`
+2. dev `node-1` control HTTP: `<auto-detected-local-ip>:50061`
+3. dev `node-2` control HTTP: `<auto-detected-local-ip>:50062`
 4. `node-1 service HTTP`: `<auto-detected-local-ip>:18081`
 5. `node-2 service HTTP`: `<auto-detected-local-ip>:18082`
 
@@ -321,10 +323,6 @@ scripts\start_services.bat status
 ```bash
 pycloudctl \
   --controlplane-host 127.0.0.1 \
-  --node1-host 127.0.0.1 \
-  --node1-http-host 127.0.0.1 \
-  --node2-host 127.0.0.1 \
-  --node2-http-host 127.0.0.1 \
   start
 ```
 

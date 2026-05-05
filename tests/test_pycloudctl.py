@@ -47,13 +47,34 @@ def test_ctl_parser_accepts_start_command():
     assert args.command == "start"
     assert args.local is False
     assert args.controlplane_port == 50051
-    assert args.node_worker_capacity == 0
+    assert not hasattr(args, "node_worker_capacity")
     assert args.env == []
+
+
+def test_ctl_parser_accepts_dev_profile_commands():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["dev-start", "--nodes", "3"])
+    assert args.command == "dev-start"
+    assert args.nodes == 3
+    args = parser.parse_args(["dev-restart", "--nodes", "0"])
+    assert args.command == "dev-restart"
+    assert args.nodes == 0
+    args = parser.parse_args(["dev-stop"])
+    assert args.command == "dev-stop"
+    args = parser.parse_args(["stopall"])
+    assert args.command == "stopall"
 
 
 def test_ctl_parser_accepts_local_flag_after_start_command():
     parser = ctl.build_parser()
     args = parser.parse_args(["start", "--local"])
+    assert args.command == "start"
+    assert args.local is True
+
+
+def test_ctl_parser_accepts_loopback_alias_after_start_command():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["start", "--loopback"])
     assert args.command == "start"
     assert args.local is True
 
@@ -73,13 +94,13 @@ def test_ctl_parser_accepts_env_overrides_for_start_commands():
             "--env",
             "PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576",
             "--env",
-            "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216",
+            "PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216",
         ]
     )
     assert args.command == "start-controlplane"
     assert args.env == [
         "PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576",
-        "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=16777216",
+        "PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216",
     ]
 
 
@@ -125,7 +146,7 @@ def test_ctl_start_node_help_mentions_canonical_bind_options():
 
 def test_ctl_parser_accepts_start_gateway_command():
     parser = ctl.build_parser()
-    args = parser.parse_args(["start-gateway", "--bind", "0.0.0.0:50052", "--infocenter-addr", "127.0.0.1:50051"])
+    args = parser.parse_args(["start-gateway", "--bind", "0.0.0.0:50052", "--target", "127.0.0.1:50051"])
     assert args.command == "start-gateway"
     assert args.bind == "0.0.0.0:50052"
     assert args.infocenter_addr == "127.0.0.1:50051"
@@ -133,10 +154,40 @@ def test_ctl_parser_accepts_start_gateway_command():
 
 def test_ctl_parser_accepts_start_job_orchestrator_command():
     parser = ctl.build_parser()
-    args = parser.parse_args(["start-job-orchestrator", "--bind", "0.0.0.0:50053", "--infocenter-addr", "127.0.0.1:50051"])
+    args = parser.parse_args(["start-job-orchestrator", "--bind", "0.0.0.0:50053", "--target", "127.0.0.1:50051", "--force"])
     assert args.command == "start-job-orchestrator"
     assert args.bind == "0.0.0.0:50053"
     assert args.infocenter_addr == "127.0.0.1:50051"
+    assert args.force is True
+
+
+def test_ctl_parser_accepts_target_for_start_commands():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["start-gateway", "--target", "local"])
+    assert args.command == "start-gateway"
+    assert args.infocenter_addr == "local"
+    args = parser.parse_args(["start-job-orchestrator", "--target", "local"])
+    assert args.command == "start-job-orchestrator"
+    assert args.infocenter_addr == "local"
+    args = parser.parse_args(["start-node", "--target", "local"])
+    assert args.command == "start-node"
+    assert args.infocenter_addr == "local"
+
+
+def test_ctl_parser_accepts_infocenter_addr_alias_for_start_commands():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["start-gateway", "--infocenter-addr", "127.0.0.1:50051"])
+    assert args.command == "start-gateway"
+    assert args.infocenter_addr == "127.0.0.1:50051"
+    args = parser.parse_args(["start-job-orchestrator", "--infocenter-addr", "127.0.0.1:50051"])
+    assert args.command == "start-job-orchestrator"
+    assert args.infocenter_addr == "127.0.0.1:50051"
+    args = parser.parse_args(["start-node", "--infocenter-addr", "127.0.0.1:50051"])
+    assert args.command == "start-node"
+    assert args.infocenter_addr == "127.0.0.1:50051"
+
+
+
 
 
 def test_server_role_prefixes_normalize_to_canonical_names():
@@ -207,13 +258,13 @@ def test_wait_ready_with_pid_fails_when_process_exits(monkeypatch):
     assert ctl._wait_ready_with_pid(12345, 0.2, lambda: False) is False
 
 
-def test_cmd_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypatch):
+def test_cmd_dev_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(
         [
             "--runtime-root",
             str(tmp_path),
-            "start",
+            "dev-start",
             "--env",
             "PYCLOUD_NODE_WORKER_CAPACITY=10",
         ]
@@ -243,11 +294,11 @@ def test_cmd_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypa
         ),
     )
 
-    assert ctl._cmd_start(args) == 0
+    assert ctl._cmd_dev_start(args) == 0
     assert [item["worker_capacity"] for item in started_nodes] == [10, 10]
 
 
-def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
+def test_cmd_dev_start_propagates_host_overrides(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(
         [
@@ -257,23 +308,17 @@ def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
             "127.0.0.1",
             "--controlplane-port",
             "51051",
-            "--node1-host",
+            "dev-start",
+            "--node-host",
             "0.0.0.0",
-            "--node1-port",
+            "--node-control-port",
             "51061",
-            "--node1-http-host",
+            "--node-service-http-host",
             "0.0.0.0",
-            "--node1-http-port",
+            "--node-service-http-port",
             "18181",
-            "--node2-host",
-            "192.168.1.10",
-            "--node2-port",
-            "51062",
-            "--node2-http-host",
-            "127.0.0.1",
-            "--node2-http-port",
-            "18182",
-            "start",
+            "--nodes",
+            "2",
         ]
     )
     controlplane_calls: list[dict[str, object]] = []
@@ -311,7 +356,7 @@ def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
         ),
     )
 
-    assert ctl._cmd_start(args) == 0
+    assert ctl._cmd_dev_start(args) == 0
     assert controlplane_calls == [
         {
             "root": tmp_path.resolve(),
@@ -333,9 +378,9 @@ def test_cmd_start_propagates_host_overrides(tmp_path, monkeypatch):
     assert started_nodes[0]["service_http_host"] == "10.0.0.9"
     assert started_nodes[0]["advertise_host"] == "10.0.0.9"
     assert started_nodes[0]["infocenter_target"] == "127.0.0.1:51051"
-    assert started_nodes[1]["bind_host"] == "192.168.1.10"
-    assert started_nodes[1]["service_http_host"] == "127.0.0.1"
-    assert started_nodes[1]["advertise_host"] == "192.168.1.10"
+    assert started_nodes[1]["name"] == "node-2"
+    assert started_nodes[1]["port"] == 51062
+    assert started_nodes[1]["http_port"] == 18182
 
 
 def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypatch):
@@ -350,12 +395,11 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
     )
     controlplane_calls: list[dict[str, object]] = []
     job_orchestrator_calls: list[dict[str, object]] = []
-    started_nodes: list[dict[str, object]] = []
 
     monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
     monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
-    monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_core_processes", lambda _root: None)
     monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
     monkeypatch.setattr(
         ctl,
@@ -367,21 +411,7 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
         "_start_job_orchestrator",
         lambda root, **kwargs: job_orchestrator_calls.append({"root": root, **kwargs}),
     )
-    monkeypatch.setattr(
-        ctl,
-        "_start_node",
-        lambda root, name, port, http_port, infocenter_target, worker_capacity, **kwargs: started_nodes.append(
-            {
-                "root": root,
-                "name": name,
-                "port": port,
-                "http_port": http_port,
-                "infocenter_target": infocenter_target,
-                "worker_capacity": worker_capacity,
-                **kwargs,
-            }
-        ),
-    )
+    monkeypatch.setattr(ctl, "_start_node", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("start must not launch nodes")))
 
     assert ctl._cmd_start(args) == 0
     assert controlplane_calls[0]["bind_host"] == "127.0.0.1"
@@ -394,12 +424,7 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
             "extra_env": {},
         }
     ]
-    assert started_nodes[0]["bind_host"] == "127.0.0.1"
-    assert started_nodes[0]["service_http_host"] == "127.0.0.1"
-    assert started_nodes[0]["advertise_host"] == "127.0.0.1"
-    assert started_nodes[1]["bind_host"] == "127.0.0.1"
-    assert started_nodes[1]["service_http_host"] == "127.0.0.1"
-    assert started_nodes[1]["advertise_host"] == "127.0.0.1"
+    assert controlplane_calls[0]["bind_host"] == "127.0.0.1"
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -839,7 +864,7 @@ def test_cmd_stop_node_only_stops_requested_node(tmp_path, monkeypatch):
     assert logs == [("OK", "node-blue stopped")]
 
 
-def test_cmd_stop_stops_all_pid_backed_processes(tmp_path, monkeypatch):
+def test_cmd_stop_stops_only_core_processes(tmp_path, monkeypatch):
     pids_dir = tmp_path / "pids"
     pids_dir.mkdir(parents=True, exist_ok=True)
     for name in ("gateway", "node-blue"):
@@ -847,22 +872,38 @@ def test_cmd_stop_stops_all_pid_backed_processes(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(["--runtime-root", str(tmp_path), "stop"])
     stopped: list[tuple[Path, str]] = []
+
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda root, name: stopped.append((root, name)))
+    monkeypatch.setattr(ctl, "_log", lambda *_args: None)
+
+    assert ctl._cmd_stop(args) == 0
+    assert [name for _, name in stopped] == ["job-orchestrator", "controlplane"]
+
+
+def test_cmd_stopall_stops_pid_backed_and_local_ipc_processes(tmp_path, monkeypatch):
+    pids_dir = tmp_path / "pids"
+    pids_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("gateway", "node-blue"):
+        (pids_dir / f"{name}.pid").write_text("123\n", encoding="utf-8")
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "stopall"])
+    stopped: list[tuple[Path, str]] = []
     cleaned: list[tuple[str, str]] = []
     machine_scan_calls: list[tuple[Path, str]] = []
+    local_calls: list[tuple[float, bool]] = []
 
     monkeypatch.setattr(ctl, "_stop_named_process", lambda root, name: stopped.append((root, name)))
     monkeypatch.setattr(ctl, "_best_effort_mark_node_lost", lambda target, name: cleaned.append((target, name)) or True)
     monkeypatch.setattr(ctl, "_kill_machine_pycloud_processes", lambda *, root, target: machine_scan_calls.append((root, target)) or [])
+    monkeypatch.setattr(ctl, "_stop_local_ipc_services", lambda *, timeout_sec, force: local_calls.append((timeout_sec, force)) or (2, 0))
     monkeypatch.setattr(ctl, "_log", lambda *_args: None)
 
-    assert ctl._cmd_stop(args) == 0
-    assert [name for _, name in stopped] == ["node-1", "node-2", "node-blue", "job-orchestrator", "gateway", "controlplane"]
-    assert cleaned == [
-        ("127.0.0.1:50051", "node-1"),
-        ("127.0.0.1:50051", "node-2"),
-        ("127.0.0.1:50051", "node-blue"),
-    ]
+    assert ctl._cmd_stopall(args) == 0
+    assert "node-blue" in [name for _, name in stopped]
+    assert "gateway" in [name for _, name in stopped]
+    assert cleaned == [("127.0.0.1:50051", "node-blue")]
     assert machine_scan_calls == [(tmp_path.resolve(), "127.0.0.1:50051")]
+    assert local_calls == [(3.0, True)]
 
 
 def test_kill_machine_pycloud_processes_stops_discovered_server_processes(tmp_path, monkeypatch):
@@ -977,8 +1018,7 @@ def test_cmd_stop_scan_ports_invokes_listener_cleanup(tmp_path, monkeypatch):
     logs: list[tuple[str, str]] = []
 
     monkeypatch.setattr(ctl, "_managed_process_names", lambda _root: [])
-    monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
-    monkeypatch.setattr(ctl, "_kill_machine_pycloud_processes", lambda *, root, target: [])
+    monkeypatch.setattr(ctl, "_stop_core_processes", lambda _root: None)
     monkeypatch.setattr(ctl, "_kill_scanned_port_processes", lambda *, target, ports: scanned.append((target, tuple(ports))) or [{"pid": 11, "port": 50051}])
     monkeypatch.setattr(ctl, "_log", lambda label, message: logs.append((label, message)))
 
@@ -986,7 +1026,7 @@ def test_cmd_stop_scan_ports_invokes_listener_cleanup(tmp_path, monkeypatch):
     assert scanned == [("127.0.0.1:50051", (50051, 50061))]
     assert logs == [
         ("OK", "Stopped 1 additional scanned listener process(es)"),
-        ("OK", "All services stopped"),
+        ("OK", "Core services stopped"),
     ]
 
 
@@ -1033,7 +1073,7 @@ def test_cmd_start_node_requires_explicit_infocenter_target(tmp_path, monkeypatc
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
     monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
 
-    with pytest.raises(RuntimeError, match="requires an explicit --infocenter-addr target"):
+    with pytest.raises(RuntimeError, match="requires an explicit --target"):
         ctl._cmd_start_node(args)
 
 
@@ -1049,7 +1089,7 @@ def test_cmd_start_node_uses_explicit_infocenter_target_and_local_advertise(tmp_
         "0.0.0.0:51061",
         "--service-http-bind",
         "127.0.0.1:18181",
-        "--infocenter-addr",
+        "--target",
         "10.0.0.8:51051",
     ])
     started: list[dict[str, object]] = []
@@ -1091,8 +1131,8 @@ def test_cmd_start_node_uses_explicit_infocenter_target_and_local_advertise(tmp_
     [
         (["start-infocenter", "--local"], "127.0.0.1:50051", None),
         (["start-controlplane", "--local"], "127.0.0.1:50051", None),
-        (["start-gateway", "--local", "--infocenter-addr", "127.0.0.1:50051"], "127.0.0.1:50052", "127.0.0.1:50051"),
-        (["start-job-orchestrator", "--local", "--infocenter-addr", "127.0.0.1:50051"], "127.0.0.1:50053", "127.0.0.1:50051"),
+        (["start-gateway", "--local", "--target", "127.0.0.1:50051"], "127.0.0.1:50052", "127.0.0.1:50051"),
+        (["start-job-orchestrator", "--local", "--target", "127.0.0.1:50051"], "127.0.0.1:50053", "127.0.0.1:50051"),
     ],
 )
 def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
@@ -1166,6 +1206,7 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
                 "node_tags": "job",
                 "node_version": "v1",
                 "extra_env": {},
+                "force": False,
             }
         ]
         return
@@ -1193,7 +1234,7 @@ def test_cmd_start_node_uses_loopback_defaults_when_local_enabled(tmp_path, monk
         "--local",
         "--node-id",
         "node-blue",
-        "--infocenter-addr",
+        "--target",
         "127.0.0.1:50051",
     ])
     started: list[dict[str, object]] = []
@@ -1238,7 +1279,7 @@ def test_cmd_start_node_derives_default_service_http_port_from_node_bind(tmp_pat
         "start-node",
         "--node-id",
         "node-2",
-        "--infocenter-addr",
+        "--target",
         "10.168.70.123:50051",
         "--bind",
         "10.168.30.154:50062",
@@ -1269,7 +1310,7 @@ def test_cmd_start_node_can_disable_registration(tmp_path, monkeypatch):
         "start-node",
         "--node-id",
         "node-standalone",
-        "--infocenter-addr",
+        "--target",
         "",
     ])
     started: list[dict[str, object]] = []
@@ -1305,7 +1346,7 @@ def test_cmd_start_node_canonical_addresses(tmp_path, monkeypatch):
             "0.0.0.0:19181",
             "--advertise-addr",
             "10.0.0.9:62061",
-            "--infocenter-addr",
+            "--target",
             "10.0.0.8:51051",
         ]
     )
@@ -1354,7 +1395,7 @@ def test_cmd_start_gateway_requires_explicit_infocenter_target(tmp_path, monkeyp
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
     monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
 
-    with pytest.raises(RuntimeError, match="start-gateway requires --infocenter-addr"):
+    with pytest.raises(RuntimeError, match="start-gateway requires --target"):
         ctl._cmd_start_gateway(args)
 
 
@@ -1369,8 +1410,96 @@ def test_cmd_start_job_orchestrator_requires_explicit_infocenter_target(tmp_path
     monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
     monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
 
-    with pytest.raises(RuntimeError, match="start-job-orchestrator requires --infocenter-addr"):
+    with pytest.raises(RuntimeError, match="start-job-orchestrator requires --target"):
         ctl._cmd_start_job_orchestrator(args)
+
+
+def test_start_job_orchestrator_local_target_waits_for_local_ipc(tmp_path, monkeypatch):
+    ready_calls: list[tuple[str, float]] = []
+    spawned: list[list[str]] = []
+    written_pids: list[tuple[Path, int]] = []
+
+    monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
+    monkeypatch.setattr(ctl, "_logs_dir", lambda root: root / "logs")
+    monkeypatch.setattr(ctl, "_pid_file", lambda root, name: root / f"{name}.pid")
+    monkeypatch.setattr(ctl, "_find_local_service_pid", lambda _service_name: 0)
+    monkeypatch.setattr(
+        ctl,
+        "_stop_existing_local_ipc_service",
+        lambda _service_name: (_ for _ in ()).throw(AssertionError("local target must not stop existing service without force")),
+    )
+    monkeypatch.setattr(ctl, "_spawn_server", lambda _root, _log, args, **_kwargs: spawned.append(args) or 12345)
+    monkeypatch.setattr(ctl, "_wait_ready_with_pid", lambda _pid, _timeout, checker: checker())
+    monkeypatch.setattr(ctl, "_wait_local_service_registered", lambda service_name, timeout: ready_calls.append((service_name, timeout)) or True)
+    monkeypatch.setattr(
+        ctl,
+        "_wait_service_registered",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local target must not wait for InfoCenter registration")),
+    )
+    monkeypatch.setattr(ctl, "_write_pid", lambda path, pid: written_pids.append((path, pid)))
+    monkeypatch.setattr(ctl, "_log", lambda *_args: None)
+
+    ctl._start_job_orchestrator(
+        tmp_path,
+        bind="127.0.0.1:50053",
+        infocenter_addr="local",
+        service_name="job-orchestrator",
+    )
+
+    assert ready_calls == [("job-orchestrator", 0.2)]
+    assert "--target" in spawned[0]
+    assert spawned[0][spawned[0].index("--target") + 1] == "local"
+    assert "--force" not in spawned[0]
+    assert written_pids == [(tmp_path / "job-orchestrator.pid", 12345)]
+
+
+def test_start_job_orchestrator_local_target_reports_existing_pid_without_force(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
+    monkeypatch.setattr(ctl, "_find_local_service_pid", lambda _service_name: 22499)
+    monkeypatch.setattr(ctl, "_spawn_server", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not spawn when local service exists")))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ctl._start_job_orchestrator(
+            tmp_path,
+            bind="127.0.0.1:50053",
+            infocenter_addr="local",
+            service_name="job-orchestrator",
+        )
+
+    message = str(exc_info.value)
+    assert "local service_name already exists: job-orchestrator" in message
+    assert "pid=22499" in message
+    assert "pycloudctl stop-local-service job-orchestrator" in message
+    assert "--force" in message
+
+
+def test_start_job_orchestrator_local_target_force_replaces_existing_service(tmp_path, monkeypatch):
+    stopped: list[str] = []
+    spawned: list[list[str]] = []
+    logs: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
+    monkeypatch.setattr(ctl, "_logs_dir", lambda root: root / "logs")
+    monkeypatch.setattr(ctl, "_pid_file", lambda root, name: root / f"{name}.pid")
+    monkeypatch.setattr(ctl, "_find_local_service_pid", lambda _service_name: 22499)
+    monkeypatch.setattr(ctl, "_stop_existing_local_ipc_service", lambda service_name: stopped.append(service_name))
+    monkeypatch.setattr(ctl, "_spawn_server", lambda _root, _log, args, **_kwargs: spawned.append(args) or 12345)
+    monkeypatch.setattr(ctl, "_wait_ready_with_pid", lambda _pid, _timeout, checker: checker())
+    monkeypatch.setattr(ctl, "_wait_local_service_registered", lambda _service_name, _timeout: True)
+    monkeypatch.setattr(ctl, "_write_pid", lambda *_args: None)
+    monkeypatch.setattr(ctl, "_log", lambda label, message: logs.append((label, message)))
+
+    ctl._start_job_orchestrator(
+        tmp_path,
+        bind="127.0.0.1:50053",
+        infocenter_addr="local",
+        service_name="job-orchestrator",
+        force=True,
+    )
+
+    assert stopped == ["job-orchestrator"]
+    assert "--force" in spawned[0]
+    assert ("WARN", "Replacing existing local IPC service job-orchestrator (PID: 22499) because --force was set") in logs
 
 
 def test_spawn_server_passes_env_overrides(tmp_path, monkeypatch):

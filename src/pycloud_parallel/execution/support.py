@@ -29,8 +29,8 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.config import (
+    CONTROL_HTTP_MAX_SEND_BYTES,
     FILE_HASH_CHUNK_SIZE_BYTES,
-    CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES,
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
@@ -38,12 +38,14 @@ from pycloud_parallel.controlplane.config import (
     JOB_STAGING_REPLICA_COUNT,
     OBJECT_CHUNK_SIZE_BYTES,
     get_dataref_upload_strategy,
+    get_job_blob_inline_threshold_bytes,
+    merge_object_threshold_with_policy_soft_limit,
 )
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
     payload_policy_from_effective_policy,
-    should_use_transport_payload_bytes,
+    should_use_raw_bytes_payload,
 )
 from pycloud_parallel.controlplane.netutil import detect_local_ip
 from pycloud_parallel.data.ref import normalize_materialize_as, normalize_object_format
@@ -597,9 +599,9 @@ def _payload_policy_for_mode(
 ):
     policy = payload_policy_from_effective_policy(mode, effective_policy)
     if int(object_threshold_bytes or 0) > 0:
-        threshold = min(
-            max(1, int(object_threshold_bytes)),
-            max(1, int(policy.inline_payload_soft_limit_bytes)),
+        threshold = merge_object_threshold_with_policy_soft_limit(
+            object_threshold_bytes=object_threshold_bytes,
+            policy_soft_limit_bytes=policy.inline_payload_soft_limit_bytes,
         )
         policy = _policy_with_soft_limit(policy, threshold)
     return policy
@@ -638,7 +640,7 @@ def _managed_globals_effective_inline_limit(
         1,
         min(
             int(policy.inline_payload_hard_limit_bytes),
-            int(CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES),
+            int(CONTROL_HTTP_MAX_SEND_BYTES),
         ),
     )
 
@@ -654,7 +656,7 @@ def _encoded_managed_globals_size(
         request_mode=serialization_mode,
         context=context,
     )
-    if should_use_transport_payload_bytes(mode=effective_mode, effective_policy=effective_policy):
+    if should_use_raw_bytes_payload(mode=effective_mode, effective_policy=effective_policy):
         transport = encode_transport_payload_bytes(
             values,
             mode=effective_mode,
@@ -683,7 +685,7 @@ def _encode_managed_globals_batches(
     )
     encoded_batches: List[Tuple[Dict[str, object], Optional[object], Optional[object]]] = []
     for prepared_values in prepared_batches:
-        if should_use_transport_payload_bytes(mode=effective_mode, effective_policy=effective_policy):
+        if should_use_raw_bytes_payload(mode=effective_mode, effective_policy=effective_policy):
             encoded_batches.append(
                 (
                     prepared_values,
@@ -1314,8 +1316,7 @@ def _stage_job_submit_payload_for_transport(
 
 def _job_blob_requires_object_ref(blob: bytes) -> bool:
     raw_size = max(0, len(blob or b""))
-    inline_threshold = max(256 * 1024, int(INLINE_PAYLOAD_HARD_LIMIT_BYTES / 1.5))
-    return raw_size > inline_threshold
+    return raw_size > get_job_blob_inline_threshold_bytes()
 
 
 def _prepare_job_blob_submit_fields(

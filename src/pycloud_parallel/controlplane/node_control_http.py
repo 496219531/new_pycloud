@@ -25,7 +25,12 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.client_transport import _materialize_downloaded_result, _normalize_http_response_body
-from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_payload_policy
+from pycloud_parallel.controlplane.config import (
+    NODE_CONTROL_HTTP_BODY_MAX_BYTES,
+    OBJECT_CHUNK_SIZE_BYTES,
+    get_node_control_http_body_limit_bytes,
+    get_payload_policy,
+)
 from pycloud_parallel.controlplane.http_client import target_to_base_url
 from pycloud_parallel.controlplane.node.models import ServiceSession, TaskPoolState
 from pycloud_parallel.controlplane.node_object_http import (
@@ -53,7 +58,7 @@ from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
-MAX_NODECONTROL_HTTP_BODY_BYTES = 256 * 1024 * 1024
+MAX_NODE_CONTROL_HTTP_BODY_BYTES = int(NODE_CONTROL_HTTP_BODY_MAX_BYTES)
 _BINARY_META_LEN_BYTES = 8
 
 
@@ -190,11 +195,11 @@ class NodeControlHttpApp:
         state: NodeControlState,
         *,
         on_service_routes_changed=None,
-        max_body_bytes: int = MAX_NODECONTROL_HTTP_BODY_BYTES,
+        max_body_bytes: int = MAX_NODE_CONTROL_HTTP_BODY_BYTES,
     ) -> None:
         self.state = state
         self.on_service_routes_changed = on_service_routes_changed
-        self.max_body_bytes = max(1, int(max_body_bytes or MAX_NODECONTROL_HTTP_BODY_BYTES), MAX_OBJECT_HTTP_BODY_BYTES)
+        self.max_body_bytes = get_node_control_http_body_limit_bytes(max_body_bytes)
         self.object_app = NodeObjectHttpApp(state, max_body_bytes=MAX_OBJECT_HTTP_BODY_BYTES)
 
     def _notify(self) -> None:
@@ -621,16 +626,10 @@ class NodeControlHttpApp:
     def _call_service(self, service_id: str, method: str, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
         raw_payload = payload.get("payload", {})
         serialization_mode = detect_transport_mode(raw_payload, default=str(payload.get("serialization_mode", "") or "legacy_v1"))
-        decoded_payload = decode_payload_from_transport(
-            raw_payload,
-            policy=get_payload_policy("http_call"),
-            mode=serialization_mode,
-            context="service_owner",
-        )
         code, body = self.state.call_service(
             service_id=service_id,
             method=method,
-            payload=decoded_payload if isinstance(decoded_payload, dict) else {},
+            payload=raw_payload if isinstance(raw_payload, dict) else {},
             service_token=str(payload.get("service_token", "") or ""),
             timeout_sec=max(0.1, float(payload.get("timeout_sec", 60.0) or 60.0)),
             serialization_mode=serialization_mode,
@@ -736,7 +735,7 @@ class NodeControlHttpServer:
         bind: str,
         state: NodeControlState,
         on_service_routes_changed=None,
-        max_body_bytes: int = MAX_NODECONTROL_HTTP_BODY_BYTES,
+        max_body_bytes: int = MAX_NODE_CONTROL_HTTP_BODY_BYTES,
     ) -> None:
         self.bind = bind
         self.app = NodeControlHttpApp(state, on_service_routes_changed=on_service_routes_changed, max_body_bytes=max_body_bytes)

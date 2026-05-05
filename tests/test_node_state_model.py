@@ -393,7 +393,7 @@ def test_normalize_user_return_pickle_struct_lane_spills_by_struct_limit(tmp_pat
         raise ValueError("inline result too large")
 
     def _unexpected_transport_encode(*args, **kwargs):
-        raise AssertionError("bytes lane should not be used when use_transport_result=False")
+        raise AssertionError("transport result adapter should not be used when use_transport_result=False")
 
     monkeypatch.setattr(results_mod, "serialize_inline_result", _raise_inline_limit)
     monkeypatch.setattr(results_mod, "encode_transport_payload_bytes", _unexpected_transport_encode)
@@ -2373,7 +2373,7 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
 
 
 @pytest.mark.parametrize("mode", ["legacy_v1", "structured_v1", "pickle_stable_v1"])
-def test_submit_pool_transport_payload_stays_opaque_until_worker(tmp_path, monkeypatch, mode):
+def test_submit_pool_transport_payload_adapter_stays_opaque_until_worker(tmp_path, monkeypatch, mode):
     state = NodeControlState(
         node_id=f"node-pool-opaque-{mode}",
         queue_capacity=16,

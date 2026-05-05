@@ -992,9 +992,19 @@ def test_service_connect_local_discards_stale_ipc_registry(tmp_path, monkeypatch
         encoding="utf-8",
     )
 
-    with pytest.raises(RuntimeError, match="not accepting connections"):
+    with pytest.raises(RuntimeError, match="registered process pid=999999 is not running"):
         LocalServiceClient(service_name=service_name, timeout_sec=0.1)
     assert not metadata_path.exists()
+
+
+def test_service_connect_local_missing_service_fails_immediately(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="registry entry was not found"):
+        LocalServiceClient(service_name="missing-local-service", timeout_sec=5.0)
+    assert time.monotonic() - started < 0.5
 
 
 def test_service_local_ipc_client_reuses_thread_connection(monkeypatch):
@@ -1046,6 +1056,7 @@ def test_service_local_ipc_client_reuses_thread_connection(monkeypatch):
 
     monkeypatch.setattr(local_ipc_mod, "_read_metadata", _fake_read_metadata)
     monkeypatch.setattr(local_ipc_mod, "_connect_local_service", _fake_connect)
+    monkeypatch.setattr(local_ipc_mod, "_local_service_stale_reason", lambda meta: "")
 
     client = LocalServiceClient(service_name="reuse-test", timeout_sec=1.0)
     try:

@@ -18,6 +18,7 @@ from .client_transport import (
     _encode_http_transport_response_body,
     _is_http_transport_content_type,
 )
+from pycloud_parallel.controlplane.config import SERVICE_HTTP_BODY_MAX_BYTES
 from pycloud_parallel.controlplane.netutil import resolve_public_host
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 
@@ -47,7 +48,7 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     return False
 
 
-MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_BODY_BYTES = int(SERVICE_HTTP_BODY_MAX_BYTES)
 SERVICE_HTTP_REQUEST_QUEUE_SIZE = 1024
 
 

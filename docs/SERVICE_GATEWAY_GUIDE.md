@@ -130,13 +130,13 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 
 ## 4. HTTP 入口
 
-当前 Gateway HTTP 已经支持两条并行 transport 通道：
+当前 Gateway HTTP 主线支持两种 body：
 
-1. JSON 通道
+1. JSON carrier
    - `Content-Type: application/json`
    - 继续兼容 `legacy_v1`
    - `structured_v1` 也可继续承载在这里
-2. bytes 通道
+2. HTTP raw-bytes body
    - `Content-Type: application/x-pycloud-transport`
    - `X-Pycloud-Codec`
    - `X-Pycloud-Transport-Version`
@@ -146,7 +146,7 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 
 1. `gateway_public` 默认仍然禁止 `pickle_stable_v1`
 2. internal/discovery/owner HTTP 路径才允许 `pickle_stable_v1`
-3. route-aware staging / DataRef 语义不因 bytes 通道而改变
+3. route-aware staging / DataRef 语义不因 HTTP raw-bytes body 而改变
 
 Gateway 当前提供：
 

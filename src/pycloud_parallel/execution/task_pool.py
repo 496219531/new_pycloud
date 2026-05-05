@@ -29,7 +29,7 @@ from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.effective_policy import (
     EffectivePolicy,
     resolve_effective_policy,
-    should_use_transport_payload_bytes,
+    should_use_raw_bytes_payload,
 )
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode, _node_instance_key_from_node
 from pycloud_parallel.controlplane.node_control_transport import (
@@ -856,7 +856,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             "priority": max(1, int(priority)),
         }
         effective_mode = str(serialization_mode or self._serialization_mode or "").strip().lower() or "legacy_v1"
-        if should_use_transport_payload_bytes(
+        if should_use_raw_bytes_payload(
             mode=effective_mode,
             effective_policy=self.effective_policy,
         ):
@@ -2509,8 +2509,6 @@ def _build_task_pool_from_infocenter(
     artifact: Optional[Any] = None,
     deps: Optional[Any] = None,
     runtime: str = "py3",
-    entry_module: Any = "",
-    entry_callable: Any = "run",
     package_format: str = "",
     resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
@@ -2709,6 +2707,8 @@ def _build_local_task_pool(
     artifact: Optional[Any] = None,
     deps: Optional[Any] = None,
     runtime: str = "py3",
+    entry_module: Any = "",
+    entry_callable: Any = "run",
     package_format: str = "",
     resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
@@ -2716,6 +2716,7 @@ def _build_local_task_pool(
     heartbeat_timeout_sec: int = 30,
     idle_ttl_sec: int = 0,
     serialization_mode: str = "",
+    policy_id: str = "",
 ) -> "TaskPool":
     from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 
@@ -2746,8 +2747,9 @@ def _build_local_task_pool(
     effective_owner = str(owner_client_id or f"local-client-{_get_local_ip()}").strip()
     effective_pool_name = str(pool_name or f"local-task-pool-{uuid.uuid4().hex[:10]}").strip()
     effective_worker_count = max(1, int(worker_count or 1))
+    effective_policy_id = str(policy_id or get_default_policy_id_for_binding("taskpool_default")).strip()
     effective_policy = resolve_effective_policy(
-        get_policy_profile(get_default_policy_id_for_binding("taskpool_default")),
+        get_policy_profile(effective_policy_id),
         requested_mode=serialization_mode,
         context="taskpool_session",
     )
@@ -2814,7 +2816,7 @@ def _build_local_task_pool(
             task_method=prepared_artifact.entry_callable,
             job_id=job_id,
             serialization_mode=effective_policy.resolved_mode,
-            policy_id=get_default_policy_id_for_binding("taskpool_default"),
+            policy_id=effective_policy_id,
             effective_policy=effective_policy,
         )
     except Exception:
@@ -2863,6 +2865,7 @@ class TaskPool(_TaskPoolSessionBase):
         node_limit: int = 100,
         timeout_sec: float = 10.0,
         serialization_mode: str = "",
+        policy_id: str = "",
     ) -> "TaskPool":
         """Product-facing open action for V1 task pools.
 
@@ -2886,6 +2889,7 @@ class TaskPool(_TaskPoolSessionBase):
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
                 serialization_mode=serialization_mode,
+                policy_id=policy_id,
             )
         effective_target = _resolve_public_target_arg(
             target=target,
@@ -2915,6 +2919,7 @@ class TaskPool(_TaskPoolSessionBase):
             node_limit=node_limit,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
+            policy_id=policy_id,
         )
 
     @classmethod

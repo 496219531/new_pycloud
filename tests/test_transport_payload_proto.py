@@ -64,7 +64,7 @@ def test_node_control_service_close_task_pool_triggers_sync_callback():
     assert calls["kwargs"]["pool_id"] == "pool-1"
 
 
-def test_node_control_client_call_service_uses_transport_payload_for_pickle():
+def test_node_control_client_call_service_uses_transport_payload_adapter_for_pickle():
     client = NodeControlClient.__new__(NodeControlClient)
     client.timeout_sec = 5.0
     client.base_url = "http://node-control.test"
@@ -98,7 +98,7 @@ def test_node_control_client_call_service_uses_transport_payload_for_pickle():
     )["array"].tolist() == [1, 2, 3]
 
 
-def test_node_control_client_update_runtime_globals_uses_transport_values_for_pickle():
+def test_node_control_client_update_runtime_globals_uses_transport_values_adapter_for_pickle():
     client = NodeControlClient.__new__(NodeControlClient)
     client.timeout_sec = 5.0
     client.base_url = "http://node-control.test"
@@ -187,7 +187,7 @@ def test_update_service_globals_auth_runs_before_decode(monkeypatch):
     assert "service_token mismatch" in context.details
 
 
-def test_node_control_service_prefers_transport_payload_for_call_service():
+def test_node_control_service_accepts_transport_payload_adapter_for_call_service():
     captured = {}
 
     class _State:
@@ -249,7 +249,7 @@ def test_inline_transport_carrier_checksum_is_opt_in(monkeypatch):
         reload_config()
 
 
-def test_task_pool_pickle_submit_uses_transport_payload():
+def test_task_pool_pickle_submit_uses_transport_payload_adapter():
     fake_pool_client = SimpleNamespace(
         owner_client_id="owner-demo",
         pool_id="pool-1",
@@ -296,7 +296,7 @@ def test_task_pool_pickle_submit_uses_transport_payload():
         session.close()
 
 
-def test_task_result_pickle_uses_transport_result_and_adapter_reads_it():
+def test_task_result_pickle_uses_transport_result_adapter_and_reader_accepts_it():
     state = TaskState(
         task_id="task-1",
         client_id="client-1",

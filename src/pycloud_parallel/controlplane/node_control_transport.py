@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pycloud_parallel.controlplane.node_capability import control_base_url_from_capability
+
 
 def node_control_client(*args: Any, **kwargs: Any):
     kwargs.pop("transport", None)
@@ -13,18 +15,16 @@ def node_control_client(*args: Any, **kwargs: Any):
 
 
 def node_control_target_for_node(node: Any) -> str:
-    capability = getattr(node, "capability", None)
-    node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    if node_http_base_url:
-        return node_http_base_url
+    control_base_url = control_base_url_from_capability(node)
+    if control_base_url:
+        return control_base_url
     return str(getattr(node, "control_addr", "") or "").strip()
 
 
 def node_control_target_for_route(route: Any) -> str:
-    capability = getattr(route, "capability", None)
-    node_http_base_url = str(getattr(capability, "node_http_base_url", "") or "").strip()
-    if node_http_base_url:
-        return node_http_base_url
+    control_base_url = control_base_url_from_capability(route)
+    if control_base_url:
+        return control_base_url
     return str(getattr(route, "control_addr", "") or "").strip()
 
 

@@ -248,8 +248,8 @@
 1. allowed modes
 2. default mode
 3. inline payload/result limits
-4. 是否启用 control bytes transport
-5. 是否启用 HTTP bytes transport
+4. 是否启用旧内部 `TransportPayload` adapter
+5. 是否启用 HTTP raw-bytes body
 5. 是否允许 `pickle_stable_v1`
 6. soft limit 以上是否强制转 `DataRef`
 7. public gateway 是否允许 pickle
@@ -296,8 +296,8 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 2. allowed modes
 3. inline payload soft/hard limit
 4. inline result hard limit
-5. 是否启用 transport payload bytes
-6. 是否启用 HTTP bytes transport
+5. 是否启用旧内部 `TransportPayload` adapter
+6. 是否启用 HTTP raw-bytes body
 7. 是否允许 pickle
 
 这意味着：
@@ -337,11 +337,11 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 
 1. codec 和 carrier 现在是两个层次
 2. serialization mode 决定“怎么编解码”
-3. carrier（Struct / protobuf bytes lane / HTTP bytes lane）优先由 `EffectivePolicy` 决定
-4. `prefers_transport_payload_bytes()` 这类 mode helper 只在“当前没有 effective policy”时才作为 fallback
+3. carrier（JSON / HTTP raw-bytes body / 旧内部 adapter）优先由 `EffectivePolicy` 决定
+4. `prefers_raw_bytes_payload()` 这类 mode helper 只在“当前没有 effective policy”时才作为 fallback
 
-也就是说，`pickle_stable_v1` 不再天然等于“一定走 bytes lane”；
-如果当前 effective policy 关闭了 bytes lane，运行时会继续用该 codec，但改走非 bytes carrier。
+也就是说，`pickle_stable_v1` 不再天然等于“一定走 HTTP raw-bytes body”；
+如果当前 effective policy 关闭了 HTTP raw-bytes body / adapter，运行时会继续用该 codec，但改走 JSON/Struct 这类兼容 carrier。
 
 `JobQueue` 还有一个额外约束：
 
@@ -367,12 +367,12 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
 4. `JobQueue` submit call
 5. managed globals 上传准备
 
-也就是说，同一 session 下 JSON/Struct inline 和 transport bytes 都会受同一个 effective payload limit 约束；节点差异主要通过 tags / healthy / runtime 过滤来表达，而不是再参与 policy 协商。
+也就是说，同一 session 下 JSON inline、HTTP raw-bytes body 和旧内部 adapter 都会受同一个 effective payload limit 约束；节点差异主要通过 tags / healthy / runtime 过滤来表达，而不是再参与 policy 协商。
 
 另外，carrier 的运行时选择也已经收口到 effective policy：
 
-1. NodeControl/protobuf 请求是否走 `transport_payload`
-2. HTTP/service call 是否走 bytes body
+1. NodeControl 旧内部路径是否走 `TransportPayload` adapter
+2. HTTP/service call 是否走 HTTP raw-bytes body
 3. `CallService` 响应是否回 `transport_data`
 4. `TaskResult` 是否回 `transport_result`
 
@@ -383,7 +383,7 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
 当前 3 个 serialization mode 不再只作用于 `put_data()` 这一条对象上传路径，而是统一进入了主传输层：
 
 1. payload encode
-2. request body
+2. request body / carrier
 3. response / result decode
 4. task submit / task result
 5. object upload / DataRef materialize
@@ -394,15 +394,15 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
    - 继续走老的 Arrow-compatible / Struct-safe 语义
    - 也是当前默认
 2. `structured_v1`
-   - transport body 使用显式 envelope 标明 codec
+   - carrier 使用显式 envelope 标明 codec
    - bytes 通过结构化 sentinel 传输
 3. `pickle_stable_v1`
-   - transport body 同样显式标明 codec
+   - carrier 同样显式标明 codec
    - pandas / numpy 先做稳定 schema，再进入 pickle
 
-当前 transport decode 规则：
+当前 carrier decode 规则：
 
-1. 优先识别显式 transport envelope
+1. 优先识别显式 carrier envelope
 2. 只有 `legacy_v1` 允许裸 payload fallback
 3. `structured_v1` / `pickle_stable_v1` 不再依赖 decode 端猜测
 4. 接收端会按上下文重新校验 declared codec，不再无条件信任 envelope
@@ -415,35 +415,36 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
    - `pickle_stable_v1`
 2. transport 容器层
    - JSON / Struct
-   - NodeControl bytes payload
+   - `TransportPayload` adapter
+   - HTTP raw-bytes body
    - object upload blob
 
-当前 NodeControl/protobuf 主链已经是并行双通道：
+当前 NodeControl 消息主链仍保留双兼容路径：
 
-1. 旧通道
+1. 旧 carrier
    - `google.protobuf.Struct`
    - 继续兼容 `legacy_v1`
-2. 新通道
+2. `TransportPayload` adapter
    - `TransportPayload { codec, version, payload(bytes) }`
-   - `pickle_stable_v1` 优先走这条 bytes 通道
-   - 接收端优先读取这条通道
+   - 旧内部 state/proto 路径仍会用
+   - 新 HTTP wire 设计不继续扩散这个概念
 
-当前 HTTP 主链也已经是并行双通道：
+当前 HTTP 主线支持两种 body：
 
-1. 旧通道
+1. JSON carrier
    - `application/json`
    - 继续兼容 `legacy_v1`
    - `structured_v1` 也可继续走这条路径
-2. 新通道
+2. HTTP raw-bytes body
    - `application/x-pycloud-transport`
    - `X-Pycloud-Codec`
    - `X-Pycloud-Transport-Version`
-   - `pickle_stable_v1` 优先走这条 bytes 通道
+   - `pickle_stable_v1` 在 policy 允许时优先走这条 raw body
 
 HTTP 接收端规则：
 
 1. JSON body 继续走旧 JSON decode
-2. bytes body 先按 header 读 declared codec/version
+2. HTTP raw-bytes body 先按 header 读 declared codec/version
 3. 再按上下文做权限校验
 4. `gateway_public` 默认仍然硬性禁止 `pickle_stable_v1`
 

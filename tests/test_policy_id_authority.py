@@ -11,13 +11,13 @@ from pycloud_parallel.execution.task_pool import _TaskPoolSessionBase
 def test_public_api_signatures_do_not_expose_policy_id():
     assert "policy_id" not in inspect.signature(Service.connect).parameters
     assert "policy_id" not in inspect.signature(Service.deploy).parameters
-    assert "policy_id" not in inspect.signature(TaskPool.open).parameters
     assert "nodecontrol_transport" not in inspect.signature(Service.deploy).parameters
     assert "policy_id" not in inspect.signature(JobQueue.__init__).parameters
     assert "policy_id" not in inspect.signature(JobQueue.connect).parameters
 
 
-def test_low_level_controlplane_entries_still_accept_policy_id():
+def test_owner_taskpool_entries_accept_policy_id():
+    assert "policy_id" in inspect.signature(TaskPool.open).parameters
     assert "policy_id" in inspect.signature(Service._deploy_from_infocenter).parameters
     assert "policy_id" in inspect.signature(TaskPool._from_infocenter).parameters
 

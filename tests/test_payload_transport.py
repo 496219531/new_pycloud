@@ -115,7 +115,7 @@ def test_prepare_outbound_payload_job_submit_applies_managed_globals_policy(tmp_
 def test_prepare_managed_globals_batches_splits_inline_keys(monkeypatch) -> None:
     from pycloud_parallel.execution import support
 
-    monkeypatch.setattr(support, "CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
+    monkeypatch.setattr(support, "CONTROL_HTTP_MAX_SEND_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [],
@@ -140,7 +140,7 @@ def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch
             uploaded.append((bytes(blob), str(format), int(chunk_size)))
             return DataRef(ref_id="obj-1", storage_id="obj-1", format=format, size_bytes=len(blob))
 
-    monkeypatch.setattr(support, "CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 1000)
+    monkeypatch.setattr(support, "CONTROL_HTTP_MAX_SEND_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [_Client()],
@@ -208,7 +208,7 @@ def test_decode_payload_from_transport_keeps_payload_decoded_without_localizing(
     assert isinstance(decoded["blob"], DataRef)
 
 
-def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
+def test_decode_http_request_body_returns_raw_payload_for_worker_decode() -> None:
     body = json.dumps(
         {
             "blob": data_ref_to_payload(
@@ -232,7 +232,8 @@ def test_decode_http_request_body_returns_decoded_payload_objects() -> None:
     )
 
     assert mode == "legacy_v1"
-    assert isinstance(decoded["blob"], DataRef)
+    assert isinstance(decoded["blob"], dict)
+    assert decoded["blob"]["__pycloud_data_ref__"]["ref_id"] == "sha256:" + ("e" * 64)
 
 
 def test_encode_result_for_transport_wraps_scalar_value() -> None:
@@ -266,7 +267,7 @@ def test_decode_payload_from_transport_recognizes_data_ref_sentinel() -> None:
     assert decoded["blob"].object_id == "sha256:" + ("f" * 64)
 
 
-def test_decode_http_request_body_returns_data_ref_objects() -> None:
+def test_decode_http_request_body_defers_data_ref_decode_to_worker() -> None:
     body = json.dumps(
         {
             "blob": data_ref_to_payload(
@@ -288,5 +289,5 @@ def test_decode_http_request_body_returns_data_ref_objects() -> None:
     )
 
     assert mode == "legacy_v1"
-    assert isinstance(decoded["blob"], DataRef)
-    assert decoded["blob"].logical_type == "json"
+    assert isinstance(decoded["blob"], dict)
+    assert decoded["blob"]["__pycloud_data_ref__"]["logical_type"] == "json"

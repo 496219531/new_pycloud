@@ -20,6 +20,14 @@ def _env_int(name: str, default: int) -> int:
     return value
 
 
+def _env_int_any(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        raw = str(os.environ.get(name, "") or "").strip()
+        if raw:
+            return _env_int(name, default)
+    return int(default)
+
+
 def env_int(name: str, default: int) -> int:
     return _env_int(name, default)
 
@@ -64,6 +72,12 @@ INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BY
 INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024)
 LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 64 * 1024 * 1024)
 LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 256 * 1024 * 1024)
+DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
+DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024)
+DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES = _env_int("PYCLOUD_DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024)
+TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 10 * 1024 * 1024)
+TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 50 * 1024 * 1024)
+TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES = _env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES", 1000 * 1024 * 1024)
 JOB_PAYLOAD_MAX_BYTES = _env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024)
 JOB_STAGING_REPLICA_COUNT = _env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2)
 JOB_STAGED_REF_TTL_SEC = _env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60)
@@ -123,8 +137,34 @@ JOBQUEUE_RESOLVE_REFS = _env_choice(
     {"eager", "defer_to_worker"},
 )
 
-CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
-CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES = _env_int("PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024)
+CONTROL_HTTP_MAX_SEND_BYTES = _env_int_any(
+    ("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"),
+    16 * 1024 * 1024,
+)
+CONTROL_HTTP_MAX_RECEIVE_BYTES = _env_int_any(
+    ("PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES", "PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES"),
+    16 * 1024 * 1024,
+)
+SERVICE_HTTP_BODY_MAX_BYTES = _env_int_any(
+    ("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_SERVICE_BODY_MAX_BYTES"),
+    64 * 1024 * 1024,
+)
+GATEWAY_HTTP_BODY_MAX_BYTES = _env_int_any(
+    ("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"),
+    64 * 1024 * 1024,
+)
+INFOCENTER_HTTP_BODY_MAX_BYTES = _env_int_any(
+    ("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"),
+    64 * 1024 * 1024,
+)
+NODE_CONTROL_HTTP_BODY_MAX_BYTES = _env_int_any(
+    ("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES"),
+    256 * 1024 * 1024,
+)
+OBJECT_HTTP_BODY_MAX_BYTES = _env_int_any(
+    ("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"),
+    512 * 1024 * 1024,
+)
 
 NODE_WORKER_CAPACITY = _env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32)
 NODE_QUEUE_CAPACITY = _env_int("PYCLOUD_NODE_QUEUE_CAPACITY", 4000)
@@ -207,6 +247,95 @@ def get_runtime_limits() -> PayloadLimits:
         inline_result_hard_limit_bytes=int(INLINE_RESULT_HARD_LIMIT_BYTES),
         object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
         file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
+    )
+
+
+def get_policy_limit_defaults(policy_id: str) -> tuple[int, int, int]:
+    normalized = str(policy_id or "").strip().lower()
+    if normalized == "default_safe":
+        return (
+            int(DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+            int(DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
+            int(DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES),
+        )
+    if normalized in {"trusted_internal", "pickle_internal_heavy"}:
+        return (
+            int(TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+            int(TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
+            int(TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES),
+        )
+    return (
+        int(INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+        int(INLINE_PAYLOAD_HARD_LIMIT_BYTES),
+        int(INLINE_RESULT_HARD_LIMIT_BYTES),
+    )
+
+
+def get_local_inline_limits() -> tuple[int, int]:
+    local_hard = max(1, int(LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES))
+    local_soft = min(max(1, int(LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), local_hard)
+    return local_soft, local_hard
+
+
+def get_job_blob_inline_threshold_bytes() -> int:
+    return max(256 * 1024, int(INLINE_PAYLOAD_HARD_LIMIT_BYTES / 1.5))
+
+
+def merge_object_threshold_with_policy_soft_limit(*, object_threshold_bytes: int, policy_soft_limit_bytes: int) -> int:
+    threshold = max(1, int(object_threshold_bytes or 1))
+    soft_limit = max(1, int(policy_soft_limit_bytes or 1))
+    return min(threshold, soft_limit)
+
+
+def get_node_control_http_body_limit_bytes(node_control_body_bytes: int = 0) -> int:
+    control_limit = int(node_control_body_bytes or NODE_CONTROL_HTTP_BODY_MAX_BYTES)
+    return max(1, control_limit, int(OBJECT_HTTP_BODY_MAX_BYTES))
+
+
+def get_http_object_body_limit_bytes(object_body_bytes: int = 0) -> int:
+    return max(1, int(object_body_bytes or OBJECT_HTTP_BODY_MAX_BYTES))
+
+
+def normalize_policy_limit_values(*, soft: int, hard: int, result_hard: int) -> tuple[int, int, int]:
+    hard_value = max(1, int(hard or 1))
+    return (
+        min(max(1, int(soft or 1)), hard_value),
+        hard_value,
+        max(1, int(result_hard or 1)),
+    )
+
+
+def effective_limits_from_profile(profile: object) -> tuple[int, int, int]:
+    return normalize_policy_limit_values(
+        soft=int(getattr(profile, "inline_payload_soft_limit_bytes", 1) or 1),
+        hard=int(getattr(profile, "inline_payload_hard_limit_bytes", 1) or 1),
+        result_hard=int(getattr(profile, "inline_result_hard_limit_bytes", 1) or 1),
+    )
+
+
+def merge_payload_limits_with_effective_policy(base_limits: PayloadLimits, effective_policy: object) -> PayloadLimits:
+    soft, hard, result_hard = normalize_policy_limit_values(
+        soft=min(
+            int(base_limits.inline_payload_soft_limit_bytes),
+            int(getattr(effective_policy, "inline_payload_soft_limit_bytes", 1) or 1),
+        ),
+        hard=min(
+            int(base_limits.inline_payload_hard_limit_bytes),
+            int(getattr(effective_policy, "inline_payload_hard_limit_bytes", 1) or 1),
+        ),
+        result_hard=min(
+            int(base_limits.inline_result_hard_limit_bytes),
+            int(getattr(effective_policy, "inline_result_hard_limit_bytes", 1) or 1),
+        ),
+    )
+    return PayloadLimits(
+        inline_payload_soft_limit_bytes=soft,
+        inline_payload_hard_limit_bytes=hard,
+        inline_payload_request_limit_bytes=min(int(base_limits.inline_payload_request_limit_bytes), hard),
+        inline_result_soft_limit_bytes=min(int(base_limits.inline_result_soft_limit_bytes), result_hard),
+        inline_result_hard_limit_bytes=result_hard,
+        object_chunk_size_bytes=int(base_limits.object_chunk_size_bytes),
+        file_hash_chunk_size_bytes=int(base_limits.file_hash_chunk_size_bytes),
     )
 
 
@@ -315,8 +444,7 @@ def get_payload_policy(mode: PayloadMode) -> PayloadPolicy:
 
 def get_local_service_payload_policy() -> PayloadPolicy:
     limits = get_runtime_limits()
-    local_hard = max(1, int(LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES))
-    local_soft = min(max(1, int(LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), local_hard)
+    local_soft, local_hard = get_local_inline_limits()
     return PayloadPolicy(
         mode="http_call",
         limits=PayloadLimits(
@@ -342,6 +470,12 @@ def reload_config() -> None:
         INLINE_PAYLOAD_REQUEST_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024),
         LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 64 * 1024 * 1024),
         LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 256 * 1024 * 1024),
+        DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024),
+        DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024),
+        DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES=_env_int("PYCLOUD_DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024),
+        TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 10 * 1024 * 1024),
+        TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 50 * 1024 * 1024),
+        TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES=_env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES", 1000 * 1024 * 1024),
         JOB_PAYLOAD_MAX_BYTES=_env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024),
         JOB_STAGING_REPLICA_COUNT=_env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2),
         JOB_STAGED_REF_TTL_SEC=_env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60),
@@ -394,8 +528,38 @@ def reload_config() -> None:
             "defer_to_worker",
             {"eager", "defer_to_worker"},
         ),
-        CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
-        CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES=_env_int("PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES", 16 * 1024 * 1024),
+        CONTROL_HTTP_MAX_SEND_BYTES=_env_int_any(
+            ("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"),
+            16 * 1024 * 1024,
+        ),
+        CONTROL_HTTP_MAX_RECEIVE_BYTES=_env_int_any(
+            ("PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES", "PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES"),
+            16 * 1024 * 1024,
+        ),
+        SERVICE_HTTP_BODY_MAX_BYTES=_env_int_any(
+            ("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_SERVICE_BODY_MAX_BYTES"),
+            64 * 1024 * 1024,
+        ),
+        GATEWAY_HTTP_BODY_MAX_BYTES=_env_int_any(
+            ("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"),
+            64 * 1024 * 1024,
+        ),
+        INFOCENTER_HTTP_BODY_MAX_BYTES=_env_int_any(
+            ("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"),
+            64 * 1024 * 1024,
+        ),
+        NODE_CONTROL_HTTP_BODY_MAX_BYTES=_env_int_any(
+            (
+                "PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES",
+                "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES",
+                "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES",
+            ),
+            256 * 1024 * 1024,
+        ),
+        OBJECT_HTTP_BODY_MAX_BYTES=_env_int_any(
+            ("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"),
+            512 * 1024 * 1024,
+        ),
         NODE_WORKER_CAPACITY=_env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32),
         NODE_QUEUE_CAPACITY=_env_int("PYCLOUD_NODE_QUEUE_CAPACITY", 4000),
         NODE_MAX_WORKERS=_env_int("PYCLOUD_NODE_MAX_WORKERS", 64),
@@ -404,15 +568,18 @@ def reload_config() -> None:
     )
 
 
-def control_channel_options() -> list[tuple[str, int]]:
+def control_http_limits() -> list[tuple[str, int]]:
     return [
-        ("http.max_send_message_length", int(CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES)),
-        ("http.max_receive_message_length", int(CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES)),
+        ("http.max_send_bytes", int(CONTROL_HTTP_MAX_SEND_BYTES)),
+        ("http.max_receive_bytes", int(CONTROL_HTTP_MAX_RECEIVE_BYTES)),
     ]
 
 
 __all__ = [
     "DEPENDENCY_POLICY_MODE",
+    "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
+    "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES",
     "DATAREF_RESOLUTION",
     "DATAREF_UPLOAD_STRATEGY",
     "DataRefResolutionMode",
@@ -424,9 +591,14 @@ __all__ = [
     "GATEWAY_MAX_UPLOAD_TOTAL_BYTES",
     "GATEWAY_STAGE_GC_INTERVAL_SEC",
     "GATEWAY_STAGE_TTL_SEC",
-    "CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES",
-    "CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES",
+    "CONTROL_HTTP_MAX_RECEIVE_BYTES",
+    "CONTROL_HTTP_MAX_SEND_BYTES",
     "GatewayDataRefRelayMode",
+    "GATEWAY_HTTP_BODY_MAX_BYTES",
+    "INFOCENTER_HTTP_BODY_MAX_BYTES",
+    "NODE_CONTROL_HTTP_BODY_MAX_BYTES",
+    "OBJECT_HTTP_BODY_MAX_BYTES",
+    "SERVICE_HTTP_BODY_MAX_BYTES",
     "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",
     "INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
@@ -469,6 +641,9 @@ __all__ = [
     "SerializationMode",
     "SystemMode",
     "TRUST_MODE",
+    "TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
+    "TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES",
     "TrustMode",
     "env_int",
     "get_dataref_resolution",
@@ -477,14 +652,23 @@ __all__ = [
     "get_gateway_dataref_relay",
     "get_inline_transport_checksum",
     "get_jobqueue_resolve_refs",
+    "get_job_blob_inline_threshold_bytes",
+    "get_local_inline_limits",
     "get_local_service_payload_policy",
+    "get_node_control_http_body_limit_bytes",
+    "get_http_object_body_limit_bytes",
+    "effective_limits_from_profile",
+    "merge_object_threshold_with_policy_soft_limit",
+    "merge_payload_limits_with_effective_policy",
+    "normalize_policy_limit_values",
     "get_object_transfer_mode",
     "get_payload_policy",
+    "get_policy_limit_defaults",
     "get_runtime_limits",
     "get_serialization_mode",
     "get_system_mode",
     "get_trust_mode",
-    "control_channel_options",
+    "control_http_limits",
     "reload_config",
     "resolve_object_transfer_mode",
 ]

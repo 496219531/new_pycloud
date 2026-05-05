@@ -182,7 +182,7 @@ class NodeControlState(NodeRuntimeBase):
         task_pool_worker_capacity: int = 0,
         service_http_bind: str = "0.0.0.0:18080",
         service_http_base_url: str = "",
-        node_http_base_url: str = "",
+        control_base_url: str = "",
     ) -> None:
         super().__init__(
             node_id=node_id,
@@ -204,7 +204,7 @@ class NodeControlState(NodeRuntimeBase):
         self.service_worker_capacity = max(1, int(service_worker_capacity or worker_capacity))
         default_task_pool_capacity = max(1, int(os.cpu_count() or 1))
         self.task_pool_worker_capacity = max(1, int(task_pool_worker_capacity or default_task_pool_capacity))
-        self.node_http_base_url = str(node_http_base_url or "").strip()
+        self.control_base_url = str(control_base_url or "").strip()
         self.started_at = utc_now()
         self.node_instance_id = f"{str(node_id or 'node').strip() or 'node'}-{uuid.uuid4().hex[:12]}"
 
@@ -564,8 +564,8 @@ class NodeControlState(NodeRuntimeBase):
 
     def node_capability(self) -> NodeCapability:
         return detect_local_node_capability(
-            supports_http_nodecontrol=bool(str(self.node_http_base_url or "").strip()),
-            node_http_base_url=str(self.node_http_base_url or "").strip(),
+            supports_http_control=bool(str(self.control_base_url or "").strip()),
+            control_base_url=str(self.control_base_url or "").strip(),
         )
 
     @property

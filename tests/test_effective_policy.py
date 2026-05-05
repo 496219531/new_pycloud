@@ -26,8 +26,8 @@ def _effective_policy(
         inline_payload_soft_limit_bytes=soft_limit_bytes,
         inline_payload_hard_limit_bytes=hard_limit_bytes,
         inline_result_hard_limit_bytes=result_limit_bytes,
-        use_transport_payload_bytes=True,
-        use_http_bytes_transport=True,
+        use_raw_bytes_payload=True,
+        use_http_raw_bytes_body=True,
         allow_pickle_stable="pickle_stable_v1" in allowed_modes,
     )
 
@@ -53,8 +53,17 @@ def test_effective_policy_depends_only_on_profile_and_context():
     assert effective.allowed_modes == ("legacy_v1", "structured_v1", "pickle_stable_v1")
     assert effective.resolved_mode == "pickle_stable_v1"
     assert effective.inline_payload_hard_limit_bytes == profile.inline_payload_hard_limit_bytes
-    assert effective.use_transport_payload_bytes is True
-    assert effective.use_http_bytes_transport is False
+    assert effective.use_raw_bytes_payload is True
+    assert effective.use_http_raw_bytes_body is False
+
+
+def test_taskpool_owner_enables_http_raw_bytes_body_for_internal_policy():
+    profile = get_policy_profile("trusted_internal")
+
+    effective = resolve_effective_policy(profile, context="taskpool_owner")
+
+    assert effective.use_raw_bytes_payload is True
+    assert effective.use_http_raw_bytes_body is True
 
 
 def test_effective_policy_rejects_gateway_pickle_when_profile_disallows_it():
@@ -77,8 +86,8 @@ def test_effective_policy_respects_requested_mode_without_capability_intersectio
         inline_payload_soft_limit_bytes=16,
         inline_payload_hard_limit_bytes=32,
         inline_result_hard_limit_bytes=48,
-        use_transport_payload_bytes=True,
-        use_http_bytes_transport=True,
+        use_raw_bytes_payload=True,
+        use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
         force_dataref_above_soft_limit=True,
     )
@@ -90,8 +99,8 @@ def test_effective_policy_respects_requested_mode_without_capability_intersectio
     )
 
     assert effective.resolved_mode == "structured_v1"
-    assert effective.use_transport_payload_bytes is True
-    assert effective.use_http_bytes_transport is True
+    assert effective.use_raw_bytes_payload is True
+    assert effective.use_http_raw_bytes_body is True
 
 
 def test_effective_policy_keeps_legacy_off_bytes_lane():
@@ -103,8 +112,8 @@ def test_effective_policy_keeps_legacy_off_bytes_lane():
         inline_payload_soft_limit_bytes=16,
         inline_payload_hard_limit_bytes=32,
         inline_result_hard_limit_bytes=48,
-        use_transport_payload_bytes=True,
-        use_http_bytes_transport=True,
+        use_raw_bytes_payload=True,
+        use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
         force_dataref_above_soft_limit=True,
     )
@@ -112,8 +121,8 @@ def test_effective_policy_keeps_legacy_off_bytes_lane():
     effective = resolve_effective_policy(profile, context="service_connect")
 
     assert effective.resolved_mode == "legacy_v1"
-    assert effective.use_transport_payload_bytes is False
-    assert effective.use_http_bytes_transport is False
+    assert effective.use_raw_bytes_payload is False
+    assert effective.use_http_raw_bytes_body is False
 
 
 def test_task_submit_payload_preparation_clamps_to_effective_policy_soft_limit():
@@ -135,7 +144,7 @@ def test_task_submit_payload_preparation_clamps_to_effective_policy_soft_limit()
     assert mocked_put.called
 
 
-def test_http_bytes_transport_body_obeys_effective_policy_hard_limit():
+def test_http_raw_bytes_body_obeys_effective_policy_hard_limit():
     effective_policy = _effective_policy(
         resolved_mode="pickle_stable_v1",
         allowed_modes=("pickle_stable_v1", "structured_v1"),

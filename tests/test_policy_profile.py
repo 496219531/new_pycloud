@@ -52,8 +52,8 @@ def test_policy_profile_normalizes_and_rejects_invalid_default_mode():
             inline_payload_soft_limit_bytes=1,
             inline_payload_hard_limit_bytes=2,
             inline_result_hard_limit_bytes=3,
-            use_transport_payload_bytes=False,
-            use_http_bytes_transport=False,
+            use_raw_bytes_payload=False,
+            use_http_raw_bytes_body=False,
             allow_pickle_stable=False,
             force_dataref_above_soft_limit=True,
         )

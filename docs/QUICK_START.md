@@ -32,12 +32,13 @@
 python -m pycloud_parallel.controlplane.ctl \
   --runtime-root /tmp/pycloud-dev \
   --controlplane-port 51051 \
-  --node1-port 51061 \
-  --node1-http-port 18181 \
-  --node2-port 51062 \
-  --node2-http-port 18182 \
-  --node-worker-capacity 4 \
   start
+
+python -m pycloud_parallel.controlplane.ctl dev-start \
+  --nodes 2 \
+  --node-control-port 51061 \
+  --node-service-http-port 18181 \
+  --node-worker-capacity 4
 ```
 
 如果已经安装了 CLI，也可以直接：
@@ -46,20 +47,24 @@ python -m pycloud_parallel.controlplane.ctl \
 pycloudctl --runtime-root /tmp/pycloud-dev --controlplane-port 51051 start
 ```
 
-默认会启动：
+`pycloudctl start` 默认会启动：
 
 1. `controlplane`：`<auto-detected-local-ip>:50051`
-2. `node-1`：`<auto-detected-local-ip>:50061`
-3. `node-2`：`<auto-detected-local-ip>:50062`
-4. `node-1 service HTTP`：`<auto-detected-local-ip>:18081`
-5. `node-2 service HTTP`：`<auto-detected-local-ip>:18082`
+2. `job-orchestrator`：`<auto-detected-local-ip>:50053`
 
-默认情况下，`pycloudctl start` 会自动探测本机可达 IP 来填充 bind / advertise / service-http 地址，不再固定回退到 `127.0.0.1`。
-如果你要单独起 `gateway` 或 `nodecontrol`，请显式传 `--infocenter-addr`：
+如果需要本地执行节点，用 `pycloudctl dev-start --nodes 2`，默认还会启动：
+
+1. `node-1 control HTTP`：`<auto-detected-local-ip>:50061`
+2. `node-2 control HTTP`：`<auto-detected-local-ip>:50062`
+3. `node-1 service HTTP`：`<auto-detected-local-ip>:18081`
+4. `node-2 service HTTP`：`<auto-detected-local-ip>:18082`
+
+默认情况下，`pycloudctl start` / `dev-start` 会自动探测本机可达 IP 来填充 bind / advertise / service-http 地址，不再固定回退到 `127.0.0.1`。
+如果你要单独起 `gateway` 或 node control，请显式传 `--target`：
 
 ```bash
-pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
-pycloudctl start-node --node-id node-1 --infocenter-addr 127.0.0.1:50051
+pycloudctl start-gateway --target 127.0.0.1:50051
+pycloudctl start-node --node-id node-1 --target 127.0.0.1:50051
 ```
 
 Web 运维页：

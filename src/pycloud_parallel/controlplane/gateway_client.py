@@ -21,16 +21,17 @@ from .client_transport import (
     _call_route_http,
     _decode_http_response_body,
     _iter_route_http_stream,
-    _prefers_http_bytes_transport,
+    _prefers_http_raw_bytes_body,
     _serialize_http_call_payload,
 )
 from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
+from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
-from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_SOFT_LIMIT_BYTES, serialize_arrow_compatible
+from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.execution.failover import STATUS_LOOKUP_FAILED, should_degrade
 client_mod = SimpleNamespace(
     _target_to_base_url=target_to_base_url,
@@ -39,7 +40,7 @@ client_mod = SimpleNamespace(
     INLINE_PAYLOAD_SOFT_LIMIT_BYTES=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     _call_route_http=_call_route_http,
     _iter_route_http_stream=_iter_route_http_stream,
-    _prefers_http_bytes_transport=_prefers_http_bytes_transport,
+    _prefers_http_raw_bytes_body=_prefers_http_raw_bytes_body,
     _serialize_http_call_payload=_serialize_http_call_payload,
     _http_json_request=http_json_request,
     _extract_result_ref=_extract_result_ref,
@@ -187,7 +188,7 @@ class GatewayServiceClient:
             for client in clients:
                 with contextlib.suppress(Exception):
                     client.close()
-        if client_mod._prefers_http_bytes_transport(serialization_mode, effective_policy=effective_policy):
+        if client_mod._prefers_http_raw_bytes_body(serialization_mode, effective_policy=effective_policy):
             response = client_mod._call_route_http(
                 SimpleNamespace(
                     http_base_url=f"{self.base_url}/svc/{quote(name, safe='')}",

@@ -390,6 +390,19 @@ def _connect_local_service(meta: Dict[str, object]):
     return Client(address, family=family, authkey=_authkey_from_metadata(meta))
 
 
+def _local_service_stale_reason(meta: Dict[str, object]) -> str:
+    pid = int(meta.get("pid", 0) or 0)
+    if pid > 0 and not _pid_running(pid):
+        return f"registered process pid={pid} is not running"
+    family = str(meta.get("family", "") or "")
+    address = str(meta.get("address", "") or "")
+    if family == "AF_UNIX" and address and not Path(address).exists():
+        return f"registered IPC socket does not exist: {address}"
+    if not family or not address:
+        return "local service metadata is incomplete"
+    return ""
+
+
 def _call_once(meta: Dict[str, object], request: Dict[str, object], *, timeout_sec: float = 5.0) -> Dict[str, object]:
     conn = _connect_local_service(meta)
     try:
@@ -617,31 +630,31 @@ class LocalServiceClient:
         self._thread_conns: dict[int, tuple[str, Any]] = {}
         deadline = time.monotonic() + self.timeout_sec
         last_exc: Optional[BaseException] = None
-        saw_stale_registry = False
         while True:
             try:
                 candidate_meta = _read_metadata(self.service_name)
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"local service IPC unavailable for service_name={self.service_name!r}; "
+                    "local service registry entry was not found"
+                ) from exc
+
+            stale_reason = _local_service_stale_reason(candidate_meta)
+            if stale_reason:
+                _discard_metadata_if_current(self.service_name, candidate_meta)
+                raise RuntimeError(
+                    f"local service IPC unavailable for service_name={self.service_name!r}; "
+                    f"{stale_reason}"
+                )
+
+            try:
                 response = _call_once(candidate_meta, {"action": "ping"}, timeout_sec=min(1.0, self.timeout_sec))
                 if not bool(response.get("ok", False)):
                     raise RuntimeError(str(response.get("error", "local service IPC ping failed")))
                 self._meta = candidate_meta
                 break
-            except FileNotFoundError as exc:
-                last_exc = exc
-                if time.monotonic() >= deadline:
-                    if saw_stale_registry:
-                        raise RuntimeError(
-                            f"local service IPC unavailable for service_name={self.service_name!r}; "
-                            "local service registry entry existed but the service is not accepting connections"
-                        ) from last_exc
-                    raise RuntimeError(
-                        f"local service IPC unavailable for service_name={self.service_name!r}; "
-                        "local service registry entry was not found"
-                    ) from last_exc
-                time.sleep(0.05)
             except Exception as exc:
                 last_exc = exc
-                saw_stale_registry = True
                 with contextlib.suppress(Exception):
                     _discard_metadata_if_current(self.service_name, candidate_meta)
                 if time.monotonic() >= deadline:
