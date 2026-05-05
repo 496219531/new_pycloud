@@ -347,6 +347,8 @@ client/controlplane 侧允许 `service` 和 `taskpool` 共享一套轻量会话�
 4. `taskpool` 不进入 service discovery，不改成 service call
 5. `service` 不改成 task submit/results 协议
 
+低频创建链路也允许共享一层薄 helper：source/artifact 规范化、runtime/package/deps/managed globals 参数整理、InfoCenter 选点外层编排、并发 create replica 骨架。这个共享只发生在 client/controlplane 侧的创建前半段，不进入 node 热路径，也不改变两者运行期协议。
+
 动态部署还有一个 code version / owner 控制域约束：
 
 1. 同名动态服务副本必须由唯一发布者统一发布管理

@@ -56,6 +56,10 @@ from pycloud_parallel.execution.failover import (
     mark_candidate_success,
 )
 from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
+from pycloud_parallel.execution.deployment_create_helper import (
+    dispatch_create_requests,
+    prepare_deployment_artifact,
+)
 from pycloud_parallel.execution.scheduler import (
     SchedulerCandidate,
     SchedulerState,
@@ -2542,17 +2546,7 @@ def _build_task_pool_from_infocenter(
     serialization_mode: str = "",
     policy_id: str = "",
 ) -> "TaskPool":
-    module_source = source if inspect.ismodule(source) else None
-    normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
-    if normalized_resource_paths and module_source is None:
-        raise ValueError("resource_paths requires a module source")
-    if normalized_resource_paths and module_source is not None:
-        module_blob, module_filename = _prepare_code_blob(module=module_source, resource_paths=normalized_resource_paths)
-        source = module_blob
-        entry_module = _default_entry_module_for_module(module_source)
-        package_format = _resolve_package_format(package_format, module_filename, default="py")
-
-    normalized_artifact = _normalize_artifact_input(
+    prepared_artifact = prepare_deployment_artifact(
         consumer_kind="task",
         source=source,
         artifact=artifact,
@@ -2562,10 +2556,7 @@ def _build_task_pool_from_infocenter(
         entry_callable=entry_callable,
         package_format=package_format,
         managed_global_names=managed_global_names,
-    )
-    prepared_artifact = _prepare_artifact(
-        normalized_artifact,
-        consumer_kind="task",
+        resource_paths=resource_paths,
     )
     effective_blob = prepared_artifact.blob
     runtime = prepared_artifact.runtime
@@ -2630,30 +2621,28 @@ def _build_task_pool_from_infocenter(
             raise
         return node, pool
 
+    dispatch_results = dispatch_create_requests(
+        desired_nodes,
+        create_one=_create_pool_on_node,
+        thread_name_prefix="taskpool-create",
+        describe_error=lambda node, exc: repr(exc),
+    )
     created: List[Tuple[InfoCenterNode, NativeTaskPoolClient]] = []
     create_failures: Dict[str, str] = {}
-    if len(desired_nodes) == 1:
-        try:
-            created.append(_create_pool_on_node(desired_nodes[0]))
-        except Exception as exc:
-            create_failures[_node_instance_key_from_node(desired_nodes[0])] = repr(exc)
-    else:
-        with ThreadPoolExecutor(max_workers=max(1, len(desired_nodes)), thread_name_prefix="taskpool-create") as executor:
-            futures = {executor.submit(_create_pool_on_node, node): node for node in desired_nodes}
-            for future in as_completed(futures):
-                node = futures[future]
-                try:
-                    created.append(future.result())
-                except Exception as exc:
-                    node_key = _node_instance_key_from_node(node)
-                    create_failures[node_key] = repr(exc)
-                    logger.warning(
-                        "task pool replica create failed pool_name=%s node_id=%s node_instance_id=%s err=%r",
-                        effective_pool_name,
-                        getattr(node, "node_id", ""),
-                        node_key,
-                        exc,
-                    )
+    for item in dispatch_results:
+        node_key = _node_instance_key_from_node(item.node)
+        if item.error_message:
+            create_failures[node_key] = item.error_message
+            logger.warning(
+                "task pool replica create failed pool_name=%s node_id=%s node_instance_id=%s err=%s",
+                effective_pool_name,
+                getattr(item.node, "node_id", ""),
+                node_key,
+                item.error_message,
+            )
+            continue
+        if item.created is not None:
+            created.append(item.created)
     if not created:
         raise RuntimeError(f"task pool create failed on all selected nodes; failures={create_failures}")
     desired_order = {

@@ -78,6 +78,10 @@ from pycloud_parallel.execution.failover import (
     should_failover,
 )
 from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
+from pycloud_parallel.execution.deployment_create_helper import (
+    dispatch_create_requests,
+    prepare_deployment_artifact,
+)
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
@@ -2612,17 +2616,7 @@ class Service(ServiceExecutionSession):
         Returns:
             Service: 部署的服务组
         """
-        module_source = source if inspect.ismodule(source) else None
-        normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
-        if normalized_resource_paths and module_source is None:
-            raise ValueError("resource_paths requires a module source")
-        if normalized_resource_paths and module_source is not None:
-            module_blob, module_filename = _prepare_code_blob(module=module_source, resource_paths=normalized_resource_paths)
-            source = module_blob
-            entry_module = _default_entry_module_for_module(module_source)
-            package_format = _resolve_package_format(package_format, module_filename, default="py")
-
-        normalized_artifact = _normalize_artifact_input(
+        prepared_artifact = prepare_deployment_artifact(
             consumer_kind="service",
             source=source,
             artifact=artifact,
@@ -2632,10 +2626,7 @@ class Service(ServiceExecutionSession):
             entry_callable=entry_callable,
             package_format=package_format,
             managed_global_names=managed_global_names,
-        )
-        prepared_artifact = _prepare_artifact(
-            normalized_artifact,
-            consumer_kind="service",
+            resource_paths=resource_paths,
         )
         effective_blob = prepared_artifact.blob
         effective_filename = prepared_artifact.filename
@@ -3095,17 +3086,23 @@ class Service(ServiceExecutionSession):
                 session.node_id = str(node.node_id or "")
                 return node_key, node, client, session, ""
 
-            create_results: List[Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]] = []
-            if len(selected_nodes) == 1:
-                create_results.append(_create_service_on_node(selected_nodes[0]))
-            else:
-                with ThreadPoolExecutor(max_workers=max(1, len(selected_nodes)), thread_name_prefix="service-deploy") as executor:
-                    futures = [executor.submit(_create_service_on_node, node) for node in selected_nodes]
-                    for future in futures:
-                        create_results.append(future.result())
+            dispatch_results = dispatch_create_requests(
+                selected_nodes,
+                create_one=_create_service_on_node,
+                thread_name_prefix="service-deploy",
+                describe_error=lambda node, exc: repr(exc),
+            )
 
             first_failure: Tuple[str, str] = ("", "")
-            for node_key, node, client, session, error_message in create_results:
+            for item in dispatch_results:
+                if item.created is None:
+                    node_key = _node_instance_key_from_node(item.node)
+                    error_message = item.error_message
+                    failures[node_key] = error_message
+                    if not first_failure[0]:
+                        first_failure = (node_key, error_message)
+                    continue
+                node_key, node, client, session, error_message = item.created
                 if error_message:
                     failures[node_key] = error_message
                     if not first_failure[0]:
