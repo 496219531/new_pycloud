@@ -109,7 +109,7 @@
   - 默认：`eager`
   - 含义：gateway 仍使用旧默认；外部 gateway_public 的 DataRef locator 信任策略不在本轮调整
 
-### 2.4 control message size
+### 2.4 control HTTP body size
 
 - `PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES`
   - 默认：`16777216` (`16 MiB`)
@@ -117,7 +117,7 @@
 - `PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-当前 node control HTTP client/server 都会读取这两个值，统一设置 inline message size 限制。
+当前 node control HTTP client/server 都会读取这两个值，统一设置 HTTP body 大小限制。这里的 `control HTTP` 指协议边界；如果内部仍经过 `TransportPayload` adapter，那只是兼容 carrier，不代表 gRPC。
 
 ### 2.5 node 默认进程/并发参数
 
@@ -260,7 +260,7 @@ export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=131072
 export PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072
 ```
 
-### 组合 C：放大 control message size 到 16 MiB
+### 组合 C：放大 control HTTP body size 到 16 MiB
 
 适合：
 

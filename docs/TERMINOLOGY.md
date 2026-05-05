@@ -15,7 +15,7 @@
 | 调用载荷层 | `payload` / `result` | 一次调用的业务输入或输出 |
 | 传输容器层 | `carrier` | payload/result 在当前协议里的承载形态 |
 | HTTP 二进制体 | HTTP raw-bytes body | HTTP request/response body 直接放 codec bytes |
-| 内部兼容 adapter | `TransportPayload` adapter | 旧 proto/state 路径里带 `codec/version/payload(bytes)` 的兼容结构 |
+| 内部兼容 adapter | `TransportPayload` adapter | 旧 proto/state 路径里带 `codec/version/payload(bytes)` 的兼容结构；不是独立 protocol |
 | 大对象层 | `DataRef` / object store | 长期或跨节点引用的大对象/文件/大结果 |
 
 ## 2. target / route / protocol
@@ -87,11 +87,12 @@ Service.connect(
 兼容层：
 
 1. Struct carrier
-   - 内部 protobuf `Struct`
+   - 内部 protobuf schema 的 `Struct` 表达
    - 仍用于兼容老路径
 2. `TransportPayload` adapter
    - 形态：`TransportPayload { codec, version, payload(bytes) }`
    - 旧 NodeControl / TaskPool / Service state 路径仍会用
+   - 不是新的 wire protocol，也不是 gRPC
    - 新 HTTP wire 设计不应继续扩散这个概念
 
 ## 5. protobuf 与 gRPC
@@ -102,9 +103,10 @@ Service.connect(
 
 1. `protobuf` 表示消息 schema / 生成的 `pb2` 类 / `Struct` 等数据结构。
 2. `gRPC` 是一种 RPC 传输协议。
-3. 清掉 gRPC runtime 不等于清掉 protobuf carrier。
-4. `pb2.TransportPayload` 当前仍是内部兼容 adapter。
-5. `proto/pycloud_v1.proto` 里的旧字段名会暂时保留，作为 schema 兼容层。
+3. 当前公开通信主线按 `protocol="http"` 理解；不要新增 `protocol="grpc"` 语义。
+4. 清掉 gRPC runtime 不等于清掉 protobuf schema / carrier。
+5. `pb2.TransportPayload` 当前仍是内部兼容 adapter。
+6. `proto/pycloud_v1.proto` 里的旧字段名会暂时保留，作为 schema 兼容层。
 
 因此，看到 `TransportPayload` 或 `pb2` 时，不要自动理解成 gRPC。
 

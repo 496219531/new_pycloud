@@ -34,7 +34,7 @@
 - [PYCLOUDCTL_USAGE.md](PYCLOUDCTL_USAGE.md)
   - `pycloudctl` 的完整命令说明、host 自动探测、显式 `--target`、dev profile、日志、GC 与常见示例
 - [TERMINOLOGY.md](TERMINOLOGY.md)
-  - serialization mode、carrier、HTTP raw-bytes body、`TransportPayload`、`DataRef`、protobuf/gRPC 边界的统一术语
+  - target / route / protocol、serialization mode、carrier、HTTP raw-bytes body、`TransportPayload` adapter、`DataRef`、protobuf schema 边界的统一术语
 - [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md)
   - 当前控制面、节点、任务模式、服务模式与外部 Web 层的边界
 - [LONG_TERM_CONTEXT.md](LONG_TERM_CONTEXT.md)
