@@ -4,7 +4,7 @@ from dataclasses import replace
 import json
 
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
-from pycloud_parallel.controlplane.config import get_local_service_payload_policy, get_payload_policy
+from pycloud_parallel.controlplane.config import get_config_limit_authority, get_local_service_payload_policy, get_payload_policy
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
@@ -49,6 +49,37 @@ def test_get_payload_policy_defaults() -> None:
     assert managed_globals_policy.objectify_strings_as_files is True
     assert managed_globals_policy.objectify_bytes is True
     assert managed_globals_policy.consume_on_read is False
+
+
+def test_config_limit_authority_groups_existing_defaults() -> None:
+    authority = get_config_limit_authority()
+
+    assert authority.runtime_payload.inline_payload_soft_limit_bytes == 512 * 1024
+    assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 2 * 1024 * 1024
+    assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
+    assert authority.transport_bounds.control_http_max_send_bytes == 16 * 1024 * 1024
+    assert authority.object_store_bounds.object_chunk_size_bytes == 256 * 1024
+    assert authority.job_staging_bounds.job_staging_replica_count == 2
+    assert authority.capacity_defaults.node_worker_capacity == 32
+
+
+def test_config_env_loader_and_reload_share_defaults(monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config
+
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "12345")
+    monkeypatch.setenv("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", "23456")
+
+    loaded = config.load_config_from_env()
+    config.reload_config()
+    try:
+        assert loaded["INLINE_PAYLOAD_SOFT_LIMIT_BYTES"] == 12345
+        assert config.INLINE_PAYLOAD_SOFT_LIMIT_BYTES == 12345
+        assert loaded["CONTROL_HTTP_MAX_SEND_BYTES"] == 23456
+        assert config.CONTROL_HTTP_MAX_SEND_BYTES == 23456
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", raising=False)
+        config.reload_config()
 
 
 def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:

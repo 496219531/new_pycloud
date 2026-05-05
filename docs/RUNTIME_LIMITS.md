@@ -6,6 +6,10 @@
 
 这些限制默认值已经内置，但都可以通过环境变量覆盖。
 
+详细 authority 分层见：
+
+- [CONFIG_LIMIT_AUTHORITY.md](CONFIG_LIMIT_AUTHORITY.md)
+
 ## 0. 默认值速查
 
 | 环境变量 | 默认值 | 说明 |

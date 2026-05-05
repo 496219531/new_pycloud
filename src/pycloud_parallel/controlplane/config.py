@@ -67,110 +67,95 @@ PYCLOUD_JOBQUEUE_RESOLVE_REFS = "PYCLOUD_JOBQUEUE_RESOLVE_REFS"
 PYCLOUD_INLINE_TRANSPORT_CHECKSUM = "PYCLOUD_INLINE_TRANSPORT_CHECKSUM"
 
 
-INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
-INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024)
-INLINE_PAYLOAD_REQUEST_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024)
-LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 64 * 1024 * 1024)
-LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 256 * 1024 * 1024)
-DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024)
-DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024)
-DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES = _env_int("PYCLOUD_DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024)
-TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 10 * 1024 * 1024)
-TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES = _env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 50 * 1024 * 1024)
-TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES = _env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES", 1000 * 1024 * 1024)
-JOB_PAYLOAD_MAX_BYTES = _env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024)
-JOB_STAGING_REPLICA_COUNT = _env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2)
-JOB_STAGED_REF_TTL_SEC = _env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60)
-GATEWAY_STAGE_TTL_SEC = _env_int("PYCLOUD_GATEWAY_STAGE_TTL_SEC", 30 * 60)
-GATEWAY_STAGE_GC_INTERVAL_SEC = _env_int("PYCLOUD_GATEWAY_STAGE_GC_INTERVAL_SEC", 60)
-GATEWAY_MAX_UPLOAD_FILE_BYTES = _env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", 512 * 1024 * 1024)
-GATEWAY_MAX_UPLOAD_TOTAL_BYTES = _env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", 1024 * 1024 * 1024)
-INLINE_RESULT_SOFT_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", 1024 * 1024)
-INLINE_RESULT_HARD_LIMIT_BYTES = _env_int("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024)
+@dataclass(frozen=True)
+class EnvIntSetting:
+    names: tuple[str, ...]
+    default: int
 
-OBJECT_CHUNK_SIZE_BYTES = _env_int("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES", 256 * 1024)
-FILE_HASH_CHUNK_SIZE_BYTES = _env_int("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES", 1024 * 1024)
-OBJECT_SEGMENT_MAX_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024)
-OBJECT_SEGMENT_TARGET_BYTES = _env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024)
-OBJECT_UPLOAD_TRUSTED_PRECHECK = _env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True)
-INLINE_TRANSPORT_CHECKSUM = _env_bool(PYCLOUD_INLINE_TRANSPORT_CHECKSUM, False)
-SYSTEM_MODE = _env_choice(PYCLOUD_SYSTEM_MODE, "trusted_default", {"trusted_default"})
-TRUST_MODE = _env_choice(PYCLOUD_TRUST_MODE, "trusted", {"trusted", "balanced", "strict"})
-OBJECT_TRANSFER_MODE = _env_choice(
-    PYCLOUD_OBJECT_TRANSFER_MODE,
-    "auto",
-    {"auto", "known_digest_precheck", "single_pass_authoritative"},
-)
-SERIALIZATION_MODE = _env_choice(
-    PYCLOUD_SERIALIZATION_MODE,
-    "legacy_v1",
-    {"legacy_v1", "structured_v1", "pickle_stable_v1"},
-)
-DEPENDENCY_POLICY_MODE = _env_choice(
-    PYCLOUD_DEPENDENCY_POLICY_MODE,
-    "prebuilt",
-    {"prebuilt", "node_preinstalled", "allow_install"},
-)
-EXECUTOR_BACKEND = _env_choice(
-    PYCLOUD_EXECUTOR_BACKEND,
-    "subprocess_host",
-    {"subprocess_host"},
-)
-DATAREF_RESOLUTION = _env_choice(
-    PYCLOUD_DATAREF_RESOLUTION,
-    "remote_fetch",
-    {"local_only", "remote_fetch"},
-)
-DATAREF_UPLOAD_STRATEGY = _env_choice(
-    PYCLOUD_DATAREF_UPLOAD_STRATEGY,
-    "upload_once",
-    {"fanout", "upload_once"},
-)
-GATEWAY_DATAREF_RELAY = _env_choice(
-    PYCLOUD_GATEWAY_DATAREF_RELAY,
-    "eager",
-    {"eager", "lazy"},
-)
-JOBQUEUE_RESOLVE_REFS = _env_choice(
-    PYCLOUD_JOBQUEUE_RESOLVE_REFS,
-    "defer_to_worker",
-    {"eager", "defer_to_worker"},
-)
 
-CONTROL_HTTP_MAX_SEND_BYTES = _env_int_any(
-    ("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"),
-    16 * 1024 * 1024,
-)
-CONTROL_HTTP_MAX_RECEIVE_BYTES = _env_int_any(
-    ("PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES", "PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES"),
-    16 * 1024 * 1024,
-)
-SERVICE_HTTP_BODY_MAX_BYTES = _env_int_any(
-    ("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_SERVICE_BODY_MAX_BYTES"),
-    64 * 1024 * 1024,
-)
-GATEWAY_HTTP_BODY_MAX_BYTES = _env_int_any(
-    ("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"),
-    64 * 1024 * 1024,
-)
-INFOCENTER_HTTP_BODY_MAX_BYTES = _env_int_any(
-    ("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"),
-    64 * 1024 * 1024,
-)
-NODE_CONTROL_HTTP_BODY_MAX_BYTES = _env_int_any(
-    ("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES"),
-    256 * 1024 * 1024,
-)
-OBJECT_HTTP_BODY_MAX_BYTES = _env_int_any(
-    ("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"),
-    512 * 1024 * 1024,
-)
+@dataclass(frozen=True)
+class EnvBoolSetting:
+    name: str
+    default: bool
 
-NODE_WORKER_CAPACITY = _env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32)
-NODE_QUEUE_CAPACITY = _env_int("PYCLOUD_NODE_QUEUE_CAPACITY", 4000)
-NODE_MAX_WORKERS = _env_int("PYCLOUD_NODE_MAX_WORKERS", 64)
-SERVICE_DEFAULT_WORKERS = _env_int("PYCLOUD_SERVICE_DEFAULT_WORKERS", 10)
-SERVICE_HEARTBEAT_TIMEOUT_SEC = _env_int("PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC", 30)
+
+@dataclass(frozen=True)
+class EnvChoiceSetting:
+    name: str
+    default: str
+    choices: frozenset[str]
+
+
+_INT_SETTINGS: dict[str, EnvIntSetting] = {
+    "INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 512 * 1024),
+    "INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 2 * 1024 * 1024),
+    "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",), 8 * 1024 * 1024),
+    "LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 64 * 1024 * 1024),
+    "LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 256 * 1024 * 1024),
+    "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 512 * 1024),
+    "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 2 * 1024 * 1024),
+    "DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES",), 4 * 1024 * 1024),
+    "TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 10 * 1024 * 1024),
+    "TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 50 * 1024 * 1024),
+    "TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES",), 1000 * 1024 * 1024),
+    "JOB_PAYLOAD_MAX_BYTES": EnvIntSetting(("PYCLOUD_JOB_PAYLOAD_MAX_BYTES",), 64 * 1024),
+    "JOB_STAGING_REPLICA_COUNT": EnvIntSetting(("PYCLOUD_JOB_STAGING_REPLICA_COUNT",), 2),
+    "JOB_STAGED_REF_TTL_SEC": EnvIntSetting(("PYCLOUD_JOB_STAGED_REF_TTL_SEC",), 24 * 60 * 60),
+    "GATEWAY_STAGE_TTL_SEC": EnvIntSetting(("PYCLOUD_GATEWAY_STAGE_TTL_SEC",), 30 * 60),
+    "GATEWAY_STAGE_GC_INTERVAL_SEC": EnvIntSetting(("PYCLOUD_GATEWAY_STAGE_GC_INTERVAL_SEC",), 60),
+    "GATEWAY_MAX_UPLOAD_FILE_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES",), 512 * 1024 * 1024),
+    "GATEWAY_MAX_UPLOAD_TOTAL_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES",), 1024 * 1024 * 1024),
+    "INLINE_RESULT_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES",), 1024 * 1024),
+    "INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES",), 4 * 1024 * 1024),
+    "OBJECT_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES",), 256 * 1024),
+    "FILE_HASH_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES",), 1024 * 1024),
+    "OBJECT_SEGMENT_MAX_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES",), 8 * 1024 * 1024),
+    "OBJECT_SEGMENT_TARGET_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES",), 64 * 1024 * 1024),
+    "CONTROL_HTTP_MAX_SEND_BYTES": EnvIntSetting(("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"), 16 * 1024 * 1024),
+    "CONTROL_HTTP_MAX_RECEIVE_BYTES": EnvIntSetting(("PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES", "PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES"), 16 * 1024 * 1024),
+    "SERVICE_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_SERVICE_BODY_MAX_BYTES"), 64 * 1024 * 1024),
+    "GATEWAY_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"), 64 * 1024 * 1024),
+    "INFOCENTER_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"), 64 * 1024 * 1024),
+    "NODE_CONTROL_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES"), 256 * 1024 * 1024),
+    "OBJECT_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"), 512 * 1024 * 1024),
+    "NODE_WORKER_CAPACITY": EnvIntSetting(("PYCLOUD_NODE_WORKER_CAPACITY",), 32),
+    "NODE_QUEUE_CAPACITY": EnvIntSetting(("PYCLOUD_NODE_QUEUE_CAPACITY",), 4000),
+    "NODE_MAX_WORKERS": EnvIntSetting(("PYCLOUD_NODE_MAX_WORKERS",), 64),
+    "SERVICE_DEFAULT_WORKERS": EnvIntSetting(("PYCLOUD_SERVICE_DEFAULT_WORKERS",), 10),
+    "SERVICE_HEARTBEAT_TIMEOUT_SEC": EnvIntSetting(("PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC",), 30),
+}
+
+_BOOL_SETTINGS: dict[str, EnvBoolSetting] = {
+    "OBJECT_UPLOAD_TRUSTED_PRECHECK": EnvBoolSetting("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True),
+    "INLINE_TRANSPORT_CHECKSUM": EnvBoolSetting(PYCLOUD_INLINE_TRANSPORT_CHECKSUM, False),
+}
+
+_CHOICE_SETTINGS: dict[str, EnvChoiceSetting] = {
+    "SYSTEM_MODE": EnvChoiceSetting(PYCLOUD_SYSTEM_MODE, "trusted_default", frozenset({"trusted_default"})),
+    "TRUST_MODE": EnvChoiceSetting(PYCLOUD_TRUST_MODE, "trusted", frozenset({"trusted", "balanced", "strict"})),
+    "OBJECT_TRANSFER_MODE": EnvChoiceSetting(PYCLOUD_OBJECT_TRANSFER_MODE, "auto", frozenset({"auto", "known_digest_precheck", "single_pass_authoritative"})),
+    "SERIALIZATION_MODE": EnvChoiceSetting(PYCLOUD_SERIALIZATION_MODE, "legacy_v1", frozenset({"legacy_v1", "structured_v1", "pickle_stable_v1"})),
+    "DEPENDENCY_POLICY_MODE": EnvChoiceSetting(PYCLOUD_DEPENDENCY_POLICY_MODE, "prebuilt", frozenset({"prebuilt", "node_preinstalled", "allow_install"})),
+    "EXECUTOR_BACKEND": EnvChoiceSetting(PYCLOUD_EXECUTOR_BACKEND, "subprocess_host", frozenset({"subprocess_host"})),
+    "DATAREF_RESOLUTION": EnvChoiceSetting(PYCLOUD_DATAREF_RESOLUTION, "remote_fetch", frozenset({"local_only", "remote_fetch"})),
+    "DATAREF_UPLOAD_STRATEGY": EnvChoiceSetting(PYCLOUD_DATAREF_UPLOAD_STRATEGY, "upload_once", frozenset({"fanout", "upload_once"})),
+    "GATEWAY_DATAREF_RELAY": EnvChoiceSetting(PYCLOUD_GATEWAY_DATAREF_RELAY, "eager", frozenset({"eager", "lazy"})),
+    "JOBQUEUE_RESOLVE_REFS": EnvChoiceSetting(PYCLOUD_JOBQUEUE_RESOLVE_REFS, "defer_to_worker", frozenset({"eager", "defer_to_worker"})),
+}
+
+
+def load_config_from_env() -> dict[str, object]:
+    values: dict[str, object] = {}
+    for key, setting in _INT_SETTINGS.items():
+        values[key] = _env_int_any(setting.names, setting.default)
+    for key, setting in _BOOL_SETTINGS.items():
+        values[key] = _env_bool(setting.name, setting.default)
+    for key, setting in _CHOICE_SETTINGS.items():
+        values[key] = _env_choice(setting.name, setting.default, set(setting.choices))
+    return values
+
+
+globals().update(load_config_from_env())
 
 
 PayloadMode = Literal["http_call", "job_submit", "task_submit", "managed_globals", "result"]
@@ -195,6 +180,70 @@ class PayloadLimits:
     inline_result_hard_limit_bytes: int
     object_chunk_size_bytes: int
     file_hash_chunk_size_bytes: int
+
+
+@dataclass(frozen=True)
+class PolicyThresholdLimits:
+    inline_payload_soft_limit_bytes: int
+    inline_payload_hard_limit_bytes: int
+    inline_result_hard_limit_bytes: int
+
+
+@dataclass(frozen=True)
+class PolicyThresholds:
+    default_safe: PolicyThresholdLimits
+    trusted_internal: PolicyThresholdLimits
+
+
+@dataclass(frozen=True)
+class TransportBounds:
+    control_http_max_send_bytes: int
+    control_http_max_receive_bytes: int
+    service_http_body_max_bytes: int
+    gateway_http_body_max_bytes: int
+    infocenter_http_body_max_bytes: int
+    node_control_http_body_max_bytes: int
+    object_http_body_max_bytes: int
+
+
+@dataclass(frozen=True)
+class ObjectStoreBounds:
+    object_chunk_size_bytes: int
+    file_hash_chunk_size_bytes: int
+    object_segment_max_bytes: int
+    object_segment_target_bytes: int
+    gateway_max_upload_file_bytes: int
+    gateway_max_upload_total_bytes: int
+    object_upload_trusted_precheck: bool
+
+
+@dataclass(frozen=True)
+class JobStagingBounds:
+    job_payload_max_bytes: int
+    job_staging_replica_count: int
+    job_staged_ref_ttl_sec: int
+    gateway_stage_ttl_sec: int
+    gateway_stage_gc_interval_sec: int
+
+
+@dataclass(frozen=True)
+class CapacityDefaults:
+    node_worker_capacity: int
+    node_queue_capacity: int
+    node_max_workers: int
+    service_default_workers: int
+    service_heartbeat_timeout_sec: int
+
+
+@dataclass(frozen=True)
+class ConfigLimitAuthority:
+    runtime_payload: PayloadLimits
+    local_inline_payload: tuple[int, int]
+    policy_thresholds: PolicyThresholds
+    transport_bounds: TransportBounds
+    object_store_bounds: ObjectStoreBounds
+    job_staging_bounds: JobStagingBounds
+    capacity_defaults: CapacityDefaults
 
 
 @dataclass(frozen=True)
@@ -247,6 +296,57 @@ def get_runtime_limits() -> PayloadLimits:
         inline_result_hard_limit_bytes=int(INLINE_RESULT_HARD_LIMIT_BYTES),
         object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
         file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
+    )
+
+
+def get_config_limit_authority() -> ConfigLimitAuthority:
+    return ConfigLimitAuthority(
+        runtime_payload=get_runtime_limits(),
+        local_inline_payload=get_local_inline_limits(),
+        policy_thresholds=PolicyThresholds(
+            default_safe=PolicyThresholdLimits(
+                inline_payload_soft_limit_bytes=int(DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+                inline_payload_hard_limit_bytes=int(DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
+                inline_result_hard_limit_bytes=int(DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES),
+            ),
+            trusted_internal=PolicyThresholdLimits(
+                inline_payload_soft_limit_bytes=int(TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+                inline_payload_hard_limit_bytes=int(TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
+                inline_result_hard_limit_bytes=int(TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES),
+            ),
+        ),
+        transport_bounds=TransportBounds(
+            control_http_max_send_bytes=int(CONTROL_HTTP_MAX_SEND_BYTES),
+            control_http_max_receive_bytes=int(CONTROL_HTTP_MAX_RECEIVE_BYTES),
+            service_http_body_max_bytes=int(SERVICE_HTTP_BODY_MAX_BYTES),
+            gateway_http_body_max_bytes=int(GATEWAY_HTTP_BODY_MAX_BYTES),
+            infocenter_http_body_max_bytes=int(INFOCENTER_HTTP_BODY_MAX_BYTES),
+            node_control_http_body_max_bytes=int(NODE_CONTROL_HTTP_BODY_MAX_BYTES),
+            object_http_body_max_bytes=int(OBJECT_HTTP_BODY_MAX_BYTES),
+        ),
+        object_store_bounds=ObjectStoreBounds(
+            object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
+            file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
+            object_segment_max_bytes=int(OBJECT_SEGMENT_MAX_BYTES),
+            object_segment_target_bytes=int(OBJECT_SEGMENT_TARGET_BYTES),
+            gateway_max_upload_file_bytes=int(GATEWAY_MAX_UPLOAD_FILE_BYTES),
+            gateway_max_upload_total_bytes=int(GATEWAY_MAX_UPLOAD_TOTAL_BYTES),
+            object_upload_trusted_precheck=bool(OBJECT_UPLOAD_TRUSTED_PRECHECK),
+        ),
+        job_staging_bounds=JobStagingBounds(
+            job_payload_max_bytes=int(JOB_PAYLOAD_MAX_BYTES),
+            job_staging_replica_count=int(JOB_STAGING_REPLICA_COUNT),
+            job_staged_ref_ttl_sec=int(JOB_STAGED_REF_TTL_SEC),
+            gateway_stage_ttl_sec=int(GATEWAY_STAGE_TTL_SEC),
+            gateway_stage_gc_interval_sec=int(GATEWAY_STAGE_GC_INTERVAL_SEC),
+        ),
+        capacity_defaults=CapacityDefaults(
+            node_worker_capacity=int(NODE_WORKER_CAPACITY),
+            node_queue_capacity=int(NODE_QUEUE_CAPACITY),
+            node_max_workers=int(NODE_MAX_WORKERS),
+            service_default_workers=int(SERVICE_DEFAULT_WORKERS),
+            service_heartbeat_timeout_sec=int(SERVICE_HEARTBEAT_TIMEOUT_SEC),
+        ),
     )
 
 
@@ -464,108 +564,7 @@ def get_local_service_payload_policy() -> PayloadPolicy:
 
 def reload_config() -> None:
     """Reload environment-backed limits for tests or dynamic config."""
-    globals().update(
-        INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024),
-        INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024),
-        INLINE_PAYLOAD_REQUEST_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES", 8 * 1024 * 1024),
-        LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 64 * 1024 * 1024),
-        LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 256 * 1024 * 1024),
-        DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 512 * 1024),
-        DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 2 * 1024 * 1024),
-        DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES=_env_int("PYCLOUD_DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024),
-        TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 10 * 1024 * 1024),
-        TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES=_env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", 50 * 1024 * 1024),
-        TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES=_env_int("PYCLOUD_TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES", 1000 * 1024 * 1024),
-        JOB_PAYLOAD_MAX_BYTES=_env_int("PYCLOUD_JOB_PAYLOAD_MAX_BYTES", 64 * 1024),
-        JOB_STAGING_REPLICA_COUNT=_env_int("PYCLOUD_JOB_STAGING_REPLICA_COUNT", 2),
-        JOB_STAGED_REF_TTL_SEC=_env_int("PYCLOUD_JOB_STAGED_REF_TTL_SEC", 24 * 60 * 60),
-        GATEWAY_STAGE_TTL_SEC=_env_int("PYCLOUD_GATEWAY_STAGE_TTL_SEC", 30 * 60),
-        GATEWAY_STAGE_GC_INTERVAL_SEC=_env_int("PYCLOUD_GATEWAY_STAGE_GC_INTERVAL_SEC", 60),
-        GATEWAY_MAX_UPLOAD_FILE_BYTES=_env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", 512 * 1024 * 1024),
-        GATEWAY_MAX_UPLOAD_TOTAL_BYTES=_env_int("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", 1024 * 1024 * 1024),
-        INLINE_RESULT_SOFT_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", 1024 * 1024),
-        INLINE_RESULT_HARD_LIMIT_BYTES=_env_int("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", 4 * 1024 * 1024),
-        OBJECT_CHUNK_SIZE_BYTES=_env_int("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES", 256 * 1024),
-        FILE_HASH_CHUNK_SIZE_BYTES=_env_int("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES", 1024 * 1024),
-        OBJECT_SEGMENT_MAX_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES", 8 * 1024 * 1024),
-        OBJECT_SEGMENT_TARGET_BYTES=_env_int("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES", 64 * 1024 * 1024),
-        OBJECT_UPLOAD_TRUSTED_PRECHECK=_env_bool("PYCLOUD_OBJECT_UPLOAD_TRUSTED_PRECHECK", True),
-        INLINE_TRANSPORT_CHECKSUM=_env_bool(PYCLOUD_INLINE_TRANSPORT_CHECKSUM, False),
-        SYSTEM_MODE=_env_choice(PYCLOUD_SYSTEM_MODE, "trusted_default", {"trusted_default"}),
-        TRUST_MODE=_env_choice(PYCLOUD_TRUST_MODE, "trusted", {"trusted", "balanced", "strict"}),
-        OBJECT_TRANSFER_MODE=_env_choice(
-            PYCLOUD_OBJECT_TRANSFER_MODE,
-            "auto",
-            {"auto", "known_digest_precheck", "single_pass_authoritative"},
-        ),
-        SERIALIZATION_MODE=_env_choice(
-            PYCLOUD_SERIALIZATION_MODE,
-            "legacy_v1",
-            {"legacy_v1", "structured_v1", "pickle_stable_v1"},
-        ),
-        DEPENDENCY_POLICY_MODE=_env_choice(
-            PYCLOUD_DEPENDENCY_POLICY_MODE,
-            "prebuilt",
-            {"prebuilt", "node_preinstalled", "allow_install"},
-        ),
-        DATAREF_RESOLUTION=_env_choice(
-            PYCLOUD_DATAREF_RESOLUTION,
-            "remote_fetch",
-            {"local_only", "remote_fetch"},
-        ),
-        DATAREF_UPLOAD_STRATEGY=_env_choice(
-            PYCLOUD_DATAREF_UPLOAD_STRATEGY,
-            "upload_once",
-            {"fanout", "upload_once"},
-        ),
-        GATEWAY_DATAREF_RELAY=_env_choice(
-            PYCLOUD_GATEWAY_DATAREF_RELAY,
-            "eager",
-            {"eager", "lazy"},
-        ),
-        JOBQUEUE_RESOLVE_REFS=_env_choice(
-            PYCLOUD_JOBQUEUE_RESOLVE_REFS,
-            "defer_to_worker",
-            {"eager", "defer_to_worker"},
-        ),
-        CONTROL_HTTP_MAX_SEND_BYTES=_env_int_any(
-            ("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"),
-            16 * 1024 * 1024,
-        ),
-        CONTROL_HTTP_MAX_RECEIVE_BYTES=_env_int_any(
-            ("PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES", "PYCLOUD_CONTROL_MAX_RECEIVE_MESSAGE_LENGTH_BYTES"),
-            16 * 1024 * 1024,
-        ),
-        SERVICE_HTTP_BODY_MAX_BYTES=_env_int_any(
-            ("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_SERVICE_BODY_MAX_BYTES"),
-            64 * 1024 * 1024,
-        ),
-        GATEWAY_HTTP_BODY_MAX_BYTES=_env_int_any(
-            ("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"),
-            64 * 1024 * 1024,
-        ),
-        INFOCENTER_HTTP_BODY_MAX_BYTES=_env_int_any(
-            ("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"),
-            64 * 1024 * 1024,
-        ),
-        NODE_CONTROL_HTTP_BODY_MAX_BYTES=_env_int_any(
-            (
-                "PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES",
-                "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES",
-                "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES",
-            ),
-            256 * 1024 * 1024,
-        ),
-        OBJECT_HTTP_BODY_MAX_BYTES=_env_int_any(
-            ("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"),
-            512 * 1024 * 1024,
-        ),
-        NODE_WORKER_CAPACITY=_env_int("PYCLOUD_NODE_WORKER_CAPACITY", 32),
-        NODE_QUEUE_CAPACITY=_env_int("PYCLOUD_NODE_QUEUE_CAPACITY", 4000),
-        NODE_MAX_WORKERS=_env_int("PYCLOUD_NODE_MAX_WORKERS", 64),
-        SERVICE_DEFAULT_WORKERS=_env_int("PYCLOUD_SERVICE_DEFAULT_WORKERS", 10),
-        SERVICE_HEARTBEAT_TIMEOUT_SEC=_env_int("PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC", 30),
-    )
+    globals().update(load_config_from_env())
 
 
 def control_http_limits() -> list[tuple[str, int]]:
@@ -593,6 +592,8 @@ __all__ = [
     "GATEWAY_STAGE_TTL_SEC",
     "CONTROL_HTTP_MAX_RECEIVE_BYTES",
     "CONTROL_HTTP_MAX_SEND_BYTES",
+    "CapacityDefaults",
+    "ConfigLimitAuthority",
     "GatewayDataRefRelayMode",
     "GATEWAY_HTTP_BODY_MAX_BYTES",
     "INFOCENTER_HTTP_BODY_MAX_BYTES",
@@ -621,9 +622,12 @@ __all__ = [
     "OBJECT_TRANSFER_MODE",
     "OBJECT_UPLOAD_TRUSTED_PRECHECK",
     "ObjectTransferMode",
+    "ObjectStoreBounds",
     "PayloadLimits",
     "PayloadMode",
     "PayloadPolicy",
+    "PolicyThresholdLimits",
+    "PolicyThresholds",
     "PYCLOUD_DEPENDENCY_POLICY_MODE",
     "PYCLOUD_DATAREF_RESOLUTION",
     "PYCLOUD_DATAREF_UPLOAD_STRATEGY",
@@ -644,12 +648,14 @@ __all__ = [
     "TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
     "TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES",
+    "TransportBounds",
     "TrustMode",
     "env_int",
     "get_dataref_resolution",
     "get_dataref_upload_strategy",
     "get_dependency_policy_mode",
     "get_gateway_dataref_relay",
+    "get_config_limit_authority",
     "get_inline_transport_checksum",
     "get_jobqueue_resolve_refs",
     "get_job_blob_inline_threshold_bytes",
@@ -668,6 +674,7 @@ __all__ = [
     "get_serialization_mode",
     "get_system_mode",
     "get_trust_mode",
+    "load_config_from_env",
     "control_http_limits",
     "reload_config",
     "resolve_object_transfer_mode",
