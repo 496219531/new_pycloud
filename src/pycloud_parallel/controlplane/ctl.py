@@ -1389,11 +1389,12 @@ def _cmd_start(args: argparse.Namespace) -> int:
     _stop_core_processes(root)
     time.sleep(1.0)
 
-    infocenter_target = _format_host_port(controlplane_host, int(args.controlplane_port))
+    default_target = _format_host_port(controlplane_host, int(args.controlplane_port))
+    infocenter_target = str(getattr(args, "target", "") or "").strip() or default_target
     debug = bool(getattr(args, "debug", False))
     controlplane_kwargs = dict(
         bind_host=controlplane_host,
-        remote_hint=infocenter_target,
+        remote_hint=default_target,
         extra_env=extra_env,
     )
     job_orchestrator_kwargs = dict(
@@ -1414,7 +1415,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     print("  Core Services Started!")
     print("============================================")
     print()
-    print(f"  ControlPlane: {_format_host_port(controlplane_host, int(args.controlplane_port))}")
+    print(f"  ControlPlane: {default_target}")
     print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
     print(f"  Logs:        {_logs_dir(root)}")
     print(f"  PIDs:        {_pids_dir(root)}")
@@ -1432,11 +1433,12 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     _stop_all_managed_processes(root)
     time.sleep(1.0)
 
-    infocenter_target = _format_host_port(controlplane_host, int(args.controlplane_port))
+    default_target = _format_host_port(controlplane_host, int(args.controlplane_port))
+    infocenter_target = str(getattr(args, "target", "") or "").strip() or default_target
     debug = bool(getattr(args, "debug", False))
     controlplane_kwargs = dict(
         bind_host=controlplane_host,
-        remote_hint=infocenter_target,
+        remote_hint=default_target,
         extra_env=extra_env,
     )
     job_orchestrator_kwargs = dict(
@@ -1499,7 +1501,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     print("  Dev Services Started!")
     print("============================================")
     print()
-    print(f"  ControlPlane: {_format_host_port(controlplane_host, int(args.controlplane_port))}")
+    print(f"  ControlPlane: {default_target}")
     print(f"  JobQueue:     {_format_host_port(job_orchestrator_host, int(args.job_orchestrator_port))}")
     for index in range(node_count):
         print(
@@ -2511,6 +2513,21 @@ def _add_local_argument(parser: argparse.ArgumentParser, *, dest: str = "local")
     )
 
 
+def _add_target_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    default: object = "",
+    help: str = "InfoCenter/ControlPlane target; --infocenter-addr is a compatibility alias",
+) -> None:
+    parser.add_argument(
+        "--target",
+        "--infocenter-addr",
+        dest="target",
+        default=default,
+        help=help,
+    )
+
+
 def _add_debug_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--debug",
@@ -2574,10 +2591,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     start_parser = subparsers.add_parser("start", help="start controlplane and job-orchestrator")
     _add_local_argument(start_parser)
+    _add_target_argument(start_parser)
     _add_env_argument(start_parser)
     _add_debug_argument(start_parser)
     dev_start_parser = subparsers.add_parser("dev-start", help="start controlplane, job-orchestrator, and a configurable local node set")
     _add_local_argument(dev_start_parser)
+    _add_target_argument(dev_start_parser)
     _add_env_argument(dev_start_parser)
     _add_debug_argument(dev_start_parser)
     _add_dev_node_arguments(dev_start_parser)
@@ -2591,12 +2610,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_gateway)
     _add_debug_argument(start_gateway)
     start_gateway.add_argument("--bind", default="0.0.0.0:50052", help="full bind address in host:port form for start-gateway; wildcard hosts auto-resolve to the local IP")
-    start_gateway.add_argument(
-        "--target",
-        "--infocenter-addr",
-        dest="target",
-        default="",
-        help='InfoCenter/ControlPlane target; use "local" only for commands that explicitly support local IPC',
+    _add_target_argument(
+        start_gateway,
+        help='InfoCenter/ControlPlane target; --infocenter-addr is a compatibility alias; use "local" only for commands that explicitly support local IPC',
     )
     start_gateway.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0, help="gateway route refresh interval in seconds")
     start_gateway.add_argument("--gateway-failure-threshold", type=int, default=3, help="circuit-breaker failure threshold for gateway route refresh")
@@ -2614,12 +2630,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(start_job_orchestrator)
     _add_debug_argument(start_job_orchestrator)
     start_job_orchestrator.add_argument("--bind", default="0.0.0.0:50053", help="full bind address in host:port form for start-job-orchestrator; wildcard hosts auto-resolve to the local IP")
-    start_job_orchestrator.add_argument(
-        "--target",
-        "--infocenter-addr",
-        dest="target",
-        default="",
-        help='InfoCenter/ControlPlane target; "local" starts the job-orchestrator as a local IPC service',
+    _add_target_argument(
+        start_job_orchestrator,
+        help='InfoCenter/ControlPlane target; --infocenter-addr is a compatibility alias; "local" starts the job-orchestrator as a local IPC service',
     )
     start_job_orchestrator.add_argument("--node-id", default="job-orchestrator-01", type=_normalize_managed_name, help="managed node id advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--service-name", default="job-orchestrator", help="service name registered by job-orchestrator")
@@ -2635,12 +2648,10 @@ def build_parser() -> argparse.ArgumentParser:
     start_node.add_argument("--node-id", default="node-local-01", type=_normalize_managed_name, help="managed node name used for pid/log files and registration")
     start_node.add_argument("--bind", default="0.0.0.0:50061", help="full HTTP control bind address in host:port form for start-node; wildcard hosts auto-resolve to the local IP")
     start_node.add_argument("--service-http-bind", default="", help="full service HTTP bind address in host:port form for start-node; defaults to the node bind host and a port derived from the control port, for example 50061 -> 18081")
-    start_node.add_argument(
-        "--target",
-        "--infocenter-addr",
-        dest="target",
+    _add_target_argument(
+        start_node,
         default=None,
-        help='InfoCenter/ControlPlane target for registration; pass empty string ("") to disable registration',
+        help='InfoCenter/ControlPlane target for registration; --infocenter-addr is a compatibility alias; pass empty string ("") to disable registration',
     )
     start_node.add_argument("--advertise-addr", default="", help="full advertised control address in host:port form; defaults to the auto-resolved HTTP control bind address")
     start_node.add_argument("--worker-capacity", type=int, default=0, help="node runtime worker capacity; 0 means auto-calculate")
@@ -2666,10 +2677,12 @@ def build_parser() -> argparse.ArgumentParser:
     stop_node_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
     restart_parser = subparsers.add_parser("restart", help="restart local core controlplane and job-orchestrator services")
     _add_local_argument(restart_parser)
+    _add_target_argument(restart_parser)
     _add_env_argument(restart_parser)
     _add_debug_argument(restart_parser)
     dev_restart_parser = subparsers.add_parser("dev-restart", help="restart local dev profile services")
     _add_local_argument(dev_restart_parser)
+    _add_target_argument(dev_restart_parser)
     _add_env_argument(dev_restart_parser)
     _add_debug_argument(dev_restart_parser)
     _add_dev_node_arguments(dev_restart_parser, restart=True)
