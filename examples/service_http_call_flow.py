@@ -119,18 +119,18 @@ def main():
         print(f"   内部 payload: {{'args': [10], 'kwargs': {{'b': 20}}}}")
         print()
 
-        # === 方式 4: 通过 gateway transport 传普通 kwargs ===
+        # === 方式 4: 通过 gateway route 传普通 kwargs ===
         print("4️⃣  HTTP 风格 (直接传字典)")
         with Service.connect(
             target=gateway_target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=10.0,
         ) as client:
             print("   调用: client.add.sync(a=100, b=200)")
             result = client.add.sync(a=100, b=200)
             print(f"   结果: {result}")
-            print(f"   gateway transport 内部仍会把 {{'a': 100, 'b': 200}} 当作 kwargs 发送")
+            print(f"   gateway route 内部仍会把 {{'a': 100, 'b': 200}} 当作 kwargs 发送")
         print()
 
         # === 方式 5: 带默认值的位置参数 ===

@@ -953,7 +953,7 @@ def test_service_connect_local_uses_ipc_registry(tmp_path, monkeypatch):
         client = Service.connect(
             target="local",
             service_name="deploy-local-ipc",
-            transport="gateway",
+            route="gateway",
             validate_on_init=True,
         )
         try:

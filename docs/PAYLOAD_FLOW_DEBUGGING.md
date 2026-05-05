@@ -180,11 +180,11 @@ logging.getLogger("pycloud_parallel.payload_flow").setLevel(logging.DEBUG)
 
 服务调用常见入口是：
 
-1. `Service.connect(..., transport="gateway")`
+1. `Service.connect(..., route="gateway")`
 2. `GatewayServiceClient`
-3. `Service.connect(..., transport="discovery")`
+3. `Service.connect(..., route="discovery")`
 
-它们会经过 HTTP transport，所以你除了 payload path 事件，还能结合普通 HTTP debug 看。
+它们会经过 HTTP 调用链，所以你除了 payload path 事件，还能结合普通 HTTP debug 看。
 
 `TaskPool` / `NativeTaskPoolClient` 走的是 NodeControl HTTP，不会经过 service gateway 的 `_http_json_request()`。
 

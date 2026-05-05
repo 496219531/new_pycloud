@@ -157,8 +157,8 @@ result = group.call_sync("square", x=7)
 `Service` 当前默认已经统一到同一套 scheduler 主心智：
 
 1. owner `Service`
-2. `Service.connect(..., transport="discovery")`
-3. `Service.connect(..., transport="gateway")`
+2. `Service.connect(..., route="discovery")`
+3. `Service.connect(..., route="gateway")`
 
 默认都按 `predicted_busy / service_default` 这套口径选路。
 
@@ -184,7 +184,7 @@ connected `Service` 现在支持轻量批量 RPC 辅助能力：
 svc = Service.connect(
     target="127.0.0.1:50051",
     service_name="square-service",
-    transport="gateway",
+    route="gateway",
 )
 
 results = svc.square.map([1, 2, 3], arg_name="x")

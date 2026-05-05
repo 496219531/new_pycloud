@@ -86,7 +86,30 @@ pycloudctl --help
 2. `dev-start` / `dev-restart` 的 node 参数要写在子命令后面，例如 `pycloudctl dev-start --nodes 3 --node-control-port 51061`
 3. `--loopback` / `--local` 只表示 bind 到 `127.0.0.1`
 4. `target="local"` / `--target local` 表示 local IPC runtime，两者不要混用语义
-5. `--target` 是主参数名，`--infocenter-addr` 只是兼容 alias
+5. `--target` 是主参数名，`--infocenter-addr` 与它等价，只保留给旧脚本
+
+命令层术语：
+
+1. `target`
+   - 连接哪里
+   - CLI 里写作 `--target`
+   - 例子：`local`、`127.0.0.1:50051`、远端 ControlPlane / InfoCenter 地址
+2. `route`
+   - 怎么接入目标
+   - 主要出现在 Python API，例如 `Service.connect(..., route="gateway")`
+   - CLI 里的 `start-gateway` 是启动 gateway 组件，不是把 `--target` 解释成 gateway route
+3. `protocol`
+   - 底层通信协议
+   - 当前 `pycloudctl` 管理的远端进程主线都是 HTTP；CLI 暂不暴露可选 `--protocol`
+
+因此：
+
+```bash
+pycloudctl start-gateway --target 127.0.0.1:50051
+pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
+```
+
+这两条命令等价，都是让 gateway 连接到同一个 `target`。
 
 ## 2. 运行目录与默认值
 

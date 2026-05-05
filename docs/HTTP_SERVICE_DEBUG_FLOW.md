@@ -17,14 +17,14 @@
 
 当前常见 HTTP caller 有两类：
 
-1. gateway transport
-   - 统一 `Service.connect(..., transport="gateway")` 的模块化调用体验
+1. gateway route
+   - 统一 `Service.connect(..., route="gateway")` 的模块化调用体验
 2. `GatewayServiceClient`
    - 显式 HTTP 调用体验，如 `client.call(service_name=..., method=..., payload=...)`
 
-如果你走 gateway transport：
+如果你走 gateway route：
 
-1. `Service.connect(..., transport="gateway")` 返回统一连接对象
+1. `Service.connect(..., route="gateway")` 返回统一连接对象
 2. 连接对象的 `__getattr__()` 动态返回 `_CallProxy`
 3. `_SyncCallProxy.__call__()` 或 `_CallProxy.__call__()` 进入统一连接对象的 `call_balanced()`
 4. 再调用父类 `GatewayServiceClient.call()`
@@ -229,7 +229,7 @@ Gateway 选到 route 后，会打到 NodeControl 的 `CallService` HTTP 入口�
 
 ## 10. 备注
 
-如果你不是走 `gateway transport`，而是走 `discovery transport`，前半段会变成：
+如果你不是走 `gateway route`，而是走 `discovery route`，前半段会变成：
 
 1. 统一连接对象的 `call_balanced()`
 2. route cache 直接选节点 route

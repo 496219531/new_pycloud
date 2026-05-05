@@ -7,9 +7,9 @@
 2. `jobqueue_basic.py`
    - `JobQueue` 排队与单活编排示例
 3. `service_connect_gateway.py`
-   - `Service.connect(..., transport="gateway")` 基本示例
-4. `gateway_transport_client.py`
-   - `GatewayServiceClient` 底层 transport 示例
+   - `Service.connect(..., route="gateway")` 基本示例
+4. `gateway_route_client.py`
+   - `GatewayServiceClient` 底层 HTTP route 示例
 5. `service_deploy_basic.py`
    - `Service.deploy(...)` owner 侧示例
 6. `service_deploy_simple.py`
@@ -26,7 +26,7 @@
 1. 任务模式优先展示 `TaskPool`
 2. 大任务排队优先展示 `JobQueue`
 3. 服务模式优先展示 `Service`
-4. Gateway 调用优先展示 `Service.connect(..., transport="gateway")`
+4. Gateway 调用优先展示 `Service.connect(..., route="gateway")`
 
 已移除：
 
@@ -34,4 +34,4 @@
 2. 共享任务池相关旧示例
 3. 函数级 `max_workers` 本地并行 demo
 4. Cloudpickle 诊断 demo
-5. 旧 async transport demo
+5. 旧 async 低层调用 demo

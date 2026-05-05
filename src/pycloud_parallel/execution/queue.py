@@ -117,12 +117,13 @@ class QueueServiceClient:
 
         from pycloud_parallel.execution.service_session import Service
 
-        self._service = Service._connect_transport(
+        self._service = Service._connect_route(
             target=self.target,
             service_name=self.service_name,
             timeout_sec=self.timeout_sec,
             service_token=self.auth_token,
-            transport="local" if _is_local_target(self.target) else "discovery",
+            route="local" if _is_local_target(self.target) else "discovery",
+            protocol="http",
             serialization_mode=self.serialization_mode,
             validate_on_init=False,
             effective_policy_override=self.effective_policy,
@@ -159,7 +160,7 @@ class QueueServiceClient:
         self._service.effective_policy = effective_policy
         self._service.serialization_mode = effective_policy.resolved_mode
         payload = dict(call_kwargs.get("payload") or {})
-        if getattr(self._service, "transport", "") == "local" and self.auth_token:
+        if getattr(self._service, "route", "") == "local" and self.auth_token:
             payload.setdefault("_service_token", self.auth_token)
         effective_serialization_mode = (
             str(call_kwargs.get("serialization_mode", "") or "").strip()

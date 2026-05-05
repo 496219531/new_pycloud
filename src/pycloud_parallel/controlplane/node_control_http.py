@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""HTTP transport for the core NodeControl TaskPool and Service APIs."""
+"""HTTP implementation for the core NodeControl TaskPool and Service APIs."""
 
 import base64
 import json

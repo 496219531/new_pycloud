@@ -343,7 +343,7 @@ def encode_transport_payload_bytes(
     elif normalized == "structured_v1":
         payload = structured_dumps(value)
     else:
-        raise ValueError(f"{normalized!r} does not use bytes transport payloads")
+        raise ValueError(f"{normalized!r} does not use TransportPayload adapter payloads")
     if int(limit_bytes or 0) > 0:
         validate_inline_payload_size(
             len(payload),
@@ -384,7 +384,7 @@ def decode_transport_payload_bytes(
     elif normalized == "structured_v1":
         decoded = structured_loads(raw)
     else:
-        raise ValueError(f"{normalized!r} is not supported on protobuf bytes transport")
+        raise ValueError(f"{normalized!r} is not supported by the TransportPayload adapter")
     log_payload_flow("transport_payload_decode", context=context, codec=normalized, summary=summarize_payload_flow_value(decoded))
     return decoded
 
@@ -1115,12 +1115,12 @@ def _value_to_python(value: struct_pb2.Value) -> Any:
 
 
 def struct_to_python(data: struct_pb2.Struct) -> dict:
-    """Convert protobuf Struct into nested Python objects without transport decode."""
+    """Convert protobuf Struct into nested Python objects without carrier decode."""
     return {key: _value_to_python(item) for key, item in data.fields.items()}
 
 
 def struct_to_dict(data: struct_pb2.Struct, *, mode: str = "legacy_v1") -> dict:
-    """Convert protobuf Struct into nested Python objects and decode transport envelopes."""
+    """Convert protobuf Struct into nested Python objects and decode carrier envelopes."""
     result = struct_to_python(data)
     decoded = decode_transport_value(result, mode=mode, context="protobuf payload")
     if isinstance(decoded, dict):

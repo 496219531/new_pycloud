@@ -19,7 +19,7 @@ Gateway 只服务于服务模式 caller：
 
 ## 2. 当前推荐入口
 
-### 2.1 `Service.connect(..., transport="gateway")`
+### 2.1 `Service.connect(..., route="gateway")`
 
 V1 推荐直接把 gateway 当成 `Service` 的一种连接策略：
 
@@ -29,7 +29,7 @@ from pycloud_parallel import Service
 client = Service.connect(
     target="127.0.0.1:50051",
     service_name="square-service",
-    transport="gateway",
+    route="gateway",
 )
 
 print(client.square.sync(x=7))
@@ -65,7 +65,7 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 2. 想直接拿 HTTP 层返回
 3. 脚本或系统集成场景
 
-这是底层 transport client，不是 V1 主产品入口。
+这是底层 HTTP client，不是 V1 主产品入口。
 
 适合：
 
@@ -106,7 +106,7 @@ from pycloud_parallel import Service
 client = Service.connect(
     target="127.0.0.1:50051",
     service_name="square-service",
-    transport="gateway",
+    route="gateway",
 )
 
 print(client.square.sync(x=7))
@@ -162,7 +162,7 @@ curl -X POST 'http://127.0.0.1:50051/svc/square-service/call/square' \
   -d '{"x": 7}'
 ```
 
-## 5. 与 discovery transport 的区别
+## 5. 与 discovery route 的区别
 
 Gateway 路径：
 

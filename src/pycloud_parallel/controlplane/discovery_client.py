@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Discovery-based low-level service transport client."""
+"""Discovery-routed low-level service HTTP client."""
 
 import contextlib
 import atexit
@@ -117,7 +117,7 @@ atexit.register(_stop_shared_route_caches)
 
 
 class DiscoveryServiceClient:
-    """Low-level discovery transport client for service calls."""
+    """Low-level discovery-routed HTTP client for service calls."""
 
     def __init__(
         self,

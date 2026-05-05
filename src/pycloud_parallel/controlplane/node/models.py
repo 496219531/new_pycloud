@@ -108,7 +108,7 @@ class TaskState:
             else bool(self.use_transport_result)
         )
         if use_transport_result:
-            # Bytes transport must see the raw high-level result object exactly
+            # The legacy TransportPayload adapter must see the raw high-level result object exactly
             # once. Receiving an already transport-wrapped payload here would
             # double-encode the result and leak internal envelopes to clients.
             result_kwargs["transport_result"] = value_to_transport_payload(

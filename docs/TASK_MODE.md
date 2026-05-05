@@ -65,7 +65,7 @@ with TaskPool.open(
 
 1. 大任务先排队
 2. 同一时刻只允许一个大任务进入运行态
-3. `JobQueue` 复用 `Service.connect(...)` 的底层 route / transport 逻辑调用 `job-orchestrator`
+3. `JobQueue` 复用 `Service.connect(...)` 的底层 route / protocol 逻辑调用 `job-orchestrator`
 4. job 排到后，再自动创建 `TaskPool`
 
 这里更适合把 `JobQueue` 理解成“排队与单活编排入口”，而不是单纯的客户端 helper。
@@ -236,7 +236,7 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
 
 ## 4. Task Serialization Mode
 
-`TaskPool` 当前也已经接入统一 transport codec pipeline。
+`TaskPool` 当前也已经接入统一 codec/carrier pipeline。
 
 也就是说：
 
@@ -267,7 +267,7 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
 1. `TaskPool.serialization_mode` 是当前 session 的主边界
 2. `submit_payloads(...)` 可以临时 override，但不会污染 session 默认值
 3. `put_data()/put_json()/put_ndarray()/put_dataframe()` 不显式传 mode 时，会继承当前 `TaskPool` session mode
-4. transport decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
+4. carrier decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
 
 ### 4.1 DataRef 默认链路
 

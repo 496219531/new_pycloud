@@ -13,7 +13,7 @@ def test_connected_service_map_preserves_input_order_for_discovery():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
     try:
@@ -36,7 +36,7 @@ def test_connected_service_map_returns_none_on_failure():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
 
@@ -59,7 +59,7 @@ def test_connected_service_amap_preserves_input_order_for_gateway():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="gateway",
+        route="gateway",
         validate_on_init=False,
     )
 
@@ -84,7 +84,7 @@ def test_connected_service_unordered_sync_yields_index_and_result_or_none():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
 
@@ -110,11 +110,11 @@ def test_connected_service_unordered_sync_yields_index_and_result_or_none():
         client.close()
 
 
-def test_connected_service_aunordered_supports_gateway_transport():
+def test_connected_service_aunordered_supports_gateway_route():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="gateway",
+        route="gateway",
         validate_on_init=False,
     )
 
@@ -148,7 +148,7 @@ def test_connected_service_iter_items_exposes_full_execution_items():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
 
@@ -179,7 +179,7 @@ def test_connected_service_unordered_can_return_execution_items():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
 
@@ -203,7 +203,7 @@ def test_connected_service_aunordered_can_return_execution_items():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
 
@@ -230,7 +230,7 @@ def test_connected_service_collect_items_returns_input_order():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="gateway",
+        route="gateway",
         validate_on_init=False,
     )
 
@@ -253,7 +253,7 @@ def test_connected_service_map_requires_arg_name_for_non_dict_values():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
     try:
@@ -268,7 +268,7 @@ def test_connected_service_unordered_requires_mapping_payloads():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
     try:
@@ -283,7 +283,7 @@ def test_connected_service_unordered_merges_shared_kwargs():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
 
@@ -303,7 +303,7 @@ def test_connected_service_unordered_is_not_async_iterable():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
     try:

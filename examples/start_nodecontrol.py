@@ -6,7 +6,7 @@
 python examples/start_nodecontrol.py \
   --bind 0.0.0.0:50062 \
   --node-id node-2 \
-  --infocenter-addr 127.0.0.1:50051 \
+  --target 127.0.0.1:50051 \
   --advertise-addr 127.0.0.1:50062 \
   --service-http-bind 127.0.0.1:18082
 """
@@ -38,7 +38,7 @@ from pycloud_parallel.controlplane.server import build_nodecontrol_server
 DEFAULT_CONFIG = {
     "bind": "0.0.0.0:50061",
     "node_id": "node-local-01",
-    "infocenter_addr": "127.0.0.1:50051",
+    "target": "127.0.0.1:50051",
     "advertise_addr": "",
     "service_http_bind": "127.0.0.1:18081",
     "service_http_base_url": "",
@@ -57,7 +57,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Start a single PyCloud NodeControl node")
     parser.add_argument("--bind", default=DEFAULT_CONFIG["bind"], help="NodeControl HTTP bind address")
     parser.add_argument("--node-id", default=DEFAULT_CONFIG["node_id"], help="logical node id")
-    parser.add_argument("--infocenter-addr", default=DEFAULT_CONFIG["infocenter_addr"], help="InfoCenter address")
+    parser.add_argument("--target", "--infocenter-addr", dest="target", default=DEFAULT_CONFIG["target"], help="InfoCenter/ControlPlane target")
     parser.add_argument("--advertise-addr", default=DEFAULT_CONFIG["advertise_addr"], help="address advertised to InfoCenter")
     parser.add_argument("--service-http-bind", default=DEFAULT_CONFIG["service_http_bind"], help="service HTTP bind address")
     parser.add_argument("--service-http-base-url", default=DEFAULT_CONFIG["service_http_base_url"], help="external service HTTP base url")
@@ -103,9 +103,9 @@ def main() -> None:
     )
 
     registrar: Optional[NodeInfoCenterRegistrar] = None
-    if args.infocenter_addr:
+    if args.target:
         registrar = NodeInfoCenterRegistrar(
-            infocenter_addr=args.infocenter_addr,
+            infocenter_addr=args.target,
             node_id=args.node_id,
             control_addr=advertise_addr,
             state=state,
@@ -140,10 +140,10 @@ def main() -> None:
             continue
 
     logger.info(
-        "starting nodecontrol bind=%s node_id=%s infocenter=%s advertise=%s service_http_bind=%s",
+        "starting nodecontrol bind=%s node_id=%s target=%s advertise=%s service_http_bind=%s",
         args.bind,
         args.node_id,
-        args.infocenter_addr,
+        args.target,
         advertise_addr,
         args.service_http_bind,
     )

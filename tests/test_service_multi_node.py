@@ -172,7 +172,7 @@ def test_service_deploy_connect_iter_items_accepts_generator_payload_stream(tmp_
             client = Service.connect(
                 target=info_target,
                 service_name="svc-stream-test",
-                transport="discovery",
+                route="discovery",
                 timeout_sec=10.0,
             )
             produced = []
@@ -250,7 +250,7 @@ def test_service_connect_streams_generator_results_incrementally(tmp_path, capsy
             client = Service.connect(
                 target=info_target,
                 service_name="svc-stream-out-test",
-                transport="discovery",
+                route="discovery",
                 timeout_sec=10.0,
             )
             try:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Gateway HTTP low-level transport client."""
+"""Gateway-routed low-level HTTP client."""
 
 import contextlib
 import http.client
@@ -73,7 +73,7 @@ def _resolve_gateway_service_policy(
 
 
 class GatewayServiceClient:
-    """Low-level HTTP transport client for Gateway-routed service calls."""
+    """Low-level HTTP client for Gateway-routed service calls."""
 
     def __init__(self, target: str, *, timeout_sec: float = 10.0, service_token: str = "") -> None:
         self.target = target

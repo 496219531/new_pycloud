@@ -4,10 +4,13 @@
 
 ## 1. 分层原则
 
-不要把 codec、carrier、transport、object store 混成一个词。
+不要把 target、route、protocol、codec、carrier、object store 混成一个词。
 
 | 层次 | 推荐用语 | 含义 |
 | --- | --- | --- |
+| 连接目标层 | `target` | 连接哪里，例如 `local` / `127.0.0.1:50051` / 远端地址 |
+| 接入路径层 | `route` | 怎么接入，例如 `local` / `discovery` / `gateway`；`direct` 预留给未来直连 |
+| 协议层 | `protocol` | 底层通信协议；当前主线只有 HTTP |
 | 对象编码层 | `serialization mode` / `codec` | 一个 Python 对象如何编码与解码 |
 | 调用载荷层 | `payload` / `result` | 一次调用的业务输入或输出 |
 | 传输容器层 | `carrier` | payload/result 在当前协议里的承载形态 |
@@ -15,7 +18,40 @@
 | 内部兼容 adapter | `TransportPayload` adapter | 旧 proto/state 路径里带 `codec/version/payload(bytes)` 的兼容结构 |
 | 大对象层 | `DataRef` / object store | 长期或跨节点引用的大对象/文件/大结果 |
 
-## 2. serialization mode
+## 2. target / route / protocol
+
+这三个词只描述“怎么连上服务”，不描述对象怎么编码，也不描述 payload 放在 JSON 还是 raw bytes body 里。
+
+1. `target`
+   - 含义：连接哪里
+   - 例子：`local`、`127.0.0.1:50051`、远端 InfoCenter / ControlPlane 地址
+   - `target="local"` 表示 local IPC runtime
+2. `route`
+   - 含义：怎么接入目标
+   - 当前值：`local`、`discovery`、`gateway`
+   - `discovery` 表示先查 service discovery，再直连具体 service HTTP endpoint
+   - `gateway` 表示通过 gateway 统一入口转发
+   - `direct` 是未来直连 endpoint 的预留概念，当前不要当成已实现能力
+3. `protocol`
+   - 含义：底层 wire protocol
+   - 当前值：`http`
+   - 以后如果出现其他协议，也应该放在 `protocol`，不要塞进 `route`
+
+推荐写法：
+
+```python
+Service.connect(
+    target="127.0.0.1:50051",
+    service_name="demo",
+    route="discovery",
+    protocol="http",
+)
+```
+
+不要再用 `transport="gateway"` 或 `transport="discovery"` 表达接入路径。
+`transport` 这个词只允许在内部实现泛称中偶尔出现，不作为公开参数名。
+
+## 3. serialization mode
 
 `serialization_mode` 只描述对象怎么编解码，不描述走 HTTP 还是走内部消息。
 
@@ -34,7 +70,7 @@
 
 不要说“pickle 模式一定走 bytes”。是否走 HTTP raw-bytes body 由 `effective_policy` 和当前调用路径决定。
 
-## 3. carrier
+## 4. carrier
 
 `carrier` 是“把已经编码好的 payload/result 放进哪种协议容器”。
 
@@ -58,7 +94,7 @@
    - 旧 NodeControl / TaskPool / Service state 路径仍会用
    - 新 HTTP wire 设计不应继续扩散这个概念
 
-## 4. protobuf 与 gRPC
+## 5. protobuf 与 gRPC
 
 `protobuf` 不是 gRPC。
 
@@ -72,7 +108,7 @@
 
 因此，看到 `TransportPayload` 或 `pb2` 时，不要自动理解成 gRPC。
 
-## 5. HTTP raw-bytes body
+## 6. HTTP raw-bytes body
 
 推荐用语：HTTP raw-bytes body。
 
@@ -91,7 +127,7 @@
 2. `use_raw_bytes_payload`
    - 兼容旧内部 carrier 路径的开关；新 HTTP wire 语义优先看 `use_http_raw_bytes_body`
 
-## 6. DataRef
+## 7. DataRef
 
 `DataRef` 是大对象引用，不是一次调用的 HTTP raw-bytes body。
 
@@ -105,7 +141,7 @@
 `DataRef` 背后通常会落到 object store / node-local cache。
 HTTP raw-bytes body 则只是一条请求或响应的 body。
 
-## 7. limit 用语
+## 8. limit 用语
 
 推荐这样理解：
 
@@ -124,10 +160,12 @@ HTTP raw-bytes body 则只是一条请求或响应的 body。
    - HTTP server/client 对整个 body 的限制
    - 与 DataRef/object store limit 是不同层次
 
-## 8. 旧用语对照
+## 9. 旧用语对照
 
 | 旧用语 | 新推荐用语 |
 | --- | --- |
+| `transport="gateway"` | `route="gateway", protocol="http"` |
+| `transport="discovery"` | `route="discovery", protocol="http"` |
 | `transport_payload_bytes` | `TransportPayload` adapter / legacy internal raw bytes |
 | `http_bytes_transport` | HTTP raw-bytes body |
 | `protobuf bytes lane` | `TransportPayload` adapter |

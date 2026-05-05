@@ -60,23 +60,25 @@ def test_api_service_module_exposes_only_service():
     discovery = ApiService.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
     gateway = ApiService.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="gateway",
+        route="gateway",
         validate_on_init=False,
     )
     try:
         assert discovery.service_name == "svc-demo"
-        assert discovery.transport == "discovery"
+        assert discovery.route == "discovery"
+        assert discovery.protocol == "http"
         assert callable(discovery.status)
         assert isinstance(getattr(type(discovery), "methods", None), property)
         assert not hasattr(discovery, "update_globals")
         assert gateway.service_name == "svc-demo"
-        assert gateway.transport == "gateway"
+        assert gateway.route == "gateway"
+        assert gateway.protocol == "http"
         assert callable(gateway.status)
         assert isinstance(getattr(type(gateway), "methods", None), property)
         assert not hasattr(gateway, "update_globals")

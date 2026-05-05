@@ -4,7 +4,7 @@ PyCloud Gateway 完整演示
 
 演示完整的流程：
 1. 部署一个服务（使用 Service）
-2. 通过 `Service.connect(..., transport="gateway")` 按服务名调用
+2. 通过 `Service.connect(..., route="gateway")` 按服务名调用
 3. 清理服务
 """
 
@@ -73,7 +73,7 @@ def main():
         with Service.connect(
             target=gateway_target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=10.0,
         ) as client:
             # 列出方法
@@ -109,7 +109,7 @@ def main():
         with Service.connect(
             target=gateway_target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=10.0,
         ) as client:
             print(f"可用方法: {client.methods}")

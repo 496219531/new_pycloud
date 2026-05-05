@@ -18,7 +18,7 @@ def test_service_connect_discovery_returns_unified_service_object():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="discovery",
+        route="discovery",
         validate_on_init=False,
     )
     try:
@@ -42,7 +42,7 @@ def test_service_connect_gateway_returns_unified_service_object():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="gateway",
+        route="gateway",
         validate_on_init=False,
     )
     try:
@@ -66,7 +66,7 @@ def test_service_connect_gateway_stream_proxy_yields_items():
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name="svc-demo",
-        transport="gateway",
+        route="gateway",
         validate_on_init=False,
     )
     try:
@@ -106,7 +106,7 @@ def test_service_connect_discovery_retries_briefly_when_routes_are_not_ready():
         client = Service.connect(
             target="127.0.0.1:50051",
             service_name="svc-demo",
-            transport="discovery",
+            route="discovery",
             timeout_sec=1.0,
             validate_on_init=True,
         )
@@ -156,7 +156,7 @@ def test_service_connect_inherits_deploy_bound_policy_from_routes():
         client = Service.connect(
             target="127.0.0.1:50051",
             service_name="svc-demo",
-            transport="discovery",
+            route="discovery",
             serialization_mode="pickle_stable_v1",
             validate_on_init=True,
         )
@@ -208,7 +208,7 @@ def test_service_connect_rejects_mixed_route_policy_metadata():
             Service.connect(
                 target="127.0.0.1:50051",
                 service_name="svc-demo",
-                transport="discovery",
+                route="discovery",
                 validate_on_init=True,
             )
         except RuntimeError as exc:

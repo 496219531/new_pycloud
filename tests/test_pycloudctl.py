@@ -149,7 +149,7 @@ def test_ctl_parser_accepts_start_gateway_command():
     args = parser.parse_args(["start-gateway", "--bind", "0.0.0.0:50052", "--target", "127.0.0.1:50051"])
     assert args.command == "start-gateway"
     assert args.bind == "0.0.0.0:50052"
-    assert args.infocenter_addr == "127.0.0.1:50051"
+    assert args.target == "127.0.0.1:50051"
 
 
 def test_ctl_parser_accepts_start_job_orchestrator_command():
@@ -157,7 +157,7 @@ def test_ctl_parser_accepts_start_job_orchestrator_command():
     args = parser.parse_args(["start-job-orchestrator", "--bind", "0.0.0.0:50053", "--target", "127.0.0.1:50051", "--force"])
     assert args.command == "start-job-orchestrator"
     assert args.bind == "0.0.0.0:50053"
-    assert args.infocenter_addr == "127.0.0.1:50051"
+    assert args.target == "127.0.0.1:50051"
     assert args.force is True
 
 
@@ -165,26 +165,26 @@ def test_ctl_parser_accepts_target_for_start_commands():
     parser = ctl.build_parser()
     args = parser.parse_args(["start-gateway", "--target", "local"])
     assert args.command == "start-gateway"
-    assert args.infocenter_addr == "local"
+    assert args.target == "local"
     args = parser.parse_args(["start-job-orchestrator", "--target", "local"])
     assert args.command == "start-job-orchestrator"
-    assert args.infocenter_addr == "local"
+    assert args.target == "local"
     args = parser.parse_args(["start-node", "--target", "local"])
     assert args.command == "start-node"
-    assert args.infocenter_addr == "local"
+    assert args.target == "local"
 
 
-def test_ctl_parser_accepts_infocenter_addr_alias_for_start_commands():
+def test_ctl_parser_accepts_target_alias_for_start_commands():
     parser = ctl.build_parser()
     args = parser.parse_args(["start-gateway", "--infocenter-addr", "127.0.0.1:50051"])
     assert args.command == "start-gateway"
-    assert args.infocenter_addr == "127.0.0.1:50051"
+    assert args.target == "127.0.0.1:50051"
     args = parser.parse_args(["start-job-orchestrator", "--infocenter-addr", "127.0.0.1:50051"])
     assert args.command == "start-job-orchestrator"
-    assert args.infocenter_addr == "127.0.0.1:50051"
+    assert args.target == "127.0.0.1:50051"
     args = parser.parse_args(["start-node", "--infocenter-addr", "127.0.0.1:50051"])
     assert args.command == "start-node"
-    assert args.infocenter_addr == "127.0.0.1:50051"
+    assert args.target == "127.0.0.1:50051"
 
 
 
@@ -1054,7 +1054,7 @@ def test_cmd_doctor_uses_default_ports(tmp_path, monkeypatch, capsys):
     assert "50053 (job-orchestrator): no listener" in out
 
 
-def test_cmd_start_node_requires_explicit_infocenter_target(tmp_path, monkeypatch):
+def test_cmd_start_node_requires_explicit_target(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args([
         "--runtime-root",
@@ -1077,7 +1077,7 @@ def test_cmd_start_node_requires_explicit_infocenter_target(tmp_path, monkeypatc
         ctl._cmd_start_node(args)
 
 
-def test_cmd_start_node_uses_explicit_infocenter_target_and_local_advertise(tmp_path, monkeypatch):
+def test_cmd_start_node_uses_explicit_target_and_local_advertise(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args([
         "--runtime-root",
@@ -1127,7 +1127,7 @@ def test_cmd_start_node_uses_explicit_infocenter_target_and_local_advertise(tmp_
 
 
 @pytest.mark.parametrize(
-    ("argv", "expected_bind", "expected_infocenter"),
+    ("argv", "expected_bind", "expected_target"),
     [
         (["start-infocenter", "--local"], "127.0.0.1:50051", None),
         (["start-controlplane", "--local"], "127.0.0.1:50051", None),
@@ -1140,7 +1140,7 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
     monkeypatch,
     argv,
     expected_bind,
-    expected_infocenter,
+    expected_target,
 ):
     parser = ctl.build_parser()
     args = parser.parse_args(["--runtime-root", str(tmp_path), *argv])
@@ -1199,7 +1199,7 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
             {
                 "root": tmp_path.resolve(),
                 "bind": expected_bind,
-                "infocenter_addr": expected_infocenter,
+                "infocenter_addr": expected_target,
                 "node_id": "job-orchestrator-01",
                 "service_name": "job-orchestrator",
                 "queue_capacity": 4000,
@@ -1216,7 +1216,7 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
         {
             "root": tmp_path.resolve(),
             "bind": expected_bind,
-            "infocenter_addr": expected_infocenter,
+            "infocenter_addr": expected_target,
             "gateway_refresh_interval_sec": 3.0,
             "gateway_failure_threshold": 3,
             "gateway_open_sec": 5.0,
@@ -1384,7 +1384,7 @@ def test_cmd_start_node_canonical_addresses(tmp_path, monkeypatch):
     ]
 
 
-def test_cmd_start_gateway_requires_explicit_infocenter_target(tmp_path, monkeypatch):
+def test_cmd_start_gateway_requires_explicit_target(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args([
         "--runtime-root",
@@ -1399,7 +1399,7 @@ def test_cmd_start_gateway_requires_explicit_infocenter_target(tmp_path, monkeyp
         ctl._cmd_start_gateway(args)
 
 
-def test_cmd_start_job_orchestrator_requires_explicit_infocenter_target(tmp_path, monkeypatch):
+def test_cmd_start_job_orchestrator_requires_explicit_target(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args([
         "--runtime-root",

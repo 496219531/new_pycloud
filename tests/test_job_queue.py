@@ -2261,7 +2261,8 @@ def test_job_queue_local_reuses_service_connect_local_transport(monkeypatch) -> 
     captured = {}
 
     class _FakeConnectedService:
-        transport = "local"
+        route = "local"
+        protocol = "http"
         service_name = "job-orchestrator"
 
         def close(self):
@@ -2277,7 +2278,7 @@ def test_job_queue_local_reuses_service_connect_local_transport(monkeypatch) -> 
         captured["connect_kwargs"] = dict(kwargs)
         return _FakeConnectedService()
 
-    monkeypatch.setattr(Service, "_connect_transport", staticmethod(_fake_connect))
+    monkeypatch.setattr(Service, "_connect_route", staticmethod(_fake_connect))
 
     client = JobQueue.connect("local", client_id="client-local", auth_token="token-local")
     try:
@@ -2288,7 +2289,8 @@ def test_job_queue_local_reuses_service_connect_local_transport(monkeypatch) -> 
     assert resp["job"]["job_id"] == "job-local"
     assert captured["connect_kwargs"]["target"] == "local"
     assert captured["connect_kwargs"]["service_name"] == "job-orchestrator"
-    assert captured["connect_kwargs"]["transport"] == "local"
+    assert captured["connect_kwargs"]["route"] == "local"
+    assert captured["connect_kwargs"]["protocol"] == "http"
     assert captured["connect_kwargs"]["service_token"] == "token-local"
     assert captured["connect_kwargs"]["effective_policy_override"].resolved_mode == "structured_v1"
     assert captured["connect_kwargs"]["prepare_discovery_payload"] is False

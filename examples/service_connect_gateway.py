@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-通过 `Service.connect(..., transport="gateway")` 调用已部署服务。
+通过 `Service.connect(..., route="gateway")` 调用已部署服务。
 
 这个示例聚焦 gateway 连接主路径：
-1. `Service.connect(..., transport="gateway")`
+1. `Service.connect(..., route="gateway")`
 2. 统一服务对象的 `methods / status / foo.sync(...)`
 
 前置条件：
@@ -29,7 +29,7 @@ def check_service_exists(gateway_target: str, service_name: str) -> bool:
         with Service.connect(
             target=gateway_target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=5.0,
             validate_on_init=False,
         ) as client:
@@ -47,7 +47,7 @@ def wait_for_service_ready(gateway_target: str, service_name: str, *, timeout_se
             with Service.connect(
                 target=gateway_target,
                 service_name=service_name,
-                transport="gateway",
+                route="gateway",
                 timeout_sec=5.0,
                 validate_on_init=False,
             ) as client:
@@ -108,7 +108,7 @@ def main() -> None:
         with Service.connect(
             target=gateway_target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=10.0,
         ) as client:
             methods = client.methods
@@ -138,7 +138,7 @@ def main() -> None:
         with Service.connect(
             target=gateway_target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=10.0,
         ) as client:
             status = client.status()

@@ -1621,21 +1621,21 @@ def _cmd_start_gateway(args: argparse.Namespace) -> int:
     _ensure_runtime_dirs(root)
     _stop_named_process(root, "gateway")
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
-    infocenter_addr = str(getattr(args, "infocenter_addr", "") or "").strip()
-    if not infocenter_addr:
+    target = str(getattr(args, "target", "") or "").strip()
+    if not target:
         raise RuntimeError("start-gateway requires --target; pycloudctl no longer defaults to a local InfoCenter target")
     bind = _resolve_bind_value(
         str(args.bind),
         host="",
         port=0,
         label="gateway bind",
-        remote_hint=infocenter_addr,
+        remote_hint=target,
         prefer_local=bool(getattr(args, "local", False)),
     )
     _start_gateway(
         root,
         bind=bind,
-        infocenter_addr=infocenter_addr,
+        infocenter_addr=target,
         gateway_refresh_interval_sec=float(args.gateway_refresh_interval_sec),
         gateway_failure_threshold=int(args.gateway_failure_threshold),
         gateway_open_sec=float(args.gateway_open_sec),
@@ -1674,21 +1674,21 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
     _ensure_runtime_dirs(root)
     _stop_named_process(root, "job-orchestrator")
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
-    infocenter_addr = str(getattr(args, "infocenter_addr", "") or "").strip()
-    if not infocenter_addr:
+    target = str(getattr(args, "target", "") or "").strip()
+    if not target:
         raise RuntimeError("start-job-orchestrator requires --target")
     bind = _resolve_bind_value(
         str(args.bind),
         host="",
         port=0,
         label="job orchestrator bind",
-        remote_hint=infocenter_addr,
+        remote_hint=target,
         prefer_local=bool(getattr(args, "local", False)),
     )
     _start_job_orchestrator(
         root,
         bind=bind,
-        infocenter_addr=infocenter_addr,
+        infocenter_addr=target,
         node_id=str(getattr(args, "node_id", "") or "job-orchestrator-01"),
         service_name=str(getattr(args, "service_name", "") or "job-orchestrator"),
         queue_capacity=int(getattr(args, "queue_capacity", NODE_QUEUE_CAPACITY)),
@@ -1708,18 +1708,18 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
     node_id = _normalize_managed_name(args.node_id)
     _stop_named_process(root, node_id)
     worker_capacity = int(args.worker_capacity or _default_node_worker_capacity())
-    infocenter_arg = getattr(args, "infocenter_addr", None)
-    if infocenter_arg is None:
+    target_arg = getattr(args, "target", None)
+    if target_arg is None:
         raise RuntimeError(
             'start-node requires an explicit --target; pass --target "" to start a standalone node without registration'
         )
-    infocenter_addr = str(infocenter_arg or "").strip()
+    target = str(target_arg or "").strip()
     bind = _resolve_bind_value(
         str(args.bind),
         host="",
         port=0,
         label="node bind",
-        remote_hint=infocenter_addr,
+        remote_hint=target,
         prefer_local=bool(getattr(args, "local", False)),
     )
     service_http_seed = str(getattr(args, "service_http_bind", "") or "").strip()
@@ -1730,7 +1730,7 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
         host="",
         port=0,
         label="service http bind",
-        remote_hint=infocenter_addr,
+        remote_hint=target,
         prefer_local=bool(getattr(args, "local", False)),
     )
     advertise_addr = str(args.advertise_addr or "").strip()
@@ -1742,15 +1742,15 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
             label="advertise addr",
             prefer_local=bool(getattr(args, "local", False)),
         )
-    if infocenter_addr and not advertise_addr:
+    if target and not advertise_addr:
         host, port = _split_host_port(bind)
-        advertise_addr = _format_host_port(resolve_public_host(host, remote_hint=infocenter_addr), int(port))
+        advertise_addr = _format_host_port(resolve_public_host(host, remote_hint=target), int(port))
     _start_standalone_node(
         root,
         node_id=node_id,
         bind=bind,
         service_http_bind=service_http_bind,
-        infocenter_addr=infocenter_addr,
+        infocenter_addr=target,
         advertise_addr=advertise_addr,
         worker_capacity=worker_capacity,
         queue_capacity=int(args.queue_capacity),
@@ -2594,7 +2594,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_gateway.add_argument(
         "--target",
         "--infocenter-addr",
-        dest="infocenter_addr",
+        dest="target",
         default="",
         help='InfoCenter/ControlPlane target; use "local" only for commands that explicitly support local IPC',
     )
@@ -2617,7 +2617,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_job_orchestrator.add_argument(
         "--target",
         "--infocenter-addr",
-        dest="infocenter_addr",
+        dest="target",
         default="",
         help='InfoCenter/ControlPlane target; "local" starts the job-orchestrator as a local IPC service',
     )
@@ -2638,7 +2638,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_node.add_argument(
         "--target",
         "--infocenter-addr",
-        dest="infocenter_addr",
+        dest="target",
         default=None,
         help='InfoCenter/ControlPlane target for registration; pass empty string ("") to disable registration',
     )

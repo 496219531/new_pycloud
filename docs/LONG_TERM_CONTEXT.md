@@ -33,7 +33,7 @@ V1 公开概念固定为：
 ### 3.1 mode 与 policy 的职责
 
 1. `serialization_mode` 负责“对象如何编解码”（codec 语义）
-2. `policy profile` 负责“是否允许该 mode + payload/transport 限制”
+2. `policy profile` 负责“是否允许该 mode + payload/carrier 限制”
 3. `effective_policy` 是会话冻结后的最终执行策略
 
 ### 3.2 当前默认绑定（重要）
@@ -53,7 +53,7 @@ V1 公开概念固定为：
 
 ### 4.1 调用面约束
 
-1. `JobQueue` 自身 transport 固定：`structured_v1 + default_safe`
+1. `JobQueue` 自身 controlplane session 固定：`structured_v1 + default_safe`
 2. `JobQueue.submit(...)` 允许传 `task_serialization_mode`，只影响后续 TaskPool 执行面
 3. `JobQueue.submit(...)` 不再接受 `policy_id/taskpool_policy_id`（应直接报错）
 
@@ -162,7 +162,7 @@ V1 公开概念固定为：
 
 1. 先判断是“codec 问题”还是“policy 问题”
 2. 若涉及默认行为，优先改 binding/profile，不在业务调用链硬编码分支
-3. 若涉及 JobQueue 与 TaskPool 边界，优先保持“queue transport policy”与“task execution policy”分离
+3. 若涉及 JobQueue 与 TaskPool 边界，优先保持“queue controlplane policy”与“task execution policy”分离
 4. 所有默认值变更，必须同步：
    - `src/pycloud_parallel/controlplane/policy_profile.py`
    - `src/pycloud_parallel/controlplane/config.py`（涉及运行时 env 默认值时）
@@ -172,7 +172,7 @@ V1 公开概念固定为：
 
 ## 9. 近期精简路线
 
-这部分不是行为边界，而是给 coder 的低风险重构顺序。目标是减少重复实现，降低后续继续加 timing / policy / transport 字段时的同步成本。
+这部分不是行为边界，而是给 coder 的低风险重构顺序。目标是减少重复实现，降低后续继续加 timing / policy / carrier 字段时的同步成本。
 
 ### 9.1 优先级顺序
 
@@ -262,6 +262,6 @@ V1 公开概念固定为：
 本次更新摘要（2026-04-29）：
 
 1. 对齐 V1 默认绑定：JobQueue 控制面固定 `default_safe + structured_v1`，Service/TaskPool 内部可信默认 `trusted_internal + pickle_stable_v1`，gateway/public 保守禁止 pickle
-2. 保留 JobQueue/job-orch 的长期边界：job-orch 作为系统内置 startup service module，服务端复用 startup service transport，JobQueue client 复用 `Service.connect` 底层 transport，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
+2. 保留 JobQueue/job-orch 的长期边界：job-orch 作为系统内置 startup service module，服务端复用 startup service runtime，JobQueue client 复用 `Service.connect` 底层 route/protocol，policy 启动时固定，submit 仅允许 `task_serialization_mode`，共享池串行复用，软切失败回退重建
 3. 确认内部可信 DataRef 主路径：`upload_once -> forward DataRef -> final worker/client remote_fetch`，gateway/public DataRef 边界后续单独收口
 4. 明确默认值变更同步范围：policy profile、runtime config、相关文档与测试必须一起更新

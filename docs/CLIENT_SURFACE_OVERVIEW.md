@@ -63,13 +63,13 @@
 分层原则：
 
 1. `legacy_v1 / structured_v1 / pickle_stable_v1` 首先是对象 codec 层
-2. JSON carrier / HTTP raw-bytes body / object upload blob 属于当前主线 transport 容器层
+2. JSON carrier / HTTP raw-bytes body / object upload blob 属于当前主线 carrier 层
 3. Struct carrier / `TransportPayload` adapter 属于旧内部兼容层
 4. `pickle_stable_v1` 不会为了 JSON/Struct 预先把 schema 里的 raw bytes 文本化
-5. 如果当前 transport 是 JSON/Struct-only，base64 或拒绝都由 transport 适配层决定
+5. 如果当前 carrier 是 JSON/Struct-only，base64 或拒绝都由 carrier 适配层决定
 6. 因此：
    - codec 层表达对象本身
-   - transport 层表达“这个对象怎么进当前容器”
+   - carrier 层表达“这个对象怎么进当前协议容器”
 
 当前 NodeControl 消息主链仍有两条兼容路径：
 
@@ -113,11 +113,11 @@
 4. `JobQueue.connect(...)`
 5. `put_data() / put_dataframe() / put_ndarray() / put_json()`
 
-这些边界负责选择 mode；内部 transport/helper 只消费和传递 mode，不再私自重选默认值。
+这些边界负责选择 mode；内部 carrier/helper 只消费和传递 mode，不再私自重选默认值。
 
 另外：
 
-1. 非 legacy transport body 必须显式带 codec/version envelope
+1. 非 legacy carrier body 必须显式带 codec/version envelope
 2. decode 端优先按 envelope 解码
 3. 没有 envelope 时只按 `legacy_v1` 兜底，不再按全局 env 猜 mode
 4. 接收端会按当前边界上下文重新校验 declared mode，不是发送端声明什么就无条件接受什么
@@ -156,8 +156,8 @@
 
 1. `gateway_public` 即使后端节点支持 pickle，只要 profile 不允许，也会统一拒绝
 2. payload 准备链会优先遵守 session 的 effective payload limit，必要时转 `DataRef`
-3. `Service.connect(transport="gateway")` 默认绑定 `default_safe`，默认 mode 是 `legacy_v1`
-4. `Service.connect(transport="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
+3. `Service.connect(route="gateway")` 默认绑定 `default_safe`，默认 mode 是 `legacy_v1`
+4. `Service.connect(route="discovery")` / `Service.deploy(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
 5. `TaskPool.open(...)` 默认绑定 `trusted_internal`，默认 mode 是 `pickle_stable_v1`
 6. 重数据 task 场景建议显式切到 `pickle_internal_heavy`
 7. `JobQueue.connect()` 默认绑定 `jobqueue_controlplane_transport`，对应 profile=`default_safe`，默认 mode=`structured_v1`
@@ -174,7 +174,7 @@ carrier 选择也已经改成同一个原则：
 
 对 `JobQueue` 要再补一句：
 
-1. `JobQueue` 自己的 transport/session 默认绑定 `jobqueue_controlplane_transport -> default_safe`
+1. `JobQueue` 自己的 controlplane session 默认绑定 `jobqueue_controlplane_transport -> default_safe`
 2. 这个 binding 的默认 mode 仍然是 `structured_v1`
 3. `job-orchestrator` 是系统内置 startup service，不作为用户 module deploy 入口暴露
 4. 用户在 `JobQueue.submit(...)` 里传的 `task_serialization_mode`，解释为未来 `TaskPool` 的执行策略；`policy_id/taskpool_policy_id` 不再允许由 submit 传入

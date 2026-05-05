@@ -43,7 +43,7 @@ python -m pycloud_parallel.controlplane.server \
     --worker-capacity 4 \
     --queue-capacity 1000 \
     --service-http-bind 127.0.0.1:18081 \
-    --infocenter-addr 127.0.0.1:50051 \
+    --target 127.0.0.1:50051 \
     --advertise-addr 127.0.0.1:50061 \
     --node-tags compute \
     --log-level INFO \
@@ -57,7 +57,7 @@ python -m pycloud_parallel.controlplane.server \
     --worker-capacity 4 \
     --queue-capacity 1000 \
     --service-http-bind 127.0.0.1:18082 \
-    --infocenter-addr 127.0.0.1:50051 \
+    --target 127.0.0.1:50051 \
     --advertise-addr 127.0.0.1:50062 \
     --node-tags compute \
     --log-level INFO \

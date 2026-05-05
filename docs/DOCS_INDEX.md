@@ -52,7 +52,7 @@
 - [SERVICE_GUIDE.md](SERVICE_GUIDE.md)
   - `Service` 的 owner 侧用法与常驻函数服务定位
 - [SERVICE_GATEWAY_GUIDE.md](SERVICE_GATEWAY_GUIDE.md)
-  - `Service.connect(..., transport="gateway")` 的推荐用法，以及 `GatewayServiceClient` 的底层定位
+  - `Service.connect(..., route="gateway")` 的推荐用法，以及 `GatewayServiceClient` 的底层定位
 - [V1_PUBLIC_API.md](V1_PUBLIC_API.md)
   - V1 最终公开面与不再推荐的旧概念
 
@@ -87,6 +87,6 @@
 - [../examples/taskpool_basic.py](../examples/taskpool_basic.py)
 - [../examples/jobqueue_basic.py](../examples/jobqueue_basic.py)
 - [../examples/service_connect_gateway.py](../examples/service_connect_gateway.py)
-- [../examples/gateway_transport_client.py](../examples/gateway_transport_client.py)
+- [../examples/gateway_route_client.py](../examples/gateway_route_client.py)
 - [../examples/service_deploy_basic.py](../examples/service_deploy_basic.py)
 - [../examples/service_deploy_simple.py](../examples/service_deploy_simple.py)

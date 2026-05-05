@@ -175,7 +175,7 @@ print(group.square.sync(x=7))
 svc = Service.connect(
     target="127.0.0.1:50051",
     service_name="square-service",
-    transport="gateway",
+    route="gateway",
 )
 
 results = svc.square.map([1, 2, 3], arg_name="x")
@@ -351,7 +351,7 @@ python examples/taskpool_basic.py
 python examples/jobqueue_basic.py
 python examples/service_deploy_register.py
 python examples/service_connect_gateway.py --service-name square-service
-python examples/gateway_transport_client.py
+python examples/gateway_route_client.py
 python examples/service_deploy_basic.py
 ```
 

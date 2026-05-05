@@ -195,7 +195,7 @@ def _connect_discovery_service(
         target=target,
         service_name=service_name,
         timeout_sec=timeout_sec,
-        transport="discovery",
+        route="discovery",
         validate_on_init=validate_on_init,
     )
 
@@ -577,7 +577,7 @@ class TestDiscoveryConnectedService:
                 locator_token="",
             )
 
-        def fake_call(route, *, method, payload, timeout_sec, service_token):
+        def fake_call(route, *, method, payload, timeout_sec, service_token, **_kwargs):
             if route.service_id == primary.service_id:
                 raise DiscoveryCallError(status_code=502, data={"ok": False, "error": "primary failed"})
             return {"ok": True, "data": {"y": 100}}

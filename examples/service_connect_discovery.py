@@ -2,8 +2,8 @@
 """
 调用已部署服务示例。
 
-这个脚本演示通过 `Service.connect(..., transport="discovery")`
-直接按 discovery transport 调已有服务。
+这个脚本演示通过 `Service.connect(..., route="discovery")`
+直接按 discovery route 调已有服务。
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def main() -> None:
         target=infocenter_target,
         service_name=service_name,
         timeout_sec=10.0,
-        transport="discovery",
+        route="discovery",
     )
     try:
         print(f"[+] Status: {module_client.status()}")

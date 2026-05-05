@@ -377,7 +377,7 @@ print(group.square.sync(x=7))
 svc = Service.connect(
     target="127.0.0.1:50051",
     service_name="square-service",
-    transport="gateway",
+    route="gateway",
 )
 
 print(svc.square.map([1, 2, 3], arg_name="x"))
@@ -547,7 +547,7 @@ from pycloud_parallel import Service
 client = Service.connect(
     target="127.0.0.1:50051",
     service_name="square-service",
-    transport="gateway",
+    route="gateway",
 )
 print(client.square.sync(x=9))
 ```
@@ -570,8 +570,8 @@ V1 删除旧的本地 `foreach/parallel_for` 辅助入口；请使用 `TaskPool`
 当前推荐调用路径：
 
 1. owner：`Service.deploy(...)`
-2. caller：`Service.connect(..., transport="gateway")`
-3. 调试直连：`Service.connect(..., transport="discovery")`
+2. caller：`Service.connect(..., route="gateway")`
+3. 调试直连：`Service.connect(..., route="discovery")`
 
 ## 任务模式说明
 

@@ -2,7 +2,7 @@
 """
 PyCloud Gateway caller 示例。
 
-演示如何通过 `Service.connect(..., transport="gateway")`
+演示如何通过 `Service.connect(..., route="gateway")`
 像本地模块一样调用远程服务。
 """
 
@@ -24,7 +24,7 @@ def _service_exists(target: str, service_name: str) -> bool:
         with Service.connect(
             target=target,
             service_name=service_name,
-            transport="gateway",
+            route="gateway",
             timeout_sec=5.0,
             validate_on_init=False,
         ) as client:
@@ -66,7 +66,7 @@ def main() -> None:
     client = Service.connect(
         target="127.0.0.1:50051",
         service_name=service_name,
-        transport="gateway",
+        route="gateway",
         timeout_sec=10.0,
     )
 

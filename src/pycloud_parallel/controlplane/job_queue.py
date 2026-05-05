@@ -1095,7 +1095,7 @@ class JobQueueManager:
         def _create_pool(mode: str) -> TaskPool:
             dependency_allowlist = list(payload.get("dependency_allowlist") or ())
             task_pool_kwargs = {
-                "infocenter_target": self._controlplane_target,
+                "target": self._controlplane_target,
                 "job_id": job_id_snapshot,
                 "owner_client_id": client_id,
                 "pool_name": str(payload.get("pool_name", "") or f"job-pool-{job_id_snapshot}"),

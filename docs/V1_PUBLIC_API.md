@@ -73,7 +73,7 @@ V1 删除旧的本地 `foreach/parallel_for` 辅助入口；公开执行入口�
 5. `pycloud_export`
 6. 旧 large-object wrapper 命名
 
-如果你确实需要更底层 transport / controlplane client，请从 `pycloud_parallel.controlplane` 导入内部基础设施类，而不是从顶层公开面寻找这些旧名字。
+如果你确实需要更底层 HTTP / controlplane client，请从 `pycloud_parallel.controlplane` 导入内部基础设施类，而不是从顶层公开面寻找这些旧名字。
 
 相关资料：
 

@@ -154,7 +154,7 @@ def test_service_connect_propagates_serialization_mode_to_transport_client():
         client = Service.connect(
             target="127.0.0.1:50051",
             service_name="svc-demo",
-            transport="discovery",
+            route="discovery",
             serialization_mode=mode,
             validate_on_init=False,
         )

@@ -45,9 +45,9 @@
 
 推荐入口：
 
-1. `Service.connect(..., transport="gateway")`
-2. `Service.connect(..., transport="discovery")`
-3. 如需更底层 transport client，再从 `pycloud_parallel.controlplane` 使用内部客户端
+1. `Service.connect(..., route="gateway")`
+2. `Service.connect(..., route="discovery")`
+3. 如需更底层 HTTP client，再从 `pycloud_parallel.controlplane` 使用内部客户端
 
 ### 2.3 job client
 
@@ -181,7 +181,7 @@
    - 默认仍是它
 2. `structured_v1`
    - 结构化显式 codec
-   - transport body 可显式识别 codec
+   - HTTP raw-bytes body 可显式识别 codec
 3. `pickle_stable_v1`
    - 受信环境高保真 Python codec
    - 对 pandas/numpy 先做稳定 schema 规范化，再进入 pickle
@@ -325,7 +325,7 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 
 `JobQueue.connect()` 也遵循同样的边界：
 
-1. queue 自己的 controlplane transport 固定绑定 `jobqueue_controlplane_transport`
+1. queue 自己的 controlplane session 固定绑定 `jobqueue_controlplane_transport`
 2. 这个 binding 当前固定落到 `default_safe + structured_v1`
 3. `job-orch` 作为系统内置 startup service 挂载，不作为用户 module deploy 入口暴露
 4. `job-orch` 在启动时通过 startup managed globals 冻结自己的 `taskpool_policy_id`
@@ -413,7 +413,7 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
    - `legacy_v1`
    - `structured_v1`
    - `pickle_stable_v1`
-2. transport 容器层
+2. carrier 容器层
    - JSON / Struct
    - `TransportPayload` adapter
    - HTTP raw-bytes body
@@ -454,9 +454,9 @@ HTTP 接收端规则：
 2. ndarray schema 里的数据字段保留 raw bytes
 3. 不为了 JSON/Struct 预处理成 base64
 
-当前如果某条 transport 通道仍然是 JSON / Struct-only：
+当前如果某条 carrier 通道仍然是 JSON / Struct-only：
 
-1. 由 transport 层显式做 container adaptation
+1. 由 carrier 层显式做 container adaptation
 2. 或显式拒绝该 codec 走该通道
 3. 不再把这个责任下推到 `pickle_stable_v1` codec 本身
 
@@ -467,7 +467,7 @@ mode 选择权也已经固定在少数边界：
 3. 单次调用级：低层显式 call/submit API
 4. 对象上传级：`put_data(...)` 及其变体
 
-内部模块例如 transport client、payload helper、node execution helper 现在只接收/传递 mode，不再私自切换默认 mode。
+内部模块例如 HTTP client、payload helper、node execution helper 现在只接收/传递 mode，不再私自切换默认 mode。
 
 `pickle_stable_v1` 的边界：
 

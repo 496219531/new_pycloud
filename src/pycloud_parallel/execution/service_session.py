@@ -709,14 +709,15 @@ async def _service_acollect_item_calls(
 
 
 class _ConnectedService:
-    """Unified product-facing connected service object for discovery/gateway transports."""
+    """Unified product-facing connected service object for discovery/gateway routes."""
 
     def __init__(
         self,
         *,
         transport_client: Any,
         service_name: str,
-        transport: str,
+        route: str,
+        protocol: str = "http",
         timeout_sec: float,
         serialization_mode: str = "",
         validate_on_init: bool = True,
@@ -725,24 +726,27 @@ class _ConnectedService:
     ) -> None:
         self._transport_client = transport_client
         self.service_name = str(service_name or "").strip()
-        self.transport = str(transport or "").strip().lower() or "discovery"
+        self.route = str(route or "").strip().lower() or "discovery"
+        self.protocol = str(protocol or "http").strip().lower() or "http"
+        if self.protocol != "http":
+            raise ValueError("Service.connect() protocol must be 'http'")
         self.timeout_sec = max(0.1, float(timeout_sec))
         self._requested_serialization_mode = str(serialization_mode or "").strip()
         self._fixed_effective_policy = effective_policy_override
         self._prepare_discovery_payload_enabled = bool(prepare_discovery_payload)
         self._default_policy_id = get_default_policy_id_for_binding(
-            "gateway_public" if self.transport == "gateway" else "service_internal"
+            "gateway_public" if self.route == "gateway" else "service_internal"
         )
         self.target = str(
             getattr(transport_client, "target", "") or getattr(transport_client, "infocenter_target", "") or ""
         ).strip()
         self._route_cache = getattr(transport_client, "_route_cache", None)
         self._client_mod: Any = None
-        if self.transport == "discovery":
+        if self.route == "discovery":
             from pycloud_parallel.controlplane import discovery_client as discovery_client_mod
 
             self._client_mod = discovery_client_mod.client_mod
-        elif self.transport == "gateway":
+        elif self.route == "gateway":
             from pycloud_parallel.controlplane import gateway_client as gateway_client_mod
 
             self._client_mod = gateway_client_mod.client_mod
@@ -783,7 +787,7 @@ class _ConnectedService:
         self.close()
 
     def route_summary(self) -> List[Dict[str, object]]:
-        if self.transport == "discovery":
+        if self.route == "discovery":
             routes = self._discoverable_routes(force_refresh=False)
         else:
             status = self.status()
@@ -802,12 +806,12 @@ class _ConnectedService:
         self._route_notice_emitted = True
         _emit_owner_notice(
             f"connected routes service_name={self.service_name} "
-            f"transport={self.transport} routes={_format_route_summary(summary)}"
+            f"route={self.route} protocol={self.protocol} routes={_format_route_summary(summary)}"
         )
 
     def _validate_service_ready(self) -> Dict[str, object]:
         def _probe() -> Dict[str, object]:
-            if self.transport == "discovery":
+            if self.route == "discovery":
                 try:
                     refresh = getattr(self._transport_client, "refresh_routes", None)
                     if callable(refresh):
@@ -815,25 +819,25 @@ class _ConnectedService:
                     status = self._transport_client.get_status(service_name=self.service_name)
                 except Exception as exc:
                     raise _RetryableReadyError(
-                        f"failed to query {self.transport} status for service_name={self.service_name!r}: {exc}"
+                        f"failed to query {self.route} status for service_name={self.service_name!r}: {exc}"
                     ) from exc
             else:
                 try:
                     status = self._transport_client.get_status(service_name=self.service_name)
                 except Exception as exc:
                     raise _RetryableReadyError(
-                        f"failed to query {self.transport} status for service_name={self.service_name!r}: {exc}"
+                        f"failed to query {self.route} status for service_name={self.service_name!r}: {exc}"
                     ) from exc
             if not isinstance(status, dict):
                 raise RuntimeError(
-                    f"invalid {self.transport} status for service_name={self.service_name!r}: {status!r}"
+                    f"invalid {self.route} status for service_name={self.service_name!r}: {status!r}"
                 )
             self._last_status = status
             route_count = int(status.get("route_count", 0) or 0)
             if route_count <= 0:
                 raise _RetryableReadyError(
                     f"Service.connect() could not find an available route for "
-                    f"service_name={self.service_name!r} via {self.transport}"
+                    f"service_name={self.service_name!r} via {self.route}"
                 )
             self._refresh_effective_policy_from_routes(status.get("routes", []) or [])
             self._emit_route_notice_once(status.get("routes", []) or [])
@@ -843,12 +847,12 @@ class _ConnectedService:
             _probe,
             timeout_sec=self.timeout_sec,
             grace_sec=_SERVICE_READY_GRACE_SEC,
-            target=self.target or self.transport,
+            target=self.target or self.route,
             action=f"service connect {self.service_name!r}",
         )
 
     def _policy_context(self) -> str:
-        return "gateway_public" if self.transport == "gateway" else "service_connect"
+        return "gateway_public" if self.route == "gateway" else "service_connect"
 
     def _refresh_effective_policy_from_routes(self, routes: Optional[Sequence[object]] = None) -> None:
         if self._fixed_effective_policy is not None:
@@ -859,7 +863,7 @@ class _ConnectedService:
         candidates = list(routes or [])
         if not candidates:
             try:
-                if self.transport == "discovery":
+                if self.route == "discovery":
                     candidates = list(self._discoverable_routes(force_refresh=False))
                 elif isinstance(self._last_status, dict):
                     candidates = list(self._last_status.get("routes", []) or [])
@@ -882,7 +886,7 @@ class _ConnectedService:
         self.serialization_mode = self.effective_policy.resolved_mode
 
     def _ensure_effective_policy_loaded(self, *, force_refresh: bool = False) -> None:
-        if self.transport == "discovery":
+        if self.route == "discovery":
             routes = self._discoverable_routes(force_refresh=force_refresh)
         else:
             try:
@@ -906,13 +910,13 @@ class _ConnectedService:
             except Exception as exc:
                 self._validate_service_ready()
                 raise _RetryableReadyError(
-                    f"failed to list methods for service_name={self.service_name!r} via {self.transport}: {exc}"
+                    f"failed to list methods for service_name={self.service_name!r} via {self.route}: {exc}"
                 ) from exc
             discovered = [str(item.get("method", "")).strip() for item in methods if str(item.get("method", "")).strip()]
             if not discovered:
                 self._validate_service_ready()
                 raise _RetryableReadyError(
-                    f"service_name={self.service_name!r} has active {self.transport} routes but no exported methods"
+                    f"service_name={self.service_name!r} has active {self.route} routes but no exported methods"
                 )
             return discovered
 
@@ -920,7 +924,7 @@ class _ConnectedService:
             _probe,
             timeout_sec=self.timeout_sec,
             grace_sec=_SERVICE_READY_GRACE_SEC,
-            target=self.target or self.transport,
+            target=self.target or self.route,
             action=f"service method discovery {self.service_name!r}",
         )
 
@@ -930,7 +934,7 @@ class _ConnectedService:
         return list(self._discovered_methods or [])
 
     def list_methods(self, *, include_docs: bool = False) -> List[Dict[str, object]]:
-        if self.transport == "discovery":
+        if self.route == "discovery":
             route_cache = self._route_cache
             strategy = "predicted_busy"
             tried: Set[str] = set()
@@ -1004,7 +1008,7 @@ class _ConnectedService:
         return list(self._discovered_methods or [])
 
     def status(self) -> Dict[str, object]:
-        if self.transport == "discovery":
+        if self.route == "discovery":
             try:
                 status = self._transport_client.get_status(service_name=self.service_name)
             except Exception:
@@ -1054,7 +1058,7 @@ class _ConnectedService:
             )
 
     def _discoverable_routes(self, *, force_refresh: bool = False) -> List[InfoCenterServiceRoute]:
-        if self.transport != "discovery":
+        if self.route != "discovery":
             return []
         route_cache = self._route_cache
         routes: List[InfoCenterServiceRoute] = []
@@ -1134,7 +1138,7 @@ class _ConnectedService:
 
     def _effective_worker_count(self) -> int:
         routes: List[object] = []
-        if self.transport == "discovery":
+        if self.route == "discovery":
             with contextlib.suppress(Exception):
                 routes = list(self._discoverable_routes(force_refresh=False))
         else:
@@ -1195,13 +1199,13 @@ class _ConnectedService:
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         del refresh_status, max_attempts
-        self._ensure_effective_policy_loaded(force_refresh=(self.transport == "discovery"))
+        self._ensure_effective_policy_loaded(force_refresh=(self.route == "discovery"))
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            context="gateway_public" if self.transport == "gateway" else "service_call",
+            context="gateway_public" if self.route == "gateway" else "service_call",
             frozen_mode=self.serialization_mode,
         )
-        if self.transport == "discovery":
+        if self.route == "discovery":
             route_cache = self._route_cache
             strategy_name, _profile = resolve_service_strategy(strategy)
             tried: Set[str] = set()
@@ -1362,7 +1366,7 @@ class _ConnectedService:
             serialization_mode=effective_serialization_mode,
             effective_policy=self.effective_policy,
         )
-        return self.transport, response
+        return self.route, response
 
     async def acall_balanced(
         self,
@@ -1401,9 +1405,9 @@ class _ConnectedService:
         del max_concurrency
         if isinstance(payload, list):
             if len(payload) != 1:
-                raise ValueError(f"{self.transport} connected service broadcast accepts exactly one payload")
+                raise ValueError(f"{self.route} connected service broadcast accepts exactly one payload")
             payload = dict(payload[0] or {})
-        node_id = "local" if self.transport == "local" else self.service_name
+        node_id = "local" if self.route == "local" else self.service_name
         try:
             called_node_id, response = await self.acall_balanced(
                 method,
@@ -1437,10 +1441,10 @@ class _ConnectedService:
         self._ensure_effective_policy_loaded(force_refresh=True)
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
-            context="gateway_public" if self.transport == "gateway" else "service_call",
+            context="gateway_public" if self.route == "gateway" else "service_call",
             frozen_mode=self.serialization_mode,
         )
-        if self.transport == "gateway":
+        if self.route == "gateway":
             def _gateway_iter():
                 for event in self._transport_client.stream_call(
                     service_name=self.service_name,
@@ -1471,7 +1475,7 @@ class _ConnectedService:
 
             return _gateway_iter()
 
-        if self.transport == "local":
+        if self.route == "local":
             def _local_iter():
                 for event in self._transport_client.stream_call(
                     service_name=self.service_name,
@@ -1501,8 +1505,8 @@ class _ConnectedService:
 
             return _local_iter()
 
-        if self.transport != "discovery":
-            raise NotImplementedError(f"stream_call does not support transport={self.transport!r}")
+        if self.route != "discovery":
+            raise NotImplementedError(f"stream_call does not support route={self.route!r}")
         route = (
             self._route_cache.select_route(self.service_name, strategy=resolve_service_strategy(strategy)[0])
             if self._route_cache is not None
@@ -1762,7 +1766,8 @@ class _ConnectedService:
         return (
             f"<ConnectedService "
             f"service={self.service_name!r} "
-            f"transport={self.transport} "
+            f"route={self.route} "
+            f"protocol={self.protocol} "
             f"serialization_mode={self.serialization_mode} "
             f"{effective_policy_text} "
             f"methods={methods[:3]}{'...' if len(methods) > 3 else ''}>"
@@ -2423,36 +2428,42 @@ class Service(ServiceExecutionSession):
         service_name: str,
         timeout_sec: float = 10.0,
         service_token: str = "",
-        transport: str = "discovery",
+        route: str = "discovery",
+        protocol: str = "http",
         serialization_mode: str = "",
         validate_on_init: bool = False,
     ):
         """Product-facing connect action for an already deployed service."""
-        return cls._connect_transport(
+        return cls._connect_route(
             target=target,
             service_name=service_name,
             timeout_sec=timeout_sec,
             service_token=service_token,
-            transport=transport,
+            route=route,
+            protocol=protocol,
             serialization_mode=serialization_mode,
             validate_on_init=validate_on_init,
         )
 
     @classmethod
-    def _connect_transport(
+    def _connect_route(
         cls,
         *,
         target: str,
         service_name: str,
         timeout_sec: float = 10.0,
         service_token: str = "",
-        transport: str = "discovery",
+        route: str = "discovery",
+        protocol: str = "http",
         serialization_mode: str = "",
         validate_on_init: bool = False,
         effective_policy_override: Optional[EffectivePolicy] = None,
         prepare_discovery_payload: bool = True,
     ):
-        normalized_transport = str(transport or "discovery").strip().lower() or "discovery"
+        normalized_protocol = str(protocol or "http").strip().lower() or "http"
+        if normalized_protocol != "http":
+            raise ValueError("Service.connect() protocol must be 'http'")
+        normalized_route = str(route or "discovery").strip().lower() or "discovery"
         if str(target or "").strip().lower() == "local":
             from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
 
@@ -2462,14 +2473,15 @@ class Service(ServiceExecutionSession):
                     timeout_sec=timeout_sec,
                 ),
                 service_name=service_name,
-                transport="local",
+                route="local",
+                protocol=normalized_protocol,
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
                 validate_on_init=validate_on_init,
                 effective_policy_override=effective_policy_override,
                 prepare_discovery_payload=prepare_discovery_payload,
             )
-        if normalized_transport == "gateway":
+        if normalized_route == "gateway":
             from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
             return _ConnectedService(
@@ -2479,16 +2491,17 @@ class Service(ServiceExecutionSession):
                     service_token=service_token,
                 ),
                 service_name=service_name,
-                transport=normalized_transport,
+                route=normalized_route,
+                protocol=normalized_protocol,
                 timeout_sec=timeout_sec,
                 serialization_mode=serialization_mode,
                 validate_on_init=validate_on_init,
                 effective_policy_override=effective_policy_override,
                 prepare_discovery_payload=prepare_discovery_payload,
             )
-        if normalized_transport != "discovery":
+        if normalized_route != "discovery":
             raise ValueError(
-                "Service.connect() transport must be one of: discovery, gateway"
+                "Service.connect() route must be one of: discovery, gateway"
             )
         from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
 
@@ -2500,7 +2513,8 @@ class Service(ServiceExecutionSession):
                 shared_route_cache=True,
             ),
             service_name=service_name,
-            transport=normalized_transport,
+            route=normalized_route,
+            protocol=normalized_protocol,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
             validate_on_init=validate_on_init,
