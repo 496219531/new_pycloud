@@ -15,9 +15,8 @@ from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.config import (
-    GATEWAY_MAX_UPLOAD_FILE_BYTES,
-    GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
-    GATEWAY_HTTP_BODY_MAX_BYTES,
+    get_gateway_http_body_limit_bytes,
+    get_gateway_upload_limits,
 )
 from .client_transport import (
     _decode_http_request_body_with_mode,
@@ -63,7 +62,7 @@ def _is_client_disconnect_error(exc: BaseException) -> bool:
     return False
 
 
-MAX_BODY_BYTES = int(GATEWAY_HTTP_BODY_MAX_BYTES)
+MAX_BODY_BYTES = get_gateway_http_body_limit_bytes()
 EXTERNAL_DATA_REF_ERROR = "external DataRef is not accepted; upload data to gateway first"
 
 
@@ -143,8 +142,8 @@ class GatewayHttpApp:
         register_data_ref: Optional[Callable[..., object]] = None,
         controlplane_target: str = "",
         stage_manager: Optional[GatewayStageManager] = None,
-        max_upload_file_bytes: int = GATEWAY_MAX_UPLOAD_FILE_BYTES,
-        max_upload_total_bytes: int = GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
+        max_upload_file_bytes: int = 0,
+        max_upload_total_bytes: int = 0,
     ) -> None:
         self.route_cache = route_cache
         self.timeout_sec = max(0.1, float(timeout_sec))
@@ -153,8 +152,10 @@ class GatewayHttpApp:
         self.register_data_ref = register_data_ref
         self.controlplane_target = str(controlplane_target or "").strip()
         self.stage_manager = stage_manager or GatewayStageManager()
-        self.max_upload_file_bytes = max(1, int(max_upload_file_bytes or GATEWAY_MAX_UPLOAD_FILE_BYTES))
-        self.max_upload_total_bytes = max(self.max_upload_file_bytes, int(max_upload_total_bytes or GATEWAY_MAX_UPLOAD_TOTAL_BYTES))
+        self.max_upload_file_bytes, self.max_upload_total_bytes = get_gateway_upload_limits(
+            max_file_bytes=max_upload_file_bytes,
+            max_total_bytes=max_upload_total_bytes,
+        )
 
     def start(self) -> None:
         self._stopped = False

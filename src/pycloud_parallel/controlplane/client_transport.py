@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy
+from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy, resolve_payload_policy
 from pycloud_parallel.data.ref import (
     DataRef,
     maybe_data_ref,
@@ -103,9 +103,7 @@ def _resolve_http_call_payload_policy(
 ) -> PayloadPolicy:
     if payload_policy is not None:
         return payload_policy
-    from pycloud_parallel.controlplane.effective_policy import payload_policy_from_effective_policy
-
-    return payload_policy_from_effective_policy("http_call", effective_policy)
+    return resolve_payload_policy("http_call", effective_policy=effective_policy)
 
 
 def _serialize_http_call_payload(

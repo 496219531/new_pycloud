@@ -26,15 +26,14 @@ from pycloud_parallel.controlplane.artifact import (
 )
 from pycloud_parallel.controlplane.client_transport import _materialize_downloaded_result, _normalize_http_response_body
 from pycloud_parallel.controlplane.config import (
-    NODE_CONTROL_HTTP_BODY_MAX_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,
+    get_http_object_body_limit_bytes,
     get_node_control_http_body_limit_bytes,
     get_payload_policy,
 )
 from pycloud_parallel.controlplane.http_client import target_to_base_url
 from pycloud_parallel.controlplane.node.models import ServiceSession, TaskPoolState
 from pycloud_parallel.controlplane.node_object_http import (
-    MAX_OBJECT_HTTP_BODY_BYTES,
     HttpNodeObjectClient,
     NodeObjectHttpApp,
 )
@@ -58,7 +57,7 @@ from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
-MAX_NODE_CONTROL_HTTP_BODY_BYTES = int(NODE_CONTROL_HTTP_BODY_MAX_BYTES)
+MAX_NODE_CONTROL_HTTP_BODY_BYTES = get_node_control_http_body_limit_bytes()
 _BINARY_META_LEN_BYTES = 8
 
 
@@ -200,7 +199,7 @@ class NodeControlHttpApp:
         self.state = state
         self.on_service_routes_changed = on_service_routes_changed
         self.max_body_bytes = get_node_control_http_body_limit_bytes(max_body_bytes)
-        self.object_app = NodeObjectHttpApp(state, max_body_bytes=MAX_OBJECT_HTTP_BODY_BYTES)
+        self.object_app = NodeObjectHttpApp(state, max_body_bytes=get_http_object_body_limit_bytes())
 
     def _notify(self) -> None:
         if self.on_service_routes_changed is None:

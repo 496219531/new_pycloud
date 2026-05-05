@@ -7,13 +7,18 @@ from pycloud_parallel.controlplane import client_transport as client_transport_m
 from pycloud_parallel.controlplane.config import (
     effective_limits_from_profile,
     get_config_limit_authority,
+    get_gateway_http_body_limit_bytes,
+    get_gateway_upload_limits,
     get_http_object_body_limit_bytes,
+    get_infocenter_http_body_limit_bytes,
     get_job_blob_inline_threshold_bytes,
     get_job_staged_ref_ttl_sec,
     get_job_staging_replica_count,
     get_local_service_payload_policy,
     get_managed_globals_control_limit_bytes,
     get_node_control_http_body_limit_bytes,
+    get_service_http_body_limit_bytes,
+    get_transport_bounds,
     get_payload_policy,
     merge_object_threshold_with_policy_soft_limit,
     merge_payload_limits_with_effective_policy,
@@ -116,6 +121,10 @@ def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
     assert get_job_staged_ref_ttl_sec(10) == 10
     assert get_http_object_body_limit_bytes(123) == 123
     assert get_node_control_http_body_limit_bytes(123) == 512 * 1024 * 1024
+    assert get_service_http_body_limit_bytes(0) == get_transport_bounds().service_http_body_max_bytes
+    assert get_gateway_http_body_limit_bytes(123) == 123
+    assert get_infocenter_http_body_limit_bytes(123) == 123
+    assert get_gateway_upload_limits(max_file_bytes=10, max_total_bytes=5) == (10, 10)
 
 
 def test_config_limit_helpers_merge_effective_policy() -> None:

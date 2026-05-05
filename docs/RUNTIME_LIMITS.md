@@ -49,6 +49,8 @@
 
 ### 2.1 inline payload / result
 
+这些是 payload policy threshold，不是 HTTP body limit。它们决定 payload/result 是否 inline、转 `DataRef` 或拒绝；HTTP server/client 的 request body 上限见 `2.4`。
+
 - `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
   - 默认：`524288` (`512 KiB`)
   - 用于“建议转 DataRef”的阈值
@@ -111,6 +113,8 @@
 
 ### 2.4 control HTTP body size
 
+这些是 transport bounds，限制 HTTP request/response body 或控制面消息的大小。它们不决定单个业务对象是否转 `DataRef`。
+
 - `PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
@@ -118,6 +122,27 @@
   - 默认：`16777216` (`16 MiB`)
 
 当前 node control HTTP client/server 都会读取这两个值，统一设置 HTTP body 大小限制。这里的 `control HTTP` 指协议边界；如果内部仍经过 `TransportPayload` adapter，那只是兼容 carrier，不代表 gRPC。
+
+- `PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES`
+  - 默认：`67108864` (`64 MiB`)
+  - service HTTP endpoint 的 request body 上限
+
+- `PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES`
+  - 默认：`67108864` (`64 MiB`)
+  - gateway HTTP endpoint 的 request/response body 上限
+
+- `PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES`
+  - 默认：`67108864` (`64 MiB`)
+  - InfoCenter HTTP endpoint 的 request body 上限
+
+- `PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES`
+  - 默认：`268435456` (`256 MiB`)
+  - NodeControl HTTP endpoint 的 request body 上限
+  - 实际 helper 会保证它不小于 object HTTP body bound，避免 NodeControl 嵌套 object app 时把 object upload 缩小
+
+- `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`
+  - 默认：`536870912` (`512 MiB`)
+  - object HTTP upload body 上限
 
 ### 2.5 node 默认进程/并发参数
 

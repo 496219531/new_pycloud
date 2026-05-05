@@ -16,7 +16,7 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.http_client import target_to_base_url
-from pycloud_parallel.controlplane.config import OBJECT_HTTP_BODY_MAX_BYTES, get_http_object_body_limit_bytes
+from pycloud_parallel.controlplane.config import get_http_object_body_limit_bytes
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.data.ref import (
@@ -27,7 +27,7 @@ from pycloud_parallel.data.ref import (
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
-MAX_OBJECT_HTTP_BODY_BYTES = int(OBJECT_HTTP_BODY_MAX_BYTES)
+MAX_OBJECT_HTTP_BODY_BYTES = get_http_object_body_limit_bytes()
 
 
 def _split_host_port(bind: str) -> Tuple[str, int]:

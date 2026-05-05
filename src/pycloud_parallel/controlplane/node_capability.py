@@ -7,11 +7,9 @@ from math import inf
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from pycloud_parallel.controlplane.config import (
-    CONTROL_HTTP_MAX_RECEIVE_BYTES,
-    CONTROL_HTTP_MAX_SEND_BYTES,
-    GATEWAY_MAX_UPLOAD_FILE_BYTES,
-    GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
-    SERVICE_HTTP_BODY_MAX_BYTES,
+    get_gateway_upload_limits,
+    get_service_http_body_limit_bytes,
+    get_transport_bounds,
 )
 from pycloud_parallel.controlplane.serialization_mode import SUPPORTED_SERIALIZATION_MODES, normalize_serialization_mode
 
@@ -147,6 +145,11 @@ def detect_local_node_capability(
     max_upload_file_bytes: Optional[int] = None,
     max_upload_total_bytes: Optional[int] = None,
 ) -> NodeCapability:
+    transport_bounds = get_transport_bounds()
+    upload_file_limit, upload_total_limit = get_gateway_upload_limits(
+        max_file_bytes=0 if max_upload_file_bytes is None else max_upload_file_bytes,
+        max_total_bytes=0 if max_upload_total_bytes is None else max_upload_total_bytes,
+    )
     return NodeCapability(
         supported_modes=tuple(supported_modes or SUPPORTED_SERIALIZATION_MODES),
         supports_raw_bytes_payload=True if supports_raw_bytes_payload is None else bool(supports_raw_bytes_payload),
@@ -154,18 +157,14 @@ def detect_local_node_capability(
         supports_http_control=True if supports_http_control is None else bool(supports_http_control),
         control_base_url=str(control_base_url or "").strip(),
         max_control_send_bytes=int(
-            CONTROL_HTTP_MAX_SEND_BYTES if max_control_send_bytes is None else max_control_send_bytes
+            transport_bounds.control_http_max_send_bytes if max_control_send_bytes is None else max_control_send_bytes
         ),
         max_control_recv_bytes=int(
-            CONTROL_HTTP_MAX_RECEIVE_BYTES if max_control_recv_bytes is None else max_control_recv_bytes
+            transport_bounds.control_http_max_receive_bytes if max_control_recv_bytes is None else max_control_recv_bytes
         ),
-        max_http_body_bytes=int(SERVICE_HTTP_BODY_MAX_BYTES if max_http_body_bytes is None else max_http_body_bytes),
-        max_upload_file_bytes=int(
-            GATEWAY_MAX_UPLOAD_FILE_BYTES if max_upload_file_bytes is None else max_upload_file_bytes
-        ),
-        max_upload_total_bytes=int(
-            GATEWAY_MAX_UPLOAD_TOTAL_BYTES if max_upload_total_bytes is None else max_upload_total_bytes
-        ),
+        max_http_body_bytes=get_service_http_body_limit_bytes(0 if max_http_body_bytes is None else max_http_body_bytes),
+        max_upload_file_bytes=upload_file_limit,
+        max_upload_total_bytes=upload_total_limit,
     )
 
 

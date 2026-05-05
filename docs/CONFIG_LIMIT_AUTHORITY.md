@@ -2,7 +2,7 @@
 
 `pycloud_parallel.controlplane.config` 是运行时 limit 的唯一 authority。
 
-PR1 已完成归类与 loader。PR2 继续收口 payload policy resolver 与 `support.py` limit authority，不改变默认值、不删除旧常量。
+PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.py` limit authority。PR3 开始迁移 transport/http 消费点，明确 payload threshold 与 HTTP body bound 的边界。
 
 ## 分层
 
@@ -13,6 +13,10 @@ PR1 已完成归类与 loader。PR2 继续收口 payload policy resolver 与 `su
 | `object/store bounds` | object upload、hash、segment、gateway upload 限制 | DataRef / object store |
 | `job/staging bounds` | job submit、staged refs、gateway stage TTL | JobQueue / gateway staging |
 | `capacity defaults` | node/service 默认容量和 worker 数 | `pycloudctl` / node startup |
+
+`policy thresholds` 只回答“业务 payload/result 多大时应该 inline、转 DataRef 或拒绝”。
+`transport bounds` 只回答“HTTP request/response body 或控制消息最大能收发多少 bytes”。
+两者不能互相替代。
 
 ## 代码入口
 
@@ -28,7 +32,9 @@ PR1 已完成归类与 loader。PR2 继续收口 payload policy resolver 与 `su
 4. `resolve_payload_policy(...)`
    - payload policy 的统一入口
    - 负责合并 effective policy，并把 object threshold 与 policy soft limit 对齐
-5. 旧常量
+5. `get_transport_bounds()` / `get_object_store_bounds()`
+   - transport/http 与 object/store 消费侧读取分层默认值的入口
+6. 旧常量
    - 继续导出
    - 继续作为外部兼容入口
 
@@ -48,18 +54,24 @@ PR1 已完成归类与 loader。PR2 继续收口 payload policy resolver 与 `su
    - 负责统一 `get_payload_policy(...)`、effective policy merge、object threshold 合成
 6. `get_node_control_http_body_limit_bytes(...)`
    - 负责 NodeControl HTTP body 与 object body 下限合成
-7. `get_managed_globals_control_limit_bytes(...)`
+7. `get_service_http_body_limit_bytes(...)` / `get_gateway_http_body_limit_bytes(...)` / `get_infocenter_http_body_limit_bytes(...)`
+   - 负责各 HTTP server 的 body bound 默认值和下限修正
+8. `get_http_object_body_limit_bytes(...)`
+   - 负责 object HTTP upload/download body bound 默认值和下限修正
+9. `get_gateway_upload_limits(...)`
+   - 负责 gateway upload 文件/总量 limit 的默认值和总量下限修正
+10. `get_managed_globals_control_limit_bytes(...)`
    - 负责 managed globals 的 policy hard limit 与 control send bound 合成
-8. `get_job_staging_replica_count(...)`
+11. `get_job_staging_replica_count(...)`
    - 负责 job staged refs 的副本数默认值和下限修正
-9. `get_job_staged_ref_ttl_sec(...)`
+12. `get_job_staged_ref_ttl_sec(...)`
    - 负责 job staged refs 的 TTL 默认值和下限修正
 
 ## 不做
 
 1. 不改变默认值
 2. 不改变 Service / TaskPool / JobQueue API
-3. 不迁移 client transport / node HTTP body limit 逻辑
+3. 不改变 serialization mode / policy profile 语义
 4. 不重构 serialization / scheduler / DataRef 主流程
 5. 不删除旧常量导出
 

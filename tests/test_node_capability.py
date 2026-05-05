@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
 from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
+from pycloud_parallel.controlplane.config import get_gateway_upload_limits, get_service_http_body_limit_bytes, get_transport_bounds
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
@@ -14,8 +15,10 @@ def test_detect_local_node_capability_has_transport_support():
     assert "structured_v1" in capability.supported_modes
     assert capability.supports_raw_bytes_payload is True
     assert capability.supports_http_raw_bytes_body is True
-    assert capability.max_control_send_bytes > 0
-    assert capability.max_http_body_bytes > 0
+    assert capability.max_control_send_bytes == get_transport_bounds().control_http_max_send_bytes
+    assert capability.max_control_recv_bytes == get_transport_bounds().control_http_max_receive_bytes
+    assert capability.max_http_body_bytes == get_service_http_body_limit_bytes()
+    assert (capability.max_upload_file_bytes, capability.max_upload_total_bytes) == get_gateway_upload_limits()
 
 
 def test_node_capability_roundtrips_http_control_fields():

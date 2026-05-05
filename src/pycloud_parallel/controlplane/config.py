@@ -435,6 +435,33 @@ def get_http_object_body_limit_bytes(object_body_bytes: int = 0) -> int:
     return max(1, int(object_body_bytes or OBJECT_HTTP_BODY_MAX_BYTES))
 
 
+def get_transport_bounds() -> TransportBounds:
+    return get_config_limit_authority().transport_bounds
+
+
+def get_object_store_bounds() -> ObjectStoreBounds:
+    return get_config_limit_authority().object_store_bounds
+
+
+def get_service_http_body_limit_bytes(value: int = 0) -> int:
+    return max(1, int(value or get_transport_bounds().service_http_body_max_bytes))
+
+
+def get_gateway_http_body_limit_bytes(value: int = 0) -> int:
+    return max(1, int(value or get_transport_bounds().gateway_http_body_max_bytes))
+
+
+def get_infocenter_http_body_limit_bytes(value: int = 0) -> int:
+    return max(1, int(value or get_transport_bounds().infocenter_http_body_max_bytes))
+
+
+def get_gateway_upload_limits(*, max_file_bytes: int = 0, max_total_bytes: int = 0) -> tuple[int, int]:
+    bounds = get_object_store_bounds()
+    file_limit = max(1, int(max_file_bytes or bounds.gateway_max_upload_file_bytes))
+    total_limit = max(file_limit, int(max_total_bytes or bounds.gateway_max_upload_total_bytes))
+    return file_limit, total_limit
+
+
 def get_managed_globals_control_limit_bytes(*, policy_hard_limit_bytes: int, control_send_bytes: int = 0) -> int:
     return max(
         1,
@@ -715,6 +742,12 @@ __all__ = [
     "get_managed_globals_control_limit_bytes",
     "get_node_control_http_body_limit_bytes",
     "get_http_object_body_limit_bytes",
+    "get_gateway_http_body_limit_bytes",
+    "get_gateway_upload_limits",
+    "get_infocenter_http_body_limit_bytes",
+    "get_object_store_bounds",
+    "get_service_http_body_limit_bytes",
+    "get_transport_bounds",
     "effective_limits_from_profile",
     "merge_object_threshold_with_policy_soft_limit",
     "merge_payload_limits_with_effective_policy",
