@@ -396,6 +396,16 @@ def get_http_object_body_limit_bytes(object_body_bytes: int = 0) -> int:
     return max(1, int(object_body_bytes or OBJECT_HTTP_BODY_MAX_BYTES))
 
 
+def get_managed_globals_control_limit_bytes(*, policy_hard_limit_bytes: int, control_send_bytes: int = 0) -> int:
+    return max(
+        1,
+        min(
+            max(1, int(policy_hard_limit_bytes or 1)),
+            max(1, int(control_send_bytes or CONTROL_HTTP_MAX_SEND_BYTES)),
+        ),
+    )
+
+
 def normalize_policy_limit_values(*, soft: int, hard: int, result_hard: int) -> tuple[int, int, int]:
     hard_value = max(1, int(hard or 1))
     return (
@@ -661,6 +671,7 @@ __all__ = [
     "get_job_blob_inline_threshold_bytes",
     "get_local_inline_limits",
     "get_local_service_payload_policy",
+    "get_managed_globals_control_limit_bytes",
     "get_node_control_http_body_limit_bytes",
     "get_http_object_body_limit_bytes",
     "effective_limits_from_profile",

@@ -39,6 +39,7 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_CHUNK_SIZE_BYTES,
     get_dataref_upload_strategy,
     get_job_blob_inline_threshold_bytes,
+    get_managed_globals_control_limit_bytes,
     merge_object_threshold_with_policy_soft_limit,
 )
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
@@ -636,12 +637,9 @@ def _managed_globals_effective_inline_limit(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> int:
     policy = _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)
-    return max(
-        1,
-        min(
-            int(policy.inline_payload_hard_limit_bytes),
-            int(CONTROL_HTTP_MAX_SEND_BYTES),
-        ),
+    return get_managed_globals_control_limit_bytes(
+        policy_hard_limit_bytes=int(policy.inline_payload_hard_limit_bytes),
+        control_send_bytes=int(CONTROL_HTTP_MAX_SEND_BYTES),
     )
 
 

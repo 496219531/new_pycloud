@@ -4,7 +4,12 @@ from dataclasses import replace
 import json
 
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
-from pycloud_parallel.controlplane.config import get_config_limit_authority, get_local_service_payload_policy, get_payload_policy
+from pycloud_parallel.controlplane.config import (
+    get_config_limit_authority,
+    get_local_service_payload_policy,
+    get_managed_globals_control_limit_bytes,
+    get_payload_policy,
+)
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
 from pycloud_parallel.controlplane.payload_transport import (
@@ -80,6 +85,12 @@ def test_config_env_loader_and_reload_share_defaults(monkeypatch) -> None:
         monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", raising=False)
         config.reload_config()
+
+
+def test_managed_globals_control_limit_clamps_policy_and_control_bounds() -> None:
+    assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=1000, control_send_bytes=2000) == 1000
+    assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=2000, control_send_bytes=1000) == 1000
+    assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=0, control_send_bytes=0) >= 1
 
 
 def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:
