@@ -60,7 +60,8 @@ def node_admission_block_reason(
 
     This is the shared base admission predicate for task and service deploy
     candidates. Runtime compatibility, tags, and scoring stay at call sites.
-    Node capability is observability/compat metadata and is not consulted here.
+    Node capability is observability/compat metadata and is not consulted here;
+    this helper is not a resource scheduler or complex node manager.
     """
 
     return deploy_candidate_block_reason(

@@ -1174,6 +1174,70 @@ def test_infocenter_managed_tags_are_endpoint_profiles(tmp_path):
     assert restarted.list_nodes(healthy_only=True, tags=["manual"], limit=10)[0].node_instance_id == "node-profile-new-inst"
 
 
+def test_infocenter_tag_profile_boundaries_survive_register_and_heartbeat(tmp_path):
+    profiles_path = tmp_path / "profiles.json"
+    state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=profiles_path)
+    state.update_node_profile("127.0.0.1:50061", managed_tags=["manual", "shared"], notes="kept")
+
+    node = state.register_node_record(
+        node_id="node-boundary",
+        node_instance_id="node-boundary-inst",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=20,
+        tags=["legacy-a", "shared"],
+        metadata={"component": "compute"},
+        python_version="3.12.1",
+    )
+    expected_tags = sorted(set(node.managed_tags + node.capability_tags + node.legacy_node_tags))
+    assert node.tags == expected_tags
+    assert node.managed_tags == ["manual", "shared"]
+    assert node.legacy_node_tags == ["legacy-a", "shared"]
+    assert state.list_nodes(healthy_only=True, tags=["manual"], limit=10)[0].node_id == "node-boundary"
+    assert state.list_nodes(healthy_only=True, tags=["legacy-a"], limit=10)[0].node_id == "node-boundary"
+    assert state.list_nodes(healthy_only=True, tags=["role:compute"], limit=10)[0].node_id == "node-boundary"
+
+    rereregistered = state.register_node_record(
+        node_id="node-boundary",
+        node_instance_id="node-boundary-inst",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=20,
+        tags=["legacy-b"],
+        metadata={"component": "job-orchestrator"},
+        accept_service_deploy=False,
+        python_version="3.12.1",
+    )
+    assert rereregistered.managed_tags == ["manual", "shared"]
+    assert rereregistered.legacy_node_tags == ["legacy-b"]
+    assert "role:job" in rereregistered.capability_tags
+    assert "role:compute" not in rereregistered.capability_tags
+    assert rereregistered.tags == sorted(set(rereregistered.managed_tags + rereregistered.capability_tags + rereregistered.legacy_node_tags))
+
+    heartbeated = state.heartbeat_record(
+        node_id="node-boundary",
+        node_instance_id="node-boundary-inst",
+        healthy=True,
+        metadata={"component": "compute"},
+        python_version="3.11.8",
+        accept_service_deploy=True,
+    )
+    assert heartbeated is not None
+    assert heartbeated.managed_tags == ["manual", "shared"]
+    assert "role:compute" in heartbeated.capability_tags
+    assert "role:job" not in heartbeated.capability_tags
+    assert heartbeated.tags == sorted(set(heartbeated.managed_tags + heartbeated.capability_tags + heartbeated.legacy_node_tags))
+
+    raw = json.loads(profiles_path.read_text(encoding="utf-8"))
+    allowed = {"profile_key", "managed_tags", "enabled", "drain", "notes"}
+    for item in raw["profiles"].values():
+        assert set(item) == allowed
+    serialized = json.dumps(raw)
+    assert "capability_tags" not in serialized
+    assert "legacy_node_tags" not in serialized
+    assert '"tags"' not in serialized
+
+
 def test_infocenter_profile_enabled_and_drain_block_task_selection(tmp_path):
     state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=tmp_path / "profiles.json")
     server = InfoCenterHttpServer(bind="127.0.0.1:0", state=state)

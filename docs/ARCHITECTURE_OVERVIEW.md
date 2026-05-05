@@ -296,6 +296,8 @@
 
 endpoint 是第一版身份键。如果 endpoint 改变，managed profile 不会自动迁移，管理员需要重新打标签或后续使用迁移工具。
 
+项目边界到此为止：PyCloud 只提供最小 endpoint profile、manual tags、enable/drain。复杂 node 生命周期管理、资源打分、机器标签同步、拓扑、配额、权限和自动迁移应交给外部成熟工具；外部工具可以把最终需要的简单标签写回 `managed_tags`，client 仍只用 `tags=[...]` 筛选。
+
 InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断使用；但运行时 `effective_policy` 不再与 candidate capability 做交集协商。
 
 新的长期口径：

@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import threading
 import contextlib
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -192,6 +192,9 @@ class InfoCenterState:
         return InfoCenterState._normalize_tags(tags)
 
     def _apply_profile_locked(self, state: NodeState, *, registration_tags: Optional[Iterable[str]] = None) -> None:
+        # Boundary: managed_tags are the only persisted human inputs; capability
+        # and legacy node tags are recomputed/received facts. Keep clients on the
+        # merged tags field so scheduling stays simple.
         profile_key = normalize_node_profile_key(str(state.control_addr or ""))
         state.profile_key = profile_key
         if registration_tags is not None:

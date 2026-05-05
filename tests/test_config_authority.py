@@ -107,3 +107,77 @@ def test_core_transport_http_modules_do_not_import_body_limit_constants_directly
                     violations.append(f"{rel}:{node.lineno} imports {alias.name}; use {banned_imports[alias.name]}")
 
     assert not violations, "Core transport/http code must use config authority helpers:\n" + "\n".join(violations)
+
+
+def test_core_scheduling_paths_do_not_filter_by_node_capability_limits() -> None:
+    scanned_files = [
+        ROOT / "src/pycloud_parallel/controlplane/infocenter_client.py",
+        ROOT / "src/pycloud_parallel/execution/service_session.py",
+        ROOT / "src/pycloud_parallel/execution/task_pool.py",
+    ]
+    banned_fields = {
+        "max_control_send_bytes",
+        "max_control_recv_bytes",
+        "max_http_body_bytes",
+        "max_upload_file_bytes",
+        "max_upload_total_bytes",
+    }
+    violations: list[str] = []
+
+    for path in scanned_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in banned_fields:
+                rel = path.relative_to(ROOT)
+                violations.append(f"{rel}:{node.lineno} reads capability limit field {node.attr}")
+
+    assert not violations, "Task/service candidate paths must not use NodeCapability limit fields:\n" + "\n".join(violations)
+
+
+def test_service_and_task_candidate_paths_use_shared_node_admission_helper() -> None:
+    scanned_files = [
+        ROOT / "src/pycloud_parallel/controlplane/infocenter_client.py",
+        ROOT / "src/pycloud_parallel/execution/service_session.py",
+    ]
+    helper_names = {"node_admission_block_reason", "is_admitted_node"}
+    banned_phrases = [
+        "node.healthy and node.schedulable",
+        "node.schedulable and not node.drain",
+        "node.healthy and node.schedulable and not node.drain",
+    ]
+    violations: list[str] = []
+
+    for path in scanned_files:
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(ROOT)
+        if not any(name in text for name in helper_names):
+            violations.append(f"{rel} does not reference shared node admission helper")
+        for phrase in banned_phrases:
+            if phrase in text:
+                violations.append(f"{rel} contains hand-written admission phrase: {phrase}")
+
+    assert not violations, "Use scheduling_policy node admission helpers for new task/service candidates:\n" + "\n".join(violations)
+
+
+def test_node_profile_boundary_does_not_introduce_complex_node_management() -> None:
+    scanned_files = [
+        ROOT / "src/pycloud_parallel/controlplane/infocenter_state.py",
+        ROOT / "src/pycloud_parallel/controlplane/infocenter_client.py",
+        ROOT / "src/pycloud_parallel/controlplane/infocenter_http.py",
+        ROOT / "src/pycloud_parallel/controlplane/scheduling_policy.py",
+    ]
+    banned_terms = {
+        "NodeManager": "keep node management as minimal endpoint profiles",
+        "NodeInventory": "do not add a local inventory authority",
+        "machine_id": "endpoint is the first profile identity key",
+    }
+    violations: list[str] = []
+
+    for path in scanned_files:
+        text = path.read_text(encoding="utf-8")
+        rel = path.relative_to(ROOT)
+        for term, guidance in banned_terms.items():
+            if term in text:
+                violations.append(f"{rel} contains {term}; {guidance}")
+
+    assert not violations, "Node profile boundary should stay intentionally small:\n" + "\n".join(violations)

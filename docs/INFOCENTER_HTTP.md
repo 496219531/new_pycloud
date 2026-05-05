@@ -100,6 +100,13 @@ tags = managed_tags + capability_tags + legacy_node_tags
 
 第一版 `profile_key` 使用 endpoint，例如 `http://127.0.0.1:50061` 与 `127.0.0.1:50061` 会归一到同一个 profile。endpoint 改变时，managed profile 不会自动迁移，需要管理员重新设置或后续迁移工具处理。
 
+边界：
+
+1. 推荐 client 只使用 `tags=[...]` 做简单筛选，不要求调用方区分 tag 来源
+2. `profile_key` 是实现细节，不建议业务代码直接依赖
+3. `capability_tags` 只是事实/建议标签，不是权限、limit 或 policy authority
+4. 复杂 node 生命周期管理、资源调度、机器分组、拓扑、配额、自动迁移不在本项目内继续扩展；需要这些能力时，应接入外部成熟工具，再由外部工具调用 `/ops`/API 设置简单 managed tags
+
 其中 `services` 会展开每个服务实例的：
 
 1. `service_name`
@@ -336,6 +343,8 @@ POST /ops/nodes/{node_instance_id}/mark-lost
 说明：路径名仍是 `/ops/nodes/...`，但参数语义是 `node_instance_id`。页面上的操作按钮会自动使用对应实例 id；手写 curl 时不要只填可重复的 `node_id`。
 
 `cordon/uncordon/enable/disable/drain/undrain/managed-tags/notes` 会落到 endpoint profile，因此 node 重启后只要 `control_addr` 不变，人工标签、enabled/drain、notes 都会恢复。`mark-lost` 仍是当前 instance 的故障标记，不写入 endpoint profile。
+
+`managed-tags` 只接受简单字符串标签。它不是资源规格、权限声明、limit 配置或 machine inventory。
 
 ## 3. Python 客户端
 

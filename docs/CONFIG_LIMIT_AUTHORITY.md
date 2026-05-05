@@ -106,8 +106,11 @@ node 不是 policy / limit / capability authority。
 3. node 本地 env 只属于进程启动默认值、物理 HTTP body 边界或兼容路径
 4. `NodeCapability` 当前只是兼容/观测模型，供 route metadata、诊断和旧协议字段使用
 5. `NodeCapability` 不作为未来节点筛选、标签、分组或能力管理的主 authority
-6. 后续节点标签、能力、分组和筛选应由 controlplane 节点管理服务统一维护
-7. 同一物理机器可以启动多个 node，单个 node 的局部信息不能代表整台机器的资源/能力
+6. 当前只保留最小 endpoint profile：`managed_tags`、`enabled`、`drain`、`notes`
+7. `capability_tags` 是自动事实标签，不持久化，也不参与 limit/policy authority
+8. `legacy_node_tags` 只是兼容旧 node 启动参数，不推荐作为长期管理方式
+9. 复杂 node 管理不在本项目内继续扩展；资源打分、机器分组、拓扑、配额、权限、自动迁移应交给外部成熟工具
+10. 同一物理机器可以启动多个 node，单个 node 的局部信息不能代表整台机器的资源/能力
 
 因此，node 上报或本地检测到的能力不能参与 session policy 协商；运行时最终口径以 controlplane/session 分配为准。
 
