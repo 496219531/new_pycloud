@@ -11,7 +11,6 @@ from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
-from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -25,6 +24,13 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.client_transport import _materialize_downloaded_result, _normalize_http_response_body
+from pycloud_parallel.controlplane.client_transport_runtime import (
+    RuntimeTransportRequest,
+    pack_binary_sidecar,
+    runtime_http_request,
+    runtime_http_request_for_binary_sidecar_response,
+    unpack_binary_sidecar,
+)
 from pycloud_parallel.controlplane.config import (
     OBJECT_CHUNK_SIZE_BYTES,
     get_http_object_body_limit_bytes,
@@ -58,9 +64,6 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 MAX_NODE_CONTROL_HTTP_BODY_BYTES = get_node_control_http_body_limit_bytes()
-_BINARY_META_LEN_BYTES = 8
-
-
 def _split_host_port(bind: str) -> Tuple[str, int]:
     if ":" not in bind:
         raise ValueError("bind must be host:port")
@@ -80,23 +83,6 @@ def _read_json(body: bytes) -> Dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("json body must be object")
     return parsed
-
-
-def _pack_binary_sidecar(meta: Dict[str, object], chunks: Sequence[bytes] = ()) -> bytes:
-    meta_raw = _json_bytes(meta)
-    return len(meta_raw).to_bytes(_BINARY_META_LEN_BYTES, "big") + meta_raw + b"".join(bytes(item or b"") for item in chunks)
-
-
-def _unpack_binary_sidecar(body: bytes) -> Tuple[Dict[str, object], bytes]:
-    raw = bytes(body or b"")
-    if len(raw) < _BINARY_META_LEN_BYTES:
-        raise ValueError("binary sidecar body is too short")
-    meta_len = int.from_bytes(raw[:_BINARY_META_LEN_BYTES], "big")
-    if meta_len < 0 or len(raw) < _BINARY_META_LEN_BYTES + meta_len:
-        raise ValueError("invalid binary sidecar meta length")
-    meta = _read_json(raw[_BINARY_META_LEN_BYTES : _BINARY_META_LEN_BYTES + meta_len])
-    return meta, raw[_BINARY_META_LEN_BYTES + meta_len :]
-
 
 def _transport_payload_meta(value: pb2.TransportPayload) -> Dict[str, object]:
     return {
@@ -382,7 +368,7 @@ class NodeControlHttpApp:
 
     def _submit_pool_tasks_bytes(self, pool_id: str, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
         try:
-            payload, raw = _unpack_binary_sidecar(body)
+            payload, raw = unpack_binary_sidecar(body)
             tasks = []
             offset = 0
             for item in list(payload.get("tasks") or ()):
@@ -482,7 +468,7 @@ class NodeControlHttpApp:
                 chunks.append(bytes(item.transport_result.payload or b""))
             else:
                 meta_results.append(_message_to_dict(item))
-        raw = _pack_binary_sidecar({"ok": True, "results": meta_results, "next_cursor": next_cursor}, chunks)
+        raw = pack_binary_sidecar({"ok": True, "results": meta_results, "next_cursor": next_cursor}, chunks)
         return 200, {"Content-Type": "application/octet-stream"}, raw
 
     def _heartbeat_task_pool(self, pool_id: str, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
@@ -1324,26 +1310,19 @@ class HttpNodeControlClient:
         *,
         timeout_sec: Optional[float] = None,
     ) -> Dict[str, object]:
-        raw = _pack_binary_sidecar(meta, chunks)
-        req = Request(
-            f"{self.base_url}{path}",
-            method=method.upper(),
-            data=raw,
-            headers={"Content-Type": "application/octet-stream", "Accept": "application/json"},
+        return runtime_http_request(
+            base_url=self.base_url,
+            control_addr=self.base_url,
+            request=RuntimeTransportRequest(
+                path=path,
+                mode="binary_sidecar",
+                payload=meta,
+                chunks=chunks,
+                timeout_sec=float(timeout_sec if timeout_sec is not None else self.timeout_sec),
+                method=method.upper(),
+                headers={"Accept": "application/json"},
+            ),
         )
-        try:
-            with urlopen(req, timeout=max(0.1, float(timeout_sec if timeout_sec is not None else self.timeout_sec))) as resp:
-                parsed = json.loads((resp.read() or b"{}").decode("utf-8") or "{}")
-        except HTTPError as exc:
-            try:
-                parsed = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-            except Exception:
-                parsed = {"ok": False, "error": exc.reason}
-            raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
-        parsed = _normalize_http_response_body(parsed, control_addr=self.base_url)
-        if parsed.get("ok", False) is False:
-            raise RuntimeError(str(parsed.get("error", "request failed")))
-        return parsed
 
     def _json_to_binary_sidecar(
         self,
@@ -1353,44 +1332,31 @@ class HttpNodeControlClient:
         *,
         timeout_sec: Optional[float] = None,
     ) -> Tuple[Dict[str, object], bytes]:
-        raw = _json_bytes(payload)
-        req = Request(
-            f"{self.base_url}{path}",
-            method=method.upper(),
-            data=raw,
-            headers={"Content-Type": "application/json; charset=utf-8", "Accept": "application/octet-stream"},
+        return runtime_http_request_for_binary_sidecar_response(
+            base_url=self.base_url,
+            control_addr=self.base_url,
+            request=RuntimeTransportRequest(
+                path=path,
+                mode="json",
+                payload=payload,
+                timeout_sec=float(timeout_sec if timeout_sec is not None else self.timeout_sec),
+                method=method.upper(),
+                headers={"Accept": "application/octet-stream"},
+            ),
         )
-        try:
-            with urlopen(req, timeout=max(0.1, float(timeout_sec if timeout_sec is not None else self.timeout_sec))) as resp:
-                meta, data = _unpack_binary_sidecar(resp.read() or b"")
-        except HTTPError as exc:
-            try:
-                parsed = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-            except Exception:
-                parsed = {"ok": False, "error": exc.reason}
-            raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
-        meta = _normalize_http_response_body(meta, control_addr=self.base_url)
-        if meta.get("ok", False) is False:
-            raise RuntimeError(str(meta.get("error", "request failed")))
-        return meta, data
 
     def _json(self, method: str, path: str, payload: Optional[Dict[str, object]], *, timeout_sec: Optional[float] = None) -> Dict[str, object]:
-        raw = None if payload is None else _json_bytes(payload)
-        headers = {"Content-Type": "application/json; charset=utf-8"} if payload is not None else {}
-        req = Request(f"{self.base_url}{path}", method=method.upper(), data=raw, headers=headers)
-        try:
-            with urlopen(req, timeout=max(0.1, float(timeout_sec if timeout_sec is not None else self.timeout_sec))) as resp:
-                parsed = json.loads((resp.read() or b"{}").decode("utf-8") or "{}")
-        except HTTPError as exc:
-            try:
-                parsed = json.loads((exc.read() or b"{}").decode("utf-8") or "{}")
-            except Exception:
-                parsed = {"ok": False, "error": exc.reason}
-            raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
-        parsed = _normalize_http_response_body(parsed, control_addr=self.base_url)
-        if parsed.get("ok", False) is False:
-            raise RuntimeError(str(parsed.get("error", "request failed")))
-        return parsed
+        return runtime_http_request(
+            base_url=self.base_url,
+            control_addr=self.base_url,
+            request=RuntimeTransportRequest(
+                path=path,
+                mode="json",
+                payload=payload,
+                timeout_sec=float(timeout_sec if timeout_sec is not None else self.timeout_sec),
+                method=method.upper(),
+            ),
+        )
 
 
 __all__ = ["HttpNodeControlClient", "NodeControlHttpApp", "NodeControlHttpServer"]

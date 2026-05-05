@@ -8,16 +8,14 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Sequence
-from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from .client_transport import (
-    _call_route_http,
     _normalize_http_response_body,
     _serialize_http_call_payload,
 )
+from pycloud_parallel.controlplane.client_transport_runtime import RuntimeTransportRequest, runtime_http_request
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.session_model import (
@@ -383,12 +381,7 @@ class ServiceSessionClient:
         if not method:
             raise ValueError("method is required")
 
-        params = urlencode({"timeout_sec": f"{max(0.1, float(timeout_sec)):.3f}"})
-        url = f"{self.http_base_url}/call/{quote(method, safe='')}?{params}"
-        headers = {"Content-Type": "application/json"}
         auth_token = self.service_token if token is None else token
-        if auth_token:
-            headers["X-Service-Token"] = auth_token
         prepare_kwargs = {}
         if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
             prepare_kwargs["serialization_mode"] = serialization_mode
@@ -398,18 +391,28 @@ class ServiceSessionClient:
             effective_policy=effective_policy,
             **prepare_kwargs,
         )
+        effective_timeout_sec = max(0.1, float(timeout_sec))
+        encoded_payload = _serialize_http_call_payload(
+            prepared_payload,
+            context="service_call",
+            mode=serialization_mode,
+            effective_policy=effective_policy,
+        )
+        headers = {}
+        if auth_token:
+            headers["X-Service-Token"] = str(auth_token)
         try:
-            body = _call_route_http(
-                SimpleNamespace(
-                    http_base_url=str(self.http_base_url or "").strip(),
-                    control_addr=str(self._client.target or "").strip(),
+            body = runtime_http_request(
+                base_url=str(self.http_base_url or "").strip(),
+                control_addr=str(self._client.target or self.http_base_url or "").strip(),
+                request=RuntimeTransportRequest(
+                    path=f"/call/{quote(method, safe='')}?{urlencode({'timeout_sec': f'{effective_timeout_sec:.3f}'})}",
+                    mode="json",
+                    payload=encoded_payload,
+                    timeout_sec=effective_timeout_sec,
+                    method="POST",
+                    headers=headers,
                 ),
-                method=method,
-                payload=prepared_payload,
-                timeout_sec=max(0.1, float(timeout_sec)),
-                service_token=str(auth_token or ""),
-                serialization_mode=serialization_mode,
-                effective_policy=effective_policy,
             )
         except Exception as exc:
             raise RuntimeError(f"call failed: {exc}") from exc
