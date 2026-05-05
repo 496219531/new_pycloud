@@ -335,6 +335,18 @@ InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断�
 3. 然后按 route 绑定的 profile 和 connect 上下文冻结出自己的 `effective_policy`
 4. 如果同名 service routes 的 `policy_id` 不一致，connect 会直接失败，避免普通调用面继续“选 profile”
 
+### 9.4 Service / TaskPool Session Model
+
+client/controlplane 侧允许 `service` 和 `taskpool` 共享一套轻量会话视图模型：`SessionIdentity`、`SessionLease`、`SessionBinding`、`ExecutionReplicaSnapshot`、`ExecutionSessionStatus`。这只用于表达身份、租约、绑定和副本状态。
+
+边界：
+
+1. `service` 仍然是 public、discovery-aware 的 remote session
+2. `taskpool` 仍然是 private、owner-only 的 remote pool
+3. 二者共享 session view model，不共享 runtime call model
+4. `taskpool` 不进入 service discovery，不改成 service call
+5. `service` 不改成 task submit/results 协议
+
 动态部署还有一个 code version / owner 控制域约束：
 
 1. 同名动态服务副本必须由唯一发布者统一发布管理

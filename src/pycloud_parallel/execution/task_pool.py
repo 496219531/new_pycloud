@@ -41,7 +41,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_policy_profile,
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
-from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
+from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus, SessionBinding, SessionIdentity
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
 from pycloud_parallel.controlplane.serialization import encode_transport_payload_bytes, serialize_inline_payload
@@ -2395,8 +2395,22 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def status_map(self) -> Dict[str, pb2.TaskPoolStatusInfo]:
         return {node_id: pool.get_status() for node_id, pool in self._pools.items()}
 
-    def status(self) -> ExecutionSessionStatus:
+    def execution_identity(self) -> SessionIdentity:
+        first = next(iter(self._pools.values()))
+        return first.identity()
+
+    def execution_binding(self) -> SessionBinding:
+        first = next(iter(self._pools.values()))
+        return first.binding()
+
+    def execution_snapshot(self):
+        return super().snapshot()
+
+    def execution_status(self) -> ExecutionSessionStatus:
         return super().status()
+
+    def status(self) -> ExecutionSessionStatus:
+        return self.execution_status()
 
     def is_alive(self) -> bool:
         return (not self._closed) and (not self.failed) and any(

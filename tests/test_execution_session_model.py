@@ -179,6 +179,7 @@ def test_service_session_client_update_globals_prepared_uses_prepared_rpc() -> N
 
 def test_service_group_exposes_replicas_and_snapshot() -> None:
     from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
+    from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
     from pycloud_parallel.execution.service_session import Service
 
     now = _utc_now()
@@ -208,7 +209,14 @@ def test_service_group_exposes_replicas_and_snapshot() -> None:
     snap = group.snapshot()["node-inst-1"]
     assert snap.node_id == "node-1"
     assert group.is_alive() is True
-    status = group.status()
+    execution_snap = group.execution_snapshot()["node-inst-1"]
+    assert execution_snap.session_id == "svc-1"
+    assert execution_snap.session_name == "svc-demo"
+    assert group.execution_identity().session_id == "svc-1"
+    assert group.execution_identity().session_name == "svc-demo"
+    assert group.execution_binding().worker_count == 2
+    status = group.execution_status()
+    assert isinstance(status, ExecutionSessionStatus)
     assert status.kind == "service"
     assert status.replica_count == 1
     assert status.alive_replica_count == 1
@@ -221,6 +229,7 @@ def test_service_group_exposes_replicas_and_snapshot() -> None:
 def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
     from pycloud_parallel import TaskPool
     from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
+    from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus
 
     now = _utc_now()
     pool = NativeTaskPoolClient(
@@ -248,7 +257,14 @@ def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
     snap = session.snapshot()["node-inst-1"]
     assert snap.session_name == "pool-demo"
     assert snap.node_id == "node-1"
-    status = session.status()
+    execution_snap = session.execution_snapshot()["node-inst-1"]
+    assert execution_snap.session_id == "pool-1"
+    assert execution_snap.session_name == "pool-demo"
+    assert session.execution_identity().session_id == "pool-1"
+    assert session.execution_identity().session_name == "pool-demo"
+    assert session.execution_binding().worker_count == 2
+    status = session.execution_status()
+    assert isinstance(status, ExecutionSessionStatus)
     assert status.kind == "task_pool"
     assert status.replica_count == 1
     assert status.alive_replica_count == 1
@@ -256,6 +272,72 @@ def test_task_pool_session_exposes_replicas_and_snapshot() -> None:
     assert status.alive is True
     assert status.last_heartbeat_at == now
     assert status.lease_expire_at == now + timedelta(seconds=30)
+
+
+def test_build_execution_session_status_is_shared_for_service_and_task_pool() -> None:
+    from pycloud_parallel.controlplane.session_model import (
+        ExecutionReplicaSnapshot,
+        SessionLease,
+        build_execution_session_status,
+    )
+
+    now = _utc_now()
+    lease = SessionLease(
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+    )
+    service_status = build_execution_session_status(
+        kind="service",
+        replicas={
+            "node-inst-1": ExecutionReplicaSnapshot(
+                kind="service",
+                node_instance_id="node-inst-1",
+                node_id="node-1",
+                session_id="svc-1",
+                session_name="svc-demo",
+                code_version="sha256:" + ("1" * 64),
+                worker_count=2,
+                alive=True,
+                status="RUNNING",
+                lease_expire_at=lease.lease_expire_at,
+            )
+        },
+        failures={},
+        failed=False,
+        closed=False,
+        leases={"node-inst-1": lease},
+    )
+    task_status = build_execution_session_status(
+        kind="task_pool",
+        replicas={
+            "node-inst-1": ExecutionReplicaSnapshot(
+                kind="task_pool",
+                node_instance_id="node-inst-1",
+                node_id="node-1",
+                session_id="pool-1",
+                session_name="pool-demo",
+                code_version="sha256:" + ("2" * 64),
+                worker_count=2,
+                alive=True,
+                status="RUNNING",
+                lease_expire_at=lease.lease_expire_at,
+            )
+        },
+        failures={},
+        failed=False,
+        closed=False,
+        leases={"node-inst-1": lease},
+    )
+
+    assert service_status.replica_count == task_status.replica_count == 1
+    assert service_status.alive_replica_count == task_status.alive_replica_count == 1
+    assert service_status.alive is True
+    assert task_status.alive is True
+    assert service_status.kind == "service"
+    assert task_status.kind == "task_pool"
 
 
 def test_task_pool_session_put_data_uses_shared_client_upload_path(monkeypatch) -> None:

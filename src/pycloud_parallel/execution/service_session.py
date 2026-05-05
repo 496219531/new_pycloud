@@ -57,6 +57,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
 )
+from pycloud_parallel.controlplane.session_model import SessionBinding, SessionIdentity
 from pycloud_parallel.controlplane.scheduling_policy import is_admitted_node, node_admission_block_reason
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
@@ -1816,6 +1817,20 @@ class Service(ServiceExecutionSession):
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
         return self.sessions
+
+    def execution_identity(self) -> SessionIdentity:
+        first = next(iter(self.sessions.values()))
+        return first.identity()
+
+    def execution_binding(self) -> SessionBinding:
+        first = next(iter(self.sessions.values()))
+        return first.binding()
+
+    def execution_snapshot(self):
+        return super().snapshot()
+
+    def execution_status(self):
+        return super().status()
 
     def route_summary(self) -> List[Dict[str, object]]:
         routes: List[Dict[str, object]] = []

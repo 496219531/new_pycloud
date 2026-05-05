@@ -14,6 +14,7 @@ from pycloud_parallel.controlplane.session_model import (
     ExecutionReplicaSnapshot,
     ExecutionSessionStatus,
     SessionLease,
+    build_execution_session_status,
 )
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
@@ -87,32 +88,13 @@ class ExecutionSessionBase:
     def status(self) -> ExecutionSessionStatus:
         replicas = self.snapshot()
         leases = self._replica_leases()
-        alive_replica_count = sum(1 for snapshot in replicas.values() if bool(snapshot.alive))
-        failures = {
-            node_instance_id: str(snapshot.failure or self.failures.get(node_instance_id, "") or "")
-            for node_instance_id, snapshot in replicas.items()
-            if str(snapshot.failure or self.failures.get(node_instance_id, "") or "").strip()
-        }
-        active_leases = [
-            lease.lease_expire_at
-            for node_instance_id, lease in leases.items()
-            if bool(replicas.get(node_instance_id, None) and replicas[node_instance_id].alive)
-        ]
-        all_leases = [lease.lease_expire_at for lease in leases.values()]
-        last_heartbeat_values = [lease.last_heartbeat_at for lease in leases.values()]
-        failed = bool(getattr(self, "failed", False)) or (bool(replicas) and alive_replica_count <= 0)
-        alive = (not self._is_execution_closed()) and alive_replica_count > 0 and not failed
-        return ExecutionSessionStatus(
+        return build_execution_session_status(
             kind=str(getattr(self, "kind", "") or ""),
-            replica_count=len(replicas),
-            alive_replica_count=alive_replica_count,
-            failed_replica_count=len(failures),
-            alive=alive,
-            failed=failed,
-            failures=failures,
-            last_heartbeat_at=max(last_heartbeat_values) if last_heartbeat_values else None,
-            lease_expire_at=min(active_leases or all_leases) if (active_leases or all_leases) else None,
             replicas=replicas,
+            failures=self.failures,
+            failed=bool(getattr(self, "failed", False)),
+            closed=self._is_execution_closed(),
+            leases=leases,
         )
 
     @property
