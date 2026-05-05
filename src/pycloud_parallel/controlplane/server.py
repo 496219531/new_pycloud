@@ -48,6 +48,10 @@ def _default_nodecontrol_artifact_dir(*, bind: str, node_id: str) -> str:
     return str((Path.cwd() / "code_cache" / f"{node_part}-{int(port)}").resolve())
 
 
+def _default_infocenter_profiles_path() -> str:
+    return str((Path.cwd() / "code_cache" / "profiles.json").resolve())
+
+
 def _normalize_role(value: str) -> str:
     text = str(value or "").strip().lower()
     if text.startswith("info"):
@@ -75,7 +79,7 @@ def build_infocenter_server(bind: str, *, max_workers: int = 32) -> InfoCenterHt
         logger.warning("InfoCenterHttpServer does not support max_workers; ignoring %s", max_workers)
     server = InfoCenterHttpServer(
         bind=bind,
-        state=InfoCenterState(heartbeat_interval_sec=5),
+        state=InfoCenterState(heartbeat_interval_sec=5, profiles_path=_default_infocenter_profiles_path()),
     )
     return server
 
@@ -87,7 +91,7 @@ def build_controlplane_server(
     gateway_failure_threshold: int = 3,
     gateway_open_sec: float = 5.0,
 ) -> InfoCenterHttpServer:
-    info_state = InfoCenterState(heartbeat_interval_sec=5)
+    info_state = InfoCenterState(heartbeat_interval_sec=5, profiles_path=_default_infocenter_profiles_path())
     job_queue = JobQueueManager()
     route_cache = GatewayRouteCache(
         source=InProcessInfoCenterSource(info_state),

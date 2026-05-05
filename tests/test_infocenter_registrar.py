@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pytest
@@ -15,7 +16,7 @@ from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, No
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.server import build_job_orchestrator_server
-from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
+from pycloud_parallel.controlplane.infocenter_state import InfoCenterState, normalize_node_profile_key
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
@@ -105,7 +106,8 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert "svc-reg-sync" in raw
             assert ">2</td><td>2</td>" in raw
             assert "controlplane_version=" in raw
-            assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>pycloud</th>" in raw
+            assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>enabled</th><th>pycloud</th>" in raw
+            assert "<th>effective tags</th><th>managed tags</th><th>capability tags</th><th>legacy node tags</th>" in raw
             assert "avg_total_ms" in raw
             assert "avg_child_decode_ms" in raw
             assert "avg_child_invoke_ms" in raw
@@ -1115,6 +1117,139 @@ def test_infocenter_client_select_task_nodes_rejects_explicit_cordon_or_drain_no
                 list(client.select_task_nodes(healthy_only=True, node_instance_ids=["node-drain-inst"], limit=10))
     finally:
         info_server.stop()
+
+
+def test_infocenter_managed_tags_are_endpoint_profiles(tmp_path):
+    profiles_path = tmp_path / "profiles.json"
+    state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=profiles_path)
+    profile_key = normalize_node_profile_key("http://127.0.0.1:50061/")
+    assert profile_key == "127.0.0.1:50061"
+
+    state.update_node_profile("http://127.0.0.1:50061/", managed_tags=["gpu", "manual"], notes="ops note")
+    node = state.register_node_record(
+        node_id="node-profile-a",
+        node_instance_id="node-profile-a-inst",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=20,
+        tags=["legacy"],
+        python_version="3.11.9",
+    )
+
+    assert node.profile_key == profile_key
+    assert node.managed_tags == ["gpu", "manual"]
+    assert node.legacy_node_tags == ["legacy"]
+    assert "python:3.x" in node.capability_tags
+    assert "role:compute" in node.capability_tags
+    assert set(node.tags) >= {"gpu", "manual", "legacy", "runtime:py3", "role:compute"}
+    assert state.list_nodes(healthy_only=True, tags=["legacy"], limit=10)[0].node_id == "node-profile-a"
+    assert state.list_nodes(healthy_only=True, tags=["manual"], limit=10)[0].node_id == "node-profile-a"
+
+    raw = json.loads(profiles_path.read_text(encoding="utf-8"))
+    saved = raw["profiles"][profile_key]
+    assert saved == {
+        "profile_key": profile_key,
+        "managed_tags": ["gpu", "manual"],
+        "enabled": True,
+        "drain": False,
+        "notes": "ops note",
+    }
+    assert "capability_tags" not in json.dumps(raw)
+    assert "legacy_node_tags" not in json.dumps(raw)
+
+    restarted = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=profiles_path)
+    restored = restarted.register_node_record(
+        node_id="node-profile-a",
+        node_instance_id="node-profile-new-inst",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=20,
+        tags=["legacy2"],
+    )
+
+    assert restored.node_instance_id == "node-profile-new-inst"
+    assert restored.managed_tags == ["gpu", "manual"]
+    assert "manual" in restored.tags
+    assert "legacy2" in restored.tags
+    assert restarted.list_nodes(healthy_only=True, tags=["manual"], limit=10)[0].node_instance_id == "node-profile-new-inst"
+
+
+def test_infocenter_profile_enabled_and_drain_block_task_selection(tmp_path):
+    state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=tmp_path / "profiles.json")
+    server = InfoCenterHttpServer(bind="127.0.0.1:0", state=state)
+    server.start()
+
+    try:
+        with InfoCenterClient(server.base_url, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-profile-blocked",
+                node_instance_id="node-profile-blocked-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            state.update_node_profile("127.0.0.1:50061", enabled=False)
+            blocked = client.list_nodes(healthy_only=True, tags=["compute"], limit=10)[0]
+            assert blocked.profile_enabled is False
+            assert blocked.schedulable is False
+            with pytest.raises(RuntimeError, match="no schedulable task nodes"):
+                list(client.select_task_nodes(healthy_only=True, tags=["compute"], limit=10))
+
+            state.update_node_profile("127.0.0.1:50061", enabled=True, drain=True)
+            drained = client.list_nodes(healthy_only=True, tags=["compute"], limit=10)[0]
+            assert drained.profile_enabled is True
+            assert drained.drain is True
+            with pytest.raises(RuntimeError, match="no schedulable task nodes"):
+                list(client.select_task_nodes(healthy_only=True, tags=["compute"], limit=10))
+    finally:
+        server.stop()
+
+
+def test_ops_managed_tag_form_updates_endpoint_profile(tmp_path):
+    state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=tmp_path / "profiles.json")
+    server = InfoCenterHttpServer(bind="127.0.0.1:0", state=state)
+    server.start()
+
+    try:
+        with InfoCenterClient(server.base_url, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-ops-profile",
+                node_instance_id="node-ops-profile-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["legacy"],
+            )
+
+        body = urlencode({"tag": "manual-ops", "op": "add"}).encode("utf-8")
+        req = Request(
+            f"{server.base_url}/ops/nodes/node-ops-profile-inst/managed-tags",
+            method="POST",
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urlopen(req, timeout=5.0) as resp:
+            assert resp.status == 200
+
+        node = state.list_nodes(healthy_only=True, tags=["manual-ops"], limit=10)[0]
+        assert node.managed_tags == ["manual-ops"]
+        assert "manual-ops" in node.tags
+
+        with InfoCenterClient(server.base_url, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-ops-profile",
+                node_instance_id="node-ops-profile-new-inst",
+                control_addr="http://127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=[],
+            )
+            restored = client.list_nodes(healthy_only=True, tags=["manual-ops"], limit=10)[0]
+        assert restored.node_instance_id == "node-ops-profile-new-inst"
+        assert restored.managed_tags == ("manual-ops",)
+    finally:
+        server.stop()
 
 
 def test_infocenter_client_select_task_nodes_detects_duplicate_node_ids_and_supports_instance_ids():

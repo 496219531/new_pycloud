@@ -2,8 +2,13 @@ from __future__ import annotations
 
 """InfoCenter state backend."""
 
+import json
+import os
+import tempfile
 import threading
+import contextlib
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
@@ -13,6 +18,7 @@ from pycloud_parallel.controlplane.infocenter.models import (
     FencedNodeInstance,
     NodeMetricsState,
     NodeCapability,
+    NodeProfile,
     NodeServiceState,
     NodeState,
     NodeTaskPoolInfo,
@@ -36,12 +42,14 @@ def _coerce_bool(value: object, *, default: bool = False) -> bool:
 
 
 def _endpoint_from_url_or_addr(value: str) -> Tuple[str, int]:
-    text = str(value or "").strip()
+    text = str(value or "").strip().rstrip("/")
     if not text:
         return "", 0
     parsed = urlparse(text)
     if parsed.hostname and parsed.port:
         return parsed.hostname.strip().lower(), int(parsed.port)
+    if "/" in text:
+        text = text.split("/", 1)[0]
     if ":" not in text:
         return "", 0
     host, port = text.rsplit(":", 1)
@@ -49,6 +57,13 @@ def _endpoint_from_url_or_addr(value: str) -> Tuple[str, int]:
         return host.strip("[]").lower(), int(port)
     except ValueError:
         return "", 0
+
+
+def normalize_node_profile_key(value: str) -> str:
+    host, port = _endpoint_from_url_or_addr(value)
+    if not host or port <= 0:
+        return ""
+    return f"{host}:{port}"
 
 
 def _startup_service_endpoint(state: NodeState, svc: NodeServiceState) -> Tuple[str, int]:
@@ -70,13 +85,22 @@ def _endpoint_matches(left: Tuple[str, int], right: Tuple[str, int]) -> bool:
 
 
 class InfoCenterState:
-    def __init__(self, *, lease_ttl_sec: int = 90, heartbeat_interval_sec: int = 30) -> None:
+    def __init__(
+        self,
+        *,
+        lease_ttl_sec: int = 90,
+        heartbeat_interval_sec: int = 30,
+        profiles_path: Optional[str | os.PathLike[str]] = None,
+    ) -> None:
         self.lease_ttl_sec = max(1, lease_ttl_sec)
         self.heartbeat_interval_sec = max(1, heartbeat_interval_sec)
         self._lock = threading.Lock()
         self._nodes: Dict[str, NodeState] = {}
+        self._profiles: Dict[str, NodeProfile] = {}
+        self._profiles_path = Path(profiles_path).expanduser().resolve() if profiles_path else None
         self._data_refs: Dict[str, DataRegistryEntry] = {}
         self._fenced_instances: Dict[str, FencedNodeInstance] = {}
+        self._load_profiles()
 
     def _node_is_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
         current_time = now or utc_now()
@@ -84,6 +108,215 @@ class InfoCenterState:
 
     def _node_is_healthy_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
         return bool(state.healthy) and not self._node_is_stale_locked(state, now=now)
+
+    @staticmethod
+    def _normalize_tags(tags: Iterable[str]) -> List[str]:
+        return sorted({str(tag).strip() for tag in tags if str(tag).strip()})
+
+    @staticmethod
+    def _profile_from_payload(profile_key: str, payload: Dict[str, object]) -> NodeProfile:
+        return NodeProfile(
+            profile_key=profile_key,
+            managed_tags=InfoCenterState._normalize_tags(payload.get("managed_tags") or ()),
+            enabled=_coerce_bool(payload.get("enabled"), default=True),
+            drain=_coerce_bool(payload.get("drain"), default=False),
+            notes=str(payload.get("notes", "") or ""),
+        )
+
+    def _load_profiles(self) -> None:
+        path = self._profiles_path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(raw, dict) and isinstance(raw.get("profiles"), dict):
+            items = raw.get("profiles", {})
+        elif isinstance(raw, dict):
+            items = raw
+        else:
+            return
+        profiles: Dict[str, NodeProfile] = {}
+        for raw_key, item in items.items():
+            if not isinstance(item, dict):
+                continue
+            profile_key = normalize_node_profile_key(str(item.get("profile_key", "") or raw_key))
+            if not profile_key:
+                continue
+            profiles[profile_key] = self._profile_from_payload(profile_key, item)
+        self._profiles = profiles
+
+    def _save_profiles_locked(self) -> None:
+        path = self._profiles_path
+        if path is None:
+            return
+        payload = {
+            "profiles": {
+                key: {
+                    "profile_key": profile.profile_key,
+                    "managed_tags": list(profile.managed_tags),
+                    "enabled": bool(profile.enabled),
+                    "drain": bool(profile.drain),
+                    "notes": str(profile.notes or ""),
+                }
+                for key, profile in sorted(self._profiles.items())
+            }
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_name)
+
+    @staticmethod
+    def _capability_tags_for_state(state: NodeState) -> List[str]:
+        tags = ["runtime:py3"]
+        python_text = str(state.python_version or "").strip()
+        major = python_text.split(".", 1)[0] if python_text else ""
+        if major.isdigit():
+            tags.append(f"python:{major}.x")
+        else:
+            tags.append("python:3.x")
+        metadata = dict(state.metadata or {})
+        component = str(metadata.get("component", "") or "").strip()
+        if component == "job-orchestrator" or not bool(getattr(state, "accept_service_deploy", True)):
+            tags.append("role:job")
+        else:
+            tags.append("role:compute")
+        return InfoCenterState._normalize_tags(tags)
+
+    def _apply_profile_locked(self, state: NodeState, *, registration_tags: Optional[Iterable[str]] = None) -> None:
+        profile_key = normalize_node_profile_key(str(state.control_addr or ""))
+        state.profile_key = profile_key
+        if registration_tags is not None:
+            state.legacy_node_tags = self._normalize_tags(registration_tags)
+        profile = self._profiles.get(profile_key) if profile_key else None
+        state.managed_tags = list(profile.managed_tags) if profile is not None else []
+        state.profile_enabled = bool(profile.enabled) if profile is not None else True
+        state.profile_notes = str(profile.notes or "") if profile is not None else ""
+        state.capability_tags = self._capability_tags_for_state(state)
+        state.tags = self._normalize_tags([*state.capability_tags, *state.managed_tags, *state.legacy_node_tags])
+        if profile is not None:
+            state.drain = bool(profile.drain)
+            if not bool(profile.enabled):
+                state.schedulable = False
+                state.reason = str(state.reason or "disabled by managed node profile")
+            elif state.reason == "disabled by managed node profile":
+                state.schedulable = True
+                state.reason = ""
+
+    def _clone_node_locked(self, state: NodeState, *, healthy: Optional[bool] = None) -> NodeState:
+        return NodeState(
+            node_instance_id=state.node_instance_id,
+            node_id=state.node_id,
+            control_addr=state.control_addr,
+            capacity=state.capacity,
+            queue_capacity=state.queue_capacity,
+            tags=list(state.tags),
+            profile_key=state.profile_key,
+            managed_tags=list(state.managed_tags),
+            capability_tags=list(state.capability_tags),
+            legacy_node_tags=list(state.legacy_node_tags),
+            profile_enabled=state.profile_enabled,
+            profile_notes=state.profile_notes,
+            version=state.version,
+            python_version=state.python_version,
+            metadata=dict(state.metadata),
+            healthy=state.healthy if healthy is None else bool(healthy),
+            last_seen_at=state.last_seen_at,
+            metrics=NodeMetricsState(**vars(state.metrics)),
+            services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
+            task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
+            active_runtimes=list(state.active_runtimes),
+            service_worker_capacity=state.service_worker_capacity,
+            service_worker_used=state.service_worker_used,
+            task_pool_worker_capacity=state.task_pool_worker_capacity,
+            task_pool_worker_used=state.task_pool_worker_used,
+            accept_service_deploy=state.accept_service_deploy,
+            schedulable=state.schedulable,
+            drain=state.drain,
+            reason=state.reason,
+            capability=NodeCapability.from_dict(state.capability.to_dict()),
+        )
+
+    def update_node_profile(
+        self,
+        profile_key_or_endpoint: str,
+        *,
+        managed_tags: Optional[Iterable[str]] = None,
+        add_tags: Optional[Iterable[str]] = None,
+        remove_tags: Optional[Iterable[str]] = None,
+        enabled: Optional[bool] = None,
+        drain: Optional[bool] = None,
+        notes: Optional[str] = None,
+    ) -> NodeProfile:
+        profile_key = normalize_node_profile_key(profile_key_or_endpoint)
+        if not profile_key:
+            raise ValueError("profile endpoint is required")
+        with self._lock:
+            profile = self._profiles.get(profile_key) or NodeProfile(profile_key=profile_key)
+            tags = set(profile.managed_tags)
+            if managed_tags is not None:
+                tags = set(self._normalize_tags(managed_tags))
+            tags.update(self._normalize_tags(add_tags or ()))
+            tags.difference_update(self._normalize_tags(remove_tags or ()))
+            profile.managed_tags = sorted(tags)
+            if enabled is not None:
+                profile.enabled = bool(enabled)
+            if drain is not None:
+                profile.drain = bool(drain)
+            if notes is not None:
+                profile.notes = str(notes or "")
+            self._profiles[profile_key] = profile
+            for state in self._nodes.values():
+                if normalize_node_profile_key(str(state.control_addr or "")) == profile_key:
+                    if bool(profile.enabled) and state.reason == "disabled by managed node profile":
+                        state.schedulable = True
+                        state.reason = ""
+                    self._apply_profile_locked(state)
+            self._save_profiles_locked()
+            return NodeProfile(
+                profile_key=profile.profile_key,
+                managed_tags=list(profile.managed_tags),
+                enabled=profile.enabled,
+                drain=profile.drain,
+                notes=profile.notes,
+            )
+
+    def update_node_profile_for_instance(
+        self,
+        node_instance_id: str,
+        *,
+        managed_tags: Optional[Iterable[str]] = None,
+        add_tags: Optional[Iterable[str]] = None,
+        remove_tags: Optional[Iterable[str]] = None,
+        enabled: Optional[bool] = None,
+        drain: Optional[bool] = None,
+        notes: Optional[str] = None,
+    ) -> NodeProfile:
+        normalized_instance_id = str(node_instance_id or "").strip()
+        if not normalized_instance_id:
+            raise ValueError("node_instance_id is required")
+        with self._lock:
+            state = self._nodes.get(normalized_instance_id)
+            if state is None:
+                raise KeyError("node not found")
+            profile_key = normalize_node_profile_key(str(state.control_addr or ""))
+        return self.update_node_profile(
+            profile_key,
+            managed_tags=managed_tags,
+            add_tags=add_tags,
+            remove_tags=remove_tags,
+            enabled=enabled,
+            drain=drain,
+            notes=notes,
+        )
 
     def _fence_instance_locked(
         self,
@@ -142,11 +375,18 @@ class InfoCenterState:
         normalized_control_addr = str(control_addr or "").strip()
         if not normalized_instance_id or not normalized_control_addr:
             return
+        incoming_profile_key = normalize_node_profile_key(normalized_control_addr)
         replaced_keys = [
             key
             for key, state in self._nodes.items()
             if key != normalized_instance_id
-            and str(state.control_addr or "").strip() == normalized_control_addr
+            and (
+                str(state.control_addr or "").strip() == normalized_control_addr
+                or (
+                    incoming_profile_key
+                    and normalize_node_profile_key(str(state.control_addr or "")) == incoming_profile_key
+                )
+            )
         ]
         for key in replaced_keys:
             old_state = self._nodes.pop(key, None)
@@ -307,7 +547,7 @@ class InfoCenterState:
             state.control_addr = control_addr
             state.capacity = max(1, capacity)
             state.queue_capacity = max(1, queue_capacity)
-            state.tags = list(tags or [])
+            state.legacy_node_tags = self._normalize_tags(tags or ())
             state.version = str(version or "")
             state.python_version = str(python_version or state.python_version or "").strip()
             state.metadata = incoming_metadata
@@ -323,6 +563,7 @@ class InfoCenterState:
             state.accept_service_deploy = bool(accept_service_deploy)
             if capability is not None:
                 state.capability = capability
+            self._apply_profile_locked(state, registration_tags=tags)
             if state.metrics.credit == 0:
                 state.metrics.credit = state.queue_capacity
             return state
@@ -577,6 +818,7 @@ class InfoCenterState:
                 state.accept_service_deploy = bool(accept_service_deploy)
             if capability is not None:
                 state.capability = capability
+            self._apply_profile_locked(state)
             return state
 
     def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
@@ -672,32 +914,7 @@ class InfoCenterState:
                     stop_reason=str(svc.stop_reason or state.reason or "node lost"),
                 )
             state.services = degraded
-            return NodeState(
-                node_instance_id=state.node_instance_id,
-                node_id=state.node_id,
-                control_addr=state.control_addr,
-                capacity=state.capacity,
-                queue_capacity=state.queue_capacity,
-                tags=list(state.tags),
-                version=state.version,
-                python_version=state.python_version,
-                metadata=dict(state.metadata),
-                healthy=False,
-                last_seen_at=state.last_seen_at,
-                metrics=NodeMetricsState(**vars(state.metrics)),
-                services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
-                task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
-                active_runtimes=list(state.active_runtimes),
-                service_worker_capacity=state.service_worker_capacity,
-                service_worker_used=state.service_worker_used,
-                task_pool_worker_capacity=state.task_pool_worker_capacity,
-                task_pool_worker_used=state.task_pool_worker_used,
-                accept_service_deploy=state.accept_service_deploy,
-                schedulable=state.schedulable,
-                drain=state.drain,
-                reason=state.reason,
-                capability=NodeCapability.from_dict(state.capability.to_dict()),
-            )
+            return self._clone_node_locked(state, healthy=False)
 
     def list_service_routes(
         self,
@@ -812,34 +1029,7 @@ class InfoCenterState:
                     continue
                 if filter_tags and not filter_tags.issubset(set(state.tags)):
                     continue
-                out.append(
-                    NodeState(
-                        node_instance_id=state.node_instance_id,
-                        node_id=state.node_id,
-                        control_addr=state.control_addr,
-                        capacity=state.capacity,
-                        queue_capacity=state.queue_capacity,
-                        tags=list(state.tags),
-                        version=state.version,
-                        python_version=state.python_version,
-                        metadata=dict(state.metadata),
-                        healthy=is_healthy,
-                        last_seen_at=state.last_seen_at,
-                        metrics=NodeMetricsState(**vars(state.metrics)),
-                        services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
-                        task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
-                        active_runtimes=list(state.active_runtimes),
-                        service_worker_capacity=state.service_worker_capacity,
-                        service_worker_used=state.service_worker_used,
-                        task_pool_worker_capacity=state.task_pool_worker_capacity,
-                        task_pool_worker_used=state.task_pool_worker_used,
-                        accept_service_deploy=state.accept_service_deploy,
-                        schedulable=state.schedulable,
-                        drain=state.drain,
-                        reason=state.reason,
-                        capability=NodeCapability.from_dict(state.capability.to_dict()),
-                    )
-                )
+                out.append(self._clone_node_locked(state, healthy=is_healthy))
             out.sort(key=lambda n: (not n.healthy, not n.schedulable, n.drain, -(n.service_worker_available())))
             return out[: max(1, limit)]
 
@@ -861,29 +1051,5 @@ class InfoCenterState:
                 state.drain = bool(drain)
             if reason is not None:
                 state.reason = str(reason or "")
-            return NodeState(
-                node_instance_id=state.node_instance_id,
-                node_id=state.node_id,
-                control_addr=state.control_addr,
-                capacity=state.capacity,
-                queue_capacity=state.queue_capacity,
-                tags=list(state.tags),
-                version=state.version,
-                python_version=state.python_version,
-                metadata=dict(state.metadata),
-                healthy=state.healthy,
-                last_seen_at=state.last_seen_at,
-                metrics=NodeMetricsState(**vars(state.metrics)),
-                services={k: NodeServiceState(**vars(v)) for k, v in state.services.items()},
-                task_pools={k: NodeTaskPoolInfo(**vars(v)) for k, v in state.task_pools.items()},
-                active_runtimes=list(state.active_runtimes),
-                service_worker_capacity=state.service_worker_capacity,
-                service_worker_used=state.service_worker_used,
-                task_pool_worker_capacity=state.task_pool_worker_capacity,
-                task_pool_worker_used=state.task_pool_worker_used,
-                accept_service_deploy=state.accept_service_deploy,
-                schedulable=state.schedulable,
-                drain=state.drain,
-                reason=state.reason,
-                capability=NodeCapability.from_dict(state.capability.to_dict()),
-            )
+            self._apply_profile_locked(state)
+            return self._clone_node_locked(state)

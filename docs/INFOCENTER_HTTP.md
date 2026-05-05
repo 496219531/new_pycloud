@@ -38,6 +38,8 @@
 11. `service_worker_capacity`
 12. `service_worker_used`
 
+注册时传入的 `tags` 会保留为 `legacy_node_tags`，用于兼容旧启动参数。它不是中心管理标签。
+
 ### 2.2 `POST /nodes/heartbeat`
 
 节点续租与事实刷新。
@@ -79,6 +81,24 @@
 12. `service_worker_capacity`
 13. `service_worker_used`
 14. `service_worker_available`
+15. `managed_tags`
+16. `capability_tags`
+17. `legacy_node_tags`
+18. `tags`
+
+`tags` 是兼容字段，表示最终筛选标签：
+
+```text
+tags = managed_tags + capability_tags + legacy_node_tags
+```
+
+其中：
+
+1. `managed_tags` 是管理员在 controlplane 侧维护的人工标签，按 `control_addr`/endpoint 归一后的 `profile_key` 持久化到 `profiles.json`
+2. `capability_tags` 是 InfoCenter 根据当前注册/心跳事实自动生成的建议标签，每次刷新都会重算，不写入 `profiles.json`
+3. `legacy_node_tags` 是 node 注册时传入的旧 `tags`，短期继续参与最终 `tags`，保证旧 CLI/启动参数兼容
+
+第一版 `profile_key` 使用 endpoint，例如 `http://127.0.0.1:50061` 与 `127.0.0.1:50061` 会归一到同一个 profile。endpoint 改变时，managed profile 不会自动迁移，需要管理员重新设置或后续迁移工具处理。
 
 其中 `services` 会展开每个服务实例的：
 
@@ -306,10 +326,16 @@ POST /ops/nodes/{node_instance_id}/cordon
 POST /ops/nodes/{node_instance_id}/uncordon
 POST /ops/nodes/{node_instance_id}/drain
 POST /ops/nodes/{node_instance_id}/undrain
+POST /ops/nodes/{node_instance_id}/enable
+POST /ops/nodes/{node_instance_id}/disable
+POST /ops/nodes/{node_instance_id}/managed-tags
+POST /ops/nodes/{node_instance_id}/notes
 POST /ops/nodes/{node_instance_id}/mark-lost
 ```
 
 说明：路径名仍是 `/ops/nodes/...`，但参数语义是 `node_instance_id`。页面上的操作按钮会自动使用对应实例 id；手写 curl 时不要只填可重复的 `node_id`。
+
+`cordon/uncordon/enable/disable/drain/undrain/managed-tags/notes` 会落到 endpoint profile，因此 node 重启后只要 `control_addr` 不变，人工标签、enabled/drain、notes 都会恢复。`mark-lost` 仍是当前 instance 的故障标记，不写入 endpoint profile。
 
 ## 3. Python 客户端
 

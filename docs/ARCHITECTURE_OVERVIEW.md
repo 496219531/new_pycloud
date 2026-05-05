@@ -287,6 +287,15 @@
 2. healthy_only
 3. runtime 兼容
 
+第一版中心管理标签按 endpoint 建 profile，不引入 machine_id 或完整 NodeManager：
+
+1. `managed_tags`：人工标签，由 controlplane `/ops` 维护，按归一化 `control_addr` 持久化到 `profiles.json`
+2. `capability_tags`：根据当前注册/心跳事实自动生成的低风险标签，例如 `python:3.x`、`runtime:py3`、`role:compute`、`role:job`，不持久化
+3. `legacy_node_tags`：node 注册时传入的旧 tags，短期保留兼容
+4. `tags`：对外兼容的最终筛选标签，等于三类标签去重合并
+
+endpoint 是第一版身份键。如果 endpoint 改变，managed profile 不会自动迁移，管理员需要重新打标签或后续使用迁移工具。
+
 InfoCenter 仍然会保存 node capability 这类元数据，供观测和诊断使用；但运行时 `effective_policy` 不再与 candidate capability 做交集协商。
 
 新的长期口径：

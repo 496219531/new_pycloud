@@ -239,6 +239,12 @@ def _merge_nodes_for_display(nodes: List[object]) -> List[object]:
                 capacity=max(int(getattr(node, "capacity", 0) or 0) for node in ordered),
                 queue_capacity=max(int(getattr(node, "queue_capacity", 0) or 0) for node in ordered),
                 tags=sorted(tags),
+                profile_key=str(getattr(primary, "profile_key", "") or ""),
+                managed_tags=sorted({str(tag) for node in ordered for tag in (getattr(node, "managed_tags", []) or []) if str(tag)}),
+                capability_tags=sorted({str(tag) for node in ordered for tag in (getattr(node, "capability_tags", []) or []) if str(tag)}),
+                legacy_node_tags=sorted({str(tag) for node in ordered for tag in (getattr(node, "legacy_node_tags", []) or []) if str(tag)}),
+                profile_enabled=any(bool(getattr(node, "profile_enabled", True)) for node in ordered),
+                profile_notes=str(getattr(primary, "profile_notes", "") or ""),
                 version=str(getattr(primary, "version", "") or ""),
                 python_version=str(getattr(primary, "python_version", "") or ""),
                 metadata=dict(getattr(primary, "metadata", {}) or {}),
@@ -370,6 +376,12 @@ def _serialize_node(state) -> Dict[str, object]:
         "cpu_percent": float(state.metrics.cpu_percent),
         "mem_percent": float(state.metrics.mem_percent),
         "tags": list(state.tags),
+        "profile_key": str(getattr(state, "profile_key", "") or ""),
+        "managed_tags": list(getattr(state, "managed_tags", []) or []),
+        "capability_tags": list(getattr(state, "capability_tags", []) or []),
+        "legacy_node_tags": list(getattr(state, "legacy_node_tags", []) or []),
+        "profile_enabled": bool(getattr(state, "profile_enabled", True)),
+        "profile_notes": str(getattr(state, "profile_notes", "") or ""),
         "version": str(state.version or ""),
         "metadata": dict(state.metadata),
         "last_seen_at": _dt_text(state.last_seen_at),
@@ -408,6 +420,12 @@ def _serialize_node(state) -> Dict[str, object]:
             for pool in task_pools
         ],
     }
+
+
+def _parse_form_body(body: bytes) -> Dict[str, str]:
+    raw = body.decode("utf-8") if body else ""
+    parsed = parse_qs(raw, keep_blank_values=True)
+    return {str(key): str((values or [""])[0]) for key, values in parsed.items()}
 
 
 def _parse_node_capability(payload: object) -> NodeCapability:
@@ -671,6 +689,13 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             for item in merged_services
         ) or "-"
         active_runtimes = ", ".join(node.active_runtimes[:10]) or "-"
+        effective_tags = ", ".join(getattr(node, "tags", []) or []) or "-"
+        managed_tags = ", ".join(getattr(node, "managed_tags", []) or []) or "-"
+        capability_tags = ", ".join(getattr(node, "capability_tags", []) or []) or "-"
+        legacy_node_tags = ", ".join(getattr(node, "legacy_node_tags", []) or []) or "-"
+        profile_key = str(getattr(node, "profile_key", "") or "").strip()
+        profile_notes = str(getattr(node, "profile_notes", "") or "")
+        action_node_id = html.escape(getattr(node, "action_node_instance_id", getattr(node, "node_instance_id", node.node_id)))
         node_rows.append(
             "<tr>"
             f"<td>{html.escape(node.node_id)}</td>"
@@ -680,9 +705,14 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{'yes' if node.schedulable else 'no'}</td>"
             f"<td>{'yes' if getattr(node, 'accept_service_deploy', True) else 'no'}</td>"
             f"<td>{'yes' if node.drain else 'no'}</td>"
+            f"<td>{'yes' if getattr(node, 'profile_enabled', True) else 'no'}</td>"
             f"<td>{html.escape(str((node.metadata or {}).get('pycloud_version', '-') or '-'))}</td>"
             f"<td>{html.escape(node.python_version or '-')}</td>"
             f"<td>{html.escape(active_runtimes)}</td>"
+            f"<td>{html.escape(effective_tags)}</td>"
+            f"<td>{html.escape(managed_tags)}</td>"
+            f"<td>{html.escape(capability_tags)}</td>"
+            f"<td>{html.escape(legacy_node_tags)}</td>"
             f"<td>{node.service_worker_capacity}</td>"
             f"<td>{node.service_worker_used}</td>"
             f"<td>{node.service_worker_available()}</td>"
@@ -694,11 +724,26 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{len(merged_services)}</td>"
             f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
+            f"<td>{html.escape(profile_notes or '-')}</td>"
             "<td>"
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/uncordon' style='display:inline'><button type='submit'>uncordon</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/drain' style='display:inline'><button type='submit'>drain</button></form> "
-            f"<form method='post' action='/ops/nodes/{html.escape(getattr(node, 'action_node_instance_id', getattr(node, 'node_instance_id', node.node_id)))}/undrain' style='display:inline'><button type='submit'>undrain</button></form>"
+            f"<form method='post' action='/ops/nodes/{action_node_id}/cordon' style='display:inline'><button type='submit'>cordon</button></form> "
+            f"<form method='post' action='/ops/nodes/{action_node_id}/uncordon' style='display:inline'><button type='submit'>uncordon</button></form> "
+            f"<form method='post' action='/ops/nodes/{action_node_id}/drain' style='display:inline'><button type='submit'>drain</button></form> "
+            f"<form method='post' action='/ops/nodes/{action_node_id}/undrain' style='display:inline'><button type='submit'>undrain</button></form> "
+            f"<form method='post' action='/ops/nodes/{action_node_id}/disable' style='display:inline'><button type='submit'>disable</button></form> "
+            f"<form method='post' action='/ops/nodes/{action_node_id}/enable' style='display:inline'><button type='submit'>enable</button></form>"
+            f"<form method='post' action='/ops/nodes/{action_node_id}/managed-tags' style='margin-top:4px'>"
+            f"<input name='tag' placeholder='managed tag' size='14'>"
+            "<button type='submit' name='op' value='add'>add</button>"
+            "<button type='submit' name='op' value='remove'>remove</button></form>"
+            f"<form method='post' action='/ops/nodes/{action_node_id}/managed-tags' style='margin-top:4px'>"
+            "<select name='tag'>"
+            + "".join(f"<option value='{html.escape(str(tag))}'>{html.escape(str(tag))}</option>" for tag in (getattr(node, "capability_tags", []) or []))
+            + "</select><button type='submit' name='op' value='add'>add capability tag</button></form>"
+            f"<form method='post' action='/ops/nodes/{action_node_id}/notes' style='margin-top:4px'>"
+            f"<input name='notes' value='{html.escape(profile_notes, quote=True)}' placeholder='notes' size='18'>"
+            "<button type='submit'>save</button></form>"
+            f"<div class='muted'>profile={html.escape(profile_key or '-')}</div>"
             "</td>"
             "</tr>"
         )
@@ -869,7 +914,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
             "</tr>"
         )
-    node_body = "\n".join(node_rows) or "<tr><td colspan='21'>no nodes</td></tr>"
+    node_body = "\n".join(node_rows) or "<tr><td colspan='27'>no nodes</td></tr>"
     service_body = "\n".join(service_rows) or "<tr><td colspan='18'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
@@ -895,8 +940,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "Timing columns keep only average total latency plus child decode/invoke/encode averages. "
         "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>pycloud</th>"
-        "<th>python</th><th>active runtimes</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>pool cap</th><th>pool used</th><th>pool avail</th><th>pool inflight</th><th>pool count</th><th>svc count</th><th>services</th><th>reason</th><th>actions</th>"
+        "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>enabled</th><th>pycloud</th>"
+        "<th>python</th><th>active runtimes</th><th>effective tags</th><th>managed tags</th><th>capability tags</th><th>legacy node tags</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>pool cap</th><th>pool used</th><th>pool avail</th><th>pool inflight</th><th>pool count</th><th>svc count</th><th>services</th><th>reason</th><th>notes</th><th>actions</th>"
         "</tr></thead><tbody id='ops-nodes-body'>"
         f"{node_body}"
         "</tbody></table>"
@@ -1243,18 +1288,42 @@ class InfoCenterHttpServer:
                 if len(parts) == 4 and parts[:2] == ["ops", "nodes"]:
                     node_instance_id = parts[2]
                     action = parts[3]
-                    if action == "cordon":
-                        state.update_node_schedule_state(node_instance_id, schedulable=False)
-                    elif action == "uncordon":
-                        state.update_node_schedule_state(node_instance_id, schedulable=True)
-                    elif action == "drain":
-                        state.update_node_schedule_state(node_instance_id, drain=True)
-                    elif action == "undrain":
-                        state.update_node_schedule_state(node_instance_id, drain=False)
-                    elif action == "mark-lost":
-                        state.mark_node_lost(node_instance_id, reason="marked lost via ops")
-                    else:
-                        self._send_json(404, {"ok": False, "error": "unknown ops action"})
+                    body = self._read_body()
+                    if body is None:
+                        return
+                    form = _parse_form_body(body)
+                    try:
+                        if action == "cordon":
+                            state.update_node_profile_for_instance(node_instance_id, enabled=False)
+                        elif action == "uncordon":
+                            state.update_node_profile_for_instance(node_instance_id, enabled=True)
+                        elif action == "disable":
+                            state.update_node_profile_for_instance(node_instance_id, enabled=False)
+                        elif action == "enable":
+                            state.update_node_profile_for_instance(node_instance_id, enabled=True)
+                        elif action == "drain":
+                            state.update_node_profile_for_instance(node_instance_id, drain=True)
+                        elif action == "undrain":
+                            state.update_node_profile_for_instance(node_instance_id, drain=False)
+                        elif action == "managed-tags":
+                            tag = str(form.get("tag", "") or "").strip()
+                            op = str(form.get("op", "add") or "add").strip().lower()
+                            if op == "remove":
+                                state.update_node_profile_for_instance(node_instance_id, remove_tags=[tag])
+                            else:
+                                state.update_node_profile_for_instance(node_instance_id, add_tags=[tag])
+                        elif action == "notes":
+                            state.update_node_profile_for_instance(node_instance_id, notes=str(form.get("notes", "") or ""))
+                        elif action == "mark-lost":
+                            state.mark_node_lost(node_instance_id, reason="marked lost via ops")
+                        else:
+                            self._send_json(404, {"ok": False, "error": "unknown ops action"})
+                            return
+                    except KeyError:
+                        self._send_json(404, {"ok": False, "error": "node not found"})
+                        return
+                    except ValueError as exc:
+                        self._send_json(400, {"ok": False, "error": str(exc)})
                         return
                     if "text/html" in (self.headers.get("Accept", "")):
                         self.send_response(303)

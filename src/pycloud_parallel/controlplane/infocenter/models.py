@@ -65,6 +65,15 @@ class NodeTaskPoolInfo:
 
 
 @dataclass
+class NodeProfile:
+    profile_key: str
+    managed_tags: List[str] = field(default_factory=list)
+    enabled: bool = True
+    drain: bool = False
+    notes: str = ""
+
+
+@dataclass
 class NodeState:
     node_instance_id: str
     node_id: str
@@ -72,6 +81,12 @@ class NodeState:
     capacity: int
     queue_capacity: int
     tags: List[str] = field(default_factory=list)
+    profile_key: str = ""
+    managed_tags: List[str] = field(default_factory=list)
+    capability_tags: List[str] = field(default_factory=list)
+    legacy_node_tags: List[str] = field(default_factory=list)
+    profile_enabled: bool = True
+    profile_notes: str = ""
     version: str = ""
     python_version: str = ""
     metadata: Dict[str, str] = field(default_factory=dict)
@@ -136,6 +151,7 @@ __all__ = [
     "DataRegistryEntry",
     "FencedNodeInstance",
     "NodeMetricsState",
+    "NodeProfile",
     "NodeCapability",
     "NodeServiceState",
     "NodeState",

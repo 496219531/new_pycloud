@@ -79,6 +79,12 @@ class InfoCenterNode:
     python_version: str = ""
     active_runtimes: Tuple[str, ...] = ()
     tags: Tuple[str, ...] = ()
+    profile_key: str = ""
+    managed_tags: Tuple[str, ...] = ()
+    capability_tags: Tuple[str, ...] = ()
+    legacy_node_tags: Tuple[str, ...] = ()
+    profile_enabled: bool = True
+    profile_notes: str = ""
     service_worker_capacity: int = 0
     service_worker_used: int = 0
     service_worker_available: int = 0
@@ -442,6 +448,12 @@ class InfoCenterClient:
                     python_version=str(item.get("python_version", "") or ""),
                     active_runtimes=tuple(item.get("active_runtimes") or ()),
                     tags=tuple(item.get("tags") or ()),
+                    profile_key=str(item.get("profile_key", "") or ""),
+                    managed_tags=tuple(item.get("managed_tags") or ()),
+                    capability_tags=tuple(item.get("capability_tags") or ()),
+                    legacy_node_tags=tuple(item.get("legacy_node_tags") or ()),
+                    profile_enabled=_coerce_bool(item.get("profile_enabled"), default=True),
+                    profile_notes=str(item.get("profile_notes", "") or ""),
                     service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
                     service_worker_used=int(item.get("service_worker_used", 0) or 0),
                     service_worker_available=int(item.get("service_worker_available", 0) or 0),
