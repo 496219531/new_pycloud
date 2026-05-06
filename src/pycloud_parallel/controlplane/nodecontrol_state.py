@@ -1009,7 +1009,7 @@ class NodeControlState(NodeRuntimeBase):
         self._objects[result.object_id] = artifact
         return result
 
-    def _stream_result_value_locked(self, result: Any) -> Any:
+    def _stream_result_value(self, result: Any) -> Any:
         if isinstance(result, StoredResultArtifact):
             raise ValueError("service stream item exceeds inline result limit; stream does not support DataRef or large result items")
         return result
@@ -2821,7 +2821,6 @@ class NodeControlState(NodeRuntimeBase):
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
-            touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
             self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
@@ -2832,6 +2831,7 @@ class NodeControlState(NodeRuntimeBase):
                 if is_inline_transport_carrier(payload)
                 else self._resolve_memory_object_refs_in_payload_locked(payload or {})
             )
+        touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
         setup_end = time.perf_counter()
 
         try:
@@ -3063,7 +3063,6 @@ class NodeControlState(NodeRuntimeBase):
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
-            touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
             self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, {"ok": False, "error": "service executor stopped"}
@@ -3074,6 +3073,7 @@ class NodeControlState(NodeRuntimeBase):
                 if is_inline_transport_carrier(payload)
                 else self._resolve_memory_object_refs_in_payload_locked(payload or {})
             )
+        touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
         setup_end = time.perf_counter()
         try:
             build_start = time.perf_counter()
@@ -3119,8 +3119,7 @@ class NodeControlState(NodeRuntimeBase):
                     kind = str(event.get("kind", "") or "")
                     if kind == "service_stream_item":
                         result = event.get("result")
-                        with self._lock:
-                            result = self._stream_result_value_locked(result)
+                        result = self._stream_result_value(result)
                         item_count += 1
                         yield self._encode_checked_stream_item_line(
                             {
