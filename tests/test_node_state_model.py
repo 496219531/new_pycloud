@@ -44,6 +44,7 @@ from pycloud_parallel.controlplane.node.results import (
     LargeResultError,
     ObjectResolutionError,
     _commit_result_file,
+    _materialize_object_bytes,
     _normalize_user_return,
     _resolve_object_refs_in_payload,
     _resolve_single_data_ref,
@@ -527,6 +528,72 @@ def test_normalize_user_return_rejects_result_object_over_hard_limit(tmp_path, m
     assert "result object exceeds object size hard limit" in message
     assert "size_bytes=16" in message
     assert "limit_bytes=8" in message
+
+
+def test_normalize_user_return_path_objectify_does_not_read_whole_file(tmp_path, monkeypatch):
+    from pycloud_parallel.data.ref import object_storage_path
+
+    source = tmp_path / "path-result.bin"
+    source.write_bytes(b"x" * 4096)
+    original_read_bytes = Path.read_bytes
+
+    def _guard_read_bytes(self):  # noqa: ANN001
+        if self == source:
+            raise AssertionError("path result objectify must not read the whole source file")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _guard_read_bytes)
+
+    status, result, _err_type, _err_message = _normalize_user_return(source, object_dir=str(tmp_path / "objects"))
+
+    assert status == "SUCCEEDED"
+    assert isinstance(result, StoredResultArtifact)
+    assert result.storage_backend == "file"
+    stored = object_storage_path(tmp_path / "objects", object_id=result.object_id, fmt=result.format)
+    assert stored.exists()
+    with stored.open("rb") as fp:
+        assert fp.read() == b"x" * 4096
+
+
+def test_normalize_user_return_file_backed_dataframe_series_ndarray_roundtrip(tmp_path, monkeypatch):
+    pd = pytest.importorskip("pandas")
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("pyarrow")
+    from pycloud_parallel.controlplane import config as config_mod
+    from pycloud_parallel.data.ref import object_storage_path
+
+    frame = pd.DataFrame({"x": [1, 2], "y": ["a", "b"]})
+    series = pd.Series([1.0, 2.0], name="nav")
+    array = np.arange(8, dtype=np.int64)
+
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "1")
+    config_mod.reload_config()
+    try:
+        for value, materialize_as in (
+            (frame, "dataframe"),
+            (series, "series"),
+            (array, "ndarray"),
+        ):
+            object_dir = tmp_path / materialize_as
+            status, result, _err_type, _err_message = _normalize_user_return(value, object_dir=str(object_dir))
+            assert status == "SUCCEEDED"
+            assert isinstance(result, StoredResultArtifact)
+            assert result.storage_backend == "file"
+            stored = object_storage_path(object_dir, object_id=result.object_id, fmt=result.format)
+            restored = _materialize_object_bytes(
+                blob=stored.read_bytes(),
+                fmt=result.format,
+                materialize_as=result.materialize_as,
+            )
+            if materialize_as == "dataframe":
+                pd.testing.assert_frame_equal(restored, value)
+            elif materialize_as == "series":
+                pd.testing.assert_series_equal(restored, value)
+            else:
+                np.testing.assert_array_equal(restored, value)
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
 
 
 def test_nested_arrow_payload_roundtrip():

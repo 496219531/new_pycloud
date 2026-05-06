@@ -500,15 +500,27 @@ def _append_bytes_to_segment(
     )
 
 
-def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_bytes: int, materialize_as: str) -> StoredResultArtifact:
+def _commit_result_file(
+    source_path: Path,
+    *,
+    object_dir: str,
+    fmt: str,
+    size_bytes: int,
+    materialize_as: str,
+    copy_source: bool = False,
+) -> StoredResultArtifact:
     root = Path(str(object_dir or "")).resolve()
     root.mkdir(parents=True, exist_ok=True)
+    validate_object_size_bytes(size_bytes or source_path.stat().st_size, context="result object")
     digest = _sha256_file(source_path)
     object_id = object_id_from_sha256_hex(digest)
     normalized_format = normalize_object_format(fmt, source_name=source_path.name, default="bin")
     final_path = object_storage_path(root, object_id=object_id, fmt=normalized_format)
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    _replace_file_with_retry(source_path, final_path)
+    if copy_source:
+        shutil.copyfile(str(source_path), str(final_path))
+    else:
+        _replace_file_with_retry(source_path, final_path)
     created_at = utc_now()
     _write_object_meta_with_retry(
         root,
@@ -543,47 +555,33 @@ def _commit_result_segment(blob: bytes, *, object_dir: str, fmt: str, materializ
 def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
     if not path.exists() or not path.is_file():
         raise LargeResultError(f"returned path is not a readable file: {path}")
-    validate_object_size_bytes(path.stat().st_size, context="result object")
-    if path.stat().st_size <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
-        return _commit_result_segment(
-            path.read_bytes(),
-            object_dir=object_dir,
-            fmt=normalize_object_format("", source_name=path.name, default="bin"),
-            materialize_as="path",
-        )
-    suffix = object_format_suffix(normalize_object_format("", source_name=path.name, default="bin")) or ".bin"
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=suffix, dir=str(Path(object_dir).resolve()))
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    shutil.copyfile(str(path), str(tmp_path))
     return _commit_result_file(
-        tmp_path,
+        path,
         object_dir=object_dir,
         fmt=normalize_object_format("", source_name=path.name, default="bin"),
         size_bytes=path.stat().st_size,
         materialize_as="path",
+        copy_source=True,
     )
 
 
 def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtifact:
     try:
         import zipfile
-
-        parquet_buf = io.BytesIO()
-        dataframe_bundle_parquet_frame(frame).to_parquet(parquet_buf, index=False)
-        meta = serialize_dataframe_bundle(frame)
-        bundle = io.BytesIO()
-        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("data.parquet", parquet_buf.getvalue())
-            zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        blob = bundle.getvalue()
-        validate_object_size_bytes(len(blob), context="result object")
-        if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
-            return _commit_result_segment(blob, object_dir=object_dir, fmt="dfbundle", materialize_as="dataframe")
+        Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
         os.close(fd)
         tmp_path = Path(tmp_name)
-        tmp_path.write_bytes(blob)
+        parquet_name = str(tmp_path.with_suffix(".parquet"))
+        parquet_path = Path(parquet_name)
+        try:
+            dataframe_bundle_parquet_frame(frame).to_parquet(parquet_path, index=False)
+            meta = serialize_dataframe_bundle(frame)
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(parquet_path, arcname="data.parquet")
+                zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        finally:
+            parquet_path.unlink(missing_ok=True)
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -600,22 +598,20 @@ def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtif
 def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifact:
     try:
         import zipfile
-
-        parquet_buf = io.BytesIO()
-        series.to_frame("__pycloud_series_value__").to_parquet(parquet_buf, index=False)
-        meta = serialize_series_bundle(series)
-        bundle = io.BytesIO()
-        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("data.parquet", parquet_buf.getvalue())
-            zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        blob = bundle.getvalue()
-        validate_object_size_bytes(len(blob), context="result object")
-        if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
-            return _commit_result_segment(blob, object_dir=object_dir, fmt="seriesbundle", materialize_as="series")
+        Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
         os.close(fd)
         tmp_path = Path(tmp_name)
-        tmp_path.write_bytes(blob)
+        parquet_name = str(tmp_path.with_suffix(".parquet"))
+        parquet_path = Path(parquet_name)
+        try:
+            series.to_frame("__pycloud_series_value__").to_parquet(parquet_path, index=False)
+            meta = serialize_series_bundle(series)
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.write(parquet_path, arcname="data.parquet")
+                zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        finally:
+            parquet_path.unlink(missing_ok=True)
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -632,17 +628,12 @@ def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifac
 def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifact:
     try:
         import numpy as np
-
-        buf = io.BytesIO()
-        np.save(buf, array, allow_pickle=False)
-        blob = buf.getvalue()
-        validate_object_size_bytes(len(blob), context="result object")
-        if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
-            return _commit_result_segment(blob, object_dir=object_dir, fmt="npy", materialize_as="ndarray")
+        Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".npy", dir=str(Path(object_dir).resolve()))
         os.close(fd)
         tmp_path = Path(tmp_name)
-        tmp_path.write_bytes(blob)
+        with tmp_path.open("wb") as fp:
+            np.save(fp, array, allow_pickle=False)
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -661,6 +652,7 @@ def _store_result_json(value: Any, *, object_dir: str) -> StoredResultArtifact:
     validate_object_size_bytes(len(blob), context="result object")
     if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
         return _commit_result_segment(blob, object_dir=object_dir, fmt="json", materialize_as="json")
+    Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".json", dir=str(Path(object_dir).resolve()))
     os.close(fd)
     tmp_path = Path(tmp_name)
