@@ -20,7 +20,6 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from pycloud_parallel.controlplane import serialization as serialization_mod
 from pycloud_parallel.controlplane.code_version import _code_version_from_digest
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState
 from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
@@ -49,6 +48,7 @@ from pycloud_parallel.controlplane.node.results import (
     _resolve_object_refs_in_payload,
     _resolve_single_data_ref,
 )
+from pycloud_parallel.controlplane.pickle_stable_v1 import stable_pickle_loads
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.serialization import (
@@ -357,10 +357,16 @@ def test_task_pool_artifact_prepare_is_cached_between_put_and_create(tmp_path):
 
 def test_normalize_user_return_inlines_dataframe_when_limit_allows(tmp_path, monkeypatch):
     pd = pytest.importorskip("pandas")
+    from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setattr(serialization_mod, "INLINE_RESULT_HARD_LIMIT_BYTES", 8 * 1024 * 1024)
-    frame = pd.DataFrame([{"x": 1}, {"x": 2}])
-    status, result, err_type, err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
+    config_mod.reload_config()
+    try:
+        frame = pd.DataFrame([{"x": 1}, {"x": 2}])
+        status, result, err_type, err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
+        config_mod.reload_config()
 
     assert status == "SUCCEEDED"
     assert err_type == ""
@@ -3363,7 +3369,7 @@ def test_runtime_managed_globals_pickle_mode_keeps_binary_snapshot(tmp_path, mon
         value_path = Path(pool.managed_globals_scope_dir) / "values" / f"{item['sha256']}.bin"
         assert value_path.exists()
         assert not (Path(pool.managed_globals_scope_dir) / "values" / f"{item['sha256']}.json").exists()
-        assert serialization_mod.stable_pickle_loads(value_path.read_bytes()) == {"value": [1, 2, 3]}
+        assert stable_pickle_loads(value_path.read_bytes()) == {"value": [1, 2, 3]}
     finally:
         state.close()
 
