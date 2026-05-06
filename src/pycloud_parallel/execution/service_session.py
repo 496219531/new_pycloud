@@ -583,7 +583,10 @@ def _service_iter_item_calls(
     limit = _resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=max(1, int(item_count or 1)))
 
     def _generator() -> Iterator[ExecutionItem]:
-        payload_iter = enumerate(dict(payload or {}) for payload in payloads)
+        payload_iter = enumerate(
+            payload if isinstance(payload, dict) else {}
+            for payload in payloads
+        )
 
         with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="service-items") as executor:
             pending: Dict[object, int] = {}
@@ -634,7 +637,7 @@ async def _service_aiter_item_calls(
     refresh_status: bool,
     max_in_flight: Optional[int],
 ) -> AsyncIterator[ExecutionItem]:
-    items = [dict(payload or {}) for payload in payloads]
+    items = [payload if isinstance(payload, dict) else {} for payload in payloads]
     if not items:
         return
     semaphore = asyncio.Semaphore(_resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=len(items)))
