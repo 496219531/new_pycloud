@@ -223,11 +223,51 @@ class _LocalTaskPoolNodeClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         **kwargs: Any,
     ) -> DataRef:
-        del chunk_size, kwargs
+        del kwargs
         path = Path(file_path)
-        data = path.read_bytes()
         fmt = normalize_object_format(format, source_name=path.name, default="bin")
-        return self.upload_object_from_bytes(blob=data, format=fmt)
+        effective_chunk_size = max(1, int(chunk_size or OBJECT_CHUNK_SIZE_BYTES))
+        hasher = hashlib.sha256()
+        size_bytes = 0
+        tmp = tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="pycloud-local-object-",
+            suffix=f".{fmt}",
+            delete=False,
+            dir=str(self._state.artifact_dir),
+        )
+        try:
+            with tmp:
+                with path.open("rb") as fp:
+                    while True:
+                        chunk = fp.read(effective_chunk_size)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                        size_bytes += len(chunk)
+                        tmp.write(chunk)
+            digest = hasher.hexdigest()
+            object_id = object_id_from_sha256_hex(digest)
+            artifact, _cached = self._state.put_object_from_uploaded_file(
+                object_id=object_id,
+                format=fmt,
+                uploaded_path=tmp.name,
+                actual_sha256=digest,
+                size_bytes=size_bytes,
+            )
+        except Exception:
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
+        return DataRef(
+            ref_id=artifact.object_id,
+            storage_id=artifact.object_id,
+            format=artifact.format,
+            size_bytes=artifact.size_bytes,
+            materialize_as="path",
+            locator_kind="node_local",
+            node_id=self.node_id,
+            node_instance_id=self.node_instance_id,
+        )
 
     def submit_pool_tasks(
         self,

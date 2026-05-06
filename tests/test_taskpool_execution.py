@@ -8,6 +8,7 @@ import io
 import sys
 import tarfile
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -271,6 +272,42 @@ def test_task_pool_open_local_resolves_dataref_payload_and_result(tmp_path) -> N
         assert result_items[0].ok is True
         result_path = result_items[0].result
         assert result_path.read_bytes() == b"r" * (1024 * 1024 + 5)
+
+
+def test_task_pool_open_local_put_data_file_path_does_not_read_whole_file(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"from pathlib import Path\n\n"
+        b"def run(blob=None, **_kwargs):\n"
+        b"    return {'payload_size': Path(blob).stat().st_size}\n"
+    )
+    source = tmp_path / "local-taskpool-payload.bin"
+    source.write_bytes(b"x" * (1024 * 1024 + 11))
+
+    original_read_bytes = Path.read_bytes
+
+    def _guard_read_bytes(self):  # noqa: ANN001
+        if self == source:
+            raise AssertionError("local taskpool put_data(file_path) must not read the whole source file")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _guard_read_bytes)
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_file_dataref",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        ref = pool.put_data(source, format="bin")
+        payload_items = list(pool.imap_unordered([{"blob": ref}], timeout_sec=10.0, return_items=True))
+        assert payload_items[0].ok is True
+        assert payload_items[0].result == {"payload_size": source.stat().st_size}
 
 
 def test_task_pool_open_local_applies_managed_globals(tmp_path) -> None:
