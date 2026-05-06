@@ -27,7 +27,8 @@ from .client_transport import (
     _serialize_http_call_payload,
 )
 from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
-from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
+from pycloud_parallel.controlplane.data_plane_client import DataPlaneClient
+from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
@@ -327,10 +328,11 @@ class GatewayServiceClient:
         if ref is None:
             raise ValueError("service result is inline data; no download needed")
         self._touch_data_ref(ref)
-        resolved = resolve_data_ref(ref, target=self.target, timeout_sec=self.timeout_sec)
         try:
-            with client_mod.NodeControlClient(resolved.control_addr, timeout_sec=self.timeout_sec) as client:
-                return client.download_result_to_file(ref, target_path=target_path)
+            return DataPlaneClient(self.target, timeout_sec=self.timeout_sec).download_ref_to_file(
+                ref,
+                target_path=target_path,
+            )
         finally:
             self._release_data_ref_if_consumed(ref)
 
@@ -341,10 +343,11 @@ class GatewayServiceClient:
                 return response_or_data["data"]
             return response_or_data
         self._touch_data_ref(ref)
-        resolved = resolve_data_ref(ref, target=self.target, timeout_sec=self.timeout_sec)
         try:
-            with client_mod.NodeControlClient(resolved.control_addr, timeout_sec=self.timeout_sec) as client:
-                return client.fetch_result_ref_data(ref, target_path=target_path)
+            return DataPlaneClient(self.target, timeout_sec=self.timeout_sec).fetch_ref_data(
+                ref,
+                target_path=target_path,
+            )
         finally:
             self._release_data_ref_if_consumed(ref)
 

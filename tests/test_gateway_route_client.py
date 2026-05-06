@@ -157,3 +157,39 @@ def test_gateway_service_client_status_failure_without_cache_rejects_large_paylo
                 serialization_mode="structured_v1",
             )
     mocked_http.assert_not_called()
+
+
+def test_gateway_service_client_downloads_result_ref_via_data_plane(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
+
+    ref = DataRef(
+        ref_id="ref-gateway-result",
+        storage_id="sha256:" + ("1" * 64),
+        format="bin",
+        size_bytes=3,
+        materialize_as="bytes",
+        locator_kind="controlplane",
+        locator_token="127.0.0.1:50051",
+        control_addr="127.0.0.1:50061",
+    )
+    calls = []
+
+    class FakeDataPlaneClient:
+        def __init__(self, target, *, timeout_sec=30.0):
+            calls.append(("init", target, timeout_sec))
+
+        def download_ref_to_file(self, result_ref, *, target_path):
+            calls.append(("download", result_ref, target_path))
+            path = tmp_path / "result.bin"
+            path.write_bytes(b"abc")
+            return path
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_client.DataPlaneClient", FakeDataPlaneClient)
+    with patch("pycloud_parallel.controlplane.gateway_client.DataRegistryClient"):
+        client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
+        path = client.download_result_to_file({"ok": True, "data": ref}, target_path=str(tmp_path / "out.bin"))
+
+    assert path.read_bytes() == b"abc"
+    assert calls[0] == ("init", "127.0.0.1:50051", 5.0)
+    assert calls[1][0] == "download"
+    assert calls[1][1] is ref
