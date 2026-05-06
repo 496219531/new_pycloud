@@ -16,10 +16,11 @@ from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 
 
 class DataPlaneClient:
-    def __init__(self, target: str, *, timeout_sec: float = 30.0) -> None:
+    def __init__(self, target: str, *, timeout_sec: float = 30.0, infocenter_token: str = "") -> None:
         self.target = str(target or "").strip()
         self.base_url = target_to_base_url(self.target)
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self.infocenter_token = str(infocenter_token or "").strip()
 
     def download_ref_to_file(self, result_ref: DataRef | object, *, target_path: str) -> Path:
         data_ref = maybe_data_ref(result_ref)
@@ -31,7 +32,8 @@ class DataPlaneClient:
         path = Path(target_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         url = f"{self.base_url}/data/refs/{quote(ref_id, safe='')}/download"
-        req = Request(url, method="GET")
+        headers = {"X-Infocenter-Token": self.infocenter_token} if self.infocenter_token else {}
+        req = Request(url, method="GET", headers=headers)
         try:
             with urlopen(req, timeout=self.timeout_sec) as resp:
                 with open(path, "wb") as fp:

@@ -3,12 +3,12 @@ from __future__ import annotations
 """Minimal result data-plane download facade for registered DataRefs."""
 
 import json
-from typing import Dict, Iterator, Tuple, Union
+from typing import Callable, Dict, Iterator, Tuple, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.data_registry import resolve_data_ref
+from pycloud_parallel.controlplane.data_registry import ResolvedDataRef, resolve_data_ref
 from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES
 from pycloud_parallel.controlplane.http_client import target_to_base_url
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
@@ -38,9 +38,10 @@ def _open_node_object_download(*, control_addr: str, object_id: str, timeout_sec
 
 
 class DataPlaneHttpApp:
-    def __init__(self, *, target: str, timeout_sec: float = 30.0) -> None:
+    def __init__(self, *, target: str, timeout_sec: float = 30.0, resolver: Callable[[DataRef], ResolvedDataRef] | None = None) -> None:
         self.target = str(target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self._resolver = resolver
 
     def handle_get(self, path: str) -> Union[Tuple[int, Dict[str, str], bytes], StreamingHttpResponse, None]:
         parsed = urlparse(path)
@@ -55,7 +56,10 @@ class DataPlaneHttpApp:
             return _error(400, "ref_id is required")
         request_ref = DataRef(ref_id=normalized_ref_id, storage_id=normalized_ref_id, locator_kind="controlplane", locator_token=self.target)
         try:
-            resolved = resolve_data_ref(request_ref, target=self.target, timeout_sec=self.timeout_sec)
+            if self._resolver is not None:
+                resolved = self._resolver(request_ref)
+            else:
+                resolved = resolve_data_ref(request_ref, target=self.target, timeout_sec=self.timeout_sec)
         except KeyError:
             return _error(404, "data ref not found")
         except Exception as exc:

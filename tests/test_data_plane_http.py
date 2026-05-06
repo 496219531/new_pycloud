@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
 from pycloud_parallel.controlplane.data_plane_http import DataPlaneHttpApp
@@ -157,6 +157,103 @@ def test_infocenter_data_plane_downloads_registered_object(tmp_path):
         with urlopen(f"{info_server.base_url}/data/refs/ref-result-1/download", timeout=10.0) as resp:
             assert resp.headers.get("X-Pycloud-Object-Id") == uploaded.object_id
             assert resp.headers.get("X-Pycloud-Object-Format") == "bin"
+            assert resp.read() == blob
+    finally:
+        info_server.stop()
+        node_server.stop()
+        node_state.close()
+
+
+def test_infocenter_data_registry_public_view_hides_node_locator(tmp_path):
+    info_state = InfoCenterState()
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    try:
+        info_server.start()
+        info_state.register_data_ref_record(
+            ref=DataRef(
+                ref_id="ref-public-view",
+                storage_id="sha256:" + ("2" * 64),
+                format="bin",
+                size_bytes=12,
+                locator_kind="node_control",
+                locator_token="127.0.0.1:50061",
+                control_addr="127.0.0.1:50061",
+            ),
+            node_id="node-public-view",
+            node_instance_id="node-public-view-inst",
+            control_addr="127.0.0.1:50061",
+            locator_kind="node_control",
+            locator_token="127.0.0.1:50061",
+            replicas=(
+                {
+                    "control_addr": "127.0.0.1:50061",
+                    "node_id": "node-public-view",
+                    "node_instance_id": "node-public-view-inst",
+                },
+            ),
+        )
+
+        with urlopen(f"{info_server.base_url}/data/resolve/ref-public-view", timeout=10.0) as resp:
+            import json
+
+            entry = json.loads(resp.read().decode("utf-8"))["entry"]
+        assert entry["locator_kind"] == "controlplane"
+        assert entry["locator_token"] == ""
+        assert entry["control_addr"] == ""
+        assert entry["replicas"] == []
+
+        with urlopen(f"{info_server.base_url}/data/refs", timeout=10.0) as resp:
+            import json
+
+            refs = json.loads(resp.read().decode("utf-8"))["refs"]
+        assert refs[0]["control_addr"] == ""
+        assert refs[0]["replicas"] == []
+    finally:
+        info_server.stop()
+
+
+def test_infocenter_data_endpoints_require_auth_when_token_is_set(tmp_path):
+    info_state = InfoCenterState()
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state, auth_token="secret-token")
+    node_state = NodeControlState(
+        node_id="node-data-auth-01",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "node_data_auth_01"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    node_server = NodeControlHttpServer(bind="127.0.0.1:0", state=node_state)
+    blob = b"auth-data-plane"
+    try:
+        info_server.start()
+        node_server.start()
+        with NodeControlClient(node_server.base_url, timeout_sec=10.0) as client:
+            uploaded = client.upload_object_from_bytes(blob=blob, format="bin")
+        info_state.register_data_ref_record(
+            ref=DataRef(
+                ref_id="ref-auth-download",
+                storage_id=uploaded.object_id,
+                format="bin",
+                size_bytes=len(blob),
+                locator_kind="controlplane",
+                locator_token=info_server.base_url,
+            ),
+            replicas=({"control_addr": node_server.base_url},),
+        )
+
+        try:
+            urlopen(f"{info_server.base_url}/data/refs/ref-auth-download/download", timeout=10.0)
+            raise AssertionError("expected unauthorized data-plane download")
+        except HTTPError as exc:
+            assert exc.code == 401
+
+        req = Request(
+            f"{info_server.base_url}/data/refs/ref-auth-download/download",
+            headers={"X-Infocenter-Token": "secret-token"},
+            method="GET",
+        )
+        with urlopen(req, timeout=10.0) as resp:
             assert resp.read() == blob
     finally:
         info_server.stop()

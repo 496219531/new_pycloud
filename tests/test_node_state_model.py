@@ -1362,6 +1362,7 @@ def test_data_registry_resolve_rejects_only_unhealthy_instance_replica(monkeypat
 def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
     from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import DataRegistryClient
+    from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
     from pycloud_parallel.controlplane.server import build_controlplane_server
 
     controlplane = build_controlplane_server("127.0.0.1:0")
@@ -1393,13 +1394,15 @@ def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
         assert registered["ok"] is True
         assert registered["entry"]["ref_id"] == ref.ref_id
 
-        resolved = client.resolve(ref)
-        assert resolved.control_addr == "127.0.0.1:50061"
-        assert resolved.via_registry is True
+        resolved_public = InfoCenterClient(controlplane.base_url, timeout_sec=5.0).resolve_data_ref(ref_id=ref.ref_id)
+        assert resolved_public["ok"] is True
+        assert resolved_public["entry"]["control_addr"] == ""
+        assert resolved_public["entry"]["replicas"] == []
 
         touched = client.touch(ref.ref_id)
         assert touched["ok"] is True
         assert touched["entry"]["ref_id"] == ref.ref_id
+        assert touched["entry"]["control_addr"] == ""
 
         released = client.release(ref.ref_id)
         assert released["ok"] is True

@@ -18,8 +18,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.data.ref import coerce_data_ref
+from pycloud_parallel.data.ref import DataRef, coerce_data_ref
 from pycloud_parallel.controlplane.config import get_infocenter_http_body_limit_bytes
+from pycloud_parallel.controlplane.data_registry import ResolvedDataRef
 from pycloud_parallel.controlplane.data_plane_http import DataPlaneHttpApp
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
@@ -433,8 +434,8 @@ def _parse_node_capability(payload: object) -> NodeCapability:
     return NodeCapability.from_dict(payload if isinstance(payload, dict) else None)
 
 
-def _serialize_data_registry_entry(entry: DataRegistryEntry) -> Dict[str, object]:
-    return {
+def _serialize_data_registry_entry(entry: DataRegistryEntry, *, public: bool = True) -> Dict[str, object]:
+    data = {
         "ref_id": str(entry.ref_id or ""),
         "storage_id": str(entry.storage_id or ""),
         "logical_type": str(entry.logical_type or ""),
@@ -459,6 +460,81 @@ def _serialize_data_registry_entry(entry: DataRegistryEntry) -> Dict[str, object
         "last_at": _dt_text(entry.last_at),
         "ttl_sec": int(entry.ttl_sec or 0),
     }
+    if public:
+        data["control_addr"] = ""
+        data["replicas"] = []
+        locator_kind = str(data.get("locator_kind", "") or "").strip().lower()
+        if locator_kind == "node_control":
+            data["locator_kind"] = "controlplane"
+            data["locator_token"] = ""
+    return data
+
+
+def _resolve_data_ref_record_for_data_plane(state: InfoCenterState, ref) -> ResolvedDataRef:
+    data_ref = coerce_data_ref(ref)
+    entry = state.resolve_data_ref_record(data_ref.ref_id)
+    replicas = [
+        dict(item)
+        for item in (entry.replicas or ())
+        if isinstance(item, dict) and str(item.get("control_addr", "") or "").strip()
+    ]
+    if str(entry.control_addr or "").strip():
+        replicas.append(
+            {
+                "control_addr": str(entry.control_addr or "").strip(),
+                "node_id": str(entry.node_id or ""),
+                "node_instance_id": str(entry.node_instance_id or ""),
+            }
+        )
+    normalized_replicas = []
+    seen = set()
+    for item in replicas:
+        control_addr = str(item.get("control_addr", "") or "").strip()
+        if not control_addr or control_addr in seen:
+            continue
+        seen.add(control_addr)
+        node_instance_id = str(item.get("node_instance_id", "") or "").strip()
+        if node_instance_id:
+            try:
+                node_state = state.get_node(node_instance_id)
+            except Exception:
+                node_state = None
+            if node_state is not None and not bool(getattr(node_state, "healthy", True)):
+                continue
+        normalized_replicas.append(
+            {
+                "control_addr": control_addr,
+                "node_id": str(item.get("node_id", "") or ""),
+                "node_instance_id": node_instance_id,
+            }
+        )
+    if not normalized_replicas:
+        raise KeyError("data ref has no healthy node replica")
+    best = normalized_replicas[0]
+    resolved_ref = DataRef(
+        ref_id=str(entry.ref_id or ""),
+        storage_id=str(entry.storage_id or entry.ref_id or ""),
+        logical_type=str(entry.logical_type or ""),
+        format=str(entry.format or ""),
+        size_bytes=int(entry.size_bytes or 0),
+        materialize_as=str(entry.materialize_as or "auto"),
+        locator_kind="node_control",
+        locator_token=str(best.get("control_addr", "") or ""),
+        consume_on_read=bool(entry.consume_on_read),
+        node_id=str(best.get("node_id", "") or entry.node_id or ""),
+        node_instance_id=str(best.get("node_instance_id", "") or entry.node_instance_id or ""),
+        control_addr=str(best.get("control_addr", "") or ""),
+    )
+    return ResolvedDataRef(
+        ref=resolved_ref,
+        control_addr=str(best.get("control_addr", "") or ""),
+        node_id=str(best.get("node_id", "") or entry.node_id or ""),
+        node_instance_id=str(best.get("node_instance_id", "") or entry.node_instance_id or ""),
+        locator_kind="node_control",
+        locator_token=str(best.get("control_addr", "") or ""),
+        via_registry=True,
+        replicas=tuple(normalized_replicas),
+    )
 
 
 def _parse_service_timing_metrics(node_metadata: Dict[str, object]) -> Dict[str, Dict[str, object]]:
@@ -1046,7 +1122,10 @@ class InfoCenterHttpServer:
         self.state = state or InfoCenterState()
         self.gateway_app = gateway_app
         self.job_queue = job_queue
-        self.data_plane_app = DataPlaneHttpApp(target="")
+        self.data_plane_app = DataPlaneHttpApp(
+            target="",
+            resolver=lambda ref: _resolve_data_ref_record_for_data_plane(self.state, ref),
+        )
         env_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
         self.auth_token = str(auth_token or env_token or "").strip()
         self._server: Optional[ThreadingHTTPServer] = None
@@ -1422,7 +1501,8 @@ class InfoCenterHttpServer:
                     if isinstance(handled_data, StreamingHttpResponse):
                         self._send_stream(handled_data)
                     else:
-                        self._send(*handled_data)
+                        code, headers, raw = handled_data
+                        self._send_body(code, raw, content_type=str(headers.get("Content-Type", "application/octet-stream")), extra_headers=headers)
                     return
                 if parsed.path == "/nodes":
                     qs = parse_qs(parsed.query)
@@ -1565,7 +1645,7 @@ class InfoCenterHttpServer:
             def _requires_auth(self, path: str) -> bool:
                 if not self.server_ref.auth_token:
                     return False
-                return path.startswith("/nodes") or path.startswith("/jobs") or path.startswith("/ops")
+                return path.startswith("/nodes") or path.startswith("/jobs") or path.startswith("/ops") or path.startswith("/data")
 
             def _check_auth(self) -> bool:
                 token = self.server_ref.auth_token

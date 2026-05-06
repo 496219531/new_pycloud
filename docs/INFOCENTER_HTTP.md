@@ -220,6 +220,8 @@ http://127.0.0.1:50051/ops
 
 其中 `replicas` 是控制面 registry 的附加副本元数据。
 
+如果 InfoCenter 配置了 token，`/data/...` 接口需要携带 `X-Infocenter-Token` 或 bearer token。
+
 ### 2.7 `GET /data/resolve/{ref_id}`
 
 解析某个 `DataRef` 条目。
@@ -229,9 +231,9 @@ http://127.0.0.1:50051/ops
 1. `storage_id`
 2. `format`
 3. `materialize_as`
-4. `control_addr`
-5. `replicas`
-6. `ttl_sec`
+4. `ttl_sec`
+
+对外返回是 public 视图，不返回真实 node `control_addr` 或 `replicas`。真实落点只在 registry 内部保存，供 data-plane 下载时解析。
 
 ### 2.8 `GET /data/refs/{ref_id}/download`
 
@@ -258,6 +260,7 @@ http://127.0.0.1:50051/ops
 2. 不暴露真实 node 地址给外部响应体
 3. 不把整个对象读入 controlplane 内存
 4. client 侧如需 dataframe/ndarray 等还原，应继续使用 SDK materialize helper
+5. 如果 InfoCenter 配置了 token，下载请求同样需要认证
 
 ### 2.9 `POST /data/touch`
 
