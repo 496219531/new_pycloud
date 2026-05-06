@@ -235,6 +235,19 @@ class NodeControlState(NodeRuntimeBase):
         self._codes_dir.mkdir(parents=True, exist_ok=True)
         self._object_dir = self._artifact_dir / "objects"
         self._object_dir.mkdir(parents=True, exist_ok=True)
+        object_dir = str(self._object_dir)
+        self._data_store = DataStore(
+            object_dir=object_dir,
+            node_id=str(self.node_id or ""),
+            control_addr="",
+            put_uploaded_file_impl=self.put_object_from_uploaded_file,
+            store_path_impl=lambda path: _store_result_path(path, object_dir=object_dir),
+            store_dataframe_impl=lambda frame: _store_result_dataframe(frame, object_dir=object_dir),
+            store_series_impl=lambda series: _store_result_series(series, object_dir=object_dir),
+            store_ndarray_impl=lambda array: _store_result_ndarray(array, object_dir=object_dir),
+            register_stored_result_impl=self._register_stored_result_artifact_locked,
+            resolve_data_ref_impl=lambda ref: _resolve_single_data_ref(ref, object_dir=object_dir),
+        )
         self._runtime_managed_globals: Dict[Tuple[str, str, str], ManagedGlobalsState] = {}
         self._client_code_tokens: Dict[Tuple[str, str], str] = {}
         self._client_code_managed_globals: Dict[Tuple[str, str, str], Tuple[str, ...]] = {}
@@ -550,19 +563,7 @@ class NodeControlState(NodeRuntimeBase):
 
     @property
     def data_store(self) -> DataStore:
-        object_dir = str(self._object_dir)
-        return DataStore(
-            object_dir=object_dir,
-            node_id=str(self.node_id or ""),
-            control_addr="",
-            put_uploaded_file_impl=self.put_object_from_uploaded_file,
-            store_path_impl=lambda path: _store_result_path(path, object_dir=object_dir),
-            store_dataframe_impl=lambda frame: _store_result_dataframe(frame, object_dir=object_dir),
-            store_series_impl=lambda series: _store_result_series(series, object_dir=object_dir),
-            store_ndarray_impl=lambda array: _store_result_ndarray(array, object_dir=object_dir),
-            register_stored_result_impl=self._register_stored_result_artifact_locked,
-            resolve_data_ref_impl=lambda ref: _resolve_single_data_ref(ref, object_dir=object_dir),
-        )
+        return self._data_store
 
     def node_capability(self) -> NodeCapability:
         return detect_local_node_capability(
@@ -2922,9 +2923,10 @@ class NodeControlState(NodeRuntimeBase):
 
         if status_text == "SUCCEEDED":
             if isinstance(result, StoredResultArtifact):
+                data_store = self.data_store
                 with self._lock:
-                    self.data_store.register_stored_result(result)
-                result = self.data_store.result_ref_from_stored_artifact(result)
+                    data_store.register_stored_result(result)
+                result = data_store.result_ref_from_stored_artifact(result)
             finalize_end = time.perf_counter()
             with self._lock:
                 session = self._services.get(service_id)
@@ -3573,8 +3575,9 @@ class NodeControlState(NodeRuntimeBase):
                     else:
                         task.status = pb2.TASK_STATUS_SUCCEEDED
                         if isinstance(result, StoredResultArtifact):
-                            self.data_store.register_stored_result(result)
-                            task.result = self.data_store.result_ref_from_stored_artifact(result)
+                            data_store = self.data_store
+                            data_store.register_stored_result(result)
+                            task.result = data_store.result_ref_from_stored_artifact(result)
                         else:
                             task.result = {} if result is None else result
                         task.error_type = ""
