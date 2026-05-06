@@ -533,6 +533,84 @@ def test_put_data_ndarray_uses_file_upload_without_bytes_materialization(tmp_pat
     assert calls[0][1] == "npy"
 
 
+def test_put_data_dataframe_uses_file_upload_without_bundle_bytes_materialization():
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    from pathlib import Path
+    from pycloud_parallel.execution import support
+
+    calls = []
+    frame = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+
+    class _Client:
+        control_addr = "node-a"
+        node_id = "node-a"
+        node_instance_id = "node-a-1"
+
+        def upload_object_from_file(self, *, file_path, format, chunk_size):  # noqa: ANN001
+            path = Path(file_path)
+            calls.append((str(path), str(format), int(chunk_size), path.exists(), path.stat().st_size))
+            return DataRef(
+                ref_id="sha256:" + ("b" * 64),
+                storage_id="sha256:" + ("b" * 64),
+                format=format,
+                size_bytes=path.stat().st_size,
+                materialize_as="dataframe",
+                locator_kind="node_control",
+                locator_token=self.control_addr,
+                control_addr=self.control_addr,
+            )
+
+        def upload_object_from_bytes(self, **_kwargs):  # noqa: ANN003
+            raise AssertionError("dataframe put_data must not materialize bundle bytes")
+
+    ref = support._put_data_via_clients([_Client()], frame, format="parquet")
+
+    assert ref.object_id == "sha256:" + ("b" * 64)
+    assert ref.materialize_as == "dataframe"
+    assert len(calls) == 1
+    assert calls[0][1] == "dfbundle"
+
+
+def test_put_data_series_uses_file_upload_without_bundle_bytes_materialization():
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    from pathlib import Path
+    from pycloud_parallel.execution import support
+
+    calls = []
+    series = pd.Series([1.0, 2.0], name="nav")
+
+    class _Client:
+        control_addr = "node-a"
+        node_id = "node-a"
+        node_instance_id = "node-a-1"
+
+        def upload_object_from_file(self, *, file_path, format, chunk_size):  # noqa: ANN001
+            path = Path(file_path)
+            calls.append((str(path), str(format), int(chunk_size), path.exists(), path.stat().st_size))
+            return DataRef(
+                ref_id="sha256:" + ("c" * 64),
+                storage_id="sha256:" + ("c" * 64),
+                format=format,
+                size_bytes=path.stat().st_size,
+                materialize_as="series",
+                locator_kind="node_control",
+                locator_token=self.control_addr,
+                control_addr=self.control_addr,
+            )
+
+        def upload_object_from_bytes(self, **_kwargs):  # noqa: ANN003
+            raise AssertionError("series put_data must not materialize bundle bytes")
+
+    ref = support._put_data_via_clients([_Client()], series, format="parquet")
+
+    assert ref.object_id == "sha256:" + ("c" * 64)
+    assert ref.materialize_as == "series"
+    assert len(calls) == 1
+    assert calls[0][1] == "seriesbundle"
+
+
 def test_normalize_inbound_payload_deserializes_before_object_resolution() -> None:
     captured = {}
 
