@@ -3466,21 +3466,27 @@ class NodeControlState(NodeRuntimeBase):
 
     def service_reports(self, *, include_stopped: bool = False) -> List[pb2.ServiceRouteReport]:
         with self._lock:
-            out: List[pb2.ServiceRouteReport] = []
-            for session in self._services.values():
-                if not include_stopped and session.status == pb2.SERVICE_STATUS_STOPPED:
-                    continue
-                out.append(_build_service_route_report(session, in_flight=self._service_inflight_locked(session)))
-            return out
+            rows = [
+                (session, self._service_inflight_locked(session))
+                for session in self._services.values()
+                if include_stopped or session.status != pb2.SERVICE_STATUS_STOPPED
+            ]
+        return [
+            _build_service_route_report(session, in_flight=in_flight)
+            for session, in_flight in rows
+        ]
 
     def service_report_payloads(self, *, include_stopped: bool = False) -> List[Dict[str, object]]:
         with self._lock:
-            out: List[Dict[str, object]] = []
-            for session in self._services.values():
-                if not include_stopped and session.status == pb2.SERVICE_STATUS_STOPPED:
-                    continue
-                out.append(_build_service_report_payload(session, in_flight=self._service_inflight_locked(session)))
-            return out
+            rows = [
+                (session, self._service_inflight_locked(session))
+                for session in self._services.values()
+                if include_stopped or session.status != pb2.SERVICE_STATUS_STOPPED
+            ]
+        return [
+            _build_service_report_payload(session, in_flight=in_flight)
+            for session, in_flight in rows
+        ]
 
     def active_runtime_keys(self, *, limit: int = 10) -> List[str]:
         with self._lock:
