@@ -74,9 +74,10 @@ def _data_ref_from_registry_entry(entry: Dict[str, object], fallback: DataRef) -
 
 
 class DataRegistryClient:
-    def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+    def __init__(self, target: str, *, timeout_sec: float = 10.0, infocenter_token: str = "") -> None:
         self.target = str(target or "").strip()
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self.infocenter_token = str(infocenter_token or "").strip()
 
     def register(
         self,
@@ -93,7 +94,7 @@ class DataRegistryClient:
         data_ref = ref if isinstance(ref, DataRef) else coerce_data_ref(ref)
         from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
-        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec, infocenter_token=self.infocenter_token) as client:
             return client.register_data_ref(
                 ref=data_ref,
                 ttl_sec=ttl_sec,
@@ -108,13 +109,13 @@ class DataRegistryClient:
     def touch(self, ref_id: str) -> Dict[str, object]:
         from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
-        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec, infocenter_token=self.infocenter_token) as client:
             return client.touch_data_ref(ref_id=ref_id)
 
     def release(self, ref_id: str) -> Dict[str, object]:
         from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
-        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec) as client:
+        with InfoCenterClient(self.target, timeout_sec=self.timeout_sec, infocenter_token=self.infocenter_token) as client:
             return client.release_data_ref(ref_id=ref_id)
 
     def resolve(self, ref: DataRef | object) -> ResolvedDataRef:
@@ -168,7 +169,7 @@ class DataRegistryClient:
         if locator_kind in {"controlplane", "node_local", ""} and locator_token:
             from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
-            with InfoCenterClient(locator_token, timeout_sec=self.timeout_sec) as client:
+            with InfoCenterClient(locator_token, timeout_sec=self.timeout_sec, infocenter_token=self.infocenter_token) as client:
                 try:
                     payload = client.resolve_data_ref(ref_id=data_ref.ref_id)
                 except Exception:
@@ -326,8 +327,8 @@ class DataRegistryClient:
         )
 
 
-def resolve_data_ref(ref: DataRef | object, *, target: str = "", timeout_sec: float = 10.0) -> ResolvedDataRef:
-    return DataRegistryClient(target, timeout_sec=timeout_sec).resolve(ref)
+def resolve_data_ref(ref: DataRef | object, *, target: str = "", timeout_sec: float = 10.0, infocenter_token: str = "") -> ResolvedDataRef:
+    return DataRegistryClient(target, timeout_sec=timeout_sec, infocenter_token=infocenter_token).resolve(ref)
 
 
 __all__ = [

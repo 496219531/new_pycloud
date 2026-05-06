@@ -1218,7 +1218,7 @@ def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 
     class _FakeInfoCenterClient:
-        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0, **_kwargs) -> None:
             self.target = target
             self.timeout_sec = timeout_sec
 
@@ -1262,7 +1262,7 @@ def test_data_registry_resolve_skips_unhealthy_instance_replicas(monkeypatch) ->
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 
     class _FakeInfoCenterClient:
-        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0, **_kwargs) -> None:
             self.target = target
             self.timeout_sec = timeout_sec
 
@@ -1315,7 +1315,7 @@ def test_data_registry_resolve_rejects_only_unhealthy_instance_replica(monkeypat
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
 
     class _FakeInfoCenterClient:
-        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0, **_kwargs) -> None:
             self.target = target
             self.timeout_sec = timeout_sec
 
@@ -1411,6 +1411,38 @@ def test_data_registry_client_roundtrip_via_controlplane_http() -> None:
             client.resolve(ref)
     finally:
         controlplane.stop()
+
+
+def test_data_registry_client_uses_infocenter_token_for_data_endpoints() -> None:
+    from pycloud_parallel.data.ref import DataRef
+    from pycloud_parallel.controlplane.data_registry import DataRegistryClient
+    from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer
+    from pycloud_parallel.controlplane.infocenter_state import InfoCenterState
+
+    infocenter = InfoCenterHttpServer(bind="127.0.0.1:0", state=InfoCenterState(), auth_token="registry-secret")
+    infocenter.start()
+    try:
+        ref = DataRef(
+            ref_id="sha256:" + ("7" * 64),
+            storage_id="sha256:" + ("7" * 64),
+            format="bin",
+            size_bytes=7,
+            materialize_as="bytes",
+            locator_kind="controlplane",
+            locator_token=infocenter.base_url,
+        )
+        unauthenticated = DataRegistryClient(infocenter.base_url, timeout_sec=5.0)
+        with pytest.raises(RuntimeError, match="unauthorized"):
+            unauthenticated.register(ref, control_addr="127.0.0.1:50061")
+
+        client = DataRegistryClient(infocenter.base_url, timeout_sec=5.0, infocenter_token="registry-secret")
+        registered = client.register(ref, control_addr="127.0.0.1:50061")
+        assert registered["ok"] is True
+        assert registered["entry"]["control_addr"] == ""
+        assert client.touch(ref.ref_id)["ok"] is True
+        assert client.release(ref.ref_id)["ok"] is True
+    finally:
+        infocenter.stop()
 
 
 def test_infocenter_rejects_data_ref_registration_from_fenced_instance() -> None:

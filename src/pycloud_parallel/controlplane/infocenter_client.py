@@ -219,10 +219,16 @@ def _filter_nodes_by_runtime(
 class InfoCenterClient:
     """Low-level HTTP client for InfoCenter."""
 
-    def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+    def __init__(self, target: str, *, timeout_sec: float = 10.0, infocenter_token: str = "") -> None:
         self.target = target
         self.base_url = target_to_base_url(target)
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self.infocenter_token = str(infocenter_token or "").strip()
+
+    def _auth_headers(self) -> Dict[str, str]:
+        if not self.infocenter_token:
+            return {}
+        return {"X-Infocenter-Token": self.infocenter_token}
 
     def close(self) -> None:
         return None
@@ -503,6 +509,7 @@ class InfoCenterClient:
             method="POST",
             timeout_sec=self.timeout_sec,
             payload=payload,
+            headers=self._auth_headers(),
         )
 
     def resolve_data_ref(self, *, ref_id: str) -> Dict[str, object]:
@@ -516,6 +523,7 @@ class InfoCenterClient:
             path=f"/data/resolve/{quote(normalized_ref_id, safe='')}",
             method="GET",
             timeout_sec=self.timeout_sec,
+            headers=self._auth_headers(),
         )
 
     def touch_data_ref(self, *, ref_id: str) -> Dict[str, object]:
@@ -529,6 +537,7 @@ class InfoCenterClient:
             method="POST",
             timeout_sec=self.timeout_sec,
             payload={"ref_id": normalized_ref_id},
+            headers=self._auth_headers(),
         )
 
     def release_data_ref(self, *, ref_id: str) -> Dict[str, object]:
@@ -542,6 +551,7 @@ class InfoCenterClient:
             method="POST",
             timeout_sec=self.timeout_sec,
             payload={"ref_id": normalized_ref_id},
+            headers=self._auth_headers(),
         )
 
     def list_data_refs(
@@ -565,6 +575,7 @@ class InfoCenterClient:
             path=f"/data/refs?{params}",
             method="GET",
             timeout_sec=self.timeout_sec,
+            headers=self._auth_headers(),
         )
         refs = resp.get("refs", [])
         if not isinstance(refs, list):
