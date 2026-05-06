@@ -1045,14 +1045,19 @@ class _ConnectedService:
         return self._transport_client.download_result_to_file(response_or_data, target_path=target_path)
 
     def _prepare_discovery_route_payload(self, route: object, payload: Dict[str, object]) -> Dict[str, object]:
-        from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
+        from pycloud_parallel.controlplane.remote_payload import (
+            default_remote_call_object_threshold_bytes,
+            prepare_remote_call_payload,
+        )
 
         control_addr = str(getattr(route, "control_addr", "") or "").strip()
         if not control_addr:
             return dict(payload or {})
         with _node_control_client(control_addr, timeout_sec=self.timeout_sec) as route_client:
             prepare_kwargs = {
-                "object_threshold_bytes": self._client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+                "object_threshold_bytes": default_remote_call_object_threshold_bytes(
+                    effective_policy=self.effective_policy,
+                ),
             }
             if str(self.serialization_mode or "").strip() and self.serialization_mode != "legacy_v1":
                 prepare_kwargs["serialization_mode"] = self.serialization_mode

@@ -564,7 +564,7 @@ class NodeControlHttpApp:
 
     def _update_runtime_globals_bytes(self, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
         try:
-            payload, raw = _unpack_binary_sidecar(body)
+            payload, raw = unpack_binary_sidecar(body)
             client_id = str(payload.get("client_id", "") or "")
             code_version = str(payload.get("code_version", "") or "")
             runtime_key = str(payload.get("runtime_key", "") or "")
@@ -657,7 +657,7 @@ class NodeControlHttpApp:
 
     def _update_service_globals_bytes(self, service_id: str, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
         try:
-            payload, raw = _unpack_binary_sidecar(body)
+            payload, raw = unpack_binary_sidecar(body)
             owner_client_id = str(payload.get("owner_client_id", "") or "")
             service_token = str(payload.get("service_token", "") or "")
             transport_meta = payload.get("transport_values")

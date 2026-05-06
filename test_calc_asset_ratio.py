@@ -19,7 +19,7 @@ from calc_asset_ratio.ok import calc_asset_ratio
 import calc_asset_ratio_job_module
 
 
-CONTROLPLANE_TARGET = 'local' #"127.0.0.1:50051"
+CONTROLPLANE_TARGET = "127.0.0.1:50051"
 SERVICE_NAME = "calc_asset_ratio"
 MANAGED_GLOBAL_NAMES = (
     "bench_mark_yield_df",
@@ -29,6 +29,7 @@ MANAGED_GLOBAL_NAMES = (
 # pickle_stable_v1 currently uses the protobuf bytes payload path.
 TASKPOOL_SERIALIZATION_MODE = "pickle_stable_v1"
 SERVICE_HTTP_BYTES_SERIALIZATION_MODE = "pickle_stable_v1"
+GATEWAY_SERIALIZATION_MODE = "structured_v1"
 
 
 def get_fund_nav(fund_list: Sequence[int] | None = None, frequency: int = 1) -> pd.DataFrame:
@@ -98,8 +99,23 @@ def _connect_service():
     )
 
 
+def _connect_gateway_service():
+    return Service.connect(
+        target=CONTROLPLANE_TARGET,
+        service_name=SERVICE_NAME,
+        route="gateway",
+        timeout_sec=300.0,
+        serialization_mode=GATEWAY_SERIALIZATION_MODE,
+    )
+
+
 def _call_service(payload: dict[str, object]):
     with _connect_service() as service:
+        return _normalize_result_item(service.get_fund_asset_ratio.sync(**payload))
+
+
+def _call_gateway_service(payload: dict[str, object]):
+    with _connect_gateway_service() as service:
         return _normalize_result_item(service.get_fund_asset_ratio.sync(**payload))
 
 
@@ -154,7 +170,7 @@ def calc_fund_list_asset_ratio_gateway_service(
     async def async_calls():
         tasks = [
             asyncio.to_thread(
-                _call_service,
+                _call_gateway_service,
                 {
                     "fund_net_value_series": fund_net_value_series.dropna().copy(),
                     "strategy_type": strategy_type,
@@ -176,7 +192,7 @@ def calc_fund_list_asset_ratio_gateway_service_sync(
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
     ret = [
-        _call_service(
+        _call_gateway_service(
             {
                 "fund_net_value_series": fund_net_value_series.dropna().copy(),
                 "strategy_type": strategy_type,
@@ -197,7 +213,7 @@ def calc_fund_list_asset_ratio_gateway(
 ):
     fund_net_value_pvt = _fund_net_value_pivot(fund_list, frequency=frequency)
 
-    with _connect_service() as service:
+    with _connect_gateway_service() as service:
         status = service.status()
         print("gateway route_count:", status.get("route_count"))
         methods = set(service.methods)
@@ -505,12 +521,12 @@ if __name__ == "__main__":
     # result = calc_fund_list_asset_ratio(fund_list, 1, 1)
 
     # result = calc_fund_list_asset_ratio_sync(fund_list, 1, 1)
-    # result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
+    result = calc_fund_list_asset_ratio_gateway_service(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway_service_sync(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_gateway(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio3(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio2(fund_list, 1, 1)
-    result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
+    # result = calc_fund_list_asset_ratio_job(fund_list, 1, 1)
     # result = calc_fund_list_asset_ratio_service_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_taskpool_aunordered(fund_list,1,1)
     # result = calc_fund_list_asset_ratio_service_unordered(fund_list,1,1)

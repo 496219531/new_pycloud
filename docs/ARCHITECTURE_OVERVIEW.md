@@ -266,6 +266,7 @@
 1. `gateway_public`
    - profile=`default_safe`
    - default mode=`legacy_v1`
+   - inline payload limits 由 `default_safe` policy threshold 决定，可由管理员按环境调整
 2. `service_internal`
    - profile=`trusted_internal`
    - default mode=`pickle_stable_v1`

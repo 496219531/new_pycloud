@@ -32,7 +32,6 @@ from pycloud_parallel.controlplane.config import (
     CONTROL_HTTP_MAX_SEND_BYTES,
     FILE_HASH_CHUNK_SIZE_BYTES,
     INLINE_PAYLOAD_HARD_LIMIT_BYTES,
-    INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,
     get_dataref_upload_strategy,
@@ -579,6 +578,11 @@ def _estimate_managed_global_inline_size(value: Any) -> int:
     return estimate_payload_inline_size(value)
 
 
+def _default_inline_object_threshold_bytes() -> int:
+    policy = resolve_payload_policy("http_call")
+    return max(1, int(policy.inline_payload_soft_limit_bytes or 1))
+
+
 def _payload_policy_for_mode(
     mode: str,
     *,
@@ -814,7 +818,7 @@ def _prepare_task_payload_for_submit(
     client: Any,
     payload: Dict[str, object],
     *,
-    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    object_threshold_bytes: int = 0,
     serialization_mode: str = "",
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> Any:
@@ -1115,6 +1119,8 @@ def _stage_job_submit_value(
     ttl_sec: int,
     serialization_mode: str = "",
 ) -> Any:
+    inline_threshold = _default_inline_object_threshold_bytes()
+
     def _path_is_file(path: Path) -> bool:
         try:
             return path.exists() and path.is_file()
@@ -1145,7 +1151,7 @@ def _stage_job_submit_value(
                 ttl_sec=ttl_sec,
                 serialization_mode=serialization_mode,
             )
-        if estimate_payload_inline_size(value) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+        if estimate_payload_inline_size(value) <= inline_threshold:
             return value
         return _stage_job_value_as_data_ref(
             target=target,
@@ -1157,7 +1163,7 @@ def _stage_job_submit_value(
             serialization_mode=serialization_mode,
         )
     if isinstance(value, (bytes, bytearray, memoryview)):
-        if len(bytes(value)) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+        if len(bytes(value)) <= inline_threshold:
             return bytes(value)
         return _stage_job_value_as_data_ref(
             target=target,
@@ -1171,7 +1177,7 @@ def _stage_job_submit_value(
     if isinstance(value, os.PathLike):
         path = Path(value).expanduser()
         size = path.stat().st_size if _path_is_file(path) else estimate_payload_inline_size(str(path))
-        if size <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+        if size <= inline_threshold:
             return value
         return _stage_job_value_as_data_ref(
             target=target,
@@ -1186,8 +1192,8 @@ def _stage_job_submit_value(
         try:
             inline_size = estimate_payload_inline_size(value)
         except Exception:
-            inline_size = INLINE_PAYLOAD_SOFT_LIMIT_BYTES + 1
-        if inline_size > INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+            inline_size = inline_threshold + 1
+        if inline_size > inline_threshold:
             return _stage_job_value_as_data_ref(
                 target=target,
                 value=value,
@@ -1213,8 +1219,8 @@ def _stage_job_submit_value(
         try:
             inline_size = estimate_payload_inline_size(value)
         except Exception:
-            inline_size = INLINE_PAYLOAD_SOFT_LIMIT_BYTES + 1
-        if inline_size > INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+            inline_size = inline_threshold + 1
+        if inline_size > inline_threshold:
             return _stage_job_value_as_data_ref(
                 target=target,
                 value=value,
@@ -1250,7 +1256,7 @@ def _stage_job_submit_value(
             for item in value
         )
     try:
-        if estimate_payload_inline_size(value) <= INLINE_PAYLOAD_SOFT_LIMIT_BYTES:
+        if estimate_payload_inline_size(value) <= inline_threshold:
             return value
     except Exception:
         pass

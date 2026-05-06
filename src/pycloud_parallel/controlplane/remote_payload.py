@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Dict, Optional, Sequence
 
-from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES, resolve_payload_policy
+from pycloud_parallel.controlplane.config import get_payload_policy, resolve_payload_policy
 from pycloud_parallel.controlplane.effective_policy import EffectivePolicy
 from pycloud_parallel.controlplane.payload_transport import prepare_outbound_payload
 from pycloud_parallel.execution.support import (
@@ -14,19 +14,33 @@ from pycloud_parallel.execution.support import (
 )
 
 
+def default_remote_call_object_threshold_bytes(
+    *,
+    effective_policy: Optional[EffectivePolicy] = None,
+) -> int:
+    policy = resolve_payload_policy(
+        "http_call",
+        effective_policy=effective_policy,
+    )
+    return max(1, int(policy.inline_payload_soft_limit_bytes or 1))
+
+
 def prepare_remote_call_payload(
     clients: Sequence[object],
     payload: Optional[Dict[str, object]],
     *,
-    object_threshold_bytes: int = INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
+    object_threshold_bytes: int = 0,
     managed_global_field_names: Sequence[str] = (),
     serialization_mode: str = "",
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> Dict[str, object]:
+    threshold = int(object_threshold_bytes or 0) or default_remote_call_object_threshold_bytes(
+        effective_policy=effective_policy,
+    )
     policy = resolve_payload_policy(
         "http_call",
         effective_policy=effective_policy,
-        object_threshold_bytes=object_threshold_bytes,
+        object_threshold_bytes=threshold,
     )
     if managed_global_field_names:
         policy = replace(policy, managed_global_field_names=tuple(str(name) for name in managed_global_field_names))
@@ -48,5 +62,4 @@ def prepare_remote_call_payload(
         **prepare_kwargs,
     )
 
-
-__all__ = ["prepare_remote_call_payload"]
+__all__ = ["default_remote_call_object_threshold_bytes", "prepare_remote_call_payload"]

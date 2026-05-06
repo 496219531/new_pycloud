@@ -17,6 +17,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
 )
+from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size
 from .client_transport import (
     _call_route_http,
     _decode_http_response_body,
@@ -26,18 +27,12 @@ from .client_transport import (
 )
 from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient, resolve_data_ref
-from pycloud_parallel.controlplane.config import INLINE_PAYLOAD_SOFT_LIMIT_BYTES
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
-from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.controlplane.remote_payload import prepare_remote_call_payload
 from pycloud_parallel.controlplane.replica_client import _extract_result_ref
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
 from pycloud_parallel.execution.failover import STATUS_LOOKUP_FAILED, should_degrade
 client_mod = SimpleNamespace(
     _target_to_base_url=target_to_base_url,
-    NodeControlClient=NodeControlClient,
-    _prepare_remote_call_payload=prepare_remote_call_payload,
-    INLINE_PAYLOAD_SOFT_LIMIT_BYTES=INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
     _call_route_http=_call_route_http,
     _iter_route_http_stream=_iter_route_http_stream,
     _prefers_http_raw_bytes_body=_prefers_http_raw_bytes_body,
@@ -70,6 +65,48 @@ def _resolve_gateway_service_policy(
         context="jobqueue_session",
     )
     return str(policy.resolved_mode or default_mode).strip() or default_mode, policy
+
+
+def _validate_gateway_payload_shape(payload: object) -> None:
+    if maybe_data_ref(payload) is not None:
+        raise ValueError("gateway call payload cannot contain external DataRef; upload to gateway first")
+    if isinstance(payload, dict):
+        for value in payload.values():
+            _validate_gateway_payload_shape(value)
+        return
+    if isinstance(payload, (list, tuple)):
+        for value in payload:
+            _validate_gateway_payload_shape(value)
+
+
+def _prepare_gateway_payload(
+    payload: Optional[Dict[str, object]],
+    *,
+    serialization_mode: str,
+    effective_policy: Optional[EffectivePolicy],
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    prepared_payload = payload or {}
+    _validate_gateway_payload_shape(prepared_payload)
+    inline_size = estimate_payload_inline_size(prepared_payload)
+    gateway_policy = effective_policy or resolve_effective_policy(
+        get_policy_profile(get_default_policy_id_for_binding("gateway_public")),
+        requested_mode=str(serialization_mode or "").strip() or get_default_mode_for_binding("gateway_public"),
+        context="gateway_public",
+    )
+    soft_limit_bytes = int(gateway_policy.inline_payload_soft_limit_bytes or 0)
+    if inline_size > soft_limit_bytes:
+        raise ValueError(
+            "gateway payload is too large for public inline transport: "
+            f"size_bytes={inline_size} soft_limit_bytes={soft_limit_bytes}; "
+            "use gateway upload-call or a smaller payload"
+        )
+    serialized_payload = client_mod._serialize_http_call_payload(
+        prepared_payload,
+        context="service call payload",
+        mode=serialization_mode,
+        effective_policy=effective_policy,
+    )
+    return prepared_payload, serialized_payload
 
 
 class GatewayServiceClient:
@@ -134,60 +171,11 @@ class GatewayServiceClient:
             requires_route_aware_staging=False,
         ):
             raise RuntimeError(f"gateway status lookup failed for service_name={name!r}: {status_error}") from status_error
-        clients: List[object] = []
-        prepared_payload = payload or {}
-        try:
-            for item in routes:
-                if not isinstance(item, dict):
-                    continue
-                control_addr = str(item.get("control_addr", "") or "").strip()
-                if not control_addr:
-                    continue
-                clients.append(client_mod.NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
-            if clients:
-                prepare_kwargs = {
-                    "object_threshold_bytes": client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-                }
-                if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
-                    prepare_kwargs["serialization_mode"] = serialization_mode
-                if effective_policy is not None:
-                    prepare_kwargs["effective_policy"] = effective_policy
-                prepared_payload = client_mod._prepare_remote_call_payload(
-                    clients,
-                    payload,
-                    **prepare_kwargs,
-                )
-            else:
-                try:
-                    prepared_payload = payload or {}
-                    serialized_payload = client_mod._serialize_http_call_payload(
-                        prepared_payload,
-                        context="service call payload",
-                        mode=serialization_mode,
-                        effective_policy=effective_policy,
-                    )
-                except ValueError as exc:
-                    if status_error is not None and not should_degrade(
-                        STATUS_LOOKUP_FAILED,
-                        has_cached_candidate=bool(routes),
-                        requires_route_aware_staging=True,
-                    ):
-                        raise RuntimeError(
-                            "Gateway call requires route-aware staging but gateway status lookup failed "
-                            "and no cached routes are available"
-                        ) from exc
-                    raise
-            if clients:
-                serialized_payload = client_mod._serialize_http_call_payload(
-                    prepared_payload,
-                    context="service call payload",
-                    mode=serialization_mode,
-                    effective_policy=effective_policy,
-                )
-        finally:
-            for client in clients:
-                with contextlib.suppress(Exception):
-                    client.close()
+        prepared_payload, serialized_payload = _prepare_gateway_payload(
+            payload,
+            serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
+        )
         if client_mod._prefers_http_raw_bytes_body(serialization_mode, effective_policy=effective_policy):
             response = client_mod._call_route_http(
                 SimpleNamespace(
@@ -251,53 +239,11 @@ class GatewayServiceClient:
             requires_route_aware_staging=False,
         ):
             raise RuntimeError(f"gateway status lookup failed for service_name={name!r}: {status_error}") from status_error
-        clients: List[object] = []
-        prepared_payload = payload or {}
-        try:
-            for item in routes:
-                if not isinstance(item, dict):
-                    continue
-                control_addr = str(item.get("control_addr", "") or "").strip()
-                if not control_addr:
-                    continue
-                clients.append(client_mod.NodeControlClient(control_addr, timeout_sec=self.timeout_sec))
-            if clients:
-                prepare_kwargs = {
-                    "object_threshold_bytes": client_mod.INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-                }
-                if str(serialization_mode or "").strip() and str(serialization_mode).strip().lower() != "legacy_v1":
-                    prepare_kwargs["serialization_mode"] = serialization_mode
-                if effective_policy is not None:
-                    prepare_kwargs["effective_policy"] = effective_policy
-                prepared_payload = client_mod._prepare_remote_call_payload(
-                    clients,
-                    payload,
-                    **prepare_kwargs,
-                )
-            else:
-                try:
-                    prepared_payload = payload or {}
-                    client_mod._serialize_http_call_payload(
-                        prepared_payload,
-                        context="service call payload",
-                        mode=serialization_mode,
-                        effective_policy=effective_policy,
-                    )
-                except ValueError as exc:
-                    if status_error is not None and not should_degrade(
-                        STATUS_LOOKUP_FAILED,
-                        has_cached_candidate=bool(routes),
-                        requires_route_aware_staging=True,
-                    ):
-                        raise RuntimeError(
-                            "Gateway stream requires route-aware staging but gateway status lookup failed "
-                            "and no cached routes are available"
-                        ) from exc
-                    raise
-        finally:
-            for client in clients:
-                with contextlib.suppress(Exception):
-                    client.close()
+        prepared_payload, _serialized_payload = _prepare_gateway_payload(
+            payload,
+            serialization_mode=serialization_mode,
+            effective_policy=effective_policy,
+        )
         return client_mod._iter_route_http_stream(
             SimpleNamespace(
                 http_base_url=f"{self.base_url}/svc/{quote(name, safe='')}",

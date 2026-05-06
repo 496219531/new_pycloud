@@ -1633,44 +1633,19 @@ def test_gateway_supports_http_only_job_orchestrator_service():
 
 def test_gateway_service_client_call_uses_http_payload_policy(monkeypatch) -> None:
     captured = {}
-
-    class _FakeNodeControlClient:
-        def __init__(self, target: str, timeout_sec: float = 10.0) -> None:
-            del timeout_sec
-            self.target = target
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(
-        "pycloud_parallel.controlplane.gateway_client.client_mod.NodeControlClient",
-        _FakeNodeControlClient,
-    )
     monkeypatch.setattr(
         GatewayServiceClient,
         "get_status",
         lambda self, *, service_name: {"routes": [{"control_addr": "127.0.0.1:50061"}]},
     )
-
-    def _fake_prepare(payload, *, put_data, estimate_inline_size, policy, managed_global_policy=None):
-        del put_data, estimate_inline_size
-        del managed_global_policy
-        captured["mode"] = policy.mode
-        captured["preserve_args_kwargs_container"] = policy.preserve_args_kwargs_container
-        return dict(payload or {})
-
-    monkeypatch.setattr(
-        "pycloud_parallel.controlplane.remote_payload.prepare_outbound_payload",
-        _fake_prepare,
-    )
     monkeypatch.setattr(
         "pycloud_parallel.controlplane.gateway_client.client_mod._http_json_request",
-        lambda **kwargs: {"ok": True, "data": kwargs.get("payload", {})},
+        lambda **kwargs: captured.update({"payload": kwargs.get("payload", {})}) or {"ok": True, "data": kwargs.get("payload", {})},
     )
 
     with GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0) as gateway:
         resp = gateway.call(service_name="svc-demo", method="run", payload={"args": [1], "kwargs": {"x": 2}})
 
     assert resp["ok"] is True
-    assert captured["mode"] == "http_call"
-    assert captured["preserve_args_kwargs_container"] is True
+    assert captured["payload"]["args"] == [1]
+    assert captured["payload"]["kwargs"] == {"x": 2}

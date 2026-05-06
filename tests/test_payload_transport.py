@@ -75,7 +75,8 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     authority = get_config_limit_authority()
 
     assert authority.runtime_payload.inline_payload_soft_limit_bytes == 512 * 1024
-    assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 2 * 1024 * 1024
+    assert authority.policy_thresholds.default_safe.inline_payload_soft_limit_bytes == 2 * 1024 * 1024
+    assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 8 * 1024 * 1024
     assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
     assert authority.transport_bounds.control_http_max_send_bytes == 16 * 1024 * 1024
     assert authority.object_store_bounds.object_chunk_size_bytes == 256 * 1024

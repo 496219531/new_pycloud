@@ -57,6 +57,14 @@
   - 默认：`524288` (`512 KiB`)
   - 用于“建议转 DataRef”的阈值
 
+- `PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
+  - `default_safe` / `gateway_public` 的 inline payload soft limit
+  - 具体值可由管理员按环境调整
+
+- `PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES`
+  - `default_safe` / `gateway_public` 的 inline payload hard limit
+  - 具体值可由管理员按环境调整
+
 - `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES`
   - 默认：`2097152` (`2 MiB`)
   - 单个 inline payload 的硬限制

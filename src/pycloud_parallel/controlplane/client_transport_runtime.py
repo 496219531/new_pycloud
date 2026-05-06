@@ -8,9 +8,12 @@ task-pool submit/results keep their own business protocols on top.
 """
 
 import json
+import socket
 from dataclasses import dataclass, field
+from http.client import RemoteDisconnected
 from typing import Dict, Optional, Sequence, Tuple
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.client_transport import _normalize_http_response_body
@@ -53,6 +56,27 @@ def unpack_binary_sidecar(body: bytes) -> Tuple[Dict[str, object], bytes]:
     return meta, raw[_BINARY_META_LEN_BYTES + meta_len :]
 
 
+def _friendly_runtime_http_error(*, url: str, exc: BaseException) -> RuntimeError:
+    parsed = urlparse(url)
+    endpoint = parsed.netloc or parsed.path or url
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ConnectionRefusedError):
+        return RuntimeError(
+            f"cannot connect to {endpoint}; check that the target is correct and the service is listening on that address"
+        )
+    if isinstance(reason, socket.timeout):
+        return RuntimeError(
+            f"request to {endpoint} timed out; check that the target is reachable and the service is responding"
+        )
+    if isinstance(exc, RemoteDisconnected):
+        return RuntimeError(
+            f"connection to {endpoint} was closed by the remote service; check that the target points to a healthy compatible server"
+        )
+    if isinstance(exc, URLError):
+        return RuntimeError(f"http request to {endpoint} failed: {reason}")
+    return RuntimeError(f"http request to {endpoint} failed: {exc}")
+
+
 def runtime_http_request(
     *,
     base_url: str,
@@ -71,8 +95,9 @@ def runtime_http_request(
     else:
         raise ValueError("request.mode must be json or binary_sidecar")
 
+    url = f"{base_url.rstrip('/')}{request.path}"
     req = Request(
-        f"{base_url.rstrip('/')}{request.path}",
+        url,
         method=request.method.upper(),
         data=raw,
         headers=headers,
@@ -86,6 +111,10 @@ def runtime_http_request(
         except Exception:
             parsed = {"ok": False, "error": exc.reason}
         raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
+    except URLError as exc:
+        raise _friendly_runtime_http_error(url=url, exc=exc) from exc
+    except RemoteDisconnected as exc:
+        raise _friendly_runtime_http_error(url=url, exc=exc) from exc
     normalized = _normalize_http_response_body(parsed, control_addr=control_addr)
     if normalized.get("ok", False) is False:
         raise RuntimeError(str(normalized.get("error", "request failed")))
@@ -105,8 +134,9 @@ def runtime_http_request_for_binary_sidecar_response(
     if request.payload is not None:
         headers.setdefault("Content-Type", "application/json; charset=utf-8")
     headers.setdefault("Accept", "application/octet-stream")
+    url = f"{base_url.rstrip('/')}{request.path}"
     req = Request(
-        f"{base_url.rstrip('/')}{request.path}",
+        url,
         method=request.method.upper(),
         data=raw,
         headers=headers,
@@ -120,6 +150,10 @@ def runtime_http_request_for_binary_sidecar_response(
         except Exception:
             parsed = {"ok": False, "error": exc.reason}
         raise RuntimeError(str(parsed.get("error", exc.reason))) from exc
+    except URLError as exc:
+        raise _friendly_runtime_http_error(url=url, exc=exc) from exc
+    except RemoteDisconnected as exc:
+        raise _friendly_runtime_http_error(url=url, exc=exc) from exc
     normalized_meta = _normalize_http_response_body(meta, control_addr=control_addr)
     if normalized_meta.get("ok", False) is False:
         raise RuntimeError(str(normalized_meta.get("error", "request failed")))

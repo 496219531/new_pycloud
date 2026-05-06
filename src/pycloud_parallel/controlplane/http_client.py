@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+from http.client import RemoteDisconnected
 from typing import Dict, Optional
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -23,6 +25,27 @@ def target_to_base_url(target: str) -> str:
     if parsed.scheme in ("http", "https"):
         return text.rstrip("/")
     return f"http://{text}"
+
+
+def _friendly_http_connect_error(*, url: str, exc: BaseException) -> RuntimeError:
+    parsed = urlparse(url)
+    endpoint = parsed.netloc or parsed.path or url
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ConnectionRefusedError):
+        return RuntimeError(
+            f"cannot connect to {endpoint}; check that the target is correct and the service is listening on that address"
+        )
+    if isinstance(reason, socket.timeout):
+        return RuntimeError(
+            f"request to {endpoint} timed out; check that the target is reachable and the service is responding"
+        )
+    if isinstance(exc, RemoteDisconnected):
+        return RuntimeError(
+            f"connection to {endpoint} was closed by the remote service; check that the target points to a healthy compatible server"
+        )
+    if isinstance(exc, URLError):
+        return RuntimeError(f"http request to {endpoint} failed: {reason}")
+    return RuntimeError(f"http request to {endpoint} failed: {exc}")
 
 
 def http_json_request(
@@ -66,6 +89,10 @@ def http_json_request(
         except Exception:
             body = {"ok": False, "error": exc.reason}
         raise RuntimeError(str(body.get("error", exc.reason))) from exc
+    except URLError as exc:
+        raise _friendly_http_connect_error(url=url, exc=exc) from exc
+    except RemoteDisconnected as exc:
+        raise _friendly_http_connect_error(url=url, exc=exc) from exc
     if data.get("ok", False) is False and raise_on_error_response:
         raise RuntimeError(str(data.get("error", "request failed")))
     return data
