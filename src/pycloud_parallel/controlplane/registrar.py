@@ -202,6 +202,9 @@ class NodeInfoCenterRegistrar:
         metadata["pycloud_version"] = self._pycloud_version()
         accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
+        task_pool_reports = self.state.task_pool_reports()
+        service_reports = self.state.service_report_payloads(include_stopped=True)
+        active_runtimes = self.state.active_runtime_keys(limit=10)
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -217,7 +220,7 @@ class NodeInfoCenterRegistrar:
                 "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
                 "lease_expire_at": item.lease_expire_at.isoformat(),
             }
-            for item in self.state.task_pool_reports().values()
+            for item in task_pool_reports.values()
         ]
         resp = self._client.register_node(
             node_id=self.node_id,
@@ -228,9 +231,9 @@ class NodeInfoCenterRegistrar:
             tags=self.tags,
             version=self.version,
             metadata=metadata,
-            services=self.state.service_report_payloads(include_stopped=True),
+            services=service_reports,
             task_pools=task_pools,
-            active_runtimes=self.state.active_runtime_keys(limit=10),
+            active_runtimes=active_runtimes,
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
@@ -261,8 +264,8 @@ class NodeInfoCenterRegistrar:
             self.node_instance_id,
             self.control_addr,
             self._next_hb_sec,
-            len(self.state.service_report_payloads(include_stopped=True)),
-            len(self.state.task_pool_reports()),
+            len(service_reports),
+            len(task_pool_reports),
         )
         return True
 
@@ -273,6 +276,9 @@ class NodeInfoCenterRegistrar:
         metadata["pycloud_version"] = self._pycloud_version()
         accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
+        task_pool_reports = self.state.task_pool_reports()
+        service_reports = self.state.service_report_payloads(include_stopped=True)
+        active_runtimes = self.state.active_runtime_keys(limit=10)
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -288,7 +294,7 @@ class NodeInfoCenterRegistrar:
                 "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
                 "lease_expire_at": item.lease_expire_at.isoformat(),
             }
-            for item in self.state.task_pool_reports().values()
+            for item in task_pool_reports.values()
         ]
         resp = self._client.heartbeat_node(
             node_id=self.node_id,
@@ -303,9 +309,9 @@ class NodeInfoCenterRegistrar:
                 "mem_percent": 0.0,
             },
             metadata=metadata,
-            services=self.state.service_report_payloads(include_stopped=True),
+            services=service_reports,
             task_pools=task_pools,
-            active_runtimes=self.state.active_runtime_keys(limit=10),
+            active_runtimes=active_runtimes,
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=self.state.service_worker_used(),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
