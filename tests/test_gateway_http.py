@@ -139,12 +139,15 @@ def test_gateway_attaches_result_ref_locator_without_materializing() -> None:
 
     updated = body["data"]
     assert updated.object_id == ref.object_id
-    assert updated.locator_kind == "node_control"
-    assert updated.locator_token == route.control_addr
-    assert updated.control_addr == route.control_addr
+    assert updated.locator_kind == "controlplane"
+    assert updated.locator_token == "127.0.0.1:50051"
+    assert updated.control_addr == ""
     assert updated.node_id == route.node_id
     assert updated.node_instance_id == route.node_instance_id
     assert calls
+    assert calls[0]["ref"].locator_kind == "node_control"
+    assert calls[0]["ref"].locator_token == route.control_addr
+    assert calls[0]["ref"].control_addr == route.control_addr
     assert calls[0]["control_addr"] == route.control_addr
 
 
@@ -1384,7 +1387,7 @@ def test_gateway_service_client_fetches_large_dataframe_result(tmp_path):
                 assert body["data"].node_id == "node-gw-large-01"
                 assert body["data"].locator_kind == "controlplane"
                 assert body["data"].locator_token == controlplane.base_url
-                assert body["data"].control_addr == node_target
+                assert body["data"].control_addr == ""
             else:
                 assert isinstance(body["data"], pd.DataFrame)
             frame = gateway.fetch_result_data(body)

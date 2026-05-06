@@ -26,7 +26,7 @@ from .client_transport import (
     _prefers_http_raw_bytes_body,
     _serialize_http_call_payload,
 )
-from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_locator
+from pycloud_parallel.data.ref import maybe_data_ref, with_data_ref_public_controlplane_locator
 from pycloud_parallel.controlplane.data_plane_client import DataPlaneClient
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
@@ -354,9 +354,8 @@ class GatewayServiceClient:
     def _attach_controlplane_locator(self, response: Dict[str, object]) -> Dict[str, object]:
         if not isinstance(response, dict) or "data" not in response:
             return response
-        updated = with_data_ref_locator(
+        updated = with_data_ref_public_controlplane_locator(
             response.get("data"),
-            locator_kind="controlplane",
             locator_token=self.target,
         )
         if updated is response.get("data"):

@@ -312,6 +312,29 @@ def with_data_ref_locator(
     )
 
 
+def with_data_ref_public_controlplane_locator(
+    value: Any,
+    *,
+    locator_token: str,
+    node_id: str = "",
+    node_instance_id: str = "",
+) -> Any:
+    normalized_token = str(locator_token or "").strip()
+    if not normalized_token:
+        return value
+    data_ref = maybe_data_ref(value)
+    if data_ref is None:
+        return value
+    return replace(
+        data_ref,
+        locator_kind="controlplane",
+        locator_token=normalized_token,
+        node_id=str(node_id or data_ref.node_id or "").strip(),
+        node_instance_id=str(node_instance_id or data_ref.node_instance_id or "").strip(),
+        control_addr="",
+    )
+
+
 __all__ = [
     "DATA_REF_SENTINEL",
     "DataRef",
@@ -331,4 +354,5 @@ __all__ = [
     "resolve_data_ref_materialize_as",
     "with_data_ref_control_addr",
     "with_data_ref_locator",
+    "with_data_ref_public_controlplane_locator",
 ]

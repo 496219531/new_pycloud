@@ -30,7 +30,14 @@ from .client_transport import (
     _iter_route_http_stream,
     _serialize_http_call_payload,
 )
-from pycloud_parallel.data.ref import DataRef, is_data_ref_payload, maybe_data_ref, with_data_ref_control_addr, with_data_ref_locator
+from pycloud_parallel.data.ref import (
+    DataRef,
+    is_data_ref_payload,
+    maybe_data_ref,
+    with_data_ref_control_addr,
+    with_data_ref_locator,
+    with_data_ref_public_controlplane_locator,
+)
 from pycloud_parallel.controlplane.gateway_cache import GatewayRouteCache
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.gateway_stage import GatewayStageManager
@@ -910,21 +917,21 @@ class GatewayHttpApp:
             body = dict(data)
             body["data"] = updated
             return body
-        updated = with_data_ref_locator(
+        registered_ref = with_data_ref_locator(
             data.get("data"),
-            locator_kind="node_control" if route_control_addr else "controlplane",
-            locator_token=route_control_addr or self.controlplane_target,
+            locator_kind="node_control",
+            locator_token=route_control_addr,
             node_id=str(route.node_id or ""),
             node_instance_id=str(route.node_instance_id or ""),
             control_addr=route_control_addr,
         )
-        if updated is data.get("data"):
+        if registered_ref is data.get("data"):
             return data
-        ref = maybe_data_ref(updated)
+        ref = maybe_data_ref(registered_ref)
         if ref is not None and callable(self.register_data_ref):
             try:
                 self.register_data_ref(
-                    ref=updated,
+                    ref=registered_ref,
                     node_id=str(route.node_id or ""),
                     node_instance_id=str(route.node_instance_id or ""),
                     control_addr=route_control_addr,
@@ -933,8 +940,14 @@ class GatewayHttpApp:
                 )
             except Exception:
                 pass
+        public_ref = with_data_ref_public_controlplane_locator(
+            registered_ref,
+            locator_token=self.controlplane_target,
+            node_id=str(route.node_id or ""),
+            node_instance_id=str(route.node_instance_id or ""),
+        )
         body = dict(data)
-        body["data"] = updated
+        body["data"] = public_ref
         return body
 
 

@@ -159,6 +159,8 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 4. 第一版 data-plane 只做结果下载，不做输入 upload
 5. data-plane 会内部 resolve 到真实 node，外部 client 不需要也不应该依赖 node 地址
 6. `GatewayServiceClient.fetch_result_data()` / `download_result_to_file()` 默认使用这条 data-plane 下载路径
+7. gateway 返回给外部 caller 的 `DataRef` 只保留 controlplane locator，不返回真实 node `control_addr`
+8. 真实 node 落点只保存在 controlplane registry 内部，供 data-plane 下载时解析
 
 Gateway 当前提供：
 
