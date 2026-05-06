@@ -147,6 +147,9 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 1. `gateway_public` 默认仍然禁止 `pickle_stable_v1`
 2. internal/discovery/owner HTTP 路径才允许 `pickle_stable_v1`
 3. route-aware staging / DataRef 语义不因 HTTP raw-bytes body 而改变
+4. `gateway_public` 当前只适合小型 inline payload/result
+5. 它不是大对象上传/下载通道
+6. 超过 public inline 阈值时，当前行为是失败，而不是自动转 `DataRef`
 
 Gateway 当前提供：
 
@@ -169,6 +172,7 @@ Gateway 路径：
 1. 通过 Gateway 代理
 2. 更稳定
 3. 更适合外部 caller
+4. 当前更适合作为轻量 public RPC 入口，而不是重数据平面
 
 Discovery 路径：
 

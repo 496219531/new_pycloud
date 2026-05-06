@@ -103,6 +103,30 @@ def test_config_env_loader_and_reload_share_defaults(monkeypatch) -> None:
         config.reload_config()
 
 
+def test_core_client_payload_paths_do_not_import_default_safe_payload_constants_directly() -> None:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    scanned_files = [
+        root / "src/pycloud_parallel/controlplane/gateway_client.py",
+        root / "src/pycloud_parallel/controlplane/discovery_client.py",
+        root / "src/pycloud_parallel/controlplane/remote_payload.py",
+        root / "src/pycloud_parallel/execution/service_session.py",
+        root / "src/pycloud_parallel/execution/support.py",
+    ]
+    banned_terms = {
+        "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+        "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
+    }
+    violations = []
+    for path in scanned_files:
+        text = path.read_text(encoding="utf-8")
+        for term in banned_terms:
+            if term in text:
+                violations.append(f"{path.relative_to(root)} references {term} directly")
+    assert not violations, "Payload limit consumers should resolve policy thresholds through helpers:\n" + "\n".join(violations)
+
+
 def test_managed_globals_control_limit_clamps_policy_and_control_bounds() -> None:
     assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=1000, control_send_bytes=2000) == 1000
     assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=2000, control_send_bytes=1000) == 1000

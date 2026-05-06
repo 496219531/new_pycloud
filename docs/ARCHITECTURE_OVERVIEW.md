@@ -267,6 +267,7 @@
    - profile=`default_safe`
    - default mode=`legacy_v1`
    - inline payload limits 由 `default_safe` policy threshold 决定，可由管理员按环境调整
+   - 当前定位是轻量 public RPC 入口，不是大对象传输通道
 2. `service_internal`
    - profile=`trusted_internal`
    - default mode=`pickle_stable_v1`
@@ -355,6 +356,13 @@ client/controlplane 侧允许 `service` 和 `taskpool` 共享一套轻量会话�
 5. `service` 不改成 task submit/results 协议
 
 低频创建链路也允许共享一层薄 helper：source/artifact 规范化、runtime/package/deps/managed globals 参数整理、InfoCenter 选点外层编排、并发 create replica 骨架。这个共享只发生在 client/controlplane 侧的创建前半段，不进入 node 热路径，也不改变两者运行期协议。
+
+gateway public 还有一个需要特别记住的边界：
+
+1. 当前允许的只是小型 inline payload/result
+2. 它不自动把超阈值 payload 转成 DataRef
+3. 它不承担大对象上传/下载职责
+4. 这里的 payload soft limit 语义更接近“public inline max”，而不是“建议 objectify”
 
 动态部署还有一个 code version / owner 控制域约束：
 

@@ -81,6 +81,14 @@
   - 默认：`4194304` (`4 MiB`)
   - 单个 inline result 的硬限制；超出后更容易走对象缓存 / `DataRef`
 
+补充边界：
+
+1. 多数 internal path 上，payload soft limit 的语义是“超过后更倾向于 objectify / DataRef”
+2. 但 `gateway_public` 当前不是这样
+3. `gateway_public` 不自动做大对象上传，也不接受 external `DataRef`
+4. 因此在 `gateway_public` 上，payload soft limit 当前应理解为“public inline max”
+5. 具体阈值仍然来自 `default_safe` policy threshold，可由管理员按环境调整
+
 ### 2.2 object / file chunk
 
 - `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
