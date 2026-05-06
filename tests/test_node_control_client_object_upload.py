@@ -441,6 +441,29 @@ def test_upload_object_from_file_sends_file_without_reading_whole_file(tmp_path,
         state.close()
 
 
+def test_upload_object_from_file_segment_path_avoids_server_side_read_bytes(tmp_path, monkeypatch):
+    server, target, state = _start_nodeobject_http_server("node-object-http-file-segment", str(tmp_path / "node_object_http_file_segment"))
+    source = tmp_path / "payload-segmented.dat"
+    source.write_bytes(b"segment upload should stream" * 128)
+    state._object_segment_max_bytes = 1024 * 1024  # noqa: SLF001
+
+    original_read_bytes = Path.read_bytes
+
+    def _fail_source_read_bytes(self):  # noqa: ANN001
+        if self == source:
+            raise AssertionError("upload_object_from_file must not read the whole source file into memory")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _fail_source_read_bytes)
+    try:
+        with HttpNodeObjectClient(target, timeout_sec=10.0) as client:
+            ref = client.upload_object_from_file(file_path=str(source), format="bin")
+            assert client.download_object_bytes(object_id=ref.object_id) == source.open("rb").read()
+    finally:
+        server.stop()
+        state.close()
+
+
 def test_http_object_download_to_file_streams_chunks(tmp_path, monkeypatch):
     blob = b"streamed-object" * 10000
     reads = []

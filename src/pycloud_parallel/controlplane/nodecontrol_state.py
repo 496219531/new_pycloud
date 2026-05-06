@@ -89,6 +89,7 @@ from pycloud_parallel.controlplane.node.object_meta import (
     _write_object_meta,
 )
 from pycloud_parallel.controlplane.node.results import (
+    _append_file_to_segment,
     _append_bytes_to_segment,
     _artifact_exists,
     _object_artifact_from_meta,
@@ -1699,11 +1700,12 @@ class NodeControlState(NodeRuntimeBase):
 
             now = utc_now()
             if max(0, int(size_bytes or 0)) <= max(0, int(self._object_segment_max_bytes)):
-                result = _append_bytes_to_segment(
+                result = _append_file_to_segment(
                     self._object_dir,
                     object_id=actual_object_id,
                     fmt=normalized_format,
-                    blob=tmp_path.read_bytes(),
+                    source_path=tmp_path,
+                    size_bytes=max(0, int(size_bytes or 0)),
                     materialize_as="path",
                     created_at=now,
                 )

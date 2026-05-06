@@ -505,6 +505,62 @@ def _append_bytes_to_segment(
     )
 
 
+def _append_file_to_segment(
+    object_dir: Path,
+    *,
+    object_id: str,
+    fmt: str,
+    source_path: Path,
+    size_bytes: int,
+    materialize_as: str,
+    created_at: Optional[datetime] = None,
+) -> StoredResultArtifact:
+    root = Path(object_dir).resolve()
+    segments_root = _segments_dir(root)
+    segments_root.mkdir(parents=True, exist_ok=True)
+    normalized_size = max(0, int(size_bytes or source_path.stat().st_size))
+    lock = _segment_writer_lock(root)
+    with lock:
+        key = _segment_writer_key(root)
+        current_segment = Path(_SEGMENT_WRITER_STATE.get(key, "")).resolve() if _SEGMENT_WRITER_STATE.get(key) else None
+        if (
+            current_segment is None
+            or not current_segment.exists()
+            or (current_segment.stat().st_size + normalized_size) > max(1, int(OBJECT_SEGMENT_TARGET_BYTES))
+        ):
+            current_segment = segments_root / f"segment-{os.getpid()}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.bin"
+            current_segment.touch()
+            _SEGMENT_WRITER_STATE[key] = str(current_segment)
+        with current_segment.open("ab") as out_fp:
+            offset = out_fp.tell()
+            with source_path.open("rb") as in_fp:
+                shutil.copyfileobj(in_fp, out_fp)
+        relpath = _segment_relpath(root, current_segment)
+    current_time = created_at or utc_now()
+    _write_object_meta_with_retry(
+        root,
+        object_id=object_id,
+        fmt=fmt,
+        size_bytes=normalized_size,
+        created_at=current_time,
+        last_at=current_time,
+        storage_backend="segment",
+        segment_relpath=relpath,
+        segment_offset=offset,
+        segment_length=normalized_size,
+    )
+    return StoredResultArtifact(
+        object_id=object_id,
+        format=normalize_object_format(fmt, default="bin"),
+        size_bytes=normalized_size,
+        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        storage_backend="segment",
+        segment_relpath=relpath,
+        segment_offset=offset,
+        segment_length=normalized_size,
+    )
+
+
 def _commit_result_file(
     source_path: Path,
     *,
