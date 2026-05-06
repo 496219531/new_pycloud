@@ -45,6 +45,7 @@
 4. taskpool 不会改成 service call/discovery 模型
 5. taskpool 保留 bytes batch submit/results 协议，因为它服务于批量异步和性能
 6. node 端 submit/call/result 热路径是性能敏感区，后续共享只允许发生在低频 create/status/control path
+7. service stream 只承载小型 inline item；单个 item 超过 inline result hard limit 时直接失败，不自动转 `DataRef`
 
 ## Startup Service
 

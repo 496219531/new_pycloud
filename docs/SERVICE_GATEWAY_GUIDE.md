@@ -162,6 +162,14 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 7. gateway 返回给外部 caller 的 `DataRef` 只保留 controlplane locator，不返回真实 node `control_addr`
 8. 真实 node 落点只保存在 controlplane registry 内部，供 data-plane 下载时解析
 
+Stream 边界：
+
+1. stream 是小型结果流，不是大对象传输通道
+2. 每个 stream item 在 node 写出前按 inline result hard limit 检查
+3. 单个 item 超限时，当前 stream 直接失败并结束
+4. stream 不自动把超限 item 转成 `DataRef`
+5. 大结果应使用普通 call / taskpool results / DataRef data-plane
+
 Gateway 当前提供：
 
 1. `POST /svc/{service_name}/call/{method}`

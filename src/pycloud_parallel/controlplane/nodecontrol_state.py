@@ -1009,8 +1009,7 @@ class NodeControlState(NodeRuntimeBase):
 
     def _stream_result_value_locked(self, result: Any) -> Any:
         if isinstance(result, StoredResultArtifact):
-            self._register_stored_result_artifact_locked(result)
-            return self.data_store.result_ref_from_stored_artifact(result)
+            raise ValueError("service stream item exceeds inline result limit; stream does not support DataRef or large result items")
         return result
 
     @staticmethod
@@ -1029,6 +1028,17 @@ class NodeControlState(NodeRuntimeBase):
             return value
 
         return json.dumps(serialize_arrow_compatible(_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
+
+    def _encode_checked_stream_item_line(self, event: Dict[str, object]) -> bytes:
+        line = self._encode_stream_line(event)
+        limit = get_payload_policy("result").inline_result_hard_limit_bytes
+        size = len(line)
+        if size > limit:
+            raise ValueError(
+                f"service stream item exceeds inline result limit: size_bytes={size} limit_bytes={limit}; "
+                "stream does not support large result items"
+            )
+        return line
 
     def _dependency_dir_for_code_version(self, code_version: str) -> Path:
         return _code_dependency_dir(self._artifact_dir, code_version=code_version)
@@ -3102,7 +3112,7 @@ class NodeControlState(NodeRuntimeBase):
                         with self._lock:
                             result = self._stream_result_value_locked(result)
                         item_count += 1
-                        yield self._encode_stream_line(
+                        yield self._encode_checked_stream_item_line(
                             {
                                 "event": "item",
                                 "index": int(event.get("item_index", item_count - 1) or (item_count - 1)),

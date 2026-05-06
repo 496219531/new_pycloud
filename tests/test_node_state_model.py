@@ -1213,6 +1213,50 @@ def test_data_store_builds_result_and_data_refs() -> None:
     assert result_ref.control_addr == "127.0.0.1:50061"
 
 
+def test_node_service_stream_rejects_oversized_inline_items(tmp_path, monkeypatch) -> None:
+    state = NodeControlState(
+        node_id="node-stream-large",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_stream_large"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class _TinyResultPolicy:
+        inline_result_hard_limit_bytes = 8
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.get_payload_policy", lambda mode: _TinyResultPolicy())
+    try:
+        with pytest.raises(ValueError, match="inline result limit"):
+            state._encode_checked_stream_item_line({"event": "item", "index": 0, "data": "small"})  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_node_service_stream_rejects_spilled_result_artifacts(tmp_path) -> None:
+    state = NodeControlState(
+        node_id="node-stream-spill",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_stream_spill"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    artifact = StoredResultArtifact(
+        object_id="sha256:" + ("6" * 64),
+        format="bin",
+        size_bytes=1024,
+        materialize_as="bytes",
+    )
+    try:
+        with state._lock:  # noqa: SLF001
+            with pytest.raises(ValueError, match="stream item exceeds inline result limit"):
+                state._stream_result_value_locked(artifact)  # noqa: SLF001
+    finally:
+        state.close()
+
+
 def test_data_registry_resolves_controlplane_data_ref(monkeypatch) -> None:
     from pycloud_parallel.data.ref import DataRef
     from pycloud_parallel.controlplane.data_registry import resolve_data_ref
