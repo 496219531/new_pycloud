@@ -442,7 +442,18 @@ class HttpNodeObjectClient:
     def download_object_to_file(self, *, object_id: str, target_path: str) -> Path:
         path = Path(target_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(self.download_object_bytes(object_id=object_id))
+        url = f"{self.base_url}/objects/{quote(str(object_id or '').strip(), safe='')}/download"
+        req = Request(url, method="GET")
+        try:
+            with urlopen(req, timeout=self.timeout_sec) as resp:
+                with open(path, "wb") as fp:
+                    while True:
+                        chunk = resp.read(max(1, int(OBJECT_CHUNK_SIZE_BYTES)))
+                        if not chunk:
+                            break
+                        fp.write(chunk)
+        except HTTPError as exc:
+            raise RuntimeError(self._error_message(exc)) from exc
         return path
 
     def pin_object(self, *, object_id: str, ref_id: str) -> bool:

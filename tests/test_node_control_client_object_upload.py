@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 import pytest
 
 from pycloud_parallel.controlplane.config import (
@@ -203,6 +204,42 @@ def test_http_object_file_roundtrip(tmp_path):
     finally:
         server.stop()
         state.close()
+
+
+def test_http_object_download_to_file_streams_chunks(tmp_path, monkeypatch):
+    blob = b"streamed-object" * 10000
+    reads = []
+
+    class FakeResponse:
+        def __init__(self):
+            self.offset = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def read(self, size=-1):
+            reads.append(size)
+            if size < 0:
+                raise AssertionError("download_object_to_file must not read the whole response at once")
+            if self.offset >= len(blob):
+                return b""
+            chunk = blob[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.node_object_http.urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    output = tmp_path / "streamed.bin"
+    with HttpNodeObjectClient("127.0.0.1:50061", timeout_sec=10.0) as client:
+        path = client.download_object_to_file(object_id="sha256:" + ("3" * 64), target_path=str(output))
+
+    assert Path(path) == output
+    assert output.read_bytes() == blob
+    assert reads
+    assert all(size > 0 for size in reads)
 
 
 def test_http_object_checksum_mismatch_errors(tmp_path):
