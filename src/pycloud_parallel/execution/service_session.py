@@ -1055,7 +1055,7 @@ class _ConnectedService:
 
         control_addr = str(getattr(route, "control_addr", "") or "").strip()
         if not control_addr:
-            return dict(payload or {})
+            return payload if isinstance(payload, dict) else {}
         with _node_control_client(control_addr, timeout_sec=self.timeout_sec) as route_client:
             prepare_kwargs = {
                 "object_threshold_bytes": default_remote_call_object_threshold_bytes(
