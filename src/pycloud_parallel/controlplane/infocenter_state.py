@@ -28,10 +28,6 @@ from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
-class _RouteSnapshot(Tuple[str, str, bool, NodeState, NodeServiceState]):
-    pass
-
-
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
     if value is None:
         return bool(default)
