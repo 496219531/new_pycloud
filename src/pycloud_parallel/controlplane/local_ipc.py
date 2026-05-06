@@ -151,14 +151,10 @@ def _make_local_pickle_payload_transport(
 ) -> Dict[str, object]:
     policy = get_local_service_payload_policy()
     normalized_payload = dict(payload or {})
-    prepared_payload = normalized_payload
-    try:
-        inline_size = _estimate_local_inline_size(normalized_payload)
-    except Exception:
-        inline_size = max(1, int(policy.inline_payload_soft_limit_bytes))
-    if inline_size > max(1, int(policy.inline_payload_soft_limit_bytes)):
+    raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
+    if len(raw_payload) > max(1, int(policy.inline_payload_soft_limit_bytes)):
         prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=serialization_mode)
-    raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
+        raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(
         len(raw_payload),
         limit_bytes=policy.inline_payload_hard_limit_bytes,

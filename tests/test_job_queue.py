@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
@@ -106,7 +107,7 @@ def test_startup_module_mount_decodes_inline_transport_adapter_at_invoke(tmp_pat
     assert body["data"]["task_generator_callable"] == "task_generator"
 
 
-def test_local_pickle_payload_transport_pickles_once_after_prepare(tmp_path, monkeypatch) -> None:
+def test_local_pickle_payload_transport_reuses_exact_pickle_when_within_soft_limit(tmp_path, monkeypatch) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
 
     real_pickle_dumps = pickle.dumps
@@ -117,11 +118,39 @@ def test_local_pickle_payload_transport_pickles_once_after_prepare(tmp_path, mon
         return real_pickle_dumps(value, protocol=protocol)
 
     monkeypatch.setattr(local_ipc_mod.pickle, "dumps", _counting_dumps)
-    monkeypatch.setattr(
-        local_ipc_mod,
-        "_estimate_local_inline_size",
-        lambda value: 10**9,
+
+    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+        {"items": [{"value": i} for i in range(2)]},
+        meta={"object_dir": str(tmp_path)},
     )
+
+    assert payload_transport
+    assert len(dump_calls) == 1
+
+
+def test_local_pickle_payload_transport_repickles_after_prepare_when_over_soft_limit(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
+
+    real_pickle_dumps = pickle.dumps
+    dump_calls: list[object] = []
+
+    def _counting_dumps(value, protocol=None):
+        dump_calls.append(value)
+        return real_pickle_dumps(value, protocol=protocol)
+
+    monkeypatch.setattr(local_ipc_mod.pickle, "dumps", _counting_dumps)
+    base_policy = local_ipc_mod.get_local_service_payload_policy()
+    forced_policy = replace(
+        base_policy,
+        limits=replace(
+            base_policy.limits,
+            inline_payload_soft_limit_bytes=1,
+            inline_payload_hard_limit_bytes=10**9,
+            inline_payload_request_limit_bytes=10**9,
+            inline_payload_estimate_threshold_bytes=1,
+        ),
+    )
+    monkeypatch.setattr(local_ipc_mod, "get_local_service_payload_policy", lambda: forced_policy)
 
     payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
         {"items": [{"value": i} for i in range(8)]},
@@ -129,7 +158,7 @@ def test_local_pickle_payload_transport_pickles_once_after_prepare(tmp_path, mon
     )
 
     assert payload_transport
-    assert len(dump_calls) == 1
+    assert len(dump_calls) == 2
 
 
 def test_startup_module_mount_decodes_transport_envelope_payload_at_invoke(tmp_path, monkeypatch) -> None:
