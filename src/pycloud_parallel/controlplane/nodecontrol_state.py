@@ -1363,15 +1363,15 @@ class NodeControlState(NodeRuntimeBase):
                 if not pool_id:
                     continue
                 inflight_by_pool[pool_id] = inflight_by_pool.get(pool_id, 0) + 1
-            reports: Dict[str, NodeTaskPoolInfo] = {}
-            for pool in self._task_pools.values():
-                if not (pool.is_running() or bool(pool.timing_metrics) or str(pool.stop_reason or "").strip()):
-                    continue
-                reports[pool.pool_id] = _build_task_pool_info(
-                    pool,
-                    in_flight=inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)),
-                )
-            return reports
+            rows = [
+                (pool, inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)))
+                for pool in self._task_pools.values()
+                if pool.is_running() or bool(pool.timing_metrics) or str(pool.stop_reason or "").strip()
+            ]
+        return {
+            pool.pool_id: _build_task_pool_info(pool, in_flight=in_flight)
+            for pool, in_flight in rows
+        }
 
     def _get_code_write_lock(self, code_version: str) -> threading.Lock:
         key = str(code_version or "").strip()
