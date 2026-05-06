@@ -143,20 +143,6 @@ def _prepare_local_payload(payload: Dict[str, object], *, meta: Dict[str, object
     )
 
 
-def _freeze_local_pickle_value(value: Any) -> Any:
-    if isinstance(value, memoryview):
-        return value.tobytes()
-    if isinstance(value, bytearray):
-        return bytes(value)
-    if isinstance(value, dict):
-        return {key: _freeze_local_pickle_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_freeze_local_pickle_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_freeze_local_pickle_value(item) for item in value)
-    return value
-
-
 def _make_local_pickle_payload_transport(
     payload: Dict[str, object],
     *,
@@ -164,11 +150,15 @@ def _make_local_pickle_payload_transport(
     serialization_mode: str = "",
 ) -> Dict[str, object]:
     policy = get_local_service_payload_policy()
-    frozen_payload = _freeze_local_pickle_value(dict(payload or {}))
-    raw_payload = pickle.dumps(frozen_payload, protocol=pickle.HIGHEST_PROTOCOL)
-    if len(raw_payload) > max(1, int(policy.inline_payload_soft_limit_bytes)):
+    normalized_payload = dict(payload or {})
+    prepared_payload = normalized_payload
+    try:
+        inline_size = _estimate_local_inline_size(normalized_payload)
+    except Exception:
+        inline_size = max(1, int(policy.inline_payload_soft_limit_bytes))
+    if inline_size > max(1, int(policy.inline_payload_soft_limit_bytes)):
         prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=serialization_mode)
-        raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
+    raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(
         len(raw_payload),
         limit_bytes=policy.inline_payload_hard_limit_bytes,

@@ -106,21 +106,30 @@ def test_startup_module_mount_decodes_inline_transport_adapter_at_invoke(tmp_pat
     assert body["data"]["task_generator_callable"] == "task_generator"
 
 
-def test_local_pickle_payload_transport_freezes_memoryview(tmp_path) -> None:
-    from pycloud_parallel.controlplane.local_ipc import _make_local_pickle_payload_transport
-    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
+def test_local_pickle_payload_transport_pickles_once_after_prepare(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
 
-    payload_transport = _make_local_pickle_payload_transport(
-        {
-            "blob": memoryview(b"abc123"),
-            "nested": {"items": [memoryview(b"xyz")]},
-        },
+    real_pickle_dumps = pickle.dumps
+    dump_calls: list[object] = []
+
+    def _counting_dumps(value, protocol=None):
+        dump_calls.append(value)
+        return real_pickle_dumps(value, protocol=protocol)
+
+    monkeypatch.setattr(local_ipc_mod.pickle, "dumps", _counting_dumps)
+    monkeypatch.setattr(
+        local_ipc_mod,
+        "_estimate_local_inline_size",
+        lambda value: 10**9,
+    )
+
+    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+        {"items": [{"value": i} for i in range(8)]},
         meta={"object_dir": str(tmp_path)},
     )
 
-    restored = decode_inline_transport_carrier(payload_transport, context="service_owner")
-    assert restored["blob"] == b"abc123"
-    assert restored["nested"]["items"][0] == b"xyz"
+    assert payload_transport
+    assert len(dump_calls) == 1
 
 
 def test_startup_module_mount_decodes_transport_envelope_payload_at_invoke(tmp_path, monkeypatch) -> None:
