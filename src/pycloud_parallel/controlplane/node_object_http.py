@@ -479,12 +479,13 @@ class HttpNodeObjectClient:
         if not path.exists():
             raise FileNotFoundError(f"file_path not found: {file_path}")
         effective_format = normalize_object_format(format, source_name=path.name)
-        digest = self._sha256_file(path, chunk_size=chunk_size)
-        object_id = object_id_from_sha256_hex(digest)
         mode = str(transfer_mode or "").strip().lower()
         if not mode or mode == "auto":
             mode = "single_pass_authoritative"
+        object_id = ""
         if mode == "known_digest_precheck" and trusted_precheck is not False:
+            digest = self._sha256_file(path, chunk_size=chunk_size)
+            object_id = object_id_from_sha256_hex(digest)
             existing = self._object_ref_if_exists(object_id=object_id, fallback_format=effective_format, fallback_size=path.stat().st_size)
             if existing is not None:
                 return existing
@@ -495,6 +496,9 @@ class HttpNodeObjectClient:
             "X-Pycloud-Integrity-Mode": integrity_mode,
         }
         if integrity_mode == "client_declared":
+            if not object_id:
+                digest = self._sha256_file(path, chunk_size=chunk_size)
+                object_id = object_id_from_sha256_hex(digest)
             headers["X-Pycloud-Object-Id"] = object_id
         data = self._upload_file_request(path=path, headers=headers, chunk_size=chunk_size)
         return _object_ref(

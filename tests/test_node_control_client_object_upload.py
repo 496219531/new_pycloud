@@ -111,7 +111,7 @@ def test_upload_object_client_declared_digest_mismatch_errors(tmp_path):
         state.close()
 
 
-def test_upload_object_from_file_auto_cache_miss_uses_single_pass_and_stores_digest(tmp_path, monkeypatch):
+def test_upload_object_from_file_auto_uses_single_pass_and_stores_digest(tmp_path, monkeypatch):
     monkeypatch.setenv("PYCLOUD_HOME", str(tmp_path / "pycloud_home"))
     server, target, state = _start_nodecontrol_server("node-object-file-01", str(tmp_path / "node_object_file_01"))
     upload_path = tmp_path / "upload.bin"
@@ -126,11 +126,124 @@ def test_upload_object_from_file_auto_cache_miss_uses_single_pass_and_stores_dig
         state.close()
 
 
-def test_upload_object_from_file_auto_cache_hit_uses_precheck_and_skips_upload(tmp_path, monkeypatch):
+def test_upload_object_from_file_auto_does_not_pre_hash(tmp_path, monkeypatch):
+    upload_path = tmp_path / "upload-auto.bin"
+    upload_path.write_bytes(b"default file upload should be single pass")
+    calls = {}
+
+    def _fail_sha256(self, path, *, chunk_size=0):  # noqa: ANN001
+        raise AssertionError("default file upload must not pre-hash")
+
+    def _fake_upload(self, *, path, headers, chunk_size=0):  # noqa: ANN001
+        calls["headers"] = dict(headers)
+        calls["path"] = Path(path)
+        return {
+            "ok": True,
+            "object_id": "sha256:" + ("1" * 64),
+            "format": "bin",
+            "size_bytes": upload_path.stat().st_size,
+        }
+
+    monkeypatch.setattr(HttpNodeObjectClient, "_sha256_file", _fail_sha256)
+    monkeypatch.setattr(HttpNodeObjectClient, "_upload_file_request", _fake_upload)
+
+    with HttpNodeObjectClient("http://127.0.0.1:1", timeout_sec=1.0) as client:
+        ref = client.upload_object_from_file(file_path=str(upload_path), format="bin")
+
+    assert ref.object_id == "sha256:" + ("1" * 64)
+    assert ref.size_bytes == upload_path.stat().st_size
+    assert calls["path"] == upload_path
+    assert calls["headers"]["X-Pycloud-Integrity-Mode"] == "server_authoritative"
+    assert "X-Pycloud-Object-Id" not in calls["headers"]
+
+
+def test_upload_object_from_file_single_pass_does_not_pre_hash_when_trusted_precheck_false(tmp_path, monkeypatch):
+    upload_path = tmp_path / "upload-single-pass.bin"
+    upload_path.write_bytes(b"single pass with trusted_precheck false")
+    calls = {}
+
+    def _fail_sha256(self, path, *, chunk_size=0):  # noqa: ANN001
+        raise AssertionError("single_pass_authoritative file upload must not pre-hash")
+
+    def _fake_upload(self, *, path, headers, chunk_size=0):  # noqa: ANN001
+        calls["headers"] = dict(headers)
+        return {
+            "ok": True,
+            "object_id": "sha256:" + ("2" * 64),
+            "format": "bin",
+            "size_bytes": upload_path.stat().st_size,
+        }
+
+    monkeypatch.setattr(HttpNodeObjectClient, "_sha256_file", _fail_sha256)
+    monkeypatch.setattr(HttpNodeObjectClient, "_upload_file_request", _fake_upload)
+
+    with HttpNodeObjectClient("http://127.0.0.1:1", timeout_sec=1.0) as client:
+        ref = client.upload_object_from_file(
+            file_path=str(upload_path),
+            format="bin",
+            transfer_mode="single_pass_authoritative",
+            trusted_precheck=False,
+        )
+
+    assert ref.object_id == "sha256:" + ("2" * 64)
+    assert calls["headers"]["X-Pycloud-Integrity-Mode"] == "server_authoritative"
+    assert "X-Pycloud-Object-Id" not in calls["headers"]
+
+
+def test_upload_object_from_file_known_digest_precheck_still_pre_hashes(tmp_path, monkeypatch):
+    upload_path = tmp_path / "upload-known.bin"
+    upload_path.write_bytes(b"known digest precheck")
+    digest = hashlib.sha256(upload_path.read_bytes()).hexdigest()
+    object_id = "sha256:" + digest
+    calls = {"hash": 0, "precheck": 0}
+
+    def _fake_sha256(self, path, *, chunk_size=0):  # noqa: ANN001
+        calls["hash"] += 1
+        assert Path(path) == upload_path
+        return digest
+
+    def _fake_precheck(self, *, object_id, fallback_format, fallback_size):  # noqa: ANN001
+        calls["precheck"] += 1
+        calls["precheck_object_id"] = object_id
+        calls["fallback_format"] = fallback_format
+        calls["fallback_size"] = fallback_size
+        return None
+
+    def _fake_upload(self, *, path, headers, chunk_size=0):  # noqa: ANN001
+        calls["headers"] = dict(headers)
+        return {
+            "ok": True,
+            "object_id": object_id,
+            "format": "bin",
+            "size_bytes": upload_path.stat().st_size,
+        }
+
+    monkeypatch.setattr(HttpNodeObjectClient, "_sha256_file", _fake_sha256)
+    monkeypatch.setattr(HttpNodeObjectClient, "_object_ref_if_exists", _fake_precheck)
+    monkeypatch.setattr(HttpNodeObjectClient, "_upload_file_request", _fake_upload)
+
+    with HttpNodeObjectClient("http://127.0.0.1:1", timeout_sec=1.0) as client:
+        ref = client.upload_object_from_file(
+            file_path=str(upload_path),
+            format="bin",
+            transfer_mode="known_digest_precheck",
+        )
+
+    assert ref.object_id == object_id
+    assert calls["hash"] == 1
+    assert calls["precheck"] == 1
+    assert calls["precheck_object_id"] == object_id
+    assert calls["fallback_format"] == "bin"
+    assert calls["fallback_size"] == upload_path.stat().st_size
+    assert calls["headers"]["X-Pycloud-Integrity-Mode"] == "client_declared"
+    assert calls["headers"]["X-Pycloud-Object-Id"] == object_id
+
+
+def test_upload_object_from_file_auto_reupload_returns_same_digest(tmp_path, monkeypatch):
     monkeypatch.setenv("PYCLOUD_HOME", str(tmp_path / "pycloud_home"))
     server, target, state = _start_nodecontrol_server("node-object-file-02", str(tmp_path / "node_object_file_02"))
     upload_path = tmp_path / "upload-hit.bin"
-    upload_path.write_bytes(b"cache hit precheck")
+    upload_path.write_bytes(b"repeat single pass upload")
     try:
         with NodeControlClient(target, timeout_sec=10.0) as client:
             first = client.upload_object_from_file(file_path=str(upload_path), format="bin")
@@ -142,11 +255,11 @@ def test_upload_object_from_file_auto_cache_hit_uses_precheck_and_skips_upload(t
         state.close()
 
 
-def test_upload_object_from_file_cache_hit_remote_miss_reuploads_client_declared(tmp_path, monkeypatch):
+def test_upload_object_from_file_auto_remote_miss_reuploads_authoritatively(tmp_path, monkeypatch):
     monkeypatch.setenv("PYCLOUD_HOME", str(tmp_path / "pycloud_home"))
     server, target, state = _start_nodecontrol_server("node-object-file-03", str(tmp_path / "node_object_file_03"))
     upload_path = tmp_path / "upload-retry.bin"
-    upload_path.write_bytes(b"cache hit remote miss")
+    upload_path.write_bytes(b"authoritative remote miss")
     try:
         with NodeControlClient(target, timeout_sec=10.0) as client:
             first = client.upload_object_from_file(file_path=str(upload_path), format="bin")
