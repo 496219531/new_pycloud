@@ -71,6 +71,18 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
         config.reload_config()
 
 
+def test_binding_payload_thresholds_follow_default_safe_policy() -> None:
+    soft, hard, result_hard = config.get_binding_payload_thresholds(
+        "gateway_public",
+        requested_mode="structured_v1",
+        context="gateway_public",
+    )
+
+    assert soft == config.DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES
+    assert hard == config.DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES
+    assert result_hard == config.DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES
+
+
 def test_core_transport_http_modules_do_not_import_body_limit_constants_directly() -> None:
     scanned_files = [
         ROOT / "src/pycloud_parallel/controlplane/client_transport.py",

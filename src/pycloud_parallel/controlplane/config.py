@@ -371,6 +371,34 @@ def get_policy_limit_defaults(policy_id: str) -> tuple[int, int, int]:
     )
 
 
+def get_binding_payload_thresholds(
+    binding_id: str,
+    *,
+    requested_mode: str = "",
+    context: str = "",
+) -> tuple[int, int, int]:
+    from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
+    from pycloud_parallel.controlplane.policy_profile import (
+        get_default_mode_for_binding,
+        get_default_policy_id_for_binding,
+        get_policy_profile,
+    )
+
+    normalized_binding = str(binding_id or "").strip().lower()
+    if not normalized_binding:
+        raise ValueError("binding_id is required")
+    effective = resolve_effective_policy(
+        get_policy_profile(get_default_policy_id_for_binding(normalized_binding)),
+        requested_mode=str(requested_mode or "").strip() or get_default_mode_for_binding(normalized_binding),
+        context=context,
+    )
+    return (
+        int(effective.inline_payload_soft_limit_bytes or 1),
+        int(effective.inline_payload_hard_limit_bytes or 1),
+        int(effective.inline_result_hard_limit_bytes or 1),
+    )
+
+
 def get_local_inline_limits() -> tuple[int, int]:
     local_hard = max(1, int(LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES))
     local_soft = min(max(1, int(LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), local_hard)

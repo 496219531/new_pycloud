@@ -272,7 +272,7 @@ def test_gateway_client_does_not_use_global_inline_payload_soft_limit_constant()
     text = (root / "src/pycloud_parallel/controlplane/gateway_client.py").read_text(encoding="utf-8")
 
     assert "INLINE_PAYLOAD_SOFT_LIMIT_BYTES" not in text
-    assert "get_default_policy_id_for_binding(\"gateway_public\")" in text
+    assert "get_binding_payload_thresholds(" in text
 
 
 def test_internal_http_decode_still_allows_system_data_ref() -> None:

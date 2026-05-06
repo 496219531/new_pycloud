@@ -18,6 +18,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_policy_profile,
 )
 from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size
+from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
 from .client_transport import (
     _call_route_http,
     _decode_http_response_body,
@@ -88,12 +89,14 @@ def _prepare_gateway_payload(
     prepared_payload = payload or {}
     _validate_gateway_payload_shape(prepared_payload)
     inline_size = estimate_payload_inline_size(prepared_payload)
-    gateway_policy = effective_policy or resolve_effective_policy(
-        get_policy_profile(get_default_policy_id_for_binding("gateway_public")),
-        requested_mode=str(serialization_mode or "").strip() or get_default_mode_for_binding("gateway_public"),
-        context="gateway_public",
-    )
-    soft_limit_bytes = int(gateway_policy.inline_payload_soft_limit_bytes or 0)
+    if effective_policy is not None:
+        soft_limit_bytes = int(effective_policy.inline_payload_soft_limit_bytes or 0)
+    else:
+        soft_limit_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+            "gateway_public",
+            requested_mode=str(serialization_mode or "").strip(),
+            context="gateway_public",
+        )
     if inline_size > soft_limit_bytes:
         raise ValueError(
             "gateway payload is too large for public inline transport: "
