@@ -231,7 +231,9 @@ class ServiceHttpGateway:
                         service_id = parts[1]
                         handled = extra_get_handler(service_id, parts[2:], qs)
                         if handled is not None:
-                            if len(handled) == 3:
+                            if isinstance(handled, StreamingHttpResponse):
+                                self._send_stream(handled)
+                            elif len(handled) == 3:
                                 code, resp, content_type = handled
                                 self._send_body(code, resp, content_type=str(content_type or "text/plain; charset=utf-8"))
                             else:

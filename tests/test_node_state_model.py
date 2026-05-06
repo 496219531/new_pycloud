@@ -2356,6 +2356,73 @@ def test_put_object_from_uploaded_file_uses_file_backend_for_large_objects(tmp_p
         node_state.close()
 
 
+def test_service_extra_object_get_streams_file_backend_object(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 1)
+    node_state = NodeControlState(
+        node_id="node-extra-object-stream-file-01",
+        artifact_dir=str(tmp_path / "code_cache_extra_object_stream_file"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"stream-file-object" * 32
+        uploaded_path = tmp_path / "upload-file-object.bin"
+        uploaded_path.write_bytes(blob)
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="bin",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+
+        response = node_state._service_extra_get_http("", ["objects", object_id], {})
+
+        assert isinstance(response, StreamingHttpResponse)
+        assert response.content_type == "application/octet-stream"
+        assert response.content_length == len(blob)
+        assert b"".join(response.body_iter) == blob
+    finally:
+        node_state.close()
+
+
+def test_service_extra_object_get_streams_segment_backend_object(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1024)
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 4096)
+    node_state = NodeControlState(
+        node_id="node-extra-object-stream-segment-01",
+        artifact_dir=str(tmp_path / "code_cache_extra_object_stream_segment"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"segment-object" * 16
+        uploaded_path = tmp_path / "upload-segment-object.bin"
+        uploaded_path.write_bytes(blob)
+        object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+        node_state.put_object_from_uploaded_file(
+            object_id=object_id,
+            format="bin",
+            uploaded_path=str(uploaded_path),
+            actual_sha256=hashlib.sha256(blob).hexdigest(),
+            size_bytes=len(blob),
+        )
+
+        response = node_state._service_extra_get_http("", ["objects", object_id], {})
+
+        assert isinstance(response, StreamingHttpResponse)
+        assert response.content_length == len(blob)
+        assert b"".join(response.body_iter) == blob
+    finally:
+        node_state.close()
+
+
 def test_release_object_removes_file_backend_object(tmp_path, monkeypatch):
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_MAX_BYTES", 1)
     monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.OBJECT_SEGMENT_TARGET_BYTES", 1)

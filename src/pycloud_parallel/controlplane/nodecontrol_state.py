@@ -3206,7 +3206,7 @@ class NodeControlState(NodeRuntimeBase):
         service_id: str,
         path_parts: List[str],
         query: Dict[str, List[str]],
-    ) -> Optional[Tuple[object, ...]]:
+    ) -> Optional[Union[Tuple[object, ...], StreamingHttpResponse]]:
         del service_id
         del query
         if len(path_parts) != 2 or path_parts[0] != "objects":
@@ -3214,13 +3214,36 @@ class NodeControlState(NodeRuntimeBase):
         object_id = unquote(str(path_parts[1] or ""))
         artifact = self.get_object_artifact(object_id)
         if getattr(artifact, "storage_backend", "file") == "segment":
-            with open(artifact.segment_path, "rb") as fp:
-                fp.seek(max(0, int(getattr(artifact, "segment_offset", 0) or 0)))
-                body = fp.read(max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes)))
+            source_path = Path(artifact.segment_path)
+            source_offset = max(0, int(getattr(artifact, "segment_offset", 0) or 0))
+            source_length = max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes))
         else:
-            with open(artifact.path, "rb") as fp:
-                body = fp.read()
-        return 200, body, "application/octet-stream"
+            source_path = Path(artifact.path)
+            source_offset = 0
+            source_length = max(0, int(getattr(artifact, "size_bytes", 0) or source_path.stat().st_size))
+
+        def _iter_file_chunks(chunk_size: int = 1024 * 1024):
+            remaining = source_length
+            with source_path.open("rb") as fp:
+                fp.seek(source_offset)
+                while remaining > 0:
+                    chunk = fp.read(min(max(1, int(chunk_size or 1)), remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingHttpResponse(
+            status_code=200,
+            body_iter=_iter_file_chunks(),
+            content_type="application/octet-stream",
+            extra_headers={
+                "X-Pycloud-Object-Id": str(artifact.object_id),
+                "X-Pycloud-Object-Format": str(artifact.format or ""),
+                "X-Pycloud-Object-Size-Bytes": str(int(source_length or 0)),
+            },
+            content_length=source_length,
+        )
 
     def call_service(
         self,
