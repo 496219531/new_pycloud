@@ -283,6 +283,12 @@ def stable_pickle_loads(blob: bytes | bytearray | memoryview) -> Any:
     return restore_from_pickle_stable(loaded)
 
 
+def stable_pickle_load_file(path: Any) -> Any:
+    with open(path, "rb") as fp:
+        loaded = pickle.load(fp)
+    return restore_from_pickle_stable(loaded)
+
+
 __all__ = [
     "_decode_dataframe_v1",
     "_decode_ndarray_v1",
@@ -292,6 +298,7 @@ __all__ = [
     "_encode_series_v1",
     "normalize_for_pickle_stable",
     "restore_from_pickle_stable",
+    "stable_pickle_load_file",
     "stable_pickle_dumps",
     "stable_pickle_loads",
 ]

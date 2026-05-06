@@ -3948,6 +3948,87 @@ def test_apply_managed_globals_allows_indirect_runtime_binding_for_task_pool(tmp
         state.close()
 
 
+def test_apply_managed_globals_pickle_mode_does_not_read_full_bytes(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-apply-managed-globals-pickle-01",
+        queue_capacity=16,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_apply_managed_globals_pickle"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = (
+            b"GLOBAL_STATE = None\n\n"
+            b"def apply_managed_globals(values, **_context):\n"
+            b"    return {'GLOBAL_STATE': values.get('cfg')}\n\n"
+            b"def run(**_kwargs):\n"
+            b"    return {'cfg': GLOBAL_STATE}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        artifact, _cached = state.put_code(
+            client_id="owner-apply-pickle",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_apply_globals_pickle_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            managed_global_names=["cfg"],
+            chunks=[blob],
+            validate_load=True,
+        )
+        globals_digest, updated_names = state.update_runtime_globals(
+            client_id="owner-apply-pickle",
+            code_version=artifact.code_version,
+            runtime_key="rt-apply-pickle",
+            code_token=state.get_client_code_token(client_id="owner-apply-pickle", code_version=artifact.code_version),
+            values={"cfg": {"value": [1, 2, 3]}},
+            serialization_mode="pickle_stable_v1",
+        )
+        assert globals_digest
+        assert updated_names == ["cfg"]
+
+        with state._lock:  # noqa: SLF001
+            artifact = state._codes[artifact.code_version]  # noqa: SLF001
+            managed_state = state._runtime_managed_globals[("owner-apply-pickle", artifact.code_version, "rt-apply-pickle")]  # noqa: SLF001
+
+        manifest_path = Path(managed_state.scope_dir) / "manifests" / f"{managed_state.globals_digest.replace('sha256:', '')}.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        value_digest = manifest["values"]["cfg"]["sha256"]
+        value_path = Path(managed_state.scope_dir) / "values" / f"{value_digest}.bin"
+        original_read_bytes = Path.read_bytes
+
+        def _guard_read_bytes(self):  # noqa: ANN001
+            if Path(self) == value_path:
+                raise AssertionError("managed globals pickle load must not read full bytes")
+            return original_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", _guard_read_bytes)
+
+        status, result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                work_dir=_code_data_dir(Path(state.artifact_dir), code_version=artifact.code_version),
+                method_name="run",
+                payload={},
+                payload_mode="task_submit",
+                serialization_mode="pickle_stable_v1",
+                managed_globals_scope_dir=managed_state.scope_dir,
+                managed_globals_digest=managed_state.globals_digest,
+            )
+        )
+
+        assert status == "SUCCEEDED"
+        assert err_type == ""
+        assert err_message == ""
+        assert result["cfg"] == {"value": [1, 2, 3]}
+    finally:
+        state.close()
+
+
 def test_managed_global_names_still_require_entry_globals_without_apply_hook(tmp_path):
     state = NodeControlState(
         node_id="node-managed-globals-strict-01",

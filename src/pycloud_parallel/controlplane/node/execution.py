@@ -47,6 +47,7 @@ from pycloud_parallel.controlplane.serialization import (
     is_inline_transport_carrier,
     log_payload_flow,
     serialize_arrow_compatible,
+    stable_pickle_load_file,
     stable_pickle_loads,
     summarize_payload_flow_value,
 )
@@ -1056,7 +1057,7 @@ def _apply_managed_globals_to_router(
             key_started = time.perf_counter()
             value_json_started = time.perf_counter()
             if value_codec == "pickle_stable_v1":
-                serialized_value = stable_pickle_loads(value_path.read_bytes())
+                serialized_value = stable_pickle_load_file(value_path)
             else:
                 serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
             key_value_json_ms = (time.perf_counter() - value_json_started) * 1000.0

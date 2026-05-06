@@ -25,7 +25,11 @@ from pycloud_parallel.data.ref import (
     is_data_ref_payload,
     maybe_data_ref,
 )
-from pycloud_parallel.controlplane.pickle_stable_v1 import stable_pickle_dumps, stable_pickle_loads
+from pycloud_parallel.controlplane.pickle_stable_v1 import (
+    stable_pickle_dumps,
+    stable_pickle_load_file,
+    stable_pickle_loads,
+)
 from pycloud_parallel.controlplane.serialization_mode import (
     resolve_declared_transport_mode,
     resolve_effective_serialization_mode,
