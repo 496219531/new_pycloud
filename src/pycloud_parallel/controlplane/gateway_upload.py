@@ -467,7 +467,7 @@ def collect_used_upload_slots(
         if str(slot or "").strip()
     }
     _rewritten, used_slots = rewrite_payload_with_uploaded_refs(
-        payload=deepcopy(dict(payload or {})),
+        payload=dict(payload or {}),
         refs_by_slot=placeholder_refs,
         file_map=file_map,
     )
