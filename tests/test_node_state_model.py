@@ -949,6 +949,25 @@ def test_series_object_upload_preserves_index_and_name():
         Path(tmp_name).unlink(missing_ok=True)
 
 
+def test_ndarray_object_upload_prefers_file_backed_source(tmp_path):
+    np = pytest.importorskip("numpy")
+
+    array = np.arange(12, dtype=np.int64).reshape(3, 4)
+    source = _serialize_data_for_object_ref(array, format="npy")
+
+    assert source.is_file is True
+    assert source.format == "npy"
+    assert source.materialize_as == "ndarray"
+
+    path = Path(source.file_path)
+    assert path.exists() is True
+    try:
+        restored = np.load(path, allow_pickle=False)
+        np.testing.assert_array_equal(restored, array)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_json_object_upload_roundtrip_supports_nested_series():
     pd = pytest.importorskip("pandas")
 

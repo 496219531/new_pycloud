@@ -495,6 +495,44 @@ def test_put_data_file_path_uses_file_upload_without_reading_whole_file(tmp_path
     assert calls == [(str(source), "bin", 256 * 1024)]
 
 
+def test_put_data_ndarray_uses_file_upload_without_bytes_materialization(tmp_path):
+    np = pytest.importorskip("numpy")
+    from pathlib import Path
+    from pycloud_parallel.execution import support
+
+    calls = []
+    array = np.arange(16, dtype=np.int64).reshape(4, 4)
+
+    class _Client:
+        control_addr = "node-a"
+        node_id = "node-a"
+        node_instance_id = "node-a-1"
+
+        def upload_object_from_file(self, *, file_path, format, chunk_size):  # noqa: ANN001
+            path = Path(file_path)
+            calls.append((str(path), str(format), int(chunk_size), path.exists(), path.stat().st_size))
+            return DataRef(
+                ref_id="sha256:" + ("a" * 64),
+                storage_id="sha256:" + ("a" * 64),
+                format=format,
+                size_bytes=path.stat().st_size,
+                materialize_as="ndarray",
+                locator_kind="node_control",
+                locator_token=self.control_addr,
+                control_addr=self.control_addr,
+            )
+
+        def upload_object_from_bytes(self, **_kwargs):  # noqa: ANN003
+            raise AssertionError("ndarray put_data must not materialize upload bytes")
+
+    ref = support._put_data_via_clients([_Client()], array, format="npy")
+
+    assert ref.object_id == "sha256:" + ("a" * 64)
+    assert ref.materialize_as == "ndarray"
+    assert len(calls) == 1
+    assert calls[0][1] == "npy"
+
+
 def test_normalize_inbound_payload_deserializes_before_object_resolution() -> None:
     captured = {}
 

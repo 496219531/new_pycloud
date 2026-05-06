@@ -359,6 +359,24 @@ def _file_upload_source(path: Path, *, format: str = "") -> _ObjectUploadSource:
     return _ObjectUploadSource(materialize_as="path", format=fmt, file_path=str(path))
 
 
+def _temp_file_upload_source(
+    *,
+    suffix: str,
+    format: str,
+    materialize_as: str,
+    write_bytes: Callable[[Path], None],
+) -> _ObjectUploadSource:
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-object-upload-", suffix=suffix)
+    os.close(fd)
+    path = Path(tmp_name)
+    try:
+        write_bytes(path)
+        return _ObjectUploadSource(materialize_as=materialize_as, format=format, file_path=str(path))
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def _serialize_data_for_object_ref(
     data: Any,
     *,
@@ -470,12 +488,14 @@ def _serialize_data_for_object_ref(
         import numpy as np
 
         if isinstance(data, np.ndarray):
-            import io
-
-            buf = io.BytesIO()
-            np.save(buf, data, allow_pickle=False)
             log_payload_flow("object_ref_upload", path_type="ndarray", format=(format or "npy"), summary=summarize_payload_flow_value(data))
-            return _ObjectUploadSource(materialize_as="ndarray", format=normalize_object_format(format or "npy", default="npy"), blob=buf.getvalue())
+            normalized_format = normalize_object_format(format or "npy", default="npy")
+            return _temp_file_upload_source(
+                suffix=".npy",
+                format=normalized_format,
+                materialize_as="ndarray",
+                write_bytes=lambda path: np.save(path, data, allow_pickle=False),
+            )
     except ImportError:
         pass
 
@@ -516,23 +536,27 @@ def _put_data_via_clients(
         serialization_mode=serialization_mode,
         default_serialization_mode=default_serialization_mode,
     )
-    if source.is_file:
-        return _upload_file_via_clients(
+    try:
+        if source.is_file:
+            return _upload_file_via_clients(
+                clients,
+                source.file_path,
+                fmt=source.format,
+                chunk_size=chunk_size,
+                materialize_as=normalize_materialize_as(source.materialize_as, default="path"),
+                no_clients_msg="no node clients available for object upload",
+            )
+        return _upload_blob_via_clients(
             clients,
-            source.file_path,
+            source.blob,
             fmt=source.format,
             chunk_size=chunk_size,
             materialize_as=normalize_materialize_as(source.materialize_as, default="path"),
             no_clients_msg="no node clients available for object upload",
         )
-    return _upload_blob_via_clients(
-        clients,
-        source.blob,
-        fmt=source.format,
-        chunk_size=chunk_size,
-        materialize_as=normalize_materialize_as(source.materialize_as, default="path"),
-        no_clients_msg="no node clients available for object upload",
-    )
+    finally:
+        if source.is_file and str(source.file_path or "").strip().startswith(tempfile.gettempdir()):
+            Path(str(source.file_path)).unlink(missing_ok=True)
 
 
 def _upload_file_via_clients(
