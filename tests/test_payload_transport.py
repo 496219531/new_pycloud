@@ -324,6 +324,47 @@ def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch
     assert stats["batch_bytes"][0] <= 1000
 
 
+def test_put_data_file_path_uses_file_upload_without_reading_whole_file(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+    from pycloud_parallel.execution import support
+
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"stream local path upload")
+    calls = []
+
+    class _Client:
+        control_addr = "node-a"
+        node_id = "node-a"
+        node_instance_id = "node-a-1"
+
+        def upload_object_from_file(self, *, file_path, format, chunk_size):  # noqa: ANN001
+            calls.append((str(file_path), str(format), int(chunk_size)))
+            return DataRef(
+                ref_id="sha256:" + ("f" * 64),
+                storage_id="sha256:" + ("f" * 64),
+                format=format,
+                size_bytes=source.stat().st_size,
+                materialize_as="path",
+                locator_kind="node_control",
+                locator_token=self.control_addr,
+                control_addr=self.control_addr,
+            )
+
+        def upload_object_from_bytes(self, **_kwargs):  # noqa: ANN003
+            raise AssertionError("file path put_data must use upload_object_from_file")
+
+    def _fail_read_bytes(self):  # noqa: ANN001
+        raise AssertionError("file path put_data must not read the whole file")
+
+    monkeypatch.setattr(Path, "read_bytes", _fail_read_bytes)
+
+    ref = support._put_data_via_clients([_Client()], source, format="bin")
+
+    assert ref.object_id == "sha256:" + ("f" * 64)
+    assert ref.materialize_as == "path"
+    assert calls == [(str(source), "bin", 256 * 1024)]
+
+
 def test_normalize_inbound_payload_deserializes_before_object_resolution() -> None:
     captured = {}
 

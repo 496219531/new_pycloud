@@ -103,16 +103,20 @@ def _put_local_payload_data(
         return existing
     from pycloud_parallel.execution.support import _serialize_data_for_object_ref
 
-    materialize_as, effective_format, blob = _serialize_data_for_object_ref(
+    source = _serialize_data_for_object_ref(
         value,
         format=format,
         default_serialization_mode=default_serialization_mode,
     )
+    if getattr(source, "is_file", False):
+        blob = Path(str(source.file_path)).read_bytes()
+    else:
+        blob = source.blob
     return _store_local_payload_blob(
         blob,
         meta=meta,
-        fmt=effective_format,
-        materialize_as=materialize_as,
+        fmt=source.format,
+        materialize_as=source.materialize_as,
     )
 
 

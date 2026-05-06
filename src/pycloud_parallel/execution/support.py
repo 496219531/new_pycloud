@@ -15,7 +15,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 from urllib.error import URLError
@@ -334,6 +334,31 @@ def _resolve_high_level_service_results(
     return resolved
 
 
+@dataclass(frozen=True)
+class _ObjectUploadSource:
+    materialize_as: str
+    format: str
+    blob: bytes = b""
+    file_path: str = ""
+
+    @property
+    def is_file(self) -> bool:
+        return bool(str(self.file_path or "").strip())
+
+    def __iter__(self):
+        if self.is_file:
+            raise TypeError("file upload source cannot be unpacked as bytes; use upload_object_from_file")
+        yield self.materialize_as
+        yield self.format
+        yield self.blob
+
+
+def _file_upload_source(path: Path, *, format: str = "") -> _ObjectUploadSource:
+    fmt = normalize_object_format(format, source_name=path.name)
+    log_payload_flow("object_ref_upload", path_type="file", format=fmt)
+    return _ObjectUploadSource(materialize_as="path", format=fmt, file_path=str(path))
+
+
 def _serialize_data_for_object_ref(
     data: Any,
     *,
@@ -341,7 +366,7 @@ def _serialize_data_for_object_ref(
     materialize_as: str = "auto",
     serialization_mode: str = "",
     default_serialization_mode: str = "",
-) -> Tuple[str, str, bytes]:
+) -> _ObjectUploadSource:
     log_payload_flow(
         "object_ref_upload_prepare",
         format=(format or "auto"),
@@ -361,21 +386,11 @@ def _serialize_data_for_object_ref(
             path = Path(data).expanduser()
             if not path.exists() or not path.is_file():
                 raise FileNotFoundError(f"path not found or not a file: {path}")
-            log_payload_flow(
-                "object_ref_upload",
-                path_type="file",
-                format=normalize_object_format(format, source_name=path.name),
-            )
-            return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+            return _file_upload_source(path, format=format)
         if isinstance(data, str):
             path = Path(data).expanduser()
             if path.exists() and path.is_file():
-                log_payload_flow(
-                    "object_ref_upload",
-                    path_type="string-file",
-                    format=normalize_object_format(format, source_name=path.name),
-                )
-                return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+                return _file_upload_source(path, format=format)
         blob = serialize_by_mode(data, mode=normalized_mode)
         if not isinstance(blob, (bytes, bytearray, memoryview)):
             blob = json.dumps(blob, ensure_ascii=False).encode("utf-8")
@@ -405,28 +420,18 @@ def _serialize_data_for_object_ref(
             format=normalized_mode,
             summary=summarize_payload_flow_value(data),
         )
-        return materialize_kind, normalized_mode, bytes(blob)
+        return _ObjectUploadSource(materialize_as=materialize_kind, format=normalized_mode, blob=bytes(blob))
 
     if isinstance(data, os.PathLike):
         path = Path(data).expanduser()
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"path not found or not a file: {path}")
-        log_payload_flow(
-            "object_ref_upload",
-            path_type="file",
-            format=normalize_object_format(format, source_name=path.name),
-        )
-        return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+        return _file_upload_source(path, format=format)
 
     if isinstance(data, str):
         path = Path(data).expanduser()
         if path.exists() and path.is_file():
-            log_payload_flow(
-                "object_ref_upload",
-                path_type="string-file",
-                format=normalize_object_format(format, source_name=path.name),
-            )
-            return "path", normalize_object_format(format, source_name=path.name), path.read_bytes()
+            return _file_upload_source(path, format=format)
         raise TypeError("plain string is not supported by put_data; pass it inline in payload or use an existing file path")
 
     try:
@@ -444,7 +449,7 @@ def _serialize_data_for_object_ref(
                 zf.writestr("data.parquet", parquet_buf.getvalue())
                 zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             log_payload_flow("object_ref_upload", path_type="dataframe", format="dfbundle", summary=summarize_payload_flow_value(data))
-            return "dataframe", "dfbundle", bundle_buf.getvalue()
+            return _ObjectUploadSource(materialize_as="dataframe", format="dfbundle", blob=bundle_buf.getvalue())
         if isinstance(data, pd.Series):
             import io
             import zipfile
@@ -457,7 +462,7 @@ def _serialize_data_for_object_ref(
                 zf.writestr("data.parquet", parquet_buf.getvalue())
                 zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             log_payload_flow("object_ref_upload", path_type="series", format="seriesbundle", summary=summarize_payload_flow_value(data))
-            return "series", "seriesbundle", bundle_buf.getvalue()
+            return _ObjectUploadSource(materialize_as="series", format="seriesbundle", blob=bundle_buf.getvalue())
     except ImportError:
         pass
 
@@ -470,18 +475,22 @@ def _serialize_data_for_object_ref(
             buf = io.BytesIO()
             np.save(buf, data, allow_pickle=False)
             log_payload_flow("object_ref_upload", path_type="ndarray", format=(format or "npy"), summary=summarize_payload_flow_value(data))
-            return "ndarray", normalize_object_format(format or "npy", default="npy"), buf.getvalue()
+            return _ObjectUploadSource(materialize_as="ndarray", format=normalize_object_format(format or "npy", default="npy"), blob=buf.getvalue())
     except ImportError:
         pass
 
     if isinstance(data, (dict, list)):
         log_payload_flow("object_ref_upload", path_type="json", format=(format or "json"), summary=summarize_payload_flow_value(data))
         serialized = serialize_arrow_compatible(data)
-        return "json", normalize_object_format(format or "json", default="json"), json.dumps(serialized, ensure_ascii=False).encode("utf-8")
+        return _ObjectUploadSource(
+            materialize_as="json",
+            format=normalize_object_format(format or "json", default="json"),
+            blob=json.dumps(serialized, ensure_ascii=False).encode("utf-8"),
+        )
 
     if isinstance(data, (bytes, bytearray, memoryview)):
         log_payload_flow("object_ref_upload", path_type="bytes", format=(format or "bin"), summary=summarize_payload_flow_value(data))
-        return "bytes", normalize_object_format(format or "bin", default="bin"), bytes(data)
+        return _ObjectUploadSource(materialize_as="bytes", format=normalize_object_format(format or "bin", default="bin"), blob=bytes(data))
 
     raise TypeError(
         f"put_data does not support type {type(data).__name__}; "
@@ -501,19 +510,71 @@ def _put_data_via_clients(
     existing = maybe_data_ref(data)
     if existing is not None:
         return existing
-    materialize_as, effective_format, blob = _serialize_data_for_object_ref(
+    source = _serialize_data_for_object_ref(
         data,
         format=format,
         serialization_mode=serialization_mode,
         default_serialization_mode=default_serialization_mode,
     )
+    if source.is_file:
+        return _upload_file_via_clients(
+            clients,
+            source.file_path,
+            fmt=source.format,
+            chunk_size=chunk_size,
+            materialize_as=normalize_materialize_as(source.materialize_as, default="path"),
+            no_clients_msg="no node clients available for object upload",
+        )
     return _upload_blob_via_clients(
         clients,
-        blob,
-        fmt=effective_format,
+        source.blob,
+        fmt=source.format,
         chunk_size=chunk_size,
-        materialize_as=normalize_materialize_as(materialize_as, default="path"),
+        materialize_as=normalize_materialize_as(source.materialize_as, default="path"),
         no_clients_msg="no node clients available for object upload",
+    )
+
+
+def _upload_file_via_clients(
+    clients: Sequence[Any],
+    file_path: str,
+    *,
+    fmt: str,
+    chunk_size: int,
+    materialize_as: str,
+    logical_type: str = "",
+    consume_on_read: bool = False,
+    no_clients_msg: str,
+) -> DataRef:
+    if not clients:
+        raise RuntimeError(no_clients_msg)
+    if get_dataref_upload_strategy() == "upload_once":
+        first_client = clients[0]
+        first = first_client.upload_object_from_file(
+            file_path=file_path,
+            format=fmt,
+            chunk_size=chunk_size,
+        )
+        return _data_ref_from_uploaded_object(
+            first,
+            client=first_client,
+            logical_type=logical_type,
+            materialize_as=materialize_as,
+            consume_on_read=consume_on_read,
+        )
+    refs = [
+        client.upload_object_from_file(
+            file_path=file_path,
+            format=fmt,
+            chunk_size=chunk_size,
+        )
+        for client in clients
+    ]
+    return _data_ref_from_replicated_upload_refs(
+        refs,
+        logical_type=logical_type,
+        materialize_as=materialize_as,
+        consume_on_read=consume_on_read,
     )
 
 
@@ -552,6 +613,21 @@ def _upload_blob_via_clients(
         )
         for client in clients
     ]
+    return _data_ref_from_replicated_upload_refs(
+        refs,
+        logical_type=logical_type,
+        materialize_as=materialize_as,
+        consume_on_read=consume_on_read,
+    )
+
+
+def _data_ref_from_replicated_upload_refs(
+    refs: Sequence[DataRef],
+    *,
+    logical_type: str,
+    materialize_as: str,
+    consume_on_read: bool,
+) -> DataRef:
     object_ids = {ref.object_id for ref in refs}
     formats = {ref.format for ref in refs}
     if len(object_ids) != 1 or len(formats) != 1:
