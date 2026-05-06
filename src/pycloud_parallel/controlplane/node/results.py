@@ -51,6 +51,7 @@ from pycloud_parallel.controlplane.serialization import (
     transport_payload_to_inline_carrier,
     serialize_inline_result,
 )
+from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.data.ref import (
     normalize_materialize_as,
@@ -655,6 +656,28 @@ def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifac
         raise
 
 
+def _store_result_json(value: Any, *, object_dir: str) -> StoredResultArtifact:
+    blob = json.dumps(serialize_arrow_compatible(value), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    validate_object_size_bytes(len(blob), context="result object")
+    if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
+        return _commit_result_segment(blob, object_dir=object_dir, fmt="json", materialize_as="json")
+    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".json", dir=str(Path(object_dir).resolve()))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_bytes(blob)
+        return _commit_result_file(
+            tmp_path,
+            object_dir=object_dir,
+            fmt="json",
+            size_bytes=tmp_path.stat().st_size,
+            materialize_as="json",
+        )
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _normalize_result_value(
     ret: Any,
     *,
@@ -663,11 +686,19 @@ def _normalize_result_value(
     use_transport_result: Optional[bool] = None,
 ) -> Any:
     data_store = _data_store_for_object_dir(object_dir)
+    result_policy = get_payload_policy("result")
+    result_estimate_threshold = int(result_policy.inline_result_estimate_threshold_bytes)
+
+    def _should_skip_inline_attempt(value: Any) -> bool:
+        try:
+            return estimate_payload_inline_size(value) > result_estimate_threshold
+        except Exception:
+            return True
 
     def _try_inline_result(value: Any) -> tuple[bool, Any]:
         try:
             if bool(use_transport_result):
-                result_limit = get_payload_policy("result").inline_result_hard_limit_bytes
+                result_limit = result_policy.inline_result_hard_limit_bytes
                 transport = encode_transport_payload_bytes(
                     value,
                     mode=serialization_mode,
@@ -699,15 +730,17 @@ def _normalize_result_value(
         import pandas as pd
 
         if isinstance(ret, pd.DataFrame):
-            is_inline, inline_value = _try_inline_result(ret)
-            if is_inline:
-                return inline_value
+            if not _should_skip_inline_attempt(ret):
+                is_inline, inline_value = _try_inline_result(ret)
+                if is_inline:
+                    return inline_value
             log_payload_flow("result_ref_store", path_type="dataframe", summary=summarize_payload_flow_value(ret))
             return data_store.store_dataframe(ret)
         if isinstance(ret, pd.Series):
-            is_inline, inline_value = _try_inline_result(ret)
-            if is_inline:
-                return inline_value
+            if not _should_skip_inline_attempt(ret):
+                is_inline, inline_value = _try_inline_result(ret)
+                if is_inline:
+                    return inline_value
             log_payload_flow("result_ref_store", path_type="series", summary=summarize_payload_flow_value(ret))
             return data_store.store_series(ret)
     except ImportError:
@@ -717,13 +750,19 @@ def _normalize_result_value(
         import numpy as np
 
         if isinstance(ret, np.ndarray):
-            is_inline, inline_value = _try_inline_result(ret)
-            if is_inline:
-                return inline_value
+            if not _should_skip_inline_attempt(ret):
+                is_inline, inline_value = _try_inline_result(ret)
+                if is_inline:
+                    return inline_value
             log_payload_flow("result_ref_store", path_type="ndarray", summary=summarize_payload_flow_value(ret))
             return data_store.store_ndarray(ret)
     except ImportError:
         pass
+
+    if isinstance(ret, (dict, list)):
+        if _should_skip_inline_attempt(ret):
+            log_payload_flow("result_ref_store", path_type="json", summary=summarize_payload_flow_value(ret))
+            return data_store.store_json(ret)
 
     is_inline, inline_value = _try_inline_result(ret)
     if is_inline:
@@ -829,6 +868,7 @@ def _data_store_for_object_dir(
         store_dataframe_impl=lambda frame: _store_result_dataframe(frame, object_dir=normalized_dir),
         store_series_impl=lambda series: _store_result_series(series, object_dir=normalized_dir),
         store_ndarray_impl=lambda array: _store_result_ndarray(array, object_dir=normalized_dir),
+        store_json_impl=lambda value: _store_result_json(value, object_dir=normalized_dir),
         resolve_data_ref_impl=lambda ref: _resolve_single_data_ref(ref, object_dir=normalized_dir),
     )
 
@@ -962,6 +1002,7 @@ __all__ = [
     "_store_result_dataframe",
     "_store_result_ndarray",
     "_store_result_path",
+    "_store_result_json",
     "_store_result_series",
     "_write_object_meta_with_retry",
 ]

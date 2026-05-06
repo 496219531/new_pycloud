@@ -32,6 +32,7 @@ class DataStore:
     store_dataframe_impl: Optional[Callable[[Any], StoredDataArtifact]] = None
     store_series_impl: Optional[Callable[[Any], StoredDataArtifact]] = None
     store_ndarray_impl: Optional[Callable[[Any], StoredDataArtifact]] = None
+    store_json_impl: Optional[Callable[[Any], StoredDataArtifact]] = None
     register_stored_result_impl: Optional[Callable[[StoredDataArtifact], StoredDataArtifact]] = None
     resolve_data_ref_impl: Optional[Callable[[DataRef], Any]] = None
 
@@ -78,6 +79,11 @@ class DataStore:
         if self.store_ndarray_impl is None:
             raise RuntimeError("DataStore.store_ndarray is not configured")
         return self.store_ndarray_impl(array)
+
+    def store_json(self, value: Any) -> StoredDataArtifact:
+        if self.store_json_impl is None:
+            raise RuntimeError("DataStore.store_json is not configured")
+        return self.store_json_impl(value)
 
     def resolve_data_ref(self, ref: DataRef | object) -> Any:
         if self.resolve_data_ref_impl is None:

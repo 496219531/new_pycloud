@@ -3,7 +3,6 @@ from __future__ import annotations
 """Unified payload transport policy helpers."""
 
 from dataclasses import replace
-import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -14,7 +13,6 @@ from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
     decode_transport_value,
     encode_transport_value,
-    serialize_arrow_compatible,
     serialize_inline_payload,
     serialize_inline_result,
 )
@@ -67,7 +65,7 @@ def _prepare_value_for_transport(
                 inline_size = estimate_inline_size(value)
             except Exception:
                 inline_size = 0
-            if inline_size > max(1, int(policy.inline_payload_soft_limit_bytes)):
+            if inline_size > max(1, int(policy.inline_payload_estimate_threshold_bytes)):
                 return _put_prepared_value(value, policy=policy, put_data=put_data, format="json")
         return {
             key: _prepare_value_for_transport(
@@ -85,7 +83,7 @@ def _prepare_value_for_transport(
                 inline_size = estimate_inline_size(value)
             except Exception:
                 inline_size = 0
-            if inline_size > max(1, int(policy.inline_payload_soft_limit_bytes)):
+            if inline_size > max(1, int(policy.inline_payload_estimate_threshold_bytes)):
                 return _put_prepared_value(value, policy=policy, put_data=put_data, format="json")
         return [
             _prepare_value_for_transport(
@@ -113,7 +111,7 @@ def _prepare_value_for_transport(
         inline_size = estimate_inline_size(value)
     except Exception:
         return value
-    if inline_size <= max(1, int(policy.inline_payload_soft_limit_bytes)):
+    if inline_size <= max(1, int(policy.inline_payload_estimate_threshold_bytes)):
         return value
     if isinstance(value, (dict, list)):
         return _put_prepared_value(value, policy=policy, put_data=put_data, format="json")
@@ -182,8 +180,47 @@ def prepare_outbound_payload(
 
 
 def estimate_payload_inline_size(value: Any) -> int:
-    serialized = serialize_arrow_compatible(value)
-    return len(json.dumps(serialized, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    direct_ref = maybe_data_ref(value)
+    if direct_ref is not None:
+        return 256
+    if value is None or isinstance(value, (bool, int, float)):
+        return 32
+    if isinstance(value, str):
+        return len(value.encode("utf-8")) + 16
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, os.PathLike):
+        try:
+            path = Path(value).expanduser()
+            if path.exists() and path.is_file():
+                return int(path.stat().st_size)
+        except OSError:
+            pass
+        return len(str(value).encode("utf-8")) + 16
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return int(value.nbytes)
+    except ImportError:
+        pass
+    try:
+        import pandas as pd
+
+        if isinstance(value, pd.DataFrame):
+            return int(value.memory_usage(index=True, deep=True).sum())
+        if isinstance(value, pd.Series):
+            return int(value.memory_usage(index=True, deep=True))
+    except ImportError:
+        pass
+    if isinstance(value, dict):
+        total = 2
+        for key, item in value.items():
+            total += estimate_payload_inline_size(key) + estimate_payload_inline_size(item) + 4
+        return total
+    if isinstance(value, (list, tuple, set)):
+        return 2 + sum(estimate_payload_inline_size(item) + 2 for item in value)
+    return len(type(value).__name__.encode("utf-8")) + 64
 
 
 def encode_payload_for_transport(

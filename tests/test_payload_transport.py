@@ -77,6 +77,8 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     authority = get_config_limit_authority()
 
     assert authority.runtime_payload.inline_payload_soft_limit_bytes == 512 * 1024
+    assert authority.runtime_payload.inline_payload_estimate_threshold_bytes == 512 * 1024
+    assert authority.runtime_payload.inline_result_estimate_threshold_bytes == 1024 * 1024
     assert authority.policy_thresholds.default_safe.inline_payload_soft_limit_bytes == 2 * 1024 * 1024
     assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 8 * 1024 * 1024
     assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
@@ -85,6 +87,37 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     assert authority.object_store_bounds.object_size_hard_limit_bytes == 1024 * 1024 * 1024
     assert authority.job_staging_bounds.job_staging_replica_count == 2
     assert authority.capacity_defaults.node_worker_capacity == 32
+
+
+def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", "100")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", "999")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", "200")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "999")
+    config_mod.reload_config()
+    try:
+        policy = get_payload_policy("http_call")
+        result_policy = get_payload_policy("result")
+        assert policy.inline_payload_estimate_threshold_bytes == 100
+        assert result_policy.inline_result_estimate_threshold_bytes == 200
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
+
+
+def test_estimate_payload_inline_size_uses_cheap_type_metadata(monkeypatch) -> None:
+    import pycloud_parallel.controlplane.payload_transport as transport_mod
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("estimate_payload_inline_size must not serialize for sizing")
+
+    monkeypatch.setattr(transport_mod, "serialize_inline_payload", _unexpected)
+    assert estimate_payload_inline_size({"blob": b"x" * 128}) >= 128
 
 
 def test_config_env_loader_and_reload_share_defaults(monkeypatch) -> None:
@@ -224,7 +257,11 @@ def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:
     policy = get_payload_policy("http_call")
     policy = replace(
         policy,
-        limits=replace(policy.limits, inline_payload_soft_limit_bytes=32),
+        limits=replace(
+            policy.limits,
+            inline_payload_soft_limit_bytes=32,
+            inline_payload_estimate_threshold_bytes=32,
+        ),
     )
     uploads: list[tuple[object, str]] = []
 

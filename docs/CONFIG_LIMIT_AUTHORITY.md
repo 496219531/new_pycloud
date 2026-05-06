@@ -14,7 +14,9 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 | `job/staging bounds` | job submit、staged refs、gateway stage TTL | JobQueue / gateway staging |
 | `capacity defaults` | node/service 默认容量和 worker 数 | `pycloudctl` / node startup |
 
-`policy thresholds` 只回答“业务 payload/result 多大时应该 inline、转 DataRef 或拒绝”。
+`policy thresholds` 只回答“业务 payload/result 的 policy 边界在哪里”。
+`estimate thresholds` 位于 runtime payload limit 中，只回答“是否值得尝试 inline”。
+超过 estimate threshold 的对象直接转 `DataRef`，不再做完整序列化试算。
 `transport bounds` 只回答“HTTP request/response body 或控制消息最大能收发多少 bytes”。
 `object/store bounds` 里的 object size hard limit 只回答“系统允许单个 object/DataRef 背后的对象最大多大”。
 三者不能互相替代。
@@ -34,10 +36,14 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
    - 用来阅读和测试 authority 结构
 4. `resolve_payload_policy(...)`
    - payload policy 的统一入口
-   - 负责合并 effective policy，并把 object threshold 与 policy soft limit 对齐
+   - 负责合并 effective policy，并把 object threshold 与 policy soft/estimate threshold 对齐
 5. `get_transport_bounds()` / `get_object_store_bounds()`
    - transport/http 与 object/store 消费侧读取分层默认值的入口
-6. body / upload helper
+6. estimate threshold helper
+   - `get_payload_estimate_threshold_bytes(...)`
+   - `get_result_estimate_threshold_bytes(...)`
+   - 用于“cheap estimate 后是否尝试 inline”的稳定入口
+7. body / upload helper
    - `get_service_http_body_limit_bytes(...)`
    - `get_gateway_http_body_limit_bytes(...)`
    - `get_infocenter_http_body_limit_bytes(...)`
@@ -82,7 +88,7 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 3. `merge_object_threshold_with_policy_soft_limit(...)`
    - 负责 objectify threshold 与 policy soft limit 的取小
 4. `policy_with_soft_limit(...)`
-   - 负责把已合成的 soft limit 写回 `PayloadPolicy`
+   - 负责把已合成的 soft limit 写回 `PayloadPolicy`，并同步收紧 estimate threshold
 5. `resolve_payload_policy(...)`
    - 负责统一 `get_payload_policy(...)`、effective policy merge、object threshold 合成
 6. `get_node_control_http_body_limit_bytes(...)`

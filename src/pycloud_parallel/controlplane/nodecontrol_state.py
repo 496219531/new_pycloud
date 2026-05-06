@@ -1030,9 +1030,12 @@ class NodeControlState(NodeRuntimeBase):
 
         return json.dumps(serialize_arrow_compatible(_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
 
-    def _encode_checked_stream_item_line(self, event: Dict[str, object], *, inline_result_limit_bytes: int) -> bytes:
+    def _encode_checked_stream_item_line(self, event: Dict[str, object], *, inline_result_limit_bytes: int = 0) -> bytes:
         line = self._encode_stream_line(event)
-        limit = max(1, int(inline_result_limit_bytes))
+        limit = max(
+            1,
+            int(inline_result_limit_bytes or get_payload_policy("result").inline_result_hard_limit_bytes),
+        )
         size = len(line)
         if size > limit:
             raise ValueError(

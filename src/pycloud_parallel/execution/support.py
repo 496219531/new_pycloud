@@ -655,7 +655,7 @@ def _estimate_managed_global_inline_size(value: Any) -> int:
 
 def _default_inline_object_threshold_bytes() -> int:
     policy = resolve_payload_policy("http_call")
-    return max(1, int(policy.inline_payload_soft_limit_bytes or 1))
+    return max(1, int(policy.inline_payload_estimate_threshold_bytes or 1))
 
 
 def _payload_policy_for_mode(

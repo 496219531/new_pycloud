@@ -16,10 +16,12 @@
 
 | 环境变量 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES` | `524288` | inline payload 建议转 `DataRef` 阈值 |
+| `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES` | `524288` | payload policy 兼容 soft threshold |
+| `PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES` | `524288` | cheap estimate 超过后直接转 `DataRef`，不做精确 inline 试算 |
 | `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES` | `2097152` | 单个 inline payload 硬限制 |
 | `PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES` | `8388608` | 单次请求所有 inline payload 总硬限制 |
-| `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES` | `1048576` | inline result 建议转 `DataRef` 阈值 |
+| `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES` | `1048576` | result policy 兼容 soft threshold |
+| `PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES` | `1048576` | cheap estimate 超过后直接转 `DataRef`，不做精确 inline 试算 |
 | `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `4194304` | 单个 inline result 硬限制 |
 | `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES` | `262144` | 对象上传/下载默认分片大小 |
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
@@ -54,9 +56,14 @@
 
 这些是 payload policy threshold，不是 HTTP body limit。它们决定 payload/result 是否 inline、转 `DataRef` 或拒绝；HTTP server/client 的 request body 上限见 `2.4`。
 
+- `PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES`
+  - 默认：`524288` (`512 KiB`)
+  - 用于“是否尝试 inline”的保守估算阈值
+  - cheap estimate 超过该值时直接走 `DataRef`，不再做完整序列化试算
+
 - `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
   - 默认：`524288` (`512 KiB`)
-  - 用于“建议转 DataRef”的阈值
+  - 兼容 policy soft threshold；新路径优先使用 estimate threshold
 
 - `PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
   - `default_safe` / `gateway_public` 的 inline payload soft limit
@@ -74,9 +81,14 @@
   - 默认：`8388608` (`8 MiB`)
   - 一次请求里所有 inline payload 的总硬限制
 
+- `PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES`
+  - 默认：`1048576` (`1 MiB`)
+  - 结果是否尝试 inline 的保守估算阈值
+  - cheap estimate 超过该值时直接走结果 object/DataRef，不再做完整 inline 试算
+
 - `PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES`
   - 默认：`1048576` (`1 MiB`)
-  - 结果建议转 `DataRef` 的阈值
+  - 兼容 policy soft threshold；新路径优先使用 estimate threshold
 
 - `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`
   - 默认：`4194304` (`4 MiB`)
@@ -84,11 +96,18 @@
 
 补充边界：
 
-1. 多数 internal path 上，payload soft limit 的语义是“超过后更倾向于 objectify / DataRef”
+1. 多数 internal path 上，estimate threshold 的语义是“超过后直接 objectify / DataRef”
 2. 但 `gateway_public` 当前不是这样
 3. `gateway_public` 不自动做大对象上传，也不接受 external `DataRef`
-4. 因此在 `gateway_public` 上，payload soft limit 当前应理解为“public inline max”
+4. 因此在 `gateway_public` 上，public inline max 仍由 gateway policy 和 gateway body/path 共同约束
 5. 具体阈值仍然来自 `default_safe` policy threshold，可由管理员按环境调整
+
+### 2.1.1 hard limit 与 estimate threshold
+
+- hard limit 是协议/安全边界：真正 inline 编码后不能超过它。
+- estimate threshold 是分流边界：cheap estimate 超过它就直接走 `DataRef`。
+- estimate threshold 会在 `config.py` 中 clamp 到不超过对应 hard limit。
+- 系统不再为了争取灰区 inline 命中率而先完整序列化试算。
 
 ### 2.2 object / file chunk
 
@@ -212,7 +231,7 @@ node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。�
 
 ```bash
 pycloudctl start-controlplane \
-  --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576 \
+  --env PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES=1048576 \
   --env PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216 \
   --env PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES=16777216
 ```
@@ -234,13 +253,13 @@ pycloudctl start-infocenter
 如果你想更保守：
 
 ```bash
-export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
+export PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES=1048576
 ```
 
 或者 Windows PowerShell：
 
 ```powershell
-$env:PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
+$env:PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES=1048576
 ```
 
 ### 3.2 放大 control message limit
@@ -283,7 +302,7 @@ pycloudctl start-node \
 
 推荐优先调整顺序：
 
-1. 先调 `PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES`
+1. 先调 `PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES`
    - 让大对象更早走 `DataRef`
 2. 再考虑调 `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
 3. 最后才考虑直接放大 control message limit
@@ -304,7 +323,7 @@ pycloudctl start-node \
 2. 想少走 `DataRef`
 
 ```bash
-export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576
+export PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES=1048576
 export PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES=1048576
 ```
 
@@ -316,8 +335,8 @@ export PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES=1048576
 2. 不希望 HTTP inline 太重
 
 ```bash
-export PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=131072
-export PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072
+export PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES=131072
+export PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES=131072
 ```
 
 ### 组合 C：放大 control HTTP body size 到 16 MiB
@@ -347,8 +366,8 @@ export PYCLOUD_OBJECT_CHUNK_SIZE_BYTES=524288
 
 ```bash
 pycloudctl start \
-  --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=131072 \
-  --env PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES=131072 \
+  --env PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES=131072 \
+  --env PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES=131072 \
   --env PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216 \
   --env PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES=16777216
 ```

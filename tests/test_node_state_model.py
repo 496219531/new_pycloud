@@ -391,6 +391,82 @@ def test_normalize_user_return_spills_dataframe_when_limit_too_small(tmp_path, m
     assert isinstance(result, StoredResultArtifact)
 
 
+def test_normalize_user_return_large_dataframe_skips_inline_trial(tmp_path, monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import pycloud_parallel.controlplane.node.results as results_mod
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "128")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
+    config_mod.reload_config()
+
+    def _unexpected_inline_trial(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("large dataframe result should objectify without inline trial")
+
+    monkeypatch.setattr(results_mod, "serialize_inline_result", _unexpected_inline_trial)
+    frame = pd.DataFrame([{"x": idx, "y": "a" * 256} for idx in range(20)])
+    try:
+        status, result, _err_type, _err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
+        config_mod.reload_config()
+
+    assert status == "SUCCEEDED"
+    assert isinstance(result, StoredResultArtifact)
+
+
+def test_normalize_user_return_large_ndarray_skips_inline_trial(tmp_path, monkeypatch):
+    np = pytest.importorskip("numpy")
+    import pycloud_parallel.controlplane.node.results as results_mod
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "128")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
+    config_mod.reload_config()
+
+    def _unexpected_inline_trial(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("large ndarray result should objectify without inline trial")
+
+    monkeypatch.setattr(results_mod, "serialize_inline_result", _unexpected_inline_trial)
+    array = np.arange(1024, dtype=np.int64)
+    try:
+        status, result, _err_type, _err_message = _normalize_user_return(array, object_dir=str(tmp_path))
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
+        config_mod.reload_config()
+
+    assert status == "SUCCEEDED"
+    assert isinstance(result, StoredResultArtifact)
+
+
+def test_normalize_user_return_large_json_skips_inline_trial(tmp_path, monkeypatch):
+    import pycloud_parallel.controlplane.node.results as results_mod
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "128")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
+    config_mod.reload_config()
+
+    def _unexpected_inline_trial(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("large dict/list result should objectify without inline trial")
+
+    monkeypatch.setattr(results_mod, "serialize_inline_result", _unexpected_inline_trial)
+    value = {"rows": [{"x": idx, "text": "a" * 64} for idx in range(20)]}
+    try:
+        status, result, _err_type, _err_message = _normalize_user_return(value, object_dir=str(tmp_path))
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
+        config_mod.reload_config()
+
+    assert status == "SUCCEEDED"
+    assert isinstance(result, StoredResultArtifact)
+    assert result.format == "json"
+    assert result.materialize_as == "json"
+
+
 def test_normalize_user_return_pickle_struct_lane_spills_by_struct_limit(tmp_path, monkeypatch):
     pd = pytest.importorskip("pandas")
     import pycloud_parallel.controlplane.node.results as results_mod

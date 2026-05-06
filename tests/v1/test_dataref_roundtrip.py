@@ -13,7 +13,11 @@ from pycloud_parallel.data.ref import DataRef, DATA_REF_SENTINEL, maybe_data_ref
 def test_prepare_outbound_payload_converts_large_object_uploads_to_dataref():
     policy = replace(
         get_payload_policy("http_call"),
-        limits=replace(get_payload_policy("http_call").limits, inline_payload_soft_limit_bytes=32),
+        limits=replace(
+            get_payload_policy("http_call").limits,
+            inline_payload_soft_limit_bytes=32,
+            inline_payload_estimate_threshold_bytes=32,
+        ),
     )
     prepared = prepare_outbound_payload(
         {"blob": "x" * 2048},
