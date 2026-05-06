@@ -542,18 +542,19 @@ def _put_data_via_clients(
         import pandas as pd
 
         if isinstance(data, pd.DataFrame):
-            parquet_buf = tempfile.NamedTemporaryFile(suffix=".dfbundle", delete=False)
-            parquet_buf.close()
-            path = Path(parquet_buf.name)
+            bundle_tmp = tempfile.NamedTemporaryFile(suffix=".dfbundle", delete=False)
+            bundle_tmp.close()
+            path = Path(bundle_tmp.name)
+            parquet_tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+            parquet_tmp.close()
+            parquet_path = Path(parquet_tmp.name)
             try:
-                import io
                 import zipfile
 
-                data_buf = io.BytesIO()
-                dataframe_bundle_parquet_frame(data).to_parquet(data_buf, index=False)
+                dataframe_bundle_parquet_frame(data).to_parquet(parquet_path, index=False)
                 meta = serialize_dataframe_bundle(data)
                 with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("data.parquet", data_buf.getvalue())
+                    zf.write(parquet_path, arcname="data.parquet")
                     zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                 return _upload_file_via_clients(
                     clients,
@@ -564,20 +565,22 @@ def _put_data_via_clients(
                     no_clients_msg="no node clients available for object upload",
                 )
             finally:
+                parquet_path.unlink(missing_ok=True)
                 path.unlink(missing_ok=True)
         if isinstance(data, pd.Series):
             bundle_tmp = tempfile.NamedTemporaryFile(suffix=".seriesbundle", delete=False)
             bundle_tmp.close()
             path = Path(bundle_tmp.name)
+            parquet_tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+            parquet_tmp.close()
+            parquet_path = Path(parquet_tmp.name)
             try:
-                import io
                 import zipfile
 
-                data_buf = io.BytesIO()
-                data.to_frame("__pycloud_series_value__").to_parquet(data_buf, index=False)
+                data.to_frame("__pycloud_series_value__").to_parquet(parquet_path, index=False)
                 meta = serialize_series_bundle(data)
                 with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("data.parquet", data_buf.getvalue())
+                    zf.write(parquet_path, arcname="data.parquet")
                     zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                 return _upload_file_via_clients(
                     clients,
@@ -588,6 +591,7 @@ def _put_data_via_clients(
                     no_clients_msg="no node clients available for object upload",
                 )
             finally:
+                parquet_path.unlink(missing_ok=True)
                 path.unlink(missing_ok=True)
     except ImportError:
         pass
