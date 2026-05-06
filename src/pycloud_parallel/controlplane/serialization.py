@@ -14,11 +14,7 @@ from google.protobuf import struct_pb2
 
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.controlplane.config import (
-    INLINE_PAYLOAD_HARD_LIMIT_BYTES,
-    INLINE_PAYLOAD_REQUEST_LIMIT_BYTES,
-    INLINE_PAYLOAD_SOFT_LIMIT_BYTES,
-    INLINE_RESULT_HARD_LIMIT_BYTES,
-    INLINE_RESULT_SOFT_LIMIT_BYTES,
+    get_payload_policy,
     get_inline_transport_checksum,
 )
 from pycloud_parallel.data.ref import (
@@ -144,10 +140,27 @@ def inline_payload_limit_error(size_bytes: int, *, limit_bytes: int, context: st
     )
 
 
-def validate_inline_payload_size(size_bytes: int, *, limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES, context: str = "payload") -> int:
+def _default_payload_hard_limit_bytes() -> int:
+    return max(1, int(get_payload_policy("http_call").inline_payload_hard_limit_bytes))
+
+
+def _default_payload_request_limit_bytes() -> int:
+    return max(1, int(get_payload_policy("http_call").inline_payload_request_limit_bytes))
+
+
+def _default_result_hard_limit_bytes() -> int:
+    return max(1, int(get_payload_policy("result").inline_result_hard_limit_bytes))
+
+
+def _effective_limit_bytes(value: int, *, default: int) -> int:
+    return max(1, int(value or default))
+
+
+def validate_inline_payload_size(size_bytes: int, *, limit_bytes: int = 0, context: str = "payload") -> int:
     normalized = max(0, int(size_bytes or 0))
-    if normalized > max(1, int(limit_bytes)):
-        raise inline_payload_limit_error(normalized, limit_bytes=max(1, int(limit_bytes)), context=context)
+    effective_limit = _effective_limit_bytes(limit_bytes, default=_default_payload_hard_limit_bytes())
+    if normalized > effective_limit:
+        raise inline_payload_limit_error(normalized, limit_bytes=effective_limit, context=context)
     return normalized
 
 
@@ -161,7 +174,7 @@ def _struct_wire_size_with_overhead(data: struct_pb2.Struct) -> int:
     return size + overhead
 
 
-def validate_inline_payload_struct(data: struct_pb2.Struct, *, limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES, context: str = "payload") -> int:
+def validate_inline_payload_struct(data: struct_pb2.Struct, *, limit_bytes: int = 0, context: str = "payload") -> int:
     return validate_inline_payload_size(
         _struct_wire_size_with_overhead(data),
         limit_bytes=limit_bytes,
@@ -169,10 +182,10 @@ def validate_inline_payload_struct(data: struct_pb2.Struct, *, limit_bytes: int 
     )
 
 
-def validate_inline_request_size(size_bytes: int, *, limit_bytes: int = INLINE_PAYLOAD_REQUEST_LIMIT_BYTES, context: str = "payload request") -> int:
+def validate_inline_request_size(size_bytes: int, *, limit_bytes: int = 0, context: str = "payload request") -> int:
     return validate_inline_payload_size(
         size_bytes,
-        limit_bytes=limit_bytes,
+        limit_bytes=_effective_limit_bytes(limit_bytes, default=_default_payload_request_limit_bytes()),
         context=context,
     )
 
@@ -185,14 +198,15 @@ def inline_result_limit_error(size_bytes: int, *, limit_bytes: int, context: str
     )
 
 
-def validate_inline_result_size(size_bytes: int, *, limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES, context: str = "result") -> int:
+def validate_inline_result_size(size_bytes: int, *, limit_bytes: int = 0, context: str = "result") -> int:
     normalized = max(0, int(size_bytes or 0))
-    if normalized > max(1, int(limit_bytes)):
-        raise inline_result_limit_error(normalized, limit_bytes=max(1, int(limit_bytes)), context=context)
+    effective_limit = _effective_limit_bytes(limit_bytes, default=_default_result_hard_limit_bytes())
+    if normalized > effective_limit:
+        raise inline_result_limit_error(normalized, limit_bytes=effective_limit, context=context)
     return normalized
 
 
-def validate_inline_result_struct(data: struct_pb2.Struct, *, limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES, context: str = "result") -> int:
+def validate_inline_result_struct(data: struct_pb2.Struct, *, limit_bytes: int = 0, context: str = "result") -> int:
     return validate_inline_result_size(
         _struct_wire_size_with_overhead(data),
         limit_bytes=limit_bytes,
@@ -204,7 +218,7 @@ def serialize_inline_result(
     data: Optional[dict],
     *,
     context: str = "result",
-    limit_bytes: int = INLINE_RESULT_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
     mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
     normalized_data = {} if data is None else data
@@ -433,9 +447,9 @@ def validate_inline_payload_structs(
     payloads: Sequence[struct_pb2.Struct],
     *,
     item_context: str = "payload",
-    item_limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    item_limit_bytes: int = 0,
     request_context: str = "payload request",
-    request_limit_bytes: int = INLINE_PAYLOAD_REQUEST_LIMIT_BYTES,
+    request_limit_bytes: int = 0,
 ) -> int:
     total_size = 0
     total_count = len(payloads)
@@ -473,7 +487,7 @@ def validate_transport_payload_bytes(
     *,
     context: str = "payload",
     trust_mode: str = "",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
 ) -> tuple[str, bytes, int]:
     declared_codec = str(codec or "").strip().lower()
     if declared_codec == INTERNAL_PICKLE_NATIVE_V1:
@@ -510,7 +524,7 @@ def make_inline_transport_carrier(
     payload_mode: str = "",
     context: str = "payload",
     trust_mode: str = "",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
 ) -> dict[str, Any]:
     normalized, raw, size = validate_transport_payload_bytes(
         codec,
@@ -570,7 +584,7 @@ def validate_inline_transport_carrier(
     *,
     context: str = "payload",
     trust_mode: str = "",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
 ) -> tuple[str, int, bytes]:
     meta = _inline_transport_carrier_meta(value)
     payload = meta.get("content_bytes", b"")
@@ -598,7 +612,7 @@ def transport_payload_to_inline_carrier(
     payload_mode: str = "",
     context: str = "payload",
     trust_mode: str = "",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
 ) -> dict[str, Any]:
     return make_inline_transport_carrier(
         codec=str(transport.codec or ""),
@@ -616,7 +630,7 @@ def inline_carrier_to_transport_payload(
     *,
     context: str = "payload",
     trust_mode: str = "",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
 ) -> pb2.TransportPayload:
     codec, version, raw = validate_inline_transport_carrier(
         value,
@@ -632,7 +646,7 @@ def decode_inline_transport_carrier(
     *,
     context: str = "payload",
     trust_mode: str = "",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
 ) -> Any:
     codec, version, raw = validate_inline_transport_carrier(
         value,
@@ -678,7 +692,7 @@ def serialize_inline_payload(
     data: Optional[dict],
     *,
     context: str = "payload",
-    limit_bytes: int = INLINE_PAYLOAD_HARD_LIMIT_BYTES,
+    limit_bytes: int = 0,
     mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
     normalized_data = {} if data is None else data

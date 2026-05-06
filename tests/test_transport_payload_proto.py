@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from pycloud_parallel.controlplane.config import get_payload_policy, reload_config
 from pycloud_parallel.controlplane.node.models import TaskState
@@ -17,6 +18,7 @@ from pycloud_parallel.controlplane.serialization import (
     serialize_inline_payload,
     struct_to_python,
     transport_payload_to_inline_carrier,
+    validate_inline_payload_size,
 )
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport
 from pycloud_parallel.controlplane.services import NodeControlService
@@ -246,6 +248,18 @@ def test_inline_transport_carrier_checksum_is_opt_in(monkeypatch):
         raise AssertionError("expected checksum mismatch")
     finally:
         monkeypatch.setenv("PYCLOUD_INLINE_TRANSPORT_CHECKSUM", "0")
+        reload_config()
+
+
+def test_serialization_default_payload_limit_tracks_reload_config(monkeypatch):
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", "64")
+    reload_config()
+    try:
+        assert validate_inline_payload_size(64, context="payload") == 64
+        with pytest.raises(ValueError, match="inline limit"):
+            validate_inline_payload_size(65, context="payload")
+    finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
         reload_config()
 
 

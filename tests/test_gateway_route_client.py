@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pytest
 
 from pycloud_parallel.data.ref import DataRef
-from pycloud_parallel.controlplane.serialization import INLINE_PAYLOAD_HARD_LIMIT_BYTES
 
 
 class TestGatewayServiceClient:
@@ -55,39 +54,35 @@ class TestGatewayServiceClient:
 
 
 def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
+    from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
-    payload = {"blob": "x" * (INLINE_PAYLOAD_HARD_LIMIT_BYTES + 1024)}
+    soft_limit_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+        "gateway_public",
+        requested_mode="structured_v1",
+        context="gateway_public",
+    )
+    payload = {"blob": "x" * (soft_limit_bytes + 1024)}
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
     with patch("pycloud_parallel.controlplane.gateway_client.client_mod._http_json_request") as mocked:
-        with pytest.raises(ValueError, match="DataRef"):
-            client.call(service_name="svc-demo", method="run", payload=payload, timeout_sec=5.0)
+        with pytest.raises(ValueError, match="size_bytes=.*soft_limit_bytes="):
+            client.call(
+                service_name="svc-demo",
+                method="run",
+                payload=payload,
+                timeout_sec=5.0,
+                serialization_mode="structured_v1",
+            )
     assert mocked.call_count == 1
     assert mocked.call_args.kwargs["path"] == "/svc/svc-demo/status"
 
 
-def test_gateway_service_client_uses_route_aware_staging_when_status_succeeds(monkeypatch):
+def test_gateway_service_client_does_not_use_route_aware_staging_when_status_succeeds(monkeypatch):
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
     routes = [{"control_addr": "127.0.0.1:50061"}]
-    uploads = []
-
-    class _FakeNodeControlClient:
-        def __init__(self, target: str, timeout_sec: float = 10.0) -> None:
-            del timeout_sec
-            self.target = target
-
-        def close(self) -> None:
-            return None
-
-    def _fake_prepare(clients, payload, *, object_threshold_bytes):
-        del object_threshold_bytes
-        uploads.append([client.target for client in clients])
-        return {"blob": {"__pycloud_data_ref__": {"ref_id": "sha256:" + ("a" * 64)}}}
 
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
-    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_client.client_mod.NodeControlClient", _FakeNodeControlClient)
-    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_client.client_mod._prepare_remote_call_payload", _fake_prepare)
     with (
         patch.object(client, "get_status", return_value={"ok": True, "route_count": 1, "routes": routes}),
         patch(
@@ -98,32 +93,15 @@ def test_gateway_service_client_uses_route_aware_staging_when_status_succeeds(mo
         result = client.call(service_name="svc-demo", method="run", payload={"blob": "x" * 2048}, timeout_sec=5.0)
 
     assert result == {"ok": True, "data": {"y": 49}}
-    assert uploads == [["127.0.0.1:50061"]]
     assert mocked_http.call_count == 1
 
 
-def test_gateway_service_client_uses_cached_routes_when_status_lookup_fails(monkeypatch):
+def test_gateway_service_client_does_not_use_cached_routes_for_payload_staging(monkeypatch):
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
     routes = [{"control_addr": "127.0.0.1:50061"}]
-    uploads = []
-
-    class _FakeNodeControlClient:
-        def __init__(self, target: str, timeout_sec: float = 10.0) -> None:
-            del timeout_sec
-            self.target = target
-
-        def close(self) -> None:
-            return None
-
-    def _fake_prepare(clients, payload, *, object_threshold_bytes):
-        del object_threshold_bytes
-        uploads.append([client.target for client in clients])
-        return {"blob": {"__pycloud_data_ref__": {"ref_id": "sha256:" + ("b" * 64)}}}
 
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
-    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_client.client_mod.NodeControlClient", _FakeNodeControlClient)
-    monkeypatch.setattr("pycloud_parallel.controlplane.gateway_client.client_mod._prepare_remote_call_payload", _fake_prepare)
     with (
         patch.object(client, "get_status", side_effect=[
             {"ok": True, "route_count": 1, "routes": routes},
@@ -136,8 +114,6 @@ def test_gateway_service_client_uses_cached_routes_when_status_lookup_fails(monk
     ):
         client.call(service_name="svc-demo", method="run", payload={"blob": "x" * 2048}, timeout_sec=5.0)
         client.call(service_name="svc-demo", method="run", payload={"blob": "y" * 2048}, timeout_sec=5.0)
-
-    assert uploads == [["127.0.0.1:50061"], ["127.0.0.1:50061"]]
 
 
 def test_gateway_service_client_status_failure_without_cache_allows_small_payload():
@@ -158,14 +134,26 @@ def test_gateway_service_client_status_failure_without_cache_allows_small_payloa
 
 
 def test_gateway_service_client_status_failure_without_cache_rejects_large_payload():
+    from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
-    payload = {"blob": "x" * (INLINE_PAYLOAD_HARD_LIMIT_BYTES + 1024)}
+    soft_limit_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+        "gateway_public",
+        requested_mode="structured_v1",
+        context="gateway_public",
+    )
+    payload = {"blob": "x" * (soft_limit_bytes + 1024)}
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
     with (
         patch.object(client, "get_status", side_effect=RuntimeError("status boom")),
         patch("pycloud_parallel.controlplane.gateway_client.client_mod._http_json_request") as mocked_http,
     ):
-        with pytest.raises(RuntimeError, match="route-aware staging"):
-            client.call(service_name="svc-demo", method="run", payload=payload, timeout_sec=5.0)
+        with pytest.raises(ValueError, match="gateway payload is too large"):
+            client.call(
+                service_name="svc-demo",
+                method="run",
+                payload=payload,
+                timeout_sec=5.0,
+                serialization_mode="structured_v1",
+            )
     mocked_http.assert_not_called()
