@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import contextlib
+import heapq
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -977,6 +978,7 @@ class InfoCenterState:
         now = utc_now()
         name_filter = service_name.strip()
         normalized_scope = str(route_scope or "call").strip().lower()
+        effective_limit = max(1, int(limit))
         with self._lock:
             candidate_node_ids = (
                 list(self._services_by_name.get(name_filter, ()))
@@ -1064,7 +1066,23 @@ class InfoCenterState:
                     "capability": state.capability.to_dict(),
                 }
             )
-        out.sort(
+        if len(out) <= effective_limit:
+            out.sort(
+                key=lambda x: (
+                    x["service_name"],
+                    not x["node_healthy"],
+                    int(x["status"] != pb2.SERVICE_STATUS_RUNNING),
+                    float(x.get("predicted_busy", 0.0) or 0.0),
+                    int(x["in_flight"]),
+                    -int(x.get("alive_workers", 0) or 0),
+                    x["node_id"],
+                    x["service_id"],
+                )
+            )
+            return out[:effective_limit]
+        return heapq.nsmallest(
+            effective_limit,
+            out,
             key=lambda x: (
                 x["service_name"],
                 not x["node_healthy"],
@@ -1074,15 +1092,15 @@ class InfoCenterState:
                 -int(x.get("alive_workers", 0) or 0),
                 x["node_id"],
                 x["service_id"],
-            )
+            ),
         )
-        return out[: max(1, limit)]
 
     def list_nodes(self, *, healthy_only: bool, tags: Iterable[str], limit: int) -> List[NodeState]:
         now = utc_now()
         filter_tags = set(tags)
+        effective_limit = max(1, int(limit))
         with self._lock:
-            out: List[NodeState] = []
+            ranked: List[tuple[tuple[object, ...], NodeState, bool]] = []
             for state in self._nodes.values():
                 self._fence_if_stale_locked(state, now=now)
                 is_healthy = self._node_is_healthy_locked(state, now=now)
@@ -1090,9 +1108,25 @@ class InfoCenterState:
                     continue
                 if filter_tags and not filter_tags.issubset(set(state.tags)):
                     continue
-                out.append(self._clone_node_locked(state, healthy=is_healthy))
-            out.sort(key=lambda n: (not n.healthy, not n.schedulable, n.drain, -(n.service_worker_available())))
-            return out[: max(1, limit)]
+                ranked.append(
+                    (
+                        (
+                            not is_healthy,
+                            not bool(state.schedulable),
+                            bool(state.drain),
+                            -int(state.service_worker_available()),
+                        ),
+                        state,
+                        is_healthy,
+                    )
+                )
+            selected = (
+                ranked
+                if len(ranked) <= effective_limit
+                else heapq.nsmallest(effective_limit, ranked, key=lambda item: item[0])
+            )
+            selected.sort(key=lambda item: item[0])
+            return [self._clone_node_locked(state, healthy=is_healthy) for _key, state, is_healthy in selected]
 
     def list_selected_nodes(
         self,
