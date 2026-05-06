@@ -216,6 +216,86 @@ def _filter_nodes_by_runtime(
     ]
 
 
+def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNode]:
+    out: list[InfoCenterNode] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        services = []
+        for svc in item.get("services", []) or []:
+            services.append(
+                InfoCenterNodeService(
+                    service_name=str(svc.get("service_name", "") or ""),
+                    service_id=str(svc.get("service_id", "") or ""),
+                    status=int(svc.get("status", 0) or 0),
+                    policy_id=str(svc.get("policy_id", "") or "default_safe"),
+                    owner_client_id=str(svc.get("owner_client_id", "") or ""),
+                    code_version=str(svc.get("code_version", "") or ""),
+                    entry_module=str(svc.get("entry_module", "") or ""),
+                    entry_callable=str(svc.get("entry_callable", "") or ""),
+                    serialization_mode=str(svc.get("serialization_mode", "") or ""),
+                    status_text=str(svc.get("status_text", "") or ""),
+                    worker_count=int(svc.get("worker_count", 0) or 0),
+                    alive_workers=int(svc.get("alive_workers", 0) or 0),
+                    in_flight=int(svc.get("in_flight", 0) or 0),
+                    http_base_url=str(svc.get("http_base_url", "") or ""),
+                    stop_reason=str(svc.get("stop_reason", svc.get("failure_reason", "")) or ""),
+                )
+            )
+        task_pools = []
+        for pool in item.get("task_pools", []) or []:
+            task_pools.append(
+                InfoCenterNodeTaskPool(
+                    pool_id=str(pool.get("pool_id", "") or ""),
+                    owner_client_id=str(pool.get("owner_client_id", "") or ""),
+                    pool_name=str(pool.get("pool_name", "") or ""),
+                    code_version=str(pool.get("code_version", "") or ""),
+                    status=str(pool.get("status", "") or ""),
+                    worker_count=int(pool.get("worker_count", 0) or 0),
+                    task_count=int(pool.get("task_count", 0) or 0),
+                    inflight=int(pool.get("inflight", 0) or 0),
+                    failure_reason=str(pool.get("failure_reason", "") or ""),
+                )
+            )
+        out.append(
+            InfoCenterNode(
+                node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
+                node_id=str(item.get("node_id", "")),
+                control_addr=str(item.get("control_addr", "")),
+                healthy=bool(item.get("healthy", False)),
+                capacity=int(item.get("capacity", 0) or 0),
+                queue_capacity=int(item.get("queue_capacity", 0) or 0),
+                queued=int(item.get("queued", 0) or 0),
+                inflight=int(item.get("inflight", 0) or 0),
+                credit=int(item.get("credit", 0) or 0),
+                python_version=str(item.get("python_version", "") or ""),
+                active_runtimes=tuple(item.get("active_runtimes") or ()),
+                tags=tuple(item.get("tags") or ()),
+                profile_key=str(item.get("profile_key", "") or ""),
+                managed_tags=tuple(item.get("managed_tags") or ()),
+                capability_tags=tuple(item.get("capability_tags") or ()),
+                legacy_node_tags=tuple(item.get("legacy_node_tags") or ()),
+                profile_enabled=_coerce_bool(item.get("profile_enabled"), default=True),
+                profile_notes=str(item.get("profile_notes", "") or ""),
+                service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
+                service_worker_used=int(item.get("service_worker_used", 0) or 0),
+                service_worker_available=int(item.get("service_worker_available", 0) or 0),
+                task_pool_worker_capacity=int(item.get("task_pool_worker_capacity", 0) or 0),
+                task_pool_worker_used=int(item.get("task_pool_worker_used", 0) or 0),
+                task_pool_worker_available=int(item.get("task_pool_worker_available", 0) or 0),
+                accept_service_deploy=_coerce_bool(item.get("accept_service_deploy"), default=True),
+                schedulable=bool(item.get("schedulable", True)),
+                drain=bool(item.get("drain", False)),
+                reason=str(item.get("reason", "") or ""),
+                capability=NodeCapability.from_dict(item.get("capability")),
+                loaded_services=tuple(item.get("loaded_services") or ()),
+                services=tuple(services),
+                task_pools=tuple(task_pools),
+            )
+        )
+    return out
+
+
 class InfoCenterClient:
     """Low-level HTTP client for InfoCenter."""
 
@@ -402,81 +482,7 @@ class InfoCenterClient:
             method="GET",
             timeout_sec=self.timeout_sec,
         )
-        out = []
-        for item in resp.get("nodes", []):
-            services = []
-            for svc in item.get("services", []) or []:
-                services.append(
-                    InfoCenterNodeService(
-                        service_name=str(svc.get("service_name", "") or ""),
-                        service_id=str(svc.get("service_id", "") or ""),
-                        status=int(svc.get("status", 0) or 0),
-                        policy_id=str(svc.get("policy_id", "") or "default_safe"),
-                        owner_client_id=str(svc.get("owner_client_id", "") or ""),
-                        code_version=str(svc.get("code_version", "") or ""),
-                        entry_module=str(svc.get("entry_module", "") or ""),
-                        entry_callable=str(svc.get("entry_callable", "") or ""),
-                        serialization_mode=str(svc.get("serialization_mode", "") or ""),
-                        status_text=str(svc.get("status_text", "") or ""),
-                        worker_count=int(svc.get("worker_count", 0) or 0),
-                        alive_workers=int(svc.get("alive_workers", 0) or 0),
-                        in_flight=int(svc.get("in_flight", 0) or 0),
-                        http_base_url=str(svc.get("http_base_url", "") or ""),
-                        stop_reason=str(svc.get("stop_reason", svc.get("failure_reason", "")) or ""),
-                    )
-                )
-            task_pools = []
-            for pool in item.get("task_pools", []) or []:
-                task_pools.append(
-                    InfoCenterNodeTaskPool(
-                        pool_id=str(pool.get("pool_id", "") or ""),
-                        owner_client_id=str(pool.get("owner_client_id", "") or ""),
-                        pool_name=str(pool.get("pool_name", "") or ""),
-                        code_version=str(pool.get("code_version", "") or ""),
-                        status=str(pool.get("status", "") or ""),
-                        worker_count=int(pool.get("worker_count", 0) or 0),
-                        task_count=int(pool.get("task_count", 0) or 0),
-                        inflight=int(pool.get("inflight", 0) or 0),
-                        failure_reason=str(pool.get("failure_reason", "") or ""),
-                    )
-                )
-            out.append(
-                InfoCenterNode(
-                    node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
-                    node_id=str(item.get("node_id", "")),
-                    control_addr=str(item.get("control_addr", "")),
-                    healthy=bool(item.get("healthy", False)),
-                    capacity=int(item.get("capacity", 0) or 0),
-                    queue_capacity=int(item.get("queue_capacity", 0) or 0),
-                    queued=int(item.get("queued", 0) or 0),
-                    inflight=int(item.get("inflight", 0) or 0),
-                    credit=int(item.get("credit", 0) or 0),
-                    python_version=str(item.get("python_version", "") or ""),
-                    active_runtimes=tuple(item.get("active_runtimes") or ()),
-                    tags=tuple(item.get("tags") or ()),
-                    profile_key=str(item.get("profile_key", "") or ""),
-                    managed_tags=tuple(item.get("managed_tags") or ()),
-                    capability_tags=tuple(item.get("capability_tags") or ()),
-                    legacy_node_tags=tuple(item.get("legacy_node_tags") or ()),
-                    profile_enabled=_coerce_bool(item.get("profile_enabled"), default=True),
-                    profile_notes=str(item.get("profile_notes", "") or ""),
-                    service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
-                    service_worker_used=int(item.get("service_worker_used", 0) or 0),
-                    service_worker_available=int(item.get("service_worker_available", 0) or 0),
-                    task_pool_worker_capacity=int(item.get("task_pool_worker_capacity", 0) or 0),
-                    task_pool_worker_used=int(item.get("task_pool_worker_used", 0) or 0),
-                    task_pool_worker_available=int(item.get("task_pool_worker_available", 0) or 0),
-                    accept_service_deploy=_coerce_bool(item.get("accept_service_deploy"), default=True),
-                    schedulable=bool(item.get("schedulable", True)),
-                    drain=bool(item.get("drain", False)),
-                    reason=str(item.get("reason", "") or ""),
-                    capability=NodeCapability.from_dict(item.get("capability")),
-                    loaded_services=tuple(item.get("loaded_services") or ()),
-                    services=tuple(services),
-                    task_pools=tuple(task_pools),
-                )
-            )
-        return out
+        return _deserialize_infocenter_nodes(resp.get("nodes", []))
 
     def list_selected_nodes(
         self,
@@ -507,81 +513,7 @@ class InfoCenterClient:
             method="GET",
             timeout_sec=self.timeout_sec,
         )
-        out = []
-        for item in resp.get("nodes", []):
-            services = []
-            for svc in item.get("services", []) or []:
-                services.append(
-                    InfoCenterNodeService(
-                        service_name=str(svc.get("service_name", "") or ""),
-                        service_id=str(svc.get("service_id", "") or ""),
-                        status=int(svc.get("status", 0) or 0),
-                        policy_id=str(svc.get("policy_id", "") or "default_safe"),
-                        owner_client_id=str(svc.get("owner_client_id", "") or ""),
-                        code_version=str(svc.get("code_version", "") or ""),
-                        entry_module=str(svc.get("entry_module", "") or ""),
-                        entry_callable=str(svc.get("entry_callable", "") or ""),
-                        serialization_mode=str(svc.get("serialization_mode", "") or ""),
-                        status_text=str(svc.get("status_text", "") or ""),
-                        worker_count=int(svc.get("worker_count", 0) or 0),
-                        alive_workers=int(svc.get("alive_workers", 0) or 0),
-                        in_flight=int(svc.get("in_flight", 0) or 0),
-                        http_base_url=str(svc.get("http_base_url", "") or ""),
-                        stop_reason=str(svc.get("stop_reason", svc.get("failure_reason", "")) or ""),
-                    )
-                )
-            task_pools = []
-            for pool in item.get("task_pools", []) or []:
-                task_pools.append(
-                    InfoCenterNodeTaskPool(
-                        pool_id=str(pool.get("pool_id", "") or ""),
-                        owner_client_id=str(pool.get("owner_client_id", "") or ""),
-                        pool_name=str(pool.get("pool_name", "") or ""),
-                        code_version=str(pool.get("code_version", "") or ""),
-                        status=str(pool.get("status", "") or ""),
-                        worker_count=int(pool.get("worker_count", 0) or 0),
-                        task_count=int(pool.get("task_count", 0) or 0),
-                        inflight=int(pool.get("inflight", 0) or 0),
-                        failure_reason=str(pool.get("failure_reason", "") or ""),
-                    )
-                )
-            out.append(
-                InfoCenterNode(
-                    node_instance_id=str(item.get("node_instance_id", "") or item.get("node_id", "") or ""),
-                    node_id=str(item.get("node_id", "")),
-                    control_addr=str(item.get("control_addr", "")),
-                    healthy=bool(item.get("healthy", False)),
-                    capacity=int(item.get("capacity", 0) or 0),
-                    queue_capacity=int(item.get("queue_capacity", 0) or 0),
-                    queued=int(item.get("queued", 0) or 0),
-                    inflight=int(item.get("inflight", 0) or 0),
-                    credit=int(item.get("credit", 0) or 0),
-                    python_version=str(item.get("python_version", "") or ""),
-                    active_runtimes=tuple(item.get("active_runtimes") or ()),
-                    tags=tuple(item.get("tags") or ()),
-                    profile_key=str(item.get("profile_key", "") or ""),
-                    managed_tags=tuple(item.get("managed_tags") or ()),
-                    capability_tags=tuple(item.get("capability_tags") or ()),
-                    legacy_node_tags=tuple(item.get("legacy_node_tags") or ()),
-                    profile_enabled=_coerce_bool(item.get("profile_enabled"), default=True),
-                    profile_notes=str(item.get("profile_notes", "") or ""),
-                    service_worker_capacity=int(item.get("service_worker_capacity", 0) or 0),
-                    service_worker_used=int(item.get("service_worker_used", 0) or 0),
-                    service_worker_available=int(item.get("service_worker_available", 0) or 0),
-                    task_pool_worker_capacity=int(item.get("task_pool_worker_capacity", 0) or 0),
-                    task_pool_worker_used=int(item.get("task_pool_worker_used", 0) or 0),
-                    task_pool_worker_available=int(item.get("task_pool_worker_available", 0) or 0),
-                    accept_service_deploy=_coerce_bool(item.get("accept_service_deploy"), default=True),
-                    schedulable=bool(item.get("schedulable", True)),
-                    drain=bool(item.get("drain", False)),
-                    reason=str(item.get("reason", "") or ""),
-                    capability=NodeCapability.from_dict(item.get("capability")),
-                    loaded_services=tuple(item.get("loaded_services") or ()),
-                    services=tuple(services),
-                    task_pools=tuple(task_pools),
-                )
-            )
-        return out
+        return _deserialize_infocenter_nodes(resp.get("nodes", []))
 
     def register_data_ref(
         self,
