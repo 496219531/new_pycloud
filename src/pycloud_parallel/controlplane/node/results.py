@@ -34,6 +34,11 @@ from pycloud_parallel.controlplane.node.filesystem import (
     _segments_dir,
 )
 from pycloud_parallel.controlplane.node.models import ObjectArtifact, StoredResultArtifact
+from pycloud_parallel.controlplane.object_file_source import (
+    dataframe_bundle_temp_file,
+    ndarray_temp_file,
+    series_bundle_temp_file,
+)
 from pycloud_parallel.controlplane.node.object_meta import (
     _load_object_meta,
     _touch_object_last_at,
@@ -42,12 +47,9 @@ from pycloud_parallel.controlplane.node.object_meta import (
 from pycloud_parallel.controlplane.serialization import (
     encode_transport_payload_bytes,
     convert_dict_to_arrow,
-    dataframe_bundle_parquet_frame,
     deserialize_by_mode,
     log_payload_flow,
     serialize_arrow_compatible,
-    serialize_dataframe_bundle,
-    serialize_series_bundle,
     summarize_payload_flow_value,
     transport_payload_to_inline_carrier,
     serialize_inline_result,
@@ -628,21 +630,8 @@ def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
 
 def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtifact:
     try:
-        import zipfile
         Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
-        os.close(fd)
-        tmp_path = Path(tmp_name)
-        parquet_name = str(tmp_path.with_suffix(".parquet"))
-        parquet_path = Path(parquet_name)
-        try:
-            dataframe_bundle_parquet_frame(frame).to_parquet(parquet_path, index=False)
-            meta = serialize_dataframe_bundle(frame)
-            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.write(parquet_path, arcname="data.parquet")
-                zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        finally:
-            parquet_path.unlink(missing_ok=True)
+        tmp_path = dataframe_bundle_temp_file(frame, dir=str(Path(object_dir).resolve()))
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -658,21 +647,8 @@ def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtif
 
 def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifact:
     try:
-        import zipfile
         Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
-        os.close(fd)
-        tmp_path = Path(tmp_name)
-        parquet_name = str(tmp_path.with_suffix(".parquet"))
-        parquet_path = Path(parquet_name)
-        try:
-            series.to_frame("__pycloud_series_value__").to_parquet(parquet_path, index=False)
-            meta = serialize_series_bundle(series)
-            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.write(parquet_path, arcname="data.parquet")
-                zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        finally:
-            parquet_path.unlink(missing_ok=True)
+        tmp_path = series_bundle_temp_file(series, dir=str(Path(object_dir).resolve()))
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
@@ -688,17 +664,12 @@ def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifac
 
 def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifact:
     try:
-        import numpy as np
         Path(object_dir).resolve().mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".npy", dir=str(Path(object_dir).resolve()))
-        os.close(fd)
-        tmp_path = Path(tmp_name)
-        with tmp_path.open("wb") as fp:
-            np.save(fp, array, allow_pickle=False)
+        tmp_path, fmt = ndarray_temp_file(array, format="npy", dir=str(Path(object_dir).resolve()))
         return _commit_result_file(
             tmp_path,
             object_dir=object_dir,
-            fmt="npy",
+            fmt=fmt,
             size_bytes=tmp_path.stat().st_size,
             materialize_as="ndarray",
         )

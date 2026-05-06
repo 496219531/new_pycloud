@@ -46,6 +46,11 @@ from pycloud_parallel.controlplane.effective_policy import (
     should_use_raw_bytes_payload,
 )
 from pycloud_parallel.controlplane.netutil import detect_local_ip
+from pycloud_parallel.controlplane.object_file_source import (
+    dataframe_bundle_temp_file,
+    ndarray_temp_file,
+    series_bundle_temp_file,
+)
 from pycloud_parallel.data.ref import normalize_materialize_as, normalize_object_format
 from pycloud_parallel.controlplane.payload_transport import (
     estimate_payload_inline_size,
@@ -53,13 +58,10 @@ from pycloud_parallel.controlplane.payload_transport import (
 )
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.serialization import (
-    dataframe_bundle_parquet_frame,
     dict_to_struct,
     encode_transport_payload_bytes,
     log_payload_flow,
     serialize_arrow_compatible,
-    serialize_dataframe_bundle,
-    serialize_series_bundle,
     serialize_by_mode,
     serialize_inline_payload,
     summarize_payload_flow_value,
@@ -359,87 +361,22 @@ def _file_upload_source(path: Path, *, format: str = "") -> _ObjectUploadSource:
     return _ObjectUploadSource(materialize_as="path", format=fmt, file_path=str(path))
 
 
-def _temp_file_upload_source(
-    *,
-    suffix: str,
-    format: str,
-    materialize_as: str,
-    write_bytes: Callable[[Path], None],
-) -> _ObjectUploadSource:
-    fd, tmp_name = tempfile.mkstemp(prefix="pycloud-object-upload-", suffix=suffix)
-    os.close(fd)
-    path = Path(tmp_name)
-    try:
-        write_bytes(path)
-        return _ObjectUploadSource(materialize_as=materialize_as, format=format, file_path=str(path))
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-
-
-def _write_dataframe_bundle_file(path: Path, frame: Any) -> None:
-    import zipfile
-
-    fd, parquet_name = tempfile.mkstemp(prefix="pycloud-object-upload-", suffix=".parquet", dir=str(path.parent))
-    os.close(fd)
-    parquet_path = Path(parquet_name)
-    try:
-        dataframe_bundle_parquet_frame(frame).to_parquet(parquet_path, index=False)
-        meta = serialize_dataframe_bundle(frame)
-        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.write(parquet_path, arcname="data.parquet")
-            zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    finally:
-        parquet_path.unlink(missing_ok=True)
-
-
-def _write_series_bundle_file(path: Path, series: Any) -> None:
-    import zipfile
-
-    fd, parquet_name = tempfile.mkstemp(prefix="pycloud-object-upload-", suffix=".parquet", dir=str(path.parent))
-    os.close(fd)
-    parquet_path = Path(parquet_name)
-    try:
-        series.to_frame("__pycloud_series_value__").to_parquet(parquet_path, index=False)
-        meta = serialize_series_bundle(series)
-        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.write(parquet_path, arcname="data.parquet")
-            zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    finally:
-        parquet_path.unlink(missing_ok=True)
-
-
 def _dataframe_upload_source(frame: Any) -> _ObjectUploadSource:
     log_payload_flow("object_ref_upload", path_type="dataframe", format="dfbundle", summary=summarize_payload_flow_value(frame))
-    return _temp_file_upload_source(
-        suffix=".dfbundle",
-        format="dfbundle",
-        materialize_as="dataframe",
-        write_bytes=lambda path: _write_dataframe_bundle_file(path, frame),
-    )
+    path = dataframe_bundle_temp_file(frame)
+    return _ObjectUploadSource(materialize_as="dataframe", format="dfbundle", file_path=str(path))
 
 
 def _series_upload_source(series: Any) -> _ObjectUploadSource:
     log_payload_flow("object_ref_upload", path_type="series", format="seriesbundle", summary=summarize_payload_flow_value(series))
-    return _temp_file_upload_source(
-        suffix=".seriesbundle",
-        format="seriesbundle",
-        materialize_as="series",
-        write_bytes=lambda path: _write_series_bundle_file(path, series),
-    )
+    path = series_bundle_temp_file(series)
+    return _ObjectUploadSource(materialize_as="series", format="seriesbundle", file_path=str(path))
 
 
 def _ndarray_upload_source(array: Any, *, format: str = "") -> _ObjectUploadSource:
-    import numpy as np
-
     log_payload_flow("object_ref_upload", path_type="ndarray", format=(format or "npy"), summary=summarize_payload_flow_value(array))
-    normalized_format = normalize_object_format(format or "npy", default="npy")
-    return _temp_file_upload_source(
-        suffix=".npy",
-        format=normalized_format,
-        materialize_as="ndarray",
-        write_bytes=lambda path: np.save(path, array, allow_pickle=False),
-    )
+    path, normalized_format = ndarray_temp_file(array, format=format)
+    return _ObjectUploadSource(materialize_as="ndarray", format=normalized_format, file_path=str(path))
 
 
 def _serialize_data_for_object_ref(
