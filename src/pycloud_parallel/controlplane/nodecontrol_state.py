@@ -1030,9 +1030,9 @@ class NodeControlState(NodeRuntimeBase):
 
         return json.dumps(serialize_arrow_compatible(_json_safe(event)), ensure_ascii=False).encode("utf-8") + b"\n"
 
-    def _encode_checked_stream_item_line(self, event: Dict[str, object]) -> bytes:
+    def _encode_checked_stream_item_line(self, event: Dict[str, object], *, inline_result_limit_bytes: int) -> bytes:
         line = self._encode_stream_line(event)
-        limit = get_payload_policy("result").inline_result_hard_limit_bytes
+        limit = max(1, int(inline_result_limit_bytes))
         size = len(line)
         if size > limit:
             raise ValueError(
@@ -2433,23 +2433,24 @@ class NodeControlState(NodeRuntimeBase):
 
         work_dir = _code_data_dir(self._artifact_dir, code_version=artifact.code_version)
         transport_request_size = 0
+        # Local reuse keeps config.py as authority while avoiding repeated helper calls in this hot loop.
+        task_submit_policy = get_payload_policy("task_submit")
         for item in reserved_items:
             task_id = str(item.task_id or "").strip()
             record: Optional[TaskState] = None
             try:
                 if item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
-                    payload_policy = get_payload_policy("task_submit")
                     item_serialization_mode, _raw_payload, item_payload_size = validate_transport_payload_bytes(
                         item.transport_payload.codec,
                         item.transport_payload.version,
                         item.transport_payload.payload,
                         context="taskpool_session",
-                        limit_bytes=payload_policy.inline_payload_hard_limit_bytes,
+                        limit_bytes=task_submit_policy.inline_payload_hard_limit_bytes,
                     )
                     proposed_request_size = transport_request_size + item_payload_size
                     validate_inline_request_size(
                         proposed_request_size,
-                        limit_bytes=payload_policy.inline_payload_request_limit_bytes,
+                        limit_bytes=task_submit_policy.inline_payload_request_limit_bytes,
                         context="taskpool submit request",
                     )
                     transport_request_size = proposed_request_size
@@ -2467,7 +2468,7 @@ class NodeControlState(NodeRuntimeBase):
                     item_serialization_mode = detect_transport_mode(raw_payload, default="legacy_v1")
                     decoded_payload = decode_payload_from_transport(
                         raw_payload,
-                        policy=get_payload_policy("task_submit"),
+                        policy=task_submit_policy,
                         mode=item_serialization_mode,
                         context="taskpool_session",
                     )
@@ -3093,6 +3094,8 @@ class NodeControlState(NodeRuntimeBase):
             return 500, {"ok": False, "error": repr(exc)}
         build_execute_spec_ms = (build_end - build_start) * 1000.0
         executor_start = build_end
+        # Resolve once per stream request; each item still enforces the current config-derived limit.
+        inline_result_limit_bytes = get_payload_policy("result").inline_result_hard_limit_bytes
 
         def _iter_stream():
             status_text = "FAILED_INFRA"
@@ -3119,7 +3122,8 @@ class NodeControlState(NodeRuntimeBase):
                                 "event": "item",
                                 "index": int(event.get("item_index", item_count - 1) or (item_count - 1)),
                                 "data": {} if result is None else result,
-                            }
+                            },
+                            inline_result_limit_bytes=inline_result_limit_bytes,
                         )
                         continue
                     if kind == "service_stream_done":
