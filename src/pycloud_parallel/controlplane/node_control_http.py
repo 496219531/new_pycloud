@@ -742,6 +742,9 @@ class NodeControlHttpServer:
                     self._send(*result)
 
             def do_POST(self):  # noqa: N802
+                if urlparse(self.path).path.rstrip("/") == "/objects/upload":
+                    self._handle_object_upload_stream()
+                    return
                 self._handle_with_body(app.handle_post, pass_headers=True)
 
             def do_DELETE(self):  # noqa: N802
@@ -756,6 +759,25 @@ class NodeControlHttpServer:
                     self._send(*handler(self.path, self.rfile.read(max(0, length)), self.headers))
                 else:
                     self._send(*handler(self.path, self.rfile.read(max(0, length))))
+
+            def _handle_object_upload_stream(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length > app.object_app.max_body_bytes:
+                    self._send(
+                        413,
+                        {"Content-Type": "application/json; charset=utf-8"},
+                        _json_bytes(
+                            {
+                                "ok": False,
+                                "error": (
+                                    f"object upload payload too large: size_bytes={length} "
+                                    f"limit_bytes={app.object_app.max_body_bytes}"
+                                ),
+                            }
+                        ),
+                    )
+                    return
+                self._send(*app.object_app.handle_post_stream(self.path, self.headers, self.rfile, content_length=length))
 
             def _send(self, status_code: int, headers: Dict[str, str], raw: bytes) -> None:
                 self.send_response(int(status_code))

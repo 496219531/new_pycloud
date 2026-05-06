@@ -3,6 +3,9 @@ from __future__ import annotations
 """HTTP object API for NodeControl DataRef blobs."""
 
 import contextlib
+import hashlib
+import http.client
+import io
 import json
 import os
 import tempfile
@@ -10,7 +13,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple, Union
+from typing import BinaryIO, Dict, Optional, Tuple, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -82,6 +85,44 @@ def _expected_object_id(meta: pb2.UploadObjectMeta, actual_sha256: str) -> str:
     return declared_object_id
 
 
+def _read_stream_to_temp_file(
+    *,
+    stream: BinaryIO,
+    content_length: int,
+    tmp_dir: Path,
+    max_body_bytes: int,
+    chunk_size: int = 0,
+) -> Tuple[str, str, int]:
+    expected = max(0, int(content_length or 0))
+    limit = max(1, int(max_body_bytes or 1))
+    if expected > limit:
+        raise ValueError(f"object upload payload too large: size_bytes={expected} limit_bytes={limit}")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = ""
+    hasher = hashlib.sha256()
+    total = 0
+    effective_chunk_size = max(1, int(chunk_size or OBJECT_CHUNK_SIZE_BYTES))
+    tmp = tempfile.NamedTemporaryFile(mode="wb", prefix="pycloud-object-http-", suffix=".bin", delete=False, dir=str(tmp_dir))
+    tmp_path = tmp.name
+    try:
+        with tmp:
+            remaining = expected
+            while remaining > 0:
+                chunk = stream.read(min(effective_chunk_size, remaining))
+                if not chunk:
+                    raise ValueError(f"object upload ended early: expected_bytes={expected} actual_bytes={total}")
+                total += len(chunk)
+                remaining -= len(chunk)
+                hasher.update(chunk)
+                tmp.write(chunk)
+        return tmp_path, hasher.hexdigest(), total
+    except Exception:
+        if tmp_path:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
+        raise
+
+
 class NodeObjectHttpApp:
     def __init__(self, state: NodeControlState, *, max_body_bytes: int = MAX_OBJECT_HTTP_BODY_BYTES) -> None:
         self.state = state
@@ -107,6 +148,21 @@ class NodeObjectHttpApp:
             return self._handle_release(parts[1], body)
         return 404, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": "not found"})
 
+    def handle_post_stream(
+        self,
+        path: str,
+        headers,
+        stream: BinaryIO,
+        *,
+        content_length: int,
+        chunk_size: int = 0,
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        parsed = urlparse(path)
+        parts = [unquote(x) for x in parsed.path.split("/") if x]
+        if parts == ["objects", "upload"]:
+            return self._handle_upload_stream(headers, stream, content_length=content_length, chunk_size=chunk_size)
+        return self.handle_post(path, headers, stream.read(max(0, int(content_length or 0))))
+
     def _handle_meta(self, object_id: str) -> Tuple[int, Dict[str, str], bytes]:
         object_id = str(object_id or "").strip()
         if not object_id:
@@ -129,6 +185,16 @@ class NodeObjectHttpApp:
         )
 
     def _handle_upload(self, headers, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
+        return self._handle_upload_stream(headers, body, content_length=len(body))
+
+    def _handle_upload_stream(
+        self,
+        headers,
+        stream: Union[BinaryIO, bytes],
+        *,
+        content_length: int,
+        chunk_size: int = 0,
+    ) -> Tuple[int, Dict[str, str], bytes]:
         object_format = normalize_object_format(str(headers.get("X-Pycloud-Object-Format", "") or ""), default="bin")
         integrity_mode = str(headers.get("X-Pycloud-Integrity-Mode", "") or "").strip().lower()
         object_id = str(headers.get("X-Pycloud-Object-Id", "") or "").strip()
@@ -139,20 +205,30 @@ class NodeObjectHttpApp:
         self.state.object_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = ""
         try:
-            tmp = tempfile.NamedTemporaryFile(mode="wb", prefix="pycloud-object-http-", suffix=".bin", delete=False, dir=str(self.state.object_dir))
-            tmp_path = tmp.name
-            with tmp:
-                tmp.write(body)
-            import hashlib
-
-            digest = hashlib.sha256(body).hexdigest()
+            if isinstance(stream, (bytes, bytearray, memoryview)):
+                body = bytes(stream)
+                tmp_path, digest, size_bytes = _read_stream_to_temp_file(
+                    stream=io.BytesIO(body),
+                    content_length=len(body),
+                    tmp_dir=self.state.object_dir,
+                    max_body_bytes=self.max_body_bytes,
+                    chunk_size=chunk_size,
+                )
+            else:
+                tmp_path, digest, size_bytes = _read_stream_to_temp_file(
+                    stream=stream,
+                    content_length=content_length,
+                    tmp_dir=self.state.object_dir,
+                    max_body_bytes=self.max_body_bytes,
+                    chunk_size=chunk_size,
+                )
             expected_object_id = _expected_object_id(meta, digest)
             artifact, cached = self.state.data_store.put_uploaded_file(
                 object_id=expected_object_id,
                 format=object_format,
                 uploaded_path=tmp_path,
                 actual_sha256=digest,
-                size_bytes=len(body),
+                size_bytes=size_bytes,
             )
         except ValueError as exc:
             return 400, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": str(exc)})
@@ -276,7 +352,14 @@ class NodeObjectHttpServer:
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > app.max_body_bytes:
-                    self._send(413, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": "payload too large"}))
+                    self._send(
+                        413,
+                        {"Content-Type": "application/json; charset=utf-8"},
+                        _json_bytes({"ok": False, "error": f"object upload payload too large: size_bytes={length} limit_bytes={app.max_body_bytes}"}),
+                    )
+                    return
+                if urlparse(self.path).path.rstrip("/") == "/objects/upload":
+                    self._send(*app.handle_post_stream(self.path, self.headers, self.rfile, content_length=length))
                     return
                 self._send(*app.handle_post(self.path, self.headers, self.rfile.read(max(0, length))))
 
@@ -393,13 +476,29 @@ class HttpNodeObjectClient:
         if not path.exists():
             raise FileNotFoundError(f"file_path not found: {file_path}")
         effective_format = normalize_object_format(format, source_name=path.name)
-        blob = path.read_bytes()
-        return self.upload_object_from_bytes(
-            blob=blob,
-            format=effective_format,
-            chunk_size=chunk_size,
-            trusted_precheck=trusted_precheck,
-            transfer_mode=transfer_mode,
+        digest = self._sha256_file(path, chunk_size=chunk_size)
+        object_id = object_id_from_sha256_hex(digest)
+        mode = str(transfer_mode or "").strip().lower()
+        if not mode or mode == "auto":
+            mode = "single_pass_authoritative"
+        if mode == "known_digest_precheck" and trusted_precheck is not False:
+            existing = self._object_ref_if_exists(object_id=object_id, fallback_format=effective_format, fallback_size=path.stat().st_size)
+            if existing is not None:
+                return existing
+        integrity_mode = "client_declared" if mode == "known_digest_precheck" else "server_authoritative"
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Pycloud-Object-Format": effective_format,
+            "X-Pycloud-Integrity-Mode": integrity_mode,
+        }
+        if integrity_mode == "client_declared":
+            headers["X-Pycloud-Object-Id"] = object_id
+        data = self._upload_file_request(path=path, headers=headers, chunk_size=chunk_size)
+        return _object_ref(
+            object_id=str(data.get("object_id", "") or object_id),
+            format=str(data.get("format", "") or effective_format),
+            size_bytes=int(data.get("size_bytes", path.stat().st_size) or path.stat().st_size),
+            control_addr=self.base_url,
         )
 
     def get_object_meta(self, *, object_id: str):
@@ -490,6 +589,47 @@ class HttpNodeObjectClient:
         if not bool(parsed.get("ok", False)):
             raise RuntimeError(str(parsed.get("error", "request failed")))
         return parsed
+
+    def _sha256_file(self, path: Path, *, chunk_size: int = 0) -> str:
+        hasher = hashlib.sha256()
+        effective_chunk_size = max(1, int(chunk_size or OBJECT_CHUNK_SIZE_BYTES))
+        with path.open("rb") as fp:
+            while True:
+                chunk = fp.read(effective_chunk_size)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _upload_file_request(self, *, path: Path, headers: Dict[str, str], chunk_size: int = 0) -> Dict[str, object]:
+        parsed = urlparse(self.base_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise RuntimeError(f"unsupported node object scheme: {parsed.scheme!r}")
+        request_headers = dict(headers or {})
+        request_headers["Content-Length"] = str(path.stat().st_size)
+        connection_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = connection_cls(parsed.hostname, parsed.port, timeout=self.timeout_sec)
+        effective_chunk_size = max(1, int(chunk_size or OBJECT_CHUNK_SIZE_BYTES))
+        try:
+            connection.putrequest("POST", "/objects/upload")
+            for name, value in request_headers.items():
+                if str(value or "").strip():
+                    connection.putheader(str(name), str(value))
+            connection.endheaders()
+            with path.open("rb") as fp:
+                while True:
+                    chunk = fp.read(effective_chunk_size)
+                    if not chunk:
+                        break
+                    connection.send(chunk)
+            response = connection.getresponse()
+            raw = response.read()
+            parsed_body = json.loads((raw or b"{}").decode("utf-8") or "{}")
+            if 200 <= int(response.status) < 300 and bool(parsed_body.get("ok", False)):
+                return parsed_body
+            raise RuntimeError(str(parsed_body.get("error", response.reason)))
+        finally:
+            connection.close()
 
     def _error_message(self, exc: HTTPError) -> str:
         try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 from pathlib import Path
 import pytest
 
@@ -12,7 +14,7 @@ from pycloud_parallel.controlplane.config import (
 )
 from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
-from pycloud_parallel.controlplane.node_object_http import HttpNodeObjectClient, NodeObjectHttpServer
+from pycloud_parallel.controlplane.node_object_http import HttpNodeObjectClient, NodeObjectHttpApp, NodeObjectHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 
 
@@ -201,6 +203,63 @@ def test_http_object_file_roundtrip(tmp_path):
             ref = client.upload_object_from_file(file_path=str(source))
             client.download_object_to_file(object_id=ref.object_id, target_path=str(output))
         assert output.read_bytes() == source.read_bytes()
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_object_upload_streams_request_body_to_temp_file(tmp_path):
+    state = NodeControlState(
+        node_id="node-object-http-stream-upload",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "node_object_http_stream_upload"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class ChunkOnlyStream(io.BytesIO):
+        def read(self, size=-1):
+            if size < 0 or size > 16:
+                raise AssertionError("object upload handler must read bounded chunks")
+            return super().read(size)
+
+    blob = b"stream-upload-body" * 8
+    app = NodeObjectHttpApp(state, max_body_bytes=1024)
+    try:
+        code, headers, raw = app.handle_post_stream(
+            "/objects/upload",
+            {
+                "X-Pycloud-Object-Format": "bin",
+                "X-Pycloud-Integrity-Mode": "server_authoritative",
+            },
+            ChunkOnlyStream(blob),
+            content_length=len(blob),
+            chunk_size=16,
+        )
+        body = json.loads(raw.decode("utf-8"))
+        assert code == 200
+        assert headers["Content-Type"].startswith("application/json")
+        assert body["ok"] is True
+        assert body["size_bytes"] == len(blob)
+    finally:
+        state.close()
+
+
+def test_upload_object_from_file_sends_file_without_reading_whole_file(tmp_path, monkeypatch):
+    server, target, state = _start_nodeobject_http_server("node-object-http-file-stream", str(tmp_path / "node_object_http_file_stream"))
+    source = tmp_path / "payload-streamed.dat"
+    source.write_bytes(b"file upload should stream" * 1024)
+    state._object_segment_max_bytes = 1  # noqa: SLF001
+
+    def _fail_read_bytes(self):  # noqa: ANN001
+        raise AssertionError("upload_object_from_file must not read the whole file into memory")
+
+    monkeypatch.setattr(Path, "read_bytes", _fail_read_bytes)
+    try:
+        with HttpNodeObjectClient(target, timeout_sec=10.0) as client:
+            ref = client.upload_object_from_file(file_path=str(source), format="bin")
+            assert client.download_object_bytes(object_id=ref.object_id) == source.open("rb").read()
     finally:
         server.stop()
         state.close()
