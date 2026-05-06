@@ -1926,7 +1926,7 @@ def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_poll
     from pycloud_parallel import TaskPool
 
     submissions: dict[str, list[str]] = {"node-1": [], "node-2": []}
-    pull_calls: list[str] = []
+    pull_calls: list[tuple[str, int]] = []
 
     class _Pool:
         owner_client_id = "owner"
@@ -1947,7 +1947,7 @@ def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_poll
             )
 
         def pull_results(self, limit=100, wait_ms=0, cursor=""):
-            pull_calls.append(self.node_id)
+            pull_calls.append((self.node_id, int(wait_ms)))
             return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
 
     session = TaskPool(
@@ -1969,7 +1969,7 @@ def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_poll
 def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
     from pycloud_parallel import TaskPool
 
-    pull_calls: list[str] = []
+    pull_calls: list[tuple[str, int]] = []
 
     class _Pool:
         owner_client_id = "owner"
@@ -1989,7 +1989,7 @@ def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
             )
 
         def pull_results(self, limit=100, wait_ms=0, cursor=""):
-            pull_calls.append(self.node_id)
+            pull_calls.append((self.node_id, int(wait_ms)))
             return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
 
     session = TaskPool(
@@ -2010,8 +2010,45 @@ def test_native_task_pool_session_imap_unordered_rotates_poll_order() -> None:
             )
         )
 
-    assert pull_calls[:2] == ["node-1", "node-2"]
+    assert [node_id for node_id, _wait_ms in pull_calls[:2]] == ["node-1", "node-2"]
+    assert sum(1 for _node_id, wait_ms in pull_calls[:2] if wait_ms == 1) == 1
+    assert sum(1 for _node_id, wait_ms in pull_calls[:2] if wait_ms == 0) == 1
     assert len(pull_calls) >= 2
+
+
+def test_native_task_pool_session_collect_results_waits_on_one_node_per_round() -> None:
+    from pycloud_parallel import TaskPool
+
+    pull_calls: list[tuple[str, int]] = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": task_result.task_id)
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            pull_calls.append((self.node_id, int(wait_ms)))
+            return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool("node-1"), "node-2": _Pool("node-2")},
+        nodes={},
+        task_method="run",
+        job_id="job-collect-wait",
+    )
+    session._pending_task_ids = {"task-1"}  # noqa: SLF001
+    session._pending_task_node_ids = {"task-1": "node-2"}  # noqa: SLF001
+
+    assert session.collect_results(timeout_sec=0.05, wait_ms=7) == []
+
+    assert len(pull_calls) >= 2
+    assert [node_id for node_id, _wait_ms in pull_calls[:2]] == ["node-1", "node-2"]
+    assert sum(1 for _node_id, wait_ms in pull_calls[:2] if wait_ms == 7) == 1
+    assert sum(1 for _node_id, wait_ms in pull_calls[:2] if wait_ms == 0) == 1
 
 
 def test_native_task_pool_session_imap_unordered_refills_fast_node() -> None:

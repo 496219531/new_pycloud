@@ -1296,6 +1296,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         del job_id
         deadline = time.time() + max(0.1, float(timeout_sec))
         yielded = 0
+        poll_round = 0
         while time.time() < deadline:
             effective_target = self._pending_result_count() if max_count is None else max(0, int(max_count))
             if effective_target > 0 and yielded >= effective_target:
@@ -1312,12 +1313,32 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     return
             any_result = False
             remaining_by_max = effective_target - yielded if effective_target > 0 else 0
-            for node_id, pool in self._pools.items():
+            node_items = list(self._pools.items())
+            if node_items:
+                start_index = poll_round % len(node_items)
+                ordered_items = node_items[start_index:] + node_items[:start_index]
+            else:
+                ordered_items = []
+            blocking_node_id = ""
+            if ordered_items:
+                blocking_node_id = str(ordered_items[0][0])
+                pending_node_ids = {
+                    str(node_id)
+                    for node_id in self._pending_task_node_ids.values()
+                    if str(node_id)
+                }
+                for node_id, _pool in ordered_items:
+                    if str(node_id) in pending_node_ids:
+                        blocking_node_id = str(node_id)
+                        break
+                poll_round += 1
+            for node_id, pool in ordered_items:
                 per_pull_limit = max(1, int(limit or 100))
                 if remaining_by_max > 0:
                     per_pull_limit = max(1, min(per_pull_limit, remaining_by_max))
+                per_pull_wait_ms = max(0, int(wait_ms or 0)) if str(node_id) == blocking_node_id else 0
                 try:
-                    resp = pool.pull_results(limit=per_pull_limit, wait_ms=0, cursor="")
+                    resp = pool.pull_results(limit=per_pull_limit, wait_ms=per_pull_wait_ms, cursor="")
                 except Exception as exc:
                     self._fail_pending_tasks_for_lost_node(node_id, error=exc)
                     any_result = True
@@ -2000,16 +2021,25 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         task_index_by_id: Dict[str, int],
         max_infra_retries: int,
         retry_backoff_ms: int,
+        wait_ms: int = 0,
     ) -> Tuple[List[ExecutionItem], Dict[str, int]]:
         completed_items: List[ExecutionItem] = []
         freed_by_node: Dict[str, int] = {}
+        blocking_node_id = ""
+        for node_id in ordered_node_ids:
+            if node_id in disabled_submit_nodes and int(inflight_by_node.get(node_id, 0) or 0) <= 0:
+                continue
+            blocking_node_id = str(node_id)
+            if int(inflight_by_node.get(node_id, 0) or 0) > 0:
+                break
 
         for node_id in ordered_node_ids:
             if node_id in disabled_submit_nodes and int(inflight_by_node.get(node_id, 0) or 0) <= 0:
                 continue
             pull_limit = max(1, int(inflight_by_node.get(node_id, 0) or 1))
+            per_pull_wait_ms = max(0, int(wait_ms or 0)) if str(node_id) == blocking_node_id else 0
             try:
-                resp = self._pools[node_id].pull_results(limit=pull_limit, wait_ms=0, cursor="")
+                resp = self._pools[node_id].pull_results(limit=pull_limit, wait_ms=per_pull_wait_ms, cursor="")
             except Exception as exc:
                 disabled_submit_nodes.add(node_id)
                 records, _orphan_task_ids = self._mark_taskpool_node_lost(node_id, error=exc)
@@ -2251,6 +2281,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     task_index_by_id=task_index_by_id,
                     max_infra_retries=max_infra_retries,
                     retry_backoff_ms=retry_backoff_ms,
+                    wait_ms=wait_ms,
                 )
 
                 if completed_items:
