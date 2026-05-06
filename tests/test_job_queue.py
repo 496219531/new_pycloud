@@ -194,6 +194,31 @@ def test_local_pickle_payload_transport_keeps_large_file_path_inline(tmp_path) -
     assert restored["file_path"] == source.resolve()
 
 
+def test_local_put_payload_data_uses_file_commit_without_reading_whole_file(tmp_path, monkeypatch) -> None:
+    from pathlib import Path
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
+
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"stream-local-file")
+    source_size = source.stat().st_size
+    original_read_bytes = Path.read_bytes
+
+    def _fail_read_bytes(self):  # noqa: ANN001
+        if Path(self) == source:
+            raise AssertionError("local file-backed payload must not read_bytes() the whole file")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _fail_read_bytes)
+
+    ref = local_ipc_mod._put_local_payload_data(
+        source,
+        meta={"object_dir": str(tmp_path / "objects")},
+    )
+
+    assert ref.object_id.startswith("sha256:")
+    assert ref.size_bytes == source_size
+
+
 def test_startup_module_mount_decodes_transport_envelope_payload_at_invoke(tmp_path, monkeypatch) -> None:
     module_path = tmp_path / "startup_envelope_call.py"
     module_path.write_text(

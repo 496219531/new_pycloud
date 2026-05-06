@@ -109,11 +109,29 @@ def _put_local_payload_data(
         default_serialization_mode=default_serialization_mode,
     )
     if getattr(source, "is_file", False):
-        blob = Path(str(source.file_path)).read_bytes()
-    else:
-        blob = source.blob
+        path = Path(str(source.file_path)).expanduser().resolve()
+        artifact = _commit_result_file(
+            path,
+            object_dir=_local_object_dir(meta),
+            fmt=source.format,
+            size_bytes=int(path.stat().st_size),
+            materialize_as=source.materialize_as,
+        )
+        return DataRef(
+            ref_id=artifact.object_id,
+            storage_id=artifact.object_id,
+            logical_type="",
+            format=artifact.format,
+            size_bytes=artifact.size_bytes,
+            materialize_as=artifact.materialize_as,
+            locator_kind="node_local",
+            locator_token="",
+            consume_on_read=False,
+            node_id=str(meta.get("node_id", "") or ""),
+            node_instance_id=str(meta.get("node_instance_id", "") or ""),
+        )
     return _store_local_payload_blob(
-        blob,
+        source.blob,
         meta=meta,
         fmt=source.format,
         materialize_as=source.materialize_as,
