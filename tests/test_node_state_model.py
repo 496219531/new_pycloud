@@ -1512,9 +1512,8 @@ def test_node_service_stream_rejects_spilled_result_artifacts(tmp_path) -> None:
         materialize_as="bytes",
     )
     try:
-        with state._lock:  # noqa: SLF001
-            with pytest.raises(ValueError, match="stream item exceeds inline result limit"):
-                state._stream_result_value_locked(artifact)  # noqa: SLF001
+        with pytest.raises(ValueError, match="stream item exceeds inline result limit"):
+            state._stream_result_value(artifact)  # noqa: SLF001
     finally:
         state.close()
 
@@ -2704,6 +2703,59 @@ def test_submit_pool_tasks_rejects_when_node_queue_capacity_exceeded(tmp_path):
         assert rejected[0].task_id == "pool-queue-2"
         assert rejected[0].code == pb2.ERROR_CODE_QUEUE_FULL
         mocked_decode.assert_not_called()
+    finally:
+        state.close()
+
+
+def test_submit_pool_tasks_computes_node_queue_occupancy_once_per_batch(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-occupancy-once-01",
+        queue_capacity=16,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_occupancy_once"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    try:
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool",
+            pool_name="pool-occupancy-once",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_occupancy_once_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+        calls = {"count": 0}
+        original = state._node_queue_occupancy_locked  # noqa: SLF001
+
+        def _counting_occupancy():
+            calls["count"] += 1
+            return original()
+
+        monkeypatch.setattr(state, "_node_queue_occupancy_locked", _counting_occupancy)
+
+        accepted, rejected = state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            tasks=[
+                pb2.TaskSubmitItem(task_id="pool-occupancy-1", payload=dict_to_struct({"value": 1})),
+                pb2.TaskSubmitItem(task_id="pool-occupancy-2", payload=dict_to_struct({"value": 2})),
+                pb2.TaskSubmitItem(task_id="pool-occupancy-3", payload=dict_to_struct({"value": 3})),
+            ],
+            job_id="job-pool-occupancy-once",
+        )
+
+        assert len(accepted) == 3
+        assert not rejected
+        assert calls["count"] == 1
     finally:
         state.close()
 

@@ -2410,6 +2410,7 @@ class NodeControlState(NodeRuntimeBase):
                 raise RuntimeError("code artifact missing")
             if self._executor_host is None:
                 raise RuntimeError("executor host unavailable")
+            node_queue_occupancy = self._node_queue_occupancy_locked()
             for item in tasks:
                 task_id = str(item.task_id or "").strip()
                 if task_id in self._pool_tasks or task_id in self._pool_task_reserved_ids:
@@ -2421,7 +2422,7 @@ class NodeControlState(NodeRuntimeBase):
                         )
                     )
                     continue
-                if self._node_queue_occupancy_locked() >= int(self.queue_capacity):
+                if node_queue_occupancy >= int(self.queue_capacity):
                     rejected.append(
                         pb2.TaskRejected(
                             task_id=task_id,
@@ -2435,6 +2436,7 @@ class NodeControlState(NodeRuntimeBase):
                     continue
                 self._pool_task_reserved_ids.add(task_id)
                 reserved_items.append(item)
+                node_queue_occupancy += 1
 
         work_dir = _code_data_dir(self._artifact_dir, code_version=artifact.code_version)
         transport_request_size = 0
