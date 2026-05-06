@@ -10,13 +10,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.http_client import target_to_base_url
-from pycloud_parallel.controlplane.config import get_http_object_body_limit_bytes
+from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_http_object_body_limit_bytes
+from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.data.ref import (
@@ -86,7 +87,7 @@ class NodeObjectHttpApp:
         self.state = state
         self.max_body_bytes = get_http_object_body_limit_bytes(max_body_bytes)
 
-    def handle_get(self, path: str) -> Tuple[int, Dict[str, str], bytes]:
+    def handle_get(self, path: str) -> Union[Tuple[int, Dict[str, str], bytes], StreamingHttpResponse]:
         parsed = urlparse(path)
         parts = [unquote(x) for x in parsed.path.split("/") if x]
         if len(parts) == 3 and parts[0] == "objects" and parts[2] == "meta":
@@ -170,7 +171,7 @@ class NodeObjectHttpApp:
             }
         )
 
-    def _handle_download(self, object_id: str) -> Tuple[int, Dict[str, str], bytes]:
+    def _handle_download(self, object_id: str) -> Union[Tuple[int, Dict[str, str], bytes], StreamingHttpResponse]:
         try:
             artifact = self.state.get_object_artifact(str(object_id or "").strip())
         except KeyError:
@@ -180,20 +181,46 @@ class NodeObjectHttpApp:
         try:
             if getattr(artifact, "storage_backend", "file") == "segment":
                 touch_object_last_at(self.state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.segment_path))
-                with open(artifact.segment_path, "rb") as fp:
-                    fp.seek(max(0, int(getattr(artifact, "segment_offset", 0) or 0)))
-                    blob = fp.read(max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes)))
+                source_path = Path(artifact.segment_path)
+                if not source_path.exists():
+                    raise FileNotFoundError(str(source_path))
+                source_offset = max(0, int(getattr(artifact, "segment_offset", 0) or 0))
+                source_length = max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes))
             else:
                 touch_object_last_at(self.state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.path))
-                blob = Path(artifact.path).read_bytes()
+                source_path = Path(artifact.path)
+                if not source_path.exists():
+                    raise FileNotFoundError(str(source_path))
+                source_offset = 0
+                source_length = max(0, int(getattr(artifact, "size_bytes", 0) or source_path.stat().st_size))
         except FileNotFoundError:
             return 404, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": "object file missing"})
-        return 200, {
-            "Content-Type": "application/octet-stream",
-            "X-Pycloud-Object-Id": artifact.object_id,
-            "X-Pycloud-Object-Format": artifact.format,
-            "X-Pycloud-Object-Size-Bytes": str(int(artifact.size_bytes or len(blob))),
-        }, blob
+
+        def _iter_file_chunks(path: Path, *, offset: int, length: int, chunk_size: int = 0):
+            remaining = max(0, int(length or 0))
+            effective_chunk_size = max(1, int(chunk_size or OBJECT_CHUNK_SIZE_BYTES))
+            with open(path, "rb") as fp:
+                if offset:
+                    fp.seek(max(0, int(offset or 0)))
+                while remaining > 0:
+                    chunk = fp.read(min(effective_chunk_size, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        size_bytes = max(0, int(source_length or 0))
+        return StreamingHttpResponse(
+            status_code=200,
+            body_iter=_iter_file_chunks(source_path, offset=source_offset, length=size_bytes),
+            content_type="application/octet-stream",
+            content_length=size_bytes,
+            extra_headers={
+                "X-Pycloud-Object-Id": artifact.object_id,
+                "X-Pycloud-Object-Format": artifact.format,
+                "X-Pycloud-Object-Size-Bytes": str(size_bytes),
+            },
+        )
 
     def _json_body(self, body: bytes) -> Dict[str, object]:
         if not body:
@@ -240,7 +267,11 @@ class NodeObjectHttpServer:
 
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                self._send(*app.handle_get(self.path))
+                result = app.handle_get(self.path)
+                if isinstance(result, StreamingHttpResponse):
+                    self._send_stream(result)
+                else:
+                    self._send(*result)
 
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -261,6 +292,23 @@ class NodeObjectHttpServer:
                     self.end_headers()
                     if raw:
                         self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+            def _send_stream(self, response: StreamingHttpResponse) -> None:
+                try:
+                    self.send_response(int(response.status_code or 200))
+                    self.send_header("Content-Type", str(response.content_type or "application/octet-stream"))
+                    for key, value in dict(response.extra_headers or {}).items():
+                        if str(key).lower() == "content-type":
+                            continue
+                        self.send_header(str(key), str(value))
+                    if int(response.content_length or 0) > 0:
+                        self.send_header("Content-Length", str(int(response.content_length)))
+                    self.end_headers()
+                    for chunk in response.body_iter:
+                        if chunk:
+                            self.wfile.write(bytes(chunk))
                 except (BrokenPipeError, ConnectionResetError):
                     return
 

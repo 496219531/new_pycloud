@@ -233,7 +233,33 @@ http://127.0.0.1:50051/ops
 5. `replicas`
 6. `ttl_sec`
 
-### 2.8 `POST /data/touch`
+### 2.8 `GET /data/refs/{ref_id}/download`
+
+下载已注册的结果 `DataRef`。
+
+当前语义：
+
+1. caller 只请求 InfoCenter / controlplane 的 `/data/...` 入口
+2. data-plane 通过 registry 解析真实 node 副本
+3. data-plane 内部请求 node object HTTP download
+4. data-plane 边从 node 读，边转发给 caller
+5. 响应体是原始 bytes，不在服务端自动 materialize 成 dataframe/json/ndarray
+
+响应 headers 会尽量保留：
+
+1. `X-Pycloud-Ref-Id`
+2. `X-Pycloud-Object-Id`
+3. `X-Pycloud-Object-Format`
+4. `X-Pycloud-Object-Size-Bytes`
+
+边界：
+
+1. 这是结果下载 data-plane，不是上传入口
+2. 不暴露真实 node 地址给外部响应体
+3. 不把整个对象读入 controlplane 内存
+4. client 侧如需 dataframe/ndarray 等还原，应继续使用 SDK materialize helper
+
+### 2.9 `POST /data/touch`
 
 延长某个 `DataRef` 的 TTL。
 
@@ -241,7 +267,7 @@ http://127.0.0.1:50051/ops
 
 1. `ref_id`
 
-### 2.9 `POST /data/release`
+### 2.10 `POST /data/release`
 
 释放某个 `DataRef` 逻辑句柄。
 
@@ -251,7 +277,7 @@ http://127.0.0.1:50051/ops
 2. 对 `consume_on_read` 引用 best-effort 通知 node 释放 pin
 3. 真正物理删除仍可能延后到 GC
 
-### 2.10 `GET /data/refs`
+### 2.11 `GET /data/refs`
 
 列出当前 registry 中的 `DataRef` 条目。
 

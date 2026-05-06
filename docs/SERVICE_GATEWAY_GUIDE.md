@@ -151,6 +151,14 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 5. 它不是大对象上传/下载通道
 6. 超过 public inline 阈值时，当前行为是失败，而不是自动转 `DataRef`
 
+大结果下载边界：
+
+1. Gateway 只负责 service 调用控制面，不承担大结果本体中转
+2. 普通 call 如果返回 `DataRef`，外部 client 后续应通过 controlplane 的结果 data-plane 下载
+3. 结果 data-plane 入口是 `GET /data/refs/{ref_id}/download`
+4. 第一版 data-plane 只做结果下载，不做输入 upload
+5. data-plane 会内部 resolve 到真实 node，外部 client 不需要也不应该依赖 node 地址
+
 Gateway 当前提供：
 
 1. `POST /svc/{service_name}/call/{method}`

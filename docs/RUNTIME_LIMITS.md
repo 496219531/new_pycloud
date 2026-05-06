@@ -120,6 +120,12 @@
   - 回滚：显式设为 `local_only`
   - 含义：worker 先查本地 object cache，未命中时按 `control_addr` / registry 远程下载、校验 checksum 后写入本地缓存
 
+- result data-plane download
+  - 入口：`GET /data/refs/{ref_id}/download`
+  - 含义：controlplane 通过 registry resolve 到真实 node，再从 node object HTTP 边读边转发给 client
+  - 分片大小：复用 `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
+  - 边界：第一版只做结果下载，不做输入 upload，不让 gateway 承担大结果本体中转
+
 - `PYCLOUD_JOBQUEUE_RESOLVE_REFS`
   - 默认：`defer_to_worker`
   - 回滚：显式设为 `eager`

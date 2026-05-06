@@ -29,6 +29,7 @@ class StreamingHttpResponse:
     body_iter: Iterable[bytes]
     content_type: str = "application/x-ndjson; charset=utf-8"
     extra_headers: Dict[str, str] = field(default_factory=dict)
+    content_length: int = 0
 
 
 InvokeHandler = Callable[
@@ -298,6 +299,8 @@ class ServiceHttpGateway:
                     self.send_header("Connection", "close")
                     for key, value in dict(response.extra_headers or {}).items():
                         self.send_header(str(key), str(value))
+                    if int(response.content_length or 0) > 0:
+                        self.send_header("Content-Length", str(int(response.content_length)))
                     self.end_headers()
                     for chunk in response.body_iter:
                         if not chunk:

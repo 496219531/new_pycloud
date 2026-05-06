@@ -56,6 +56,23 @@ def _replica_known_unhealthy(replica: Dict[str, str], healthy_map: Dict[str, boo
     return bool(node_instance_id) and healthy_map.get(node_instance_id) is False
 
 
+def _data_ref_from_registry_entry(entry: Dict[str, object], fallback: DataRef) -> DataRef:
+    return DataRef(
+        ref_id=str(entry.get("ref_id", "") or fallback.ref_id or ""),
+        storage_id=str(entry.get("storage_id", "") or fallback.storage_id or fallback.object_id or ""),
+        logical_type=str(entry.get("logical_type", "") or fallback.logical_type or ""),
+        format=str(entry.get("format", "") or fallback.format or ""),
+        size_bytes=int(entry.get("size_bytes", 0) or fallback.size_bytes or 0),
+        materialize_as=str(entry.get("materialize_as", "") or fallback.materialize_as or ""),
+        locator_kind=str(entry.get("locator_kind", "") or fallback.locator_kind or ""),
+        locator_token=str(entry.get("locator_token", "") or fallback.locator_token or ""),
+        consume_on_read=bool(entry.get("consume_on_read", fallback.consume_on_read)),
+        node_id=str(entry.get("node_id", "") or fallback.node_id or ""),
+        node_instance_id=str(entry.get("node_instance_id", "") or fallback.node_instance_id or ""),
+        control_addr=str(entry.get("control_addr", "") or fallback.control_addr or ""),
+    )
+
+
 class DataRegistryClient:
     def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
         self.target = str(target or "").strip()
@@ -157,6 +174,7 @@ class DataRegistryClient:
                 except Exception:
                     payload = {}
                 entry = dict(payload.get("entry") or {})
+                registry_ref = _data_ref_from_registry_entry(entry, data_ref) if entry else data_ref
                 control_addr = str(entry.get("control_addr", "") or "").strip()
                 replicas = [
                     dict(item)
@@ -193,10 +211,10 @@ class DataRegistryClient:
                     )
                     best = replicas[0]
                     return ResolvedDataRef(
-                        ref=data_ref,
+                        ref=registry_ref,
                         control_addr=str(best.get("control_addr", "") or "").strip(),
-                        node_id=str(best.get("node_id", "") or data_ref.node_id or ""),
-                        node_instance_id=str(best.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                        node_id=str(best.get("node_id", "") or registry_ref.node_id or ""),
+                        node_instance_id=str(best.get("node_instance_id", "") or registry_ref.node_instance_id or ""),
                         locator_kind="node_control",
                         locator_token=str(best.get("control_addr", "") or "").strip(),
                         via_registry=True,
@@ -211,10 +229,10 @@ class DataRegistryClient:
                     )
                 if control_addr and not had_registry_locator:
                     return ResolvedDataRef(
-                        ref=data_ref,
+                        ref=registry_ref,
                         control_addr=control_addr,
-                        node_id=str(entry.get("node_id", "") or data_ref.node_id or ""),
-                        node_instance_id=str(entry.get("node_instance_id", "") or data_ref.node_instance_id or ""),
+                        node_id=str(entry.get("node_id", "") or registry_ref.node_id or ""),
+                        node_instance_id=str(entry.get("node_instance_id", "") or registry_ref.node_instance_id or ""),
                         locator_kind=str(entry.get("locator_kind", "") or locator_kind),
                         locator_token=str(entry.get("locator_token", "") or locator_token),
                         via_registry=True,

@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from pycloud_parallel.data.ref import coerce_data_ref
 from pycloud_parallel.controlplane.config import get_infocenter_http_body_limit_bytes
+from pycloud_parallel.controlplane.data_plane_http import DataPlaneHttpApp
 from pycloud_parallel.controlplane.gateway_http import GatewayHttpApp
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.job_queue import JobQueueManager
@@ -1045,6 +1046,7 @@ class InfoCenterHttpServer:
         self.state = state or InfoCenterState()
         self.gateway_app = gateway_app
         self.job_queue = job_queue
+        self.data_plane_app = DataPlaneHttpApp(target="")
         env_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
         self.auth_token = str(auth_token or env_token or "").strip()
         self._server: Optional[ThreadingHTTPServer] = None
@@ -1057,6 +1059,7 @@ class InfoCenterHttpServer:
         host, port = _split_host_port(self._bind)
         state = self.state
         gateway_app = self.gateway_app
+        data_plane_app = self.data_plane_app
         if gateway_app is not None:
             gateway_app.start()
 
@@ -1414,6 +1417,13 @@ class InfoCenterHttpServer:
                     if not self._check_auth():
                         self._send_json(401, {"ok": False, "error": "unauthorized"})
                         return
+                handled_data = data_plane_app.handle_get(self.path)
+                if handled_data is not None:
+                    if isinstance(handled_data, StreamingHttpResponse):
+                        self._send_stream(handled_data)
+                    else:
+                        self._send(*handled_data)
+                    return
                 if parsed.path == "/nodes":
                     qs = parse_qs(parsed.query)
                     tags = [x for x in ",".join(qs.get("tags", [])).split(",") if x]
@@ -1592,6 +1602,8 @@ class InfoCenterHttpServer:
                         if str(key).lower() == "content-type":
                             continue
                         self.send_header(str(key), str(value))
+                    if int(response.content_length or 0) > 0:
+                        self.send_header("Content-Length", str(int(response.content_length)))
                     self.end_headers()
                     for chunk in response.body_iter:
                         if not chunk:
@@ -1633,6 +1645,7 @@ class InfoCenterHttpServer:
         public_host = resolve_public_host(host)
         actual_port = int(self._server.server_address[1])
         self.base_url = f"http://{public_host}:{actual_port}"
+        self.data_plane_app.target = self.base_url
         if self.gateway_app is not None:
             self.gateway_app.controlplane_target = self.base_url
         if self.job_queue is not None:

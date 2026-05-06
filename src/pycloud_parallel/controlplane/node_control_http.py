@@ -10,7 +10,7 @@ import time
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -38,6 +38,7 @@ from pycloud_parallel.controlplane.config import (
     get_payload_policy,
 )
 from pycloud_parallel.controlplane.http_client import target_to_base_url
+from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.node.models import ServiceSession, TaskPoolState
 from pycloud_parallel.controlplane.node_object_http import (
     HttpNodeObjectClient,
@@ -192,7 +193,7 @@ class NodeControlHttpApp:
             return
         self.on_service_routes_changed()
 
-    def handle_get(self, path: str) -> Tuple[int, Dict[str, str], bytes]:
+    def handle_get(self, path: str) -> Union[Tuple[int, Dict[str, str], bytes], StreamingHttpResponse]:
         parsed = urlparse(path)
         parts = [unquote(x) for x in parsed.path.split("/") if x]
         if parts and parts[0] == "objects":
@@ -734,7 +735,11 @@ class NodeControlHttpServer:
 
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                self._send(*app.handle_get(self.path))
+                result = app.handle_get(self.path)
+                if isinstance(result, StreamingHttpResponse):
+                    self._send_stream(result)
+                else:
+                    self._send(*result)
 
             def do_POST(self):  # noqa: N802
                 self._handle_with_body(app.handle_post, pass_headers=True)
@@ -760,6 +765,20 @@ class NodeControlHttpServer:
                 self.end_headers()
                 if raw:
                     self.wfile.write(raw)
+
+            def _send_stream(self, response: StreamingHttpResponse) -> None:
+                self.send_response(int(response.status_code or 200))
+                self.send_header("Content-Type", str(response.content_type or "application/octet-stream"))
+                for key, value in dict(response.extra_headers or {}).items():
+                    if str(key).lower() == "content-type":
+                        continue
+                    self.send_header(str(key), str(value))
+                if int(response.content_length or 0) > 0:
+                    self.send_header("Content-Length", str(int(response.content_length)))
+                self.end_headers()
+                for chunk in response.body_iter:
+                    if chunk:
+                        self.wfile.write(bytes(chunk))
 
             def log_message(self, _format, *args):  # noqa: A002
                 return
