@@ -1098,6 +1098,63 @@ class InfoCenterState:
             out.sort(key=lambda n: (not n.healthy, not n.schedulable, n.drain, -(n.service_worker_available())))
             return out[: max(1, limit)]
 
+    def list_selected_nodes(
+        self,
+        *,
+        healthy_only: bool,
+        tags: Iterable[str],
+        limit: int,
+        node_ids: Iterable[str] = (),
+        node_instance_ids: Iterable[str] = (),
+    ) -> List[NodeState]:
+        now = utc_now()
+        filter_tags = set(tags)
+        requested_instance_ids = [str(value or "").strip() for value in node_instance_ids if str(value or "").strip()]
+        requested_node_ids = [str(value or "").strip() for value in node_ids if str(value or "").strip()]
+        if not requested_instance_ids and not requested_node_ids:
+            return self.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit)
+        with self._lock:
+            out: List[NodeState] = []
+            if requested_instance_ids:
+                for node_instance_id in requested_instance_ids:
+                    state = self._nodes.get(node_instance_id)
+                    if state is None:
+                        continue
+                    self._fence_if_stale_locked(state, now=now)
+                    is_healthy = self._node_is_healthy_locked(state, now=now)
+                    if healthy_only and not is_healthy:
+                        continue
+                    if filter_tags and not filter_tags.issubset(set(state.tags)):
+                        continue
+                    out.append(self._clone_node_locked(state, healthy=is_healthy))
+                return out[: max(1, limit)]
+
+            node_id_to_instances: Dict[str, List[NodeState]] = {}
+            for state in self._nodes.values():
+                node_id = str(state.node_id or "").strip()
+                if not node_id or node_id not in requested_node_ids:
+                    continue
+                self._fence_if_stale_locked(state, now=now)
+                is_healthy = self._node_is_healthy_locked(state, now=now)
+                if healthy_only and not is_healthy:
+                    continue
+                if filter_tags and not filter_tags.issubset(set(state.tags)):
+                    continue
+                node_id_to_instances.setdefault(node_id, []).append(self._clone_node_locked(state, healthy=is_healthy))
+
+            duplicates = sorted(node_id for node_id, items in node_id_to_instances.items() if len(items) > 1)
+            if duplicates:
+                dup_list = sorted(duplicates)
+                raise RuntimeError(
+                    f"requested node_ids are ambiguous because multiple live node instances share the same node_id: {dup_list}; "
+                    "please select by node_instance_ids instead"
+                )
+            for node_id in requested_node_ids:
+                item = node_id_to_instances.get(node_id)
+                if item:
+                    out.append(item[0])
+            return out[: max(1, limit)]
+
     def update_node_schedule_state(
         self,
         node_instance_id: str,

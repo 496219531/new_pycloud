@@ -1507,13 +1507,30 @@ class InfoCenterHttpServer:
                 if parsed.path == "/nodes":
                     qs = parse_qs(parsed.query)
                     tags = [x for x in ",".join(qs.get("tags", [])).split(",") if x]
+                    node_ids = [x for x in ",".join(qs.get("node_ids", [])).split(",") if x]
+                    node_instance_ids = [x for x in ",".join(qs.get("node_instance_ids", [])).split(",") if x]
                     healthy_only = str((qs.get("healthy_only", ["true"]) or ["true"])[0]).lower() not in ("0", "false", "no")
                     limit = max(1, int((qs.get("limit", ["100"]) or ["100"])[0]))
-                    nodes = [_serialize_node(item) for item in state.list_nodes(healthy_only=healthy_only, tags=tags, limit=limit)]
+                    try:
+                        nodes = [
+                            _serialize_node(item)
+                            for item in state.list_selected_nodes(
+                                healthy_only=healthy_only,
+                                tags=tags,
+                                limit=limit,
+                                node_ids=node_ids,
+                                node_instance_ids=node_instance_ids,
+                            )
+                        ]
+                    except (ValueError, RuntimeError) as exc:
+                        self._send_json(400, {"ok": False, "error": str(exc)})
+                        return
                     logger.info(
-                        "[InfoCenter] GET /nodes healthy_only=%s tags=%s limit=%d count=%d",
+                        "[InfoCenter] GET /nodes healthy_only=%s tags=%s node_ids=%s node_instance_ids=%s limit=%d count=%d",
                         healthy_only,
                         tags,
+                        node_ids,
+                        node_instance_ids,
                         limit,
                         len(nodes),
                     )
