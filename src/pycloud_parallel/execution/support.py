@@ -377,6 +377,14 @@ def _temp_file_upload_source(
         raise
 
 
+def _write_zip_bundle(path: Path, *, data_name: str, data_bytes: bytes, meta_payload: Dict[str, Any]) -> None:
+    import zipfile
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(data_name, data_bytes)
+        zf.writestr("meta.json", json.dumps(meta_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def _serialize_data_for_object_ref(
     data: Any,
     *,
@@ -462,11 +470,11 @@ def _serialize_data_for_object_ref(
             parquet_buf = io.BytesIO()
             dataframe_bundle_parquet_frame(data).to_parquet(parquet_buf, index=False)
             meta = serialize_dataframe_bundle(data)
+            log_payload_flow("object_ref_upload", path_type="dataframe", format="dfbundle", summary=summarize_payload_flow_value(data))
             bundle_buf = io.BytesIO()
             with zipfile.ZipFile(bundle_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("data.parquet", parquet_buf.getvalue())
                 zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            log_payload_flow("object_ref_upload", path_type="dataframe", format="dfbundle", summary=summarize_payload_flow_value(data))
             return _ObjectUploadSource(materialize_as="dataframe", format="dfbundle", blob=bundle_buf.getvalue())
         if isinstance(data, pd.Series):
             import io
@@ -475,11 +483,11 @@ def _serialize_data_for_object_ref(
             parquet_buf = io.BytesIO()
             data.to_frame("__pycloud_series_value__").to_parquet(parquet_buf, index=False)
             meta = serialize_series_bundle(data)
+            log_payload_flow("object_ref_upload", path_type="series", format="seriesbundle", summary=summarize_payload_flow_value(data))
             bundle_buf = io.BytesIO()
             with zipfile.ZipFile(bundle_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("data.parquet", parquet_buf.getvalue())
                 zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            log_payload_flow("object_ref_upload", path_type="series", format="seriesbundle", summary=summarize_payload_flow_value(data))
             return _ObjectUploadSource(materialize_as="series", format="seriesbundle", blob=bundle_buf.getvalue())
     except ImportError:
         pass
