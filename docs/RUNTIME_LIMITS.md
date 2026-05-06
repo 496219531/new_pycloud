@@ -26,6 +26,7 @@
 | `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES` | `262144` | 对象上传/下载默认分片大小 |
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
 | `PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES` | `1073741824` | 单个 object/DataRef 背后对象的业务硬上限 |
+| `PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES` | `16777216` | 允许整包 bytes 下载/物化的保守阈值，超出后必须走 file/path/streaming |
 | `PYCLOUD_OBJECT_SEGMENT_MAX_BYTES` | `8388608` | 单个结果段文件允许的最大大小 |
 | `PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES` | `67108864` | 结果段文件滚动写入的目标大小 |
 | `PYCLOUD_DATAREF_UPLOAD_STRATEGY` | `upload_once` | 内部链路大对象默认只上传到一个 node，其他层转发 `DataRef` |
@@ -116,6 +117,12 @@
   - 单个 object / DataRef 背后对象的业务硬上限
   - object upload 和大结果转 DataRef 都受这个限制
   - 这不是 HTTP body limit，也不是 segment layout 阈值
+
+- `PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES`
+  - 默认：`16777216` (`16 MiB`)
+  - 控制 `download_object_bytes()`、`materialize_as="bytes"`、`structured_v1` / `pickle_stable_v1` 整包反序列化这类内存路径
+  - 超过该阈值的大对象应使用 `download_object_to_file()`、`materialize_as="path"` 或 data-plane streaming
+  - 这个阈值会被 clamp 到不超过 object size hard limit
 
 - `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
   - 默认：`262144` (`256 KiB`)

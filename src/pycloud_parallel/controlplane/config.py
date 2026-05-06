@@ -112,6 +112,7 @@ _INT_SETTINGS: dict[str, EnvIntSetting] = {
     "OBJECT_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES",), 256 * 1024),
     "FILE_HASH_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES",), 1024 * 1024),
     "OBJECT_SIZE_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES",), 1024 * 1024 * 1024),
+    "BYTES_MATERIALIZE_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES",), 16 * 1024 * 1024),
     "OBJECT_SEGMENT_MAX_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES",), 8 * 1024 * 1024),
     "OBJECT_SEGMENT_TARGET_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES",), 64 * 1024 * 1024),
     "CONTROL_HTTP_MAX_SEND_BYTES": EnvIntSetting(("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"), 16 * 1024 * 1024),
@@ -216,6 +217,7 @@ class ObjectStoreBounds:
     object_chunk_size_bytes: int
     file_hash_chunk_size_bytes: int
     object_size_hard_limit_bytes: int
+    bytes_materialize_threshold_bytes: int
     object_segment_max_bytes: int
     object_segment_target_bytes: int
     gateway_max_upload_file_bytes: int
@@ -380,6 +382,7 @@ def get_config_limit_authority() -> ConfigLimitAuthority:
             object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
             file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
             object_size_hard_limit_bytes=int(OBJECT_SIZE_HARD_LIMIT_BYTES),
+            bytes_materialize_threshold_bytes=int(BYTES_MATERIALIZE_THRESHOLD_BYTES),
             object_segment_max_bytes=int(OBJECT_SEGMENT_MAX_BYTES),
             object_segment_target_bytes=int(OBJECT_SEGMENT_TARGET_BYTES),
             gateway_max_upload_file_bytes=int(GATEWAY_MAX_UPLOAD_FILE_BYTES),
@@ -533,6 +536,27 @@ def get_object_store_bounds() -> ObjectStoreBounds:
 
 def get_object_size_hard_limit_bytes(value: int = 0) -> int:
     return max(1, int(value or get_object_store_bounds().object_size_hard_limit_bytes))
+
+
+def get_bytes_materialize_threshold_bytes(value: int = 0) -> int:
+    bounds = get_object_store_bounds()
+    return max(
+        1,
+        min(
+            int(value or bounds.bytes_materialize_threshold_bytes),
+            int(bounds.object_size_hard_limit_bytes),
+        ),
+    )
+
+
+def validate_bytes_materialize_size(size_bytes: int, *, context: str = "object") -> None:
+    size = max(0, int(size_bytes or 0))
+    limit = get_bytes_materialize_threshold_bytes()
+    if size > limit:
+        raise ValueError(
+            f"{context} is too large for in-memory bytes materialize: "
+            f"size_bytes={size} limit_bytes={limit}; use file/path download instead"
+        )
 
 
 def validate_object_size_bytes(size_bytes: int, *, context: str = "object") -> None:
@@ -774,6 +798,7 @@ STABLE_CONFIG_API_EXPORTS = [
     "effective_limits_from_profile",
     "env_int",
     "get_config_limit_authority",
+    "get_bytes_materialize_threshold_bytes",
     "get_dataref_resolution",
     "get_dataref_upload_strategy",
     "get_dependency_policy_mode",
@@ -813,11 +838,13 @@ STABLE_CONFIG_API_EXPORTS = [
     "resolve_object_transfer_mode",
     "resolve_payload_policy",
     "validate_object_size_bytes",
+    "validate_bytes_materialize_size",
 ]
 
 
 COMPATIBILITY_CONFIG_EXPORTS = [
     "DEPENDENCY_POLICY_MODE",
+    "BYTES_MATERIALIZE_THRESHOLD_BYTES",
     "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
     "DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES",

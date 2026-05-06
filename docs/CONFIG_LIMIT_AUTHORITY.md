@@ -19,7 +19,8 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 超过 estimate threshold 的对象直接转 `DataRef`，不再做完整序列化试算。
 `transport bounds` 只回答“HTTP request/response body 或控制消息最大能收发多少 bytes”。
 `object/store bounds` 里的 object size hard limit 只回答“系统允许单个 object/DataRef 背后的对象最大多大”。
-三者不能互相替代。
+`bytes materialize threshold` 只回答“对象是否允许整包进入内存成为 bytes / 被整包反序列化”。
+这些边界不能互相替代。
 
 ## 代码入口
 
@@ -51,7 +52,9 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
    - `get_http_object_body_limit_bytes(...)`
    - `get_gateway_upload_limits(...)`
    - `get_object_size_hard_limit_bytes(...)`
+   - `get_bytes_materialize_threshold_bytes(...)`
    - `validate_object_size_bytes(...)`
+   - `validate_bytes_materialize_size(...)`
 
 新代码应优先使用以上入口，不要直接 import 裸 limit 常量。
 
@@ -102,11 +105,14 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 10. `get_object_size_hard_limit_bytes(...)` / `validate_object_size_bytes(...)`
    - 负责单个 object/DataRef 背后对象大小的业务硬限制
    - 不等同于 HTTP body limit，也不等同于 segment layout 阈值
-11. `get_managed_globals_control_limit_bytes(...)`
+11. `get_bytes_materialize_threshold_bytes(...)` / `validate_bytes_materialize_size(...)`
+   - 负责整包 bytes 下载、`materialize_as="bytes"` 和整包反序列化路径的内存保护
+   - 不等同于 object size hard limit；大对象可以存在，但不能走 bytes 主路径
+12. `get_managed_globals_control_limit_bytes(...)`
    - 负责 managed globals 的 policy hard limit 与 control send bound 合成
-12. `get_job_staging_replica_count(...)`
+13. `get_job_staging_replica_count(...)`
    - 负责 job staged refs 的副本数默认值和下限修正
-13. `get_job_staged_ref_ttl_sec(...)`
+14. `get_job_staged_ref_ttl_sec(...)`
    - 负责 job staged refs 的 TTL 默认值和下限修正
 
 ## Node 侧职责边界
@@ -151,6 +157,8 @@ node 不是 policy / limit / capability authority。
    - `get_gateway_upload_limits(...)`
    - `get_object_size_hard_limit_bytes(...)`
    - `validate_object_size_bytes(...)`
+   - `get_bytes_materialize_threshold_bytes(...)`
+   - `validate_bytes_materialize_size(...)`
 4. 不要在核心 transport/http 新代码里直接 import body/upload 裸常量：
    - `SERVICE_HTTP_BODY_MAX_BYTES`
    - `GATEWAY_HTTP_BODY_MAX_BYTES`

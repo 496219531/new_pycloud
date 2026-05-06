@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 
+import pytest
+
 from pycloud_parallel.controlplane import client_transport as client_transport_mod
 from pycloud_parallel.controlplane.config import (
     effective_limits_from_profile,
@@ -11,6 +13,7 @@ from pycloud_parallel.controlplane.config import (
     get_gateway_upload_limits,
     get_http_object_body_limit_bytes,
     get_infocenter_http_body_limit_bytes,
+    get_bytes_materialize_threshold_bytes,
     get_job_blob_inline_threshold_bytes,
     get_job_staged_ref_ttl_sec,
     get_job_staging_replica_count,
@@ -26,6 +29,7 @@ from pycloud_parallel.controlplane.config import (
     normalize_policy_limit_values,
     resolve_payload_policy,
     validate_object_size_bytes,
+    validate_bytes_materialize_size,
 )
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
@@ -36,6 +40,7 @@ from pycloud_parallel.controlplane.payload_transport import (
     normalize_inbound_payload,
     prepare_outbound_payload,
 )
+from pycloud_parallel.controlplane.client_transport import _materialize_downloaded_result
 
 _decode_http_request_body_with_mode = client_transport_mod._decode_http_request_body_with_mode
 
@@ -85,6 +90,7 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     assert authority.transport_bounds.control_http_max_send_bytes == 16 * 1024 * 1024
     assert authority.object_store_bounds.object_chunk_size_bytes == 256 * 1024
     assert authority.object_store_bounds.object_size_hard_limit_bytes == 1024 * 1024 * 1024
+    assert authority.object_store_bounds.bytes_materialize_threshold_bytes == 16 * 1024 * 1024
     assert authority.job_staging_bounds.job_staging_replica_count == 2
     assert authority.capacity_defaults.node_worker_capacity == 32
 
@@ -110,6 +116,24 @@ def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
         config_mod.reload_config()
 
 
+def test_bytes_materialize_threshold_is_clamped_to_object_hard_limit(monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", "100")
+    monkeypatch.setenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", "999")
+    config_mod.reload_config()
+    try:
+        assert get_bytes_materialize_threshold_bytes() == 100
+        with pytest.raises(ValueError) as exc_info:
+            validate_bytes_materialize_size(101, context="download")
+    finally:
+        monkeypatch.delenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
+
+    assert "too large for in-memory bytes materialize" in str(exc_info.value)
+
+
 def test_estimate_payload_inline_size_uses_cheap_type_metadata(monkeypatch) -> None:
     import pycloud_parallel.controlplane.payload_transport as transport_mod
 
@@ -118,6 +142,75 @@ def test_estimate_payload_inline_size_uses_cheap_type_metadata(monkeypatch) -> N
 
     monkeypatch.setattr(transport_mod, "serialize_inline_payload", _unexpected)
     assert estimate_payload_inline_size({"blob": b"x" * 128}) >= 128
+
+
+def test_materialize_downloaded_result_rejects_large_bytes(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    path = tmp_path / "large-bytes.bin"
+    path.write_bytes(b"x" * 64)
+    ref = DataRef(
+        ref_id="sha256:" + ("b" * 64),
+        storage_id="sha256:" + ("b" * 64),
+        format="bin",
+        size_bytes=64,
+        materialize_as="bytes",
+    )
+    monkeypatch.setenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", "8")
+    config_mod.reload_config()
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            _materialize_downloaded_result(path, result_ref=ref)
+    finally:
+        monkeypatch.delenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
+
+    assert "too large for in-memory bytes materialize" in str(exc_info.value)
+
+
+def test_materialize_downloaded_result_allows_large_path(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    path = tmp_path / "large-path.bin"
+    path.write_bytes(b"x" * 64)
+    ref = DataRef(
+        ref_id="sha256:" + ("c" * 64),
+        storage_id="sha256:" + ("c" * 64),
+        format="bin",
+        size_bytes=64,
+        materialize_as="path",
+    )
+    monkeypatch.setenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", "8")
+    config_mod.reload_config()
+    try:
+        assert _materialize_downloaded_result(path, result_ref=ref) == path
+    finally:
+        monkeypatch.delenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
+
+
+def test_materialize_downloaded_result_rejects_large_structured_bytes(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config as config_mod
+
+    path = tmp_path / "large-structured.bin"
+    path.write_bytes(b"x" * 64)
+    ref = DataRef(
+        ref_id="sha256:" + ("d" * 64),
+        storage_id="sha256:" + ("d" * 64),
+        format="structured_v1",
+        size_bytes=64,
+        materialize_as="auto",
+    )
+    monkeypatch.setenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", "8")
+    config_mod.reload_config()
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            _materialize_downloaded_result(path, result_ref=ref)
+    finally:
+        monkeypatch.delenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
+
+    assert "too large for in-memory bytes materialize" in str(exc_info.value)
 
 
 def test_config_env_loader_and_reload_share_defaults(monkeypatch) -> None:

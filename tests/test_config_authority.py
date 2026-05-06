@@ -30,6 +30,7 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
     assert object_store.object_chunk_size_bytes == config.OBJECT_CHUNK_SIZE_BYTES
     assert object_store.file_hash_chunk_size_bytes == config.FILE_HASH_CHUNK_SIZE_BYTES
     assert object_store.object_size_hard_limit_bytes == config.OBJECT_SIZE_HARD_LIMIT_BYTES
+    assert object_store.bytes_materialize_threshold_bytes == config.BYTES_MATERIALIZE_THRESHOLD_BYTES
     assert object_store.gateway_max_upload_file_bytes == config.GATEWAY_MAX_UPLOAD_FILE_BYTES
     assert object_store.gateway_max_upload_total_bytes == config.GATEWAY_MAX_UPLOAD_TOTAL_BYTES
 
@@ -37,6 +38,10 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
     assert config.get_gateway_http_body_limit_bytes() == config.GATEWAY_HTTP_BODY_MAX_BYTES
     assert config.get_infocenter_http_body_limit_bytes() == config.INFOCENTER_HTTP_BODY_MAX_BYTES
     assert config.get_http_object_body_limit_bytes() == config.OBJECT_HTTP_BODY_MAX_BYTES
+    assert config.get_bytes_materialize_threshold_bytes() == min(
+        config.BYTES_MATERIALIZE_THRESHOLD_BYTES,
+        config.OBJECT_SIZE_HARD_LIMIT_BYTES,
+    )
     assert config.get_gateway_upload_limits() == (
         config.GATEWAY_MAX_UPLOAD_FILE_BYTES,
         config.GATEWAY_MAX_UPLOAD_TOTAL_BYTES,

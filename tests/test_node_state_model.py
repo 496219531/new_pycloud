@@ -1096,8 +1096,12 @@ def test_data_ref_resolution_defaults_to_remote_fetch_and_caches(tmp_path, monke
             return None
 
         def download_object_bytes(self, *, object_id):
+            raise AssertionError("remote fetch must use download_object_to_file")
+
+        def download_object_to_file(self, *, object_id, target_path):
             calls.append((self.target, object_id))
-            return blob
+            Path(target_path).write_bytes(blob)
+            return Path(target_path)
 
     monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
     ref = DataRef(
@@ -1114,6 +1118,53 @@ def test_data_ref_resolution_defaults_to_remote_fetch_and_caches(tmp_path, monke
     assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
     assert calls == [("127.0.0.1:50061", object_id)]
     assert object_storage_path(tmp_path, object_id=object_id, fmt="bin").read_bytes() == blob
+
+
+def test_data_ref_resolution_rejects_large_bytes_materialize_after_file_fetch(tmp_path, monkeypatch, request):
+    from pycloud_parallel.controlplane import config as config_mod
+    import pycloud_parallel.controlplane.node_control_client as node_control_client_mod
+    from pycloud_parallel.data.ref import DataRef
+
+    monkeypatch.delenv("PYCLOUD_DATAREF_RESOLUTION", raising=False)
+    monkeypatch.setenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", "8")
+    config_mod.reload_config()
+    request.addfinalizer(config_mod.reload_config)
+
+    blob = b"x" * 64
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+
+    class FakeClient:
+        def __init__(self, target, *args, **kwargs):
+            self.target = target
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def download_object_bytes(self, *, object_id):
+            raise AssertionError("remote fetch must not use in-memory bytes download")
+
+        def download_object_to_file(self, *, object_id, target_path):
+            Path(target_path).write_bytes(blob)
+            return Path(target_path)
+
+    monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+        locator_kind="node_control",
+        locator_token="127.0.0.1:50061",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        _resolve_single_data_ref(ref, object_dir=str(tmp_path))
+
+    assert "too large for in-memory bytes materialize" in str(exc_info.value)
 
 
 def test_data_ref_resolution_remote_fetch_resolves_controlplane_locator(tmp_path, monkeypatch, request):
@@ -1156,8 +1207,12 @@ def test_data_ref_resolution_remote_fetch_resolves_controlplane_locator(tmp_path
             return None
 
         def download_object_bytes(self, *, object_id):
+            raise AssertionError("remote fetch must use download_object_to_file")
+
+        def download_object_to_file(self, *, object_id, target_path):
             calls.append((self.target, object_id))
-            return blob
+            Path(target_path).write_bytes(blob)
+            return Path(target_path)
 
     monkeypatch.setattr(data_registry_mod, "DataRegistryClient", FakeRegistryClient)
     monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
@@ -1199,7 +1254,11 @@ def test_data_ref_resolution_remote_fetch_rejects_checksum_mismatch(tmp_path, mo
             return None
 
         def download_object_bytes(self, *, object_id):
-            return wrong_blob
+            raise AssertionError("remote fetch must use download_object_to_file")
+
+        def download_object_to_file(self, *, object_id, target_path):
+            Path(target_path).write_bytes(wrong_blob)
+            return Path(target_path)
 
     monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)
     ref = DataRef(
@@ -1240,6 +1299,9 @@ def test_data_ref_resolution_remote_fetch_error_names_object_and_target(tmp_path
             return None
 
         def download_object_bytes(self, *, object_id):
+            raise AssertionError("remote fetch must use download_object_to_file")
+
+        def download_object_to_file(self, *, object_id, target_path):
             raise FileNotFoundError(f"object missing: {object_id}")
 
     monkeypatch.setattr(node_control_client_mod, "NodeControlClient", FakeClient)

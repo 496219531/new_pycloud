@@ -306,6 +306,34 @@ def test_http_object_bytes_roundtrip_and_precheck(tmp_path):
         state.close()
 
 
+def test_http_object_download_bytes_rejects_over_materialize_threshold(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    server, target, state = _start_nodeobject_http_server("node-object-http-bytes-limit", str(tmp_path / "node_object_http_bytes_limit"))
+    blob = b"x" * 64
+    monkeypatch.setenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", "8")
+    config_mod.reload_config()
+    try:
+        with HttpNodeObjectClient(target, timeout_sec=10.0) as client:
+            ref = client.upload_object_from_bytes(blob=blob, format="bin")
+            with pytest.raises(ValueError) as exc_info:
+                client.download_object_bytes(object_id=ref.object_id)
+            output = tmp_path / "large-download.bin"
+            client.download_object_to_file(object_id=ref.object_id, target_path=str(output))
+        assert output.read_bytes() == blob
+    finally:
+        server.stop()
+        state.close()
+        monkeypatch.delenv("PYCLOUD_BYTES_MATERIALIZE_THRESHOLD_BYTES", raising=False)
+        config_mod.reload_config()
+
+    message = str(exc_info.value)
+    assert "too large for in-memory bytes materialize" in message
+    assert "size_bytes=64" in message
+    assert "limit_bytes=8" in message
+    assert "file/path download" in message
+
+
 def test_http_object_file_roundtrip(tmp_path):
     server, target, state = _start_nodeobject_http_server("node-object-http-02", str(tmp_path / "node_object_http_02"))
     source = tmp_path / "payload.dat"

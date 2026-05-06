@@ -21,6 +21,7 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_SEGMENT_TARGET_BYTES,
     get_dataref_resolution,
     get_payload_policy,
+    validate_bytes_materialize_size,
     validate_object_size_bytes,
 )
 from pycloud_parallel.data.ref import DataRef, coerce_data_ref, maybe_data_ref, resolve_data_ref_materialize_as
@@ -305,41 +306,37 @@ def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) 
     started_at = time.perf_counter()
     from pycloud_parallel.controlplane.node_object_http import make_node_object_client
 
+    normalized_id = normalize_object_id(data_ref.object_id)
+    expected_size = int(data_ref.size_bytes or 0)
+    normalized_format = normalize_object_format(data_ref.format, default="bin")
+    final_path = object_storage_path(object_dir, object_id=normalized_id, fmt=normalized_format)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with make_node_object_client(target) as client:
-            blob = client.download_object_bytes(object_id=data_ref.object_id)
+            client.download_object_to_file(object_id=data_ref.object_id, target_path=str(tmp_path))
     except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
         raise ObjectResolutionError(
             f"remote fetch failed object_id={data_ref.object_id} control_addr={target} "
             f"error_type={type(exc).__name__}: {exc}"
         ) from exc
     fetch_ms = (time.perf_counter() - started_at) * 1000.0
 
-    normalized_id = normalize_object_id(data_ref.object_id)
-    actual_id = object_id_from_sha256_hex(hashlib.sha256(blob).hexdigest())
+    actual_id = object_id_from_sha256_hex(_sha256_file(tmp_path))
     if actual_id != normalized_id:
+        tmp_path.unlink(missing_ok=True)
         raise ObjectResolutionError(
             f"remote object checksum mismatch: expected {normalized_id}, got {actual_id}"
         )
-    expected_size = int(data_ref.size_bytes or 0)
-    if expected_size > 0 and expected_size != len(blob):
+    actual_size = tmp_path.stat().st_size
+    if expected_size > 0 and expected_size != actual_size:
+        tmp_path.unlink(missing_ok=True)
         raise ObjectResolutionError(
-            f"remote object size mismatch: expected {expected_size}, got {len(blob)}"
+            f"remote object size mismatch: expected {expected_size}, got {actual_size}"
         )
 
     cache_started_at = time.perf_counter()
-    normalized_format = normalize_object_format(data_ref.format, default="bin")
-    final_path = object_storage_path(object_dir, object_id=normalized_id, fmt=normalized_format)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        prefix="pycloud-remote-object-",
-        suffix=object_format_suffix(normalized_format) or ".bin",
-        delete=False,
-        dir=str(final_path.parent),
-    ) as tmp_file:
-        tmp_file.write(blob)
-        tmp_path = Path(tmp_file.name)
     try:
         _replace_file_with_retry(tmp_path, final_path)
     finally:
@@ -349,7 +346,7 @@ def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) 
         object_dir,
         object_id=normalized_id,
         fmt=normalized_format,
-        size_bytes=len(blob),
+        size_bytes=actual_size,
         created_at=created_at,
         last_at=created_at,
     )
@@ -360,13 +357,13 @@ def _cache_remote_data_ref(data_ref: DataRef, *, object_dir: Path, target: str) 
         target=target,
         worker_dataref_fetch_ms=fetch_ms,
         worker_dataref_cache_write_ms=cache_ms,
-        size_bytes=len(blob),
+        size_bytes=actual_size,
     )
     return ObjectArtifact(
         object_id=normalized_id,
         path=str(final_path),
         format=normalized_format,
-        size_bytes=len(blob),
+        size_bytes=actual_size,
         created_at=created_at,
         storage_backend="file",
     )
@@ -381,10 +378,18 @@ def _materialize_object_artifact(
     if artifact.storage_backend == "file":
         candidate = Path(artifact.path)
         if str(artifact.format or "").strip().lower() in {"structured_v1", "pickle_stable_v1"}:
+            validate_bytes_materialize_size(
+                int(artifact.size_bytes or candidate.stat().st_size),
+                context=f"object {artifact.object_id}",
+            )
             return deserialize_by_mode(candidate.read_bytes(), mode=str(artifact.format or "").strip().lower())
         if materialize_as == "path":
             return candidate
         if materialize_as == "bytes":
+            validate_bytes_materialize_size(
+                int(artifact.size_bytes or candidate.stat().st_size),
+                context=f"object {artifact.object_id}",
+            )
             return candidate.read_bytes()
         if materialize_as == "text":
             return candidate.read_text(encoding="utf-8")

@@ -11,7 +11,12 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.config import PayloadPolicy, get_payload_policy, resolve_payload_policy
+from pycloud_parallel.controlplane.config import (
+    PayloadPolicy,
+    get_payload_policy,
+    resolve_payload_policy,
+    validate_bytes_materialize_size,
+)
 from pycloud_parallel.data.ref import (
     DataRef,
     maybe_data_ref,
@@ -308,8 +313,16 @@ def _materialize_downloaded_result(path: Path, *, result_ref: object):
         return path
     normalized_format = str(data_ref.format or "").strip().lower()
     if normalized_format in {"structured_v1", "pickle_stable_v1"}:
+        validate_bytes_materialize_size(
+            int(getattr(data_ref, "size_bytes", 0) or path.stat().st_size),
+            context=f"result {data_ref.object_id}",
+        )
         return deserialize_by_mode(path.read_bytes(), mode=normalized_format)
     if materialized == "bytes":
+        validate_bytes_materialize_size(
+            int(getattr(data_ref, "size_bytes", 0) or path.stat().st_size),
+            context=f"result {data_ref.object_id}",
+        )
         return path.read_bytes()
     if materialized == "text":
         return path.read_text(encoding="utf-8")

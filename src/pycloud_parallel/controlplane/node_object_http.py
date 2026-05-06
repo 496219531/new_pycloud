@@ -19,7 +19,12 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.http_client import target_to_base_url
-from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_http_object_body_limit_bytes, validate_object_size_bytes
+from pycloud_parallel.controlplane.config import (
+    OBJECT_CHUNK_SIZE_BYTES,
+    get_http_object_body_limit_bytes,
+    validate_bytes_materialize_size,
+    validate_object_size_bytes,
+)
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
@@ -537,10 +542,19 @@ class HttpNodeObjectClient:
         )
 
     def download_object_bytes(self, *, object_id: str) -> bytes:
+        meta = self.get_object_meta(object_id=object_id)
+        if bool(getattr(meta, "exists", False)):
+            validate_bytes_materialize_size(
+                int(getattr(meta, "size_bytes", 0) or 0),
+                context=f"object {object_id}",
+            )
         url = f"{self.base_url}/objects/{quote(str(object_id or '').strip(), safe='')}/download"
         req = Request(url, method="GET")
         try:
             with urlopen(req, timeout=self.timeout_sec) as resp:
+                length = str(resp.headers.get("Content-Length", "") or "").strip()
+                if length:
+                    validate_bytes_materialize_size(int(length), context=f"object {object_id}")
                 return resp.read()
         except HTTPError as exc:
             raise RuntimeError(self._error_message(exc)) from exc
