@@ -23,6 +23,7 @@
 | `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `4194304` | 单个 inline result 硬限制 |
 | `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES` | `262144` | 对象上传/下载默认分片大小 |
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
+| `PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES` | `1073741824` | 单个 object/DataRef 背后对象的业务硬上限 |
 | `PYCLOUD_OBJECT_SEGMENT_MAX_BYTES` | `8388608` | 单个结果段文件允许的最大大小 |
 | `PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES` | `67108864` | 结果段文件滚动写入的目标大小 |
 | `PYCLOUD_DATAREF_UPLOAD_STRATEGY` | `upload_once` | 内部链路大对象默认只上传到一个 node，其他层转发 `DataRef` |
@@ -91,6 +92,12 @@
 
 ### 2.2 object / file chunk
 
+- `PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES`
+  - 默认：`1073741824` (`1 GiB`)
+  - 单个 object / DataRef 背后对象的业务硬上限
+  - object upload 和大结果转 DataRef 都受这个限制
+  - 这不是 HTTP body limit，也不是 segment layout 阈值
+
 - `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES`
   - 默认：`262144` (`256 KiB`)
   - 对象上传、对象下载分片大小
@@ -138,6 +145,7 @@
 ### 2.4 control HTTP body size
 
 这些是 transport bounds，限制 HTTP request/response body 或控制面消息的大小。它们不决定单个业务对象是否转 `DataRef`。
+单个 object/DataRef 背后对象能有多大，见 `PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES`。
 
 - `PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES`
   - 默认：`16777216` (`16 MiB`)
@@ -169,6 +177,7 @@ node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。�
 - `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`
   - 默认：`536870912` (`512 MiB`)
   - object HTTP upload body 上限
+  - 只表示单次 HTTP upload request body 能接收多大，不表示系统允许单个 object 有多大
 
 ### 2.5 node 默认进程/并发参数
 

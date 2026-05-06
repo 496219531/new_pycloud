@@ -109,6 +109,7 @@ _INT_SETTINGS: dict[str, EnvIntSetting] = {
     "INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES",), 4 * 1024 * 1024),
     "OBJECT_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES",), 256 * 1024),
     "FILE_HASH_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES",), 1024 * 1024),
+    "OBJECT_SIZE_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES",), 1024 * 1024 * 1024),
     "OBJECT_SEGMENT_MAX_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SEGMENT_MAX_BYTES",), 8 * 1024 * 1024),
     "OBJECT_SEGMENT_TARGET_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SEGMENT_TARGET_BYTES",), 64 * 1024 * 1024),
     "CONTROL_HTTP_MAX_SEND_BYTES": EnvIntSetting(("PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES", "PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES"), 16 * 1024 * 1024),
@@ -210,6 +211,7 @@ class TransportBounds:
 class ObjectStoreBounds:
     object_chunk_size_bytes: int
     file_hash_chunk_size_bytes: int
+    object_size_hard_limit_bytes: int
     object_segment_max_bytes: int
     object_segment_target_bytes: int
     gateway_max_upload_file_bytes: int
@@ -327,6 +329,7 @@ def get_config_limit_authority() -> ConfigLimitAuthority:
         object_store_bounds=ObjectStoreBounds(
             object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
             file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
+            object_size_hard_limit_bytes=int(OBJECT_SIZE_HARD_LIMIT_BYTES),
             object_segment_max_bytes=int(OBJECT_SEGMENT_MAX_BYTES),
             object_segment_target_bytes=int(OBJECT_SEGMENT_TARGET_BYTES),
             gateway_max_upload_file_bytes=int(GATEWAY_MAX_UPLOAD_FILE_BYTES),
@@ -469,6 +472,17 @@ def get_transport_bounds() -> TransportBounds:
 
 def get_object_store_bounds() -> ObjectStoreBounds:
     return get_config_limit_authority().object_store_bounds
+
+
+def get_object_size_hard_limit_bytes(value: int = 0) -> int:
+    return max(1, int(value or get_object_store_bounds().object_size_hard_limit_bytes))
+
+
+def validate_object_size_bytes(size_bytes: int, *, context: str = "object") -> None:
+    size = max(0, int(size_bytes or 0))
+    limit = get_object_size_hard_limit_bytes()
+    if size > limit:
+        raise ValueError(f"{context} exceeds object size hard limit: size_bytes={size} limit_bytes={limit}")
 
 
 def get_service_http_body_limit_bytes(value: int = 0) -> int:
@@ -710,6 +724,7 @@ STABLE_CONFIG_API_EXPORTS = [
     "get_managed_globals_control_limit_bytes",
     "get_node_control_http_body_limit_bytes",
     "get_object_store_bounds",
+    "get_object_size_hard_limit_bytes",
     "get_object_transfer_mode",
     "get_payload_policy",
     "get_policy_limit_defaults",
@@ -727,6 +742,7 @@ STABLE_CONFIG_API_EXPORTS = [
     "reload_config",
     "resolve_object_transfer_mode",
     "resolve_payload_policy",
+    "validate_object_size_bytes",
 ]
 
 
@@ -771,6 +787,7 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "NODE_QUEUE_CAPACITY",
     "NODE_WORKER_CAPACITY",
     "OBJECT_CHUNK_SIZE_BYTES",
+    "OBJECT_SIZE_HARD_LIMIT_BYTES",
     "OBJECT_SEGMENT_MAX_BYTES",
     "OBJECT_SEGMENT_TARGET_BYTES",
     "OBJECT_TRANSFER_MODE",

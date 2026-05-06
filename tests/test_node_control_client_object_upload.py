@@ -246,6 +246,41 @@ def test_http_object_upload_streams_request_body_to_temp_file(tmp_path):
         state.close()
 
 
+def test_http_object_upload_rejects_object_limit_separately_from_body_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", "8")
+    from pycloud_parallel.controlplane import config
+
+    config.reload_config()
+    state = NodeControlState(
+        node_id="node-object-http-object-limit",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "node_object_http_object_limit"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    app = NodeObjectHttpApp(state, max_body_bytes=1024)
+    try:
+        code, _headers, raw = app.handle_post_stream(
+            "/objects/upload",
+            {
+                "X-Pycloud-Object-Format": "bin",
+                "X-Pycloud-Integrity-Mode": "server_authoritative",
+            },
+            io.BytesIO(b"larger-than-eight"),
+            content_length=len(b"larger-than-eight"),
+        )
+        body = json.loads(raw.decode("utf-8"))
+        assert code == 400
+        assert "object upload exceeds object size hard limit" in body["error"]
+        assert "size_bytes=17" in body["error"]
+        assert "limit_bytes=8" in body["error"]
+    finally:
+        state.close()
+        monkeypatch.delenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", raising=False)
+        config.reload_config()
+
+
 def test_upload_object_from_file_sends_file_without_reading_whole_file(tmp_path, monkeypatch):
     server, target, state = _start_nodeobject_http_server("node-object-http-file-stream", str(tmp_path / "node_object_http_file_stream"))
     source = tmp_path / "payload-streamed.dat"

@@ -10,13 +10,14 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 | --- | --- | --- |
 | `policy thresholds` | policy profile 的 inline payload/result 阈值 | `policy_profile.py` / effective policy |
 | `transport bounds` | HTTP request/response body 或 control message 边界 | HTTP client/server |
-| `object/store bounds` | object upload、hash、segment、gateway upload 限制 | DataRef / object store |
+| `object/store bounds` | 单对象硬上限、object upload、hash、segment、gateway upload 限制 | DataRef / object store |
 | `job/staging bounds` | job submit、staged refs、gateway stage TTL | JobQueue / gateway staging |
 | `capacity defaults` | node/service 默认容量和 worker 数 | `pycloudctl` / node startup |
 
 `policy thresholds` 只回答“业务 payload/result 多大时应该 inline、转 DataRef 或拒绝”。
 `transport bounds` 只回答“HTTP request/response body 或控制消息最大能收发多少 bytes”。
-两者不能互相替代。
+`object/store bounds` 里的 object size hard limit 只回答“系统允许单个 object/DataRef 背后的对象最大多大”。
+三者不能互相替代。
 
 ## 代码入口
 
@@ -43,6 +44,8 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
    - `get_node_control_http_body_limit_bytes(...)`
    - `get_http_object_body_limit_bytes(...)`
    - `get_gateway_upload_limits(...)`
+   - `get_object_size_hard_limit_bytes(...)`
+   - `validate_object_size_bytes(...)`
 
 新代码应优先使用以上入口，不要直接 import 裸 limit 常量。
 
@@ -90,11 +93,14 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
    - 负责 object HTTP upload/download body bound 默认值和下限修正
 9. `get_gateway_upload_limits(...)`
    - 负责 gateway upload 文件/总量 limit 的默认值和总量下限修正
-10. `get_managed_globals_control_limit_bytes(...)`
+10. `get_object_size_hard_limit_bytes(...)` / `validate_object_size_bytes(...)`
+   - 负责单个 object/DataRef 背后对象大小的业务硬限制
+   - 不等同于 HTTP body limit，也不等同于 segment layout 阈值
+11. `get_managed_globals_control_limit_bytes(...)`
    - 负责 managed globals 的 policy hard limit 与 control send bound 合成
-11. `get_job_staging_replica_count(...)`
+12. `get_job_staging_replica_count(...)`
    - 负责 job staged refs 的副本数默认值和下限修正
-12. `get_job_staged_ref_ttl_sec(...)`
+13. `get_job_staged_ref_ttl_sec(...)`
    - 负责 job staged refs 的 TTL 默认值和下限修正
 
 ## Node 侧职责边界
@@ -137,6 +143,8 @@ node 不是 policy / limit / capability authority。
 3. object/store 和 gateway upload 优先使用：
    - `get_object_store_bounds()`
    - `get_gateway_upload_limits(...)`
+   - `get_object_size_hard_limit_bytes(...)`
+   - `validate_object_size_bytes(...)`
 4. 不要在核心 transport/http 新代码里直接 import body/upload 裸常量：
    - `SERVICE_HTTP_BODY_MAX_BYTES`
    - `GATEWAY_HTTP_BODY_MAX_BYTES`

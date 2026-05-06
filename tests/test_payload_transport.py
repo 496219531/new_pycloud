@@ -17,6 +17,7 @@ from pycloud_parallel.controlplane.config import (
     get_local_service_payload_policy,
     get_managed_globals_control_limit_bytes,
     get_node_control_http_body_limit_bytes,
+    get_object_size_hard_limit_bytes,
     get_service_http_body_limit_bytes,
     get_transport_bounds,
     get_payload_policy,
@@ -24,6 +25,7 @@ from pycloud_parallel.controlplane.config import (
     merge_payload_limits_with_effective_policy,
     normalize_policy_limit_values,
     resolve_payload_policy,
+    validate_object_size_bytes,
 )
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.data.ref import data_ref_to_payload
@@ -80,6 +82,7 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
     assert authority.transport_bounds.control_http_max_send_bytes == 16 * 1024 * 1024
     assert authority.object_store_bounds.object_chunk_size_bytes == 256 * 1024
+    assert authority.object_store_bounds.object_size_hard_limit_bytes == 1024 * 1024 * 1024
     assert authority.job_staging_bounds.job_staging_replica_count == 2
     assert authority.capacity_defaults.node_worker_capacity == 32
 
@@ -147,11 +150,13 @@ def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
     assert get_job_staged_ref_ttl_sec(-5) == 1
     assert get_job_staged_ref_ttl_sec(10) == 10
     assert get_http_object_body_limit_bytes(123) == 123
+    assert get_object_size_hard_limit_bytes(123) == 123
     assert get_node_control_http_body_limit_bytes(123) == 512 * 1024 * 1024
     assert get_service_http_body_limit_bytes(0) == get_transport_bounds().service_http_body_max_bytes
     assert get_gateway_http_body_limit_bytes(123) == 123
     assert get_infocenter_http_body_limit_bytes(123) == 123
     assert get_gateway_upload_limits(max_file_bytes=10, max_total_bytes=5) == (10, 10)
+    validate_object_size_bytes(123, context="test object")
 
 
 def test_config_limit_helpers_merge_effective_policy() -> None:

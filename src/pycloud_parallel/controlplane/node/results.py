@@ -21,6 +21,7 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_SEGMENT_TARGET_BYTES,
     get_dataref_resolution,
     get_payload_policy,
+    validate_object_size_bytes,
 )
 from pycloud_parallel.data.ref import DataRef, coerce_data_ref, maybe_data_ref, resolve_data_ref_materialize_as
 from pycloud_parallel.controlplane.data_store import DataStore
@@ -526,6 +527,7 @@ def _commit_result_file(source_path: Path, *, object_dir: str, fmt: str, size_by
 
 
 def _commit_result_segment(blob: bytes, *, object_dir: str, fmt: str, materialize_as: str) -> StoredResultArtifact:
+    validate_object_size_bytes(len(blob), context="result object")
     digest = hashlib.sha256(blob).hexdigest()
     object_id = object_id_from_sha256_hex(digest)
     return _append_bytes_to_segment(
@@ -540,6 +542,7 @@ def _commit_result_segment(blob: bytes, *, object_dir: str, fmt: str, materializ
 def _store_result_path(path: Path, *, object_dir: str) -> StoredResultArtifact:
     if not path.exists() or not path.is_file():
         raise LargeResultError(f"returned path is not a readable file: {path}")
+    validate_object_size_bytes(path.stat().st_size, context="result object")
     if path.stat().st_size <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
         return _commit_result_segment(
             path.read_bytes(),
@@ -573,6 +576,7 @@ def _store_result_dataframe(frame: Any, *, object_dir: str) -> StoredResultArtif
             zf.writestr("data.parquet", parquet_buf.getvalue())
             zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         blob = bundle.getvalue()
+        validate_object_size_bytes(len(blob), context="result object")
         if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
             return _commit_result_segment(blob, object_dir=object_dir, fmt="dfbundle", materialize_as="dataframe")
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
@@ -604,6 +608,7 @@ def _store_result_series(series: Any, *, object_dir: str) -> StoredResultArtifac
             zf.writestr("data.parquet", parquet_buf.getvalue())
             zf.writestr("meta.json", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         blob = bundle.getvalue()
+        validate_object_size_bytes(len(blob), context="result object")
         if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
             return _commit_result_segment(blob, object_dir=object_dir, fmt="seriesbundle", materialize_as="series")
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".zip", dir=str(Path(object_dir).resolve()))
@@ -630,6 +635,7 @@ def _store_result_ndarray(array: Any, *, object_dir: str) -> StoredResultArtifac
         buf = io.BytesIO()
         np.save(buf, array, allow_pickle=False)
         blob = buf.getvalue()
+        validate_object_size_bytes(len(blob), context="result object")
         if len(blob) <= max(0, int(OBJECT_SEGMENT_MAX_BYTES)):
             return _commit_result_segment(blob, object_dir=object_dir, fmt="npy", materialize_as="ndarray")
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-result-", suffix=".npy", dir=str(Path(object_dir).resolve()))

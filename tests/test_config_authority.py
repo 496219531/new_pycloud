@@ -29,6 +29,7 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
 
     assert object_store.object_chunk_size_bytes == config.OBJECT_CHUNK_SIZE_BYTES
     assert object_store.file_hash_chunk_size_bytes == config.FILE_HASH_CHUNK_SIZE_BYTES
+    assert object_store.object_size_hard_limit_bytes == config.OBJECT_SIZE_HARD_LIMIT_BYTES
     assert object_store.gateway_max_upload_file_bytes == config.GATEWAY_MAX_UPLOAD_FILE_BYTES
     assert object_store.gateway_max_upload_total_bytes == config.GATEWAY_MAX_UPLOAD_TOTAL_BYTES
 
@@ -45,6 +46,7 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
 def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
     monkeypatch.setenv("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "345678")
     monkeypatch.setenv("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "456789")
+    monkeypatch.setenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", "567890")
     monkeypatch.setenv("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", "123456")
     monkeypatch.setenv("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", "234567")
 
@@ -55,10 +57,13 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
 
         assert config.SERVICE_HTTP_BODY_MAX_BYTES == 345678
         assert config.OBJECT_HTTP_BODY_MAX_BYTES == 456789
+        assert config.OBJECT_SIZE_HARD_LIMIT_BYTES == 567890
         assert transport.service_http_body_max_bytes == 345678
         assert transport.object_http_body_max_bytes == 456789
+        assert object_store.object_size_hard_limit_bytes == 567890
         assert config.get_service_http_body_limit_bytes() == 345678
         assert config.get_http_object_body_limit_bytes() == 456789
+        assert config.get_object_size_hard_limit_bytes() == 567890
 
         assert object_store.gateway_max_upload_file_bytes == 123456
         assert object_store.gateway_max_upload_total_bytes == 234567
@@ -66,6 +71,7 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
     finally:
         monkeypatch.delenv("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", raising=False)
         config.reload_config()

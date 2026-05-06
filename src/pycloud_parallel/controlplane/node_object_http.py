@@ -19,7 +19,7 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.http_client import target_to_base_url
-from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_http_object_body_limit_bytes
+from pycloud_parallel.controlplane.config import OBJECT_CHUNK_SIZE_BYTES, get_http_object_body_limit_bytes, validate_object_size_bytes
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
@@ -207,6 +207,7 @@ class NodeObjectHttpApp:
         try:
             if isinstance(stream, (bytes, bytearray, memoryview)):
                 body = bytes(stream)
+                validate_object_size_bytes(len(body), context="object upload")
                 tmp_path, digest, size_bytes = _read_stream_to_temp_file(
                     stream=io.BytesIO(body),
                     content_length=len(body),
@@ -215,6 +216,7 @@ class NodeObjectHttpApp:
                     chunk_size=chunk_size,
                 )
             else:
+                validate_object_size_bytes(content_length, context="object upload")
                 tmp_path, digest, size_bytes = _read_stream_to_temp_file(
                     stream=stream,
                     content_length=content_length,
@@ -222,6 +224,7 @@ class NodeObjectHttpApp:
                     max_body_bytes=self.max_body_bytes,
                     chunk_size=chunk_size,
                 )
+            validate_object_size_bytes(size_bytes, context="object upload")
             expected_object_id = _expected_object_id(meta, digest)
             artifact, cached = self.state.data_store.put_uploaded_file(
                 object_id=expected_object_id,

@@ -33,6 +33,7 @@ from pycloud_parallel.controlplane.config import (
     OBJECT_SEGMENT_MAX_BYTES,
     OBJECT_SEGMENT_TARGET_BYTES,
     get_payload_policy,
+    validate_object_size_bytes,
 )
 from pycloud_parallel.controlplane.data_store import DataStore
 from pycloud_parallel.controlplane.node_capability import NodeCapability, detect_local_node_capability
@@ -1669,6 +1670,7 @@ class NodeControlState(NodeRuntimeBase):
         digest = str(actual_sha256 or "").strip().lower()
         if not digest:
             raise ValueError("empty uploaded object")
+        validate_object_size_bytes(size_bytes, context="object upload")
         actual_object_id = object_id_from_sha256_hex(digest)
         if expected and expected != actual_object_id:
             raise ValueError(f"sha256 mismatch: expected={expected}, actual={actual_object_id}")

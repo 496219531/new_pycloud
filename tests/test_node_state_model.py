@@ -433,6 +433,26 @@ def test_normalize_user_return_large_plain_value_raises_instead_of_silent_none(t
         )
 
 
+def test_normalize_user_return_rejects_result_object_over_hard_limit(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import config as config_mod
+
+    result_path = tmp_path / "large-result.bin"
+    result_path.write_bytes(b"x" * 16)
+    monkeypatch.setenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", "8")
+    config_mod.reload_config()
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            _normalize_user_return(result_path, object_dir=str(tmp_path / "objects"))
+    finally:
+        monkeypatch.delenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", raising=False)
+        config_mod.reload_config()
+
+    message = str(exc_info.value)
+    assert "result object exceeds object size hard limit" in message
+    assert "size_bytes=16" in message
+    assert "limit_bytes=8" in message
+
+
 def test_nested_arrow_payload_roundtrip():
     pd = pytest.importorskip("pandas")
     np = pytest.importorskip("numpy")
