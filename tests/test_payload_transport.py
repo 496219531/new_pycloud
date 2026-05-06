@@ -115,6 +115,8 @@ def test_core_client_payload_paths_do_not_import_default_safe_payload_constants_
         root / "src/pycloud_parallel/execution/support.py",
     ]
     banned_terms = {
+        "INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+        "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
         "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
         "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     }

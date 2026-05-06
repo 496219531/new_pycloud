@@ -1940,7 +1940,6 @@ def test_job_queue_client_submit_job_accepts_controlplane_data_ref_in_job_payloa
 def _submit_oversized_job_payload(monkeypatch):
     from pycloud_parallel import DataRef, JobQueue
 
-    monkeypatch.setattr("pycloud_parallel.execution.support.INLINE_PAYLOAD_SOFT_LIMIT_BYTES", 32)
     client = JobQueue("127.0.0.1:50051", client_id="client-a")
     captured = {}
     registered = {}
@@ -2015,9 +2014,16 @@ def _submit_oversized_job_payload(monkeypatch):
 def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "32")
     monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
     config_mod.reload_config()
-    request.addfinalizer(config_mod.reload_config)
+
+    def _reset_config() -> None:
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
+        config_mod.reload_config()
+
+    request.addfinalizer(_reset_config)
 
     resp, captured, registered, replicas, data_ref_type = _submit_oversized_job_payload(monkeypatch)
 
@@ -2030,9 +2036,16 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, r
 def test_job_queue_client_submit_job_fanout_registers_all_replicas(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "32")
     monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "fanout")
     config_mod.reload_config()
-    request.addfinalizer(config_mod.reload_config)
+
+    def _reset_config() -> None:
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
+        config_mod.reload_config()
+
+    request.addfinalizer(_reset_config)
 
     resp, captured, registered, replicas, data_ref_type = _submit_oversized_job_payload(monkeypatch)
 

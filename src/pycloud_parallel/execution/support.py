@@ -31,7 +31,6 @@ from pycloud_parallel.controlplane.artifact import (
 from pycloud_parallel.controlplane.config import (
     CONTROL_HTTP_MAX_SEND_BYTES,
     FILE_HASH_CHUNK_SIZE_BYTES,
-    INLINE_PAYLOAD_HARD_LIMIT_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,
     get_dataref_upload_strategy,
