@@ -68,6 +68,18 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 _materialize_downloaded_result = client_transport_mod._materialize_downloaded_result
 
+
+def _object_upload_source_blob(source):
+    if source.is_file:
+        return Path(source.file_path).read_bytes()
+    return source.blob
+
+
+def _cleanup_object_upload_source(source) -> None:
+    if source.is_file:
+        Path(source.file_path).unlink(missing_ok=True)
+
+
 def test_commit_result_file_retries_transient_permission_error(tmp_path, monkeypatch):
     source = tmp_path / "source.bin"
     source.write_bytes(b"hello")
@@ -863,9 +875,9 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
     )
     frame = pd.DataFrame([[1, 2], [3, 4]], index=index, columns=[10006, 10007])
 
-    kind, fmt, blob = _serialize_data_for_object_ref(frame, format="parquet")
+    source = _serialize_data_for_object_ref(frame, format="parquet")
+    kind, fmt, blob = source.materialize_as, source.format, _object_upload_source_blob(source)
     import tempfile
-    from pathlib import Path
 
     fd, tmp_name = tempfile.mkstemp(prefix="pycloud-dfbundle-", suffix=".dfbundle")
     import os
@@ -900,6 +912,7 @@ def test_dataframe_object_upload_parquet_preserves_index_and_int_columns():
         pd.testing.assert_frame_equal(restored, frame)
     finally:
         Path(tmp_name).unlink(missing_ok=True)
+        _cleanup_object_upload_source(source)
 
 
 def test_series_object_upload_preserves_index_and_name():
@@ -917,11 +930,11 @@ def test_series_object_upload_preserves_index_and_name():
         name=10006,
     )
 
-    kind, fmt, blob = _serialize_data_for_object_ref(series)
+    source = _serialize_data_for_object_ref(series)
+    kind, fmt, blob = source.materialize_as, source.format, _object_upload_source_blob(source)
 
     import os
     import tempfile
-    from pathlib import Path
 
     fd, tmp_name = tempfile.mkstemp(prefix="pycloud-seriesbundle-", suffix=".seriesbundle")
     os.close(fd)
@@ -947,6 +960,7 @@ def test_series_object_upload_preserves_index_and_name():
         pd.testing.assert_series_equal(restored, series)
     finally:
         Path(tmp_name).unlink(missing_ok=True)
+        _cleanup_object_upload_source(source)
 
 
 def test_ndarray_object_upload_prefers_file_backed_source(tmp_path):
@@ -1002,11 +1016,13 @@ def test_object_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
         ),
         columns=[10006, 10007],
     )
-    _kind, fmt, blob = _serialize_data_for_object_ref(frame)
+    source = _serialize_data_for_object_ref(frame)
+    _kind, fmt, blob = source.materialize_as, source.format, _object_upload_source_blob(source)
     object_id = "sha256:" + "d" * 64
     path = object_storage_path(tmp_path, object_id=object_id, fmt=fmt)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(blob)
+    _cleanup_object_upload_source(source)
 
     payload = {
         "frame": DataRef(
@@ -1040,11 +1056,13 @@ def test_data_ref_resolution_restores_dataframe_bundle_on_node(tmp_path):
         ),
         columns=[10006, 10007],
     )
-    _kind, fmt, blob = _serialize_data_for_object_ref(frame)
+    source = _serialize_data_for_object_ref(frame)
+    _kind, fmt, blob = source.materialize_as, source.format, _object_upload_source_blob(source)
     object_id = "sha256:" + "e" * 64
     path = object_storage_path(tmp_path, object_id=object_id, fmt=fmt)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(blob)
+    _cleanup_object_upload_source(source)
 
     payload = {
         "frame": DataRef(
@@ -2270,10 +2288,12 @@ def test_resolve_object_refs_restores_seriesbundle_from_segment_backend(tmp_path
             ),
             name=10006,
         )
-        kind, fmt, blob = _serialize_data_for_object_ref(series)
+        source = _serialize_data_for_object_ref(series)
+        kind, fmt, blob = source.materialize_as, source.format, _object_upload_source_blob(source)
         object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
         uploaded_path = tmp_path / "upload.seriesbundle"
         uploaded_path.write_bytes(blob)
+        _cleanup_object_upload_source(source)
 
         artifact, cached = node_state.put_object_from_uploaded_file(
             object_id=object_id,
