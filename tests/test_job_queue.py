@@ -161,6 +161,39 @@ def test_local_pickle_payload_transport_repickles_after_prepare_when_over_soft_l
     assert len(dump_calls) == 2
 
 
+def test_local_pickle_payload_transport_normalizes_file_paths(tmp_path) -> None:
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
+    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
+
+    source = tmp_path / "demo.txt"
+    source.write_text("hello", encoding="utf-8")
+
+    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+        {"file_path": source, "file_name": str(source)},
+        meta={"object_dir": str(tmp_path)},
+    )
+
+    restored = decode_inline_transport_carrier(payload_transport, context="service_owner")
+    assert restored["file_path"] == source.resolve()
+    assert restored["file_name"] == str(source.resolve())
+
+
+def test_local_pickle_payload_transport_keeps_large_file_path_inline(tmp_path) -> None:
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
+    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
+
+    source = tmp_path / "large.bin"
+    source.write_bytes(b"x" * (1024 * 1024))
+
+    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+        {"file_path": source},
+        meta={"object_dir": str(tmp_path)},
+    )
+
+    restored = decode_inline_transport_carrier(payload_transport, context="service_owner")
+    assert restored["file_path"] == source.resolve()
+
+
 def test_startup_module_mount_decodes_transport_envelope_payload_at_invoke(tmp_path, monkeypatch) -> None:
     module_path = tmp_path / "startup_envelope_call.py"
     module_path.write_text(

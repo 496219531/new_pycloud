@@ -121,6 +121,16 @@ def _put_local_payload_data(
 
 
 def _estimate_local_inline_size(value: Any) -> int:
+    if isinstance(value, os.PathLike):
+        return len(str(Path(value).expanduser().resolve()).encode("utf-8")) + 16
+    if isinstance(value, str):
+        try:
+            path = Path(value).expanduser()
+            if path.exists() and path.is_file():
+                return len(str(path.resolve()).encode("utf-8")) + 16
+        except OSError:
+            pass
+        return len(value.encode("utf-8")) + 16
     if isinstance(value, (bytes, bytearray, memoryview)):
         return len(value)
     try:
@@ -129,9 +139,35 @@ def _estimate_local_inline_size(value: Any) -> int:
         return len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
 
 
+def _normalize_local_path_value(value: Any) -> Any:
+    if isinstance(value, os.PathLike):
+        return Path(value).expanduser().resolve()
+    if isinstance(value, str):
+        try:
+            path = Path(value).expanduser()
+            if path.exists() and path.is_file():
+                return str(path.resolve())
+        except OSError:
+            return value
+    return value
+
+
+def _normalize_local_payload_paths(value: Any) -> Any:
+    normalized = _normalize_local_path_value(value)
+    if normalized is not value:
+        return normalized
+    if isinstance(value, dict):
+        return {key: _normalize_local_payload_paths(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_local_payload_paths(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_local_payload_paths(item) for item in value)
+    return value
+
+
 def _prepare_local_payload(payload: Dict[str, object], *, meta: Dict[str, object], serialization_mode: str = "") -> Dict[str, object]:
     return prepare_outbound_payload(
-        payload,
+        _normalize_local_payload_paths(payload),
         put_data=lambda value, *, format="": _put_local_payload_data(
             value,
             meta=meta,
@@ -150,7 +186,7 @@ def _make_local_pickle_payload_transport(
     serialization_mode: str = "",
 ) -> Dict[str, object]:
     policy = get_local_service_payload_policy()
-    normalized_payload = dict(payload or {})
+    normalized_payload = dict(_normalize_local_payload_paths(payload or {}))
     raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
     if len(raw_payload) > max(1, int(policy.inline_payload_soft_limit_bytes)):
         prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=serialization_mode)
