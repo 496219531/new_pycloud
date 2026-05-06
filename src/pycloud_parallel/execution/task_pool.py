@@ -123,7 +123,7 @@ class _IndexedPayloadBuffer:
     def next(self) -> Optional[Tuple[int, Dict[str, object]]]:
         if self._retry_payloads:
             index, payload = self._retry_payloads.popleft()
-            return int(index), dict(payload or {})
+            return int(index), payload if isinstance(payload, dict) else {}
         if self._input_exhausted:
             return None
         try:
@@ -133,14 +133,13 @@ class _IndexedPayloadBuffer:
             return None
         if not isinstance(raw_payload, dict):
             raise TypeError("payloads must yield dict items")
-        payload = dict(raw_payload)
         index = self._next_index
         self._next_index += 1
-        return index, payload
+        return index, raw_payload
 
     def requeue_front(self, items: Sequence[Tuple[int, Dict[str, object], Any]]) -> None:
         for index, payload, _item in reversed(list(items)):
-            self._retry_payloads.appendleft((int(index), dict(payload or {})))
+            self._retry_payloads.appendleft((int(index), payload if isinstance(payload, dict) else {}))
 
 
 @dataclass
@@ -1098,7 +1097,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             grouped.setdefault(target_node_id, []).append(
                 self._build_task_submit_item(
                     node_id=target_node_id,
-                    payload=dict(payload or {}),
+                    payload=payload if isinstance(payload, dict) else {},
                     task_id_prefix=task_id_prefix,
                     timeout_hint_sec=max(0, int(timeout_hint_sec)),
                     priority=max(1, int(priority)),
@@ -1278,7 +1277,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         for payload in payloads:
             if not isinstance(payload, dict):
                 raise TypeError("payloads must be mapping payloads")
-            yield {**dict(payload), **shared}
+            yield {**payload, **shared}
 
     def _item_with_index(self, item: ExecutionItem, *, index: int, key: Union[int, str]) -> ExecutionItem:
         return replace(item, index=int(index), key=key)
