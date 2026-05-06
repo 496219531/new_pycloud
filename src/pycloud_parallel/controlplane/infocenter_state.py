@@ -28,6 +28,10 @@ from pycloud_parallel.controlplane.state_time import ts_to_dt, utc_now
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
+class _RouteSnapshot(Tuple[str, str, bool, NodeState, NodeServiceState]):
+    pass
+
+
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
     if value is None:
         return bool(default)
@@ -96,6 +100,7 @@ class InfoCenterState:
         self.heartbeat_interval_sec = max(1, heartbeat_interval_sec)
         self._lock = threading.Lock()
         self._nodes: Dict[str, NodeState] = {}
+        self._services_by_name: Dict[str, set[str]] = {}
         self._profiles: Dict[str, NodeProfile] = {}
         self._profiles_path = Path(profiles_path).expanduser().resolve() if profiles_path else None
         self._data_refs: Dict[str, DataRegistryEntry] = {}
@@ -346,6 +351,28 @@ class InfoCenterState:
             state.schedulable = False
             state.reason = str(state.reason or "node heartbeat timeout")
 
+    def _reindex_node_services_locked(self, state: NodeState, *, previous_names: Optional[Iterable[str]] = None) -> None:
+        node_key = str(getattr(state, "node_instance_id", "") or "").strip()
+        if not node_key:
+            return
+        for name in previous_names or ():
+            normalized_name = str(name or "").strip()
+            if not normalized_name:
+                continue
+            members = self._services_by_name.get(normalized_name)
+            if members is None:
+                continue
+            members.discard(node_key)
+            if not members:
+                self._services_by_name.pop(normalized_name, None)
+        current_names = {
+            str(svc.service_name or "").strip()
+            for svc in state.services.values()
+            if str(svc.service_name or "").strip()
+        }
+        for normalized_name in current_names:
+            self._services_by_name.setdefault(normalized_name, set()).add(node_key)
+
     def is_instance_fenced(self, node_instance_id: str) -> bool:
         normalized_instance = str(node_instance_id or "").strip()
         if not normalized_instance:
@@ -394,6 +421,12 @@ class InfoCenterState:
         for key in replaced_keys:
             old_state = self._nodes.pop(key, None)
             if old_state is not None:
+                previous_service_names = {
+                    str(svc.service_name or "").strip()
+                    for svc in old_state.services.values()
+                    if str(svc.service_name or "").strip()
+                }
+                self._reindex_node_services_locked(old_state, previous_names=previous_service_names)
                 self._fence_instance_locked(old_state, reason="node control_addr replaced")
 
     def _validate_startup_service_names_locked(
@@ -556,6 +589,11 @@ class InfoCenterState:
             state.metadata = incoming_metadata
             state.healthy = True
             state.last_seen_at = now
+            previous_service_names = {
+                str(svc.service_name or "").strip()
+                for svc in state.services.values()
+                if str(svc.service_name or "").strip()
+            }
             state.services = incoming_services
             state.task_pools = dict(task_pools or {})
             state.active_runtimes = [str(x).strip() for x in (active_runtimes or []) if str(x).strip()]
@@ -567,6 +605,7 @@ class InfoCenterState:
             if capability is not None:
                 state.capability = capability
             self._apply_profile_locked(state, registration_tags=tags)
+            self._reindex_node_services_locked(state, previous_names=previous_service_names)
             if state.metrics.credit == 0:
                 state.metrics.credit = state.queue_capacity
             return state
@@ -793,6 +832,11 @@ class InfoCenterState:
                 state.metrics = metrics
             if metadata is not None:
                 state.metadata = dict(metadata or {})
+            previous_service_names = {
+                str(svc.service_name or "").strip()
+                for svc in state.services.values()
+                if str(svc.service_name or "").strip()
+            }
             state.services = dict(services or {})
             state.task_pools = dict(task_pools or {})
             if python_version:
@@ -822,6 +866,7 @@ class InfoCenterState:
             if capability is not None:
                 state.capability = capability
             self._apply_profile_locked(state)
+            self._reindex_node_services_locked(state, previous_names=previous_service_names)
             return state
 
     def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
@@ -892,6 +937,11 @@ class InfoCenterState:
             state = self._nodes.get(node_instance_id)
             if state is None:
                 raise KeyError("node not found")
+            previous_service_names = {
+                str(svc.service_name or "").strip()
+                for svc in state.services.values()
+                if str(svc.service_name or "").strip()
+            }
             self._fence_instance_locked(state, now=now, reason=str(reason or "node lost"))
             state.healthy = False
             state.schedulable = False
@@ -917,6 +967,7 @@ class InfoCenterState:
                     stop_reason=str(svc.stop_reason or state.reason or "node lost"),
                 )
             state.services = degraded
+            self._reindex_node_services_locked(state, previous_names=previous_service_names)
             return self._clone_node_locked(state, healthy=False)
 
     def list_service_routes(
@@ -931,8 +982,16 @@ class InfoCenterState:
         name_filter = service_name.strip()
         normalized_scope = str(route_scope or "call").strip().lower()
         with self._lock:
-            out: List[Dict[str, object]] = []
-            for state in self._nodes.values():
+            candidate_node_ids = (
+                list(self._services_by_name.get(name_filter, ()))
+                if name_filter
+                else list(self._nodes.keys())
+            )
+            snapshots: List[tuple[str, str, bool, NodeState, NodeServiceState]] = []
+            for node_instance_id in candidate_node_ids:
+                state = self._nodes.get(node_instance_id)
+                if state is None:
+                    continue
                 self._fence_if_stale_locked(state, now=now)
                 is_healthy = self._node_is_healthy_locked(state, now=now)
                 if healthy_only and not is_healthy:
@@ -940,85 +999,88 @@ class InfoCenterState:
                 for svc in state.services.values():
                     if name_filter and svc.service_name != name_filter:
                         continue
-                    effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
-                        self._effective_service_state_locked(state, svc, now=now)
-                    )
-                    if healthy_only:
-                        if normalized_scope == "call":
-                            if not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain)):
-                                continue
-                        elif normalized_scope == "owner_command":
-                            if not is_owner_target(healthy=is_healthy, service_status=effective_status):
-                                continue
-                        elif normalized_scope == "exclusive_check":
-                            if not is_conflict_scope(healthy=is_healthy, service_status=effective_status):
-                                continue
-                        elif not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=False):
-                            continue
-                    reported_inflight = max(0, int(svc.in_flight or 0))
-                    received_count = max(0, int(svc.received_count or 0))
-                    returned_count = max(0, int(svc.returned_count or 0))
-                    if received_count > 0 or returned_count > 0:
-                        computed_inflight = max(0, received_count - returned_count)
-                    else:
-                        computed_inflight = max(0, int(effective_in_flight or 0))
-                    effective_computed_inflight = computed_inflight if is_healthy else 0
-                    ema_samples = max(0, int(svc.ema_samples or 0))
-                    raw_ema_child_invoke_ms = max(0.0, float(svc.ema_child_invoke_ms or 0.0))
-                    effective_ema_child_invoke_ms = raw_ema_child_invoke_ms if ema_samples >= 10 else 0.0
-                    predicted_busy = self._predicted_busy_score(
-                        inflight=effective_computed_inflight,
-                        ema_child_invoke_ms=effective_ema_child_invoke_ms,
-                        alive_workers=effective_alive,
-                    )
-                    out.append(
-                        {
-                            "service_name": svc.service_name,
-                            "service_id": svc.service_id,
-                            "status": effective_status,
-                            "service_status": effective_status,
-                            "status_text": status_text,
-                            "policy_id": str(svc.policy_id or "").strip().lower() or "default_safe",
-                            "owner_client_id": str(getattr(svc, "owner_client_id", "") or ""),
-                            "code_version": str(getattr(svc, "code_version", "") or ""),
-                            "entry_module": str(getattr(svc, "entry_module", "") or ""),
-                            "entry_callable": str(getattr(svc, "entry_callable", "") or ""),
-                            "serialization_mode": str(getattr(svc, "serialization_mode", "") or ""),
-                            "node_instance_id": state.node_instance_id,
-                            "node_id": state.node_id,
-                            "control_addr": state.control_addr,
-                            "node_healthy": is_healthy,
-                            "node_schedulable": bool(state.schedulable),
-                            "node_drain": bool(state.drain),
-                            "accept_service_deploy": bool(getattr(state, "accept_service_deploy", True)),
-                            "stale": stale,
-                            "worker_count": svc.worker_count,
-                            "alive_workers": effective_alive,
-                            "in_flight": effective_computed_inflight,
-                            "reported_in_flight": reported_inflight,
-                            "received_count": received_count,
-                            "returned_count": returned_count,
-                            "ema_child_invoke_ms": raw_ema_child_invoke_ms,
-                            "ema_samples": ema_samples,
-                            "predicted_busy": predicted_busy,
-                            "lease_expire_at": effective_lease_expire_at,
-                            "http_base_url": svc.http_base_url,
-                            "capability": state.capability.to_dict(),
-                        }
-                    )
-            out.sort(
-                key=lambda x: (
-                    x["service_name"],
-                    not x["node_healthy"],
-                    int(x["status"] != pb2.SERVICE_STATUS_RUNNING),
-                    float(x.get("predicted_busy", 0.0) or 0.0),
-                    int(x["in_flight"]),
-                    -int(x.get("alive_workers", 0) or 0),
-                    x["node_id"],
-                    x["service_id"],
-                )
+                    snapshots.append((str(svc.service_name or ""), str(svc.service_id or ""), is_healthy, state, svc))
+        out: List[Dict[str, object]] = []
+        for _svc_name, _svc_id, is_healthy, state, svc in snapshots:
+            effective_status, effective_alive, effective_in_flight, effective_lease_expire_at, stale, status_text = (
+                self._effective_service_state_locked(state, svc, now=now)
             )
-            return out[: max(1, limit)]
+            if healthy_only:
+                if normalized_scope == "call":
+                    if not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain)):
+                        continue
+                elif normalized_scope == "owner_command":
+                    if not is_owner_target(healthy=is_healthy, service_status=effective_status):
+                        continue
+                elif normalized_scope == "exclusive_check":
+                    if not is_conflict_scope(healthy=is_healthy, service_status=effective_status):
+                        continue
+                elif not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=False):
+                    continue
+            reported_inflight = max(0, int(svc.in_flight or 0))
+            received_count = max(0, int(svc.received_count or 0))
+            returned_count = max(0, int(svc.returned_count or 0))
+            if received_count > 0 or returned_count > 0:
+                computed_inflight = max(0, received_count - returned_count)
+            else:
+                computed_inflight = max(0, int(effective_in_flight or 0))
+            effective_computed_inflight = computed_inflight if is_healthy else 0
+            ema_samples = max(0, int(svc.ema_samples or 0))
+            raw_ema_child_invoke_ms = max(0.0, float(svc.ema_child_invoke_ms or 0.0))
+            effective_ema_child_invoke_ms = raw_ema_child_invoke_ms if ema_samples >= 10 else 0.0
+            predicted_busy = self._predicted_busy_score(
+                inflight=effective_computed_inflight,
+                ema_child_invoke_ms=effective_ema_child_invoke_ms,
+                alive_workers=effective_alive,
+            )
+            out.append(
+                {
+                    "service_name": svc.service_name,
+                    "service_id": svc.service_id,
+                    "status": effective_status,
+                    "service_status": effective_status,
+                    "status_text": status_text,
+                    "policy_id": str(svc.policy_id or "").strip().lower() or "default_safe",
+                    "owner_client_id": str(getattr(svc, "owner_client_id", "") or ""),
+                    "code_version": str(getattr(svc, "code_version", "") or ""),
+                    "entry_module": str(getattr(svc, "entry_module", "") or ""),
+                    "entry_callable": str(getattr(svc, "entry_callable", "") or ""),
+                    "serialization_mode": str(getattr(svc, "serialization_mode", "") or ""),
+                    "node_instance_id": state.node_instance_id,
+                    "node_id": state.node_id,
+                    "control_addr": state.control_addr,
+                    "node_healthy": is_healthy,
+                    "node_schedulable": bool(state.schedulable),
+                    "node_drain": bool(state.drain),
+                    "accept_service_deploy": bool(getattr(state, "accept_service_deploy", True)),
+                    "stale": stale,
+                    "worker_count": svc.worker_count,
+                    "alive_workers": effective_alive,
+                    "in_flight": effective_computed_inflight,
+                    "reported_in_flight": reported_inflight,
+                    "received_count": received_count,
+                    "returned_count": returned_count,
+                    "ema_child_invoke_ms": raw_ema_child_invoke_ms,
+                    "ema_samples": ema_samples,
+                    "predicted_busy": predicted_busy,
+                    "lease_expire_at": effective_lease_expire_at,
+                    "http_base_url": svc.http_base_url,
+                    "capability": state.capability.to_dict(),
+                }
+            )
+        out.sort(
+            key=lambda x: (
+                x["service_name"],
+                not x["node_healthy"],
+                int(x["status"] != pb2.SERVICE_STATUS_RUNNING),
+                float(x.get("predicted_busy", 0.0) or 0.0),
+                int(x["in_flight"]),
+                -int(x.get("alive_workers", 0) or 0),
+                x["node_id"],
+                x["service_id"],
+            )
+        )
+        return out[: max(1, limit)]
 
     def list_nodes(self, *, healthy_only: bool, tags: Iterable[str], limit: int) -> List[NodeState]:
         now = utc_now()

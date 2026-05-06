@@ -240,6 +240,66 @@ def test_ops_snapshot_returns_partial_table_fragments():
     assert "<tbody" not in fragments["ops-nodes-body"]
 
 
+def test_list_service_routes_uses_service_name_index_for_filtered_lookup():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-a-inst",
+        node_id="node-a",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-a": NodeServiceState(
+                service_name="svc-a",
+                service_id="svc-a",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-a",
+            )
+        },
+    )
+    info_state.register_node_record(
+        node_instance_id="node-b-inst",
+        node_id="node-b",
+        control_addr="127.0.0.1:50062",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-b": NodeServiceState(
+                service_name="svc-b",
+                service_id="svc-b",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18082/svc/svc-b",
+            )
+        },
+    )
+
+    original = info_state._fence_if_stale_locked  # noqa: SLF001
+    visited: list[str] = []
+
+    def _tracking_fence(state, *, now=None):  # noqa: ANN001
+        visited.append(str(state.node_instance_id))
+        return original(state, now=now)
+
+    info_state._fence_if_stale_locked = _tracking_fence  # type: ignore[method-assign]  # noqa: SLF001
+    try:
+        routes = info_state.list_service_routes(
+            service_name="svc-a",
+            healthy_only=True,
+            limit=10,
+        )
+    finally:
+        info_state._fence_if_stale_locked = original  # type: ignore[method-assign]  # noqa: SLF001
+
+    assert [route["service_name"] for route in routes] == ["svc-a"]
+    assert visited == ["node-a-inst"]
+
+
 def test_ops_page_merges_duplicate_services_across_node_records_with_same_endpoint():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     for idx, instance_id in enumerate(("node-dup-a", "node-dup-b"), start=1):
