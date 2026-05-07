@@ -851,11 +851,11 @@ class NodeControlState(NodeRuntimeBase):
             self._delete_object_artifact_locked(normalized)
         return True
 
-    def _ensure_executor_host_alive_locked(self, *, now: Optional[datetime] = None) -> None:
+    def _ensure_executor_host_alive_locked(self, *, now: Optional[datetime] = None) -> bool:
         if not self._executor_host_required():
-            return
+            return False
         if self._executor_host_alive_locked():
-            return
+            return False
 
         current_time = now or utc_now()
         old_host = self._executor_host
@@ -919,6 +919,7 @@ class NodeControlState(NodeRuntimeBase):
                 old_host.close()
             except Exception:
                 pass
+        return True
 
     def get_object_artifact(self, object_id: str) -> ObjectArtifact:
         normalized = normalize_object_id(object_id)
@@ -3705,8 +3706,9 @@ class NodeControlState(NodeRuntimeBase):
         while not self._stop_event.is_set():
             self._drain_executor_events()
             with self._cv:
-                self._ensure_executor_host_alive_locked()
-            self._drain_executor_events()
+                rebuilt = self._ensure_executor_host_alive_locked()
+            if rebuilt:
+                self._drain_executor_events()
             self._stop_event.wait(self.executor_poll_interval_sec)
 
     def _monitor_loop(self) -> None:
