@@ -1280,7 +1280,7 @@ class NodeControlState(NodeRuntimeBase):
     def service_worker_used(self) -> int:
         with self._lock:
             active = sum(
-                session.resource_snapshot().worker_count
+                max(0, int(session.worker_count or 0))
                 for session in self._services.values()
                 if session.is_running()
             )
@@ -1291,11 +1291,15 @@ class NodeControlState(NodeRuntimeBase):
 
     @staticmethod
     def _service_inflight_locked(session: ServiceSession) -> int:
-        return session.resource_snapshot().in_flight
+        received = max(0, int(session.request_count or 0))
+        returned = max(0, int(session.returned_count or 0))
+        return max(0, received - returned)
 
     @staticmethod
     def _task_pool_inflight_locked(pool: TaskPoolState) -> int:
-        return pool.resource_snapshot().in_flight
+        received = max(0, int(pool.task_count or 0))
+        returned = max(0, int(pool.returned_count or 0))
+        return max(0, received - returned)
 
     @staticmethod
     def _pool_task_is_terminal_status(status: int) -> bool:
@@ -1323,7 +1327,7 @@ class NodeControlState(NodeRuntimeBase):
     def task_pool_worker_used(self) -> int:
         with self._lock:
             active = sum(
-                pool.resource_snapshot().worker_count
+                max(0, int(pool.worker_count or 0))
                 for pool in self._task_pools.values()
                 if pool.is_running()
             )
