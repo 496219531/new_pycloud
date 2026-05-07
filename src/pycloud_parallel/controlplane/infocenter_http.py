@@ -326,6 +326,53 @@ def _effective_service_status_text(*, node_healthy: bool, service_status: int) -
     return _service_status_text(service_status)
 
 
+def _ops_badge(text: object, tone: str = "neutral") -> str:
+    return f"<span class='badge badge-{html.escape(str(tone), quote=True)}'>{html.escape(str(text))}</span>"
+
+
+def _ops_bool_badge(value: object, *, true_text: str = "yes", false_text: str = "no", invert: bool = False) -> str:
+    ok = bool(value)
+    tone = "bad" if ok and invert else "good" if ok else "neutral" if invert else "bad"
+    return _ops_badge(true_text if ok else false_text, tone)
+
+
+def _ops_status_badge(text: object) -> str:
+    normalized = str(text or "-").strip().upper()
+    if normalized in {"RUNNING", "SUCCEEDED", "YES"}:
+        tone = "good"
+    elif normalized in {"STARTING", "DRAINING", "PENDING", "WAITING"}:
+        tone = "warn"
+    elif normalized in {"STOPPED", "FAILED", "LOST", "NO", "ERROR"}:
+        tone = "bad"
+    else:
+        tone = "neutral"
+    return _ops_badge(text, tone)
+
+
+def _ops_metric_card(label: str, value: object, subtext: str = "") -> str:
+    detail = f"<div class='metric-sub'>{html.escape(str(subtext))}</div>" if str(subtext or "").strip() else ""
+    return (
+        "<div class='metric-card'>"
+        f"<div class='metric-label'>{html.escape(label)}</div>"
+        f"<div class='metric-value'>{html.escape(str(value))}</div>"
+        f"{detail}"
+        "</div>"
+    )
+
+
+def _ops_table(title: str, note: str, headers: List[str], body_id: str, body: str) -> str:
+    note_html = f"<div class='section-note'>{html.escape(note)}</div>" if note else ""
+    header_html = "".join(f"<th>{html.escape(item)}</th>" for item in headers)
+    return (
+        f"<section class='ops-section'><h2>{html.escape(title)}</h2>{note_html}"
+        "<div class='table-wrap'><table><thead><tr>"
+        f"{header_html}"
+        f"</tr></thead><tbody id='{html.escape(body_id, quote=True)}'>"
+        f"{body}"
+        "</tbody></table></div></section>"
+    )
+
+
 def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) -> Dict[str, object]:
     status_text = _effective_service_status_text(node_healthy=node_healthy, service_status=service.status)
     return {
@@ -695,10 +742,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "<tr>"
             "<td>embedded</td>"
             "<td>-</td>"
-            "<td>yes</td>"
+            f"<td>{_ops_bool_badge(True)}</td>"
             "<td>-</td>"
             f"<td>{html.escape(str(summary.get('current_job_id', '') or '-'))}</td>"
-            f"<td>{html.escape(str(summary.get('current_job_status', '') or '-'))}</td>"
+            f"<td>{_ops_status_badge(str(summary.get('current_job_status', '') or '-'))}</td>"
             f"<td>{html.escape(str(summary.get('current_job_phase', '') or '-'))}</td>"
             f"<td>{html.escape(str(current_job_timing.get('pool_action', '') or '-'))}</td>"
             f"<td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td>"
@@ -719,7 +766,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                     "<td>embedded</td>"
                     "<td>-</td>"
                     f"<td>{html.escape(str(item.get('job_id', '') or '-'))}</td>"
-                    f"<td>{html.escape(str(item.get('status', '') or '-'))}</td>"
+                    f"<td>{_ops_status_badge(str(item.get('status', '') or '-'))}</td>"
                     f"<td>{html.escape(str(item.get('submitted_at', '') or '-'))}</td>"
                     f"<td>{html.escape(str(item.get('finished_at', '') or '-'))}</td>"
                     f"<td>{html.escape(str(item.get('final_result_preview', '') or '-'))}</td>"
@@ -778,11 +825,11 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(node.node_id)}</td>"
             f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
             f"<td>{html.escape(node.control_addr)}</td>"
-            f"<td>{'yes' if node.healthy else 'no'}</td>"
-            f"<td>{'yes' if node.schedulable else 'no'}</td>"
-            f"<td>{'yes' if getattr(node, 'accept_service_deploy', True) else 'no'}</td>"
-            f"<td>{'yes' if node.drain else 'no'}</td>"
-            f"<td>{'yes' if getattr(node, 'profile_enabled', True) else 'no'}</td>"
+            f"<td>{_ops_bool_badge(node.healthy)}</td>"
+            f"<td>{_ops_bool_badge(node.schedulable)}</td>"
+            f"<td>{_ops_bool_badge(getattr(node, 'accept_service_deploy', True))}</td>"
+            f"<td>{_ops_bool_badge(node.drain, invert=True)}</td>"
+            f"<td>{_ops_bool_badge(getattr(node, 'profile_enabled', True))}</td>"
             f"<td>{html.escape(str((node.metadata or {}).get('pycloud_version', '-') or '-'))}</td>"
             f"<td>{html.escape(node.python_version or '-')}</td>"
             f"<td>{html.escape(active_runtimes)}</td>"
@@ -845,7 +892,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(pool.pool_name)}</td>"
                 f"<td>{html.escape(pool.pool_id)}</td>"
                 f"<td>{html.escape(pool.owner_client_id)}</td>"
-                f"<td>{html.escape(pool.status)}</td>"
+                f"<td>{_ops_status_badge(pool.status)}</td>"
                 f"<td>{pool.worker_count}</td>"
                 f"<td>{pool.task_count}</td>"
                 f"<td>{int(getattr(pool, 'inflight', 0) or 0)}</td>"
@@ -876,10 +923,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 "<tr>"
                 f"<td>{html.escape(node.node_id)}</td>"
                 f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
-                f"<td>{'yes' if node_healthy else 'no'}</td>"
+                f"<td>{_ops_bool_badge(node_healthy)}</td>"
                 f"<td>{html.escape(str(metadata.get('pycloud_version', '-') or '-'))}</td>"
                 f"<td>{html.escape(str(metadata.get('current_job_id', '') or '-'))}</td>"
-                f"<td>{html.escape(str(metadata.get('current_job_status', '') or '-'))}</td>"
+                f"<td>{_ops_status_badge(str(metadata.get('current_job_status', '') or '-'))}</td>"
                 "<td>-</td>"
                 "<td>-</td>"
                 "<td>-</td>"
@@ -899,7 +946,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                         f"<td>{html.escape(node.node_id)}</td>"
                         f"<td>{html.escape(getattr(node, 'node_instance_id', '-') or '-')}</td>"
                         f"<td>{_job_detail_link(job_http_base, item.get('job_id', ''))}</td>"
-                        f"<td>{html.escape(str(item.get('status', '') or '-'))}</td>"
+                        f"<td>{_ops_status_badge(str(item.get('status', '') or '-'))}</td>"
                         f"<td>{html.escape(str(item.get('submitted_at', '') or '-'))}</td>"
                         f"<td>{html.escape(str(item.get('finished_at', '') or '-'))}</td>"
                         f"<td>{html.escape(str(item.get('final_result_preview', '') or '-'))}</td>"
@@ -975,8 +1022,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(', '.join(instance_ids) or '-')}</td>"
             f"<td>{html.escape(str(item['service_name']))}</td>"
             f"<td>{service_id_text}</td>"
-            f"<td>{'yes' if any_healthy else 'no'}</td>"
-            f"<td>{html.escape(_effective_service_status_text(node_healthy=any_healthy, service_status=int(item['status'])))}</td>"
+            f"<td>{_ops_bool_badge(any_healthy)}</td>"
+            f"<td>{_ops_status_badge(_effective_service_status_text(node_healthy=any_healthy, service_status=int(item['status'])))}</td>"
             f"<td>{max(int(entry['item'].get('worker_count', 0) or 0) for entry in ordered)}</td>"
             f"<td>{max(int(entry['item'].get('alive_workers', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
             f"<td>{max(int(entry['item'].get('in_flight', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
@@ -1001,65 +1048,96 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     recent_job_body = "\n".join(row for _sort_key, row in recent_job_rows) or "<tr><td colspan='8'>no recent jobs</td></tr>"
     waiting_job_rows.sort(key=lambda item: item[0])
     waiting_job_body = "\n".join(row for _sort_key, row in waiting_job_rows) or "<tr><td colspan='7'>no waiting jobs</td></tr>"
+    healthy_nodes = sum(1 for node in nodes if bool(getattr(node, "healthy", False)))
+    total_nodes = len(nodes)
+    total_services = len(service_entries)
+    running_services = sum(
+        1
+        for rows in service_entries.values()
+        if any(bool(entry["node_healthy"]) and int(entry["item"].get("status", 0) or 0) == int(pb2.SERVICE_STATUS_RUNNING) for entry in rows)
+    )
+    total_pools = len(pool_entries)
+    pool_inflight = sum(
+        int(getattr(pool, "inflight", 0) or 0)
+        for node in nodes
+        for pool in getattr(node, "task_pools", {}).values()
+    )
+    total_waiting_jobs = len(waiting_job_rows)
+    total_recent_jobs = len(recent_job_rows)
+    overview = (
+        "<div class='metrics-grid'>"
+        f"{_ops_metric_card('Nodes', f'{healthy_nodes}/{total_nodes}', 'healthy / total')}"
+        f"{_ops_metric_card('Services', f'{running_services}/{total_services}', 'routable / known')}"
+        f"{_ops_metric_card('Task Pools', total_pools, f'in-flight {pool_inflight}')}"
+        f"{_ops_metric_card('Jobs', total_waiting_jobs, f'waiting, {total_recent_jobs} recent')}"
+        "</div>"
+    )
+    node_headers = [
+        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "accept deploy", "drain", "enabled", "pycloud",
+        "python", "active runtimes", "effective tags", "managed tags", "capability tags", "legacy node tags", "svc cap",
+        "svc used", "svc avail", "pool cap", "pool used", "pool avail", "pool inflight", "pool count", "svc count",
+        "services", "reason", "notes", "actions",
+    ]
+    job_queue_headers = [
+        "owner", "instance_id", "healthy", "pycloud", "current_job_id", "current_status", "current_phase", "pool_action",
+        "current_total_ms", "waiting", "running", "terminal", "job_count", "http_base_url",
+    ]
+    recent_job_headers = ["owner", "instance_id", "job_id", "status", "submitted_at", "finished_at", "final_result", "error"]
+    waiting_job_headers = ["owner", "instance_id", "job_id", "priority", "submitted_at", "position", "actions"]
+    service_headers = [
+        "node_id", "instance_id", "service_name", "service_id", "node_healthy", "status", "workers", "alive", "in_flight",
+        "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
+        "lease_expire_at", "failure_reason", "http_base_url",
+    ]
+    pool_headers = [
+        "node_id", "instance_id", "pool_name", "pool_id", "owner_client_id", "status", "workers", "tasks", "in_flight",
+        "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
+        "last_executor_create_ms", "avg_warmup_ms", "executor_rebuild_count", "code_version", "created_at",
+        "last_heartbeat_at", "lease_expire_at", "failure_reason",
+    ]
     return (
         "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
-        "<style>body{font-family:Menlo,monospace;margin:20px;}table{border-collapse:collapse;width:100%;}"
-        "th,td{border:1px solid #ccc;padding:6px 8px;font-size:13px;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}"
-        "th{background:#f5f5f5;text-align:left;}"
-        "h2{margin-top:28px;} .muted{color:#666;} .section-note{color:#555;font-size:12px;margin:6px 0 10px;}"
-        ".stale-row{background:#fff1f0;color:#8a1f11;}</style>"
+        "<style>"
+        ":root{color-scheme:light;--bg:#f6f8fb;--panel:#ffffff;--line:#d8dee8;--line-soft:#e7ebf2;--text:#182230;--muted:#64748b;--head:#f1f5f9;--good:#087443;--good-bg:#dcfce7;--warn:#a15c00;--warn-bg:#fff4ce;--bad:#b42318;--bad-bg:#fee4e2;--neutral:#475467;--neutral-bg:#eef2f6;--accent:#2563eb;}"
+        "*{box-sizing:border-box;}body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:var(--bg);color:var(--text);}"
+        ".ops-shell{max-width:1600px;margin:0 auto;padding:24px;} .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px;}"
+        "h1{font-size:26px;line-height:1.2;margin:0 0 6px;font-weight:720;letter-spacing:0;}h2{font-size:18px;margin:0 0 8px;font-weight:700;letter-spacing:0;}"
+        ".muted{color:var(--muted);} .section-note{color:var(--muted);font-size:12px;line-height:1.45;margin:6px 0 10px;}"
+        ".refresh-pill{white-space:nowrap;border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:7px 10px;font-size:12px;color:var(--muted);box-shadow:0 1px 2px rgba(16,24,40,.05);}"
+        ".metrics-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:12px;margin:16px 0 20px;}"
+        ".metric-card{background:var(--panel);border:1px solid var(--line-soft);border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(16,24,40,.04);}"
+        ".metric-label{font-size:12px;color:var(--muted);font-weight:650;text-transform:uppercase;letter-spacing:.04em;}.metric-value{font-size:28px;line-height:1.1;margin-top:8px;font-weight:760;}.metric-sub{font-size:12px;color:var(--muted);margin-top:6px;}"
+        ".ops-section{margin:18px 0 22px;}.table-wrap{overflow:auto;max-height:68vh;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(16,24,40,.04);}"
+        "table{border-collapse:separate;border-spacing:0;width:100%;min-width:1120px;}th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);padding:8px 10px;font-size:12px;line-height:1.35;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}"
+        "th{position:sticky;top:0;z-index:1;background:var(--head);text-align:left;color:#334155;font-weight:700;}tr:last-child td{border-bottom:0;}td:last-child,th:last-child{border-right:0;}tbody tr:hover{background:#f8fafc;}"
+        ".badge{display:inline-flex;align-items:center;min-height:20px;border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700;line-height:1.2;border:1px solid transparent;white-space:nowrap;}"
+        ".badge-good{background:var(--good-bg);color:var(--good);}.badge-warn{background:var(--warn-bg);color:var(--warn);}.badge-bad{background:var(--bad-bg);color:var(--bad);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);}"
+        ".stale-row{background:#fff7f5;color:#8a1f11;}button{appearance:none;border:1px solid var(--line);border-radius:6px;background:#fff;color:#1f2937;padding:4px 8px;margin:1px;font:inherit;font-size:12px;cursor:pointer;}button:hover{border-color:#93c5fd;color:var(--accent);background:#eff6ff;}input,select{border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit;font-size:12px;background:#fff;max-width:180px;}"
+        "@media(max-width:900px){.ops-shell{padding:16px}.topbar{display:block}.refresh-pill{display:inline-block;margin-top:10px}.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.metric-value{font-size:23px;}}"
+        "@media(max-width:560px){.metrics-grid{grid-template-columns:1fr;}th,td{font-size:11px;padding:7px 8px;}}"
+        "</style>"
         "</head><body>"
-        f"<h1>InfoCenter Ops</h1><div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
-        "<div class='section-note' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div>"
+        "<div class='ops-shell'>"
+        "<div class='topbar'><div>"
+        "<h1>InfoCenter Ops</h1>"
+        f"<div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
+        "</div><div class='refresh-pill' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div></div>"
+        f"{overview}"
         "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
         "Service table below shows each deployed service instance, worker process counts, and reduced timing metrics. "
-        "Task pool table shows native temporary pools running on each node. "
-        "Timing columns keep only average total latency plus child decode/invoke/encode averages. "
-        "Rows for stale nodes are highlighted and rendered as LOST.</div>"
-        "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>enabled</th><th>pycloud</th>"
-        "<th>python</th><th>active runtimes</th><th>effective tags</th><th>managed tags</th><th>capability tags</th><th>legacy node tags</th><th>svc cap</th><th>svc used</th><th>svc avail</th><th>pool cap</th><th>pool used</th><th>pool avail</th><th>pool inflight</th><th>pool count</th><th>svc count</th><th>services</th><th>reason</th><th>notes</th><th>actions</th>"
-        "</tr></thead><tbody id='ops-nodes-body'>"
-        f"{node_body}"
-        "</tbody></table>"
-        "<h2>Job Queue</h2>"
-        "<div class='section-note'>Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.</div>"
-        "<table><thead><tr>"
-        "<th>owner</th><th>instance_id</th><th>healthy</th><th>pycloud</th><th>current_job_id</th><th>current_status</th><th>current_phase</th><th>pool_action</th><th>current_total_ms</th><th>waiting</th><th>running</th><th>terminal</th><th>job_count</th><th>http_base_url</th>"
-        "</tr></thead><tbody id='ops-job-queue-body'>"
-        f"{job_queue_body}"
-        "</tbody></table>"
-        "<div class='section-note'>Job-orch timing is reduced timing for queue wait, pool prepare, globals fanout, task running, finalize, writeback and total. Windows-focused fields highlight executor create/rebuild, warmup, and first-result wait.</div>"
-        "<table><thead><tr>"
+        "Task pool table shows native temporary pools running on each node. Rows for stale nodes are highlighted and rendered as LOST.</div>"
+        f"{_ops_table('Nodes', '', node_headers, 'ops-nodes-body', node_body)}"
+        f"{_ops_table('Job Queue', 'Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.', job_queue_headers, 'ops-job-queue-body', job_queue_body)}"
+        "<section class='ops-section'><div class='section-note'>Job-orch timing is reduced timing for queue wait, pool prepare, globals fanout, task running, finalize, writeback and total. Windows-focused fields highlight executor create/rebuild, warmup, and first-result wait.</div>"
+        "<div class='table-wrap'><table><thead><tr>"
         "<th>scope</th><th>job_count</th><th>avg_queue_wait_ms</th><th>avg_pool_prepare_ms</th><th>avg_fanout_globals_ms</th><th>avg_running_tasks_ms</th><th>avg_finalize_ms</th><th>avg_terminal_writeback_ms</th><th>avg_total_ms</th><th>max_total_ms</th><th>executor_create_count</th><th>executor_rebuild_count</th><th>pool_reuse_count</th><th>pool_create_count</th><th>pool_rebuild_count</th><th>avg_first_result_wait_ms</th><th>avg_warmup_ms</th></tr></thead><tbody id='ops-job-timing-body'>"
         f"<tr><td>embedded-job-orch</td><td>{html.escape(str(queue_timing.get('job_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_queue_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_pool_prepare_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_fanout_globals_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_running_tasks_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_finalize_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_terminal_writeback_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('max_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_first_result_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_warmup_ms', '-')))}</td></tr>"
         f"<tr><td>current-job</td><td>1</td><td>{html.escape(str(current_job_timing.get('queue_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_prepare_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('fanout_globals_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('running_tasks_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('finalize_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('terminal_writeback_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'create' else 0))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'rebuild' else 0))}</td><td>{html.escape(str(current_job_timing.get('first_result_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('warmup_ms', '-')))}</td></tr>"
-        "</tbody></table>"
-        "<h2>Recent Jobs</h2>"
-        "<table><thead><tr>"
-        "<th>owner</th><th>instance_id</th><th>job_id</th><th>status</th><th>submitted_at</th><th>finished_at</th><th>final_result</th><th>error</th>"
-        "</tr></thead><tbody id='ops-recent-jobs-body'>"
-        f"{recent_job_body}"
-        "</tbody></table>"
-        "<h2>Waiting Jobs</h2>"
-        "<div class='section-note'>Only waiting jobs can be reordered. Running jobs keep their current slot.</div>"
-        "<table><thead><tr>"
-        "<th>owner</th><th>instance_id</th><th>job_id</th><th>priority</th><th>submitted_at</th><th>position</th><th>actions</th>"
-        "</tr></thead><tbody id='ops-waiting-jobs-body'>"
-        f"{waiting_job_body}"
-        "</tbody></table>"
-        "<h2>Service Instances</h2>"
-        "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>service_name</th><th>service_id</th><th>node_healthy</th><th>status</th><th>workers</th><th>alive</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>lease_expire_at</th><th>failure_reason</th><th>http_base_url</th>"
-        "</tr></thead><tbody id='ops-services-body'>"
-        f"{service_body}"
-        "</tbody></table>"
-        "<h2>Task Pools</h2>"
-        "<table><thead><tr>"
-        "<th>node_id</th><th>instance_id</th><th>pool_name</th><th>pool_id</th><th>owner_client_id</th><th>status</th><th>workers</th><th>tasks</th><th>in_flight</th><th>calls</th><th>errors</th><th>avg_total_ms</th><th>avg_child_decode_ms</th><th>avg_child_invoke_ms</th><th>avg_child_encode_ms</th><th>last_executor_create_ms</th><th>avg_warmup_ms</th><th>executor_rebuild_count</th><th>code_version</th><th>created_at</th><th>last_heartbeat_at</th><th>lease_expire_at</th><th>failure_reason</th>"
-        "</tr></thead><tbody id='ops-pools-body'>"
-        f"{pool_body}"
-        "</tbody></table>"
+        "</tbody></table></div></section>"
+        f"{_ops_table('Recent Jobs', '', recent_job_headers, 'ops-recent-jobs-body', recent_job_body)}"
+        f"{_ops_table('Waiting Jobs', 'Only waiting jobs can be reordered. Running jobs keep their current slot.', waiting_job_headers, 'ops-waiting-jobs-body', waiting_job_body)}"
+        f"{_ops_table('Service Instances', '', service_headers, 'ops-services-body', service_body)}"
+        f"{_ops_table('Task Pools', '', pool_headers, 'ops-pools-body', pool_body)}"
         "<script>"
         "(function(){"
         "const ids=['ops-nodes-body','ops-job-queue-body','ops-job-timing-body','ops-recent-jobs-body','ops-waiting-jobs-body','ops-services-body','ops-pools-body'];"
@@ -1075,7 +1153,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "}"
         "window.setInterval(refreshOps,5000);"
         "})();"
-        "</script></body></html>"
+        "</script></div></body></html>"
     )
 
 
