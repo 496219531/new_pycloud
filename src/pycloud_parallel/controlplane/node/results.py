@@ -711,7 +711,7 @@ def _normalize_result_value(
 ) -> Any:
     data_store = _data_store_for_object_dir(object_dir)
     result_policy = get_payload_policy("result")
-    result_estimate_threshold = int(result_policy.inline_result_estimate_threshold_bytes)
+    result_estimate_threshold = int(result_policy.inline_result_threshold_bytes)
 
     def _should_skip_inline_attempt(value: Any) -> bool:
         try:

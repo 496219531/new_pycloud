@@ -65,7 +65,7 @@ def _prepare_value_for_transport(
                 inline_size = estimate_inline_size(value)
             except Exception:
                 inline_size = 0
-            if inline_size > max(1, int(policy.inline_payload_estimate_threshold_bytes)):
+            if inline_size > max(1, int(policy.inline_payload_threshold_bytes)):
                 return _put_prepared_value(value, policy=policy, put_data=put_data, format="json")
         return {
             key: _prepare_value_for_transport(
@@ -83,7 +83,7 @@ def _prepare_value_for_transport(
                 inline_size = estimate_inline_size(value)
             except Exception:
                 inline_size = 0
-            if inline_size > max(1, int(policy.inline_payload_estimate_threshold_bytes)):
+            if inline_size > max(1, int(policy.inline_payload_threshold_bytes)):
                 return _put_prepared_value(value, policy=policy, put_data=put_data, format="json")
         return [
             _prepare_value_for_transport(
@@ -111,7 +111,7 @@ def _prepare_value_for_transport(
         inline_size = estimate_inline_size(value)
     except Exception:
         return value
-    if inline_size <= max(1, int(policy.inline_payload_estimate_threshold_bytes)):
+    if inline_size <= max(1, int(policy.inline_payload_threshold_bytes)):
         return value
     if isinstance(value, (dict, list)):
         return _put_prepared_value(value, policy=policy, put_data=put_data, format="json")

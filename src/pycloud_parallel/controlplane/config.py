@@ -279,11 +279,15 @@ class PayloadPolicy:
         return int(self.limits.inline_payload_request_limit_bytes)
 
     @property
-    def inline_payload_estimate_threshold_bytes(self) -> int:
+    def inline_payload_threshold_bytes(self) -> int:
         threshold = int(getattr(self.limits, "inline_payload_estimate_threshold_bytes", 0) or 0)
         if threshold <= 0:
             threshold = int(self.inline_payload_soft_limit_bytes)
         return max(1, min(threshold, int(self.inline_payload_hard_limit_bytes)))
+
+    @property
+    def inline_payload_estimate_threshold_bytes(self) -> int:
+        return int(self.inline_payload_threshold_bytes)
 
     @property
     def inline_result_soft_limit_bytes(self) -> int:
@@ -294,11 +298,15 @@ class PayloadPolicy:
         return int(self.limits.inline_result_hard_limit_bytes)
 
     @property
-    def inline_result_estimate_threshold_bytes(self) -> int:
+    def inline_result_threshold_bytes(self) -> int:
         threshold = int(getattr(self.limits, "inline_result_estimate_threshold_bytes", 0) or 0)
         if threshold <= 0:
             threshold = int(self.inline_result_soft_limit_bytes)
         return max(1, min(threshold, int(self.inline_result_hard_limit_bytes)))
+
+    @property
+    def inline_result_estimate_threshold_bytes(self) -> int:
+        return int(self.inline_result_threshold_bytes)
 
     @property
     def object_chunk_size_bytes(self) -> int:
@@ -340,6 +348,10 @@ def get_payload_estimate_threshold_bytes(value: int = 0) -> int:
     )
 
 
+def get_payload_inline_threshold_bytes(value: int = 0) -> int:
+    return get_payload_estimate_threshold_bytes(value)
+
+
 def get_result_estimate_threshold_bytes(value: int = 0) -> int:
     limits = get_runtime_limits()
     return max(
@@ -349,6 +361,10 @@ def get_result_estimate_threshold_bytes(value: int = 0) -> int:
             int(limits.inline_result_hard_limit_bytes),
         ),
     )
+
+
+def get_result_inline_threshold_bytes(value: int = 0) -> int:
+    return get_result_estimate_threshold_bytes(value)
 
 
 def get_config_limit_authority() -> ConfigLimitAuthority:
