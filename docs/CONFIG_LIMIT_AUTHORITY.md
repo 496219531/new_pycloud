@@ -22,6 +22,87 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 `bytes materialize threshold` 只回答“对象是否允许整包进入内存成为 bytes / 被整包反序列化”。
 这些边界不能互相替代。
 
+## 实际表达式
+
+下面这些是“最终实际使用的 limit”对应的计算式，后续新代码应直接按这组口径理解。
+
+### Inline 最终决策公式
+
+inline 最终决策分成三步：先得到 runtime 基础值，再把 profile / effective policy 收进来，最后按 threshold 分流、按 hard limit 拦截。
+
+1. runtime 基础值
+   - `runtime_payload_hard = max(1, INLINE_PAYLOAD_HARD_LIMIT_BYTES)`
+   - `runtime_payload_threshold = min(max(1, INLINE_PAYLOAD_THRESHOLD_BYTES), runtime_payload_hard)`
+   - `runtime_result_hard = max(1, INLINE_RESULT_HARD_LIMIT_BYTES)`
+   - `runtime_result_threshold = min(max(1, INLINE_RESULT_THRESHOLD_BYTES), runtime_result_hard)`
+2. profile 名义值
+   - `profile_payload_hard = max(1, profile.inline_payload_hard_limit_bytes)`
+   - `profile_payload_threshold = min(max(1, profile.inline_payload_threshold_bytes), profile_payload_hard)`
+   - `profile_result_hard = max(1, profile.inline_result_hard_limit_bytes)`
+3. effective policy 合并
+   - `final_payload_threshold = min(runtime_payload_threshold, profile_payload_threshold)`
+   - `final_payload_hard = min(runtime_payload_hard, profile_payload_hard)`
+   - `final_result_hard = min(runtime_result_hard, profile_result_hard)`
+   - `final_result_threshold = min(runtime_result_threshold, final_result_hard)`
+4. object threshold 继续收紧 payload inline 分流线
+   - 当 `object_threshold_bytes > 0`：
+   - `final_payload_threshold = min(final_payload_threshold, object_threshold_bytes)`
+5. payload inline 决策
+   - `cheap_estimate(payload) > final_payload_threshold` 时，直接走 `DataRef` / objectify
+   - 否则尝试 inline 编码
+   - inline 编码后的真实大小必须 `<= final_payload_hard`
+6. result inline 决策
+   - `cheap_estimate(result) > final_result_threshold` 时，直接走 object / `DataRef`
+   - 否则尝试 inline 编码
+   - inline 编码后的真实大小必须 `<= final_result_hard`
+
+因此，profile 里的 limit 不是单独生效的最终值。最终 inline limit 永远是 `runtime`、`profile/effective policy` 和可选 `object_threshold_bytes` 取更严格值后的结果。比如 `trusted_internal` profile 的名义值可以比 runtime 大，但最终仍会被 `min(runtime, profile)` 拉回 runtime 边界。
+
+1. runtime payload threshold
+   - `payload_hard = max(1, INLINE_PAYLOAD_HARD_LIMIT_BYTES)`
+   - `payload_threshold = min(max(1, INLINE_PAYLOAD_THRESHOLD_BYTES), payload_hard)`
+2. runtime result threshold
+   - `result_hard = max(1, INLINE_RESULT_HARD_LIMIT_BYTES)`
+   - `result_threshold = min(max(1, INLINE_RESULT_THRESHOLD_BYTES), result_hard)`
+3. local inline payload limit
+   - `local_hard = max(1, LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES)`
+   - `local_threshold = min(max(1, LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES), local_hard)`
+4. policy profile threshold
+   - `profile_threshold = min(max(1, profile.inline_payload_threshold_bytes), profile.inline_payload_hard_limit_bytes)`
+   - `profile_result_hard = max(1, profile.inline_result_hard_limit_bytes)`
+5. effective policy
+   - `effective = resolve_effective_policy(profile, requested_mode, context)`
+   - `effective.inline_payload_threshold_bytes = min(profile_threshold, runtime_threshold_from_base)`
+   - `effective.inline_payload_hard_limit_bytes = min(profile_hard, runtime_hard_from_base)`
+   - `effective.inline_result_hard_limit_bytes = min(profile_result_hard, runtime_result_hard_from_base)`
+6. runtime payload policy merge
+   - `resolve_payload_policy(mode, effective_policy, object_threshold_bytes)`
+   - `base_policy = get_payload_policy(mode)`
+   - `merged_policy = merge_payload_limits_with_effective_policy(base_policy.limits, effective_policy)` when `effective_policy` exists
+   - `final.inline_payload_threshold_bytes = min(merged_policy.inline_payload_threshold_bytes, object_threshold_bytes)` when `object_threshold_bytes > 0`
+   - `final.inline_payload_hard_limit_bytes = merged_policy.inline_payload_hard_limit_bytes`
+   - `final.inline_result_threshold_bytes = merged_policy.inline_result_threshold_bytes`
+   - `final.inline_result_hard_limit_bytes = merged_policy.inline_result_hard_limit_bytes`
+7. binding payload thresholds
+   - `get_binding_payload_thresholds(binding_id, requested_mode, context)` returns
+     `(effective.inline_payload_threshold_bytes, effective.inline_payload_hard_limit_bytes, effective.inline_result_hard_limit_bytes)`
+8. object size hard limit
+   - `object_size_hard_limit = max(1, OBJECT_SIZE_HARD_LIMIT_BYTES)`
+9. bytes materialize threshold
+   - `bytes_materialize_threshold = max(1, min(BYTES_MATERIALIZE_THRESHOLD_BYTES, object_size_hard_limit))`
+10. NodeControl HTTP body limit
+   - `node_control_http_body_limit = max(1, NODE_CONTROL_HTTP_BODY_MAX_BYTES, OBJECT_HTTP_BODY_MAX_BYTES)`
+11. gateway upload limits
+   - `file_limit = max(1, max_file_bytes or GATEWAY_MAX_UPLOAD_FILE_BYTES)`
+   - `total_limit = max(file_limit, max_total_bytes or GATEWAY_MAX_UPLOAD_TOTAL_BYTES)`
+12. managed globals control limit
+   - `managed_globals_limit = max(1, min(policy_hard_limit_bytes, control_send_bytes or CONTROL_HTTP_MAX_SEND_BYTES))`
+13. inline payload request validation
+   - `validate_inline_request_size(size, limit_bytes=0)` 实际使用的默认 limit 是 `get_payload_policy("http_call").inline_payload_hard_limit_bytes`
+   - 现在没有单独的 request limit 主概念，request 校验和 payload hard limit 共用同一条硬边界
+14. inline result validation
+   - `validate_inline_result_size(size, limit_bytes=0)` 实际使用的默认 limit 是 `get_payload_policy("result").inline_result_hard_limit_bytes`
+
 ## 代码入口
 
 ### 推荐新代码入口

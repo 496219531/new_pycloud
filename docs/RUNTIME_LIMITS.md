@@ -80,6 +80,16 @@
   - 默认：`4194304` (`4 MiB`)
   - 单个 inline result 的硬限制；超出后更容易走对象缓存 / `DataRef`
 
+实际计算式见 [CONFIG_LIMIT_AUTHORITY.md](CONFIG_LIMIT_AUTHORITY.md) 的“实际表达式”章节。最简版就是：
+
+```text
+payload_threshold = min(max(1, PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES), PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES)
+result_threshold = min(max(1, PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES), PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES)
+local_threshold = min(max(1, PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES), PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES)
+```
+
+如果调用链带有 policy profile / effective policy，最终 inline 决策还会继续和 profile 的 threshold / hard limit 取更严格值；如果同时传入 `object_threshold_bytes`，payload inline threshold 还会再被它收紧。完整公式见 [CONFIG_LIMIT_AUTHORITY.md](CONFIG_LIMIT_AUTHORITY.md) 的“Inline 最终决策公式”。
+
 补充边界：
 
 1. 多数 internal path 上，inline threshold 的语义是“超过后直接 objectify / DataRef”
