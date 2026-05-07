@@ -3638,6 +3638,13 @@ class NodeControlState(NodeRuntimeBase):
                     err_type = str(item.get("err_type", "") or "")
                     err_message = str(item.get("err_message", "") or "")
                     subprocess_timings = dict(item.get("timings") or {})
+                    ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
+                        status_text,
+                        error_type=err_type,
+                        error_message=err_message,
+                        user_fallback="user function failed",
+                        infra_fallback="infra failure",
+                    )
                     now = utc_now()
                     task = self._pool_tasks.get(task_id)
                     if task is None or task.attempt != attempt:
@@ -3654,13 +3661,6 @@ class NodeControlState(NodeRuntimeBase):
                     )
                     build_execute_spec_ms = float(getattr(task, "dispatch_build_execute_spec_ms", 0.0) or 0.0)
                     executor_ms = max(0.0, total_ms - build_execute_spec_ms)
-                    ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
-                        status_text,
-                        error_type=err_type,
-                        error_message=err_message,
-                        user_fallback="user function failed",
-                        infra_fallback="infra failure",
-                    )
                     if status_text == "FAILED_USER":
                         task.status = pb2.TASK_STATUS_FAILED_USER
                         task.result = None
