@@ -82,8 +82,8 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     authority = get_config_limit_authority()
 
     assert authority.runtime_payload.inline_payload_soft_limit_bytes == 512 * 1024
-    assert authority.runtime_payload.inline_payload_estimate_threshold_bytes == 512 * 1024
-    assert authority.runtime_payload.inline_result_estimate_threshold_bytes == 1024 * 1024
+    assert authority.runtime_payload.inline_payload_estimate_threshold_bytes == authority.runtime_payload.inline_payload_soft_limit_bytes
+    assert authority.runtime_payload.inline_result_estimate_threshold_bytes == authority.runtime_payload.inline_result_soft_limit_bytes
     assert authority.policy_thresholds.default_safe.inline_payload_soft_limit_bytes == 2 * 1024 * 1024
     assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 8 * 1024 * 1024
     assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
@@ -108,8 +108,8 @@ def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
     try:
         policy = get_payload_policy("http_call")
         result_policy = get_payload_policy("result")
-        assert policy.inline_payload_estimate_threshold_bytes == 100
-        assert result_policy.inline_result_estimate_threshold_bytes == 200
+        assert policy.inline_payload_threshold_bytes == 100
+        assert result_policy.inline_result_threshold_bytes == 200
     finally:
         monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
