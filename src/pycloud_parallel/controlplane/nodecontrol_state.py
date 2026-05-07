@@ -3645,6 +3645,7 @@ class NodeControlState(NodeRuntimeBase):
                     pool = self._task_pools.get(pool_id)
                     if pool is None or str(task.client_id or "").strip() != pool_id:
                         continue
+                    queued_result = None
                     task.finished_at = now
                     task.last_heartbeat_at = now
                     total_ms = max(
@@ -3680,6 +3681,7 @@ class NodeControlState(NodeRuntimeBase):
                             task.result = {} if result is None else result
                         task.error_type = ""
                         task.error_message = ""
+                    queued_result = task.as_result()
                     pool.returned_count += 1
                     self._record_task_pool_timing_locked(
                         pool,
@@ -3694,8 +3696,10 @@ class NodeControlState(NodeRuntimeBase):
                         error_type=task.error_type,
                         error_message=task.error_message,
                     )
-                    self._pool_result_hook.push(pool_id, task.as_result())
+                    result_hook = self._pool_result_hook
                     self._cv.notify_all()
+                    if queued_result is not None:
+                        result_hook.push(pool_id, queued_result)
                     continue
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
