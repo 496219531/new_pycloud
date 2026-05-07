@@ -409,29 +409,7 @@ class NodeControlState(NodeRuntimeBase):
 
     def service_timing_metadata(self) -> Dict[str, str]:
         with self._lock:
-            service_payload: Dict[str, object] = {}
-            for session in self._services.values():
-                if not session.timing_metrics:
-                    continue
-                service_payload[session.service_id] = {
-                    "service_name": session.service_name,
-                    **dict(session.timing_metrics),
-                }
-            pool_payload: Dict[str, object] = {}
-            for pool in self._task_pools.values():
-                if not pool.timing_metrics:
-                    continue
-                pool_payload[pool.pool_id] = {
-                    "pool_name": pool.pool_name,
-                    "task_method": pool.task_method,
-                    **dict(pool.timing_metrics),
-                }
-        out: Dict[str, str] = {}
-        if service_payload:
-            out["service_timing_metrics"] = json.dumps(service_payload, ensure_ascii=False, separators=(",", ":"))
-        if pool_payload:
-            out["task_pool_timing_metrics"] = json.dumps(pool_payload, ensure_ascii=False, separators=(",", ":"))
-        return out
+            return self._collect_registrar_timing_metadata_locked()
 
     def close(self) -> None:
         self._stop_event.set()
@@ -1355,14 +1333,8 @@ class NodeControlState(NodeRuntimeBase):
 
     def task_pool_reports(self) -> Dict[str, NodeTaskPoolInfo]:
         with self._lock:
-            inflight_by_pool: Dict[str, int] = {}
-            for task in self._pool_tasks.values():
-                if int(task.status) != int(pb2.TASK_STATUS_RUNNING):
-                    continue
-                pool_id = str(task.client_id or "").strip()
-                if not pool_id:
-                    continue
-                inflight_by_pool[pool_id] = inflight_by_pool.get(pool_id, 0) + 1
+            task_stats = self._collect_registrar_task_stats_locked()
+            inflight_by_pool = dict(task_stats["inflight_by_pool"])
             rows = [
                 (pool, inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)))
                 for pool in self._task_pools.values()
@@ -3490,20 +3462,8 @@ class NodeControlState(NodeRuntimeBase):
 
     def active_runtime_keys(self, *, limit: int = 10) -> List[str]:
         with self._lock:
-            stats: Dict[str, Tuple[int, int, float]] = {}
-            now_ts = utc_now().timestamp()
-            for task in self._pool_tasks.values():
-                if task.status not in (pb2.TASK_STATUS_QUEUED, pb2.TASK_STATUS_RUNNING):
-                    continue
-                runtime_key = str(task.runtime_key or task.client_id or task.code_version).strip() or str(task.code_version or "")
-                running, queued, last_used = stats.get(runtime_key, (0, 0, 0.0))
-                if task.status == pb2.TASK_STATUS_RUNNING:
-                    running += 1
-                    last_used = max(last_used, (task.last_heartbeat_at or task.started_at or utc_now()).timestamp())
-                else:
-                    queued += 1
-                    last_used = max(last_used, now_ts)
-                stats[runtime_key] = (running, queued, last_used)
+            task_stats = self._collect_registrar_task_stats_locked()
+            stats = dict(task_stats["runtime_stats"])
             rows: List[Tuple[int, int, float, str]] = [
                 (running, queued, last_used, runtime_key)
                 for runtime_key, (running, queued, last_used) in stats.items()
