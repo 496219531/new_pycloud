@@ -98,8 +98,10 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
 def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "999")
     monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", "100")
     monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", "999")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", "999")
     monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", "200")
     monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "999")
     config_mod.reload_config()
@@ -109,8 +111,10 @@ def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
         assert policy.inline_payload_estimate_threshold_bytes == 100
         assert result_policy.inline_result_estimate_threshold_bytes == 200
     finally:
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
         config_mod.reload_config()

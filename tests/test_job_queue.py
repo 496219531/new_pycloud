@@ -2128,12 +2128,12 @@ def _submit_oversized_job_payload(monkeypatch):
 def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", "32")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "32")
     monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
     config_mod.reload_config()
 
     def _reset_config() -> None:
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
         config_mod.reload_config()
 
@@ -2150,12 +2150,12 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, r
 def test_job_queue_client_submit_job_fanout_registers_all_replicas(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", "32")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "32")
     monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "fanout")
     config_mod.reload_config()
 
     def _reset_config() -> None:
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
         config_mod.reload_config()
 

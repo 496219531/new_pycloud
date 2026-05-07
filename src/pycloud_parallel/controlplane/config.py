@@ -311,23 +311,21 @@ class PayloadPolicy:
 
 def get_runtime_limits() -> PayloadLimits:
     payload_hard = max(1, int(INLINE_PAYLOAD_HARD_LIMIT_BYTES))
+    payload_soft = min(max(1, int(INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), payload_hard)
     result_hard = max(1, int(INLINE_RESULT_HARD_LIMIT_BYTES))
+    result_soft = min(max(1, int(INLINE_RESULT_SOFT_LIMIT_BYTES)), result_hard)
     return PayloadLimits(
-        inline_payload_soft_limit_bytes=min(max(1, int(INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), payload_hard),
+        inline_payload_soft_limit_bytes=payload_soft,
         inline_payload_hard_limit_bytes=payload_hard,
         inline_payload_request_limit_bytes=max(1, int(INLINE_PAYLOAD_REQUEST_LIMIT_BYTES)),
-        inline_result_soft_limit_bytes=min(max(1, int(INLINE_RESULT_SOFT_LIMIT_BYTES)), result_hard),
+        inline_result_soft_limit_bytes=result_soft,
         inline_result_hard_limit_bytes=result_hard,
         object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
         file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
-        inline_payload_estimate_threshold_bytes=min(
-            max(1, int(INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES)),
-            payload_hard,
-        ),
-        inline_result_estimate_threshold_bytes=min(
-            max(1, int(INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES)),
-            result_hard,
-        ),
+        # Keep the estimate fields as compatibility aliases, but make the
+        # inline threshold authority identical to the configured soft limit.
+        inline_payload_estimate_threshold_bytes=payload_soft,
+        inline_result_estimate_threshold_bytes=result_soft,
     )
 
 
@@ -336,7 +334,7 @@ def get_payload_estimate_threshold_bytes(value: int = 0) -> int:
     return max(
         1,
         min(
-            int(value or limits.inline_payload_estimate_threshold_bytes),
+            int(value or limits.inline_payload_soft_limit_bytes),
             int(limits.inline_payload_hard_limit_bytes),
         ),
     )
@@ -347,7 +345,7 @@ def get_result_estimate_threshold_bytes(value: int = 0) -> int:
     return max(
         1,
         min(
-            int(value or limits.inline_result_estimate_threshold_bytes),
+            int(value or limits.inline_result_soft_limit_bytes),
             int(limits.inline_result_hard_limit_bytes),
         ),
     )
@@ -483,7 +481,7 @@ def policy_with_soft_limit(policy: PayloadPolicy, object_threshold_bytes: int) -
     threshold = max(1, int(object_threshold_bytes or 1))
     if (
         int(threshold) == int(policy.inline_payload_soft_limit_bytes)
-        and int(policy.inline_payload_estimate_threshold_bytes) <= int(threshold)
+        and int(policy.inline_payload_estimate_threshold_bytes) == int(threshold)
     ):
         return policy
     return replace(
@@ -491,10 +489,7 @@ def policy_with_soft_limit(policy: PayloadPolicy, object_threshold_bytes: int) -
         limits=replace(
             policy.limits,
             inline_payload_soft_limit_bytes=threshold,
-            inline_payload_estimate_threshold_bytes=min(
-                threshold,
-                int(policy.inline_payload_estimate_threshold_bytes),
-            ),
+            inline_payload_estimate_threshold_bytes=threshold,
         ),
     )
 
@@ -635,13 +630,9 @@ def merge_payload_limits_with_effective_policy(base_limits: PayloadLimits, effec
         inline_result_hard_limit_bytes=result_hard,
         object_chunk_size_bytes=int(base_limits.object_chunk_size_bytes),
         file_hash_chunk_size_bytes=int(base_limits.file_hash_chunk_size_bytes),
-        inline_payload_estimate_threshold_bytes=min(
-            int(getattr(base_limits, "inline_payload_estimate_threshold_bytes", 0) or soft),
-            soft,
-            hard,
-        ),
+        inline_payload_estimate_threshold_bytes=soft,
         inline_result_estimate_threshold_bytes=min(
-            int(getattr(base_limits, "inline_result_estimate_threshold_bytes", 0) or result_hard),
+            int(base_limits.inline_result_soft_limit_bytes),
             result_hard,
         ),
     )
