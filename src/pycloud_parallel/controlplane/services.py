@@ -169,7 +169,7 @@ class NodeControlService:
             )
             validate_inline_request_size(
                 request_payload_size,
-                limit_bytes=payload_policy.inline_payload_request_limit_bytes,
+                limit_bytes=payload_policy.inline_payload_hard_limit_bytes,
                 context="call service request",
             )
             decoded_payload = make_validated_inline_transport_carrier(

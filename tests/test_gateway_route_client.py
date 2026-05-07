@@ -57,15 +57,15 @@ def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
     from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
-    soft_limit_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+    threshold_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
         "gateway_public",
         requested_mode="structured_v1",
         context="gateway_public",
     )
-    payload = {"blob": "x" * (soft_limit_bytes + 1024)}
+    payload = {"blob": "x" * (threshold_bytes + 1024)}
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
     with patch("pycloud_parallel.controlplane.gateway_client.client_mod._http_json_request") as mocked:
-        with pytest.raises(ValueError, match="size_bytes=.*soft_limit_bytes="):
+        with pytest.raises(ValueError, match="size_bytes=.*threshold_bytes="):
             client.call(
                 service_name="svc-demo",
                 method="run",
@@ -137,12 +137,12 @@ def test_gateway_service_client_status_failure_without_cache_rejects_large_paylo
     from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
-    soft_limit_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+    threshold_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
         "gateway_public",
         requested_mode="structured_v1",
         context="gateway_public",
     )
-    payload = {"blob": "x" * (soft_limit_bytes + 1024)}
+    payload = {"blob": "x" * (threshold_bytes + 1024)}
     client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
     with (
         patch.object(client, "get_status", side_effect=RuntimeError("status boom")),

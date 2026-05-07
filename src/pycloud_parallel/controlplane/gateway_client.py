@@ -91,17 +91,17 @@ def _prepare_gateway_payload(
     _validate_gateway_payload_shape(prepared_payload)
     inline_size = estimate_payload_inline_size(prepared_payload)
     if effective_policy is not None:
-        soft_limit_bytes = int(effective_policy.inline_payload_soft_limit_bytes or 0)
+        threshold_bytes = int(effective_policy.inline_payload_threshold_bytes or 0)
     else:
-        soft_limit_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+        threshold_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
             "gateway_public",
             requested_mode=str(serialization_mode or "").strip(),
             context="gateway_public",
         )
-    if inline_size > soft_limit_bytes:
+    if inline_size > threshold_bytes:
         raise ValueError(
             "gateway payload is too large for public inline transport: "
-            f"size_bytes={inline_size} soft_limit_bytes={soft_limit_bytes}; "
+            f"size_bytes={inline_size} threshold_bytes={threshold_bytes}; "
             "use gateway upload-call or a smaller payload"
         )
     serialized_payload = client_mod._serialize_http_call_payload(

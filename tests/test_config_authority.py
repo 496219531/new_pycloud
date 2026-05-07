@@ -89,7 +89,7 @@ def test_binding_payload_thresholds_follow_default_safe_policy() -> None:
         context="gateway_public",
     )
 
-    assert soft == config.DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES
+    assert soft == config.DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES
     assert hard == config.DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES
     assert result_hard == config.DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES
 

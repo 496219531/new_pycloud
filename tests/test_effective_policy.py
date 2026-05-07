@@ -14,7 +14,7 @@ def _effective_policy(
     *,
     resolved_mode: str = "structured_v1",
     allowed_modes: tuple[str, ...] = ("legacy_v1", "structured_v1"),
-    soft_limit_bytes: int = 64,
+    threshold_bytes: int = 64,
     hard_limit_bytes: int = 128,
     result_limit_bytes: int = 128,
 ) -> EffectivePolicy:
@@ -23,7 +23,7 @@ def _effective_policy(
         version=1,
         resolved_mode=resolved_mode,
         allowed_modes=allowed_modes,
-        inline_payload_soft_limit_bytes=soft_limit_bytes,
+        inline_payload_threshold_bytes=threshold_bytes,
         inline_payload_hard_limit_bytes=hard_limit_bytes,
         inline_result_hard_limit_bytes=result_limit_bytes,
         use_raw_bytes_payload=True,
@@ -83,13 +83,13 @@ def test_effective_policy_respects_requested_mode_without_capability_intersectio
         version=1,
         allowed_modes=("pickle_stable_v1", "structured_v1", "legacy_v1"),
         default_mode="pickle_stable_v1",
-        inline_payload_soft_limit_bytes=16,
+        inline_payload_threshold_bytes=16,
         inline_payload_hard_limit_bytes=32,
         inline_result_hard_limit_bytes=48,
         use_raw_bytes_payload=True,
         use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
-        force_dataref_above_soft_limit=True,
+        force_dataref_above_threshold=True,
     )
 
     effective = resolve_effective_policy(
@@ -109,13 +109,13 @@ def test_effective_policy_keeps_legacy_off_bytes_lane():
         version=1,
         allowed_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
         default_mode="legacy_v1",
-        inline_payload_soft_limit_bytes=16,
+        inline_payload_threshold_bytes=16,
         inline_payload_hard_limit_bytes=32,
         inline_result_hard_limit_bytes=48,
         use_raw_bytes_payload=True,
         use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
-        force_dataref_above_soft_limit=True,
+        force_dataref_above_threshold=True,
     )
 
     effective = resolve_effective_policy(profile, context="service_connect")
@@ -125,8 +125,8 @@ def test_effective_policy_keeps_legacy_off_bytes_lane():
     assert effective.use_http_raw_bytes_body is False
 
 
-def test_task_submit_payload_preparation_clamps_to_effective_policy_soft_limit():
-    effective_policy = _effective_policy(soft_limit_bytes=32, hard_limit_bytes=256)
+def test_task_submit_payload_preparation_clamps_to_effective_policy_threshold():
+    effective_policy = _effective_policy(threshold_bytes=32, hard_limit_bytes=256)
 
     with patch(
         "pycloud_parallel.execution.support._put_data_via_clients",
@@ -148,7 +148,7 @@ def test_http_raw_bytes_body_obeys_effective_policy_hard_limit():
     effective_policy = _effective_policy(
         resolved_mode="pickle_stable_v1",
         allowed_modes=("pickle_stable_v1", "structured_v1"),
-        soft_limit_bytes=64,
+        threshold_bytes=64,
         hard_limit_bytes=48,
     )
 

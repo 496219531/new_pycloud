@@ -1130,7 +1130,7 @@ def test_service_local_ipc_uses_local_payload_thresholds_for_dataref(tmp_path, m
     from pycloud_parallel.data.ref import DataRef
 
     monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
-    monkeypatch.setenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "64")
+    monkeypatch.setenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES", "64")
     monkeypatch.setenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", "16384")
     config.reload_config()
     captured = {}
@@ -1151,7 +1151,7 @@ def test_service_local_ipc_uses_local_payload_thresholds_for_dataref(tmp_path, m
         assert client.call(method="run", payload={"blob": b"x" * 4096})["data"] == {"value": 3}
     finally:
         server.close()
-        monkeypatch.delenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
         config.reload_config()
 

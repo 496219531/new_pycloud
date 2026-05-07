@@ -409,7 +409,7 @@ def test_normalize_user_return_large_dataframe_skips_inline_trial(tmp_path, monk
     import pycloud_parallel.controlplane.node.results as results_mod
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", "128")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", "128")
     monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
     config_mod.reload_config()
 
@@ -421,7 +421,7 @@ def test_normalize_user_return_large_dataframe_skips_inline_trial(tmp_path, monk
     try:
         status, result, _err_type, _err_message = _normalize_user_return(frame, object_dir=str(tmp_path))
     finally:
-        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
         config_mod.reload_config()
 
@@ -434,7 +434,7 @@ def test_normalize_user_return_large_ndarray_skips_inline_trial(tmp_path, monkey
     import pycloud_parallel.controlplane.node.results as results_mod
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", "128")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", "128")
     monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
     config_mod.reload_config()
 
@@ -446,7 +446,7 @@ def test_normalize_user_return_large_ndarray_skips_inline_trial(tmp_path, monkey
     try:
         status, result, _err_type, _err_message = _normalize_user_return(array, object_dir=str(tmp_path))
     finally:
-        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
         config_mod.reload_config()
 
@@ -458,7 +458,7 @@ def test_normalize_user_return_large_json_skips_inline_trial(tmp_path, monkeypat
     import pycloud_parallel.controlplane.node.results as results_mod
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", "128")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", "128")
     monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", str(8 * 1024 * 1024))
     config_mod.reload_config()
 
@@ -470,7 +470,7 @@ def test_normalize_user_return_large_json_skips_inline_trial(tmp_path, monkeypat
     try:
         status, result, _err_type, _err_message = _normalize_user_return(value, object_dir=str(tmp_path))
     finally:
-        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
         config_mod.reload_config()
 
@@ -578,7 +578,7 @@ def test_normalize_user_return_file_backed_dataframe_series_ndarray_roundtrip(tm
     series = pd.Series([1.0, 2.0], name="nav")
     array = np.arange(8, dtype=np.int64)
 
-    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", "1")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", "1")
     config_mod.reload_config()
     try:
         for value, materialize_as in (
@@ -604,7 +604,7 @@ def test_normalize_user_return_file_backed_dataframe_series_ndarray_roundtrip(tm
             else:
                 np.testing.assert_array_equal(restored, value)
     finally:
-        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", raising=False)
         config_mod.reload_config()
 
 

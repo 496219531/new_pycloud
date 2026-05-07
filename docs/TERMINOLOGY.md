@@ -135,7 +135,7 @@ Service.connect(
 
 适用场景：
 
-1. payload 超过 soft limit
+1. payload 超过 threshold
 2. result 超过 inline hard limit
 3. 文件、大 DataFrame、大 ndarray
 4. 需要跨节点 remote fetch / materialize
@@ -147,14 +147,15 @@ HTTP raw-bytes body 则只是一条请求或响应的 body。
 
 推荐这样理解：
 
-1. `inline payload soft limit`
+1. `inline payload threshold`
    - 单个对象建议转 `DataRef` 的阈值
    - 超过后优先 objectify
 2. `inline payload hard limit`
    - 单个 inline payload 的硬限制
    - 超过就是错误或必须转 `DataRef`
-3. `inline payload request limit`
-   - 一次请求内所有 inline payload 的总硬限制
+3. `inline result threshold`
+   - 单个 result 建议转 object / `DataRef` 的阈值
+   - 超过后优先 objectify
 4. `inline result hard limit`
    - 单个 inline result 的硬限制
    - 超过后应转对象缓存 / `DataRef`

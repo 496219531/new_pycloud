@@ -148,10 +148,6 @@ def _default_payload_hard_limit_bytes() -> int:
     return max(1, int(get_payload_policy("http_call").inline_payload_hard_limit_bytes))
 
 
-def _default_payload_request_limit_bytes() -> int:
-    return max(1, int(get_payload_policy("http_call").inline_payload_request_limit_bytes))
-
-
 def _default_result_hard_limit_bytes() -> int:
     return max(1, int(get_payload_policy("result").inline_result_hard_limit_bytes))
 
@@ -189,7 +185,7 @@ def validate_inline_payload_struct(data: struct_pb2.Struct, *, limit_bytes: int 
 def validate_inline_request_size(size_bytes: int, *, limit_bytes: int = 0, context: str = "payload request") -> int:
     return validate_inline_payload_size(
         size_bytes,
-        limit_bytes=_effective_limit_bytes(limit_bytes, default=_default_payload_request_limit_bytes()),
+        limit_bytes=_effective_limit_bytes(limit_bytes, default=_default_payload_hard_limit_bytes()),
         context=context,
     )
 
@@ -453,7 +449,7 @@ def validate_inline_payload_structs(
     item_context: str = "payload",
     item_limit_bytes: int = 0,
     request_context: str = "payload request",
-    request_limit_bytes: int = 0,
+    total_limit_bytes: int = 0,
 ) -> int:
     total_size = 0
     total_count = len(payloads)
@@ -467,7 +463,7 @@ def validate_inline_payload_structs(
         total_size += size_bytes
     return validate_inline_request_size(
         total_size,
-        limit_bytes=request_limit_bytes,
+        limit_bytes=total_limit_bytes,
         context=request_context,
     )
 

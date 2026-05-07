@@ -252,7 +252,7 @@
 4. 是否启用旧内部 `TransportPayload` adapter
 5. 是否启用 HTTP raw-bytes body
 5. 是否允许 `pickle_stable_v1`
-6. soft limit 以上是否强制转 `DataRef`
+6. threshold 以上是否强制转 `DataRef`
 7. public gateway 是否允许 pickle
 
 当前内置 profile：
@@ -362,7 +362,7 @@ gateway public 还有一个需要特别记住的边界：
 1. 当前允许的只是小型 inline payload/result
 2. 它不自动把超阈值 payload 转成 DataRef
 3. 它不承担大对象上传/下载职责
-4. 这里的 payload soft limit 语义更接近“public inline max”，而不是“建议 objectify”
+4. 这里的 payload threshold 语义更接近“public inline max”，而不是“建议 objectify”
 
 动态部署还有一个 code version / owner 控制域约束：
 

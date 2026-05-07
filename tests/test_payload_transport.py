@@ -24,7 +24,7 @@ from pycloud_parallel.controlplane.config import (
     get_service_http_body_limit_bytes,
     get_transport_bounds,
     get_payload_policy,
-    merge_object_threshold_with_policy_soft_limit,
+    merge_object_threshold_with_policy_threshold,
     merge_payload_limits_with_effective_policy,
     normalize_policy_limit_values,
     resolve_payload_policy,
@@ -68,7 +68,7 @@ def test_get_payload_policy_defaults() -> None:
 
     assert http_policy.preserve_args_kwargs_container is True
     assert http_policy.consume_on_read is True
-    assert local_policy.inline_payload_soft_limit_bytes == 64 * 1024 * 1024
+    assert local_policy.inline_payload_threshold_bytes == 64 * 1024 * 1024
     assert local_policy.inline_payload_hard_limit_bytes == 256 * 1024 * 1024
     assert local_policy.inline_payload_hard_limit_bytes > http_policy.inline_payload_hard_limit_bytes
     assert job_policy.managed_global_field_names == ("update_globals",)
@@ -81,10 +81,8 @@ def test_get_payload_policy_defaults() -> None:
 def test_config_limit_authority_groups_existing_defaults() -> None:
     authority = get_config_limit_authority()
 
-    assert authority.runtime_payload.inline_payload_soft_limit_bytes == 512 * 1024
-    assert authority.runtime_payload.inline_payload_estimate_threshold_bytes == authority.runtime_payload.inline_payload_soft_limit_bytes
-    assert authority.runtime_payload.inline_result_estimate_threshold_bytes == authority.runtime_payload.inline_result_soft_limit_bytes
-    assert authority.policy_thresholds.default_safe.inline_payload_soft_limit_bytes == 2 * 1024 * 1024
+    assert authority.runtime_payload.inline_payload_threshold_bytes == 512 * 1024
+    assert authority.policy_thresholds.default_safe.inline_payload_threshold_bytes == 2 * 1024 * 1024
     assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 8 * 1024 * 1024
     assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
     assert authority.transport_bounds.control_http_max_send_bytes == 16 * 1024 * 1024
@@ -95,15 +93,13 @@ def test_config_limit_authority_groups_existing_defaults() -> None:
     assert authority.capacity_defaults.node_worker_capacity == 32
 
 
-def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
+def test_inline_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "999")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", "999")
     monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", "100")
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", "999")
-    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", "999")
+    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", "999")
     monkeypatch.setenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", "200")
-    monkeypatch.setenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", "999")
     config_mod.reload_config()
     try:
         policy = get_payload_policy("http_call")
@@ -111,12 +107,10 @@ def test_estimate_thresholds_are_clamped_to_hard_limits(monkeypatch) -> None:
         assert policy.inline_payload_threshold_bytes == 100
         assert result_policy.inline_result_threshold_bytes == 200
     finally:
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES", raising=False)
-        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES", raising=False)
-        monkeypatch.delenv("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES", raising=False)
         config_mod.reload_config()
 
 
@@ -220,18 +214,18 @@ def test_materialize_downloaded_result_rejects_large_structured_bytes(tmp_path, 
 def test_config_env_loader_and_reload_share_defaults(monkeypatch) -> None:
     from pycloud_parallel.controlplane import config
 
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "12345")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", "12345")
     monkeypatch.setenv("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", "23456")
 
     loaded = config.load_config_from_env()
     config.reload_config()
     try:
-        assert loaded["INLINE_PAYLOAD_SOFT_LIMIT_BYTES"] == 12345
-        assert config.INLINE_PAYLOAD_SOFT_LIMIT_BYTES == 12345
+        assert loaded["INLINE_PAYLOAD_THRESHOLD_BYTES"] == 12345
+        assert config.INLINE_PAYLOAD_THRESHOLD_BYTES == 12345
         assert loaded["CONTROL_HTTP_MAX_SEND_BYTES"] == 23456
         assert config.CONTROL_HTTP_MAX_SEND_BYTES == 23456
     finally:
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_CONTROL_MAX_SEND_MESSAGE_LENGTH_BYTES", raising=False)
         config.reload_config()
 
@@ -248,9 +242,9 @@ def test_core_client_payload_paths_do_not_import_default_safe_payload_constants_
         root / "src/pycloud_parallel/execution/support.py",
     ]
     banned_terms = {
-        "INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+        "INLINE_PAYLOAD_THRESHOLD_BYTES",
         "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
-        "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+        "DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES",
         "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     }
     violations = []
@@ -269,9 +263,9 @@ def test_managed_globals_control_limit_clamps_policy_and_control_bounds() -> Non
 
 
 def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
-    assert normalize_policy_limit_values(soft=200, hard=100, result_hard=0) == (100, 100, 1)
-    assert merge_object_threshold_with_policy_soft_limit(object_threshold_bytes=500, policy_soft_limit_bytes=200) == 200
-    assert merge_object_threshold_with_policy_soft_limit(object_threshold_bytes=100, policy_soft_limit_bytes=200) == 100
+    assert normalize_policy_limit_values(threshold=200, hard=100, result_hard=0) == (100, 100, 1)
+    assert merge_object_threshold_with_policy_threshold(object_threshold_bytes=500, policy_threshold_bytes=200) == 200
+    assert merge_object_threshold_with_policy_threshold(object_threshold_bytes=100, policy_threshold_bytes=200) == 100
     assert get_job_blob_inline_threshold_bytes() == max(256 * 1024, int((2 * 1024 * 1024) / 1.5))
     assert get_job_staging_replica_count(0) == 2
     assert get_job_staging_replica_count(-3) == 1
@@ -298,7 +292,7 @@ def test_config_limit_helpers_merge_effective_policy() -> None:
         version=1,
         resolved_mode="structured_v1",
         allowed_modes=("structured_v1",),
-        inline_payload_soft_limit_bytes=128,
+        inline_payload_threshold_bytes=128,
         inline_payload_hard_limit_bytes=256,
         inline_result_hard_limit_bytes=512,
         use_raw_bytes_payload=False,
@@ -308,9 +302,8 @@ def test_config_limit_helpers_merge_effective_policy() -> None:
 
     merged = merge_payload_limits_with_effective_policy(base, effective)
 
-    assert merged.inline_payload_soft_limit_bytes == 128
+    assert merged.inline_payload_threshold_bytes == 128
     assert merged.inline_payload_hard_limit_bytes == 256
-    assert merged.inline_payload_request_limit_bytes == 256
     assert merged.inline_result_hard_limit_bytes == 512
     assert effective_limits_from_profile(effective) == (128, 256, 512)
 
@@ -323,7 +316,7 @@ def test_resolve_payload_policy_merges_effective_policy_and_object_threshold() -
         version=1,
         resolved_mode="structured_v1",
         allowed_modes=("structured_v1",),
-        inline_payload_soft_limit_bytes=512,
+        inline_payload_threshold_bytes=512,
         inline_payload_hard_limit_bytes=2048,
         inline_result_hard_limit_bytes=4096,
         use_raw_bytes_payload=False,
@@ -335,18 +328,18 @@ def test_resolve_payload_policy_merges_effective_policy_and_object_threshold() -
     legacy = payload_policy_from_effective_policy("http_call", effective)
 
     assert resolved.mode == legacy.mode
-    assert resolved.inline_payload_soft_limit_bytes == 256
+    assert resolved.inline_payload_threshold_bytes == 256
     assert resolved.inline_payload_hard_limit_bytes == legacy.inline_payload_hard_limit_bytes
     assert resolved.inline_result_hard_limit_bytes == legacy.inline_result_hard_limit_bytes
     assert resolved.consume_on_read == legacy.consume_on_read
     assert resolved.preserve_args_kwargs_container == legacy.preserve_args_kwargs_container
 
 
-def test_resolve_payload_policy_keeps_default_soft_limit_when_threshold_is_zero() -> None:
+def test_resolve_payload_policy_keeps_default_threshold_when_threshold_is_zero() -> None:
     policy = resolve_payload_policy("task_submit", object_threshold_bytes=0)
     base = get_payload_policy("task_submit")
 
-    assert policy.inline_payload_soft_limit_bytes == base.inline_payload_soft_limit_bytes
+    assert policy.inline_payload_threshold_bytes == base.inline_payload_threshold_bytes
     assert policy.inline_payload_hard_limit_bytes == base.inline_payload_hard_limit_bytes
 
 
@@ -356,8 +349,7 @@ def test_prepare_outbound_payload_preserves_args_kwargs_container() -> None:
         policy,
         limits=replace(
             policy.limits,
-            inline_payload_soft_limit_bytes=32,
-            inline_payload_estimate_threshold_bytes=32,
+            inline_payload_threshold_bytes=32,
         ),
     )
     uploads: list[tuple[object, str]] = []

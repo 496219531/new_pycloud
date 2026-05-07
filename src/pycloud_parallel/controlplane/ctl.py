@@ -2746,7 +2746,7 @@ def build_parser() -> argparse.ArgumentParser:
         "Environment overrides:\n"
         "  start / dev-start / start-infocenter / start-gateway / start-controlplane / start-job-orchestrator / start-node / restart / dev-restart\n"
         "  support repeated '--env KEY=VALUE' arguments. Example:\n"
-        "    pycloudctl start --env PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576"
+        "    pycloudctl start --env PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES=1048576"
     )
     return parser
 

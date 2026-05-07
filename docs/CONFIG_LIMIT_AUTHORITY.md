@@ -15,8 +15,8 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 | `capacity defaults` | node/service 默认容量和 worker 数 | `pycloudctl` / node startup |
 
 `policy thresholds` 只回答“业务 payload/result 的 policy 边界在哪里”。
-`estimate thresholds` 位于 runtime payload limit 中，只回答“是否值得尝试 inline”。
-超过 estimate threshold 的对象直接转 `DataRef`，不再做完整序列化试算。
+`inline thresholds` 位于 runtime payload limit 中，只回答“是否值得尝试 inline”。
+超过 inline threshold 的对象直接转 `DataRef`，不再做完整序列化试算。
 `transport bounds` 只回答“HTTP request/response body 或控制消息最大能收发多少 bytes”。
 `object/store bounds` 里的 object size hard limit 只回答“系统允许单个 object/DataRef 背后的对象最大多大”。
 `bytes materialize threshold` 只回答“对象是否允许整包进入内存成为 bytes / 被整包反序列化”。
@@ -37,12 +37,12 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
    - 用来阅读和测试 authority 结构
 4. `resolve_payload_policy(...)`
    - payload policy 的统一入口
-   - 负责合并 effective policy，并把 object threshold 与 policy soft/estimate threshold 对齐
+   - 负责合并 effective policy，并把 object threshold 与 policy inline threshold 对齐
 5. `get_transport_bounds()` / `get_object_store_bounds()`
    - transport/http 与 object/store 消费侧读取分层默认值的入口
-6. estimate threshold helper
-   - `get_payload_estimate_threshold_bytes(...)`
-   - `get_result_estimate_threshold_bytes(...)`
+6. inline threshold helper
+   - `get_payload_inline_threshold_bytes(...)`
+   - `get_result_inline_threshold_bytes(...)`
    - 用于“cheap estimate 后是否尝试 inline”的稳定入口
 7. body / upload helper
    - `get_service_http_body_limit_bytes(...)`
@@ -85,13 +85,13 @@ PR1 已完成归类与 loader。PR2 收口 payload policy resolver 与 `support.
 `config.py` 内的合成 helper 是 limit authority 的边界函数。
 
 1. `normalize_policy_limit_values(...)`
-   - 负责修正 policy soft/hard/result hard 的基本关系
+   - 负责修正 policy threshold/hard/result hard 的基本关系
 2. `merge_payload_limits_with_effective_policy(...)`
    - 负责把 runtime payload limit 和 session effective policy 合并
-3. `merge_object_threshold_with_policy_soft_limit(...)`
-   - 负责 objectify threshold 与 policy soft limit 的取小
-4. `policy_with_soft_limit(...)`
-   - 负责把已合成的 soft limit 写回 `PayloadPolicy`，并同步收紧 estimate threshold
+3. `merge_object_threshold_with_policy_threshold(...)`
+   - 负责 objectify threshold 与 policy threshold 的取小
+4. `policy_with_threshold(...)`
+   - 负责把已合成的 threshold 写回 `PayloadPolicy`
 5. `resolve_payload_policy(...)`
    - 负责统一 `get_payload_policy(...)`、effective policy merge、object threshold 合成
 6. `get_node_control_http_body_limit_bytes(...)`

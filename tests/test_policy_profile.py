@@ -49,11 +49,11 @@ def test_policy_profile_normalizes_and_rejects_invalid_default_mode():
             version=1,
             allowed_modes=("legacy_v1",),
             default_mode="structured_v1",
-            inline_payload_soft_limit_bytes=1,
+            inline_payload_threshold_bytes=1,
             inline_payload_hard_limit_bytes=2,
             inline_result_hard_limit_bytes=3,
             use_raw_bytes_payload=False,
             use_http_raw_bytes_body=False,
             allow_pickle_stable=False,
-            force_dataref_above_soft_limit=True,
+            force_dataref_above_threshold=True,
         )

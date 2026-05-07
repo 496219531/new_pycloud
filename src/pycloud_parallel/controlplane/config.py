@@ -87,16 +87,14 @@ class EnvChoiceSetting:
 
 
 _INT_SETTINGS: dict[str, EnvIntSetting] = {
-    "INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 512 * 1024),
+    "INLINE_PAYLOAD_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES",), 512 * 1024),
     "INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 2 * 1024 * 1024),
-    "INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES",), 512 * 1024),
-    "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",), 8 * 1024 * 1024),
-    "LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 64 * 1024 * 1024),
+    "LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES",), 64 * 1024 * 1024),
     "LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 256 * 1024 * 1024),
-    "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 2 * 1024 * 1024),
+    "DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES",), 2 * 1024 * 1024),
     "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 8 * 1024 * 1024),
     "DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES",), 4 * 1024 * 1024),
-    "TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",), 10 * 1024 * 1024),
+    "TRUSTED_INTERNAL_INLINE_PAYLOAD_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_THRESHOLD_BYTES",), 10 * 1024 * 1024),
     "TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",), 50 * 1024 * 1024),
     "TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES",), 1000 * 1024 * 1024),
     "JOB_PAYLOAD_MAX_BYTES": EnvIntSetting(("PYCLOUD_JOB_PAYLOAD_MAX_BYTES",), 64 * 1024),
@@ -106,9 +104,8 @@ _INT_SETTINGS: dict[str, EnvIntSetting] = {
     "GATEWAY_STAGE_GC_INTERVAL_SEC": EnvIntSetting(("PYCLOUD_GATEWAY_STAGE_GC_INTERVAL_SEC",), 60),
     "GATEWAY_MAX_UPLOAD_FILE_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES",), 512 * 1024 * 1024),
     "GATEWAY_MAX_UPLOAD_TOTAL_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES",), 1024 * 1024 * 1024),
-    "INLINE_RESULT_SOFT_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_SOFT_LIMIT_BYTES",), 1024 * 1024),
+    "INLINE_RESULT_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES",), 1024 * 1024),
     "INLINE_RESULT_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES",), 4 * 1024 * 1024),
-    "INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES": EnvIntSetting(("PYCLOUD_INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES",), 1024 * 1024),
     "OBJECT_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_CHUNK_SIZE_BYTES",), 256 * 1024),
     "FILE_HASH_CHUNK_SIZE_BYTES": EnvIntSetting(("PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES",), 1024 * 1024),
     "OBJECT_SIZE_HARD_LIMIT_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES",), 1024 * 1024 * 1024),
@@ -177,20 +174,17 @@ JobQueueResolveRefsMode = Literal["eager", "defer_to_worker"]
 
 @dataclass(frozen=True)
 class PayloadLimits:
-    inline_payload_soft_limit_bytes: int
+    inline_payload_threshold_bytes: int
     inline_payload_hard_limit_bytes: int
-    inline_payload_request_limit_bytes: int
-    inline_result_soft_limit_bytes: int
+    inline_result_threshold_bytes: int
     inline_result_hard_limit_bytes: int
     object_chunk_size_bytes: int
     file_hash_chunk_size_bytes: int
-    inline_payload_estimate_threshold_bytes: int = 0
-    inline_result_estimate_threshold_bytes: int = 0
 
 
 @dataclass(frozen=True)
 class PolicyThresholdLimits:
-    inline_payload_soft_limit_bytes: int
+    inline_payload_threshold_bytes: int
     inline_payload_hard_limit_bytes: int
     inline_result_hard_limit_bytes: int
 
@@ -267,46 +261,20 @@ class PayloadPolicy:
     managed_global_field_names: tuple[str, ...] = ()
 
     @property
-    def inline_payload_soft_limit_bytes(self) -> int:
-        return int(self.limits.inline_payload_soft_limit_bytes)
+    def inline_payload_threshold_bytes(self) -> int:
+        return int(self.limits.inline_payload_threshold_bytes)
 
     @property
     def inline_payload_hard_limit_bytes(self) -> int:
         return int(self.limits.inline_payload_hard_limit_bytes)
 
     @property
-    def inline_payload_request_limit_bytes(self) -> int:
-        return int(self.limits.inline_payload_request_limit_bytes)
-
-    @property
-    def inline_payload_threshold_bytes(self) -> int:
-        threshold = int(getattr(self.limits, "inline_payload_estimate_threshold_bytes", 0) or 0)
-        if threshold <= 0:
-            threshold = int(self.inline_payload_soft_limit_bytes)
-        return max(1, min(threshold, int(self.inline_payload_hard_limit_bytes)))
-
-    @property
-    def inline_payload_estimate_threshold_bytes(self) -> int:
-        return int(self.inline_payload_threshold_bytes)
-
-    @property
-    def inline_result_soft_limit_bytes(self) -> int:
-        return int(self.limits.inline_result_soft_limit_bytes)
+    def inline_result_threshold_bytes(self) -> int:
+        return int(self.limits.inline_result_threshold_bytes)
 
     @property
     def inline_result_hard_limit_bytes(self) -> int:
         return int(self.limits.inline_result_hard_limit_bytes)
-
-    @property
-    def inline_result_threshold_bytes(self) -> int:
-        threshold = int(getattr(self.limits, "inline_result_estimate_threshold_bytes", 0) or 0)
-        if threshold <= 0:
-            threshold = int(self.inline_result_soft_limit_bytes)
-        return max(1, min(threshold, int(self.inline_result_hard_limit_bytes)))
-
-    @property
-    def inline_result_estimate_threshold_bytes(self) -> int:
-        return int(self.inline_result_threshold_bytes)
 
     @property
     def object_chunk_size_bytes(self) -> int:
@@ -319,52 +287,39 @@ class PayloadPolicy:
 
 def get_runtime_limits() -> PayloadLimits:
     payload_hard = max(1, int(INLINE_PAYLOAD_HARD_LIMIT_BYTES))
-    payload_soft = min(max(1, int(INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), payload_hard)
+    payload_threshold = min(max(1, int(INLINE_PAYLOAD_THRESHOLD_BYTES)), payload_hard)
     result_hard = max(1, int(INLINE_RESULT_HARD_LIMIT_BYTES))
-    result_soft = min(max(1, int(INLINE_RESULT_SOFT_LIMIT_BYTES)), result_hard)
+    result_threshold = min(max(1, int(INLINE_RESULT_THRESHOLD_BYTES)), result_hard)
     return PayloadLimits(
-        inline_payload_soft_limit_bytes=payload_soft,
+        inline_payload_threshold_bytes=payload_threshold,
         inline_payload_hard_limit_bytes=payload_hard,
-        inline_payload_request_limit_bytes=max(1, int(INLINE_PAYLOAD_REQUEST_LIMIT_BYTES)),
-        inline_result_soft_limit_bytes=result_soft,
+        inline_result_threshold_bytes=result_threshold,
         inline_result_hard_limit_bytes=result_hard,
         object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
         file_hash_chunk_size_bytes=int(FILE_HASH_CHUNK_SIZE_BYTES),
-        # Keep the estimate fields as compatibility aliases, but make the
-        # inline threshold authority identical to the configured soft limit.
-        inline_payload_estimate_threshold_bytes=payload_soft,
-        inline_result_estimate_threshold_bytes=result_soft,
     )
 
 
-def get_payload_estimate_threshold_bytes(value: int = 0) -> int:
+def get_payload_inline_threshold_bytes(value: int = 0) -> int:
     limits = get_runtime_limits()
     return max(
         1,
         min(
-            int(value or limits.inline_payload_soft_limit_bytes),
+            int(value or limits.inline_payload_threshold_bytes),
             int(limits.inline_payload_hard_limit_bytes),
         ),
     )
 
 
-def get_payload_inline_threshold_bytes(value: int = 0) -> int:
-    return get_payload_estimate_threshold_bytes(value)
-
-
-def get_result_estimate_threshold_bytes(value: int = 0) -> int:
+def get_result_inline_threshold_bytes(value: int = 0) -> int:
     limits = get_runtime_limits()
     return max(
         1,
         min(
-            int(value or limits.inline_result_soft_limit_bytes),
+            int(value or limits.inline_result_threshold_bytes),
             int(limits.inline_result_hard_limit_bytes),
         ),
     )
-
-
-def get_result_inline_threshold_bytes(value: int = 0) -> int:
-    return get_result_estimate_threshold_bytes(value)
 
 
 def get_config_limit_authority() -> ConfigLimitAuthority:
@@ -373,12 +328,12 @@ def get_config_limit_authority() -> ConfigLimitAuthority:
         local_inline_payload=get_local_inline_limits(),
         policy_thresholds=PolicyThresholds(
             default_safe=PolicyThresholdLimits(
-                inline_payload_soft_limit_bytes=int(DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+                inline_payload_threshold_bytes=int(DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES),
                 inline_payload_hard_limit_bytes=int(DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
                 inline_result_hard_limit_bytes=int(DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES),
             ),
             trusted_internal=PolicyThresholdLimits(
-                inline_payload_soft_limit_bytes=int(TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+                inline_payload_threshold_bytes=int(TRUSTED_INTERNAL_INLINE_PAYLOAD_THRESHOLD_BYTES),
                 inline_payload_hard_limit_bytes=int(TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
                 inline_result_hard_limit_bytes=int(TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES),
             ),
@@ -424,18 +379,18 @@ def get_policy_limit_defaults(policy_id: str) -> tuple[int, int, int]:
     normalized = str(policy_id or "").strip().lower()
     if normalized == "default_safe":
         return (
-            int(DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+            int(DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES),
             int(DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
             int(DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES),
         )
     if normalized in {"trusted_internal", "pickle_internal_heavy"}:
         return (
-            int(TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+            int(TRUSTED_INTERNAL_INLINE_PAYLOAD_THRESHOLD_BYTES),
             int(TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES),
             int(TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES),
         )
     return (
-        int(INLINE_PAYLOAD_SOFT_LIMIT_BYTES),
+        int(INLINE_PAYLOAD_THRESHOLD_BYTES),
         int(INLINE_PAYLOAD_HARD_LIMIT_BYTES),
         int(INLINE_RESULT_HARD_LIMIT_BYTES),
     )
@@ -463,7 +418,7 @@ def get_binding_payload_thresholds(
         context=context,
     )
     return (
-        int(effective.inline_payload_soft_limit_bytes or 1),
+        int(effective.inline_payload_threshold_bytes or 1),
         int(effective.inline_payload_hard_limit_bytes or 1),
         int(effective.inline_result_hard_limit_bytes or 1),
     )
@@ -471,7 +426,7 @@ def get_binding_payload_thresholds(
 
 def get_local_inline_limits() -> tuple[int, int]:
     local_hard = max(1, int(LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES))
-    local_soft = min(max(1, int(LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES)), local_hard)
+    local_soft = min(max(1, int(LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES)), local_hard)
     return local_soft, local_hard
 
 
@@ -487,25 +442,21 @@ def get_job_staged_ref_ttl_sec(value: int = 0) -> int:
     return max(1, int(value or JOB_STAGED_REF_TTL_SEC))
 
 
-def merge_object_threshold_with_policy_soft_limit(*, object_threshold_bytes: int, policy_soft_limit_bytes: int) -> int:
+def merge_object_threshold_with_policy_threshold(*, object_threshold_bytes: int, policy_threshold_bytes: int) -> int:
     threshold = max(1, int(object_threshold_bytes or 1))
-    soft_limit = max(1, int(policy_soft_limit_bytes or 1))
-    return min(threshold, soft_limit)
+    policy_threshold = max(1, int(policy_threshold_bytes or 1))
+    return min(threshold, policy_threshold)
 
 
-def policy_with_soft_limit(policy: PayloadPolicy, object_threshold_bytes: int) -> PayloadPolicy:
+def policy_with_threshold(policy: PayloadPolicy, object_threshold_bytes: int) -> PayloadPolicy:
     threshold = max(1, int(object_threshold_bytes or 1))
-    if (
-        int(threshold) == int(policy.inline_payload_soft_limit_bytes)
-        and int(policy.inline_payload_estimate_threshold_bytes) == int(threshold)
-    ):
+    if int(threshold) == int(policy.inline_payload_threshold_bytes):
         return policy
     return replace(
         policy,
         limits=replace(
             policy.limits,
-            inline_payload_soft_limit_bytes=threshold,
-            inline_payload_estimate_threshold_bytes=threshold,
+            inline_payload_threshold_bytes=threshold,
         ),
     )
 
@@ -521,11 +472,11 @@ def resolve_payload_policy(
         policy = replace(policy, limits=merge_payload_limits_with_effective_policy(policy.limits, effective_policy))
     if int(object_threshold_bytes or 0) <= 0:
         return policy
-    threshold = merge_object_threshold_with_policy_soft_limit(
+    threshold = merge_object_threshold_with_policy_threshold(
         object_threshold_bytes=object_threshold_bytes,
-        policy_soft_limit_bytes=policy.inline_payload_soft_limit_bytes,
+        policy_threshold_bytes=policy.inline_payload_threshold_bytes,
     )
-    return policy_with_soft_limit(policy, threshold)
+    return policy_with_threshold(policy, threshold)
 
 
 def get_node_control_http_body_limit_bytes(node_control_body_bytes: int = 0) -> int:
@@ -606,10 +557,10 @@ def get_managed_globals_control_limit_bytes(*, policy_hard_limit_bytes: int, con
     )
 
 
-def normalize_policy_limit_values(*, soft: int, hard: int, result_hard: int) -> tuple[int, int, int]:
+def normalize_policy_limit_values(*, threshold: int, hard: int, result_hard: int) -> tuple[int, int, int]:
     hard_value = max(1, int(hard or 1))
     return (
-        min(max(1, int(soft or 1)), hard_value),
+        min(max(1, int(threshold or 1)), hard_value),
         hard_value,
         max(1, int(result_hard or 1)),
     )
@@ -617,17 +568,17 @@ def normalize_policy_limit_values(*, soft: int, hard: int, result_hard: int) -> 
 
 def effective_limits_from_profile(profile: object) -> tuple[int, int, int]:
     return normalize_policy_limit_values(
-        soft=int(getattr(profile, "inline_payload_soft_limit_bytes", 1) or 1),
+        threshold=int(getattr(profile, "inline_payload_threshold_bytes", 1) or 1),
         hard=int(getattr(profile, "inline_payload_hard_limit_bytes", 1) or 1),
         result_hard=int(getattr(profile, "inline_result_hard_limit_bytes", 1) or 1),
     )
 
 
 def merge_payload_limits_with_effective_policy(base_limits: PayloadLimits, effective_policy: object) -> PayloadLimits:
-    soft, hard, result_hard = normalize_policy_limit_values(
-        soft=min(
-            int(base_limits.inline_payload_soft_limit_bytes),
-            int(getattr(effective_policy, "inline_payload_soft_limit_bytes", 1) or 1),
+    threshold, hard, result_hard = normalize_policy_limit_values(
+        threshold=min(
+            int(base_limits.inline_payload_threshold_bytes),
+            int(getattr(effective_policy, "inline_payload_threshold_bytes", 1) or 1),
         ),
         hard=min(
             int(base_limits.inline_payload_hard_limit_bytes),
@@ -639,18 +590,12 @@ def merge_payload_limits_with_effective_policy(base_limits: PayloadLimits, effec
         ),
     )
     return PayloadLimits(
-        inline_payload_soft_limit_bytes=soft,
+        inline_payload_threshold_bytes=threshold,
         inline_payload_hard_limit_bytes=hard,
-        inline_payload_request_limit_bytes=min(int(base_limits.inline_payload_request_limit_bytes), hard),
-        inline_result_soft_limit_bytes=min(int(base_limits.inline_result_soft_limit_bytes), result_hard),
+        inline_result_threshold_bytes=min(int(base_limits.inline_result_threshold_bytes), result_hard),
         inline_result_hard_limit_bytes=result_hard,
         object_chunk_size_bytes=int(base_limits.object_chunk_size_bytes),
         file_hash_chunk_size_bytes=int(base_limits.file_hash_chunk_size_bytes),
-        inline_payload_estimate_threshold_bytes=soft,
-        inline_result_estimate_threshold_bytes=min(
-            int(base_limits.inline_result_soft_limit_bytes),
-            result_hard,
-        ),
     )
 
 
@@ -763,15 +708,12 @@ def get_local_service_payload_policy() -> PayloadPolicy:
     return PayloadPolicy(
         mode="http_call",
         limits=PayloadLimits(
-            inline_payload_soft_limit_bytes=local_soft,
+            inline_payload_threshold_bytes=local_soft,
             inline_payload_hard_limit_bytes=local_hard,
-            inline_payload_request_limit_bytes=local_hard,
-            inline_result_soft_limit_bytes=limits.inline_result_soft_limit_bytes,
+            inline_result_threshold_bytes=limits.inline_result_threshold_bytes,
             inline_result_hard_limit_bytes=limits.inline_result_hard_limit_bytes,
             object_chunk_size_bytes=limits.object_chunk_size_bytes,
             file_hash_chunk_size_bytes=limits.file_hash_chunk_size_bytes,
-            inline_payload_estimate_threshold_bytes=local_soft,
-            inline_result_estimate_threshold_bytes=limits.inline_result_estimate_threshold_bytes,
         ),
         recurse_containers=True,
         consume_on_read=True,
@@ -830,7 +772,6 @@ STABLE_CONFIG_API_EXPORTS = [
     "get_payload_policy",
     "get_result_inline_threshold_bytes",
     "get_policy_limit_defaults",
-    "get_payload_estimate_threshold_bytes",
     "get_runtime_limits",
     "get_serialization_mode",
     "get_service_http_body_limit_bytes",
@@ -838,10 +779,10 @@ STABLE_CONFIG_API_EXPORTS = [
     "get_transport_bounds",
     "get_trust_mode",
     "load_config_from_env",
-    "merge_object_threshold_with_policy_soft_limit",
+    "merge_object_threshold_with_policy_threshold",
     "merge_payload_limits_with_effective_policy",
     "normalize_policy_limit_values",
-    "policy_with_soft_limit",
+    "policy_with_threshold",
     "reload_config",
     "resolve_object_transfer_mode",
     "resolve_payload_policy",
@@ -854,7 +795,7 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "DEPENDENCY_POLICY_MODE",
     "BYTES_MATERIALIZE_THRESHOLD_BYTES",
     "DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
-    "DEFAULT_SAFE_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES",
     "DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES",
     "DATAREF_RESOLUTION",
     "DATAREF_UPLOAD_STRATEGY",
@@ -876,12 +817,9 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "OBJECT_HTTP_BODY_MAX_BYTES",
     "SERVICE_HTTP_BODY_MAX_BYTES",
     "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
-    "INLINE_PAYLOAD_ESTIMATE_THRESHOLD_BYTES",
-    "INLINE_PAYLOAD_REQUEST_LIMIT_BYTES",
-    "INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "INLINE_PAYLOAD_THRESHOLD_BYTES",
     "INLINE_RESULT_HARD_LIMIT_BYTES",
-    "INLINE_RESULT_ESTIMATE_THRESHOLD_BYTES",
-    "INLINE_RESULT_SOFT_LIMIT_BYTES",
+    "INLINE_RESULT_THRESHOLD_BYTES",
     "INLINE_TRANSPORT_CHECKSUM",
     "JOB_PAYLOAD_MAX_BYTES",
     "JOB_STAGED_REF_TTL_SEC",
@@ -889,7 +827,7 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "JOBQUEUE_RESOLVE_REFS",
     "JobQueueResolveRefsMode",
     "LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
-    "LOCAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES",
     "NODE_MAX_WORKERS",
     "NODE_QUEUE_CAPACITY",
     "NODE_WORKER_CAPACITY",
@@ -918,7 +856,7 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "SystemMode",
     "TRUST_MODE",
     "TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
-    "TRUSTED_INTERNAL_INLINE_PAYLOAD_SOFT_LIMIT_BYTES",
+    "TRUSTED_INTERNAL_INLINE_PAYLOAD_THRESHOLD_BYTES",
     "TRUSTED_INTERNAL_INLINE_RESULT_HARD_LIMIT_BYTES",
     "TrustMode",
 ]

@@ -22,7 +22,7 @@ class EffectivePolicy:
     version: int
     resolved_mode: str
     allowed_modes: Tuple[str, ...]
-    inline_payload_soft_limit_bytes: int
+    inline_payload_threshold_bytes: int
     inline_payload_hard_limit_bytes: int
     inline_result_hard_limit_bytes: int
     use_raw_bytes_payload: bool
@@ -42,12 +42,12 @@ class EffectivePolicy:
         object.__setattr__(self, "version", max(1, int(self.version or 1)))
         object.__setattr__(self, "resolved_mode", normalized_mode)
         object.__setattr__(self, "allowed_modes", normalized_allowed)
-        soft_limit, hard_limit, result_hard_limit = normalize_policy_limit_values(
-            soft=int(self.inline_payload_soft_limit_bytes or 1),
+        threshold, hard_limit, result_hard_limit = normalize_policy_limit_values(
+            threshold=int(self.inline_payload_threshold_bytes or 1),
             hard=int(self.inline_payload_hard_limit_bytes or 1),
             result_hard=int(self.inline_result_hard_limit_bytes or 1),
         )
-        object.__setattr__(self, "inline_payload_soft_limit_bytes", soft_limit)
+        object.__setattr__(self, "inline_payload_threshold_bytes", threshold)
         object.__setattr__(self, "inline_payload_hard_limit_bytes", hard_limit)
         object.__setattr__(self, "inline_result_hard_limit_bytes", result_hard_limit)
         object.__setattr__(self, "use_raw_bytes_payload", bool(self.use_raw_bytes_payload))
@@ -100,7 +100,7 @@ def resolve_effective_policy(
     else:
         resolved_mode = allowed_modes[0]
 
-    inline_payload_soft_limit_bytes, inline_payload_hard_limit_bytes, inline_result_hard_limit_bytes = (
+    inline_payload_threshold_bytes, inline_payload_hard_limit_bytes, inline_result_hard_limit_bytes = (
         effective_limits_from_profile(profile)
     )
     use_raw_bytes_payload = bool(profile.use_raw_bytes_payload) and resolved_mode != "legacy_v1"
@@ -115,7 +115,7 @@ def resolve_effective_policy(
         version=profile.version,
         resolved_mode=resolved_mode,
         allowed_modes=allowed_modes,
-        inline_payload_soft_limit_bytes=inline_payload_soft_limit_bytes,
+        inline_payload_threshold_bytes=inline_payload_threshold_bytes,
         inline_payload_hard_limit_bytes=inline_payload_hard_limit_bytes,
         inline_result_hard_limit_bytes=inline_result_hard_limit_bytes,
         use_raw_bytes_payload=use_raw_bytes_payload,

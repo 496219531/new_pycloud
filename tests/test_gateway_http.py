@@ -268,13 +268,13 @@ def test_gateway_public_http_raw_bytes_body_rejects_data_ref() -> None:
     assert response["error"] == EXTERNAL_DATA_REF_ERROR
 
 
-def test_gateway_client_does_not_use_global_inline_payload_soft_limit_constant() -> None:
+def test_gateway_client_does_not_use_global_inline_payload_threshold_constant() -> None:
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
     text = (root / "src/pycloud_parallel/controlplane/gateway_client.py").read_text(encoding="utf-8")
 
-    assert "INLINE_PAYLOAD_SOFT_LIMIT_BYTES" not in text
+    assert "INLINE_PAYLOAD_THRESHOLD_BYTES" not in text
     assert "get_binding_payload_thresholds(" in text
 
 

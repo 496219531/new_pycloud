@@ -107,7 +107,7 @@ def test_startup_module_mount_decodes_inline_transport_adapter_at_invoke(tmp_pat
     assert body["data"]["task_generator_callable"] == "task_generator"
 
 
-def test_local_pickle_payload_transport_reuses_exact_pickle_when_within_soft_limit(tmp_path, monkeypatch) -> None:
+def test_local_pickle_payload_transport_reuses_exact_pickle_when_within_threshold(tmp_path, monkeypatch) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
 
     real_pickle_dumps = pickle.dumps
@@ -128,7 +128,7 @@ def test_local_pickle_payload_transport_reuses_exact_pickle_when_within_soft_lim
     assert len(dump_calls) == 1
 
 
-def test_local_pickle_payload_transport_repickles_after_prepare_when_over_soft_limit(tmp_path, monkeypatch) -> None:
+def test_local_pickle_payload_transport_repickles_after_prepare_when_over_threshold(tmp_path, monkeypatch) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
 
     real_pickle_dumps = pickle.dumps
@@ -144,10 +144,8 @@ def test_local_pickle_payload_transport_repickles_after_prepare_when_over_soft_l
         base_policy,
         limits=replace(
             base_policy.limits,
-            inline_payload_soft_limit_bytes=1,
+            inline_payload_threshold_bytes=1,
             inline_payload_hard_limit_bytes=10**9,
-            inline_payload_request_limit_bytes=10**9,
-            inline_payload_estimate_threshold_bytes=1,
         ),
     )
     monkeypatch.setattr(local_ipc_mod, "get_local_service_payload_policy", lambda: forced_policy)
@@ -2128,12 +2126,12 @@ def _submit_oversized_job_payload(monkeypatch):
 def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "32")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", "32")
     monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
     config_mod.reload_config()
 
     def _reset_config() -> None:
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
         config_mod.reload_config()
 
@@ -2150,12 +2148,12 @@ def test_job_queue_client_submit_job_stages_oversized_job_payload(monkeypatch, r
 def test_job_queue_client_submit_job_fanout_registers_all_replicas(monkeypatch, request) -> None:
     from pycloud_parallel.controlplane import config as config_mod
 
-    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", "32")
+    monkeypatch.setenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", "32")
     monkeypatch.setenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", "fanout")
     config_mod.reload_config()
 
     def _reset_config() -> None:
-        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_DATAREF_UPLOAD_STRATEGY", raising=False)
         config_mod.reload_config()
 

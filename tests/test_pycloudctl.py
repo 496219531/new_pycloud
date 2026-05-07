@@ -108,14 +108,14 @@ def test_ctl_parser_accepts_env_overrides_for_start_commands():
         [
             "start-controlplane",
             "--env",
-            "PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576",
+            "PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES=1048576",
             "--env",
             "PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216",
         ]
     )
     assert args.command == "start-controlplane"
     assert args.env == [
-        "PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES=1048576",
+        "PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES=1048576",
         "PYCLOUD_CONTROL_HTTP_MAX_SEND_BYTES=16777216",
     ]
 
@@ -1633,11 +1633,11 @@ def test_spawn_server_passes_env_overrides(tmp_path, monkeypatch):
         tmp_path,
         log_path,
         ["--role", "controlplane"],
-        extra_env={"PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": "1048576"},
+        extra_env={"PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES": "1048576"},
     )
 
     assert pid == 12345
-    assert captured["env"]["PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES"] == "1048576"
+    assert captured["env"]["PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES"] == "1048576"
 
 
 def test_spawn_server_uses_new_console_on_windows(tmp_path, monkeypatch):
@@ -1719,7 +1719,7 @@ def test_spawn_server_debug_uses_terminal_windows_on_macos(tmp_path, monkeypatch
         tmp_path,
         tmp_path / "logs" / "service.log",
         ["--role", "controlplane"],
-        extra_env={"PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES": "1048576"},
+        extra_env={"PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES": "1048576"},
         debug=True,
     )
 
@@ -1727,4 +1727,4 @@ def test_spawn_server_debug_uses_terminal_windows_on_macos(tmp_path, monkeypatch
     assert captured["root"] == tmp_path
     assert captured["log_path"] == tmp_path / "logs" / "service.log"
     assert captured["args"] == ["--role", "controlplane"]
-    assert captured["env"]["PYCLOUD_INLINE_PAYLOAD_SOFT_LIMIT_BYTES"] == "1048576"
+    assert captured["env"]["PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES"] == "1048576"

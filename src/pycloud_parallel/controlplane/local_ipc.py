@@ -206,7 +206,7 @@ def _make_local_pickle_payload_transport(
     policy = get_local_service_payload_policy()
     normalized_payload = dict(_normalize_local_payload_paths(payload or {}))
     raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
-    if len(raw_payload) > max(1, int(policy.inline_payload_soft_limit_bytes)):
+    if len(raw_payload) > max(1, int(policy.inline_payload_threshold_bytes)):
         prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=serialization_mode)
         raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(

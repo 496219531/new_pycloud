@@ -29,13 +29,13 @@ class PolicyProfile:
     version: int
     allowed_modes: Tuple[str, ...]
     default_mode: str
-    inline_payload_soft_limit_bytes: int
+    inline_payload_threshold_bytes: int
     inline_payload_hard_limit_bytes: int
     inline_result_hard_limit_bytes: int
     use_raw_bytes_payload: bool
     use_http_raw_bytes_body: bool
     allow_pickle_stable: bool
-    force_dataref_above_soft_limit: bool
+    force_dataref_above_threshold: bool
     public_gateway_allow_pickle: bool = False
 
     def __post_init__(self) -> None:
@@ -58,18 +58,18 @@ class PolicyProfile:
         object.__setattr__(self, "version", max(1, int(self.version or 1)))
         object.__setattr__(self, "allowed_modes", normalized_modes)
         object.__setattr__(self, "default_mode", normalized_default)
-        soft_limit, hard_limit, result_hard_limit = normalize_policy_limit_values(
-            soft=int(self.inline_payload_soft_limit_bytes or 1),
+        threshold, hard_limit, result_hard_limit = normalize_policy_limit_values(
+            threshold=int(self.inline_payload_threshold_bytes or 1),
             hard=int(self.inline_payload_hard_limit_bytes or 1),
             result_hard=int(self.inline_result_hard_limit_bytes or 1),
         )
-        object.__setattr__(self, "inline_payload_soft_limit_bytes", soft_limit)
+        object.__setattr__(self, "inline_payload_threshold_bytes", threshold)
         object.__setattr__(self, "inline_payload_hard_limit_bytes", hard_limit)
         object.__setattr__(self, "inline_result_hard_limit_bytes", result_hard_limit)
         object.__setattr__(self, "use_raw_bytes_payload", bool(self.use_raw_bytes_payload))
         object.__setattr__(self, "use_http_raw_bytes_body", bool(self.use_http_raw_bytes_body))
         object.__setattr__(self, "allow_pickle_stable", bool(self.allow_pickle_stable))
-        object.__setattr__(self, "force_dataref_above_soft_limit", bool(self.force_dataref_above_soft_limit))
+        object.__setattr__(self, "force_dataref_above_threshold", bool(self.force_dataref_above_threshold))
         object.__setattr__(self, "public_gateway_allow_pickle", bool(self.public_gateway_allow_pickle))
 
 
@@ -98,13 +98,13 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         version=1,
         allowed_modes=("legacy_v1", "structured_v1"),
         default_mode="legacy_v1",
-        inline_payload_soft_limit_bytes=get_policy_limit_defaults("default_safe")[0],
+        inline_payload_threshold_bytes=get_policy_limit_defaults("default_safe")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("default_safe")[1],
         inline_result_hard_limit_bytes=get_policy_limit_defaults("default_safe")[2],
         use_raw_bytes_payload=False,
         use_http_raw_bytes_body=False,
         allow_pickle_stable=False,
-        force_dataref_above_soft_limit=True,
+        force_dataref_above_threshold=True,
         public_gateway_allow_pickle=False,
     ),
     "trusted_internal": PolicyProfile(
@@ -112,13 +112,13 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         version=1,
         allowed_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
         default_mode="pickle_stable_v1",
-        inline_payload_soft_limit_bytes=get_policy_limit_defaults("trusted_internal")[0],
+        inline_payload_threshold_bytes=get_policy_limit_defaults("trusted_internal")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("trusted_internal")[1],
         inline_result_hard_limit_bytes=get_policy_limit_defaults("trusted_internal")[2],
         use_raw_bytes_payload=True,
         use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
-        force_dataref_above_soft_limit=True,
+        force_dataref_above_threshold=True,
         public_gateway_allow_pickle=False,
     ),
     "pickle_internal_heavy": PolicyProfile(
@@ -126,13 +126,13 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         version=1,
         allowed_modes=("pickle_stable_v1", "structured_v1", "legacy_v1"),
         default_mode="pickle_stable_v1",
-        inline_payload_soft_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[0],
+        inline_payload_threshold_bytes=get_policy_limit_defaults("pickle_internal_heavy")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[1],
         inline_result_hard_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[2],
         use_raw_bytes_payload=True,
         use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
-        force_dataref_above_soft_limit=True,
+        force_dataref_above_threshold=True,
         public_gateway_allow_pickle=False,
     ),
 }

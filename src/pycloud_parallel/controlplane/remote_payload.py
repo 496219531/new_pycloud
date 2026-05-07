@@ -22,7 +22,7 @@ def default_remote_call_object_threshold_bytes(
         "http_call",
         effective_policy=effective_policy,
     )
-    return max(1, int(policy.inline_payload_soft_limit_bytes or 1))
+    return max(1, int(policy.inline_payload_threshold_bytes or 1))
 
 
 def prepare_remote_call_payload(

@@ -2435,7 +2435,7 @@ class NodeControlState(NodeRuntimeBase):
                     proposed_request_size = transport_request_size + item_payload_size
                     validate_inline_request_size(
                         proposed_request_size,
-                        limit_bytes=task_submit_policy.inline_payload_request_limit_bytes,
+                        limit_bytes=task_submit_policy.inline_payload_hard_limit_bytes,
                         context="taskpool submit request",
                     )
                     transport_request_size = proposed_request_size

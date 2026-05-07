@@ -30,7 +30,7 @@ def _policy(
         version=1,
         resolved_mode=resolved_mode,
         allowed_modes=allowed_modes,
-        inline_payload_soft_limit_bytes=256,
+        inline_payload_threshold_bytes=256,
         inline_payload_hard_limit_bytes=1024,
         inline_result_hard_limit_bytes=1024,
         use_raw_bytes_payload=use_raw_bytes_payload,
@@ -159,10 +159,10 @@ def test_node_control_client_uses_struct_payload_when_transport_lane_disabled():
         body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
         return _FakeHttpResponse(body, {"Content-Type": "application/json"})
 
-    from pycloud_parallel.controlplane import node_control_http
+    from pycloud_parallel.controlplane import client_transport_runtime
 
-    original_urlopen = node_control_http.urlopen
-    node_control_http.urlopen = _fake_urlopen
+    original_urlopen = client_transport_runtime.urlopen
+    client_transport_runtime.urlopen = _fake_urlopen
     try:
         client = NodeControlClient("http://127.0.0.1:18061", timeout_sec=5.0)
         NodeControlClient.call_service(
@@ -179,7 +179,7 @@ def test_node_control_client_uses_struct_payload_when_transport_lane_disabled():
             ),
         )
     finally:
-        node_control_http.urlopen = original_urlopen
+        client_transport_runtime.urlopen = original_urlopen
 
     assert captured["request"].full_url.endswith("/services/svc-1/call/run")
     assert captured["body"]["payload"]["__pycloud_transport__"]["codec"] == "pickle_stable_v1"
@@ -193,10 +193,10 @@ def test_node_control_client_can_use_transport_lane_for_structured_mode():
         body = json.dumps({"ok": True, "data": {"value": 1}}).encode("utf-8")
         return _FakeHttpResponse(body, {"Content-Type": "application/json"})
 
-    from pycloud_parallel.controlplane import node_control_http
+    from pycloud_parallel.controlplane import client_transport_runtime
 
-    original_urlopen = node_control_http.urlopen
-    node_control_http.urlopen = _fake_urlopen
+    original_urlopen = client_transport_runtime.urlopen
+    client_transport_runtime.urlopen = _fake_urlopen
     try:
         client = NodeControlClient("http://127.0.0.1:18061", timeout_sec=5.0)
         NodeControlClient.call_service(
@@ -213,7 +213,7 @@ def test_node_control_client_can_use_transport_lane_for_structured_mode():
             ),
         )
     finally:
-        node_control_http.urlopen = original_urlopen
+        client_transport_runtime.urlopen = original_urlopen
 
     assert captured["body"]["payload"]["__pycloud_transport__"]["codec"] == "structured_v1"
 
