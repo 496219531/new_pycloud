@@ -197,14 +197,15 @@ class NodeInfoCenterRegistrar:
         return True
 
     def _register_once(self) -> bool:
+        snapshot = self.state.registrar_snapshot(include_stopped=True, runtime_limit=10)
         metadata = dict(self.metadata)
-        metadata.update(self.state.service_timing_metadata())
+        metadata.update(snapshot.get("service_timing_metadata", {}))
         metadata["pycloud_version"] = self._pycloud_version()
         accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
-        task_pool_reports = self.state.task_pool_reports()
-        service_reports = self.state.service_report_payloads(include_stopped=True)
-        active_runtimes = self.state.active_runtime_keys(limit=10)
+        task_pool_reports = list(snapshot.get("task_pool_reports") or [])
+        service_reports = list(snapshot.get("service_reports") or [])
+        active_runtimes = list(snapshot.get("active_runtimes") or [])
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -220,7 +221,7 @@ class NodeInfoCenterRegistrar:
                 "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
                 "lease_expire_at": item.lease_expire_at.isoformat(),
             }
-            for item in task_pool_reports.values()
+            for item in task_pool_reports
         ]
         resp = self._client.register_node(
             node_id=self.node_id,
@@ -235,9 +236,9 @@ class NodeInfoCenterRegistrar:
             task_pools=task_pools,
             active_runtimes=active_runtimes,
             service_worker_capacity=self.state.service_worker_capacity,
-            service_worker_used=self.state.service_worker_used(),
+            service_worker_used=int(snapshot.get("service_worker_used", 0) or 0),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
-            task_pool_worker_used=self.state.task_pool_worker_used(),
+            task_pool_worker_used=int(snapshot.get("task_pool_worker_used", 0) or 0),
             accept_service_deploy=accept_service_deploy,
             python_version=self.state.python_version,
             capability=self.state.node_capability(),
@@ -270,15 +271,16 @@ class NodeInfoCenterRegistrar:
         return True
 
     def _heartbeat_once(self) -> bool:
-        metrics = self.state.metrics()
+        snapshot = self.state.registrar_snapshot(include_stopped=True, runtime_limit=10)
+        metrics = dict(snapshot.get("metrics") or {})
         metadata = dict(self.metadata)
-        metadata.update(self.state.service_timing_metadata())
+        metadata.update(snapshot.get("service_timing_metadata", {}))
         metadata["pycloud_version"] = self._pycloud_version()
         accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
-        task_pool_reports = self.state.task_pool_reports()
-        service_reports = self.state.service_report_payloads(include_stopped=True)
-        active_runtimes = self.state.active_runtime_keys(limit=10)
+        task_pool_reports = list(snapshot.get("task_pool_reports") or [])
+        service_reports = list(snapshot.get("service_reports") or [])
+        active_runtimes = list(snapshot.get("active_runtimes") or [])
         task_pools = [
             {
                 "pool_id": item.pool_id,
@@ -294,7 +296,7 @@ class NodeInfoCenterRegistrar:
                 "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
                 "lease_expire_at": item.lease_expire_at.isoformat(),
             }
-            for item in task_pool_reports.values()
+            for item in task_pool_reports
         ]
         resp = self._client.heartbeat_node(
             node_id=self.node_id,
@@ -313,9 +315,9 @@ class NodeInfoCenterRegistrar:
             task_pools=task_pools,
             active_runtimes=active_runtimes,
             service_worker_capacity=self.state.service_worker_capacity,
-            service_worker_used=self.state.service_worker_used(),
+            service_worker_used=int(snapshot.get("service_worker_used", 0) or 0),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
-            task_pool_worker_used=self.state.task_pool_worker_used(),
+            task_pool_worker_used=int(snapshot.get("task_pool_worker_used", 0) or 0),
             accept_service_deploy=accept_service_deploy,
             python_version=self.state.python_version,
             capability=self.state.node_capability(),

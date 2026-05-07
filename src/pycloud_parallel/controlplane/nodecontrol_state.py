@@ -3511,6 +3511,121 @@ class NodeControlState(NodeRuntimeBase):
             rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
             return [runtime_key for _hot, _queued, _last_used, runtime_key in rows[: max(1, int(limit))]]
 
+    def registrar_snapshot(self, *, include_stopped: bool = True, runtime_limit: int = 10) -> Dict[str, object]:
+        with self._lock:
+            service_rows = [
+                (session, self._service_inflight_locked(session))
+                for session in self._services.values()
+                if include_stopped or session.status != pb2.SERVICE_STATUS_STOPPED
+            ]
+            inflight_by_pool: Dict[str, int] = {}
+            runtime_stats: Dict[str, Tuple[int, int, float]] = {}
+            queued = 0
+            pool_inflight = 0
+            now_ts = utc_now().timestamp()
+            for task in self._pool_tasks.values():
+                status = int(task.status or 0)
+                if status == int(pb2.TASK_STATUS_RUNNING):
+                    pool_inflight += 1
+                    pool_id = str(task.client_id or "").strip()
+                    if pool_id:
+                        inflight_by_pool[pool_id] = inflight_by_pool.get(pool_id, 0) + 1
+                elif status == int(pb2.TASK_STATUS_QUEUED):
+                    queued += 1
+                if status not in (int(pb2.TASK_STATUS_QUEUED), int(pb2.TASK_STATUS_RUNNING)):
+                    continue
+                runtime_key = str(task.runtime_key or task.client_id or task.code_version).strip() or str(task.code_version or "")
+                running, queued_count, last_used = runtime_stats.get(runtime_key, (0, 0, 0.0))
+                if status == int(pb2.TASK_STATUS_RUNNING):
+                    running += 1
+                    last_used = max(last_used, (task.last_heartbeat_at or task.started_at or utc_now()).timestamp())
+                else:
+                    queued_count += 1
+                    last_used = max(last_used, now_ts)
+                runtime_stats[runtime_key] = (running, queued_count, last_used)
+            task_pool_rows = [
+                (pool, inflight_by_pool.get(pool.pool_id, self._task_pool_inflight_locked(pool)))
+                for pool in self._task_pools.values()
+                if pool.is_running() or bool(pool.timing_metrics) or str(pool.stop_reason or "").strip()
+            ]
+            service_inflight = sum(in_flight for _session, in_flight in service_rows)
+            active_service_workers = sum(
+                session.resource_snapshot().worker_count
+                for session in self._services.values()
+                if session.is_running()
+            )
+            active_task_pool_workers = sum(
+                pool.resource_snapshot().worker_count
+                for pool in self._task_pools.values()
+                if pool.is_running()
+            )
+            service_timing_payload: Dict[str, object] = {}
+            for session in self._services.values():
+                if not session.timing_metrics:
+                    continue
+                service_timing_payload[session.service_id] = {
+                    "service_name": session.service_name,
+                    **dict(session.timing_metrics),
+                }
+            pool_timing_payload: Dict[str, object] = {}
+            for pool in self._task_pools.values():
+                if not pool.timing_metrics:
+                    continue
+                pool_timing_payload[pool.pool_id] = {
+                    "pool_name": pool.pool_name,
+                    "task_method": pool.task_method,
+                    **dict(pool.timing_metrics),
+                }
+            metrics = {
+                "queued": queued,
+                "inflight": service_inflight + pool_inflight,
+                "running": service_inflight + pool_inflight,
+                "credit": max(0, self.queue_capacity - (queued + service_inflight + pool_inflight)),
+                "queue_capacity": self.queue_capacity,
+                "worker_capacity": self.worker_capacity,
+                "uptime_sec": int((utc_now() - self.started_at).total_seconds()),
+            }
+            runtime_rows = [
+                (running, queued_count, last_used, runtime_key)
+                for runtime_key, (running, queued_count, last_used) in runtime_stats.items()
+            ]
+            runtime_rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
+            service_timing_metadata: Dict[str, str] = {}
+            if service_timing_payload:
+                service_timing_metadata["service_timing_metrics"] = json.dumps(
+                    service_timing_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            if pool_timing_payload:
+                service_timing_metadata["task_pool_timing_metrics"] = json.dumps(
+                    pool_timing_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            service_worker_used = active_service_workers + max(0, int(self._service_worker_reserved))
+            task_pool_worker_used = active_task_pool_workers + max(0, int(self._task_pool_worker_reserved))
+        return {
+            "metrics": metrics,
+            "service_reports": [
+                _build_service_report_payload(session, in_flight=in_flight)
+                for session, in_flight in service_rows
+            ],
+            "task_pool_reports": [
+                _build_task_pool_info(pool, in_flight=in_flight)
+                for pool, in_flight in task_pool_rows
+            ],
+            "active_runtimes": [
+                runtime_key
+                for _running, _queued, _last_used, runtime_key in runtime_rows[: max(1, int(runtime_limit))]
+            ],
+            "service_worker_capacity": self.service_worker_capacity,
+            "service_worker_used": service_worker_used,
+            "task_pool_worker_capacity": self.task_pool_worker_capacity,
+            "task_pool_worker_used": task_pool_worker_used,
+            "service_timing_metadata": service_timing_metadata,
+        }
+
     @property
     def python_version(self) -> str:
         """获取节点的 Python 版本。

@@ -630,6 +630,19 @@ class NodeRuntimeBase:
         del include_stopped
         return self.startup_service_report_payloads()
 
+    def registrar_snapshot(self, *, include_stopped: bool = True, runtime_limit: int = 10) -> Dict[str, object]:
+        return {
+            "metrics": self.metrics(),
+            "service_reports": self.service_report_payloads(include_stopped=include_stopped),
+            "task_pool_reports": list(self.task_pool_reports().values()),
+            "active_runtimes": self.active_runtime_keys(limit=runtime_limit),
+            "service_worker_capacity": self.service_worker_capacity,
+            "service_worker_used": self.service_worker_used(),
+            "task_pool_worker_capacity": self.task_pool_worker_capacity,
+            "task_pool_worker_used": self.task_pool_worker_used(),
+            "service_timing_metadata": self.service_timing_metadata(),
+        }
+
     def _mounted_service(self, service_id: str) -> Optional[StaticServiceMount]:
         return self._startup_services.get(str(service_id or "").strip())
 

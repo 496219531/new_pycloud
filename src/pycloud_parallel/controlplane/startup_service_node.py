@@ -305,6 +305,14 @@ class StartupServiceNode(NodeControlState):
             *NodeControlState.service_report_payloads(self, include_stopped=include_stopped),
         ]
 
+    def registrar_snapshot(self, *, include_stopped: bool = True, runtime_limit: int = 10) -> dict[str, Any]:
+        snapshot = dict(NodeControlState.registrar_snapshot(self, include_stopped=include_stopped, runtime_limit=runtime_limit))
+        snapshot["service_reports"] = [
+            *NodeRuntimeBase.startup_service_report_payloads(self),
+            *list(snapshot.get("service_reports") or []),
+        ]
+        return snapshot
+
     def update_globals(
         self,
         values: dict[str, Any],
