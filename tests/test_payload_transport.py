@@ -11,7 +11,6 @@ from pycloud_parallel.controlplane.config import (
     get_config_limit_authority,
     get_gateway_http_body_limit_bytes,
     get_gateway_upload_limits,
-    get_http_object_body_limit_bytes,
     get_infocenter_http_body_limit_bytes,
     get_bytes_materialize_threshold_bytes,
     get_job_blob_inline_threshold_bytes,
@@ -281,7 +280,6 @@ def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
     assert get_job_staged_ref_ttl_sec(0) == 24 * 60 * 60
     assert get_job_staged_ref_ttl_sec(-5) == 1
     assert get_job_staged_ref_ttl_sec(10) == 10
-    assert get_http_object_body_limit_bytes(123) == 123
     assert get_object_size_hard_limit_bytes(123) == 123
     assert get_node_control_http_body_limit_bytes(123) == 123
     assert get_service_http_body_limit_bytes(0) == get_transport_bounds().service_http_body_max_bytes
@@ -424,7 +422,6 @@ def test_prepare_managed_globals_batches_splits_inline_keys(monkeypatch) -> None
     from pycloud_parallel.execution import support
 
     monkeypatch.setattr(config, "NODE_CONTROL_HTTP_BODY_MAX_BYTES", 1000)
-    monkeypatch.setattr(config, "OBJECT_HTTP_BODY_MAX_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [],
@@ -451,7 +448,6 @@ def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch
             return DataRef(ref_id="obj-1", storage_id="obj-1", format=format, size_bytes=len(blob))
 
     monkeypatch.setattr(config, "NODE_CONTROL_HTTP_BODY_MAX_BYTES", 1000)
-    monkeypatch.setattr(config, "OBJECT_HTTP_BODY_MAX_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [_Client()],

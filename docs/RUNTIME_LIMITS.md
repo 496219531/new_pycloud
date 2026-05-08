@@ -174,7 +174,7 @@ local_threshold = min(max(1, PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES), PYCL
 - `PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-这两个值表示轻控制消息能力边界，不等同于各 HTTP endpoint 的 body limit。Node runtime/task 通信用 `PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES`，object 本体传输用 `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`。
+这两个值表示轻控制消息能力边界，不等同于各 HTTP endpoint 的 body limit。Node runtime/task 通信和 object HTTP 上传都使用 `PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES`。
 
 node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。业务 payload threshold、session effective policy 和最终 limit 仍以中心/session 分配为准，node 不自行协商或改写。
 
@@ -193,12 +193,8 @@ node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。�
 - `PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES`
   - 默认：`134217728` (`128 MiB`)
   - NodeControl runtime/control endpoint 的 request body 上限
-  - `/objects/...` object 上传/下载路径单独使用 `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`，不再把整个 NodeControl app 抬到 object body 上限
-
-- `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`
-  - 默认：`536870912` (`512 MiB`)
-  - object HTTP upload body 上限
-  - 只表示单次 HTTP upload request body 能接收多大，不表示系统允许单个 object 有多大
+  - `/objects/...` object 上传也使用这条 body 上限；object 不再拥有单独更大的 HTTP body 后门
+  - 单个 object/DataRef 背后的业务大小仍由 `PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES` 控制
 
 ### 2.5 node 默认进程/并发参数
 

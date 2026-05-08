@@ -95,7 +95,7 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
    - `bytes_materialize_threshold = max(1, min(BYTES_MATERIALIZE_THRESHOLD_BYTES, object_size_hard_limit))`
 10. NodeControl HTTP body limit
    - `node_control_http_body_limit = max(1, NODE_CONTROL_HTTP_BODY_MAX_BYTES)`
-   - `/objects/...` object path 单独使用 `OBJECT_HTTP_BODY_MAX_BYTES`，不再把整个 NodeControl app 抬到 object body 上限
+   - `/objects/...` object path 也使用这条 body 上限；object 不再拥有单独更大的 HTTP body 后门
 11. gateway upload limits
    - `file_limit = max(1, max_file_bytes or GATEWAY_MAX_UPLOAD_FILE_BYTES)`
    - `total_limit = max(file_limit, max_total_bytes or GATEWAY_MAX_UPLOAD_TOTAL_BYTES)`
@@ -135,7 +135,6 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
    - `get_gateway_http_body_limit_bytes(...)`
    - `get_infocenter_http_body_limit_bytes(...)`
    - `get_node_control_http_body_limit_bytes(...)`
-   - `get_http_object_body_limit_bytes(...)`
    - `get_gateway_upload_limits(...)`
    - `get_object_size_hard_limit_bytes(...)`
    - `get_bytes_materialize_threshold_bytes(...)`
@@ -181,25 +180,23 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
 5. `resolve_payload_policy(...)`
    - 负责统一 `get_payload_policy(...)`、effective policy merge、object threshold 合成
 6. `get_node_control_http_body_limit_bytes(...)`
-   - 负责 NodeControl HTTP body 与 object body 下限合成
+   - 负责 NodeControl runtime/control 和 object HTTP path 共用的 body bound 默认值和下限修正
 7. `get_service_http_body_limit_bytes(...)` / `get_gateway_http_body_limit_bytes(...)` / `get_infocenter_http_body_limit_bytes(...)`
    - 负责各 HTTP server 的 body bound 默认值和下限修正
-8. `get_http_object_body_limit_bytes(...)`
-   - 负责 object HTTP upload/download body bound 默认值和下限修正
-9. `get_gateway_upload_limits(...)`
+8. `get_gateway_upload_limits(...)`
    - 负责 gateway upload 文件/总量 limit 的默认值和总量下限修正
-10. `get_object_size_hard_limit_bytes(...)` / `validate_object_size_bytes(...)`
+9. `get_object_size_hard_limit_bytes(...)` / `validate_object_size_bytes(...)`
    - 负责单个 object/DataRef 背后对象大小的业务硬限制
    - 不等同于 HTTP body limit，也不等同于 segment layout 阈值
-11. `get_bytes_materialize_threshold_bytes(...)` / `validate_bytes_materialize_size(...)`
+10. `get_bytes_materialize_threshold_bytes(...)` / `validate_bytes_materialize_size(...)`
    - 负责整包 bytes 下载、`materialize_as="bytes"` 和整包反序列化路径的内存保护
    - 不等同于 object size hard limit；大对象可以存在，但不能走 bytes 主路径
-12. `get_managed_globals_inline_limit_bytes(...)`
+11. `get_managed_globals_inline_limit_bytes(...)`
    - 负责 managed globals 的 policy hard limit 与 node runtime body bound 合成
    - managed globals 属于任务会话数据面，不使用轻控制消息的 `CONTROL_HTTP_MAX_SEND_BYTES`
-13. `get_job_staging_replica_count(...)`
+12. `get_job_staging_replica_count(...)`
    - 负责 job staged refs 的副本数默认值和下限修正
-14. `get_job_staged_ref_ttl_sec(...)`
+13. `get_job_staged_ref_ttl_sec(...)`
    - 负责 job staged refs 的 TTL 默认值和下限修正
 
 ## Node 侧职责边界
@@ -238,7 +235,6 @@ node 不是 policy / limit / capability authority。
    - `get_gateway_http_body_limit_bytes(...)`
    - `get_infocenter_http_body_limit_bytes(...)`
    - `get_node_control_http_body_limit_bytes(...)`
-   - `get_http_object_body_limit_bytes(...)`
 3. object/store 和 gateway upload 优先使用：
    - `get_object_store_bounds()`
    - `get_gateway_upload_limits(...)`
@@ -251,7 +247,6 @@ node 不是 policy / limit / capability authority。
    - `GATEWAY_HTTP_BODY_MAX_BYTES`
    - `INFOCENTER_HTTP_BODY_MAX_BYTES`
    - `NODE_CONTROL_HTTP_BODY_MAX_BYTES`
-   - `OBJECT_HTTP_BODY_MAX_BYTES`
    - `CONTROL_HTTP_MAX_SEND_BYTES`
    - `CONTROL_HTTP_MAX_RECEIVE_BYTES`
    - `GATEWAY_MAX_UPLOAD_FILE_BYTES`

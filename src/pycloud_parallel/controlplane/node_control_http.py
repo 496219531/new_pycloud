@@ -33,7 +33,6 @@ from pycloud_parallel.controlplane.client_transport_runtime import (
 )
 from pycloud_parallel.controlplane.config import (
     OBJECT_CHUNK_SIZE_BYTES,
-    get_http_object_body_limit_bytes,
     get_node_control_http_body_limit_bytes,
     get_payload_policy,
 )
@@ -186,7 +185,7 @@ class NodeControlHttpApp:
         self.state = state
         self.on_service_routes_changed = on_service_routes_changed
         self.max_body_bytes = get_node_control_http_body_limit_bytes(max_body_bytes)
-        self.object_app = NodeObjectHttpApp(state, max_body_bytes=get_http_object_body_limit_bytes())
+        self.object_app = NodeObjectHttpApp(state, max_body_bytes=self.max_body_bytes)
 
     def _notify(self) -> None:
         if self.on_service_routes_changed is None:

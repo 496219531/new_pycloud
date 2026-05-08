@@ -120,7 +120,6 @@ _INT_SETTINGS: dict[str, EnvIntSetting] = {
     "GATEWAY_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"), 64 * 1024 * 1024),
     "INFOCENTER_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"), 64 * 1024 * 1024),
     "NODE_CONTROL_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES"), 128 * 1024 * 1024),
-    "OBJECT_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"), 512 * 1024 * 1024),
     "NODE_WORKER_CAPACITY": EnvIntSetting(("PYCLOUD_NODE_WORKER_CAPACITY",), 32),
     "NODE_QUEUE_CAPACITY": EnvIntSetting(("PYCLOUD_NODE_QUEUE_CAPACITY",), 4000),
     "NODE_MAX_WORKERS": EnvIntSetting(("PYCLOUD_NODE_MAX_WORKERS",), 64),
@@ -206,7 +205,6 @@ class TransportBounds:
     gateway_http_body_max_bytes: int
     infocenter_http_body_max_bytes: int
     node_control_http_body_max_bytes: int
-    object_http_body_max_bytes: int
 
 
 @dataclass(frozen=True)
@@ -350,7 +348,6 @@ def get_config_limit_authority() -> ConfigLimitAuthority:
             gateway_http_body_max_bytes=int(GATEWAY_HTTP_BODY_MAX_BYTES),
             infocenter_http_body_max_bytes=int(INFOCENTER_HTTP_BODY_MAX_BYTES),
             node_control_http_body_max_bytes=int(NODE_CONTROL_HTTP_BODY_MAX_BYTES),
-            object_http_body_max_bytes=int(OBJECT_HTTP_BODY_MAX_BYTES),
         ),
         object_store_bounds=ObjectStoreBounds(
             object_chunk_size_bytes=int(OBJECT_CHUNK_SIZE_BYTES),
@@ -490,10 +487,6 @@ def resolve_payload_policy(
 
 def get_node_control_http_body_limit_bytes(node_control_body_bytes: int = 0) -> int:
     return max(1, int(node_control_body_bytes or NODE_CONTROL_HTTP_BODY_MAX_BYTES))
-
-
-def get_http_object_body_limit_bytes(object_body_bytes: int = 0) -> int:
-    return max(1, int(object_body_bytes or OBJECT_HTTP_BODY_MAX_BYTES))
 
 
 def get_transport_bounds() -> TransportBounds:
@@ -775,7 +768,6 @@ STABLE_CONFIG_API_EXPORTS = [
     "get_gateway_dataref_relay",
     "get_gateway_http_body_limit_bytes",
     "get_gateway_upload_limits",
-    "get_http_object_body_limit_bytes",
     "get_infocenter_http_body_limit_bytes",
     "get_inline_transport_checksum",
     "get_job_blob_inline_threshold_bytes",
@@ -836,7 +828,6 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "GATEWAY_HTTP_BODY_MAX_BYTES",
     "INFOCENTER_HTTP_BODY_MAX_BYTES",
     "NODE_CONTROL_HTTP_BODY_MAX_BYTES",
-    "OBJECT_HTTP_BODY_MAX_BYTES",
     "SERVICE_HTTP_BODY_MAX_BYTES",
     "INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "INLINE_PAYLOAD_THRESHOLD_BYTES",

@@ -25,7 +25,6 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
     assert transport.gateway_http_body_max_bytes == config.GATEWAY_HTTP_BODY_MAX_BYTES
     assert transport.infocenter_http_body_max_bytes == config.INFOCENTER_HTTP_BODY_MAX_BYTES
     assert transport.node_control_http_body_max_bytes == config.NODE_CONTROL_HTTP_BODY_MAX_BYTES
-    assert transport.object_http_body_max_bytes == config.OBJECT_HTTP_BODY_MAX_BYTES
 
     assert object_store.object_chunk_size_bytes == config.OBJECT_CHUNK_SIZE_BYTES
     assert object_store.file_hash_chunk_size_bytes == config.FILE_HASH_CHUNK_SIZE_BYTES
@@ -37,7 +36,7 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
     assert config.get_service_http_body_limit_bytes() == config.SERVICE_HTTP_BODY_MAX_BYTES
     assert config.get_gateway_http_body_limit_bytes() == config.GATEWAY_HTTP_BODY_MAX_BYTES
     assert config.get_infocenter_http_body_limit_bytes() == config.INFOCENTER_HTTP_BODY_MAX_BYTES
-    assert config.get_http_object_body_limit_bytes() == config.OBJECT_HTTP_BODY_MAX_BYTES
+    assert config.get_node_control_http_body_limit_bytes() == config.NODE_CONTROL_HTTP_BODY_MAX_BYTES
     assert config.get_bytes_materialize_threshold_bytes() == min(
         config.BYTES_MATERIALIZE_THRESHOLD_BYTES,
         config.OBJECT_SIZE_HARD_LIMIT_BYTES,
@@ -50,7 +49,7 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
 
 def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
     monkeypatch.setenv("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "345678")
-    monkeypatch.setenv("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "456789")
+    monkeypatch.setenv("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "456789")
     monkeypatch.setenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", "567890")
     monkeypatch.setenv("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", "123456")
     monkeypatch.setenv("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", "234567")
@@ -61,14 +60,13 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
         object_store = config.get_object_store_bounds()
 
         assert config.SERVICE_HTTP_BODY_MAX_BYTES == 345678
-        assert config.OBJECT_HTTP_BODY_MAX_BYTES == 456789
+        assert config.NODE_CONTROL_HTTP_BODY_MAX_BYTES == 456789
         assert config.OBJECT_SIZE_HARD_LIMIT_BYTES == 567890
         assert transport.service_http_body_max_bytes == 345678
-        assert transport.object_http_body_max_bytes == 456789
+        assert transport.node_control_http_body_max_bytes == 456789
         assert object_store.object_size_hard_limit_bytes == 567890
         assert config.get_service_http_body_limit_bytes() == 345678
-        assert config.get_http_object_body_limit_bytes() == 456789
-        assert config.get_node_control_http_body_limit_bytes() == config.NODE_CONTROL_HTTP_BODY_MAX_BYTES
+        assert config.get_node_control_http_body_limit_bytes() == 456789
         assert config.get_object_size_hard_limit_bytes() == 567890
 
         assert object_store.gateway_max_upload_file_bytes == 123456
@@ -76,7 +74,7 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
         assert config.get_gateway_upload_limits() == (123456, 234567)
     finally:
         monkeypatch.delenv("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", raising=False)
-        monkeypatch.delenv("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", raising=False)
@@ -111,7 +109,6 @@ def test_core_transport_http_modules_do_not_import_body_limit_constants_directly
         "GATEWAY_HTTP_BODY_MAX_BYTES": "get_gateway_http_body_limit_bytes(...)",
         "INFOCENTER_HTTP_BODY_MAX_BYTES": "get_infocenter_http_body_limit_bytes(...)",
         "NODE_CONTROL_HTTP_BODY_MAX_BYTES": "get_node_control_http_body_limit_bytes(...)",
-        "OBJECT_HTTP_BODY_MAX_BYTES": "get_http_object_body_limit_bytes(...)",
         "CONTROL_HTTP_MAX_SEND_BYTES": "get_transport_bounds().control_http_max_send_bytes",
         "CONTROL_HTTP_MAX_RECEIVE_BYTES": "get_transport_bounds().control_http_max_receive_bytes",
         "GATEWAY_MAX_UPLOAD_FILE_BYTES": "get_gateway_upload_limits(...)",
