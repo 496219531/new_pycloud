@@ -24,6 +24,7 @@ class EffectivePolicy:
     allowed_modes: Tuple[str, ...]
     inline_payload_threshold_bytes: int
     inline_payload_hard_limit_bytes: int
+    inline_result_threshold_bytes: int
     inline_result_hard_limit_bytes: int
     use_raw_bytes_payload: bool
     use_http_raw_bytes_body: bool
@@ -42,13 +43,15 @@ class EffectivePolicy:
         object.__setattr__(self, "version", max(1, int(self.version or 1)))
         object.__setattr__(self, "resolved_mode", normalized_mode)
         object.__setattr__(self, "allowed_modes", normalized_allowed)
-        threshold, hard_limit, result_hard_limit = normalize_policy_limit_values(
-            threshold=int(self.inline_payload_threshold_bytes or 1),
-            hard=int(self.inline_payload_hard_limit_bytes or 1),
+        payload_threshold, payload_hard_limit, result_threshold, result_hard_limit = normalize_policy_limit_values(
+            payload_threshold=int(self.inline_payload_threshold_bytes or 1),
+            payload_hard=int(self.inline_payload_hard_limit_bytes or 1),
+            result_threshold=int(self.inline_result_threshold_bytes or 1),
             result_hard=int(self.inline_result_hard_limit_bytes or 1),
         )
-        object.__setattr__(self, "inline_payload_threshold_bytes", threshold)
-        object.__setattr__(self, "inline_payload_hard_limit_bytes", hard_limit)
+        object.__setattr__(self, "inline_payload_threshold_bytes", payload_threshold)
+        object.__setattr__(self, "inline_payload_hard_limit_bytes", payload_hard_limit)
+        object.__setattr__(self, "inline_result_threshold_bytes", result_threshold)
         object.__setattr__(self, "inline_result_hard_limit_bytes", result_hard_limit)
         object.__setattr__(self, "use_raw_bytes_payload", bool(self.use_raw_bytes_payload))
         object.__setattr__(self, "use_http_raw_bytes_body", bool(self.use_http_raw_bytes_body))
@@ -100,7 +103,12 @@ def resolve_effective_policy(
     else:
         resolved_mode = allowed_modes[0]
 
-    inline_payload_threshold_bytes, inline_payload_hard_limit_bytes, inline_result_hard_limit_bytes = (
+    (
+        inline_payload_threshold_bytes,
+        inline_payload_hard_limit_bytes,
+        inline_result_threshold_bytes,
+        inline_result_hard_limit_bytes,
+    ) = (
         effective_limits_from_profile(profile)
     )
     use_raw_bytes_payload = bool(profile.use_raw_bytes_payload) and resolved_mode != "legacy_v1"
@@ -117,6 +125,7 @@ def resolve_effective_policy(
         allowed_modes=allowed_modes,
         inline_payload_threshold_bytes=inline_payload_threshold_bytes,
         inline_payload_hard_limit_bytes=inline_payload_hard_limit_bytes,
+        inline_result_threshold_bytes=inline_result_threshold_bytes,
         inline_result_hard_limit_bytes=inline_result_hard_limit_bytes,
         use_raw_bytes_payload=use_raw_bytes_payload,
         use_http_raw_bytes_body=use_http_raw_bytes_body,

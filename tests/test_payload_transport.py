@@ -263,7 +263,12 @@ def test_managed_globals_control_limit_clamps_policy_and_control_bounds() -> Non
 
 
 def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
-    assert normalize_policy_limit_values(threshold=200, hard=100, result_hard=0) == (100, 100, 1)
+    assert normalize_policy_limit_values(
+        payload_threshold=200,
+        payload_hard=100,
+        result_threshold=200,
+        result_hard=100,
+    ) == (100, 100, 100, 100)
     assert merge_object_threshold_with_policy_threshold(object_threshold_bytes=500, policy_threshold_bytes=200) == 200
     assert merge_object_threshold_with_policy_threshold(object_threshold_bytes=100, policy_threshold_bytes=200) == 100
     assert get_job_blob_inline_threshold_bytes() == max(256 * 1024, int((2 * 1024 * 1024) / 1.5))
@@ -294,6 +299,7 @@ def test_config_limit_helpers_merge_effective_policy() -> None:
         allowed_modes=("structured_v1",),
         inline_payload_threshold_bytes=128,
         inline_payload_hard_limit_bytes=256,
+        inline_result_threshold_bytes=256,
         inline_result_hard_limit_bytes=512,
         use_raw_bytes_payload=False,
         use_http_raw_bytes_body=False,
@@ -304,8 +310,9 @@ def test_config_limit_helpers_merge_effective_policy() -> None:
 
     assert merged.inline_payload_threshold_bytes == 128
     assert merged.inline_payload_hard_limit_bytes == 256
+    assert merged.inline_result_threshold_bytes == 256
     assert merged.inline_result_hard_limit_bytes == 512
-    assert effective_limits_from_profile(effective) == (128, 256, 512)
+    assert effective_limits_from_profile(effective) == (128, 256, 256, 512)
 
 
 def test_resolve_payload_policy_merges_effective_policy_and_object_threshold() -> None:
@@ -318,6 +325,7 @@ def test_resolve_payload_policy_merges_effective_policy_and_object_threshold() -
         allowed_modes=("structured_v1",),
         inline_payload_threshold_bytes=512,
         inline_payload_hard_limit_bytes=2048,
+        inline_result_threshold_bytes=2048,
         inline_result_hard_limit_bytes=4096,
         use_raw_bytes_payload=False,
         use_http_raw_bytes_body=False,
@@ -330,6 +338,7 @@ def test_resolve_payload_policy_merges_effective_policy_and_object_threshold() -
     assert resolved.mode == legacy.mode
     assert resolved.inline_payload_threshold_bytes == 256
     assert resolved.inline_payload_hard_limit_bytes == legacy.inline_payload_hard_limit_bytes
+    assert resolved.inline_result_threshold_bytes == legacy.inline_result_threshold_bytes
     assert resolved.inline_result_hard_limit_bytes == legacy.inline_result_hard_limit_bytes
     assert resolved.consume_on_read == legacy.consume_on_read
     assert resolved.preserve_args_kwargs_container == legacy.preserve_args_kwargs_container

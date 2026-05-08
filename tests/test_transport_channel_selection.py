@@ -32,6 +32,7 @@ def _policy(
         allowed_modes=allowed_modes,
         inline_payload_threshold_bytes=256,
         inline_payload_hard_limit_bytes=1024,
+        inline_result_threshold_bytes=1024,
         inline_result_hard_limit_bytes=1024,
         use_raw_bytes_payload=use_raw_bytes_payload,
         use_http_raw_bytes_body=use_http_raw_bytes_body,

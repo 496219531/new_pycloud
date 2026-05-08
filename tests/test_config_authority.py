@@ -83,14 +83,15 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
 
 
 def test_binding_payload_thresholds_follow_default_safe_policy() -> None:
-    soft, hard, result_hard = config.get_binding_payload_thresholds(
+    threshold, hard, result_threshold, result_hard = config.get_binding_payload_thresholds(
         "gateway_public",
         requested_mode="structured_v1",
         context="gateway_public",
     )
 
-    assert soft == config.DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES
+    assert threshold == config.DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES
     assert hard == config.DEFAULT_SAFE_INLINE_PAYLOAD_HARD_LIMIT_BYTES
+    assert result_threshold == config.DEFAULT_SAFE_INLINE_RESULT_THRESHOLD_BYTES
     assert result_hard == config.DEFAULT_SAFE_INLINE_RESULT_HARD_LIMIT_BYTES
 
 

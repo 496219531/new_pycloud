@@ -93,7 +93,7 @@ def _prepare_gateway_payload(
     if effective_policy is not None:
         threshold_bytes = int(effective_policy.inline_payload_threshold_bytes or 0)
     else:
-        threshold_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+        threshold_bytes, _hard_limit_bytes, _result_threshold_bytes, _result_hard_limit_bytes = get_binding_payload_thresholds(
             "gateway_public",
             requested_mode=str(serialization_mode or "").strip(),
             context="gateway_public",

@@ -31,6 +31,7 @@ class PolicyProfile:
     default_mode: str
     inline_payload_threshold_bytes: int
     inline_payload_hard_limit_bytes: int
+    inline_result_threshold_bytes: int
     inline_result_hard_limit_bytes: int
     use_raw_bytes_payload: bool
     use_http_raw_bytes_body: bool
@@ -58,13 +59,15 @@ class PolicyProfile:
         object.__setattr__(self, "version", max(1, int(self.version or 1)))
         object.__setattr__(self, "allowed_modes", normalized_modes)
         object.__setattr__(self, "default_mode", normalized_default)
-        threshold, hard_limit, result_hard_limit = normalize_policy_limit_values(
-            threshold=int(self.inline_payload_threshold_bytes or 1),
-            hard=int(self.inline_payload_hard_limit_bytes or 1),
+        payload_threshold, payload_hard_limit, result_threshold, result_hard_limit = normalize_policy_limit_values(
+            payload_threshold=int(self.inline_payload_threshold_bytes or 1),
+            payload_hard=int(self.inline_payload_hard_limit_bytes or 1),
+            result_threshold=int(self.inline_result_threshold_bytes or 1),
             result_hard=int(self.inline_result_hard_limit_bytes or 1),
         )
-        object.__setattr__(self, "inline_payload_threshold_bytes", threshold)
-        object.__setattr__(self, "inline_payload_hard_limit_bytes", hard_limit)
+        object.__setattr__(self, "inline_payload_threshold_bytes", payload_threshold)
+        object.__setattr__(self, "inline_payload_hard_limit_bytes", payload_hard_limit)
+        object.__setattr__(self, "inline_result_threshold_bytes", result_threshold)
         object.__setattr__(self, "inline_result_hard_limit_bytes", result_hard_limit)
         object.__setattr__(self, "use_raw_bytes_payload", bool(self.use_raw_bytes_payload))
         object.__setattr__(self, "use_http_raw_bytes_body", bool(self.use_http_raw_bytes_body))
@@ -100,7 +103,8 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         default_mode="legacy_v1",
         inline_payload_threshold_bytes=get_policy_limit_defaults("default_safe")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("default_safe")[1],
-        inline_result_hard_limit_bytes=get_policy_limit_defaults("default_safe")[2],
+        inline_result_threshold_bytes=get_policy_limit_defaults("default_safe")[2],
+        inline_result_hard_limit_bytes=get_policy_limit_defaults("default_safe")[3],
         use_raw_bytes_payload=False,
         use_http_raw_bytes_body=False,
         allow_pickle_stable=False,
@@ -114,7 +118,8 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         default_mode="pickle_stable_v1",
         inline_payload_threshold_bytes=get_policy_limit_defaults("trusted_internal")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("trusted_internal")[1],
-        inline_result_hard_limit_bytes=get_policy_limit_defaults("trusted_internal")[2],
+        inline_result_threshold_bytes=get_policy_limit_defaults("trusted_internal")[2],
+        inline_result_hard_limit_bytes=get_policy_limit_defaults("trusted_internal")[3],
         use_raw_bytes_payload=True,
         use_http_raw_bytes_body=True,
         allow_pickle_stable=True,
@@ -128,7 +133,8 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
         default_mode="pickle_stable_v1",
         inline_payload_threshold_bytes=get_policy_limit_defaults("pickle_internal_heavy")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[1],
-        inline_result_hard_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[2],
+        inline_result_threshold_bytes=get_policy_limit_defaults("pickle_internal_heavy")[2],
+        inline_result_hard_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[3],
         use_raw_bytes_payload=True,
         use_http_raw_bytes_body=True,
         allow_pickle_stable=True,

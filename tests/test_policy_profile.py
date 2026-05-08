@@ -51,6 +51,7 @@ def test_policy_profile_normalizes_and_rejects_invalid_default_mode():
             default_mode="structured_v1",
             inline_payload_threshold_bytes=1,
             inline_payload_hard_limit_bytes=2,
+            inline_result_threshold_bytes=3,
             inline_result_hard_limit_bytes=3,
             use_raw_bytes_payload=False,
             use_http_raw_bytes_body=False,

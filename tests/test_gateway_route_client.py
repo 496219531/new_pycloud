@@ -57,7 +57,7 @@ def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
     from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
-    threshold_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+    threshold_bytes, _hard_limit_bytes, _result_threshold_bytes, _result_hard_limit_bytes = get_binding_payload_thresholds(
         "gateway_public",
         requested_mode="structured_v1",
         context="gateway_public",
@@ -137,7 +137,7 @@ def test_gateway_service_client_status_failure_without_cache_rejects_large_paylo
     from pycloud_parallel.controlplane.config import get_binding_payload_thresholds
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 
-    threshold_bytes, _hard_limit_bytes, _result_limit_bytes = get_binding_payload_thresholds(
+    threshold_bytes, _hard_limit_bytes, _result_threshold_bytes, _result_hard_limit_bytes = get_binding_payload_thresholds(
         "gateway_public",
         requested_mode="structured_v1",
         context="gateway_public",

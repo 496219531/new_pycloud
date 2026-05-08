@@ -39,11 +39,12 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
    - `profile_payload_hard = max(1, profile.inline_payload_hard_limit_bytes)`
    - `profile_payload_threshold = min(max(1, profile.inline_payload_threshold_bytes), profile_payload_hard)`
    - `profile_result_hard = max(1, profile.inline_result_hard_limit_bytes)`
+   - `profile_result_threshold = min(max(1, profile.inline_result_threshold_bytes), profile_result_hard)`
 3. effective policy 合并
    - `final_payload_threshold = min(runtime_payload_threshold, profile_payload_threshold)`
    - `final_payload_hard = min(runtime_payload_hard, profile_payload_hard)`
+   - `final_result_threshold = min(runtime_result_threshold, profile_result_threshold)`
    - `final_result_hard = min(runtime_result_hard, profile_result_hard)`
-   - `final_result_threshold = min(runtime_result_threshold, final_result_hard)`
 4. object threshold 继续收紧 payload inline 分流线
    - 当 `object_threshold_bytes > 0`：
    - `final_payload_threshold = min(final_payload_threshold, object_threshold_bytes)`
@@ -69,11 +70,13 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
    - `local_threshold = min(max(1, LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES), local_hard)`
 4. policy profile threshold
    - `profile_threshold = min(max(1, profile.inline_payload_threshold_bytes), profile.inline_payload_hard_limit_bytes)`
+   - `profile_result_threshold = min(max(1, profile.inline_result_threshold_bytes), profile.inline_result_hard_limit_bytes)`
    - `profile_result_hard = max(1, profile.inline_result_hard_limit_bytes)`
 5. effective policy
    - `effective = resolve_effective_policy(profile, requested_mode, context)`
    - `effective.inline_payload_threshold_bytes = min(profile_threshold, runtime_threshold_from_base)`
    - `effective.inline_payload_hard_limit_bytes = min(profile_hard, runtime_hard_from_base)`
+   - `effective.inline_result_threshold_bytes = min(profile_result_threshold, runtime_result_threshold_from_base)`
    - `effective.inline_result_hard_limit_bytes = min(profile_result_hard, runtime_result_hard_from_base)`
 6. runtime payload policy merge
    - `resolve_payload_policy(mode, effective_policy, object_threshold_bytes)`
@@ -85,7 +88,7 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
    - `final.inline_result_hard_limit_bytes = merged_policy.inline_result_hard_limit_bytes`
 7. binding payload thresholds
    - `get_binding_payload_thresholds(binding_id, requested_mode, context)` returns
-     `(effective.inline_payload_threshold_bytes, effective.inline_payload_hard_limit_bytes, effective.inline_result_hard_limit_bytes)`
+     `(effective.inline_payload_threshold_bytes, effective.inline_payload_hard_limit_bytes, effective.inline_result_threshold_bytes, effective.inline_result_hard_limit_bytes)`
 8. object size hard limit
    - `object_size_hard_limit = max(1, OBJECT_SIZE_HARD_LIMIT_BYTES)`
 9. bytes materialize threshold
