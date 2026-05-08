@@ -81,7 +81,10 @@ def test_get_payload_policy_defaults() -> None:
 def test_config_limit_authority_groups_existing_defaults() -> None:
     authority = get_config_limit_authority()
 
-    assert authority.runtime_payload.inline_payload_threshold_bytes == 512 * 1024
+    assert authority.runtime_payload.inline_payload_threshold_bytes == 32 * 1024 * 1024
+    assert authority.runtime_payload.inline_payload_hard_limit_bytes == 64 * 1024 * 1024
+    assert authority.runtime_payload.inline_result_threshold_bytes == 64 * 1024 * 1024
+    assert authority.runtime_payload.inline_result_hard_limit_bytes == 128 * 1024 * 1024
     assert authority.policy_thresholds.default_safe.inline_payload_threshold_bytes == 2 * 1024 * 1024
     assert authority.policy_thresholds.default_safe.inline_payload_hard_limit_bytes == 8 * 1024 * 1024
     assert authority.policy_thresholds.trusted_internal.inline_result_hard_limit_bytes == 1000 * 1024 * 1024
@@ -271,7 +274,7 @@ def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
     ) == (100, 100, 100, 100)
     assert merge_object_threshold_with_policy_threshold(object_threshold_bytes=500, policy_threshold_bytes=200) == 200
     assert merge_object_threshold_with_policy_threshold(object_threshold_bytes=100, policy_threshold_bytes=200) == 100
-    assert get_job_blob_inline_threshold_bytes() == max(256 * 1024, int((2 * 1024 * 1024) / 1.5))
+    assert get_job_blob_inline_threshold_bytes() == max(256 * 1024, int((64 * 1024 * 1024) / 1.5))
     assert get_job_staging_replica_count(0) == 2
     assert get_job_staging_replica_count(-3) == 1
     assert get_job_staging_replica_count(5) == 5

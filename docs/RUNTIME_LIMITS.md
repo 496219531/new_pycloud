@@ -16,10 +16,10 @@
 
 | 环境变量 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES` | `524288` | payload 是否尝试 inline 的分流阈值；超过后直接转 `DataRef` |
-| `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES` | `2097152` | 单个 inline payload 硬限制 |
-| `PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES` | `1048576` | result 是否尝试 inline 的分流阈值；超过后直接转 object/DataRef |
-| `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `4194304` | 单个 inline result 硬限制 |
+| `PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES` | `33554432` | payload 是否尝试 inline 的全局分流上限；超过后直接转 `DataRef` |
+| `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES` | `67108864` | 单个 inline payload 全局硬上限 |
+| `PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES` | `67108864` | result 是否尝试 inline 的全局分流上限；超过后直接转 object/DataRef |
+| `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES` | `134217728` | 单个 inline result 全局硬上限 |
 | `PYCLOUD_OBJECT_CHUNK_SIZE_BYTES` | `262144` | 对象上传/下载默认分片大小 |
 | `PYCLOUD_FILE_HASH_CHUNK_SIZE_BYTES` | `1048576` | 本地文件计算 SHA256 时的读取分片大小 |
 | `PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES` | `1073741824` | 单个 object/DataRef 背后对象的业务硬上限 |
@@ -55,8 +55,8 @@
 这些是 payload policy threshold，不是 HTTP body limit。它们决定 payload/result 是否 inline、转 `DataRef` 或拒绝；HTTP server/client 的 request body 上限见 `2.4`。
 
 - `PYCLOUD_INLINE_PAYLOAD_THRESHOLD_BYTES`
-  - 默认：`524288` (`512 KiB`)
-  - 用于“是否尝试 inline”的保守估算阈值
+  - 默认：`33554432` (`32 MiB`)
+  - 用于“是否尝试 inline”的全局分流上限
   - cheap estimate 超过该值时直接走 `DataRef`，不再做完整序列化试算
 
 - `PYCLOUD_DEFAULT_SAFE_INLINE_PAYLOAD_THRESHOLD_BYTES`
@@ -68,17 +68,17 @@
   - 具体值可由管理员按环境调整
 
 - `PYCLOUD_INLINE_PAYLOAD_HARD_LIMIT_BYTES`
-  - 默认：`2097152` (`2 MiB`)
-  - 单个 inline payload 的硬限制
+  - 默认：`67108864` (`64 MiB`)
+  - 单个 inline payload 的全局硬上限
 
 - `PYCLOUD_INLINE_RESULT_THRESHOLD_BYTES`
-  - 默认：`1048576` (`1 MiB`)
-  - 结果是否尝试 inline 的保守估算阈值
+  - 默认：`67108864` (`64 MiB`)
+  - 结果是否尝试 inline 的全局分流上限
   - cheap estimate 超过该值时直接走结果 object/DataRef，不再做完整 inline 试算
 
 - `PYCLOUD_INLINE_RESULT_HARD_LIMIT_BYTES`
-  - 默认：`4194304` (`4 MiB`)
-  - 单个 inline result 的硬限制；超出后更容易走对象缓存 / `DataRef`
+  - 默认：`134217728` (`128 MiB`)
+  - 单个 inline result 的全局硬上限；超出后更容易走对象缓存 / `DataRef`
 
 实际计算式见 [CONFIG_LIMIT_AUTHORITY.md](CONFIG_LIMIT_AUTHORITY.md) 的“实际表达式”章节。最简版就是：
 
