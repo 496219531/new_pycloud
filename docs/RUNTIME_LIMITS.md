@@ -174,7 +174,7 @@ local_threshold = min(max(1, PYCLOUD_LOCAL_INLINE_PAYLOAD_THRESHOLD_BYTES), PYCL
 - `PYCLOUD_CONTROL_HTTP_MAX_RECEIVE_BYTES`
   - 默认：`16777216` (`16 MiB`)
 
-当前 node control HTTP client/server 都会读取这两个值，统一设置 HTTP body 大小限制。这里的 `control HTTP` 指协议边界；如果内部仍经过 `TransportPayload` adapter，那只是兼容 carrier，不代表 gRPC。
+这两个值表示轻控制消息能力边界，不等同于各 HTTP endpoint 的 body limit。Node runtime/task 通信用 `PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES`，object 本体传输用 `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`。
 
 node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。业务 payload threshold、session effective policy 和最终 limit 仍以中心/session 分配为准，node 不自行协商或改写。
 
@@ -191,9 +191,9 @@ node 侧读取这些值只是为了执行本进程的物理 HTTP body 边界。�
   - InfoCenter HTTP endpoint 的 request body 上限
 
 - `PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES`
-  - 默认：`268435456` (`256 MiB`)
-  - NodeControl HTTP endpoint 的 request body 上限
-  - 实际 helper 会保证它不小于 object HTTP body bound，避免 NodeControl 嵌套 object app 时把 object upload 缩小
+  - 默认：`134217728` (`128 MiB`)
+  - NodeControl runtime/control endpoint 的 request body 上限
+  - `/objects/...` object 上传/下载路径单独使用 `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`，不再把整个 NodeControl app 抬到 object body 上限
 
 - `PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES`
   - 默认：`536870912` (`512 MiB`)

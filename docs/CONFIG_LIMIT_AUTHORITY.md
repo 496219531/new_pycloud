@@ -94,12 +94,14 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
 9. bytes materialize threshold
    - `bytes_materialize_threshold = max(1, min(BYTES_MATERIALIZE_THRESHOLD_BYTES, object_size_hard_limit))`
 10. NodeControl HTTP body limit
-   - `node_control_http_body_limit = max(1, NODE_CONTROL_HTTP_BODY_MAX_BYTES, OBJECT_HTTP_BODY_MAX_BYTES)`
+   - `node_control_http_body_limit = max(1, NODE_CONTROL_HTTP_BODY_MAX_BYTES)`
+   - `/objects/...` object path 单独使用 `OBJECT_HTTP_BODY_MAX_BYTES`，不再把整个 NodeControl app 抬到 object body 上限
 11. gateway upload limits
    - `file_limit = max(1, max_file_bytes or GATEWAY_MAX_UPLOAD_FILE_BYTES)`
    - `total_limit = max(file_limit, max_total_bytes or GATEWAY_MAX_UPLOAD_TOTAL_BYTES)`
-12. managed globals control limit
-   - `managed_globals_limit = max(1, min(policy_hard_limit_bytes, control_send_bytes or CONTROL_HTTP_MAX_SEND_BYTES))`
+12. managed globals inline batch limit
+   - `managed_globals_limit = max(1, min(policy_hard_limit_bytes, node_control_http_body_limit))`
+   - managed globals 属于任务会话数据，不再被轻控制消息的 `CONTROL_HTTP_MAX_SEND_BYTES` 卡住
 13. inline payload request validation
    - `validate_inline_request_size(size, limit_bytes=0)` 实际使用的默认 limit 是 `get_payload_policy("http_call").inline_payload_hard_limit_bytes`
    - 现在没有单独的 request limit 主概念，request 校验和 payload hard limit 共用同一条硬边界
@@ -192,8 +194,9 @@ inline 最终决策分成三步：先得到 runtime 基础值，再把 profile /
 11. `get_bytes_materialize_threshold_bytes(...)` / `validate_bytes_materialize_size(...)`
    - 负责整包 bytes 下载、`materialize_as="bytes"` 和整包反序列化路径的内存保护
    - 不等同于 object size hard limit；大对象可以存在，但不能走 bytes 主路径
-12. `get_managed_globals_control_limit_bytes(...)`
-   - 负责 managed globals 的 policy hard limit 与 control send bound 合成
+12. `get_managed_globals_inline_limit_bytes(...)`
+   - 负责 managed globals 的 policy hard limit 与 node runtime body bound 合成
+   - managed globals 属于任务会话数据面，不使用轻控制消息的 `CONTROL_HTTP_MAX_SEND_BYTES`
 13. `get_job_staging_replica_count(...)`
    - 负责 job staged refs 的副本数默认值和下限修正
 14. `get_job_staged_ref_ttl_sec(...)`

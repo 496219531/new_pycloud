@@ -18,7 +18,7 @@ from pycloud_parallel.controlplane.config import (
     get_job_staged_ref_ttl_sec,
     get_job_staging_replica_count,
     get_local_service_payload_policy,
-    get_managed_globals_control_limit_bytes,
+    get_managed_globals_inline_limit_bytes,
     get_node_control_http_body_limit_bytes,
     get_object_size_hard_limit_bytes,
     get_service_http_body_limit_bytes,
@@ -259,10 +259,10 @@ def test_core_client_payload_paths_do_not_import_default_safe_payload_constants_
     assert not violations, "Payload limit consumers should resolve policy thresholds through helpers:\n" + "\n".join(violations)
 
 
-def test_managed_globals_control_limit_clamps_policy_and_control_bounds() -> None:
-    assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=1000, control_send_bytes=2000) == 1000
-    assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=2000, control_send_bytes=1000) == 1000
-    assert get_managed_globals_control_limit_bytes(policy_hard_limit_bytes=0, control_send_bytes=0) >= 1
+def test_managed_globals_inline_limit_clamps_policy_and_runtime_body_bounds() -> None:
+    assert get_managed_globals_inline_limit_bytes(policy_hard_limit_bytes=1000, runtime_body_bytes=2000) == 1000
+    assert get_managed_globals_inline_limit_bytes(policy_hard_limit_bytes=2000, runtime_body_bytes=1000) == 1000
+    assert get_managed_globals_inline_limit_bytes(policy_hard_limit_bytes=0, runtime_body_bytes=0) >= 1
 
 
 def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
@@ -283,7 +283,7 @@ def test_config_limit_helpers_normalize_and_merge_bounds() -> None:
     assert get_job_staged_ref_ttl_sec(10) == 10
     assert get_http_object_body_limit_bytes(123) == 123
     assert get_object_size_hard_limit_bytes(123) == 123
-    assert get_node_control_http_body_limit_bytes(123) == 512 * 1024 * 1024
+    assert get_node_control_http_body_limit_bytes(123) == 123
     assert get_service_http_body_limit_bytes(0) == get_transport_bounds().service_http_body_max_bytes
     assert get_gateway_http_body_limit_bytes(123) == 123
     assert get_infocenter_http_body_limit_bytes(123) == 123
@@ -420,9 +420,11 @@ def test_prepare_outbound_payload_job_submit_applies_managed_globals_policy(tmp_
 
 
 def test_prepare_managed_globals_batches_splits_inline_keys(monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config
     from pycloud_parallel.execution import support
 
-    monkeypatch.setattr(support, "CONTROL_HTTP_MAX_SEND_BYTES", 1000)
+    monkeypatch.setattr(config, "NODE_CONTROL_HTTP_BODY_MAX_BYTES", 1000)
+    monkeypatch.setattr(config, "OBJECT_HTTP_BODY_MAX_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [],
@@ -438,6 +440,7 @@ def test_prepare_managed_globals_batches_splits_inline_keys(monkeypatch) -> None
 
 
 def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch) -> None:
+    from pycloud_parallel.controlplane import config
     from pycloud_parallel.execution import support
 
     uploaded = []
@@ -447,7 +450,8 @@ def test_prepare_managed_globals_batches_stages_single_oversized_key(monkeypatch
             uploaded.append((bytes(blob), str(format), int(chunk_size)))
             return DataRef(ref_id="obj-1", storage_id="obj-1", format=format, size_bytes=len(blob))
 
-    monkeypatch.setattr(support, "CONTROL_HTTP_MAX_SEND_BYTES", 1000)
+    monkeypatch.setattr(config, "NODE_CONTROL_HTTP_BODY_MAX_BYTES", 1000)
+    monkeypatch.setattr(config, "OBJECT_HTTP_BODY_MAX_BYTES", 1000)
 
     batches, stats = support._prepare_managed_globals_batches_for_upload(
         [_Client()],

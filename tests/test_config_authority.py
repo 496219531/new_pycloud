@@ -68,6 +68,7 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
         assert object_store.object_size_hard_limit_bytes == 567890
         assert config.get_service_http_body_limit_bytes() == 345678
         assert config.get_http_object_body_limit_bytes() == 456789
+        assert config.get_node_control_http_body_limit_bytes() == config.NODE_CONTROL_HTTP_BODY_MAX_BYTES
         assert config.get_object_size_hard_limit_bytes() == 567890
 
         assert object_store.gateway_max_upload_file_bytes == 123456

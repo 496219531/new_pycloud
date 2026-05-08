@@ -29,7 +29,6 @@ from pycloud_parallel.controlplane.artifact import (
     _resolve_package_format,
 )
 from pycloud_parallel.controlplane.config import (
-    CONTROL_HTTP_MAX_SEND_BYTES,
     FILE_HASH_CHUNK_SIZE_BYTES,
     JOB_PAYLOAD_MAX_BYTES,
     OBJECT_CHUNK_SIZE_BYTES,
@@ -37,7 +36,7 @@ from pycloud_parallel.controlplane.config import (
     get_job_blob_inline_threshold_bytes,
     get_job_staged_ref_ttl_sec,
     get_job_staging_replica_count,
-    get_managed_globals_control_limit_bytes,
+    get_managed_globals_inline_limit_bytes,
     resolve_payload_policy,
 )
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
@@ -697,9 +696,8 @@ def _managed_globals_effective_inline_limit(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> int:
     policy = _payload_policy_for_mode("managed_globals", effective_policy=effective_policy)
-    return get_managed_globals_control_limit_bytes(
+    return get_managed_globals_inline_limit_bytes(
         policy_hard_limit_bytes=int(policy.inline_payload_hard_limit_bytes),
-        control_send_bytes=int(CONTROL_HTTP_MAX_SEND_BYTES),
     )
 
 

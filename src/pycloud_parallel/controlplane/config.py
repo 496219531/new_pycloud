@@ -119,7 +119,7 @@ _INT_SETTINGS: dict[str, EnvIntSetting] = {
     "SERVICE_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_SERVICE_BODY_MAX_BYTES"), 64 * 1024 * 1024),
     "GATEWAY_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_GATEWAY_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_GATEWAY_BODY_MAX_BYTES"), 64 * 1024 * 1024),
     "INFOCENTER_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_INFOCENTER_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_INFOCENTER_BODY_MAX_BYTES"), 64 * 1024 * 1024),
-    "NODE_CONTROL_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES"), 256 * 1024 * 1024),
+    "NODE_CONTROL_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_NODECONTROL_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_NODECONTROL_BODY_MAX_BYTES"), 128 * 1024 * 1024),
     "OBJECT_HTTP_BODY_MAX_BYTES": EnvIntSetting(("PYCLOUD_OBJECT_HTTP_BODY_MAX_BYTES", "PYCLOUD_HTTP_OBJECT_BODY_MAX_BYTES"), 512 * 1024 * 1024),
     "NODE_WORKER_CAPACITY": EnvIntSetting(("PYCLOUD_NODE_WORKER_CAPACITY",), 32),
     "NODE_QUEUE_CAPACITY": EnvIntSetting(("PYCLOUD_NODE_QUEUE_CAPACITY",), 4000),
@@ -489,8 +489,7 @@ def resolve_payload_policy(
 
 
 def get_node_control_http_body_limit_bytes(node_control_body_bytes: int = 0) -> int:
-    control_limit = int(node_control_body_bytes or NODE_CONTROL_HTTP_BODY_MAX_BYTES)
-    return max(1, control_limit, int(OBJECT_HTTP_BODY_MAX_BYTES))
+    return max(1, int(node_control_body_bytes or NODE_CONTROL_HTTP_BODY_MAX_BYTES))
 
 
 def get_http_object_body_limit_bytes(object_body_bytes: int = 0) -> int:
@@ -556,12 +555,12 @@ def get_gateway_upload_limits(*, max_file_bytes: int = 0, max_total_bytes: int =
     return file_limit, total_limit
 
 
-def get_managed_globals_control_limit_bytes(*, policy_hard_limit_bytes: int, control_send_bytes: int = 0) -> int:
+def get_managed_globals_inline_limit_bytes(*, policy_hard_limit_bytes: int, runtime_body_bytes: int = 0) -> int:
     return max(
         1,
         min(
             max(1, int(policy_hard_limit_bytes or 1)),
-            max(1, int(control_send_bytes or CONTROL_HTTP_MAX_SEND_BYTES)),
+            get_node_control_http_body_limit_bytes(int(runtime_body_bytes or 0)),
         ),
     )
 
@@ -785,7 +784,7 @@ STABLE_CONFIG_API_EXPORTS = [
     "get_jobqueue_resolve_refs",
     "get_local_inline_limits",
     "get_local_service_payload_policy",
-    "get_managed_globals_control_limit_bytes",
+    "get_managed_globals_inline_limit_bytes",
     "get_node_control_http_body_limit_bytes",
     "get_object_store_bounds",
     "get_object_size_hard_limit_bytes",
