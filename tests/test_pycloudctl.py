@@ -1297,6 +1297,66 @@ def test_cmd_start_node_uses_explicit_target_and_local_advertise(tmp_path, monke
     ]
 
 
+def test_cmd_start_node_passes_api_token_to_server(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-node",
+        "--node-id",
+        "node-blue",
+        "--target",
+        "10.0.0.8:51051",
+        "--api-token",
+        "owner-secret",
+    ])
+    started: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+    monkeypatch.setattr(ctl, "_default_node_worker_capacity", lambda: 6)
+    monkeypatch.setattr(
+        ctl,
+        "_start_standalone_node",
+        lambda root, **kwargs: started.append({"root": root, **kwargs}),
+    )
+
+    assert ctl._cmd_start_node(args) == 0
+    assert started[0]["api_token"] == "owner-secret"
+
+
+def test_cmd_start_node_uses_env_api_token_when_flag_absent(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-node",
+        "--node-id",
+        "node-blue",
+        "--target",
+        "10.0.0.8:51051",
+        "--env",
+        "PYCLOUD_API_TOKEN=env-owner-secret",
+    ])
+    started: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+    monkeypatch.setattr(ctl, "_default_node_worker_capacity", lambda: 6)
+    monkeypatch.setattr(
+        ctl,
+        "_start_standalone_node",
+        lambda root, **kwargs: started.append({"root": root, **kwargs}),
+    )
+
+    assert ctl._cmd_start_node(args) == 0
+    assert started[0]["api_token"] == "env-owner-secret"
+
+
 @pytest.mark.parametrize(
     ("argv", "expected_bind", "expected_target"),
     [
@@ -1586,6 +1646,60 @@ def test_cmd_start_job_orchestrator_requires_explicit_target(tmp_path, monkeypat
 
     with pytest.raises(RuntimeError, match="start-job-orchestrator requires --target"):
         ctl._cmd_start_job_orchestrator(args)
+
+
+def test_cmd_start_job_orchestrator_passes_api_token_to_server(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-job-orchestrator",
+        "--target",
+        "10.0.0.8:51051",
+        "--api-token",
+        "owner-secret",
+    ])
+    started: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+    monkeypatch.setattr(
+        ctl,
+        "_start_job_orchestrator",
+        lambda root, **kwargs: started.append({"root": root, **kwargs}),
+    )
+
+    assert ctl._cmd_start_job_orchestrator(args) == 0
+    assert started[0]["api_token"] == "owner-secret"
+
+
+def test_cmd_start_job_orchestrator_uses_env_api_token_when_flag_absent(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "start-job-orchestrator",
+        "--target",
+        "10.0.0.8:51051",
+        "--env",
+        "PYCLOUD_API_TOKEN=env-owner-secret",
+    ])
+    started: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda *_args: None)
+    monkeypatch.setattr(
+        ctl,
+        "_start_job_orchestrator",
+        lambda root, **kwargs: started.append({"root": root, **kwargs}),
+    )
+
+    assert ctl._cmd_start_job_orchestrator(args) == 0
+    assert started[0]["api_token"] == "env-owner-secret"
 
 
 def test_start_job_orchestrator_local_target_waits_for_local_ipc(tmp_path, monkeypatch):
