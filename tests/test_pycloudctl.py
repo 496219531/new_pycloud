@@ -385,18 +385,66 @@ def test_cmd_dev_start_propagates_host_overrides(tmp_path, monkeypatch):
     assert job_orchestrator_calls == [
         {
             "root": tmp_path.resolve(),
-            "bind": "10.0.0.9:50053",
+            "bind": "0.0.0.0:50053",
             "infocenter_addr": "127.0.0.1:51051",
             "extra_env": {},
         }
     ]
-    assert started_nodes[0]["bind_host"] == "10.0.0.9"
-    assert started_nodes[0]["service_http_host"] == "10.0.0.9"
+    assert started_nodes[0]["bind_host"] == "0.0.0.0"
+    assert started_nodes[0]["service_http_host"] == "0.0.0.0"
     assert started_nodes[0]["advertise_host"] == "10.0.0.9"
     assert started_nodes[0]["infocenter_target"] == "127.0.0.1:51051"
     assert started_nodes[1]["name"] == "node-2"
     assert started_nodes[1]["port"] == 51062
     assert started_nodes[1]["http_port"] == 18182
+
+
+def test_cmd_dev_start_defaults_bind_hosts_to_wildcard_but_advertises_reachable_host(tmp_path, monkeypatch):
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "dev-start", "--nodes", "1"])
+    controlplane_calls: list[dict[str, object]] = []
+    job_orchestrator_calls: list[dict[str, object]] = []
+    started_nodes: list[dict[str, object]] = []
+
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+    monkeypatch.setattr(ctl, "resolve_public_host", _mock_public_host)
+    monkeypatch.setattr(ctl, "_ensure_runtime_dirs", lambda _root: None)
+    monkeypatch.setattr(ctl, "_stop_all_managed_processes", lambda _root: None)
+    monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(
+        ctl,
+        "_start_controlplane",
+        lambda root, port, **kwargs: controlplane_calls.append({"root": root, "port": port, **kwargs}),
+    )
+    monkeypatch.setattr(
+        ctl,
+        "_start_job_orchestrator",
+        lambda root, **kwargs: job_orchestrator_calls.append({"root": root, **kwargs}),
+    )
+    monkeypatch.setattr(
+        ctl,
+        "_start_node",
+        lambda root, name, port, http_port, infocenter_target, worker_capacity, **kwargs: started_nodes.append(
+            {
+                "root": root,
+                "name": name,
+                "port": port,
+                "http_port": http_port,
+                "infocenter_target": infocenter_target,
+                "worker_capacity": worker_capacity,
+                **kwargs,
+            }
+        ),
+    )
+
+    assert ctl._cmd_dev_start(args) == 0
+    assert controlplane_calls[0]["bind_host"] == "0.0.0.0"
+    assert controlplane_calls[0]["remote_hint"] == "10.0.0.9:50051"
+    assert job_orchestrator_calls[0]["bind"] == "0.0.0.0:50053"
+    assert job_orchestrator_calls[0]["infocenter_addr"] == "10.0.0.9:50051"
+    assert started_nodes[0]["bind_host"] == "0.0.0.0"
+    assert started_nodes[0]["service_http_host"] == "0.0.0.0"
+    assert started_nodes[0]["advertise_host"] == "10.0.0.9"
 
 
 def test_cmd_dev_start_uses_explicit_target_for_controlplane_and_registered_components(tmp_path, monkeypatch):
@@ -1219,7 +1267,7 @@ def test_cmd_start_node_uses_explicit_target_and_local_advertise(tmp_path, monke
         {
             "root": tmp_path.resolve(),
             "node_id": "node-blue",
-            "bind": "10.0.0.9:51061",
+                "bind": "0.0.0.0:51061",
             "service_http_bind": "127.0.0.1:18181",
             "infocenter_addr": "10.0.0.8:51051",
             "advertise_addr": "10.0.0.9:51061",
@@ -1477,8 +1525,8 @@ def test_cmd_start_node_canonical_addresses(tmp_path, monkeypatch):
         {
             "root": tmp_path.resolve(),
             "node_id": "node-green",
-            "bind": "10.0.0.9:52061",
-            "service_http_bind": "10.0.0.9:19181",
+                "bind": "0.0.0.0:52061",
+                "service_http_bind": "0.0.0.0:19181",
             "infocenter_addr": "10.0.0.8:51051",
             "advertise_addr": "10.0.0.9:62061",
             "worker_capacity": 3,

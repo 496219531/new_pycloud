@@ -136,7 +136,6 @@ def _resolve_bind_value(
         resolved_host = base_host
         if prefer_local and str(base_host or "").strip() in {"", "0.0.0.0", "::", "[::]"}:
             resolved_host = _LOCALHOST
-    resolved_host = resolve_public_host(resolved_host, remote_hint=remote_hint)
     resolved_port = int(port or 0) or int(base_port)
     if resolved_port <= 0 or resolved_port > 65535:
         raise ValueError(f"{label} port must be between 1 and 65535, got {resolved_port}")
@@ -159,7 +158,8 @@ def _probe_host(host: str) -> str:
 
 
 def _default_bind_host(*, remote_hint: str = "") -> str:
-    return detect_local_ip(remote_hint=remote_hint)
+    del remote_hint
+    return "0.0.0.0"
 
 
 def _default_host_for_args(args: argparse.Namespace, *, remote_hint: str = "") -> str:
@@ -855,9 +855,10 @@ def _resolve_controlplane_target_for_start(args: argparse.Namespace) -> Tuple[st
         controlplane_port = int(target_port)
         return controlplane_host, controlplane_port, _format_host_port(controlplane_host, controlplane_port)
 
-    controlplane_host = resolve_public_host(str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args))
+    controlplane_host = str(getattr(args, "controlplane_host", "") or "") or _default_host_for_args(args)
     controlplane_port = int(getattr(args, "controlplane_port", 50051))
-    return controlplane_host, controlplane_port, _format_host_port(controlplane_host, controlplane_port)
+    target_host = resolve_public_host(controlplane_host)
+    return controlplane_host, controlplane_port, _format_host_port(target_host, controlplane_port)
 
 
 def _best_effort_mark_node_lost(target: str, node_name: str) -> bool:
@@ -1037,7 +1038,7 @@ def _start_controlplane(
     extra_env: Dict[str, str] | None = None,
     debug: bool = False,
 ) -> None:
-    effective_bind_host = resolve_public_host(str(bind_host or "").strip() or _default_bind_host(remote_hint=remote_hint), remote_hint=remote_hint)
+    effective_bind_host = str(bind_host or "").strip() or _default_bind_host(remote_hint=remote_hint)
     bind = _format_host_port(effective_bind_host, int(port))
     _assert_bind_available(bind)
     _log("INFO", f"Starting ControlPlane on {bind}...")
@@ -1245,14 +1246,8 @@ def _start_node(
     extra_env: Dict[str, str] | None = None,
     debug: bool = False,
 ) -> None:
-    effective_bind_host = resolve_public_host(
-        str(bind_host or "").strip() or _default_bind_host(remote_hint=infocenter_target),
-        remote_hint=infocenter_target,
-    )
-    effective_service_http_host = resolve_public_host(
-        str(service_http_host or "").strip() or _default_bind_host(remote_hint=infocenter_target),
-        remote_hint=infocenter_target,
-    )
+    effective_bind_host = str(bind_host or "").strip() or _default_bind_host(remote_hint=infocenter_target)
+    effective_service_http_host = str(service_http_host or "").strip() or _default_bind_host(remote_hint=infocenter_target)
     effective_advertise_host = str(advertise_host or "").strip() or resolve_public_host(effective_bind_host, remote_hint=infocenter_target)
     control_bind = _format_host_port(effective_bind_host, int(port))
     service_http_bind = _format_host_port(effective_service_http_host, int(http_port))
@@ -1406,7 +1401,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     _ensure_runtime_dirs(root)
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     controlplane_host, controlplane_port, infocenter_target = _resolve_controlplane_target_for_start(args)
-    job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
+    job_orchestrator_host = str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args)
 
     _log("INFO", "Stopping existing core services...")
     _stop_core_processes(root)
@@ -1448,7 +1443,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     _ensure_runtime_dirs(root)
     extra_env = _parse_env_overrides(getattr(args, "env", []) or [])
     controlplane_host, controlplane_port, infocenter_target = _resolve_controlplane_target_for_start(args)
-    job_orchestrator_host = resolve_public_host(str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args))
+    job_orchestrator_host = str(getattr(args, "job_orchestrator_host", "") or "") or _default_host_for_args(args)
 
     _log("INFO", "Stopping existing managed dev services...")
     _stop_all_managed_processes(root)
@@ -1497,10 +1492,9 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     node_count = max(0, int(getattr(args, "nodes", 2) or 0))
     node_base_port = int(getattr(args, "node_control_port", 50061) or 50061)
     service_http_base_port = int(getattr(args, "node_service_http_port", 18081) or 18081)
-    node_host_seed = str(getattr(args, "node_host", "") or "") or _default_host_for_args(args)
-    service_http_host_seed = str(getattr(args, "node_service_http_host", "") or "") or _default_host_for_args(args)
-    node_host = resolve_public_host(node_host_seed)
-    service_http_host = resolve_public_host(service_http_host_seed)
+    node_host = str(getattr(args, "node_host", "") or "") or _default_host_for_args(args)
+    service_http_host = str(getattr(args, "node_service_http_host", "") or "") or _default_host_for_args(args)
+    node_advertise_host = resolve_public_host(node_host, remote_hint=infocenter_target)
     for index in range(node_count):
         node_name = f"node-{index + 1}"
         _start_node(
@@ -1512,7 +1506,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
             worker_capacity,
             bind_host=node_host,
             service_http_host=service_http_host,
-            advertise_host=node_host,
+            advertise_host=node_advertise_host,
             **node_kwargs,
         )
 
@@ -2571,7 +2565,7 @@ def _add_dev_node_arguments(parser: argparse.ArgumentParser, *, restart: bool = 
             else "number of local node control processes to start; supports 0, 1, or N"
         ),
     )
-    parser.add_argument("--node-host", default="", help="bind host used by dev node control endpoints; default auto-detects local IP")
+    parser.add_argument("--node-host", default="", help="bind host used by dev node control endpoints; default 0.0.0.0, or 127.0.0.1 with --local/--loopback")
     parser.add_argument(
         "--node-control-port",
         type=int,
@@ -2581,7 +2575,7 @@ def _add_dev_node_arguments(parser: argparse.ArgumentParser, *, restart: bool = 
     parser.add_argument(
         "--node-service-http-host",
         default="",
-        help="bind host used by dev node service HTTP endpoints; default auto-detects local IP",
+        help="bind host used by dev node service HTTP endpoints; default 0.0.0.0, or 127.0.0.1 with --local/--loopback",
     )
     parser.add_argument(
         "--node-service-http-port",
@@ -2602,9 +2596,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(local=False, _global_local=False)
     parser.add_argument("--runtime-root", default="", help="base directory for logs and pid files (default: cwd or PYCLOUD_HOME)")
     _add_local_argument(parser, dest="_global_local")
-    parser.add_argument("--controlplane-host", default="", help="bind host used by `pycloudctl start` for controlplane; default auto-detects local IP")
+    parser.add_argument("--controlplane-host", default="", help="bind host used by `pycloudctl start` for controlplane; default 0.0.0.0, or 127.0.0.1 with --local/--loopback")
     parser.add_argument("--controlplane-port", type=int, default=50051, help="bind port used by `pycloudctl start` for controlplane")
-    parser.add_argument("--job-orchestrator-host", default="", help="bind host used by `pycloudctl start` for job-orchestrator; default auto-detects local IP")
+    parser.add_argument("--job-orchestrator-host", default="", help="bind host used by `pycloudctl start` for job-orchestrator; default 0.0.0.0, or 127.0.0.1 with --local/--loopback")
     parser.add_argument("--job-orchestrator-port", type=int, default=50053, help="bind port used by `pycloudctl start` for job-orchestrator")
 
     subparsers = parser.add_subparsers(dest="command", required=True)

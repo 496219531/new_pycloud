@@ -49,17 +49,17 @@ pycloudctl --runtime-root /tmp/pycloud-dev --controlplane-port 51051 start
 
 `pycloudctl start` 默认会启动：
 
-1. `controlplane`：`<auto-detected-local-ip>:50051`
-2. `job-orchestrator`：`<auto-detected-local-ip>:50053`
+1. `controlplane`：`0.0.0.0:50051` 监听，对外 target 使用本机可达 IP
+2. `job-orchestrator`：`0.0.0.0:50053`
 
 如果需要本地执行节点，用 `pycloudctl dev-start --nodes 2`，默认还会启动：
 
-1. `node-1 control HTTP`：`<auto-detected-local-ip>:50061`
-2. `node-2 control HTTP`：`<auto-detected-local-ip>:50062`
-3. `node-1 service HTTP`：`<auto-detected-local-ip>:18081`
-4. `node-2 service HTTP`：`<auto-detected-local-ip>:18082`
+1. `node-1 control HTTP`：`0.0.0.0:50061` 监听，注册时使用本机可达 IP
+2. `node-2 control HTTP`：`0.0.0.0:50062` 监听
+3. `node-1 service HTTP`：`0.0.0.0:18081` 监听
+4. `node-2 service HTTP`：`0.0.0.0:18082` 监听
 
-默认情况下，`pycloudctl start` / `dev-start` 会自动探测本机可达 IP 来填充 bind / advertise / service-http 地址，不再固定回退到 `127.0.0.1`。
+默认情况下，`pycloudctl start` / `dev-start` 的 HTTP 服务会绑定到 `0.0.0.0`，方便局域网或容器环境访问；注册、target、advertise 等对外地址仍使用本机可达 IP。若只想监听本机回环地址，使用 `--local` / `--loopback`。
 如果你要单独起 `gateway` 或 node control，请显式传 `--target`：
 
 ```bash

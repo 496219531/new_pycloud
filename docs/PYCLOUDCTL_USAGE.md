@@ -154,9 +154,9 @@ pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
 默认 host：
 
 1. `pycloudctl start` / `start-infocenter` / `start-gateway` / `start-controlplane` / `start-job-orchestrator` / `start-node`
-2. 如果没有显式传 host，都会自动探测本机可达 IP
-3. 不再默认固定成 `127.0.0.1`
-4. 如果你只想本机回环监听，可以直接加 `--local`
+2. 如果没有显式传 host，HTTP 服务默认监听 `0.0.0.0`
+3. 注册、target、advertise 等对外可达地址仍会解析成本机可达 IP，不会把 `0.0.0.0` 注册给其他组件
+4. 如果你只想本机回环监听，可以直接加 `--local` / `--loopback`
 
 dev node 的 worker capacity 默认会按 `CPU 核数 / 2` 自动计算，最少为 `1`。
 
@@ -226,7 +226,7 @@ pycloudctl \
   start --target 192.168.10.7:51051
 ```
 
-这里 controlplane 会绑定到 `192.168.10.7:51051`，job-orchestrator 也会注册到同一个 target。若需要 wildcard bind，请继续使用 `--controlplane-host 0.0.0.0 --controlplane-port ...`。
+这里 controlplane 会绑定到 `192.168.10.7:51051`，job-orchestrator 也会注册到同一个 target。未显式指定 host 时，默认监听 `0.0.0.0`，但 target / advertise 会使用本机可达地址。
 
 如果还想指定 host，也可以直接写：
 
@@ -467,7 +467,7 @@ pycloudctl start-node \
   --queue-capacity 1000
 ```
 
-默认情况下，如果你没显式指定 host，`pycloudctl` 现在会自动探测本机 IP 来填充 bind / advertise / service-http 地址，不再默认回退到 `127.0.0.1`。
+默认情况下，如果你没显式指定 host，`pycloudctl` 会把 node control / service HTTP 绑定到 `0.0.0.0`；注册和 advertise 地址仍会解析成本机可达 IP，不会把 `0.0.0.0` 注册给其他组件。若只想监听本机回环地址，使用 `--local` / `--loopback`。
 
 如果你就是想强制走回环地址，也可以直接写：
 
