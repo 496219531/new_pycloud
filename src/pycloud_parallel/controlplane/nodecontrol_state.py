@@ -418,9 +418,11 @@ class NodeControlState(NodeRuntimeBase):
             self._dispatcher.join(timeout=1.0)
         self.stop_service_gateway()
         self._shutdown_all_services()
+        self._shutdown_all_task_pools()
         self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
         if self._executor_host is not None:
             self._executor_host.close(shutdown_timeout_sec=2.0)
+            self._executor_host = None
 
     def _token_node_instance_valid(self, token_node_instance_id: str) -> bool:
         normalized = str(token_node_instance_id or "").strip()
@@ -538,6 +540,17 @@ class NodeControlState(NodeRuntimeBase):
             self._cleanup_executor.submit(_stop)
         except RuntimeError:
             _stop()
+
+    def _stop_task_pool_for_shutdown_locked(self, pool: TaskPoolState, *, reason: str) -> Optional[Tuple[ExecutorBackend, str]]:
+        stop_executor = None
+        if self._executor_host is not None and pool.executor_ready:
+            stop_executor = (self._executor_host, str(pool.pool_id))
+        pool.executor_ready = False
+        pool.alive_workers = 0
+        pool.status = "STOPPED"
+        pool.stop_reason = reason
+        pool.lease_expire_at = utc_now()
+        return stop_executor
 
     @property
     def data_store(self) -> DataStore:
@@ -2761,6 +2774,20 @@ class NodeControlState(NodeRuntimeBase):
         for session in sessions:
             with self._lock:
                 self._stop_service_locked(session, reason="nodecontrol shutdown")
+
+    def _shutdown_all_task_pools(self) -> None:
+        stop_executors: List[Tuple[ExecutorBackend, str]] = []
+        with self._lock:
+            pools = list(self._task_pools.values())
+            for pool in pools:
+                stop_executor = self._stop_task_pool_for_shutdown_locked(pool, reason="nodecontrol shutdown")
+                if stop_executor is not None:
+                    stop_executors.append(stop_executor)
+        for executor_host, pool_id in stop_executors:
+            try:
+                executor_host.stop_task_pool(pool_id=pool_id)
+            except Exception:
+                pass
 
     def list_service_methods(self, service_id: str) -> List[Dict[str, str]]:
         with self._lock:

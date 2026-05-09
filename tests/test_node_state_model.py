@@ -4590,6 +4590,88 @@ def test_nodecontrol_reset_fences_execution_until_process_restart(tmp_path):
         state.close()
 
 
+def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
+    state = NodeControlState(
+        node_id="node-close-executors",
+        queue_capacity=4,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_close_executors"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop_service", kwargs))
+
+        def stop_task_pool(self, **kwargs):
+            calls.append(("stop_task_pool", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):
+            calls.append(("close", kwargs))
+
+    service = ServiceSession(
+        service_id="svc-close",
+        owner_client_id="owner",
+        service_name="svc-close",
+        code_version="sha256:svc",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="svc-token",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={},
+    )
+    pool = TaskPoolState(
+        pool_id="pool-close",
+        owner_client_id="owner",
+        pool_name="pool-close",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+        state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+
+    state.close()
+
+    assert ("stop_service", {"service_id": "svc-close"}) in calls
+    assert ("stop_task_pool", {"pool_id": "pool-close"}) in calls
+    assert ("close", {"shutdown_timeout_sec": 2.0}) in calls
+    assert service.status == pb2.SERVICE_STATUS_STOPPED
+    assert service.stop_reason == "nodecontrol shutdown"
+    assert pool.status == "STOPPED"
+    assert pool.stop_reason == "nodecontrol shutdown"
+    assert state._executor_host is None  # noqa: SLF001
+
+
 def test_nodecontrol_discards_late_pool_event_for_stale_pool_id(tmp_path):
     state = NodeControlState(
         node_id="node-late-pool-event",
