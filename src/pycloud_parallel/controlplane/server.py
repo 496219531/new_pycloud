@@ -170,6 +170,7 @@ def build_job_orchestrator_server(
     version: str = "",
     taskpool_policy_id: str = "",
     admin_token: str = "",
+    api_token: str = "",
     replace_existing: bool = False,
 ) -> JobOrchestratorServer:
     if not infocenter_addr:
@@ -184,6 +185,7 @@ def build_job_orchestrator_server(
         version=version,
         taskpool_policy_id=taskpool_policy_id,
         admin_token=admin_token,
+        api_token=api_token,
         replace_existing=replace_existing,
     )
 
@@ -203,6 +205,7 @@ def build_nodecontrol_server(
     service_default_worker_count: int = SERVICE_DEFAULT_WORKERS,
     service_default_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
     on_service_routes_changed: Optional[Callable[[], None]] = None,
+    api_token: str = "",
 ) -> Tuple[NodeControlHttpServer, NodeControlState]:
     del max_workers
     state = NodeControlState(
@@ -221,6 +224,7 @@ def build_nodecontrol_server(
         bind=bind,
         state=state,
         on_service_routes_changed=on_service_routes_changed,
+        api_token=api_token,
     )
     return server, state
 
@@ -297,6 +301,7 @@ def main() -> None:
     parser.add_argument("--node-tags", default="compute")
     parser.add_argument("--node-version", default="v1")
     parser.add_argument("--taskpool-policy-id", default="")
+    parser.add_argument("--api-token", default="", help="owner API token required by nodes for service/taskpool creation; defaults to PYCLOUD_API_TOKEN")
     parser.add_argument("--gateway-refresh-interval-sec", type=float, default=3.0)
     parser.add_argument("--gateway-failure-threshold", type=int, default=3)
     parser.add_argument("--gateway-open-sec", type=float, default=5.0)
@@ -358,6 +363,7 @@ def main() -> None:
         return
 
     if args.role == "joborchestrator":
+        owner_api_token = str(args.api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
         bind = _resolve_bind(args.bind, remote_hint=args.infocenter_addr)
         orchestrator_node_id = str(args.node_id or "").strip() or "job-orchestrator-01"
         if orchestrator_node_id == "node-local-01":
@@ -379,6 +385,7 @@ def main() -> None:
             version=args.node_version,
             taskpool_policy_id=args.taskpool_policy_id,
             admin_token=str(getattr(args, "admin_token", "") or ""),
+            api_token=owner_api_token,
             replace_existing=bool(getattr(args, "force", False)),
         )
         _wait_until_stopped(server, on_stop=lambda: None)
@@ -409,6 +416,7 @@ def main() -> None:
         level_name,
     )
     node_tags = [x.strip() for x in args.node_tags.split(",") if x.strip()]
+    owner_api_token = str(args.api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
 
     registrar_holder: dict[str, Optional[NodeInfoCenterRegistrar]] = {"value": None}
 
@@ -431,6 +439,7 @@ def main() -> None:
         service_default_worker_count=args.service_default_workers,
         service_default_heartbeat_timeout_sec=args.service_heartbeat_timeout_sec,
         on_service_routes_changed=_sync_routes_now,
+        api_token=owner_api_token,
     )
     control_server: Optional[NodeControlHttpServer] = server
 

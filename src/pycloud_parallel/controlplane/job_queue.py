@@ -592,6 +592,7 @@ class JobQueueManager:
         *,
         taskpool_policy_id: str = "",
         pool_idle_ttl_sec: Optional[int] = None,
+        api_token: str = "",
     ) -> None:
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
@@ -612,6 +613,7 @@ class JobQueueManager:
         self._retention_sec = max(60, int(os.getenv("PYCLOUD_JOB_QUEUE_RETENTION_SEC", "3600") or 3600))
         self._taskpool_policy_id = str(taskpool_policy_id or "").strip().lower() or _TASKPOOL_SHARED_POLICY_ID
         self._taskpool_profile = get_policy_profile(self._taskpool_policy_id)
+        self._api_token = str(api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
         self._pool_idle_ttl_sec = max(
             0,
             int(
@@ -1113,6 +1115,7 @@ class JobQueueManager:
                 "node_count": max(0, int(payload.get("pool_node_count", payload.get("node_count", pool_request.default_node_count) or pool_request.default_node_count) or 0)),
                 "node_limit": int(payload.get("node_limit", 100) or 100),
                 "timeout_sec": float(payload.get("timeout_sec", 10.0) or 10.0),
+                "api_token": self._api_token,
             }
             if task_resource_paths:
                 task_pool_kwargs["resource_paths"] = list(task_resource_paths)

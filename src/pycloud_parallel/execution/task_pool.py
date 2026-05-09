@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import logging
 import math
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -78,6 +79,10 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_owner_api_token(api_token: str = "") -> str:
+    return str(api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
 _TASK_POOL_CLOSE_RETRY_DELAYS_SEC = (0.0, 0.5, 1.0, 2.0)
 _DEFAULT_MAX_IN_FLIGHT_WORKER_FACTOR = 1.5
 
@@ -652,6 +657,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     heartbeat_timeout_sec=max(5, int(spec.get("heartbeat_timeout_sec", 30) or 30)),
                     idle_ttl_sec=max(0, int(spec.get("idle_ttl_sec", 0) or 0)),
                     chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
+                    api_token=str(spec.get("api_token", "") or ""),
                 )
                 node_key = _node_instance_key_from_node(node)
                 pool.node_instance_id = node_key
@@ -2615,6 +2621,7 @@ def _build_task_pool_from_infocenter(
     timeout_sec: float = 10.0,
     serialization_mode: str = "",
     policy_id: str = "",
+    api_token: str = "",
 ) -> "TaskPool":
     prepared_artifact = prepare_deployment_artifact(
         consumer_kind="task",
@@ -2665,6 +2672,7 @@ def _build_task_pool_from_infocenter(
         requested_mode=serialization_mode,
         context="taskpool_session",
     )
+    effective_api_token = _resolve_owner_api_token(api_token)
 
     def _create_pool_on_node(node: InfoCenterNode) -> Tuple[InfoCenterNode, NativeTaskPoolClient]:
         target = _node_control_target_for_node(node)
@@ -2684,6 +2692,7 @@ def _build_task_pool_from_infocenter(
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
                 chunk_size=chunk_size,
+                api_token=effective_api_token,
             )
         except Exception:
             with contextlib.suppress(Exception):
@@ -2762,6 +2771,7 @@ def _build_task_pool_from_infocenter(
             "node_count": compensation_target_count,
             "node_limit": node_limit,
             "timeout_sec": timeout_sec,
+            "api_token": effective_api_token,
         }
     )
     session._start_keepalive()
@@ -2941,6 +2951,7 @@ class TaskPool(_TaskPoolSessionBase):
         timeout_sec: float = 10.0,
         serialization_mode: str = "",
         policy_id: str = "",
+        api_token: str = "",
     ) -> "TaskPool":
         """Product-facing open action for V1 task pools.
 
@@ -2995,6 +3006,7 @@ class TaskPool(_TaskPoolSessionBase):
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
             policy_id=policy_id,
+            api_token=api_token,
         )
 
     @classmethod
@@ -3027,6 +3039,7 @@ class TaskPool(_TaskPoolSessionBase):
         timeout_sec: float = 10.0,
         serialization_mode: str = "",
         policy_id: str = "",
+        api_token: str = "",
     ) -> "TaskPool":
         """Low-level entry; prefer ``TaskPool.open(...)``.
 
@@ -3062,4 +3075,5 @@ class TaskPool(_TaskPoolSessionBase):
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
             policy_id=policy_id,
+            api_token=api_token,
         )

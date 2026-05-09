@@ -119,6 +119,10 @@ from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_owner_api_token(api_token: str = "") -> str:
+    return str(api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
+
 _STARTUP_PREFLIGHT_RETRY_SEC = 5.0
 _STARTUP_PREFLIGHT_SLEEP_SEC = 0.2
 _LOCAL_SERVICE_EXECUTOR_POLL_INTERVAL_SEC = 0.25
@@ -1975,6 +1979,7 @@ class Service(ServiceExecutionSession):
                         idle_ttl_sec=max(0, int(spec.get("idle_ttl_sec", 0) or 0)),
                         expose_http=bool(spec.get("expose_http", True)),
                         chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
+                        api_token=str(spec.get("api_token", "") or ""),
                     )
                 except Exception as exc:
                     client.close()
@@ -2376,6 +2381,7 @@ class Service(ServiceExecutionSession):
         breaker_failure_threshold: int = 3,
         breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
+        api_token: str = "",
     ) -> "Service":
         """Product-facing deploy action for V1 service sessions.
 
@@ -2438,6 +2444,7 @@ class Service(ServiceExecutionSession):
             breaker_failure_threshold=breaker_failure_threshold,
             breaker_cooldown_sec=breaker_cooldown_sec,
             breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+            api_token=api_token,
         )
 
     @classmethod
@@ -2582,6 +2589,7 @@ class Service(ServiceExecutionSession):
         breaker_cooldown_sec: float = 5.0,
         breaker_max_cooldown_sec: float = 120.0,
         policy_id: str = "",
+        api_token: str = "",
     ) -> "Service":
         """Internal low-level deploy implementation behind ``Service.deploy(...)``.
 
@@ -2624,6 +2632,7 @@ class Service(ServiceExecutionSession):
         Returns:
             Service: 部署的服务组
         """
+        effective_api_token = _resolve_owner_api_token(api_token)
         prepared_artifact = prepare_deployment_artifact(
             consumer_kind="service",
             source=source,
@@ -3086,6 +3095,7 @@ class Service(ServiceExecutionSession):
                         idle_ttl_sec=idle_ttl_sec,
                         expose_http=expose_http,
                         chunk_size=chunk_size,
+                        api_token=effective_api_token,
                     )
                 except Exception as exc:
                     client.close()
@@ -3184,6 +3194,7 @@ class Service(ServiceExecutionSession):
                     "node_count": compensation_target_count,
                     "node_limit": node_limit,
                     "timeout_sec": timeout_sec,
+                    "api_token": effective_api_token,
                 }
             )
             group._persist_session_cache()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import secrets
 import tempfile
 import threading
 import time
@@ -181,16 +182,50 @@ class NodeControlHttpApp:
         *,
         on_service_routes_changed=None,
         max_body_bytes: int = MAX_NODE_CONTROL_HTTP_BODY_BYTES,
+        api_token: str = "",
     ) -> None:
         self.state = state
         self.on_service_routes_changed = on_service_routes_changed
         self.max_body_bytes = get_node_control_http_body_limit_bytes(max_body_bytes)
         self.object_app = NodeObjectHttpApp(state, max_body_bytes=self.max_body_bytes)
+        self.api_token = str(api_token or "").strip()
 
     def _notify(self) -> None:
         if self.on_service_routes_changed is None:
             return
         self.on_service_routes_changed()
+
+    def _configured_api_token(self) -> str:
+        return self.api_token
+
+    @staticmethod
+    def _provided_api_token(headers) -> str:
+        if not headers:
+            return ""
+        auth = str(headers.get("Authorization", "") or headers.get("authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(
+            headers.get("X-PyCloud-Api-Token", "")
+            or headers.get("x-pycloud-api-token", "")
+            or ""
+        ).strip()
+
+    def _require_create_api_token(self, headers) -> Optional[Tuple[int, Dict[str, str], bytes]]:
+        expected = self._configured_api_token()
+        if not expected:
+            return None
+        provided = self._provided_api_token(headers)
+        if not provided:
+            return self._err(401, "owner api token is required to create service/taskpool resources")
+        if not secrets.compare_digest(provided, expected):
+            return self._err(403, "invalid owner api token for resource creation")
+        return None
+
+    @staticmethod
+    def _is_resource_create_path(path: str) -> bool:
+        parts = [unquote(x) for x in urlparse(path).path.split("/") if x]
+        return parts == ["taskpools"] or parts == ["services"]
 
     def handle_get(self, path: str) -> Union[Tuple[int, Dict[str, str], bytes], StreamingHttpResponse]:
         parsed = urlparse(path)
@@ -221,6 +256,10 @@ class NodeControlHttpApp:
         if parts and parts[0] == "objects":
             return self.object_app.handle_post(path, headers or {}, body)
         try:
+            if parts == ["taskpools"] or parts == ["services"]:
+                auth_error = self._require_create_api_token(headers or {})
+                if auth_error is not None:
+                    return auth_error
             if len(parts) == 3 and parts[0] == "taskpools" and parts[2] == "submit-bytes":
                 return self._submit_pool_tasks_bytes(parts[1], body)
             if len(parts) == 3 and parts[0] == "taskpools" and parts[2] == "results-bytes":
@@ -721,9 +760,15 @@ class NodeControlHttpServer:
         state: NodeControlState,
         on_service_routes_changed=None,
         max_body_bytes: int = MAX_NODE_CONTROL_HTTP_BODY_BYTES,
+        api_token: str = "",
     ) -> None:
         self.bind = bind
-        self.app = NodeControlHttpApp(state, on_service_routes_changed=on_service_routes_changed, max_body_bytes=max_body_bytes)
+        self.app = NodeControlHttpApp(
+            state,
+            on_service_routes_changed=on_service_routes_changed,
+            max_body_bytes=max_body_bytes,
+            api_token=api_token,
+        )
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.base_url = ""
@@ -754,6 +799,11 @@ class NodeControlHttpServer:
                 if length > app.max_body_bytes:
                     self._send(413, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": "payload too large"}))
                     return
+                if pass_headers and app._is_resource_create_path(self.path):
+                    auth_error = app._require_create_api_token(self.headers)
+                    if auth_error is not None:
+                        self._send(*auth_error)
+                        return
                 if pass_headers:
                     self._send(*handler(self.path, self.rfile.read(max(0, length)), self.headers))
                 else:
@@ -824,12 +874,19 @@ class NodeControlHttpServer:
 
 
 class HttpNodeControlClient:
-    def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+    def __init__(self, target: str, *, timeout_sec: float = 10.0, api_token: str = "") -> None:
         self.base_url = target_to_base_url(target)
         self.target = self.base_url
         self.control_addr = self.base_url
         self.timeout_sec = max(0.1, float(timeout_sec))
+        self.api_token = str(api_token or "").strip()
         self._object_client: Optional[HttpNodeObjectClient] = None
+
+    def _api_headers(self, api_token: str = "") -> Dict[str, str]:
+        token = str(api_token or self.api_token or "").strip()
+        if not token:
+            return {}
+        return {"Authorization": f"Bearer {token}"}
 
     def close(self) -> None:
         if self._object_client is not None:
@@ -971,6 +1028,7 @@ class HttpNodeControlClient:
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        api_token: str = "",
     ) -> NativeTaskPoolClient:
         import hashlib
 
@@ -999,7 +1057,12 @@ class HttpNodeControlClient:
                 dependency_allowlist=resolved_deps.dependency_allowlist,
             ),
         )
-        data = self._json("POST", "/taskpools", {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")})
+        data = self._json(
+            "POST",
+            "/taskpools",
+            {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")},
+            headers=self._api_headers(api_token),
+        )
         now = utc_now()
         return NativeTaskPoolClient(
             _client=self,
@@ -1036,6 +1099,7 @@ class HttpNodeControlClient:
         idle_ttl_sec: int = 0,
         expose_http: bool = True,
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
+        api_token: str = "",
     ) -> ServiceSessionClient:
         import hashlib
 
@@ -1067,7 +1131,12 @@ class HttpNodeControlClient:
             ),
             policy_id=str(policy_id or "").strip().lower() or "default_safe",
         )
-        data = self._json("POST", "/services", {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")})
+        data = self._json(
+            "POST",
+            "/services",
+            {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")},
+            headers=self._api_headers(api_token),
+        )
         now = utc_now()
         return ServiceSessionClient(
             _client=self,
@@ -1385,7 +1454,15 @@ class HttpNodeControlClient:
             ),
         )
 
-    def _json(self, method: str, path: str, payload: Optional[Dict[str, object]], *, timeout_sec: Optional[float] = None) -> Dict[str, object]:
+    def _json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, object]],
+        *,
+        timeout_sec: Optional[float] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, object]:
         return runtime_http_request(
             base_url=self.base_url,
             control_addr=self.base_url,
@@ -1395,6 +1472,7 @@ class HttpNodeControlClient:
                 payload=payload,
                 timeout_sec=float(timeout_sec if timeout_sec is not None else self.timeout_sec),
                 method=method.upper(),
+                headers=dict(headers or {}),
             ),
         )
 

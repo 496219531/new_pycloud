@@ -711,6 +711,44 @@ def test_job_orchestrator_reorder_job_requires_admin_token() -> None:
     assert waiting_ids == ["job-1", "job-3", "job-2"]
 
 
+def test_job_orchestrator_forwards_owner_api_token_to_taskpool() -> None:
+    module = JobOrchestratorModule(
+        service_name="job-orchestrator",
+        api_token="node-owner-token",
+    )
+
+    assert module.job_queue._api_token == "node-owner-token"  # noqa: SLF001
+
+
+def test_job_queue_manager_passes_owner_api_token_to_created_taskpool() -> None:
+    queue = JobQueueManager(api_token="node-owner-token")
+    queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001
+    state = queue.submit_job(_hook_job_payload(job_id="job-api-token-1"))
+    state.status = "RUNNING"
+
+    class _FakePool:
+        job_id = "job-api-token-1"
+
+        def update_globals(self, values):
+            del values
+
+        def imap_unordered(self, payloads, **kwargs):
+            del kwargs
+            for index, _item in enumerate(payloads):
+                yield index, {"ok": True}
+
+        def close(self):
+            return None
+
+        def cancel_job(self, **kwargs):
+            del kwargs
+
+    with patch("pycloud_parallel.controlplane.job_queue._create_job_task_pool", return_value=_FakePool()) as mocked:
+        queue._run_job("job-api-token-1")  # noqa: SLF001
+
+    assert mocked.call_args.kwargs["api_token"] == "node-owner-token"
+
+
 def test_run_job_with_hooks_uses_generator_handler_and_finalize() -> None:
     queue = JobQueueManager()
     queue._controlplane_target = "127.0.0.1:50051"  # noqa: SLF001

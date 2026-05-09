@@ -22,6 +22,19 @@ def _start_http_node(tmp_path):
     return server, state
 
 
+def _start_http_node_with_api_token(tmp_path, token: str):
+    state = NodeControlState(
+        node_id="node-http-control-auth",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "node_http_control_auth"),
+        service_http_bind="127.0.0.1:0",
+    )
+    server = NodeControlHttpServer(bind="127.0.0.1:0", state=state, api_token=token)
+    server.start()
+    return server, state
+
+
 def test_http_create_service_call_heartbeat_status_close(tmp_path):
     server, state = _start_http_node(tmp_path)
     blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"
@@ -98,6 +111,96 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
             assert struct_to_dict(result.result) == {"value": 8}
             assert pool.heartbeat().accepted is True
             assert pool.get_status().pool_id == pool.pool_id
+            assert pool.close().accepted is True
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_service_requires_owner_api_token(tmp_path):
+    server, state = _start_http_node_with_api_token(tmp_path, "owner-secret")
+    blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            try:
+                client.create_service_from_bytes(
+                    owner_client_id="owner-http",
+                    service_name="svc-auth",
+                    blob=blob,
+                    runtime="py3",
+                    entry_module="svc_auth_demo",
+                    entry_callable="run",
+                    package_format="py",
+                    worker_count=1,
+                    expose_http=False,
+                )
+                assert False, "expected missing api token to fail"
+            except RuntimeError as exc:
+                assert "owner api token is required" in str(exc)
+
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-http",
+                service_name="svc-auth",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_auth_demo",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                expose_http=False,
+                api_token="owner-secret",
+            )
+            assert session.service_id
+            response = client.call_service(
+                service_id=session.service_id,
+                method="run",
+                payload={"value": 2},
+                service_token=session.service_token,
+                timeout_sec=10.0,
+            )
+            assert struct_to_dict(response.data) == {"value": 3}
+            assert client.end_service(
+                owner_client_id="owner-http",
+                service_id=session.service_id,
+                service_token=session.service_token,
+            ).accepted is True
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_taskpool_requires_owner_api_token(tmp_path):
+    server, state = _start_http_node_with_api_token(tmp_path, "owner-secret")
+    blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) * 2}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            try:
+                client.create_task_pool_from_bytes(
+                    owner_client_id="owner-http",
+                    pool_name="pool-auth",
+                    blob=blob,
+                    runtime="py3",
+                    entry_module="pool_auth_demo",
+                    entry_callable="run",
+                    package_format="py",
+                    worker_count=1,
+                )
+                assert False, "expected missing api token to fail"
+            except RuntimeError as exc:
+                assert "owner api token is required" in str(exc)
+
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http",
+                pool_name="pool-auth",
+                blob=blob,
+                runtime="py3",
+                entry_module="pool_auth_demo",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                api_token="owner-secret",
+            )
+            assert pool.pool_id
             assert pool.close().accepted is True
     finally:
         server.stop()

@@ -22,6 +22,7 @@ JOB_ORCHESTRATOR_MANAGED_GLOBALS = (
     "queue_capacity",
     "taskpool_policy_id",
     "admin_token",
+    "api_token",
     "controlplane_target",
     "base_url",
     "render_job_detail_page",
@@ -51,6 +52,7 @@ class JobOrchestratorModule:
         queue_capacity: int = 4000,
         taskpool_policy_id: str = "",
         admin_token: str = "",
+        api_token: str = "",
         render_job_detail_page=None,
     ) -> None:
         self.service_name = str(service_name or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME).strip() or DEFAULT_JOB_ORCHESTRATOR_SERVICE_NAME
@@ -60,9 +62,10 @@ class JobOrchestratorModule:
             or get_default_policy_id_for_binding("taskpool_default")
         )
         self.admin_token = str(admin_token or "").strip()
+        self.api_token = str(api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
         self.service_id = uuid.uuid4().hex
         self.base_url = ""
-        self.job_queue = JobQueueManager(taskpool_policy_id=self.taskpool_policy_id)
+        self.job_queue = JobQueueManager(taskpool_policy_id=self.taskpool_policy_id, api_token=self.api_token)
         self._render_job_detail_page = render_job_detail_page
 
     def start(self, *, controlplane_target: str) -> None:
@@ -186,6 +189,7 @@ class JobOrchestratorServer:
         job_orch_policy_id: str = "",
         taskpool_policy_id: str = "",
         admin_token: str = "",
+        api_token: str = "",
         replace_existing: bool = False,
     ) -> None:
         self.bind = str(bind or "").strip()
@@ -206,6 +210,7 @@ class JobOrchestratorServer:
         env_admin_token = str(os.getenv("PYCLOUD_JOB_ORCHESTRATOR_ADMIN_TOKEN", "") or "").strip()
         fallback_admin_token = str(os.getenv("PYCLOUD_INFOCENTER_TOKEN", "") or "").strip()
         self.admin_token = str(admin_token or env_admin_token or fallback_admin_token or "").strip()
+        self.api_token = str(api_token or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
         self.replace_existing = bool(replace_existing)
 
         self.service_id = uuid.uuid4().hex
@@ -224,6 +229,7 @@ class JobOrchestratorServer:
             "queue_capacity": self.queue_capacity,
             "taskpool_policy_id": self.taskpool_policy_id,
             "admin_token": self.admin_token,
+            "api_token": self.api_token,
             "controlplane_target": self.infocenter_addr,
             "base_url": self.base_url,
             "render_job_detail_page": self._render_job_detail_page,

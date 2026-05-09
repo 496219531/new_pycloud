@@ -1170,6 +1170,7 @@ def _start_job_orchestrator(
     extra_env: Dict[str, str] | None = None,
     debug: bool = False,
     force: bool = False,
+    api_token: str = "",
 ) -> None:
     _assert_bind_available(bind)
     local_target = _is_local_target(infocenter_addr)
@@ -1188,6 +1189,7 @@ def _start_job_orchestrator(
                     f"or re-run with: pycloudctl start-job-orchestrator --target local --force"
                 )
     _log("INFO", f"Starting JobOrchestrator on {bind} (InfoCenter: {infocenter_addr}, service: {service_name})...")
+    token_args = ["--api-token", str(api_token)] if str(api_token or "").strip() else []
     pid = _spawn_server(
         root,
         _logs_dir(root) / "job-orchestrator.log",
@@ -1208,6 +1210,7 @@ def _start_job_orchestrator(
             node_tags,
             "--node-version",
             node_version,
+            *token_args,
             "--log-level",
             "DEBUG" if debug else "INFO",
             *(["--force"] if force else []),
@@ -1245,6 +1248,7 @@ def _start_node(
     service_heartbeat_timeout_sec: int = SERVICE_HEARTBEAT_TIMEOUT_SEC,
     extra_env: Dict[str, str] | None = None,
     debug: bool = False,
+    api_token: str = "",
 ) -> None:
     effective_bind_host = str(bind_host or "").strip() or _default_bind_host(remote_hint=infocenter_target)
     effective_service_http_host = str(service_http_host or "").strip() or _default_bind_host(remote_hint=infocenter_target)
@@ -1255,6 +1259,7 @@ def _start_node(
     _assert_bind_available(control_bind)
     _assert_bind_available(service_http_bind)
     _log("INFO", f"Starting {name} on {control_bind} (HTTP: {service_http_bind}, workers: {worker_capacity})...")
+    token_args = ["--api-token", str(api_token)] if str(api_token or "").strip() else []
     pid = _spawn_server(
         root,
         _logs_dir(root) / f"{name}.log",
@@ -1283,6 +1288,7 @@ def _start_node(
             advertise_addr,
             "--node-tags",
             "compute",
+            *token_args,
             "--log-level",
             "DEBUG" if debug else "INFO",
         ],
@@ -1313,6 +1319,7 @@ def _start_standalone_node(
     node_version: str,
     extra_env: Dict[str, str] | None = None,
     debug: bool = False,
+    api_token: str = "",
 ) -> None:
     _assert_bind_available(bind)
     _assert_bind_available(service_http_bind)
@@ -1351,6 +1358,8 @@ def _start_standalone_node(
         args.extend(["--target", infocenter_addr])
     if advertise_addr:
         args.extend(["--advertise-addr", advertise_addr])
+    if str(api_token or "").strip():
+        args.extend(["--api-token", str(api_token)])
     pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=extra_env, debug=debug)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_ready(service_http_bind, 0.2)):
         _remove_pid(_pid_file(root, node_id))
@@ -1416,6 +1425,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     job_orchestrator_kwargs = dict(
         infocenter_addr=infocenter_target,
         extra_env=extra_env,
+        api_token=str(extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
     )
     if debug:
         controlplane_kwargs["debug"] = True
@@ -1458,6 +1468,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     job_orchestrator_kwargs = dict(
         infocenter_addr=infocenter_target,
         extra_env=extra_env,
+        api_token=str(extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
     )
     if debug:
         controlplane_kwargs["debug"] = True
@@ -1485,6 +1496,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
         service_default_workers=service_default_workers,
         service_heartbeat_timeout_sec=service_heartbeat_timeout_sec,
         extra_env=extra_env,
+        api_token=str(extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
     )
     if debug:
         node_kwargs["debug"] = True
@@ -1710,6 +1722,7 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
         node_tags=str(getattr(args, "node_tags", "") or "job"),
         node_version=str(getattr(args, "node_version", "") or "v1"),
         extra_env=extra_env,
+        api_token=str(getattr(args, "api_token", "") or extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
         force=bool(getattr(args, "force", False)),
         **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
@@ -1775,6 +1788,7 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
         node_tags=str(args.node_tags),
         node_version=str(args.node_version),
         extra_env=extra_env,
+        api_token=str(getattr(args, "api_token", "") or extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
         **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0
@@ -2660,6 +2674,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_job_orchestrator.add_argument("--node-version", default="v1", help="node version string advertised by job-orchestrator")
     start_job_orchestrator.add_argument("--force", action="store_true", help="replace an existing local IPC job-orchestrator with the same service name when --target local")
     start_job_orchestrator.add_argument("--admin-token", default="", help="admin token required for reorder_job; defaults to PYCLOUD_JOB_ORCHESTRATOR_ADMIN_TOKEN or PYCLOUD_INFOCENTER_TOKEN")
+    start_job_orchestrator.add_argument("--api-token", default="", help="owner API token used by job-orchestrator when creating task pools; defaults to PYCLOUD_API_TOKEN")
     start_node = subparsers.add_parser("start-node", help="start one local node control process")
     _add_local_argument(start_node)
     _add_env_argument(start_node)
@@ -2680,6 +2695,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_node.add_argument("--service-heartbeat-timeout-sec", type=int, default=SERVICE_HEARTBEAT_TIMEOUT_SEC, help="default heartbeat timeout in seconds for deployed services on this node")
     start_node.add_argument("--node-tags", default="compute", help="comma-separated node tags advertised during registration")
     start_node.add_argument("--node-version", default="v1", help="node version string advertised during registration")
+    start_node.add_argument("--api-token", default="", help="owner API token required for service/taskpool creation on this node; defaults to PYCLOUD_API_TOKEN")
     stop_parser = subparsers.add_parser("stop", help="stop local core controlplane and job-orchestrator services")
     stop_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
     stop_parser.add_argument("--scan-ports", action="store_true", help="after pid-based stop, scan configured ports and stop matching pycloud listener processes")
