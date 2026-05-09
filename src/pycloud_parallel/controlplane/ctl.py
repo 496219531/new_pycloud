@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import uuid
 from typing import Dict, Iterable, List, Tuple
 from urllib.error import HTTPError
@@ -898,6 +899,32 @@ def _parse_env_overrides(items: Iterable[str]) -> Dict[str, str]:
     return env
 
 
+def _load_owner_api_token_from_auth_file(root: Path) -> str:
+    path = Path(root) / "auth.toml"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return ""
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid auth.toml: {path}") from exc
+    owner = data.get("owner", {}) if isinstance(data, dict) else {}
+    if not isinstance(owner, dict):
+        raise ValueError(f"invalid auth.toml: [owner] must be a table in {path}")
+    return str(owner.get("api_token", "") or "").strip()
+
+
+def _resolve_owner_api_token_for_ctl(root: Path, *, explicit: str = "", extra_env: Dict[str, str] | None = None) -> str:
+    cli_token = str(explicit or "").strip()
+    if cli_token:
+        return cli_token
+    env_token = str((extra_env or {}).get("PYCLOUD_API_TOKEN", "") or os.getenv("PYCLOUD_API_TOKEN", "") or "").strip()
+    if env_token:
+        return env_token
+    return _load_owner_api_token_from_auth_file(root)
+
+
 def _env_override_int(extra_env: Dict[str, str], key: str, default: int) -> int:
     raw = str((extra_env or {}).get(key, "") or "").strip()
     if not raw:
@@ -1425,7 +1452,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     job_orchestrator_kwargs = dict(
         infocenter_addr=infocenter_target,
         extra_env=extra_env,
-        api_token=str(extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
+        api_token=_resolve_owner_api_token_for_ctl(root, extra_env=extra_env),
     )
     if debug:
         controlplane_kwargs["debug"] = True
@@ -1468,7 +1495,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
     job_orchestrator_kwargs = dict(
         infocenter_addr=infocenter_target,
         extra_env=extra_env,
-        api_token=str(extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
+        api_token=_resolve_owner_api_token_for_ctl(root, extra_env=extra_env),
     )
     if debug:
         controlplane_kwargs["debug"] = True
@@ -1496,7 +1523,7 @@ def _cmd_dev_start(args: argparse.Namespace) -> int:
         service_default_workers=service_default_workers,
         service_heartbeat_timeout_sec=service_heartbeat_timeout_sec,
         extra_env=extra_env,
-        api_token=str(extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
+        api_token=_resolve_owner_api_token_for_ctl(root, extra_env=extra_env),
     )
     if debug:
         node_kwargs["debug"] = True
@@ -1722,7 +1749,7 @@ def _cmd_start_job_orchestrator(args: argparse.Namespace) -> int:
         node_tags=str(getattr(args, "node_tags", "") or "job"),
         node_version=str(getattr(args, "node_version", "") or "v1"),
         extra_env=extra_env,
-        api_token=str(getattr(args, "api_token", "") or extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
+        api_token=_resolve_owner_api_token_for_ctl(root, explicit=getattr(args, "api_token", ""), extra_env=extra_env),
         force=bool(getattr(args, "force", False)),
         **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
@@ -1788,7 +1815,7 @@ def _cmd_start_node(args: argparse.Namespace) -> int:
         node_tags=str(args.node_tags),
         node_version=str(args.node_version),
         extra_env=extra_env,
-        api_token=str(getattr(args, "api_token", "") or extra_env.get("PYCLOUD_API_TOKEN", "") or ""),
+        api_token=_resolve_owner_api_token_for_ctl(root, explicit=getattr(args, "api_token", ""), extra_env=extra_env),
         **({"debug": True} if bool(getattr(args, "debug", False)) else {}),
     )
     return 0

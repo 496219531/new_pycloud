@@ -124,6 +124,7 @@ pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
 
 ```text
 <runtime-root>/
+  auth.toml
   logs/
     controlplane.log
     job-orchestrator.log
@@ -163,11 +164,25 @@ dev node 的 worker capacity 默认会按 `CPU 核数 / 2` 自动计算，最少
 创建鉴权：
 
 1. 默认不配置 token 时，service deploy / taskpool create 鉴权关闭
-2. 给 node 配置 `--api-token` 或环境变量 `PYCLOUD_API_TOKEN` 后，鉴权开启
+2. 给 node 配置 `--api-token`、环境变量 `PYCLOUD_API_TOKEN`，或 `<runtime-root>/auth.toml` 后，鉴权开启
 3. 开启后，只有创建资源需要 owner API token：`Service.deploy(...)` 和 `TaskPool.open(...)`
 4. 资源创建成功后，运行期仍使用资源自身返回的 `service_token` / `pool_token`
 5. `call / submit / results / heartbeat / close` 不再重复要求 owner API token
 6. `job-orchestrator` 创建内部 TaskPool 时也必须带同一个 owner API token，不能例外
+
+`auth.toml` 只支持最小单 token 配置：
+
+```toml
+[owner]
+api_token = "owner-secret"
+```
+
+读取优先级：
+
+1. CLI `--api-token`
+2. `PYCLOUD_API_TOKEN`，包括 `--env PYCLOUD_API_TOKEN=...`
+3. `<runtime-root>/auth.toml`
+4. 空字符串，表示关闭创建鉴权
 
 ## 3. `start`
 
@@ -463,6 +478,8 @@ pycloudctl start-job-orchestrator --target local --force
 pycloudctl start-job-orchestrator --target 127.0.0.1:50051 --api-token "$PYCLOUD_API_TOKEN"
 ```
 
+也可以把 token 放到同一个 `runtime-root` 的 `auth.toml`，这样 `start` / `dev-start` / `start-job-orchestrator` 会自动读取。
+
 ### 4.5 用 `pycloudctl` 单独起 node control
 
 ```bash
@@ -476,6 +493,8 @@ pycloudctl start-node --node-id node-1 --target 127.0.0.1:50051 --api-token "$PY
 ```
 
 开启后，只有 service/taskpool 创建请求需要这个 owner API token；创建后的运行期请求继续使用各自的 `service_token` / `pool_token`。
+
+也可以把 token 写入 `<runtime-root>/auth.toml`，`pycloudctl start-node` 会在没有显式 `--api-token` 和 `PYCLOUD_API_TOKEN` 时自动读取。
 
 更常见的完整写法：
 
