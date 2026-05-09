@@ -15,6 +15,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import signal
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -3765,12 +3766,61 @@ class Service(ServiceExecutionSession):
 
     def join(
         self,
+        timeout: Optional[float] = None,
         *,
         poll_interval_sec: float = 1.0,
         end_services_on_interrupt: bool = True,
         end_reason: str = "owner interrupted",
+        handle_sigterm: bool = True,
+        graceful_timeout_sec: float = 10.0,
     ) -> None:
+        def _close_for_interrupt(reason: str) -> None:
+            if not end_services_on_interrupt:
+                self._stop_keepalive()
+                return
+            close_done = threading.Event()
+
+            def _end() -> None:
+                try:
+                    self.close(end_services=True, reason=reason)
+                finally:
+                    close_done.set()
+
+            thread = threading.Thread(target=_end, name=f"service-join-close-{self.service_name}", daemon=True)
+            thread.start()
+            if not close_done.wait(timeout=max(0.0, float(graceful_timeout_sec))):
+                self._stop_keepalive()
+
+        signal_event = threading.Event()
+        previous_handlers: Dict[object, object] = {}
+
+        def _signal_handler(signum, _frame) -> None:
+            del signum, _frame
+            signal_event.set()
+
+        def _install_signal_handlers() -> None:
+            names = ["SIGINT"]
+            if handle_sigterm:
+                names.append("SIGTERM")
+            for name in names:
+                sig = getattr(signal, name, None)
+                if sig is None:
+                    continue
+                try:
+                    previous_handlers[sig] = signal.getsignal(sig)
+                    signal.signal(sig, _signal_handler)
+                except (ValueError, OSError):
+                    previous_handlers.pop(sig, None)
+
+        def _restore_signal_handlers() -> None:
+            for sig, previous in previous_handlers.items():
+                with contextlib.suppress(Exception):
+                    if signal.getsignal(sig) == _signal_handler:
+                        signal.signal(sig, previous)
+
         wait_sec = max(0.1, float(poll_interval_sec))
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        _install_signal_handlers()
         try:
             while True:
                 with self._hb_lock:
@@ -3782,12 +3832,22 @@ class Service(ServiceExecutionSession):
                             f"owner keepalive stopped service_name={self.service_name} failures={self.failures}"
                         )
                     return
-                time.sleep(wait_sec)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    current_wait = min(wait_sec, remaining)
+                else:
+                    current_wait = wait_sec
+                thread.join(timeout=current_wait)
+                if signal_event.is_set():
+                    _close_for_interrupt(end_reason)
+                    return
         except KeyboardInterrupt:
-            if end_services_on_interrupt:
-                self.end(reason=end_reason)
-            else:
-                self._stop_keepalive()
+            _close_for_interrupt(end_reason)
+            return
+        finally:
+            _restore_signal_handlers()
 
     def _stop_keepalive(self) -> None:
         super()._stop_keepalive()

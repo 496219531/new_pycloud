@@ -2903,6 +2903,154 @@ class TestOwnerServiceFacade:
         assert "[Service] owner keepalive stopped service_name=demo-service" in err
         assert "node-1" in err
 
+    def test_join_timeout_keeps_standard_join_semantics(self):
+        from pycloud_parallel.execution.service_session import Service
+
+        stop_event = threading.Event()
+
+        def _wait_forever():
+            stop_event.wait(2.0)
+
+        thread = threading.Thread(target=_wait_forever, daemon=True)
+        thread.start()
+        session = SimpleNamespace(
+            failed=False,
+            last_error="",
+            _hb_lock=threading.Lock(),
+            _hb_thread=thread,
+        )
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": session},
+            nodes={},
+        )
+        group._hb_thread = thread  # noqa: SLF001
+
+        started = time.monotonic()
+        result = group.join(timeout=0.05, poll_interval_sec=0.01)
+        elapsed = time.monotonic() - started
+
+        stop_event.set()
+        thread.join(timeout=1.0)
+        assert result is None
+        assert elapsed < 0.5
+        assert group._closed is False  # noqa: SLF001
+
+    def test_join_keyboard_interrupt_closes_services_with_reason(self, monkeypatch):
+        from pycloud_parallel.execution.service_session import Service
+
+        session = SimpleNamespace(
+            failed=False,
+            last_error="",
+            _hb_lock=threading.Lock(),
+            _hb_thread=None,
+        )
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": session},
+            nodes={},
+        )
+        calls = []
+
+        class _InterruptThread:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                del timeout
+                raise KeyboardInterrupt
+
+        group._hb_thread = _InterruptThread()  # noqa: SLF001
+        monkeypatch.setattr(group, "close", lambda **kwargs: calls.append(kwargs))
+
+        assert group.join(timeout=1.0, poll_interval_sec=0.01, end_reason="test interrupt") is None
+        assert calls == [{"end_services": True, "reason": "test interrupt"}]
+
+    def test_join_sigterm_closes_services_when_enabled(self, monkeypatch):
+        from pycloud_parallel.execution import service_session as service_mod
+        from pycloud_parallel.execution.service_session import Service
+
+        session = SimpleNamespace(
+            failed=False,
+            last_error="",
+            _hb_lock=threading.Lock(),
+            _hb_thread=None,
+        )
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": session},
+            nodes={},
+        )
+        calls = []
+        handlers = {}
+
+        class _Thread:
+            def __init__(self):
+                self._first = True
+
+            def is_alive(self):
+                if self._first:
+                    self._first = False
+                    handler = handlers.get(service_mod.signal.SIGTERM)
+                    assert handler is not None
+                    handler(service_mod.signal.SIGTERM, None)
+                    return True
+                return True
+
+            def join(self, timeout=None):
+                del timeout
+
+        group._hb_thread = _Thread()  # noqa: SLF001
+        monkeypatch.setattr(group, "close", lambda **kwargs: calls.append(kwargs))
+        monkeypatch.setattr(service_mod.signal, "getsignal", lambda sig: handlers.get(sig))
+        monkeypatch.setattr(service_mod.signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
+
+        assert group.join(timeout=1.0, poll_interval_sec=0.01, end_reason="term stop", handle_sigterm=True) is None
+        assert calls == [{"end_services": True, "reason": "term stop"}]
+
+    def test_join_graceful_timeout_stops_keepalive_when_close_hangs(self, monkeypatch):
+        from pycloud_parallel.execution.service_session import Service
+
+        session = SimpleNamespace(
+            failed=False,
+            last_error="",
+            _hb_lock=threading.Lock(),
+            _hb_thread=None,
+        )
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": session},
+            nodes={},
+        )
+        stopped = []
+
+        class _InterruptThread:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                del timeout
+                raise KeyboardInterrupt
+
+        def _hang_close(**kwargs):
+            del kwargs
+            threading.Event().wait(1.0)
+
+        group._hb_thread = _InterruptThread()  # noqa: SLF001
+        monkeypatch.setattr(group, "close", _hang_close)
+        monkeypatch.setattr(group, "_stop_keepalive", lambda: stopped.append(True))
+
+        started = time.monotonic()
+        assert group.join(timeout=1.0, poll_interval_sec=0.01, graceful_timeout_sec=0.01) is None
+        elapsed = time.monotonic() - started
+
+        assert stopped == [True]
+        assert elapsed < 0.5
+
     def test_service_group_update_globals_prepares_values_once_for_all_nodes(self):
         from pycloud_parallel.execution.service_session import Service
 
