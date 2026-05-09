@@ -160,6 +160,15 @@ pycloudctl start-gateway --infocenter-addr 127.0.0.1:50051
 
 dev node 的 worker capacity 默认会按 `CPU 核数 / 2` 自动计算，最少为 `1`。
 
+创建鉴权：
+
+1. 默认不配置 token 时，service deploy / taskpool create 鉴权关闭
+2. 给 node 配置 `--api-token` 或环境变量 `PYCLOUD_API_TOKEN` 后，鉴权开启
+3. 开启后，只有创建资源需要 owner API token：`Service.deploy(...)` 和 `TaskPool.open(...)`
+4. 资源创建成功后，运行期仍使用资源自身返回的 `service_token` / `pool_token`
+5. `call / submit / results / heartbeat / close` 不再重复要求 owner API token
+6. `job-orchestrator` 创建内部 TaskPool 时也必须带同一个 owner API token，不能例外
+
 ## 3. `start`
 
 用途：
@@ -448,11 +457,25 @@ pycloudctl start-job-orchestrator --target local
 pycloudctl start-job-orchestrator --target local --force
 ```
 
+如果目标 node 开启了创建鉴权，job-orchestrator 也要配置同一个 owner API token，这样它创建内部 TaskPool 时才能通过：
+
+```bash
+pycloudctl start-job-orchestrator --target 127.0.0.1:50051 --api-token "$PYCLOUD_API_TOKEN"
+```
+
 ### 4.5 用 `pycloudctl` 单独起 node control
 
 ```bash
 pycloudctl start-node --node-id node-1 --target 127.0.0.1:50051
 ```
+
+上面这条命令不带 `--api-token`，表示这个 node 不开启创建鉴权。要开启鉴权：
+
+```bash
+pycloudctl start-node --node-id node-1 --target 127.0.0.1:50051 --api-token "$PYCLOUD_API_TOKEN"
+```
+
+开启后，只有 service/taskpool 创建请求需要这个 owner API token；创建后的运行期请求继续使用各自的 `service_token` / `pool_token`。
 
 更常见的完整写法：
 

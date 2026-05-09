@@ -124,6 +124,24 @@
 
 这些边界负责选择 mode；内部 carrier/helper 只消费和传递 mode，不再私自重选默认值。
 
+创建鉴权边界：
+
+1. owner API token 是可选开关；node 没配置 token 时关闭
+2. node 通过 `pycloudctl start-node --api-token ...` 或 `PYCLOUD_API_TOKEN` 配置 token 后开启
+3. 开启后，只在资源创建时校验：`Service.deploy(..., api_token=...)` 和 `TaskPool.open(..., api_token=...)`
+4. 创建成功后，owner handle 已经带有 `service_token` / `pool_token`
+5. 后续 `call / stream / submit / results / heartbeat / close` 不再要求 owner API token
+6. `JobQueue` 通过 job-orchestrator 创建内部 TaskPool，job-orchestrator 也必须配置同一个 API token
+
+示例：
+
+```python
+service = Service.deploy(target="127.0.0.1:50051", source=my_module, api_token="owner-secret")
+
+with TaskPool.open(target="127.0.0.1:50051", source=my_module, api_token="owner-secret") as pool:
+    ...
+```
+
 另外：
 
 1. 非 legacy carrier body 必须显式带 codec/version envelope

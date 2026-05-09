@@ -149,6 +149,17 @@ def test_ctl_parser_accepts_start_node_command():
     assert args.bind == "0.0.0.0:51061"
 
 
+def test_ctl_parser_accepts_optional_api_token_for_resource_creation():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["start-node", "--target", "127.0.0.1:50051", "--api-token", "owner-secret"])
+    assert args.command == "start-node"
+    assert args.api_token == "owner-secret"
+
+    args = parser.parse_args(["start-job-orchestrator", "--target", "127.0.0.1:50051", "--api-token", "owner-secret"])
+    assert args.command == "start-job-orchestrator"
+    assert args.api_token == "owner-secret"
+
+
 def test_ctl_start_node_help_mentions_canonical_bind_options():
     parser = ctl.build_parser()
     help_text = parser.format_help()
@@ -388,6 +399,7 @@ def test_cmd_dev_start_propagates_host_overrides(tmp_path, monkeypatch):
             "bind": "0.0.0.0:50053",
             "infocenter_addr": "127.0.0.1:51051",
             "extra_env": {},
+            "api_token": "",
         }
     ]
     assert started_nodes[0]["bind_host"] == "0.0.0.0"
@@ -542,6 +554,7 @@ def test_cmd_start_uses_loopback_defaults_when_local_enabled(tmp_path, monkeypat
             "bind": "127.0.0.1:50053",
             "infocenter_addr": "127.0.0.1:50051",
             "extra_env": {},
+            "api_token": "",
         }
     ]
     assert controlplane_calls[0]["bind_host"] == "127.0.0.1"
@@ -1279,6 +1292,7 @@ def test_cmd_start_node_uses_explicit_target_and_local_advertise(tmp_path, monke
             "node_tags": "compute",
             "node_version": "v1",
             "extra_env": {},
+            "api_token": "",
         }
     ]
 
@@ -1364,6 +1378,7 @@ def test_standalone_start_commands_use_loopback_defaults_when_local_enabled(
                 "node_version": "v1",
                 "extra_env": {},
                 "force": False,
+                "api_token": "",
             }
         ]
         return
@@ -1424,6 +1439,7 @@ def test_cmd_start_node_uses_loopback_defaults_when_local_enabled(tmp_path, monk
             "node_tags": "compute",
             "node_version": "v1",
             "extra_env": {},
+            "api_token": "",
         }
     ]
 
@@ -1537,6 +1553,7 @@ def test_cmd_start_node_canonical_addresses(tmp_path, monkeypatch):
             "node_tags": "compute",
             "node_version": "v1",
             "extra_env": {},
+            "api_token": "",
         }
     ]
 
