@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import uuid
 from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -455,12 +456,102 @@ class NodeRuntimeBase:
             self._infocenter_registrar = None
         self.stop_service_gateway()
 
-    def join(self, timeout: Optional[float] = None) -> None:
-        if timeout is not None:
-            self._closed.wait(max(0.0, float(timeout)))
+    def join(
+        self,
+        timeout: Optional[float] = None,
+        *,
+        poll_interval_sec: float = 1.0,
+        end_services_on_interrupt: bool = True,
+        end_reason: str = "owner interrupted",
+        handle_sigterm: bool = True,
+        graceful_timeout_sec: float = 10.0,
+    ) -> None:
+        def _call_close(reason: str) -> None:
+            close_fn = self.close
+            try:
+                params = inspect.signature(close_fn).parameters
+            except (TypeError, ValueError):
+                close_fn()
+                return
+            accepts_reason = "reason" in params or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            )
+            if accepts_reason:
+                close_fn(reason=reason)
+            else:
+                close_fn()
+
+        def _close_for_interrupt(reason: str) -> None:
+            if not end_services_on_interrupt:
+                self._closed.set()
+                return
+            close_done = threading.Event()
+
+            def _close() -> None:
+                try:
+                    _call_close(reason)
+                finally:
+                    close_done.set()
+
+            thread = threading.Thread(target=_close, name=f"{self.node_id}-join-close", daemon=True)
+            thread.start()
+            if not close_done.wait(timeout=max(0.0, float(graceful_timeout_sec))):
+                self._closed.set()
+
+        signal_event = threading.Event()
+        previous_handlers: Dict[object, object] = {}
+
+        def _signal_handler(signum, frame) -> None:
+            del signum, frame
+            signal_event.set()
+
+        def _install_signal_handlers() -> None:
+            if threading.current_thread() is not threading.main_thread():
+                return
+            names = ["SIGINT"]
+            if handle_sigterm:
+                names.extend(["SIGTERM", "SIGBREAK"])
+            for sig_name in names:
+                sig = getattr(signal, sig_name, None)
+                if sig is None or sig in previous_handlers:
+                    continue
+                try:
+                    previous_handlers[sig] = signal.getsignal(sig)
+                    signal.signal(sig, _signal_handler)
+                except (OSError, ValueError):
+                    previous_handlers.pop(sig, None)
+
+        def _restore_signal_handlers() -> None:
+            if threading.current_thread() is not threading.main_thread():
+                return
+            for sig, previous in previous_handlers.items():
+                try:
+                    if signal.getsignal(sig) == _signal_handler:
+                        signal.signal(sig, previous)
+                except (OSError, ValueError):
+                    pass
+
+        wait_sec = max(0.1, float(poll_interval_sec))
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        _install_signal_handlers()
+        try:
+            while not self._closed.is_set():
+                if signal_event.is_set():
+                    _close_for_interrupt(end_reason)
+                    return
+                if deadline is None:
+                    current_wait = wait_sec
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    current_wait = min(wait_sec, remaining)
+                self._closed.wait(current_wait)
+        except KeyboardInterrupt:
+            _close_for_interrupt(end_reason)
             return
-        while not self._closed.wait(3600.0):
-            pass
+        finally:
+            _restore_signal_handlers()
 
     def install_interrupt_shutdown_handlers(self) -> None:
         if threading.current_thread() is not threading.main_thread():

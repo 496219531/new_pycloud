@@ -1409,6 +1409,77 @@ def test_service_startup_installs_process_interrupt_shutdown(tmp_path, monkeypat
         node.close()
 
 
+def test_node_runtime_join_timeout_accepts_service_join_options():
+    from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
+
+    node = NodeRuntimeBase(node_id="runtime-join-timeout", service_http_bind="")
+
+    started = time.monotonic()
+    result = node.join(
+        timeout=0.02,
+        poll_interval_sec=0.01,
+        end_services_on_interrupt=True,
+        end_reason="owner interrupted",
+        handle_sigterm=True,
+        graceful_timeout_sec=0.01,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result is None
+    assert elapsed < 0.5
+    assert not node._closed.is_set()  # noqa: SLF001
+
+
+def test_node_runtime_join_sigterm_closes_runtime(monkeypatch):
+    from pycloud_parallel.controlplane import node_runtime_base as runtime_mod
+    from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
+
+    calls = []
+    handlers = {}
+
+    class _ClosedEvent:
+        def __init__(self):
+            self.closed = False
+            self.wait_count = 0
+
+        def is_set(self):
+            return self.closed
+
+        def wait(self, timeout=None):
+            del timeout
+            self.wait_count += 1
+            if self.wait_count == 1:
+                handler = handlers.get(runtime_mod.signal.SIGTERM)
+                assert handler is not None
+                handler(runtime_mod.signal.SIGTERM, None)
+            return self.closed
+
+        def set(self):
+            self.closed = True
+
+    class _Runtime(NodeRuntimeBase):
+        def close(self):
+            calls.append("close")
+            self._closed.set()
+
+    node = _Runtime(node_id="runtime-join-term", service_http_bind="")
+    node._closed = _ClosedEvent()  # noqa: SLF001
+    monkeypatch.setattr(runtime_mod.signal, "getsignal", lambda sig: handlers.get(sig))
+    monkeypatch.setattr(runtime_mod.signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler))
+
+    result = node.join(
+        timeout=1.0,
+        poll_interval_sec=0.01,
+        end_services_on_interrupt=True,
+        end_reason="term stop",
+        handle_sigterm=True,
+        graceful_timeout_sec=0.1,
+    )
+
+    assert result is None
+    assert calls == ["close"]
+
+
 def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path, monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
