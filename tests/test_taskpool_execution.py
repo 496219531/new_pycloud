@@ -686,6 +686,32 @@ def test_submit_payloads_reuses_scheduler_candidate_snapshot_for_batch() -> None
         session.close()
 
 
+def test_task_pool_close_forwards_reason_to_replicas() -> None:
+    from pycloud_parallel import TaskPool
+
+    reasons = []
+    client_closed = []
+    fake_pool = SimpleNamespace(
+        owner_client_id="owner",
+        code_version="sha256:test",
+        heartbeat_timeout_sec=30,
+        worker_count=1,
+        close=lambda reason="": reasons.append(reason),
+        _client=SimpleNamespace(close=lambda: client_closed.append(True)),
+    )
+    session = TaskPool(
+        pools={"node-a": fake_pool},
+        nodes={},
+        task_method="run",
+        job_id="job-close-reason",
+    )
+
+    session.close(reason="owner interrupted")
+
+    assert reasons == ["owner interrupted"]
+    assert client_closed == [True]
+
+
 def test_imap_unordered_reuses_scheduler_candidate_snapshot_per_fill() -> None:
     from pycloud_parallel import TaskPool
 

@@ -2549,13 +2549,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     ) -> DataRef:
         return self.put_data(value, format="json", chunk_size=chunk_size, serialization_mode=serialization_mode)
 
-    def close(self) -> None:
+    def close(self, reason: str = "task pool session close") -> None:
         if self._closed:
             return
         self._closed = True
         self._stop_keepalive()
+        close_reason = str(reason or "task pool session close")
         for pool in self._pools.values():
-            _close_task_pool_replica(pool, reason="task pool session close")
+            _close_task_pool_replica(pool, reason=close_reason)
             with contextlib.suppress(Exception):
                 pool._client.close()  # noqa: SLF001
 
