@@ -746,10 +746,10 @@ def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch
         node.close()
 
 
-def test_service_startup_managed_globals_gate_module_mount_until_update(tmp_path, monkeypatch):
+def test_service_startup_initial_globals_module_mount_before_visible(tmp_path, monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
-    module_path = tmp_path / "startup_module_globals_gate.py"
+    module_path = tmp_path / "startup_module_initial_globals.py"
     module_path.write_text(
         "cfg = None\n"
         "def read_cfg():\n"
@@ -758,27 +758,20 @@ def test_service_startup_managed_globals_gate_module_mount_until_update(tmp_path
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
-    module = importlib.import_module("startup_module_globals_gate")
+    module = importlib.import_module("startup_module_initial_globals")
 
     node = Service.startup(
         source=module,
-        service_name="startup-module-globals-gate",
+        service_name="startup-module-initial-globals",
         export_methods=("read_cfg",),
         managed_global_names=("cfg",),
+        initial_globals={"cfg": {"value": 42}},
         start=False,
     )
     try:
         mount = next(iter(node._startup_services.values()))  # noqa: SLF001
-        assert mount.managed_globals_ready is False
-        assert node.service_report_payloads()[0]["status"] == pb2.SERVICE_STATUS_STARTING
-        with pytest.raises(RuntimeError, match="service waiting for managed globals"):
-            node.read_cfg.sync()
-
-        digest = node.update_globals({"cfg": {"value": 42}})
-
-        assert digest
-        assert mount.managed_globals_ready is True
         assert node.service_report_payloads()[0]["status"] == pb2.SERVICE_STATUS_RUNNING
+        assert mount.globals_digest
         assert node.read_cfg.sync() == {"value": 42}
     finally:
         node.close()
@@ -1814,7 +1807,7 @@ def test_service_startup_update_globals_uses_service_executor_path(tmp_path, mon
 
     try:
         session = next(iter(node._services.values()))  # noqa: SLF001
-        assert session.status == pb2.SERVICE_STATUS_STARTING
+        assert session.status == pb2.SERVICE_STATUS_RUNNING
         code, body = node.call_service(
             service_id=session.service_id,
             method="read_cfg",
@@ -1822,8 +1815,8 @@ def test_service_startup_update_globals_uses_service_executor_path(tmp_path, mon
             service_token=session.service_token,
             timeout_sec=5.0,
         )
-        assert code == 409
-        assert body["error"] == "service waiting for managed globals"
+        assert code == 200
+        assert body["data"] == {}
 
         first_digest = node.update_globals({"cfg": {"value": 42}})
         assert session.status == pb2.SERVICE_STATUS_RUNNING

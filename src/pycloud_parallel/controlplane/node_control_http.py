@@ -113,6 +113,23 @@ def _parse_message(message_cls, payload: object):
     return msg
 
 
+def _decode_initial_globals(payload: Dict[str, object], *, context: str) -> Dict[str, object]:
+    raw_values = payload.get("initial_globals")
+    if not isinstance(raw_values, dict) or not raw_values:
+        return {}
+    serialization_mode = detect_transport_mode(
+        raw_values,
+        default=str(payload.get("initial_globals_mode", "") or "legacy_v1"),
+    )
+    values = decode_payload_from_transport(
+        raw_values,
+        policy=get_payload_policy("managed_globals"),
+        mode=serialization_mode,
+        context=context,
+    )
+    return values if isinstance(values, dict) else {}
+
+
 def _task_pool_status_to_dict(info: Dict[str, object]) -> Dict[str, object]:
     return {
         "pool_id": str(info.get("pool_id", "")),
@@ -339,6 +356,7 @@ class NodeControlHttpApp:
                 dependency_policy_mode=meta.dependency_policy_mode,
                 dependency_allowlist=list(meta.dependency_allowlist),
                 managed_global_names=list(meta.managed_global_names),
+                initial_globals=_decode_initial_globals(payload, context="taskpool_session"),
                 worker_count=meta.worker_count,
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
                 idle_ttl_sec=meta.idle_ttl_sec,
@@ -367,6 +385,7 @@ class NodeControlHttpApp:
                 dependency_policy_mode=meta.dependency_policy_mode,
                 dependency_allowlist=list(meta.dependency_allowlist),
                 managed_global_names=list(meta.managed_global_names),
+                initial_globals=_decode_initial_globals(payload, context="service_owner"),
                 policy_id=str(meta.policy_id or "").strip().lower() or "default_safe",
                 worker_count=meta.worker_count,
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
@@ -1024,6 +1043,7 @@ class HttpNodeControlClient:
         package_format: str = "",
         deps: Optional[ArtifactDeps] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -1039,6 +1059,14 @@ class HttpNodeControlClient:
             fallback_stem="task_pool_artifact",
         )
         resolved_deps = _coerce_artifact_deps(deps)
+        effective_managed_global_names = [str(name) for name in (managed_global_names or ()) if str(name).strip()]
+        if initial_globals:
+            known_names = set(effective_managed_global_names)
+            for name in initial_globals:
+                normalized_name = str(name).strip()
+                if normalized_name and normalized_name not in known_names:
+                    effective_managed_global_names.append(normalized_name)
+                    known_names.add(normalized_name)
         meta = pb2.CreateTaskPoolMeta(
             owner_client_id=owner_client_id,
             pool_name=pool_name,
@@ -1051,16 +1079,24 @@ class HttpNodeControlClient:
             idle_ttl_sec=max(0, int(idle_ttl_sec)),
             package_format=effective_format,
             dependency_allowlist=list(resolved_deps.dependency_allowlist),
-            managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
+            managed_global_names=effective_managed_global_names,
             dependency_policy_mode=_normalize_dependency_policy_mode(
                 resolved_deps.mode,
                 dependency_allowlist=resolved_deps.dependency_allowlist,
             ),
         )
+        payload = {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")}
+        if initial_globals:
+            payload["initial_globals"] = encode_payload_for_transport(
+                dict(initial_globals),
+                policy=get_payload_policy("managed_globals"),
+                context="taskpool_session",
+                mode="structured_v1",
+            )
         data = self._json(
             "POST",
             "/taskpools",
-            {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")},
+            payload,
             headers=self._api_headers(api_token),
         )
         now = utc_now()
@@ -1093,6 +1129,7 @@ class HttpNodeControlClient:
         export_methods: Optional[Sequence[str]] = None,
         deps: Optional[ArtifactDeps] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         policy_id: str = "",
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
@@ -1110,6 +1147,14 @@ class HttpNodeControlClient:
             fallback_stem="service_artifact",
         )
         resolved_deps = _coerce_artifact_deps(deps)
+        effective_managed_global_names = [str(name) for name in (managed_global_names or ()) if str(name).strip()]
+        if initial_globals:
+            known_names = set(effective_managed_global_names)
+            for name in initial_globals:
+                normalized_name = str(name).strip()
+                if normalized_name and normalized_name not in known_names:
+                    effective_managed_global_names.append(normalized_name)
+                    known_names.add(normalized_name)
         meta = pb2.CreateServiceMeta(
             owner_client_id=owner_client_id,
             service_name=service_name,
@@ -1124,17 +1169,25 @@ class HttpNodeControlClient:
             package_format=effective_format,
             export_spec=pb2.ModuleExportSpec(mode=str(export_mode or ""), methods=[str(x) for x in (export_methods or [])], decorator="pycloud_export"),
             dependency_allowlist=list(resolved_deps.dependency_allowlist),
-            managed_global_names=[str(name) for name in (managed_global_names or ()) if str(name).strip()],
+            managed_global_names=effective_managed_global_names,
             dependency_policy_mode=_normalize_dependency_policy_mode(
                 resolved_deps.mode,
                 dependency_allowlist=resolved_deps.dependency_allowlist,
             ),
             policy_id=str(policy_id or "").strip().lower() or "default_safe",
         )
+        payload = {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")}
+        if initial_globals:
+            payload["initial_globals"] = encode_payload_for_transport(
+                dict(initial_globals),
+                policy=get_payload_policy("managed_globals"),
+                context="service_owner",
+                mode="structured_v1",
+            )
         data = self._json(
             "POST",
             "/services",
-            {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")},
+            payload,
             headers=self._api_headers(api_token),
         )
         now = utc_now()

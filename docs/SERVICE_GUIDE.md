@@ -363,7 +363,7 @@ group = Service.deploy(
     service_name="square-service",
     source=blob,
     package_format="py",
-    managed_global_names=["STATE", "MODEL_REF"],
+    initial_globals={"STATE": "v1"},
 )
 
 group.update_globals({"STATE": "v2"})
@@ -372,8 +372,10 @@ group.update_globals({"STATE": "v2"})
 规则：
 
 1. 只有 owner 持有 `service_token`，所以只有 owner 能更新
-2. 当前版本是按 `service_id` 定义的
-3. 同一套代码的不同服务实例可以有不同 globals
+2. `initial_globals={...}` 是创建期同步注入：node 先写入 globals，再把 service replica 放进可见状态；如果未显式传 `managed_global_names`，会从 `initial_globals` 的 key 自动补齐声明名
+3. `update_globals(...)` 是创建后的 owner 控制命令，语义是异步热更新，不阻塞 service 对外可见；如果调用方依赖某个 global 一定已存在，应在创建时传 `initial_globals`
+4. 当前版本是按 `service_id` 定义的
+5. 同一套代码的不同服务实例可以有不同 globals
 
 ## 5.3 节点目录布局
 

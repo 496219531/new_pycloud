@@ -117,6 +117,83 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
         state.close()
 
 
+def test_http_create_service_initial_globals_visible_before_first_call(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    blob = (
+        b"cfg = {}\n\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) + int(cfg.get('offset', 0))}\n"
+    )
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-http",
+                service_name="svc-http-initial-globals",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_http_initial_globals",
+                entry_callable="run",
+                package_format="py",
+                managed_global_names=["cfg"],
+                initial_globals={"cfg": {"offset": 5}},
+                worker_count=1,
+                expose_http=False,
+            )
+            response = client.call_service(
+                service_id=session.service_id,
+                method="run",
+                payload={"value": 2},
+                service_token=session.service_token,
+                timeout_sec=10.0,
+            )
+            assert struct_to_dict(response.data) == {"value": 7}
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_taskpool_initial_globals_visible_before_submit(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    blob = (
+        b"cfg = {}\n\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) + int(cfg.get('offset', 0))}\n"
+    )
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http",
+                pool_name="pool-http-initial-globals",
+                blob=blob,
+                runtime="py3",
+                entry_module="pool_http_initial_globals",
+                entry_callable="run",
+                package_format="py",
+                initial_globals={"cfg": {"offset": 6}},
+                worker_count=1,
+            )
+            task = pb2.TaskSubmitItem(
+                task_id="task-http-initial-globals",
+                payload=dict_to_struct({"value": 4}),
+                timeout_hint_sec=10,
+            )
+            submitted = pool.submit_tasks([task], job_id="job-http-initial-globals")
+            assert len(submitted.accepted) == 1
+            deadline = time.time() + 10.0
+            result = None
+            while time.time() < deadline:
+                pulled = pool.pull_results(limit=10, wait_ms=100)
+                if pulled.results:
+                    result = pulled.results[0]
+                    break
+            assert result is not None
+            assert result.status == pb2.TASK_STATUS_SUCCEEDED
+            assert struct_to_dict(result.result) == {"value": 10}
+    finally:
+        server.stop()
+        state.close()
+
+
 def test_http_create_service_requires_owner_api_token(tmp_path):
     server, state = _start_http_node_with_api_token(tmp_path, "owner-secret")
     blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"

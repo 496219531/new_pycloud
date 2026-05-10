@@ -59,6 +59,7 @@ from pycloud_parallel.execution.failover import (
 from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
+    normalize_initial_globals,
     prepare_deployment_artifact,
 )
 from pycloud_parallel.execution.scheduler import (
@@ -653,6 +654,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     package_format=str(spec.get("package_format", "") or ""),
                     deps=spec.get("deps"),
                     managed_global_names=list(spec.get("managed_global_names") or ()),
+                    initial_globals=dict(spec.get("initial_globals") or {}),
                     worker_count=max(1, int(spec.get("worker_count", 1) or 1)),
                     heartbeat_timeout_sec=max(5, int(spec.get("heartbeat_timeout_sec", 30) or 30)),
                     idle_ttl_sec=max(0, int(spec.get("idle_ttl_sec", 0) or 0)),
@@ -2609,6 +2611,7 @@ def _build_task_pool_from_infocenter(
     package_format: str = "",
     resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
+    initial_globals: Optional[Dict[str, object]] = None,
     worker_count: int = 1,
     heartbeat_timeout_sec: int = 30,
     idle_ttl_sec: int = 0,
@@ -2624,6 +2627,7 @@ def _build_task_pool_from_infocenter(
     policy_id: str = "",
     api_token: str = "",
 ) -> "TaskPool":
+    initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
     prepared_artifact = prepare_deployment_artifact(
         consumer_kind="task",
         source=source,
@@ -2633,7 +2637,7 @@ def _build_task_pool_from_infocenter(
         entry_module=entry_module,
         entry_callable=entry_callable,
         package_format=package_format,
-        managed_global_names=managed_global_names,
+        managed_global_names=effective_managed_global_names,
         resource_paths=resource_paths,
     )
     effective_blob = prepared_artifact.blob
@@ -2689,6 +2693,7 @@ def _build_task_pool_from_infocenter(
                 package_format=effective_package_format,
                 deps=prepared_artifact.dependency_policy,
                 managed_global_names=managed_global_names,
+                initial_globals=initial_globals_values,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -2761,6 +2766,7 @@ def _build_task_pool_from_infocenter(
             "package_format": effective_package_format,
             "deps": prepared_artifact.dependency_policy,
             "managed_global_names": managed_global_names,
+            "initial_globals": dict(initial_globals_values),
             "worker_count": worker_count,
             "heartbeat_timeout_sec": heartbeat_timeout_sec,
             "idle_ttl_sec": idle_ttl_sec,
@@ -2798,6 +2804,7 @@ def _build_local_task_pool(
     package_format: str = "",
     resource_paths: Optional[Sequence[Any]] = None,
     managed_global_names: Optional[Sequence[str]] = None,
+    initial_globals: Optional[Dict[str, object]] = None,
     worker_count: int = 1,
     heartbeat_timeout_sec: int = 30,
     idle_ttl_sec: int = 0,
@@ -2805,6 +2812,7 @@ def _build_local_task_pool(
     policy_id: str = "",
 ) -> "TaskPool":
     from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
+    initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
 
     module_source = source if inspect.ismodule(source) else None
     normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
@@ -2827,7 +2835,7 @@ def _build_local_task_pool(
         entry_module=entry_module,
         entry_callable=entry_callable,
         package_format=package_format,
-        managed_global_names=managed_global_names,
+        managed_global_names=effective_managed_global_names,
     )
     prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="task")
     effective_owner = str(owner_client_id or f"local-client-{_get_local_ip()}").strip()
@@ -2860,6 +2868,7 @@ def _build_local_task_pool(
             dependency_policy_mode=prepared_artifact.dependency_policy_mode,
             dependency_allowlist=list(prepared_artifact.dependency_allowlist),
             managed_global_names=list(prepared_artifact.managed_global_names),
+            initial_globals=initial_globals_values,
             worker_count=effective_worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -2939,6 +2948,7 @@ class TaskPool(_TaskPoolSessionBase):
         package_format: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2972,6 +2982,7 @@ class TaskPool(_TaskPoolSessionBase):
                 package_format=package_format,
                 resource_paths=resource_paths,
                 managed_global_names=managed_global_names,
+                initial_globals=initial_globals,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -2994,6 +3005,7 @@ class TaskPool(_TaskPoolSessionBase):
             package_format=package_format,
             resource_paths=resource_paths,
             managed_global_names=managed_global_names,
+            initial_globals=initial_globals,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -3027,6 +3039,7 @@ class TaskPool(_TaskPoolSessionBase):
         package_format: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 1,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -3063,6 +3076,7 @@ class TaskPool(_TaskPoolSessionBase):
             package_format=package_format,
             resource_paths=resource_paths,
             managed_global_names=managed_global_names,
+            initial_globals=initial_globals,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,

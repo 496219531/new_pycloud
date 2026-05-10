@@ -76,7 +76,6 @@ class StaticServiceMount:
     policy_id: str = "default_safe"
     module: Optional[ModuleType] = None
     managed_global_names: Tuple[str, ...] = ()
-    managed_globals_ready: bool = True
     globals_digest: str = ""
 
 
@@ -136,7 +135,6 @@ class NodeRuntimeBase:
             module=module,
             managed_global_names=tuple(str(name).strip() for name in (managed_global_names or ()) if str(name).strip()),
         )
-        mount.managed_globals_ready = not bool(mount.managed_global_names)
         mount.http_base_url = f"{self.service_http_base_url}/svc/{mount.service_id}" if self.service_http_base_url else ""
         self._startup_services[normalized_service_id] = mount
         self._apply_pending_startup_globals(mount)
@@ -216,8 +214,6 @@ class NodeRuntimeBase:
                     module_globals[normalized_name] = value
         self.globals_digests[mount.service_id] = globals_digest
         mount.globals_digest = globals_digest
-        if set(allowed_names).issubset(set(str(name).strip() for name in normalized_values if str(name).strip())):
-            mount.managed_globals_ready = True
         return globals_digest
 
     def update_startup_service_globals(
@@ -712,13 +708,9 @@ class NodeRuntimeBase:
             {
                 "service_name": mount.service_name,
                 "service_id": mount.service_id,
-                "status": int(
-                    pb2.SERVICE_STATUS_RUNNING
-                    if mount.managed_globals_ready
-                    else pb2.SERVICE_STATUS_STARTING
-                ),
+                "status": int(pb2.SERVICE_STATUS_RUNNING),
                 "worker_count": int(mount.worker_count),
-                "alive_workers": int(mount.worker_count if mount.managed_globals_ready else 0),
+                "alive_workers": int(mount.worker_count),
                 "in_flight": 0,
                 "lease_expire_at": lease_expire_at,
                 "http_base_url": mount.http_base_url,
@@ -763,13 +755,6 @@ class NodeRuntimeBase:
         mount = self._mounted_service(service_id)
         if mount is None:
             return 404, {"ok": False, "error": "service not found"}
-        if not mount.managed_globals_ready:
-            return 409, {
-                "ok": False,
-                "error": "service waiting for managed globals",
-                "status": int(pb2.SERVICE_STATUS_STARTING),
-                "missing_managed_globals": list(mount.managed_global_names),
-            }
         return mount.invoke_handler(
             method,
             payload,
@@ -791,16 +776,8 @@ class NodeRuntimeBase:
             "service": {
                 "service_id": mount.service_id,
                 "service_name": mount.service_name,
-                "status": int(
-                    pb2.SERVICE_STATUS_RUNNING
-                    if mount.managed_globals_ready
-                    else pb2.SERVICE_STATUS_STARTING
-                ),
-                "status_text": pb2.ServiceStatus.Name(
-                    pb2.SERVICE_STATUS_RUNNING
-                    if mount.managed_globals_ready
-                    else pb2.SERVICE_STATUS_STARTING
-                ),
+                "status": int(pb2.SERVICE_STATUS_RUNNING),
+                "status_text": pb2.ServiceStatus.Name(pb2.SERVICE_STATUS_RUNNING),
                 "http_base_url": mount.http_base_url,
                 "managed_global_names": list(mount.managed_global_names),
                 "managed_globals_digest": mount.globals_digest,

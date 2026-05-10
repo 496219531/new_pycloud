@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, List, Optional, Sequence, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
 
 from pycloud_parallel.controlplane.artifact import (
     _default_entry_module_for_module,
@@ -66,6 +66,22 @@ def prepare_deployment_artifact(
     return _prepare_artifact(normalized_artifact, consumer_kind=consumer_kind)
 
 
+def normalize_initial_globals(
+    initial_globals: Optional[Dict[str, object]],
+    managed_global_names: Optional[Sequence[str]],
+) -> Tuple[Dict[str, object], Tuple[str, ...]]:
+    values = dict(initial_globals or {})
+    names = [str(name).strip() for name in (managed_global_names or ()) if str(name).strip()]
+    if values:
+        known = set(names)
+        for name in values:
+            normalized_name = str(name).strip()
+            if normalized_name and normalized_name not in known:
+                names.append(normalized_name)
+                known.add(normalized_name)
+    return values, tuple(names)
+
+
 def dispatch_create_requests(
     nodes: Sequence[TNode],
     *,
@@ -101,5 +117,6 @@ def dispatch_create_requests(
 __all__ = [
     "CreateDispatchResult",
     "dispatch_create_requests",
+    "normalize_initial_globals",
     "prepare_deployment_artifact",
 ]

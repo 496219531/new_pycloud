@@ -678,30 +678,69 @@ class NodeControlState(NodeRuntimeBase):
         _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
         return state.globals_digest, sorted(updated_names)
 
-    @staticmethod
-    def _updated_names_cover_managed_globals(declared_names: Sequence[str], updated_names: Sequence[str]) -> bool:
-        required = set(_normalize_managed_global_names(declared_names))
-        updated = set(str(name).strip() for name in (updated_names or ()) if str(name).strip())
-        return not required or required.issubset(updated)
-
-    def _service_managed_globals_ready_locked(self, session: ServiceSession) -> bool:
-        required = set(_normalize_managed_global_names(session.managed_global_names))
-        if not required:
-            return True
-        if not str(session.managed_globals_scope_dir or "").strip():
-            return False
-        state = ManagedGlobalsState(
-            scope_kind="service",
-            scope_key=session.service_id,
-            scope_dir=session.managed_globals_scope_dir,
-            allowed_names=tuple(sorted(required)),
-            globals_digest=session.managed_globals_digest,
+    def _warmup_service_managed_globals(
+        self,
+        *,
+        artifact: CodeArtifact,
+        service_id: str,
+        worker_count: int,
+        method_name: str,
+        state: ManagedGlobalsState,
+        globals_digest: str,
+    ) -> None:
+        executor_host = self._executor_host
+        if executor_host is None:
+            return
+        execute_spec = _build_execute_spec(
+            artifact,
+            object_dir=self._object_dir,
+            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+            method_name=method_name,
+            payload={},
+            payload_mode="http_call",
+            managed_globals_scope_dir=state.scope_dir,
+            managed_globals_digest=globals_digest,
+            warmup_only=True,
         )
-        try:
-            current_values = _load_managed_globals_snapshot_serialized(state)
-        except Exception:
-            return False
-        return required.issubset(set(str(name).strip() for name in current_values if str(name).strip()))
+        self._execute_warmup(
+            executor_host=executor_host,
+            scope="service",
+            key=service_id,
+            worker_count=worker_count,
+            execute_spec=execute_spec,
+        )
+
+    def _warmup_pool_managed_globals(
+        self,
+        *,
+        artifact: CodeArtifact,
+        pool_id: str,
+        worker_count: int,
+        method_name: str,
+        state: ManagedGlobalsState,
+        globals_digest: str,
+    ) -> None:
+        executor_host = self._executor_host
+        if executor_host is None:
+            return
+        execute_spec = _build_execute_spec(
+            artifact,
+            object_dir=self._object_dir,
+            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+            method_name=method_name,
+            payload={},
+            payload_mode="task_submit",
+            managed_globals_scope_dir=state.scope_dir,
+            managed_globals_digest=globals_digest,
+            warmup_only=True,
+        )
+        self._execute_warmup(
+            executor_host=executor_host,
+            scope="pool",
+            key=pool_id,
+            worker_count=worker_count,
+            execute_spec=execute_spec,
+        )
 
     def _register_client_code_token_locked(
         self,
@@ -2018,6 +2057,7 @@ class NodeControlState(NodeRuntimeBase):
         dependency_policy_mode: str = "",
         dependency_allowlist: Sequence[str] = (),
         managed_global_names: Sequence[str] = (),
+        initial_globals: Optional[Dict[str, Any]] = None,
         policy_id: str = "",
         worker_count: int,
         heartbeat_timeout_sec: int,
@@ -2030,7 +2070,9 @@ class NodeControlState(NodeRuntimeBase):
             raise RuntimeError("node instance execution is fenced; restart NodeControl to create a new node_instance_id")
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
-        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
+        normalized_managed_global_names = _normalize_managed_global_names(
+            [*(managed_global_names or ()), *((initial_globals or {}).keys())]
+        )
         service_id = str(service_id or "").strip() or uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
         effective_service_name = str(service_name or f"service-{service_id[:8]}").strip() or f"service-{service_id[:8]}"
@@ -2085,11 +2127,7 @@ class NodeControlState(NodeRuntimeBase):
         actual_idle_ttl = max(0, idle_ttl_sec)
         now = utc_now()
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
-        initial_status = (
-            pb2.SERVICE_STATUS_STARTING
-            if normalized_managed_global_names
-            else pb2.SERVICE_STATUS_RUNNING
-        )
+        initial_status = pb2.SERVICE_STATUS_RUNNING
 
         with self._lock:
             self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
@@ -2159,6 +2197,20 @@ class NodeControlState(NodeRuntimeBase):
             )
             managed_state = self._ensure_service_managed_globals_state_locked(session)
             if managed_state is not None:
+                if initial_globals:
+                    globals_digest, _updated_names = self._update_managed_globals_state(
+                        managed_state,
+                        values=dict(initial_globals),
+                    )
+                    managed_state.globals_digest = globals_digest
+                    self._warmup_service_managed_globals(
+                        artifact=artifact,
+                        service_id=service_id,
+                        worker_count=actual_workers,
+                        method_name=next(iter(method_info.keys()), artifact.entry_callable),
+                        state=managed_state,
+                        globals_digest=globals_digest,
+                    )
                 session.managed_globals_scope_dir = managed_state.scope_dir
                 session.managed_globals_digest = managed_state.globals_digest
             with self._lock:
@@ -2232,6 +2284,7 @@ class NodeControlState(NodeRuntimeBase):
         dependency_policy_mode: str = "",
         dependency_allowlist: Sequence[str] = (),
         managed_global_names: Sequence[str] = (),
+        initial_globals: Optional[Dict[str, Any]] = None,
         worker_count: int,
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
@@ -2241,7 +2294,9 @@ class NodeControlState(NodeRuntimeBase):
             raise RuntimeError("node instance execution is fenced; restart NodeControl to create a new node_instance_id")
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
-        normalized_managed_global_names = _normalize_managed_global_names(managed_global_names)
+        normalized_managed_global_names = _normalize_managed_global_names(
+            [*(managed_global_names or ()), *((initial_globals or {}).keys())]
+        )
         pool_id = uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
         try:
@@ -2372,6 +2427,20 @@ class NodeControlState(NodeRuntimeBase):
                 allowed_names=pool.managed_global_names,
             )
             if managed_state is not None:
+                if initial_globals:
+                    globals_digest, _updated_names = self._update_managed_globals_state(
+                        managed_state,
+                        values=dict(initial_globals),
+                    )
+                    managed_state.globals_digest = globals_digest
+                    self._warmup_pool_managed_globals(
+                        artifact=artifact,
+                        pool_id=pool_id,
+                        worker_count=actual_workers,
+                        method_name=str(entry_callable or "run").strip() or "run",
+                        state=managed_state,
+                        globals_digest=globals_digest,
+                    )
                 pool.managed_globals_scope_dir = managed_state.scope_dir
                 pool.managed_globals_digest = managed_state.globals_digest
             with self._lock:
@@ -2850,17 +2919,6 @@ class NodeControlState(NodeRuntimeBase):
             if session is None:
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
-                if (
-                    session.status == pb2.SERVICE_STATUS_STARTING
-                    and session.managed_global_names
-                    and not self._service_managed_globals_ready_locked(session)
-                ):
-                    return 409, {
-                        "ok": False,
-                        "error": "service waiting for managed globals",
-                        "status": int(session.status),
-                        "missing_managed_globals": list(session.managed_global_names),
-                    }
                 return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
             if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
@@ -3104,17 +3162,6 @@ class NodeControlState(NodeRuntimeBase):
             if session is None:
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
-                if (
-                    session.status == pb2.SERVICE_STATUS_STARTING
-                    and session.managed_global_names
-                    and not self._service_managed_globals_ready_locked(session)
-                ):
-                    return 409, {
-                        "ok": False,
-                        "error": "service waiting for managed globals",
-                        "status": int(session.status),
-                        "missing_managed_globals": list(session.managed_global_names),
-                    }
                 return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
             if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
@@ -3354,47 +3401,33 @@ class NodeControlState(NodeRuntimeBase):
             )
             session.managed_globals_scope_dir = state.scope_dir
             session.managed_globals_digest = globals_digest
-            if (
-                session.status == pb2.SERVICE_STATUS_STARTING
-                and self._updated_names_cover_managed_globals(session.managed_global_names, updated_names)
-            ):
-                session.status = pb2.SERVICE_STATUS_RUNNING
             executor_host = self._executor_host
             service_id = session.service_id
             worker_count = session.worker_count
             service_executor_ready = bool(session.is_running() and session.executor_ready)
         if artifact is None or executor_host is None or not service_executor_ready:
             return globals_digest, updated_names
-        execute_spec = _build_execute_spec(
-            artifact,
-            object_dir=self._object_dir,
-            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-            method_name=next(iter(session.methods.keys()), artifact.entry_callable),
-            payload={},
-            payload_mode="http_call",
-            managed_globals_scope_dir=state.scope_dir,
-            managed_globals_digest=globals_digest,
-            warmup_only=True,
-        )
         try:
-            self._execute_warmup(
-                executor_host=executor_host,
-                scope="service",
-                key=service_id,
+            self._warmup_service_managed_globals(
+                artifact=artifact,
+                service_id=service_id,
                 worker_count=worker_count,
-                execute_spec=execute_spec,
+                method_name=next(iter(session.methods.keys()), artifact.entry_callable),
+                state=state,
+                globals_digest=globals_digest,
             )
         except RuntimeError as exc:
             message = str(exc)
             if "service executor" not in message:
                 raise
             executor_host.create_service(service_id=service_id, worker_count=worker_count)
-            self._execute_warmup(
-                executor_host=executor_host,
-                scope="service",
-                key=service_id,
+            self._warmup_service_managed_globals(
+                artifact=artifact,
+                service_id=service_id,
                 worker_count=worker_count,
-                execute_spec=execute_spec,
+                method_name=next(iter(session.methods.keys()), artifact.entry_callable),
+                state=state,
+                globals_digest=globals_digest,
             )
         return globals_digest, updated_names
 
@@ -3445,25 +3478,15 @@ class NodeControlState(NodeRuntimeBase):
             worker_count = int(pool.worker_count if pool is not None else self.worker_capacity)
         if artifact is None or executor_host is None:
             return globals_digest, updated_names
-        execute_spec = _build_execute_spec(
-            artifact,
-            object_dir=self._object_dir,
-            work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-            method_name=artifact.entry_callable,
-            payload={},
-            payload_mode="task_submit",
-            managed_globals_scope_dir=state.scope_dir,
-            managed_globals_digest=globals_digest,
-            warmup_only=True,
-        )
         warmup_started = time.monotonic()
         if pool is not None:
-            self._execute_warmup(
-                executor_host=executor_host,
-                scope="pool",
-                key=pool.pool_id,
+            self._warmup_pool_managed_globals(
+                artifact=artifact,
+                pool_id=pool.pool_id,
                 worker_count=worker_count,
-                execute_spec=execute_spec,
+                method_name=artifact.entry_callable,
+                state=state,
+                globals_digest=globals_digest,
             )
             with self._lock:
                 current_pool = self._task_pools.get(pool.pool_id)
@@ -3474,6 +3497,17 @@ class NodeControlState(NodeRuntimeBase):
                         elapsed_ms=(time.monotonic() - warmup_started) * 1000.0,
                     )
         else:
+            execute_spec = _build_execute_spec(
+                artifact,
+                object_dir=self._object_dir,
+                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                method_name=artifact.entry_callable,
+                payload={},
+                payload_mode="task_submit",
+                managed_globals_scope_dir=state.scope_dir,
+                managed_globals_digest=globals_digest,
+                warmup_only=True,
+            )
             self._execute_warmup(
                 executor_host=executor_host,
                 scope="runtime",

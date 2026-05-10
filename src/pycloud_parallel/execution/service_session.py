@@ -81,6 +81,7 @@ from pycloud_parallel.execution.failover import (
 from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
+    normalize_initial_globals,
     prepare_deployment_artifact,
 )
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
@@ -1974,6 +1975,7 @@ class Service(ServiceExecutionSession):
                         export_methods=list(spec.get("export_methods") or ()),
                         deps=spec.get("deps"),
                         managed_global_names=list(spec.get("managed_global_names") or ()),
+                        initial_globals=dict(spec.get("initial_globals") or {}),
                         policy_id=str(spec.get("policy_id", "") or ""),
                         worker_count=node_worker_count,
                         heartbeat_timeout_sec=max(5, int(spec.get("heartbeat_timeout_sec", 30) or 30)),
@@ -2041,6 +2043,7 @@ class Service(ServiceExecutionSession):
         runtime: str = "py3",
         package_format: str = "",
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         tags: Optional[Sequence[str]] = None,
         metadata: Optional[Dict[str, str]] = None,
         queue_capacity: int = 0,
@@ -2068,6 +2071,7 @@ class Service(ServiceExecutionSession):
             raise ValueError("Service.startup() requires entry_module=... or source=module")
         effective_service_name = str(service_name or module_name.rsplit(".", 1)[-1] or "startup-service").strip()
         effective_node_id = str(node_id or f"{effective_service_name}-startup").strip()
+        initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
         service_http_bind = "0.0.0.0:0" if bind is None else str(bind).strip()
         normalized_package_format = str(package_format or "").strip().lower()
         direct_module_mount = normalized_package_format == "module" or (
@@ -2087,7 +2091,7 @@ class Service(ServiceExecutionSession):
                 entry_callable=entry_callable,
                 package_format=package_format,
                 exports=ArtifactExports.explicit(export_methods) if export_methods else ArtifactExports.export_all(),
-                managed_global_names=managed_global_names,
+                managed_global_names=effective_managed_global_names,
             )
             prepared_artifact = _prepare_artifact(
                 normalized_artifact,
@@ -2205,8 +2209,10 @@ class Service(ServiceExecutionSession):
                     service_id=service_id,
                     worker_count=effective_worker_count,
                     policy_id=policy_id or (get_default_policy_id_for_binding("service_internal") if local_mode else ""),
-                    managed_global_names=managed_global_names or (),
+                    managed_global_names=effective_managed_global_names,
                 )
+                if initial_globals_values:
+                    node.update_globals(initial_globals_values, service_id=service_id, service_name=effective_service_name)
             else:
                 node.mount_prepared_service(
                     owner_client_id=f"{effective_node_id}-owner",
@@ -2222,6 +2228,7 @@ class Service(ServiceExecutionSession):
                     dependency_policy_mode=prepared_artifact.dependency_policy_mode,
                     dependency_allowlist=list(prepared_artifact.dependency_allowlist),
                     managed_global_names=list(prepared_artifact.managed_global_names),
+                    initial_globals=initial_globals_values,
                     policy_id=policy_id or (get_default_policy_id_for_binding("service_internal") if local_mode else ""),
                     worker_count=effective_worker_count,
                     heartbeat_timeout_sec=max(5, int(heartbeat_sec or 5) * 3),
@@ -2266,6 +2273,7 @@ class Service(ServiceExecutionSession):
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2274,6 +2282,7 @@ class Service(ServiceExecutionSession):
     ):
         del serialization_mode, chunk_size, timeout_sec
         from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+        initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
 
         module_source = source if inspect.ismodule(source) else None
         normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
@@ -2296,7 +2305,7 @@ class Service(ServiceExecutionSession):
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            managed_global_names=managed_global_names,
+            managed_global_names=effective_managed_global_names,
         )
         prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="service")
         effective_entry_module = prepared_artifact.entry_module
@@ -2334,6 +2343,7 @@ class Service(ServiceExecutionSession):
                 dependency_policy_mode=prepared_artifact.dependency_policy_mode,
                 dependency_allowlist=list(prepared_artifact.dependency_allowlist),
                 managed_global_names=list(prepared_artifact.managed_global_names),
+                initial_globals=initial_globals_values,
                 policy_id=get_default_policy_id_for_binding("service_internal"),
                 worker_count=effective_worker_count,
                 heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
@@ -2363,6 +2373,7 @@ class Service(ServiceExecutionSession):
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2404,6 +2415,7 @@ class Service(ServiceExecutionSession):
                 serialization_mode=serialization_mode,
                 resource_paths=resource_paths,
                 managed_global_names=managed_global_names,
+                initial_globals=initial_globals,
                 worker_count=worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
@@ -2426,6 +2438,7 @@ class Service(ServiceExecutionSession):
             serialization_mode=serialization_mode,
             resource_paths=resource_paths,
             managed_global_names=managed_global_names,
+            initial_globals=initial_globals,
             worker_count=worker_count,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             idle_ttl_sec=idle_ttl_sec,
@@ -2570,6 +2583,7 @@ class Service(ServiceExecutionSession):
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
+        initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 10,
         heartbeat_timeout_sec: int = 30,
         idle_ttl_sec: int = 0,
@@ -2637,6 +2651,7 @@ class Service(ServiceExecutionSession):
             Service: 部署的服务组
         """
         effective_api_token = _resolve_owner_api_token(api_token)
+        initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
         prepared_artifact = prepare_deployment_artifact(
             consumer_kind="service",
             source=source,
@@ -2646,7 +2661,7 @@ class Service(ServiceExecutionSession):
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
-            managed_global_names=managed_global_names,
+            managed_global_names=effective_managed_global_names,
             resource_paths=resource_paths,
         )
         effective_blob = prepared_artifact.blob
@@ -3093,6 +3108,7 @@ class Service(ServiceExecutionSession):
                         export_methods=export_methods,
                         deps=prepared_artifact.dependency_policy,
                         managed_global_names=managed_global_names,
+                        initial_globals=initial_globals_values,
                         policy_id=normalized_policy_id,
                         worker_count=node_worker_count,
                         heartbeat_timeout_sec=heartbeat_timeout_sec,
@@ -3185,6 +3201,7 @@ class Service(ServiceExecutionSession):
                     "export_methods": export_methods,
                     "deps": prepared_artifact.dependency_policy,
                     "managed_global_names": managed_global_names,
+                    "initial_globals": dict(initial_globals_values),
                     "policy_id": normalized_policy_id,
                     "worker_count": worker_count,
                     "heartbeat_timeout_sec": heartbeat_timeout_sec,

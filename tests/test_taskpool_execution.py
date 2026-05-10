@@ -337,6 +337,31 @@ def test_task_pool_open_local_applies_managed_globals(tmp_path) -> None:
         assert items[0].result == {"value": 12}
 
 
+def test_task_pool_open_local_initial_globals(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"cfg = {}\n\n"
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) + int(cfg.get('offset', 0))}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_initial_globals",
+            entry_callable="run",
+        ),
+        initial_globals={"cfg": {"offset": 9}},
+        worker_count=1,
+    ) as pool:
+        items = list(pool.imap_unordered([{"value": 5}], timeout_sec=10.0, return_items=True))
+        assert items[0].ok is True
+        assert items[0].result == {"value": 14}
+
+
 def test_task_pool_open_local_includes_resource_paths(tmp_path, monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
