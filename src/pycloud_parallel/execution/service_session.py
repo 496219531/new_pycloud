@@ -2041,7 +2041,7 @@ class Service(ServiceExecutionSession):
         worker_count: int = 1,
         policy_id: str = "",
         runtime: str = "py3",
-        package_format: str = "",
+        package_format: str = "module",
         managed_global_names: Optional[Sequence[str]] = None,
         initial_globals: Optional[Dict[str, object]] = None,
         tags: Optional[Sequence[str]] = None,
@@ -2055,9 +2055,11 @@ class Service(ServiceExecutionSession):
     ):
         """Product-facing startup-mounted service action.
 
-        Use this when a process should expose a fixed Python module as a
-        service at startup time while reusing the normal NodeControl service
-        executor path.
+        This path is module-first: prefer passing a live Python module object
+        (or `package_format="module"`) so startup can mount it directly and
+        keep local behavior close to the runtime service shape.
+
+        Use `deploy()` when you want the upload/artifact path instead.
         """
         from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 

@@ -96,21 +96,36 @@ def test_pickle_stable_v1_uses_compact_datetime_index_schema():
     assert restored_index.equals(index)
 
 
-def test_pickle_stable_v1_rejects_dataframe_object_dtype():
-    frame = pd.DataFrame({"a": [{"x": 1}]})
-    try:
-        stable_pickle_dumps(frame)
-    except TypeError as exc:
-        assert "dtype" in str(exc)
-    else:
-        raise AssertionError("expected TypeError")
+def test_pickle_stable_v1_roundtrips_dataframe_object_dtype():
+    frame = pd.DataFrame(
+        {
+            "param": ["参数", "strategy"],
+            "value": [{"window": 20}, ["a", "b"]],
+            "score": [1.5, 2.5],
+        }
+    )
+
+    normalized = normalize_for_pickle_stable(frame)
+    restored = stable_pickle_loads(stable_pickle_dumps(frame))
+
+    assert normalized["data"][0]["values"]["__codec__"] == "np.ndarray.object.v1"
+    assert restored.equals(frame)
 
 
-def test_pickle_stable_v1_rejects_ndarray_object_dtype():
+def test_pickle_stable_v1_roundtrips_series_object_dtype():
+    series = pd.Series(["中文", {"x": 1}, ["a", "b"]], name="value")
+
+    normalized = normalize_for_pickle_stable(series)
+    restored = stable_pickle_loads(stable_pickle_dumps(series))
+
+    assert normalized["values"]["__codec__"] == "np.ndarray.object.v1"
+    assert restored.equals(series)
+
+
+def test_pickle_stable_v1_roundtrips_ndarray_object_dtype():
     array = np.array([{"x": 1}], dtype=object)
-    try:
-        stable_pickle_dumps(array)
-    except TypeError as exc:
-        assert "dtype" in str(exc)
-    else:
-        raise AssertionError("expected TypeError")
+    normalized = normalize_for_pickle_stable(array)
+    restored = stable_pickle_loads(stable_pickle_dumps(array))
+
+    assert normalized["__codec__"] == "np.ndarray.object.v1"
+    assert np.array_equal(restored, array)

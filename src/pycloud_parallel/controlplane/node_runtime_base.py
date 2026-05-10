@@ -350,6 +350,47 @@ class NodeRuntimeBase:
                 if name in param_names and name not in effective_payload:
                     effective_payload[name] = value
             data = _invoke_python_callable(fn, effective_payload, params=method_params.get(method_name))
+            if stream_response:
+                inline_result_limit_bytes = get_payload_policy("result").inline_result_hard_limit_bytes
+
+                def _iter_stream():
+                    item_count = 0
+                    try:
+                        if inspect.isgenerator(data):
+                            for item in data:
+                                yield self._encode_checked_stream_item_line(
+                                    {
+                                        "event": "item",
+                                        "index": item_count,
+                                        "data": {} if item is None else item,
+                                    },
+                                    inline_result_limit_bytes=inline_result_limit_bytes,
+                                )
+                                item_count += 1
+                        else:
+                            yield self._encode_checked_stream_item_line(
+                                {
+                                    "event": "item",
+                                    "index": 0,
+                                    "data": {} if data is None else data,
+                                },
+                                inline_result_limit_bytes=inline_result_limit_bytes,
+                            )
+                            item_count = 1
+                    except Exception as exc:
+                        yield self._encode_stream_line(
+                            {
+                                "event": "done",
+                                "ok": False,
+                                "item_count": item_count,
+                                "error_type": type(exc).__name__,
+                                "error": repr(exc),
+                            }
+                        )
+                        return
+                    yield self._encode_stream_line({"event": "done", "ok": True, "item_count": item_count})
+
+                return StreamingHttpResponse(status_code=200, body_iter=_iter_stream())
             if isinstance(data, dict) and data.get("__pycloud_raw_response__", False):
                 raw = dict(data)
                 raw.pop("__pycloud_raw_response__", None)

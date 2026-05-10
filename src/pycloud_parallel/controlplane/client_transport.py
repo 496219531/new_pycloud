@@ -288,6 +288,8 @@ def _restore_stream_transport_carrier(value: Any) -> Any:
             meta["content_bytes"] = _restore_blob_from_json_transport(content_bytes)
         return {INLINE_TRANSPORT_CARRIER_SENTINEL: meta}
     if isinstance(value, dict):
+        if "__type__" in value or "__pycloud_data_ref__" in value:
+            return convert_dict_to_arrow(value)
         return {key: _restore_stream_transport_carrier(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_restore_stream_transport_carrier(item) for item in value]

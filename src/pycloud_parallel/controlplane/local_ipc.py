@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.config import OBJECT_SEGMENT_MAX_BYTES, get_local_service_payload_policy
+from pycloud_parallel.controlplane.client_transport import _restore_stream_transport_carrier
 from pycloud_parallel.controlplane.node.results import (
     _commit_result_file,
     _commit_result_segment,
@@ -490,7 +491,7 @@ def _stream_once(meta: Dict[str, object], request: Dict[str, object], *, timeout
             event = conn.recv()
             if not isinstance(event, dict):
                 raise RuntimeError(f"invalid local service IPC stream event: {type(event).__name__}")
-            yield event
+            yield _restore_stream_transport_carrier(event)
             if str(event.get("event", "") or "") == "done":
                 return
     finally:

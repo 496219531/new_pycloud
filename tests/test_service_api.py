@@ -826,7 +826,7 @@ def test_service_startup_explicit_package_format_keeps_prepared_service_path(tmp
         node.close()
 
 
-def test_service_startup_local_proxy_calls_executor_without_http(tmp_path, monkeypatch):
+def test_service_startup_local_proxy_calls_module_without_http(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_local_proxy_service.py"
     module_path.write_text(
         "def add(x=0, y=0):\n"
@@ -854,7 +854,7 @@ def test_service_startup_local_proxy_calls_executor_without_http(tmp_path, monke
         node.close()
 
 
-def test_service_startup_local_proxy_streams_from_executor(tmp_path, monkeypatch):
+def test_service_startup_local_proxy_streams(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_local_stream_service.py"
     module_path.write_text(
         "def count(limit=3):\n"
@@ -874,6 +874,42 @@ def test_service_startup_local_proxy_streams_from_executor(tmp_path, monkeypatch
     )
     try:
         assert list(node.count.stream(limit=3)) == [1, 2, 3]
+    finally:
+        node.close()
+
+
+def test_service_startup_local_sync_and_stream_share_invoke_helper(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_local_shared_invoke_service.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n\n"
+        "def count(limit=3):\n"
+        "    for value in range(1, int(limit) + 1):\n"
+        "        yield value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="startup-local-shared-invoke",
+        entry_module="startup_local_shared_invoke_service",
+        export_methods=("add", "count"),
+        worker_count=1,
+    )
+    calls = []
+    original = node._invoke_local_startup_service  # noqa: SLF001
+
+    def _tracking_invoke(*args, **kwargs):
+        calls.append(bool(kwargs.get("stream_response", False)))
+        return original(*args, **kwargs)
+
+    node._invoke_local_startup_service = _tracking_invoke  # type: ignore[method-assign]  # noqa: SLF001
+    try:
+        assert node.add.sync(x=2, y=5) == {"value": 7}
+        assert list(node.count.stream(limit=2)) == [1, 2]
+        assert calls == [False, True]
     finally:
         node.close()
 
@@ -937,6 +973,23 @@ def test_service_deploy_local_returns_direct_proxy(tmp_path, monkeypatch):
         service.close()
 
 
+def test_service_deploy_local_keeps_artifact_service_path(tmp_path, monkeypatch):
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+
+    service = Service.deploy(
+        target="local",
+        service_name="deploy-local-artifact-path",
+        source=worker_module,
+        worker_count=1,
+    )
+    try:
+        assert service._services  # noqa: SLF001
+        assert service._startup_services == {}  # noqa: SLF001
+        assert service.run.sync(value=3) == {"value": 3}
+    finally:
+        service.close()
+
+
 def test_service_connect_local_streams_via_ipc(tmp_path, monkeypatch):
     monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
     module_path = tmp_path / "connect_local_stream_service.py"
@@ -963,6 +1016,80 @@ def test_service_connect_local_streams_via_ipc(tmp_path, monkeypatch):
             client.close()
     finally:
         service.close()
+
+
+def test_service_connect_local_startup_module_streams_via_ipc(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc-startup"))
+    module_path = tmp_path / "connect_local_startup_stream_service.py"
+    module_path.write_text(
+        "def ping():\n"
+        "    return {'ok': True, 'service': 'startup'}\n\n"
+        "def chunks(limit=3):\n"
+        "    for value in range(1, int(limit) + 1):\n"
+        "        yield {'value': value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="connect-local-startup-stream",
+        entry_module="connect_local_startup_stream_service",
+        export_methods=("ping", "chunks"),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(target="local", service_name="connect-local-startup-stream", timeout_sec=5.0)
+        try:
+            assert client.call_sync("ping") == {"ok": True, "service": "startup"}
+            assert list(client.stream_call("chunks", {"limit": 3}, timeout_sec=5.0)) == [
+                {"value": 1},
+                {"value": 2},
+                {"value": 3},
+            ]
+        finally:
+            client.close()
+    finally:
+        node.close()
+
+
+def test_service_connect_local_startup_stream_restores_dataframe_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc-startup-df"))
+    module_path = tmp_path / "connect_local_startup_stream_dataframe_service.py"
+    module_path.write_text(
+        "import pandas as pd\n\n"
+        "def frames():\n"
+        "    frame = pd.DataFrame({'param': ['参数', 'strategy'], 'value': ['窗口', 'demo']})\n"
+        "    yield {'chunk': frame, 'meta': {'rows': len(frame)}}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="connect-local-startup-stream-dataframe",
+        entry_module="connect_local_startup_stream_dataframe_service",
+        export_methods=("frames",),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(target="local", service_name="connect-local-startup-stream-dataframe", timeout_sec=5.0)
+        try:
+            items = list(client.stream_call("frames", {}, timeout_sec=5.0))
+        finally:
+            client.close()
+    finally:
+        node.close()
+
+    import pandas as pd
+
+    assert len(items) == 1
+    assert isinstance(items[0], dict)
+    assert items[0]["meta"] == {"rows": 2}
+    assert isinstance(items[0]["chunk"], pd.DataFrame)
+    assert items[0]["chunk"].equals(pd.DataFrame({"param": ["参数", "strategy"], "value": ["窗口", "demo"]}))
 
 
 def test_service_connect_local_fetches_large_result_dataref_via_ipc(tmp_path, monkeypatch):

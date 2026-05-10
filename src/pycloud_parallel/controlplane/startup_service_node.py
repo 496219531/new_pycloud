@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from pycloud_parallel.controlplane.client_transport import _restore_stream_transport_carrier
+from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
 from pycloud_parallel.execution.call_proxy import _CallProxy
@@ -183,6 +184,73 @@ class StartupServiceNode(NodeControlState):
             )
         return _CallProxy(method=name, group=self, timeout_sec=60.0, refresh_status=False)
 
+    def _resolve_local_startup_service_id(self) -> str:
+        service_id = str(self._local_service_id or "").strip()
+        if service_id and (
+            self._mounted_service(service_id) is not None
+            or service_id in getattr(self, "_services", {})
+        ):
+            return service_id
+        service_name = str(self._local_service_name or "").strip()
+        if service_name:
+            for mount in getattr(self, "_startup_services", {}).values():
+                if str(getattr(mount, "service_name", "") or "").strip() == service_name:
+                    return str(getattr(mount, "service_id", "") or "").strip()
+            for session in getattr(self, "_services", {}).values():
+                if str(getattr(session, "service_name", "") or "").strip() == service_name:
+                    return str(getattr(session, "service_id", "") or "").strip()
+        startup_services = list(getattr(self, "_startup_services", {}).values())
+        if len(startup_services) == 1:
+            return str(getattr(startup_services[0], "service_id", "") or "").strip()
+        runtime_services = list(getattr(self, "_services", {}).values())
+        if len(runtime_services) == 1:
+            return str(getattr(runtime_services[0], "service_id", "") or "").strip()
+        return service_id
+
+    def _invoke_local_startup_service(
+        self,
+        method: str,
+        payload: dict,
+        *,
+        timeout_sec: float,
+        serialization_mode: str,
+        stream_response: bool,
+    ):
+        if not self._local_service_id:
+            raise RuntimeError("startup service is not mounted")
+        normalized_payload = dict(payload or {})
+        service_id = self._resolve_local_startup_service_id()
+        mounted_service = self._mounted_service(service_id)
+        if mounted_service is not None:
+            return self._invoke_mounted_startup_service(
+                service_id,
+                method=method,
+                payload=normalized_payload,
+                service_token=self._local_service_token,
+                timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
+                use_transport_result=stream_response,
+                stream_response=stream_response,
+            )
+        if stream_response:
+            return self._invoke_service_stream_http(
+                service_id=service_id,
+                method=method,
+                payload=normalized_payload,
+                service_token=self._local_service_token,
+                timeout_sec=timeout_sec,
+                serialization_mode=serialization_mode,
+                use_transport_result=True,
+            )
+        return self.call_service(
+            service_id=service_id,
+            method=method,
+            payload=normalized_payload,
+            service_token=self._local_service_token,
+            timeout_sec=timeout_sec,
+            serialization_mode=serialization_mode,
+        )
+
     def call_balanced(
         self,
         method: str,
@@ -195,26 +263,13 @@ class StartupServiceNode(NodeControlState):
     ):
         serialization_mode = str(kwargs.pop("serialization_mode", "") or "")
         del strategy, refresh_status, kwargs
-        if not self._local_service_id:
-            raise RuntimeError("startup service is not mounted")
-        if self._mounted_service(self._local_service_id) is not None:
-            status, body = self._invoke_mounted_startup_service(
-                self._local_service_id,
-                method,
-                dict(payload or {}),
-                self._local_service_token,
-                timeout_sec,
-                serialization_mode,
-            )
-        else:
-            status, body = self.call_service(
-                service_id=self._local_service_id,
-                method=method,
-                payload=dict(payload or {}),
-                service_token=self._local_service_token,
-                timeout_sec=timeout_sec,
-                serialization_mode=serialization_mode,
-            )
+        status, body = self._invoke_local_startup_service(
+            method,
+            payload,
+            timeout_sec=timeout_sec,
+            serialization_mode=serialization_mode,
+            stream_response=False,
+        )
         if int(status) >= 400 or not bool(body.get("ok", False)):
             raise RuntimeError(str(body.get("error") or body.get("error_type") or "startup service call failed"))
         return str(self.node_instance_id or self.node_id or "startup"), body
@@ -256,20 +311,18 @@ class StartupServiceNode(NodeControlState):
         serialization_mode: str = "",
     ):
         del strategy, refresh_status
-        if not self._local_service_id:
-            raise RuntimeError("startup service is not mounted")
-        handled = self._invoke_service_stream_http(
-            service_id=self._local_service_id,
-            method=method,
-            payload=dict(payload or {}),
-            service_token=self._local_service_token,
+        handled = self._invoke_local_startup_service(
+            method,
+            payload,
             timeout_sec=timeout_sec,
             serialization_mode=serialization_mode,
-            use_transport_result=True,
+            stream_response=True,
         )
         if isinstance(handled, tuple):
             status, body = handled
             raise RuntimeError(str(body.get("error") or f"startup service stream failed status={status}"))
+        if not isinstance(handled, StreamingHttpResponse):
+            raise RuntimeError("startup service stream failed: invalid streaming response")
 
         node_id = str(self.node_instance_id or self.node_id or "startup")
         for raw_line in handled.body_iter:

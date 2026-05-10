@@ -47,12 +47,28 @@ def _is_supported_ndarray_dtype(arr: Any) -> bool:
     return kind != "O"
 
 
+def _encode_python_values_v1(values: Any) -> dict[str, Any]:
+    return {
+        "__codec__": "py.values.v1",
+        "data": [normalize_for_pickle_stable(value) for value in list(values)],
+    }
+
+
+def _decode_python_values_v1(payload: Any) -> list[Any]:
+    return [restore_from_pickle_stable(value) for value in list(payload.get("data") or ())]
+
+
 def _encode_ndarray_v1(arr):
     import numpy as np
 
     array = np.asarray(arr)
     if not _is_supported_ndarray_dtype(array):
-        raise TypeError("pickle_stable_v1 does not support ndarray dtype=object")
+        return {
+            "__codec__": "np.ndarray.object.v1",
+            "dtype": str(array.dtype),
+            "shape": [int(dim) for dim in array.shape],
+            "data": _encode_python_values_v1(array.ravel(order="C").tolist()),
+        }
     order = "F" if array.flags.f_contiguous and not array.flags.c_contiguous else "C"
     contiguous = np.asfortranarray(array) if order == "F" else np.ascontiguousarray(array)
     return {
@@ -69,7 +85,9 @@ def _decode_ndarray_v1(payload):
 
     dtype = np.dtype(str(payload.get("dtype", "") or "float64"))
     if dtype.kind == "O":
-        raise TypeError("pickle_stable_v1 does not support ndarray dtype=object")
+        values = _decode_python_values_v1(dict(payload.get("data") or {}))
+        shape = tuple(int(dim) for dim in list(payload.get("shape") or ()))
+        return np.asarray(values, dtype=object).reshape(shape)
     shape = tuple(int(dim) for dim in list(payload.get("shape") or ()))
     order = str(payload.get("order", "C") or "C").strip().upper() or "C"
     if "data" in payload:
@@ -151,8 +169,6 @@ def _encode_series_v1(series):
     if not isinstance(series, pd.Series):
         raise TypeError(f"_encode_series_v1 expects Series, got {type(series).__name__}")
     values = np.asarray(series.to_numpy(copy=False))
-    if not _is_supported_ndarray_dtype(values):
-        raise TypeError("pickle_stable_v1 does not support Series with dtype=object")
     (_, _, _serialize_pandas_label, _) = _lazy_serialization_helpers()
     return {
         "__codec__": "pd.series.v1",
@@ -184,10 +200,6 @@ def _encode_dataframe_v1(df):
     for column in list(df.columns):
         series = df[column]
         values = np.asarray(series.to_numpy(copy=False))
-        if not _is_supported_ndarray_dtype(values):
-            raise TypeError(
-                f"pickle_stable_v1 does not support DataFrame object dtype column: {column!r}"
-            )
         columns.append(
             {
                 "name": _serialize_pandas_label(column, path="pickle_stable_v1.dataframe.columns"),
@@ -253,6 +265,10 @@ def restore_from_pickle_stable(obj: Any) -> Any:
         codec = str(obj.get("__codec__", "") or "").strip()
         if codec == "np.ndarray.v1":
             return _decode_ndarray_v1(obj)
+        if codec == "np.ndarray.object.v1":
+            return _decode_ndarray_v1(obj)
+        if codec == "py.values.v1":
+            return _decode_python_values_v1(obj)
         if codec == "pd.series.v1":
             return _decode_series_v1(obj)
         if codec == "pd.dataframe.v1":
