@@ -678,6 +678,31 @@ class NodeControlState(NodeRuntimeBase):
         _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
         return state.globals_digest, sorted(updated_names)
 
+    @staticmethod
+    def _updated_names_cover_managed_globals(declared_names: Sequence[str], updated_names: Sequence[str]) -> bool:
+        required = set(_normalize_managed_global_names(declared_names))
+        updated = set(str(name).strip() for name in (updated_names or ()) if str(name).strip())
+        return not required or required.issubset(updated)
+
+    def _service_managed_globals_ready_locked(self, session: ServiceSession) -> bool:
+        required = set(_normalize_managed_global_names(session.managed_global_names))
+        if not required:
+            return True
+        if not str(session.managed_globals_scope_dir or "").strip():
+            return False
+        state = ManagedGlobalsState(
+            scope_kind="service",
+            scope_key=session.service_id,
+            scope_dir=session.managed_globals_scope_dir,
+            allowed_names=tuple(sorted(required)),
+            globals_digest=session.managed_globals_digest,
+        )
+        try:
+            current_values = _load_managed_globals_snapshot_serialized(state)
+        except Exception:
+            return False
+        return required.issubset(set(str(name).strip() for name in current_values if str(name).strip()))
+
     def _register_client_code_token_locked(
         self,
         *,
@@ -2060,6 +2085,11 @@ class NodeControlState(NodeRuntimeBase):
         actual_idle_ttl = max(0, idle_ttl_sec)
         now = utc_now()
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
+        initial_status = (
+            pb2.SERVICE_STATUS_STARTING
+            if normalized_managed_global_names
+            else pb2.SERVICE_STATUS_RUNNING
+        )
 
         with self._lock:
             self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
@@ -2116,7 +2146,7 @@ class NodeControlState(NodeRuntimeBase):
                 expose_http=bool(expose_http),
                 service_token=token,
                 http_base_url=http_base,
-                status=pb2.SERVICE_STATUS_RUNNING,
+                status=initial_status,
                 created_at=now,
                 last_heartbeat_at=now,
                 lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
@@ -2820,6 +2850,17 @@ class NodeControlState(NodeRuntimeBase):
             if session is None:
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
+                if (
+                    session.status == pb2.SERVICE_STATUS_STARTING
+                    and session.managed_global_names
+                    and not self._service_managed_globals_ready_locked(session)
+                ):
+                    return 409, {
+                        "ok": False,
+                        "error": "service waiting for managed globals",
+                        "status": int(session.status),
+                        "missing_managed_globals": list(session.managed_global_names),
+                    }
                 return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
             if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
@@ -3063,6 +3104,17 @@ class NodeControlState(NodeRuntimeBase):
             if session is None:
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
+                if (
+                    session.status == pb2.SERVICE_STATUS_STARTING
+                    and session.managed_global_names
+                    and not self._service_managed_globals_ready_locked(session)
+                ):
+                    return 409, {
+                        "ok": False,
+                        "error": "service waiting for managed globals",
+                        "status": int(session.status),
+                        "missing_managed_globals": list(session.managed_global_names),
+                    }
                 return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
             if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
@@ -3302,6 +3354,11 @@ class NodeControlState(NodeRuntimeBase):
             )
             session.managed_globals_scope_dir = state.scope_dir
             session.managed_globals_digest = globals_digest
+            if (
+                session.status == pb2.SERVICE_STATUS_STARTING
+                and self._updated_names_cover_managed_globals(session.managed_global_names, updated_names)
+            ):
+                session.status = pb2.SERVICE_STATUS_RUNNING
             executor_host = self._executor_host
             service_id = session.service_id
             worker_count = session.worker_count
