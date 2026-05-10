@@ -332,7 +332,7 @@ group = Service.deploy(
 8. 如果 startup service 传入 `target` 并注册到 `InfoCenter`，它会参与 `service_name` 排他检查：动态服务已经占用同一个 `service_name` 时，startup service 必须拒绝启动
 9. 反过来，已注册 startup service 存在时，动态 deploy 也必须拒绝，不能因为 code version 一致而合并为一个服务组
 10. 如果 `Service.startup(target="")` 或不传 `target`，它是 startup 专属的未注册模式：不注册 `InfoCenter`，不参与全局 `service_name` 排他，可以在不同端口启动多个同名 startup service；这种实例不会被 `InfoCenter` / Gateway 自动发现，外部进程需要直连对应本地 service HTTP 地址，本进程内仍使用 `startup.foo.sync(...)` 直调本地 executor
-11. `Service.startup(...)` 主推 `source=已 import 的 module`。startup 是本机部署语义，不是远程 deploy；module source 默认走本地 module mount，不做远程代码 upload，也不把 module 重新打包成远端 artifact。`cwd` / `env` 用来设置该 startup service 的本地运行上下文，`node.close()` 后恢复。
+11. `Service.startup(...)` 主推 `source=已 import 的 module`。startup 是本机部署语义，不是远程 deploy；module source 默认走本地 module mount，不做远程代码 upload，也不把 module 重新打包成远端 artifact。运行配置建议通过 `managed_global_names` + `update_globals(...)` 注入，不推荐用 `cwd` / `os.environ` 这类进程全局状态承载单个服务配置。
 12. 空 `target` 不表示通用 local 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`
 13. `Service.startup(...).foo.sync(...)` 在 startup 的非 local 模式和 local 模式下都是当前 startup node 对自己挂载服务的本地调用门面：本进程内 proxy 直接调用 `StartupServiceNode.call_service(...)`，进入本地 executor 队列和 worker，不经过 Discovery、Gateway 或 service HTTP；它只是调用便利，不表示 startup service 加入动态服务组
 14. `target="local"` 是显式本地 IPC 模式：`Service.startup(target="local", ...)` 和 `Service.deploy(target="local", ...)` 在底层基本一致，都会创建本进程持有的 `StartupServiceNode`、返回本地 proxy、按 `service_name` 写入本机 IPC registry；同名 local service 已存活时启动会失败，`Service.connect(target="local", service_name=...)` 通过该 registry 连接到对应本地服务

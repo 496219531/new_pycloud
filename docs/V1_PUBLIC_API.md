@@ -32,9 +32,9 @@ node = Service.startup(
     service_name="calc",
     source=calc_service,
     bind="0.0.0.0:18080",
-    cwd="/srv/calc",
-    env={"CALC_DATA_DIR": "/srv/calc/data"},
+    managed_global_names=("CALC_DATA_DIR",),
 )
+node.update_globals({"CALC_DATA_DIR": "/srv/calc/data"})
 
 node.join()
 ```
@@ -42,7 +42,7 @@ node.join()
 它的语义是“启动时部署”，不是运行期动态部署。返回对象是底层启动节点句柄，默认不接受运行期动态部署；普通 `NodeControl` 节点额外支持动态部署。
 如果启动脚本退出，startup service 也会随进程关闭；长驻服务应调用 `node.join()` 或用自己的主循环保持进程运行。
 
-主推写法是 `source=imported_module`。这种形式默认走本地 module mount，不做远程代码上传，也不再把已 import 的 module 重新打包成远端 deploy artifact。`cwd` 和 `env` 是当前 startup 进程的本地运行上下文，会在 service 存活期间生效，`node.close()` 后恢复。显式 `entry_module=...`、bytes/path artifact 或显式 `package_format=...` 仍保留为兼容/边缘路径。
+主推写法是 `source=imported_module`。这种形式默认走本地 module mount，不做远程代码上传，也不再把已 import 的 module 重新打包成远端 deploy artifact。运行配置建议通过 `managed_global_names` + `update_globals(...)` 注入，避免 `cwd` / `os.environ` 这类进程全局状态污染同进程内其它服务。显式 `entry_module=...`、bytes/path artifact 或显式 `package_format=...` 仍保留为兼容/边缘路径。
 
 如果 `target` 为空，`Service.startup(...)` 只在当前进程启动本地 HTTP service，不注册到 `InfoCenter`，也不参与 `InfoCenter` 的 `service_name` 全局排他检查。这是 startup 专属的未注册模式，不等于 `target="local"` 的本地 IPC 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 等其它入口仍然必须显式传入 `target`；未来的 local 模式也必须显式写成 `target="local"`。
 

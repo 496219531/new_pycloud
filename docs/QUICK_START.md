@@ -123,16 +123,16 @@ node = Service.startup(
     service_name="calc",
     source=calc_service,
     bind="0.0.0.0:18080",
-    cwd="/srv/calc",
-    env={"CALC_DATA_DIR": "/srv/calc/data"},
+    managed_global_names=("CALC_DATA_DIR",),
 )
+node.update_globals({"CALC_DATA_DIR": "/srv/calc/data"})
 
 node.join()
 ```
 
 这条路径不会接受 `Service.deploy(...)` 的动态部署；需要动态部署时仍使用普通 `NodeControl` 节点。
 如果脚本启动后立刻退出，本地 `18080` 端口也会随进程关闭，浏览器访问会看到连接被拒绝；长驻场景需要像上面一样调用 `node.join()` 或用自己的主循环保持进程运行。
-`Service.startup(...)` 主推传入已 import 的 module：`source=calc_service`。startup 是本机部署语义，不需要远程 upload code；显式 `entry_module`、bytes/path artifact 或 `package_format` 仍作为兼容路径保留。
+`Service.startup(...)` 主推传入已 import 的 module：`source=calc_service`。startup 是本机部署语义，不需要远程 upload code；显式 `entry_module`、bytes/path artifact 或 `package_format` 仍作为兼容路径保留。运行配置建议通过 `managed_global_names` + `update_globals(...)` 注入，避免用 `cwd` / `os.environ` 这类进程全局状态影响同进程内其它服务。
 
 不传 `target` 时，startup service 只在当前进程本地运行并暴露 service HTTP，不注册到 `InfoCenter`。这是 startup 专属的未注册模式，不等于通用 local 模式；`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`。未来本地 IPC 模式只通过 `target="local"` 触发。
 

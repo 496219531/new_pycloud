@@ -795,43 +795,6 @@ def test_service_startup_explicit_package_format_keeps_prepared_service_path(tmp
         node.close()
 
 
-def test_service_startup_applies_cwd_and_env_until_close(tmp_path, monkeypatch):
-    module_path = tmp_path / "startup_context_service.py"
-    marker_path = tmp_path / "marker.txt"
-    marker_path.write_text("from-cwd", encoding="utf-8")
-    module_path.write_text(
-        "import os\n"
-        "def read_context():\n"
-        "    return {'cwd_value': open('marker.txt', encoding='utf-8').read(), 'env_value': os.getenv('STARTUP_ENV_VALUE', '')}\n",
-        encoding="utf-8",
-    )
-    monkeypatch.syspath_prepend(str(tmp_path))
-    importlib.invalidate_caches()
-    module = importlib.import_module("startup_context_service")
-    original_cwd = os.getcwd()
-    old_env_value = os.environ.get("STARTUP_ENV_VALUE")
-    original_sys_path = list(sys.path)
-
-    node = Service.startup(
-        source=module,
-        service_name="startup-context",
-        export_methods=("read_context",),
-        cwd=str(tmp_path),
-        env={"STARTUP_ENV_VALUE": "from-env"},
-        start=False,
-    )
-    try:
-        assert os.getcwd() == str(tmp_path)
-        assert os.environ["STARTUP_ENV_VALUE"] == "from-env"
-        assert node.read_context.sync() == {"cwd_value": "from-cwd", "env_value": "from-env"}
-    finally:
-        node.close()
-
-    assert os.getcwd() == original_cwd
-    assert os.environ.get("STARTUP_ENV_VALUE") == old_env_value
-    assert sys.path == original_sys_path
-
-
 def test_service_startup_local_proxy_calls_executor_without_http(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_local_proxy_service.py"
     module_path.write_text(
