@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import sys
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -2043,6 +2044,8 @@ class Service(ServiceExecutionSession):
         managed_global_names: Optional[Sequence[str]] = None,
         tags: Optional[Sequence[str]] = None,
         metadata: Optional[Dict[str, str]] = None,
+        cwd: str = "",
+        env: Optional[Dict[str, str]] = None,
         queue_capacity: int = 0,
         version: str = "",
         heartbeat_sec: int = 10,
@@ -2069,27 +2072,67 @@ class Service(ServiceExecutionSession):
         effective_service_name = str(service_name or module_name.rsplit(".", 1)[-1] or "startup-service").strip()
         effective_node_id = str(node_id or f"{effective_service_name}-startup").strip()
         service_http_bind = "0.0.0.0:0" if bind is None else str(bind).strip()
-        direct_module_mount = str(package_format or "").strip().lower() == "module"
-        prepared_artifact = None
-        if not direct_module_mount:
-            artifact_source = source
-            if artifact_source is None or isinstance(artifact_source, str):
-                artifact_source = importlib.import_module(module_name)
-            normalized_artifact = _normalize_artifact_input(
-                consumer_kind="service",
-                source=artifact_source,
-                deps=deps,
-                runtime=runtime,
-                entry_module=entry_module,
-                entry_callable=entry_callable,
-                package_format=package_format,
-                exports=ArtifactExports.explicit(export_methods) if export_methods else ArtifactExports.export_all(),
-                managed_global_names=managed_global_names,
-            )
-            prepared_artifact = _prepare_artifact(
-                normalized_artifact,
-                consumer_kind="service",
-            )
+        normalized_package_format = str(package_format or "").strip().lower()
+        direct_module_mount = normalized_package_format == "module" or (
+            normalized_package_format == "" and inspect.ismodule(source)
+        )
+        startup_cwd = str(cwd or "").strip()
+        startup_env = {str(key): str(value) for key, value in dict(env or {}).items()}
+        old_cwd: Optional[str] = None
+        old_env: Dict[str, Optional[str]] = {}
+        inserted_sys_path = False
+
+        def _apply_startup_context() -> None:
+            nonlocal inserted_sys_path, old_cwd
+            if startup_cwd:
+                old_cwd = os.getcwd()
+                os.chdir(startup_cwd)
+                if startup_cwd not in sys.path:
+                    sys.path.insert(0, startup_cwd)
+                    inserted_sys_path = True
+                importlib.invalidate_caches()
+            for key, value in startup_env.items():
+                old_env[key] = os.environ.get(key)
+                os.environ[key] = value
+
+        def _restore_startup_context() -> None:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            if old_cwd is not None:
+                os.chdir(old_cwd)
+            if inserted_sys_path:
+                with contextlib.suppress(ValueError):
+                    sys.path.remove(startup_cwd)
+                importlib.invalidate_caches()
+
+        _apply_startup_context()
+        try:
+            prepared_artifact = None
+            if not direct_module_mount:
+                artifact_source = source
+                if artifact_source is None or isinstance(artifact_source, str):
+                    artifact_source = importlib.import_module(module_name)
+                normalized_artifact = _normalize_artifact_input(
+                    consumer_kind="service",
+                    source=artifact_source,
+                    deps=deps,
+                    runtime=runtime,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                    exports=ArtifactExports.explicit(export_methods) if export_methods else ArtifactExports.export_all(),
+                    managed_global_names=managed_global_names,
+                )
+                prepared_artifact = _prepare_artifact(
+                    normalized_artifact,
+                    consumer_kind="service",
+                )
+        except Exception:
+            _restore_startup_context()
+            raise
 
         def _bind_startup_gateway(startup_node) -> None:
             deadline = time.monotonic() + _STARTUP_PREFLIGHT_RETRY_SEC
@@ -2189,6 +2232,7 @@ class Service(ServiceExecutionSession):
         )
         node.close_on_registration_lost = True
         node.install_interrupt_shutdown_handlers()
+        node._startup_context_restore = _restore_startup_context  # noqa: SLF001[attr-defined]
         try:
             node.service_http_bind = service_http_bind
             _preflight_existing_startup_service()

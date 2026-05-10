@@ -746,6 +746,92 @@ def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch
         node.close()
 
 
+def test_service_startup_module_source_defaults_to_module_mount(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_module_source_default.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    module = importlib.import_module("startup_module_source_default")
+
+    node = Service.startup(
+        source=module,
+        service_name="startup-module-default",
+        export_methods=("add",),
+        start=False,
+    )
+    try:
+        assert node._services == {}  # noqa: SLF001
+        assert node._startup_services  # noqa: SLF001
+        assert node.add.sync(x=2, y=5) == {"value": 7}
+    finally:
+        node.close()
+
+
+def test_service_startup_explicit_package_format_keeps_prepared_service_path(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_module_explicit_package.py"
+    module_path.write_text(
+        "def add(x=0, y=0):\n"
+        "    return {'value': int(x) + int(y)}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    node = Service.startup(
+        entry_module="startup_module_explicit_package",
+        service_name="startup-module-package",
+        export_methods=("add",),
+        package_format="tar.gz",
+        start=False,
+    )
+    try:
+        assert node._services  # noqa: SLF001
+        assert node._startup_services == {}  # noqa: SLF001
+        assert node.add.sync(x=2, y=6) == {"value": 8}
+    finally:
+        node.close()
+
+
+def test_service_startup_applies_cwd_and_env_until_close(tmp_path, monkeypatch):
+    module_path = tmp_path / "startup_context_service.py"
+    marker_path = tmp_path / "marker.txt"
+    marker_path.write_text("from-cwd", encoding="utf-8")
+    module_path.write_text(
+        "import os\n"
+        "def read_context():\n"
+        "    return {'cwd_value': open('marker.txt', encoding='utf-8').read(), 'env_value': os.getenv('STARTUP_ENV_VALUE', '')}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    module = importlib.import_module("startup_context_service")
+    original_cwd = os.getcwd()
+    old_env_value = os.environ.get("STARTUP_ENV_VALUE")
+    original_sys_path = list(sys.path)
+
+    node = Service.startup(
+        source=module,
+        service_name="startup-context",
+        export_methods=("read_context",),
+        cwd=str(tmp_path),
+        env={"STARTUP_ENV_VALUE": "from-env"},
+        start=False,
+    )
+    try:
+        assert os.getcwd() == str(tmp_path)
+        assert os.environ["STARTUP_ENV_VALUE"] == "from-env"
+        assert node.read_context.sync() == {"cwd_value": "from-cwd", "env_value": "from-env"}
+    finally:
+        node.close()
+
+    assert os.getcwd() == original_cwd
+    assert os.environ.get("STARTUP_ENV_VALUE") == old_env_value
+    assert sys.path == original_sys_path
+
+
 def test_service_startup_local_proxy_calls_executor_without_http(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_local_proxy_service.py"
     module_path.write_text(

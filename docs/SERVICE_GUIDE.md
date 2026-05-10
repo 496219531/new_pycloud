@@ -332,15 +332,16 @@ group = Service.deploy(
 8. 如果 startup service 传入 `target` 并注册到 `InfoCenter`，它会参与 `service_name` 排他检查：动态服务已经占用同一个 `service_name` 时，startup service 必须拒绝启动
 9. 反过来，已注册 startup service 存在时，动态 deploy 也必须拒绝，不能因为 code version 一致而合并为一个服务组
 10. 如果 `Service.startup(target="")` 或不传 `target`，它是 startup 专属的未注册模式：不注册 `InfoCenter`，不参与全局 `service_name` 排他，可以在不同端口启动多个同名 startup service；这种实例不会被 `InfoCenter` / Gateway 自动发现，外部进程需要直连对应本地 service HTTP 地址，本进程内仍使用 `startup.foo.sync(...)` 直调本地 executor
-11. 空 `target` 不表示通用 local 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`
-12. `Service.startup(...).foo.sync(...)` 在 startup 的非 local 模式和 local 模式下都是当前 startup node 对自己挂载服务的本地调用门面：本进程内 proxy 直接调用 `StartupServiceNode.call_service(...)`，进入本地 executor 队列和 worker，不经过 Discovery、Gateway 或 service HTTP；它只是调用便利，不表示 startup service 加入动态服务组
-13. `target="local"` 是显式本地 IPC 模式：`Service.startup(target="local", ...)` 和 `Service.deploy(target="local", ...)` 在底层基本一致，都会创建本进程持有的 `StartupServiceNode`、返回本地 proxy、按 `service_name` 写入本机 IPC registry；同名 local service 已存活时启动会失败，`Service.connect(target="local", service_name=...)` 通过该 registry 连接到对应本地服务
-14. local 模式保留与远端 service 基本一致的用户侧调用形态：`service.foo.sync(...)`、`await service.foo(...)`、`service.foo.stream(...)`、`service.foo.broadcast(...)`、`Service.connect(...)` 的方法代理语义不变；local/connected service 的 broadcast 按单节点处理，即执行一次并返回单元素结果列表；需要在本地 IPC 与远端 ControlPlane/InfoCenter 之间切换时，通常只改 `target`，业务调用代码基本无感
-15. `Service.connect(...)` 不论 local 还是 remote，都只是调用端 client，不暴露 `update_globals(...)`；`update_globals(...)` 是 owner/control 能力，只能在 `Service.startup(...)` 或 `Service.deploy(...)` 返回的 owner handle 上使用
-16. `TaskPool.open(target="local", ...)` 创建 opener 私有的本地 task pool，任务直接提交到当前进程持有的 NodeControl runtime；`unordered(...)`、`aunordered(...)`、`iter_items(...)` 等高层 wrapper 复用同一套 session 逻辑；TaskPool 没有 connect 语义，其他进程不能接入这个 pool
-17. local TaskPool 是单机私有 pool；如果本地 worker/pool 失效，语义是快速失败并由 opener 决定是否重建，不做跨节点 accepted-task replay，也不假装可以切换到其他节点
-18. Windows named pipe、spawn 模式和 Ctrl+C 清理属于 local runtime 的平台体验项，需要在 Windows 实机压测；非 Windows 单测只覆盖本机 IPC registry、普通调用、stream、DataRef、managed globals 和 close 主路径
-19. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
+11. `Service.startup(...)` 主推 `source=已 import 的 module`。startup 是本机部署语义，不是远程 deploy；module source 默认走本地 module mount，不做远程代码 upload，也不把 module 重新打包成远端 artifact。`cwd` / `env` 用来设置该 startup service 的本地运行上下文，`node.close()` 后恢复。
+12. 空 `target` 不表示通用 local 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`
+13. `Service.startup(...).foo.sync(...)` 在 startup 的非 local 模式和 local 模式下都是当前 startup node 对自己挂载服务的本地调用门面：本进程内 proxy 直接调用 `StartupServiceNode.call_service(...)`，进入本地 executor 队列和 worker，不经过 Discovery、Gateway 或 service HTTP；它只是调用便利，不表示 startup service 加入动态服务组
+14. `target="local"` 是显式本地 IPC 模式：`Service.startup(target="local", ...)` 和 `Service.deploy(target="local", ...)` 在底层基本一致，都会创建本进程持有的 `StartupServiceNode`、返回本地 proxy、按 `service_name` 写入本机 IPC registry；同名 local service 已存活时启动会失败，`Service.connect(target="local", service_name=...)` 通过该 registry 连接到对应本地服务
+15. local 模式保留与远端 service 基本一致的用户侧调用形态：`service.foo.sync(...)`、`await service.foo(...)`、`service.foo.stream(...)`、`service.foo.broadcast(...)`、`Service.connect(...)` 的方法代理语义不变；local/connected service 的 broadcast 按单节点处理，即执行一次并返回单元素结果列表；需要在本地 IPC 与远端 ControlPlane/InfoCenter 之间切换时，通常只改 `target`，业务调用代码基本无感
+16. `Service.connect(...)` 不论 local 还是 remote，都只是调用端 client，不暴露 `update_globals(...)`；`update_globals(...)` 是 owner/control 能力，只能在 `Service.startup(...)` 或 `Service.deploy(...)` 返回的 owner handle 上使用
+17. `TaskPool.open(target="local", ...)` 创建 opener 私有的本地 task pool，任务直接提交到当前进程持有的 NodeControl runtime；`unordered(...)`、`aunordered(...)`、`iter_items(...)` 等高层 wrapper 复用同一套 session 逻辑；TaskPool 没有 connect 语义，其他进程不能接入这个 pool
+18. local TaskPool 是单机私有 pool；如果本地 worker/pool 失效，语义是快速失败并由 opener 决定是否重建，不做跨节点 accepted-task replay，也不假装可以切换到其他节点
+19. Windows named pipe、spawn 模式和 Ctrl+C 清理属于 local runtime 的平台体验项，需要在 Windows 实机压测；非 Windows 单测只覆盖本机 IPC registry、普通调用、stream、DataRef、managed globals 和 close 主路径
+20. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
 
 ## 5.1 依赖补装语义
 

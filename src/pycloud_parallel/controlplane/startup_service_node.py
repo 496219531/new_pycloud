@@ -380,8 +380,15 @@ class StartupServiceNode(NodeControlState):
             with contextlib.suppress(Exception):
                 self._local_ipc_server.close()
             self._local_ipc_server = None
-        NodeControlState.close(self)
-        NodeRuntimeBase.close(self)
+        try:
+            NodeControlState.close(self)
+            NodeRuntimeBase.close(self)
+        finally:
+            restore_context = getattr(self, "_startup_context_restore", None)
+            if callable(restore_context):
+                with contextlib.suppress(Exception):
+                    restore_context()
+                self._startup_context_restore = None
 
     def create_service(self, *args: Any, **kwargs: Any):
         del args, kwargs
