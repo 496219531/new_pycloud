@@ -48,7 +48,7 @@ with TaskPool.open(
     results = pool.wait_for_data(expected_count=len(resp.accepted), timeout_sec=10.0)
     print(results)
 
-    mapped = pool.map([9, 10, 11], timeout_sec=10.0)
+    mapped = pool.map_values([9, 10, 11], timeout_sec=10.0)
     print(mapped)
 ```
 
@@ -58,6 +58,7 @@ with TaskPool.open(
 2. `entry_callable` 是 artifact 里的字符串入口名
 3. `submit_payloads(..., task_method=...)` 可以显式传方法名，但只能等于这个单一入口
 4. 如果传了别的方法名，现在会直接抛 `AttributeError`，不再静默回退到默认入口
+5. `map_values(...)` 是推荐的值映射入口：它会把每个输入值包装成 `{arg_name: value}` 发送到远端 task 方法。旧的 `map(...)` 仍保留为兼容别名，但不要把它理解成 Python 内置 `map(func, iterable)`。
 
 ### 2.2 `JobQueue`
 
@@ -198,6 +199,12 @@ print(final["job"]["status"])
 7. 仅 `submit_payloads(...)` 这类“先提交、后手动拉结果”的低层接口不保证自动 replay 已接收任务；它们更适合暴露原始 infra 失败给调用方处理。
 8. 相关观测字段包括 `task_retry_count`、`task_retry_success_count`、`task_retry_exhausted_count`、`node_lost_replayed_tasks`、`node_lost_failed_tasks`、`retry_prepare_payload_ms`、`retry_submit_ms`。
 
+结果拉取等待说明：
+
+1. `server_wait_ms` 是推荐参数名，表示单次向 node 拉结果时允许服务端等待多久
+2. `server_wait_ms=0` 表示不在该 node 上等待，没结果就立刻换下一个 node
+3. 旧参数名 `wait_ms` 仍兼容；后续文档优先使用 `server_wait_ms`
+
 补充说明：
 
 1. `TaskPool` 不强调 `join()` 这类 owner 常驻语义
@@ -254,6 +261,9 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
    - 结构化显式 codec
 3. `pickle_stable_v1`
    - 受信环境高保真 Python codec
+4. `pickle_native_v1`
+   - 受信环境原生 Python pickle codec
+   - local/trusted internal 可显式选择，gateway public 默认拒绝
 
 当前选择优先级：
 
@@ -262,12 +272,16 @@ for task_id, data in pool.iter_data(max_count=10, timeout_sec=10.0):
 3. system mode / env
 4. 最终回退 `legacy_v1`
 
+这个优先级只适用于 remote TaskPool。`TaskPool.open(target="local", ...)` 固定使用 `pickle_native_v1`，外部传入的 `serialization_mode` 会被忽略。
+
 说明：
 
 1. `TaskPool.serialization_mode` 是当前 session 的主边界
 2. `submit_payloads(...)` 可以临时 override，但不会污染 session 默认值
 3. `put_data()/put_json()/put_ndarray()/put_dataframe()` 不显式传 mode 时，会继承当前 `TaskPool` session mode
-4. carrier decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
+4. `put_data(..., object_format="bin")` 是推荐写法；旧的 `format="bin"` 仍兼容，但它表示 object-store format hint，不是 Python 字符串格式化语义
+5. local TaskPool 的 `submit_payloads(...)` / `put_data(...)` 同样固定 `pickle_native_v1`
+6. carrier decode 不再靠 env 猜 mode；没有 envelope 时只按 `legacy_v1` 兜底
 
 ### 4.1 DataRef 默认链路
 
@@ -368,7 +382,7 @@ for item in pool.iter_items(timeout_sec=10.0):
 例如，如果你更关心吞吐而不是尽量压低本地 inflight，可以显式传：
 
 ```python
-results = pool.map(
+results = pool.map_values(
     values,
     strategy="taskpool_throughput",
 )
@@ -384,7 +398,7 @@ for index, data in pool.unordered(
     print(index, data)
 ```
 
-如果你需要低层流控参数，比如 `receive_batch / result_timeout_sec / wait_ms`，请显式使用：
+如果你需要低层流控参数，比如 `receive_batch / result_timeout_sec / server_wait_ms`，请显式使用：
 
 ```python
 for index, data in pool.imap_unordered(
@@ -421,7 +435,8 @@ print(processed)
    - 不再接受低层流控参数
 3. `imap_unordered(...)`
    - 返回 `(index, result_or_none)`
-   - 但仍保留 `receive_batch / result_timeout_sec / wait_ms` 这类低层流控能力
+   - 但仍保留 `receive_batch / result_timeout_sec / server_wait_ms` 这类低层流控能力
+   - 旧参数名 `wait_ms` 仍兼容
    - 当前 submit/requeue/infra-failure 也已经接入统一 failover 状态机
    - 局部失效节点会被禁用，后续 payload 会继续退化到健康节点
    - 公开主路径不再建立在旧 `_iter_batch_items()` 的 chunk/barrier helper 之上

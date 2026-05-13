@@ -400,7 +400,7 @@ def _serialize_data_for_object_ref(
         default_mode=default_serialization_mode,
         context="object_upload",
     )
-    if normalized_mode in {"structured_v1", "pickle_stable_v1"}:
+    if normalized_mode in {"structured_v1", "pickle_stable_v1", "pickle_native_v1"}:
         if isinstance(data, os.PathLike):
             path = Path(data).expanduser()
             if not path.exists() or not path.is_file():

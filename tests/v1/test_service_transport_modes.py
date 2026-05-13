@@ -79,7 +79,7 @@ def test_call_route_http_roundtrips_transport_modes(monkeypatch):
         control_addr="",
     )
 
-    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"):
         payload = _demo_payload(mode)
         result = _demo_result(mode)
 
@@ -136,7 +136,7 @@ def test_call_route_http_roundtrips_transport_modes(monkeypatch):
 
 
 def test_service_connect_propagates_serialization_mode_to_transport_client():
-    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"):
         route = InfoCenterServiceRoute(
             service_name="svc-demo",
             service_id="svc-id-1",

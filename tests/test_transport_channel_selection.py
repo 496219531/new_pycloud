@@ -58,6 +58,7 @@ class _FakeHttpResponse:
 
 def test_transport_lane_follows_effective_policy_before_mode():
     assert should_use_raw_bytes_payload(mode="pickle_stable_v1") is True
+    assert should_use_raw_bytes_payload(mode="pickle_native_v1") is True
     assert should_use_raw_bytes_payload(mode="legacy_v1") is False
     assert (
         should_use_raw_bytes_payload(
@@ -75,6 +76,7 @@ def test_transport_lane_follows_effective_policy_before_mode():
 
 def test_http_lane_follows_effective_policy_before_mode():
     assert should_use_http_raw_bytes_body(mode="pickle_stable_v1") is True
+    assert should_use_http_raw_bytes_body(mode="pickle_native_v1") is True
     assert (
         should_use_http_raw_bytes_body(
             mode="pickle_stable_v1",

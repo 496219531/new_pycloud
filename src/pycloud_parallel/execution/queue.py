@@ -21,7 +21,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
 )
-from pycloud_parallel.controlplane.serialization import convert_dict_to_arrow
+from pycloud_parallel.controlplane.serialization import LOCAL_IPC_SERIALIZATION_MODE, convert_dict_to_arrow
 from pycloud_parallel.execution.support import (
     _JOB_UPDATE_GLOBALS_AUTO,
     _default_job_auth_ttl_sec,
@@ -90,7 +90,7 @@ class QueueServiceClient:
         self.service_name = str(service_name or "job-orchestrator").strip() or "job-orchestrator"
         self._default_task_serialization_mode = str(task_serialization_mode or "").strip()
         self.effective_policy = _jobqueue_effective_policy()
-        self.serialization_mode = self.effective_policy.resolved_mode
+        self.serialization_mode = LOCAL_IPC_SERIALIZATION_MODE if _is_local_target(self.target) else self.effective_policy.resolved_mode
         self._auth_ttl_sec = _default_job_auth_ttl_sec()
         self._recent_job_ids: List[str] = []
 
@@ -126,7 +126,7 @@ class QueueServiceClient:
             protocol="http",
             serialization_mode=self.serialization_mode,
             validate_on_init=False,
-            effective_policy_override=self.effective_policy,
+            effective_policy_override=None if _is_local_target(self.target) else self.effective_policy,
             prepare_discovery_payload=False,
         )
         self._persist_local_session()
@@ -134,7 +134,7 @@ class QueueServiceClient:
     def _refresh_effective_policy(self) -> EffectivePolicy:
         effective_policy = _jobqueue_effective_policy()
         self.effective_policy = effective_policy
-        self.serialization_mode = effective_policy.resolved_mode
+        self.serialization_mode = LOCAL_IPC_SERIALIZATION_MODE if _is_local_target(self.target) else effective_policy.resolved_mode
         return effective_policy
 
     def close(self) -> None:
@@ -155,17 +155,21 @@ class QueueServiceClient:
         if not method:
             raise ValueError("JobQueue route lookup requires method")
         self.effective_policy = effective_policy
-        self.serialization_mode = effective_policy.resolved_mode
-        self._service._fixed_effective_policy = effective_policy  # noqa: SLF001
+        self.serialization_mode = LOCAL_IPC_SERIALIZATION_MODE if _is_local_target(self.target) else effective_policy.resolved_mode
+        self._service._fixed_effective_policy = None if _is_local_target(self.target) else effective_policy  # noqa: SLF001
         self._service.effective_policy = effective_policy
-        self._service.serialization_mode = effective_policy.resolved_mode
+        self._service.serialization_mode = self.serialization_mode
         payload = dict(call_kwargs.get("payload") or {})
         if getattr(self._service, "route", "") == "local" and self.auth_token:
             payload.setdefault("_service_token", self.auth_token)
         effective_serialization_mode = (
-            str(call_kwargs.get("serialization_mode", "") or "").strip()
-            or str(self.serialization_mode or "").strip()
-            or _JOBQUEUE_TRANSPORT_MODE
+            LOCAL_IPC_SERIALIZATION_MODE
+            if _is_local_target(self.target)
+            else (
+                str(call_kwargs.get("serialization_mode", "") or "").strip()
+                or str(self.serialization_mode or "").strip()
+                or _JOBQUEUE_TRANSPORT_MODE
+            )
         )
         _node_key, response = self._service.call_balanced(
             method,

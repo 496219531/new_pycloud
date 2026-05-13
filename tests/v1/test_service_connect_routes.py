@@ -122,7 +122,7 @@ def test_service_connect_discovery_retries_briefly_when_routes_are_not_ready():
 
 def test_service_connect_inherits_deploy_bound_policy_from_routes():
     capability = NodeCapability(
-        supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
+        supported_modes=("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"),
         supports_raw_bytes_payload=True,
         supports_http_raw_bytes_body=True,
         max_control_send_bytes=4 * 1024 * 1024,

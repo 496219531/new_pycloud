@@ -314,7 +314,7 @@ def _materialize_downloaded_result(path: Path, *, result_ref: object):
     if materialized == "path":
         return path
     normalized_format = str(data_ref.format or "").strip().lower()
-    if normalized_format in {"structured_v1", "pickle_stable_v1"}:
+    if normalized_format in {"structured_v1", "pickle_stable_v1", "pickle_native_v1"}:
         validate_bytes_materialize_size(
             int(getattr(data_ref, "size_bytes", 0) or path.stat().st_size),
             context=f"result {data_ref.object_id}",

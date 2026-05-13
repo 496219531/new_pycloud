@@ -71,6 +71,7 @@ class StaticServiceMount:
     methods_handler: Callable[[bool], Tuple[int, Dict[str, object]]]
     status_handler: Optional[Callable[[], Tuple[int, Dict[str, object]]]] = None
     extra_get_handler: Optional[Callable[[List[str], Dict[str, List[str]]], Optional[Tuple[object, ...]]]] = None
+    stream_handler: Optional[Callable[[str, dict, str, float, str], Any]] = None
     worker_count: int = 1
     http_base_url: str = ""
     policy_id: str = "default_safe"
@@ -116,6 +117,7 @@ class NodeRuntimeBase:
         methods_handler: Callable[[bool], Tuple[int, Dict[str, object]]],
         status_handler: Optional[Callable[[], Tuple[int, Dict[str, object]]]] = None,
         extra_get_handler: Optional[Callable[[List[str], Dict[str, List[str]]], Optional[Tuple[object, ...]]]] = None,
+        stream_handler: Optional[Callable[[str, dict, str, float, str], Any]] = None,
         service_id: str = "",
         worker_count: int = 1,
         policy_id: str = "",
@@ -130,6 +132,7 @@ class NodeRuntimeBase:
             methods_handler=methods_handler,
             status_handler=status_handler,
             extra_get_handler=extra_get_handler,
+            stream_handler=stream_handler,
             worker_count=max(1, int(worker_count or 1)),
             policy_id=str(policy_id or "").strip().lower() or "default_safe",
             module=module,
@@ -294,19 +297,15 @@ class NodeRuntimeBase:
                 }
             )
 
-        def _invoke(
-            method: str,
+        def _decode_effective_payload(
+            method_name: str,
             payload: dict,
             token: str,
             timeout_sec: float,
             serialization_mode: str,
             use_transport_result: bool,
             stream_response: bool,
-        ):
-            method_name = str(method or "").strip()
-            fn = methods.get(method_name)
-            if fn is None:
-                return 404, {"ok": False, "error": f"method not found: {method}"}
+        ) -> dict:
             payload_policy = get_payload_policy("http_call")
             if is_inline_transport_carrier(payload):
                 inbound_payload = decode_inline_transport_carrier(
@@ -349,6 +348,30 @@ class NodeRuntimeBase:
             for name, value in context_values.items():
                 if name in param_names and name not in effective_payload:
                     effective_payload[name] = value
+            return effective_payload
+
+        def _invoke(
+            method: str,
+            payload: dict,
+            token: str,
+            timeout_sec: float,
+            serialization_mode: str,
+            use_transport_result: bool,
+            stream_response: bool,
+        ):
+            method_name = str(method or "").strip()
+            fn = methods.get(method_name)
+            if fn is None:
+                return 404, {"ok": False, "error": f"method not found: {method}"}
+            effective_payload = _decode_effective_payload(
+                method_name,
+                payload,
+                token,
+                timeout_sec,
+                serialization_mode,
+                use_transport_result,
+                stream_response,
+            )
             data = _invoke_python_callable(fn, effective_payload, params=method_params.get(method_name))
             if stream_response:
                 inline_result_limit_bytes = get_payload_policy("result").inline_result_hard_limit_bytes
@@ -362,7 +385,11 @@ class NodeRuntimeBase:
                                     {
                                         "event": "item",
                                         "index": item_count,
-                                        "data": {} if item is None else item,
+                                        "data": self._stream_event_data_value(
+                                            item,
+                                            serialization_mode=serialization_mode,
+                                            inline_result_limit_bytes=inline_result_limit_bytes,
+                                        ),
                                     },
                                     inline_result_limit_bytes=inline_result_limit_bytes,
                                 )
@@ -372,7 +399,11 @@ class NodeRuntimeBase:
                                 {
                                     "event": "item",
                                     "index": 0,
-                                    "data": {} if data is None else data,
+                                    "data": self._stream_event_data_value(
+                                        data,
+                                        serialization_mode=serialization_mode,
+                                        inline_result_limit_bytes=inline_result_limit_bytes,
+                                    ),
                                 },
                                 inline_result_limit_bytes=inline_result_limit_bytes,
                             )
@@ -397,6 +428,26 @@ class NodeRuntimeBase:
                 status_code = int(raw.pop("__pycloud_status_code__", 200) or 200)
                 return status_code, raw
             return 200, {"ok": True, "method": method_name, "data": {} if data is None else data}
+
+        def _stream(method: str, payload: dict, token: str, timeout_sec: float, serialization_mode: str):
+            method_name = str(method or "").strip()
+            fn = methods.get(method_name)
+            if fn is None:
+                raise RuntimeError(f"method not found: {method}")
+            effective_payload = _decode_effective_payload(
+                method_name,
+                payload,
+                token,
+                timeout_sec,
+                serialization_mode,
+                True,
+                True,
+            )
+            data = _invoke_python_callable(fn, effective_payload, params=method_params.get(method_name))
+            if inspect.isgenerator(data):
+                yield from data
+            else:
+                yield data
 
         def _methods(include_docs: bool):
             if include_docs:
@@ -449,6 +500,7 @@ class NodeRuntimeBase:
             methods_handler=_methods,
             status_handler=_status if callable(status_fn) else None,
             extra_get_handler=_extra_get if callable(extra_get_fn) else None,
+            stream_handler=_stream,
             service_id=normalized_service_id,
             worker_count=worker_count,
             policy_id=policy_id,

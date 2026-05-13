@@ -113,6 +113,23 @@ finally:
     group.close(end_services=not joined)
 ```
 
+`Service.close()` 默认只关闭当前 owner/client handle，不会停止已经部署到 node 上的 service replicas。
+如果语义上只是释放本地 handle，可以写得更明确：
+
+```python
+group.close_handle()
+```
+
+如果要停止远端 replicas，再关闭 owner handle，推荐写：
+
+```python
+group.shutdown_services(reason="owner shutdown")
+```
+
+等价于 `group.close(end_services=True, reason=...)`。
+
+`join()` 的核心语义仍是“等待 owner keepalive 线程结束或 timeout”，但为了适配长驻 owner 进程，它默认会在 `SIGINT/Ctrl+C` 时调用 `close(end_services=True, reason=...)` 做优雅清理；`graceful_timeout_sec` 是等待这次清理完成的最长时间。
+
 多节点标识说明：
 
 1. `node_id`
@@ -177,7 +194,7 @@ result = group.call_sync("square", x=7)
 如果你想显式切到更偏延迟优先的策略，可以传：
 
 ```python
-result = group.call_sync("square", x=7, strategy="service_latency_first")
+result = group.square.with_options(strategy="service_latency_first").sync(x=7)
 ```
 
 可选策略：
@@ -199,15 +216,15 @@ svc = Service.connect(
     route="gateway",
 )
 
-results = svc.square.map([1, 2, 3], arg_name="x")
+results = svc.square.map_values([1, 2, 3], arg_name="x")
 print(results)
 
 for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in_flight=3):
     print(index, result)
 
-# async 场景可选使用 amap(...) / aunordered(...)；
+# async 场景可选使用 amap_values(...) / aunordered(...)；
 # 当前更推荐把它们理解成进阶能力，而不是 service 主调用路径
-# results = await svc.square.amap([1, 2, 3], arg_name="x")
+# results = await svc.square.amap_values([1, 2, 3], arg_name="x")
 # async for index, result in svc.square.aunordered([{"x": 1}, {"x": 2}], max_in_flight=2):
 #     ...
 
@@ -218,11 +235,12 @@ for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in
 
 说明：
 
-1. `map(...)`
+1. `map_values(...)`
    - 并发发多个 RPC
    - 返回顺序与输入顺序一致
    - 某一项失败时该位置返回 `None`
-   - 异步场景可选使用 `amap(...)`
+   - 异步场景可选使用 `amap_values(...)`
+   - 旧的 `map(...)` / `amap(...)` 仍兼容，但不要把它理解成 Python 内置 `map(func, iterable)`
 2. `unordered(...)`
    - 谁先返回谁先 yield
    - yield 形状固定为 `(index, result_or_none)`
@@ -336,12 +354,13 @@ group = Service.deploy(
 12. 空 `target` 不表示通用 local 模式。`Service.deploy(...)`、`Service.connect(...)`、`TaskPool.open(...)` 仍然必须显式传入 `target`
 13. `Service.startup(...).foo.sync(...)` 在 startup 的非 local 模式和 local 模式下都是当前 startup node 对自己挂载服务的本地调用门面：本进程内 proxy 直接调用 `StartupServiceNode.call_service(...)`，进入本地 executor 队列和 worker，不经过 Discovery、Gateway 或 service HTTP；它只是调用便利，不表示 startup service 加入动态服务组
 14. `target="local"` 是显式本地 IPC 模式：`Service.startup(target="local", ...)` 和 `Service.deploy(target="local", ...)` 都会返回本地 owner handle、按 `service_name` 写入本机 IPC registry，同名 local service 已存活时启动会失败，`Service.connect(target="local", service_name=...)` 通过该 registry 连接到对应本地服务。但二者的创建语义不同：`startup(local)` 默认直接挂载本进程可 import 的 module；`deploy(local)` 继续走 upload/artifact 路径，用于模拟远端部署。
-15. local 模式保留与远端 service 基本一致的用户侧调用形态：`service.foo.sync(...)`、`await service.foo(...)`、`service.foo.stream(...)`、`service.foo.broadcast(...)`、`Service.connect(...)` 的方法代理语义不变；local/connected service 的 broadcast 按单节点处理，即执行一次并返回单元素结果列表；需要在本地 IPC 与远端 ControlPlane/InfoCenter 之间切换时，通常只改 `target`，业务调用代码基本无感
-16. `Service.connect(...)` 不论 local 还是 remote，都只是调用端 client，不暴露 `update_globals(...)`；`update_globals(...)` 是 owner/control 能力，只能在 `Service.startup(...)` 或 `Service.deploy(...)` 返回的 owner handle 上使用
-17. `TaskPool.open(target="local", ...)` 创建 opener 私有的本地 task pool，任务直接提交到当前进程持有的 NodeControl runtime；`unordered(...)`、`aunordered(...)`、`iter_items(...)` 等高层 wrapper 复用同一套 session 逻辑；TaskPool 没有 connect 语义，其他进程不能接入这个 pool
-18. local TaskPool 是单机私有 pool；如果本地 worker/pool 失效，语义是快速失败并由 opener 决定是否重建，不做跨节点 accepted-task replay，也不假装可以切换到其他节点
-19. Windows named pipe、spawn 模式和 Ctrl+C 清理属于 local runtime 的平台体验项，需要在 Windows 实机压测；非 Windows 单测只覆盖本机 IPC registry、普通调用、stream、DataRef、managed globals 和 close 主路径
-20. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
+15. local service 调用固定使用 `pickle_native_v1`。`Service.connect(..., serialization_mode=...)` 在 `target="local"` 下只保留接口兼容，不改变实际 codec；local `stream_call(...)` 也按 native pickle 返回 Python 对象，不强制转 JSON-safe dict。
+16. local 模式保留与远端 service 基本一致的用户侧调用形态：`service.foo.sync(...)`、`await service.foo(...)`、`service.foo.stream(...)`、`service.foo.broadcast(...)`、`Service.connect(...)` 的方法代理语义不变；local/connected service 的 broadcast 按单节点处理，即执行一次并返回单元素结果列表；需要在本地 IPC 与远端 ControlPlane/InfoCenter 之间切换时，通常只改 `target`，业务调用代码基本无感
+17. `Service.connect(...)` 不论 local 还是 remote，都只是调用端 client，不暴露 `update_globals(...)`；`update_globals(...)` 是 owner/control 能力，只能在 `Service.startup(...)` 或 `Service.deploy(...)` 返回的 owner handle 上使用
+18. `TaskPool.open(target="local", ...)` 创建 opener 私有的本地 task pool，任务直接提交到当前进程持有的 NodeControl runtime；`unordered(...)`、`aunordered(...)`、`iter_items(...)` 等高层 wrapper 复用同一套 session 逻辑；TaskPool 没有 connect 语义，其他进程不能接入这个 pool
+19. local TaskPool 是单机私有 pool；如果本地 worker/pool 失效，语义是快速失败并由 opener 决定是否重建，不做跨节点 accepted-task replay，也不假装可以切换到其他节点
+20. Windows named pipe、spawn 模式和 Ctrl+C 清理属于 local runtime 的平台体验项，需要在 Windows 实机压测；非 Windows 单测只覆盖本机 IPC registry、普通调用、stream、DataRef、managed globals 和 close 主路径
+21. 动态扩容应走同一个 owner 的 deploy session：扩大 `node_count` 并重启/恢复部署端，由缓存的 `service_id/service_token` 接回旧副本，再补齐新副本
 
 ## 5.1 依赖补装语义
 

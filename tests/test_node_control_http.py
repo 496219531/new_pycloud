@@ -77,6 +77,54 @@ def test_http_create_service_call_heartbeat_status_close(tmp_path):
         state.close()
 
 
+def test_http_end_service_requires_owner_token(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            session = client.create_service_from_bytes(
+                owner_client_id="owner-http",
+                service_name="svc-http-owner-token",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_http_owner_token",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                expose_http=False,
+            )
+            try:
+                client.end_service(
+                    owner_client_id="owner-http",
+                    service_id=session.service_id,
+                    service_token="",
+                )
+            except RuntimeError as exc:
+                assert "service_token mismatch" in str(exc)
+            else:
+                raise AssertionError("end_service without service_token should fail")
+
+            try:
+                client.end_service(
+                    owner_client_id="not-owner",
+                    service_id=session.service_id,
+                    service_token=session.service_token,
+                )
+            except RuntimeError as exc:
+                assert "owner_client_id mismatch" in str(exc)
+            else:
+                raise AssertionError("end_service with wrong owner_client_id should fail")
+
+            assert client.end_service(
+                owner_client_id="owner-http",
+                service_id=session.service_id,
+                service_token=session.service_token,
+            ).accepted is True
+    finally:
+        server.stop()
+        state.close()
+
+
 def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
     server, state = _start_http_node(tmp_path)
     blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) * 2}\n"

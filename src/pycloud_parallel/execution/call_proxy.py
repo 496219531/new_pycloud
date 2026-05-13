@@ -52,7 +52,7 @@ def _normalize_unordered_call_payloads(
         if not isinstance(item, Mapping):
             raise TypeError(
                 "unordered()/aunordered()/iter_items() inputs must be mapping payloads; "
-                "use map(..., arg_name=...) for scalar batches"
+                "use map_values(..., arg_name=...) for scalar batches"
             )
         payloads.append({**dict(item), **shared})
     return payloads
@@ -305,6 +305,22 @@ class _CallProxy:
             max_in_flight=None,
         )
 
+    def map_values(
+        self,
+        values: Sequence[object],
+        *,
+        arg_name: str = "value",
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> List[Optional[object]]:
+        """Explicit value-mapping alias for ``map(...)``.
+
+        This sends each local value as ``{arg_name: value}`` to the remote
+        service method; it does not accept a local Python callable like the
+        built-in ``map``.
+        """
+        return self.map(values, arg_name=arg_name, timeout_sec=timeout_sec, **shared_kwargs)
+
     async def amap(
         self,
         values: Sequence[object],
@@ -322,6 +338,17 @@ class _CallProxy:
             refresh_status=self._refresh_status,
             max_in_flight=None,
         )
+
+    async def amap_values(
+        self,
+        values: Sequence[object],
+        *,
+        arg_name: str = "value",
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> List[Optional[object]]:
+        """Explicit async value-mapping alias for ``amap(...)``."""
+        return await self.amap(values, arg_name=arg_name, timeout_sec=timeout_sec, **shared_kwargs)
 
     def unordered(
         self,

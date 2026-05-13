@@ -185,6 +185,9 @@
 3. `pickle_stable_v1`
    - 受信环境高保真 Python codec
    - 对 pandas/numpy 先做稳定 schema 规范化，再进入 pickle
+4. `pickle_native_v1`
+   - 受信环境原生 Python pickle codec
+   - 不做稳定 schema 规范化，兼容性由两端 Python 环境负责
 
 边界说明：
 
@@ -195,6 +198,16 @@
 3. `pickle_stable_v1`
    - 适合内网受信环境下的高保真传输
    - 但不等于任意 Python 自定义对象都承诺稳定支持
+4. `pickle_native_v1`
+   - 适合 local/trusted internal 环境下显式选择
+   - 不对 public gateway 开放
+
+local IPC 规则：
+
+1. `target="local"` 不参与 remote 的 mode 优先级和 effective policy mode 合成
+2. local service、local stream、local TaskPool、local JobQueue 调用统一固定为 `pickle_native_v1`
+3. 外部传入的 `serialization_mode` / `task_serialization_mode` 在 local 下只保留兼容，不改变实际 codec
+4. gateway public 仍禁止 pickle family，不能借 local 规则放宽
 
 当前明确支持矩阵：
 
@@ -216,6 +229,9 @@
    - pandas `DataFrame / Series / Index`
    - numpy `ndarray`（非 `dtype=object`）
    - `dtype=object` 明确报错
+4. `pickle_native_v1`
+   - 原生 pickle 能处理的 Python 对象
+   - 不承诺跨 Python/pandas/numpy 版本稳定
 
 ## 9. Policy / Tags / Effective Policy
 
@@ -450,12 +466,15 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
 3. `pickle_stable_v1`
    - carrier 同样显式标明 codec
    - pandas / numpy 先做稳定 schema，再进入 pickle
+4. `pickle_native_v1`
+   - carrier 同样显式标明 codec
+   - 直接使用 Python 原生 pickle
 
 当前 carrier decode 规则：
 
 1. 优先识别显式 carrier envelope
 2. 只有 `legacy_v1` 允许裸 payload fallback
-3. `structured_v1` / `pickle_stable_v1` 不再依赖 decode 端猜测
+3. `structured_v1` / pickle family 不再依赖 decode 端猜测
 4. 接收端会按上下文重新校验 declared codec，不再无条件信任 envelope
 
 分层边界：
@@ -464,6 +483,7 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
    - `legacy_v1`
    - `structured_v1`
    - `pickle_stable_v1`
+   - `pickle_native_v1`
 2. carrier 容器层
    - JSON / Struct
    - `TransportPayload` adapter
@@ -490,14 +510,14 @@ payload 限制现在不再只是“本机 `get_payload_policy()` 读 env”：
    - `application/x-pycloud-transport`
    - `X-Pycloud-Codec`
    - `X-Pycloud-Transport-Version`
-   - `pickle_stable_v1` 在 policy 允许时优先走这条 raw body
+   - pickle family 在 policy 允许时优先走这条 raw body
 
 HTTP 接收端规则：
 
 1. JSON body 继续走旧 JSON decode
 2. HTTP raw-bytes body 先按 header 读 declared codec/version
 3. 再按上下文做权限校验
-4. `gateway_public` 默认仍然硬性禁止 `pickle_stable_v1`
+4. `gateway_public` 默认仍然硬性禁止 pickle family：`pickle_stable_v1` / `pickle_native_v1`
 
 `pickle_stable_v1` 的对象层原则：
 

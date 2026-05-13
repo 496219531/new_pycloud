@@ -80,7 +80,7 @@ class ObjectResolutionError(RuntimeError):
 def _materialize_object_bytes(*, blob: bytes, fmt: str, materialize_as: str) -> Any:
     materialized = normalize_materialize_as(materialize_as, default="path")
     normalized_format = normalize_object_format(fmt, default="bin")
-    if normalized_format in {"structured_v1", "pickle_stable_v1"}:
+    if normalized_format in {"structured_v1", "pickle_stable_v1", "pickle_native_v1"}:
         return deserialize_by_mode(blob, mode=normalized_format)
     if materialized == "bytes":
         return bytes(blob)
@@ -379,7 +379,7 @@ def _materialize_object_artifact(
 ) -> Any:
     if artifact.storage_backend == "file":
         candidate = Path(artifact.path)
-        if str(artifact.format or "").strip().lower() in {"structured_v1", "pickle_stable_v1"}:
+        if str(artifact.format or "").strip().lower() in {"structured_v1", "pickle_stable_v1", "pickle_native_v1"}:
             validate_bytes_materialize_size(
                 int(artifact.size_bytes or candidate.stat().st_size),
                 context=f"object {artifact.object_id}",
@@ -808,12 +808,37 @@ def _normalize_stream_item_value(
     serialization_mode: str = "",
     use_transport_result: Optional[bool] = None,
 ) -> Any:
-    return _normalize_result_value(
-        ret,
-        object_dir=object_dir,
-        serialization_mode=serialization_mode,
-        use_transport_result=use_transport_result,
-    )
+    del object_dir
+    result_policy = get_payload_policy("result")
+    result_limit = result_policy.inline_result_hard_limit_bytes
+    try:
+        if bool(use_transport_result):
+            transport = encode_transport_payload_bytes(
+                ret,
+                mode=serialization_mode,
+                context="service stream item",
+                limit_bytes=result_limit,
+            )
+            inline_value = transport_payload_to_inline_carrier(
+                transport,
+                payload_mode="result",
+                context="service_result",
+                limit_bytes=result_limit,
+            )
+        else:
+            inline_value, _struct, _size = serialize_inline_result(
+                ret,
+                context="service stream item",
+                mode=serialization_mode,
+                limit_bytes=result_limit,
+            )
+    except ValueError as exc:
+        raise LargeResultError(
+            f"service stream item exceeds inline result limit: limit_bytes={result_limit}; "
+            "stream does not support DataRef or large result items"
+        ) from exc
+    log_payload_flow("inline_stream_item_ready", context="service stream item", summary=summarize_payload_flow_value(ret))
+    return inline_value
 
 
 def _normalize_user_return(

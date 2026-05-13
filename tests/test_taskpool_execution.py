@@ -170,6 +170,42 @@ def test_task_pool_open_local_supports_unordered_wrappers(tmp_path) -> None:
         assert all(item.node_instance_id for item in items)
 
 
+def test_task_pool_open_local_ignores_external_serialization_mode(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) + 1}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_ignore_mode",
+            entry_callable="run",
+        ),
+        worker_count=1,
+        serialization_mode="structured_v1",
+    ) as pool:
+        assert pool.serialization_mode == "pickle_native_v1"
+        captured_codecs = []
+        original_build_item = pool._build_task_submit_item
+
+        def _capture_build_item(*args, **kwargs):
+            item = original_build_item(*args, **kwargs)
+            captured_codecs.append(item.transport_payload.codec)
+            return item
+
+        pool._build_task_submit_item = _capture_build_item
+        resp = pool.submit_payloads([{"value": 1}], serialization_mode="legacy_v1")
+        assert len(resp.accepted) == 1
+        assert captured_codecs == ["pickle_native_v1"]
+        values = pool.wait_for_data(expected_count=1, timeout_sec=10.0)
+        assert values == [{"value": 2}]
+
+
 def test_task_pool_open_local_supports_imap_unordered_return_items(tmp_path) -> None:
     from pycloud_parallel import TaskPool
 
@@ -308,6 +344,32 @@ def test_task_pool_open_local_put_data_file_path_does_not_read_whole_file(tmp_pa
         payload_items = list(pool.imap_unordered([{"blob": ref}], timeout_sec=10.0, return_items=True))
         assert payload_items[0].ok is True
         assert payload_items[0].result == {"payload_size": source.stat().st_size}
+
+
+def test_task_pool_put_data_accepts_object_format_alias(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+
+    blob = (
+        b"from pathlib import Path\n\n"
+        b"def run(blob=None, **_kwargs):\n"
+        b"    return {'payload_size': Path(blob).stat().st_size}\n"
+    )
+    source = tmp_path / "local-taskpool-object-format.bin"
+    source.write_bytes(b"x" * 128)
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_object_format",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        ref = pool.put_data(source, object_format="bin")
+
+    assert ref.format == "bin"
 
 
 def test_task_pool_open_local_applies_managed_globals(tmp_path) -> None:
@@ -1469,6 +1531,100 @@ def test_native_task_pool_session_map_forwards_strategy_to_collect_items() -> No
     assert mocked.call_args.kwargs["strategy"] == "taskpool_throughput"
 
 
+def test_native_task_pool_session_map_values_alias_matches_map() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-map-values",
+    )
+
+    with patch.object(session, "map", return_value=[{"value": 1}]) as mocked:
+        assert session.map_values([1], arg_name="value", extra=9) == [{"value": 1}]
+
+    assert mocked.call_args.args[0] == [1]
+    assert mocked.call_args.kwargs["arg_name"] == "value"
+    assert mocked.call_args.kwargs["extra"] == 9
+
+
+def test_native_task_pool_session_call_async_alias_delegates_to_call() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-call-async-alias",
+    )
+
+    async def _fake_call(method: str, **kwargs):
+        return {"method": method, "kwargs": kwargs}
+
+    session.call = _fake_call  # type: ignore[method-assign]
+
+    assert asyncio.run(session.call_async("run", value=1)) == {"method": "run", "kwargs": {"value": 1}}
+
+
+def test_native_task_pool_session_imap_unordered_accepts_server_wait_ms_alias() -> None:
+    from pycloud_parallel import TaskPool
+
+    pull_waits = []
+    accepted_task_ids = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        _client = SimpleNamespace(
+            close=lambda: None,
+            fetch_result_data=lambda task_result, target_path="": {"value": 1},
+        )
+        worker_count = 1
+
+        def submit_tasks(self, tasks, job_id=""):
+            del job_id
+            accepted_task_ids.extend(str(item.task_id) for item in tasks)
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, *, limit=1, wait_ms=0, cursor=""):
+            del limit, cursor
+            pull_waits.append(int(wait_ms))
+            return pb2.PullResultsResponse(
+                ok=True,
+                results=[
+                    pb2.TaskResult(
+                        task_id=accepted_task_ids.pop(0),
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"value": 1}),
+                    )
+                ],
+                next_cursor="",
+            )
+
+        def close(self, reason=""):
+            del reason
+            return pb2.CloseTaskPoolResponse(ok=True, accepted=True)
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-server-wait-ms",
+    )
+
+    try:
+        assert list(session.imap_unordered([{"value": 1}], server_wait_ms=7, timeout_sec=0.5)) == [(0, {"value": 1})]
+        assert pull_waits == [7]
+    finally:
+        session.close()
+
+
 def test_native_task_pool_session_map_builds_payloads_lazily() -> None:
     from pycloud_parallel import TaskPool
 
@@ -2447,6 +2603,22 @@ def test_native_task_pool_session_collect_results_calls_iter_results() -> None:
     mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, wait_ms=500, limit=100, job_id="")
 
 
+def test_native_task_pool_session_collect_results_accepts_server_wait_ms_alias() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-collect-server-wait",
+    )
+
+    with patch.object(session, "iter_results", return_value=iter([])) as mocked:
+        assert session.collect_results(max_count=2, timeout_sec=1.0, server_wait_ms=9) == []
+
+    mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, server_wait_ms=9, wait_ms=500, limit=100, job_id="")
+
+
 def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
     from pycloud_parallel import TaskPool
 
@@ -2466,6 +2638,31 @@ def test_native_task_pool_session_collect_data_calls_iter_data() -> None:
 
     assert out == [("task-1", {"value": 1}), ("task-2", {"value": 2})]
     mocked.assert_called_once_with(max_count=2, timeout_sec=1.0, wait_ms=500, limit=100, job_id="", raise_on_error=False, task_ids=None)
+
+
+def test_native_task_pool_session_collect_data_accepts_server_wait_ms_alias() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-collect-data-server-wait",
+    )
+
+    with patch.object(session, "iter_data", return_value=iter([])) as mocked:
+        assert session.collect_data(max_count=2, timeout_sec=1.0, server_wait_ms=11) == []
+
+    mocked.assert_called_once_with(
+        max_count=2,
+        timeout_sec=1.0,
+        server_wait_ms=11,
+        wait_ms=500,
+        limit=100,
+        job_id="",
+        raise_on_error=False,
+        task_ids=None,
+    )
 
 
 def test_native_task_pool_session_unordered_has_strict_signature() -> None:

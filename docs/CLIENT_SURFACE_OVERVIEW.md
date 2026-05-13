@@ -58,12 +58,16 @@
    - 外层仍是 pickle
    - 但 `DataFrame / Series / ndarray` 先转稳定 schema 再 pickle
    - 其中 ndarray 的原始数据直接保留为 raw bytes，不再先 base64 文本化
+4. `pickle_native_v1`
+   - 受信环境原生 Python pickle codec
+   - 不做 pandas/numpy 稳定 schema 归一，兼容性由两端 Python 环境负责
 
 边界说明：
 
 1. `structured_v1` 不是 pickle
 2. `pickle_stable_v1` 也不是“任意 Python 对象全支持”的通用 pickle 模式
-3. 当前明确支持：
+3. `pickle_native_v1` 是可信内部模式，不给 gateway public 使用
+4. 当前明确支持：
    - pandas `DataFrame / Series / Index`
    - numpy `ndarray`（非 `dtype=object`）
    - 结构化标量 / 容器
@@ -71,7 +75,7 @@
 
 分层原则：
 
-1. `legacy_v1 / structured_v1 / pickle_stable_v1` 首先是对象 codec 层
+1. `legacy_v1 / structured_v1 / pickle_stable_v1 / pickle_native_v1` 首先是对象 codec 层
 2. JSON carrier / HTTP raw-bytes body / object upload blob 属于当前主线 carrier 层
 3. Struct carrier / `TransportPayload` adapter 属于旧内部兼容层
 4. `pickle_stable_v1` 不会为了 JSON/Struct 预先把 schema 里的 raw bytes 文本化
@@ -79,6 +83,13 @@
 6. 因此：
    - codec 层表达对象本身
    - carrier 层表达“这个对象怎么进当前协议容器”
+
+local 模式的特殊规则：
+
+1. 只要 `target="local"` 或 local IPC route 生效，实际 codec 固定为 `pickle_native_v1`
+2. local 下传入的 `serialization_mode` / `task_serialization_mode` 只保留接口兼容，不改变实际 codec
+3. local stream item 也走同一套 Python native pickle 语义，不再强制 JSON-safe event item
+4. 这个规则只适用于同机 local IPC；remote discovery/direct/gateway 仍按 policy/profile 解析
 
 当前 NodeControl 消息主链仍有两条兼容路径：
 
@@ -114,6 +125,8 @@
 3. 当前 system mode / env
 4. 默认回退 `legacy_v1`
 
+这个优先级只适用于 remote/discovery/direct HTTP 路径。local IPC 不参与这个优先级，统一固定为 `pickle_native_v1`。
+
 权限边界：
 
 1. `Service.connect(...)`
@@ -148,7 +161,7 @@ with TaskPool.open(target="127.0.0.1:50051", source=my_module, api_token="owner-
 2. decode 端优先按 envelope 解码
 3. 没有 envelope 时只按 `legacy_v1` 兜底，不再按全局 env 猜 mode
 4. 接收端会按当前边界上下文重新校验 declared mode，不是发送端声明什么就无条件接受什么
-5. `gateway_public` 默认硬性禁止 `pickle_stable_v1`
+5. `gateway_public` 默认硬性禁止 pickle family：`pickle_stable_v1` / `pickle_native_v1`
 
 ## 会话级 Effective Policy
 
@@ -166,6 +179,7 @@ with TaskPool.open(target="127.0.0.1:50051", source=my_module, api_token="owner-
 1. 客户端可以表达 `serialization_mode` 偏好，但不能直接挑 `policy profile`
 2. node 不会再各自凭本机 env 选默认 mode 或 payload limit
 3. 会话建成以后，`serialization_mode`、payload limits、HTTP raw-bytes body，以及旧内部 `TransportPayload` adapter 都按冻结后的 `effective_policy` 走
+4. local IPC 是例外：它不通过 requested mode 合成，固定使用 `pickle_native_v1`
 
 `policy_id` 现在属于控制面/部署层输入，而不是普通客户端输入。
 普通用户在主路径上只会看到最终冻结的 `effective_policy`，不会被引导去直接选择 profile。

@@ -40,7 +40,7 @@ def _roundtrip_payload(mode: str):
 
 
 def test_transport_payload_modes_roundtrip():
-    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"):
         payload, decoded = _roundtrip_payload(mode)
         assert decoded["frame"].equals(payload["frame"])
         assert np.array_equal(decoded["array"], payload["array"])
@@ -49,8 +49,8 @@ def test_transport_payload_modes_roundtrip():
 
 
 def test_transport_payload_raw_bytes_modes_roundtrip():
-    payload = {"frame": pd.DataFrame({"a": [1, 2]}), "value": 3}
-    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+    payload = {"frame": pd.DataFrame({"a": [1, 2], "label": ["甲", "乙"]}), "value": 3}
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"):
         transport = encode_transport_payload_bytes(payload, mode=mode, context="service_owner")
         decoded = decode_transport_payload_bytes(
             transport.codec,
@@ -60,6 +60,16 @@ def test_transport_payload_raw_bytes_modes_roundtrip():
         )
         assert decoded["frame"].equals(payload["frame"])
         assert decoded["value"] == 3
+
+
+def test_pickle_native_v1_transport_adapts_raw_codec_bytes_for_json_container():
+    frame = pd.DataFrame({"param": ["窗口", "阈值"], "value": [{"n": 20}, [1, 2]]})
+
+    encoded = encode_transport_value(frame, mode="pickle_native_v1", context="test payload")
+    envelope = encoded[TRANSPORT_ENVELOPE_SENTINEL]
+    assert envelope["codec"] == "pickle_native_v1"
+    assert envelope["payload"]["encoding"] == "base64"
+    assert isinstance(envelope["payload"]["data"], str)
 
 
 def test_pickle_stable_v1_transport_adapts_raw_codec_bytes_for_json_container():
@@ -140,6 +150,26 @@ def test_gateway_public_decode_rejects_pickle_transport_payload_raw_bytes():
         assert "pickle_stable_v1" in str(exc)
     else:
         raise AssertionError("expected gateway_public pickle bytes decode to be rejected")
+
+
+def test_gateway_public_decode_rejects_pickle_native_transport_payload_raw_bytes():
+    transport = encode_transport_payload_bytes(
+        {"value": 1},
+        mode="pickle_native_v1",
+        context="service_owner",
+    )
+    try:
+        decode_transport_payload_bytes(
+            transport.codec,
+            transport.version,
+            transport.payload,
+            context="gateway_public",
+        )
+    except ValueError as exc:
+        assert "gateway_public" in str(exc)
+        assert "pickle_native_v1" in str(exc)
+    else:
+        raise AssertionError("expected gateway_public native pickle bytes decode to be rejected")
 
 
 def test_service_owner_decode_accepts_pickle_transport():

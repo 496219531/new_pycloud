@@ -136,7 +136,7 @@ _CHOICE_SETTINGS: dict[str, EnvChoiceSetting] = {
     "SYSTEM_MODE": EnvChoiceSetting(PYCLOUD_SYSTEM_MODE, "trusted_default", frozenset({"trusted_default"})),
     "TRUST_MODE": EnvChoiceSetting(PYCLOUD_TRUST_MODE, "trusted", frozenset({"trusted", "balanced", "strict"})),
     "OBJECT_TRANSFER_MODE": EnvChoiceSetting(PYCLOUD_OBJECT_TRANSFER_MODE, "auto", frozenset({"auto", "known_digest_precheck", "single_pass_authoritative"})),
-    "SERIALIZATION_MODE": EnvChoiceSetting(PYCLOUD_SERIALIZATION_MODE, "legacy_v1", frozenset({"legacy_v1", "structured_v1", "pickle_stable_v1"})),
+    "SERIALIZATION_MODE": EnvChoiceSetting(PYCLOUD_SERIALIZATION_MODE, "legacy_v1", frozenset({"legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"})),
     "DEPENDENCY_POLICY_MODE": EnvChoiceSetting(PYCLOUD_DEPENDENCY_POLICY_MODE, "prebuilt", frozenset({"prebuilt", "node_preinstalled", "allow_install"})),
     "EXECUTOR_BACKEND": EnvChoiceSetting(PYCLOUD_EXECUTOR_BACKEND, "subprocess_host", frozenset({"subprocess_host"})),
     "DATAREF_RESOLUTION": EnvChoiceSetting(PYCLOUD_DATAREF_RESOLUTION, "remote_fetch", frozenset({"local_only", "remote_fetch"})),
@@ -164,7 +164,7 @@ PayloadMode = Literal["http_call", "job_submit", "task_submit", "managed_globals
 TrustMode = Literal["trusted", "balanced", "strict"]
 ObjectTransferMode = Literal["auto", "known_digest_precheck", "single_pass_authoritative"]
 SystemMode = Literal["trusted_default"]
-SerializationMode = Literal["legacy_v1", "structured_v1", "pickle_stable_v1"]
+SerializationMode = Literal["legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"]
 DependencyPolicyMode = Literal["prebuilt", "node_preinstalled", "allow_install"]
 ExecutorBackendMode = Literal["subprocess_host"]
 DataRefResolutionMode = Literal["local_only", "remote_fetch"]
@@ -629,7 +629,7 @@ def get_serialization_mode() -> SerializationMode:
     return _env_choice(
         PYCLOUD_SERIALIZATION_MODE,
         "legacy_v1",
-        {"legacy_v1", "structured_v1", "pickle_stable_v1"},
+        {"legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"},
     )  # type: ignore[return-value]
 
 

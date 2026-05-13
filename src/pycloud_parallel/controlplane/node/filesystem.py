@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 from pycloud_parallel.controlplane.artifact import _normalize_dependency_policy_mode
 from pycloud_parallel.controlplane.code_version import _sha256_text, _stable_json_bytes
 from pycloud_parallel.controlplane.node.models import CodeArtifact, ManagedGlobalsState
+from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.data.ref import normalize_object_id
 
@@ -25,6 +26,7 @@ from pycloud_parallel.data.ref import normalize_object_id
 _SEGMENT_WRITER_LOCKS_LOCK = threading.Lock()
 _SEGMENT_WRITER_LOCKS: Dict[Tuple[str, int], threading.Lock] = {}
 _MANAGED_GLOBAL_BINARY_SENTINEL = "__pycloud_managed_global_binary__"
+_PICKLE_MODES = set(PICKLE_SERIALIZATION_MODES)
 
 
 def _is_transient_metadata_replace_error(exc: BaseException) -> bool:
@@ -246,7 +248,7 @@ def _managed_globals_value_path(scope_dir: Path, *, value_digest: str, codec: st
     normalized = str(value_digest or "").replace("sha256:", "").strip().lower()
     if not normalized:
         raise ValueError("value_digest is required")
-    suffix = ".bin" if str(codec or "").strip().lower() == "pickle_stable_v1" else ".json"
+    suffix = ".bin" if str(codec or "").strip().lower() in _PICKLE_MODES else ".json"
     return Path(scope_dir) / "values" / f"{normalized}{suffix}"
 
 
@@ -311,7 +313,7 @@ def _load_managed_globals_snapshot_serialized(state: ManagedGlobalsState) -> Dic
         value_path = _managed_globals_value_path(scope_dir, value_digest=value_digest, codec=codec)
         if not value_path.exists():
             continue
-        if codec == "pickle_stable_v1":
+        if codec in _PICKLE_MODES:
             out[name] = _managed_globals_binary_value(codec=codec, payload=value_path.read_bytes())
         else:
             out[name] = json.loads(value_path.read_text(encoding="utf-8") or "null")

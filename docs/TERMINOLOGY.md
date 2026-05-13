@@ -55,6 +55,8 @@ Service.connect(
 
 `serialization_mode` 只描述对象怎么编解码，不描述走 HTTP 还是走内部消息。
 
+`target="local"` 是唯一特例：local IPC runtime 固定使用 `pickle_native_v1`，外部传入的 `serialization_mode` / `task_serialization_mode` 不改变实际 codec。这样 local 模式只保留一个心智模型：同机进程通信就是 Python native pickle。
+
 当前 mode：
 
 1. `legacy_v1`
@@ -66,6 +68,10 @@ Service.connect(
 3. `pickle_stable_v1`
    - 内部可信链路高保真 codec
    - `DataFrame / Series / ndarray` 会先归一到稳定 schema
+   - gateway public 默认拒绝
+4. `pickle_native_v1`
+   - 内部可信链路的 Python 原生 pickle codec
+   - 主要用于 local/trusted internal 场景，兼容性由运行端 Python 环境负责
    - gateway public 默认拒绝
 
 不要说“pickle 模式一定走 bytes”。是否走 HTTP raw-bytes body 由 `effective_policy` 和当前调用路径决定。

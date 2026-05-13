@@ -38,7 +38,7 @@ with TaskPool.open(
 5. 如果你需要更偏吞吐的策略，可以显式传：
 
 ```python
-results = pool.map(values, strategy="taskpool_throughput")
+results = pool.map_values(values, strategy="taskpool_throughput")
 ```
 
 排队执行示例：

@@ -35,6 +35,10 @@ def test_resolve_effective_serialization_mode_priority(monkeypatch):
         monkeypatch.setenv("PYCLOUD_SERIALIZATION_MODE", "structured_v1")
         config.reload_config()
         assert resolve_effective_serialization_mode() == "structured_v1"
+
+        monkeypatch.setenv("PYCLOUD_SERIALIZATION_MODE", "pickle_native_v1")
+        config.reload_config()
+        assert resolve_effective_serialization_mode() == "pickle_native_v1"
     finally:
         monkeypatch.delenv("PYCLOUD_SERIALIZATION_MODE", raising=False)
         config.reload_config()
@@ -59,8 +63,11 @@ def test_validate_mode_for_context_rejects_untrusted_gateway_pickle(monkeypatch)
 
         with pytest.raises(ValueError, match="pickle_stable_v1"):
             validate_mode_for_context("pickle_stable_v1", context="gateway_public")
+        with pytest.raises(ValueError, match="pickle_native_v1"):
+            validate_mode_for_context("pickle_native_v1", context="gateway_public")
 
         assert validate_mode_for_context("pickle_stable_v1", context="taskpool_session") == "pickle_stable_v1"
+        assert validate_mode_for_context("pickle_native_v1", context="taskpool_session") == "pickle_native_v1"
     finally:
         monkeypatch.delenv("PYCLOUD_TRUST_MODE", raising=False)
         config.reload_config()

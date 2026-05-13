@@ -156,7 +156,12 @@ def test_local_pickle_payload_transport_repickles_after_prepare_when_over_thresh
     )
 
     assert payload_transport
-    assert len(dump_calls) == 2
+    request_payload_dumps = [
+        value
+        for value in dump_calls
+        if isinstance(value, dict) and "items" in value
+    ]
+    assert len(request_payload_dumps) == 2
 
 
 def test_local_pickle_payload_transport_normalizes_file_paths(tmp_path) -> None:
@@ -2455,7 +2460,8 @@ def test_job_queue_local_reuses_service_connect_local_transport(monkeypatch) -> 
     assert captured["connect_kwargs"]["route"] == "local"
     assert captured["connect_kwargs"]["protocol"] == "http"
     assert captured["connect_kwargs"]["service_token"] == "token-local"
-    assert captured["connect_kwargs"]["effective_policy_override"].resolved_mode == "structured_v1"
+    assert captured["connect_kwargs"]["serialization_mode"] == "pickle_native_v1"
+    assert captured["connect_kwargs"]["effective_policy_override"] is None
     assert captured["connect_kwargs"]["prepare_discovery_payload"] is False
     assert captured["method"] == "get_job_status"
     assert captured["payload"] == {
@@ -2463,7 +2469,7 @@ def test_job_queue_local_reuses_service_connect_local_transport(monkeypatch) -> 
         "include_details": False,
         "_service_token": "token-local",
     }
-    assert captured["call_kwargs"]["serialization_mode"] == "structured_v1"
+    assert captured["call_kwargs"]["serialization_mode"] == "pickle_native_v1"
 
 
 def test_job_queue_local_calls_local_service_ipc_end_to_end(tmp_path, monkeypatch) -> None:

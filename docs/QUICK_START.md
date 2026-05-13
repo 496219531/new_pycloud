@@ -181,15 +181,15 @@ svc = Service.connect(
     route="gateway",
 )
 
-results = svc.square.map([1, 2, 3], arg_name="x")
+results = svc.square.map_values([1, 2, 3], arg_name="x")
 print(results)
 
 for index, result in svc.square.unordered([{"x": 1}, {"x": 2}, {"x": 3}], max_in_flight=3):
     print(index, result)
 
-# async 场景可选使用 amap(...) / aunordered(...)；
+# async 场景可选使用 amap_values(...) / aunordered(...)；
 # 当前更推荐把它们理解成进阶能力，而不是 service 主调用路径
-# results = await svc.square.amap([1, 2, 3], arg_name="x")
+# results = await svc.square.amap_values([1, 2, 3], arg_name="x")
 # async for index, result in svc.square.aunordered([{"x": 1}, {"x": 2}], max_in_flight=2):
 #     ...
 
@@ -265,7 +265,7 @@ with TaskPool.open(
         result_timeout_sec=10.0,
     )
 
-    mapped = pool.map([8, 9, 10], timeout_sec=10.0)
+    mapped = pool.map_values([8, 9, 10], timeout_sec=10.0)
     print(mapped)
 ```
 
@@ -275,7 +275,7 @@ with TaskPool.open(
 2. `submit_payloads(..., task_method=...)` 只能传这个方法名
 3. `runtime_key` 仍可用于 runtime 逻辑隔离，但不再表示独立 runtime-slot
 4. `pool.unordered(...)` / `pool.aunordered(...)` 是统一批量接口，返回 `(index, result_or_none)`
-5. 如果你需要 `receive_batch / wait_ms / raise_on_error` 这类低层流控参数，请显式使用 `pool.imap_unordered(...)`
+5. 如果你需要 `receive_batch / server_wait_ms / raise_on_error` 这类低层流控参数，请显式使用 `pool.imap_unordered(...)`；旧参数名 `wait_ms` 仍兼容
 
 如果你希望先排队，再由调度器自动创建专属 pool：
 

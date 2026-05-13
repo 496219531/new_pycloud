@@ -19,7 +19,6 @@ from typing import Any, Dict, Optional
 
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.config import OBJECT_SEGMENT_MAX_BYTES, get_local_service_payload_policy
-from pycloud_parallel.controlplane.client_transport import _restore_stream_transport_carrier
 from pycloud_parallel.controlplane.node.results import (
     _commit_result_file,
     _commit_result_segment,
@@ -27,7 +26,7 @@ from pycloud_parallel.controlplane.node.results import (
 )
 from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size, prepare_outbound_payload
 from pycloud_parallel.controlplane.serialization import (
-    INTERNAL_PICKLE_NATIVE_V1,
+    LOCAL_IPC_SERIALIZATION_MODE,
     make_validated_inline_transport_carrier,
     validate_inline_payload_size,
 )
@@ -99,6 +98,7 @@ def _put_local_payload_data(
     format: str = "",
     default_serialization_mode: str = "",
 ) -> DataRef:
+    del default_serialization_mode
     existing = maybe_data_ref(value)
     if existing is not None:
         return existing
@@ -107,7 +107,7 @@ def _put_local_payload_data(
     source = _serialize_data_for_object_ref(
         value,
         format=format,
-        default_serialization_mode=default_serialization_mode,
+        default_serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
     )
     if getattr(source, "is_file", False):
         path = Path(str(source.file_path)).expanduser().resolve()
@@ -185,13 +185,14 @@ def _normalize_local_payload_paths(value: Any) -> Any:
 
 
 def _prepare_local_payload(payload: Dict[str, object], *, meta: Dict[str, object], serialization_mode: str = "") -> Dict[str, object]:
+    del serialization_mode
     return prepare_outbound_payload(
         _normalize_local_payload_paths(payload),
         put_data=lambda value, *, format="": _put_local_payload_data(
             value,
             meta=meta,
             format=format,
-            default_serialization_mode=serialization_mode,
+            default_serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
         ),
         estimate_inline_size=_estimate_local_inline_size,
         policy=get_local_service_payload_policy(),
@@ -204,11 +205,12 @@ def _make_local_pickle_payload_transport(
     meta: Dict[str, object],
     serialization_mode: str = "",
 ) -> Dict[str, object]:
+    del serialization_mode
     policy = get_local_service_payload_policy()
     normalized_payload = dict(_normalize_local_payload_paths(payload or {}))
     raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
     if len(raw_payload) > max(1, int(policy.inline_payload_threshold_bytes)):
-        prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=serialization_mode)
+        prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
         raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(
         len(raw_payload),
@@ -216,7 +218,7 @@ def _make_local_pickle_payload_transport(
         context="local IPC service payload",
     )
     return make_validated_inline_transport_carrier(
-        codec=INTERNAL_PICKLE_NATIVE_V1,
+        codec=LOCAL_IPC_SERIALIZATION_MODE,
         payload=raw_payload,
         content_size=size,
         payload_mode="service_call",
@@ -491,7 +493,7 @@ def _stream_once(meta: Dict[str, object], request: Dict[str, object], *, timeout
             event = conn.recv()
             if not isinstance(event, dict):
                 raise RuntimeError(f"invalid local service IPC stream event: {type(event).__name__}")
-            yield _restore_stream_transport_carrier(event)
+            yield event
             if str(event.get("event", "") or "") == "done":
                 return
     finally:
@@ -818,18 +820,18 @@ class LocalServiceClient:
         serialization_mode: str = "",
         **kwargs: object,
     ) -> Dict[str, object]:
-        del service_name, kwargs
+        del service_name, serialization_mode, kwargs
         payload_transport = _make_local_pickle_payload_transport(
             payload,
             meta=self._meta,
-            serialization_mode=serialization_mode,
+            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
         )
         response = self._request(
             "call",
             method=method,
             payload_transport=payload_transport,
             timeout_sec=max(0.1, float(timeout_sec or self.timeout_sec)),
-            serialization_mode=serialization_mode,
+            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
         )
         body = response.get("response")
         if not isinstance(body, dict):
@@ -848,18 +850,18 @@ class LocalServiceClient:
         serialization_mode: str = "",
         **kwargs: object,
     ):
-        del service_name, kwargs
+        del service_name, serialization_mode, kwargs
         payload_transport = _make_local_pickle_payload_transport(
             payload,
             meta=self._meta,
-            serialization_mode=serialization_mode,
+            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
         )
         request = {
             "action": "stream_call",
             "method": method,
             "payload_transport": payload_transport,
             "timeout_sec": max(0.1, float(timeout_sec or self.timeout_sec)),
-            "serialization_mode": serialization_mode,
+            "serialization_mode": LOCAL_IPC_SERIALIZATION_MODE,
         }
         try:
             yield from _stream_once(self._meta, request, timeout_sec=max(self.timeout_sec, float(timeout_sec or 0.0)))

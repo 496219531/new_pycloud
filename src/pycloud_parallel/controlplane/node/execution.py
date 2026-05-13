@@ -43,14 +43,14 @@ from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, n
 from pycloud_parallel.controlplane.serialization import (
     convert_dict_to_arrow,
     decode_inline_transport_carrier,
+    deserialize_by_mode,
     is_arrow_compatible,
     is_inline_transport_carrier,
     log_payload_flow,
     serialize_arrow_compatible,
-    stable_pickle_load_file,
-    stable_pickle_loads,
     summarize_payload_flow_value,
 )
+from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_current_node
 from pycloud_parallel.runtime.errors import RuntimeMismatchError
 
@@ -1056,13 +1056,13 @@ def _apply_managed_globals_to_router(
                 raise RuntimeError(f"managed globals value missing: {value_path}")
             key_started = time.perf_counter()
             value_json_started = time.perf_counter()
-            if value_codec == "pickle_stable_v1":
-                serialized_value = stable_pickle_load_file(value_path)
+            if value_codec in set(PICKLE_SERIALIZATION_MODES):
+                serialized_value = deserialize_by_mode(value_path.read_bytes(), mode=value_codec)
             else:
                 serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
             key_value_json_ms = (time.perf_counter() - value_json_started) * 1000.0
             convert_started = time.perf_counter()
-            resolved_value = serialized_value if value_codec == "pickle_stable_v1" else convert_dict_to_arrow(serialized_value)
+            resolved_value = serialized_value if value_codec in set(PICKLE_SERIALIZATION_MODES) else convert_dict_to_arrow(serialized_value)
             key_convert_ms = (time.perf_counter() - convert_started) * 1000.0
             resolve_started = time.perf_counter()
             resolved_values[name] = _resolve_object_refs_in_payload(resolved_value, object_dir=object_dir)

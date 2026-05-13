@@ -13,7 +13,9 @@ from pycloud_parallel.controlplane.config import (
     normalize_policy_limit_values,
 )
 from pycloud_parallel.controlplane.policy_profile import PolicyProfile
-from pycloud_parallel.controlplane.serialization_mode import normalize_serialization_mode
+from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES, normalize_serialization_mode
+
+_PICKLE_MODES = set(PICKLE_SERIALIZATION_MODES)
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,7 @@ def _allowed_modes_for_context(profile: PolicyProfile, *, context: str) -> Tuple
     normalized_context = str(context or "").strip().lower()
     allowed = list(profile.allowed_modes)
     if not profile.allow_pickle_stable or (normalized_context == "gateway_public" and not profile.public_gateway_allow_pickle):
-        allowed = [mode for mode in allowed if mode != "pickle_stable_v1"]
+        allowed = [mode for mode in allowed if mode not in _PICKLE_MODES]
     if not allowed:
         raise ValueError(
             f"policy profile {profile.policy_id!r} does not allow any serialization modes for context={normalized_context!r}"
@@ -116,7 +118,7 @@ def resolve_effective_policy(
         str(context or "").strip().lower()
         in {"gateway_public", "service_connect", "http_call", "jobqueue_session", "taskpool_owner"}
     )
-    allow_pickle_stable = "pickle_stable_v1" in allowed_modes and bool(profile.allow_pickle_stable)
+    allow_pickle_stable = any(mode in _PICKLE_MODES for mode in allowed_modes) and bool(profile.allow_pickle_stable)
 
     return EffectivePolicy(
         policy_id=profile.policy_id,

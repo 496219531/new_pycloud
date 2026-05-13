@@ -41,6 +41,7 @@ from pycloud_parallel.controlplane.policy_profile import (
     get_default_policy_id_for_binding,
     get_policy_profile,
 )
+from pycloud_parallel.controlplane.serialization import LOCAL_IPC_SERIALIZATION_MODE
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.session_model import ExecutionSessionStatus, SessionBinding, SessionIdentity
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
@@ -542,6 +543,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self.retry_prepare_payload_ms = 0.0
         self.retry_submit_ms = 0.0
         self._init_execution_session_state()
+
+    def _is_local_session(self) -> bool:
+        if self._pools and all(isinstance(getattr(pool, "_client", None), _LocalTaskPoolNodeClient) for pool in self._pools.values()):
+            return True
+        return bool(self.nodes) and all(str(node.control_addr or "").strip().lower() == "local" for node in self.nodes.values())
 
     def _replica_handles(self) -> Dict[str, ExecutionReplicaHandle]:
         return self._pools
@@ -1080,11 +1086,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         serialization_mode: str = "",
     ) -> pb2.SubmitTasksResponse:
         del timeout_sec, runtime_key
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="taskpool_session",
-            frozen_mode=self._serialization_mode,
-        )
+        if self._is_local_session():
+            effective_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
+        else:
+            effective_serialization_mode = resolve_effective_serialization_mode(
+                request_mode=serialization_mode,
+                context="taskpool_session",
+                frozen_mode=self._serialization_mode,
+            )
         self._assert_session_available("submit_payloads")
         if self._closed:
             raise RuntimeError("TaskPool session is closed")
@@ -1290,6 +1299,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def _item_with_index(self, item: ExecutionItem, *, index: int, key: Union[int, str]) -> ExecutionItem:
         return replace(item, index=int(index), key=key)
 
+    @staticmethod
+    def _resolve_server_wait_ms(*, server_wait_ms: Optional[int], wait_ms: int) -> int:
+        """Resolve the preferred server-side wait alias without changing authority."""
+        return max(0, int(server_wait_ms if server_wait_ms is not None else wait_ms))
+
     def _iter_raw_results(
         self,
         *,
@@ -1380,15 +1394,17 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         max_count: Optional[int] = None,
         timeout_sec: float = 30.0,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
     ) -> Iterator[pb2.TaskResult]:
         self._assert_session_available("iter_results")
+        effective_wait_ms = self._resolve_server_wait_ms(server_wait_ms=server_wait_ms, wait_ms=wait_ms)
         for _node_id, item in self._iter_raw_results(
             max_count=max_count,
             timeout_sec=timeout_sec,
-            wait_ms=wait_ms,
+            wait_ms=effective_wait_ms,
             limit=limit,
             job_id=job_id,
         ):
@@ -1399,17 +1415,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         max_count: Optional[int] = None,
         timeout_sec: float = 30.0,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
     ) -> List[pb2.TaskResult]:
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         return list(
             self.iter_results(
                 max_count=max_count,
                 timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
+                **wait_kwargs,
             )
         )
 
@@ -1418,6 +1438,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         max_count: Optional[int] = None,
         timeout_sec: float = 30.0,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
@@ -1428,7 +1449,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         for item in self._iter_execution_items(
             max_count=max_count,
             timeout_sec=timeout_sec,
-            wait_ms=wait_ms,
+            wait_ms=self._resolve_server_wait_ms(server_wait_ms=server_wait_ms, wait_ms=wait_ms),
             limit=limit,
             job_id=job_id,
             task_ids=task_ids,
@@ -1445,21 +1466,25 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         max_count: Optional[int] = None,
         timeout_sec: float = 30.0,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
         raise_on_error: bool = False,
         task_ids: Optional[Set[str]] = None,
     ) -> List[Tuple[str, Any]]:
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         return list(
             self.iter_data(
                 max_count=max_count,
                 timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
                 raise_on_error=raise_on_error,
                 task_ids=task_ids,
+                **wait_kwargs,
             )
         )
 
@@ -1546,6 +1571,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
@@ -1559,11 +1585,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         objects for the batch.
         """
         self._assert_session_available("iter_items")
+        effective_wait_ms = self._resolve_server_wait_ms(server_wait_ms=server_wait_ms, wait_ms=wait_ms)
         if payloads is None:
             yield from self._iter_execution_items(
                 max_count=max_count,
                 timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
+                wait_ms=effective_wait_ms,
                 limit=limit,
                 job_id=job_id,
                 task_ids=task_ids,
@@ -1579,6 +1606,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             receive_batch=max(1, min(resolved_max_in_flight, 32)),
             submit_timeout_sec=max(0.1, float(timeout_sec)),
             result_timeout_sec=max(0.1, float(timeout_sec)),
+            server_wait_ms=effective_wait_ms,
             wait_ms=wait_ms,
             raise_on_error=False,
             node_window_factor=2.0,
@@ -1606,12 +1634,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
         **shared_kwargs,
     ) -> List[ExecutionItem]:
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         items = list(
             self.iter_items(
                 payloads,
@@ -1620,10 +1652,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 max_in_flight=max_in_flight,
                 max_count=max_count,
                 timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
                 task_ids=task_ids,
+                **wait_kwargs,
                 **shared_kwargs,
             )
         )
@@ -1640,6 +1672,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
@@ -1647,6 +1680,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         **shared_kwargs,
     ) -> AsyncIterator[ExecutionItem]:
         """Async counterpart of :meth:`iter_items` with the same dual-mode semantics."""
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         iterator = self.iter_items(
             payloads,
             task_method=task_method,
@@ -1654,10 +1690,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
             max_count=max_count,
-            wait_ms=wait_ms,
             limit=limit,
             job_id=job_id,
             task_ids=task_ids,
+            **wait_kwargs,
             **shared_kwargs,
         )
         async for item in _aiter_from_sync_iterator(iterator):
@@ -1672,6 +1708,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         max_count: Optional[int] = None,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
@@ -1679,6 +1716,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         **shared_kwargs,
     ) -> List[ExecutionItem]:
         """Async counterpart of :meth:`collect_items` with the same dual-mode semantics."""
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         return await asyncio.to_thread(
             lambda: self.collect_items(
                 payloads,
@@ -1687,10 +1727,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 max_in_flight=max_in_flight,
                 timeout_sec=timeout_sec,
                 max_count=max_count,
-                wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
                 task_ids=task_ids,
+                **wait_kwargs,
                 **shared_kwargs,
             )
         )
@@ -1709,18 +1749,22 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         expected_count: int = 0,
         timeout_sec: float = 30.0,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
     ) -> Sequence[pb2.TaskResult]:
         max_count = max(0, int(expected_count or 0))
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         return list(
             self.iter_results(
                 max_count=(max_count if max_count > 0 else None),
                 timeout_sec=timeout_sec,
-                wait_ms=wait_ms,
                 limit=limit,
                 job_id=job_id,
+                **wait_kwargs,
             )
         )
 
@@ -1729,14 +1773,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         *,
         expected_count: int = 0,
         timeout_sec: float = 30.0,
+        server_wait_ms: Optional[int] = None,
+        wait_ms: int = 500,
     ) -> Sequence[Any]:
         max_count = max(0, int(expected_count or 0))
+        wait_kwargs = {"wait_ms": wait_ms}
+        if server_wait_ms is not None:
+            wait_kwargs["server_wait_ms"] = server_wait_ms
         return [
             data
             for _task_id, data in self.iter_data(
                 max_count=(max_count if max_count > 0 else None),
                 timeout_sec=timeout_sec,
                 raise_on_error=True,
+                **wait_kwargs,
             )
         ]
 
@@ -2177,6 +2227,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         receive_batch: int = 1,
         submit_timeout_sec: Optional[float] = None,
         result_timeout_sec: Optional[float] = None,
+        server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
         raise_on_error: bool = True,
         max_infra_retries: int = 1,
@@ -2192,7 +2243,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             max_receive = max(1, int(receive_batch or 1))
             submit_timeout_sec = float(submit_timeout_sec if submit_timeout_sec is not None else timeout_sec)
             result_timeout_sec = float(result_timeout_sec if result_timeout_sec is not None else timeout_sec)
-            wait_ms = int(wait_ms or 500)
+            wait_ms = int(server_wait_ms if server_wait_ms is not None else (wait_ms or 500))
             max_infra_retries = max(0, int(max_infra_retries or 0))
             retry_backoff_ms = max(0, int(retry_backoff_ms or 0))
             _node_window_factor = float(node_window_factor or 2.0)
@@ -2423,6 +2474,33 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         )
         return [item.result if item.ok else None for item in items]
 
+    def map_values(
+        self,
+        values: Iterable[Any],
+        *,
+        arg_name: str = "value",
+        task_method: str = "",
+        strategy: str = "taskpool_default",
+        max_in_flight: Optional[int] = None,
+        timeout_sec: float = 30.0,
+        **shared_kwargs,
+    ) -> Sequence[Any]:
+        """Map a sequence of local values to remote task calls.
+
+        This is the explicit alias for ``map(...)``. It does not accept a local
+        Python callable like the built-in ``map``; each value is sent as
+        ``{arg_name: value}`` to the remote task method.
+        """
+        return self.map(
+            values,
+            arg_name=arg_name,
+            task_method=task_method,
+            strategy=strategy,
+            max_in_flight=max_in_flight,
+            timeout_sec=timeout_sec,
+            **shared_kwargs,
+        )
+
     async def amap(
         self,
         values: Iterable[Any],
@@ -2504,22 +2582,32 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         data: Any,
         *,
         format: str = "",
+        object_format: str = "",
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         serialization_mode: str = "",
     ) -> DataRef:
+        """Upload data to the task-pool object store and return a DataRef.
+
+        ``object_format`` is the preferred explicit name for the object-store
+        format hint. ``format`` remains accepted for compatibility.
+        """
         if self._closed:
             raise RuntimeError("task pool session is closed")
+        effective_format = str(object_format or format or "")
         pools_snapshot = list(self._pools.values())
         active_clients = [pool._client for pool in pools_snapshot]  # noqa: SLF001
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="object_upload",
-            frozen_mode=self._serialization_mode,
-        )
+        if self._is_local_session():
+            effective_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
+        else:
+            effective_serialization_mode = resolve_effective_serialization_mode(
+                request_mode=serialization_mode,
+                context="object_upload",
+                frozen_mode=self._serialization_mode,
+            )
         return _put_data_via_clients(
             active_clients,
             data,
-            format=format,
+            format=effective_format,
             chunk_size=chunk_size,
             serialization_mode=effective_serialization_mode,
         )
@@ -2574,13 +2662,22 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         return _TaskPoolCallProxy(session=self, method_name=self._ensure_method(name))
 
     def call_sync(self, method: str, **kwargs) -> Any:
+        """Synchronously call the task-pool entry method."""
         normalized = self._ensure_method(method)
         return getattr(self, normalized).sync(**kwargs)
 
     async def call(self, method: str, **kwargs) -> Any:
+        """Asynchronously call the task-pool entry method.
+
+        Use ``call_sync(...)`` for the synchronous variant.
+        """
         normalized = self._ensure_method(method)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: getattr(self, normalized).sync(**kwargs))
+
+    async def call_async(self, method: str, **kwargs) -> Any:
+        """Explicit alias for ``call(...)``."""
+        return await self.call(method, **kwargs)
 
     def __repr__(self) -> str:
         effective_policy_text = ""
@@ -2844,7 +2941,7 @@ def _build_local_task_pool(
     effective_policy_id = str(policy_id or get_default_policy_id_for_binding("taskpool_default")).strip()
     effective_policy = resolve_effective_policy(
         get_policy_profile(effective_policy_id),
-        requested_mode=serialization_mode,
+        requested_mode=LOCAL_IPC_SERIALIZATION_MODE,
         context="taskpool_session",
     )
     node = NodeControlState(
@@ -2910,7 +3007,7 @@ def _build_local_task_pool(
             nodes={adapter.node_instance_id: node_info},
             task_method=prepared_artifact.entry_callable,
             job_id=job_id,
-            serialization_mode=effective_policy.resolved_mode,
+            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
             policy_id=effective_policy_id,
             effective_policy=effective_policy,
         )

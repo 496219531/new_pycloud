@@ -58,7 +58,7 @@ def _result_for_mode(mode: str) -> dict[str, object]:
 def test_task_pool_submit_payload_roundtrips_transport_modes():
     fake_node = SimpleNamespace(node_id="node-1", control_addr="127.0.0.1:50061")
 
-    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"):
         captured_tasks = []
         payload = _payload_for_mode(mode)
 
@@ -124,7 +124,7 @@ def test_task_pool_submit_payload_roundtrips_transport_modes():
 
 
 def test_task_pool_wait_for_data_roundtrips_transport_modes():
-    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1"):
+    for mode in ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"):
         result = _result_for_mode(mode)
         encoded = encode_result_for_transport(
             result,

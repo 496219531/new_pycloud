@@ -144,8 +144,8 @@ with GatewayServiceClient("127.0.0.1:50051", timeout_sec=10.0) as client:
 
 注意：
 
-1. `gateway_public` 默认仍然禁止 `pickle_stable_v1`
-2. internal/discovery/owner HTTP 路径才允许 `pickle_stable_v1`
+1. `gateway_public` 默认仍然禁止 pickle family：`pickle_stable_v1` / `pickle_native_v1`
+2. internal/discovery/owner HTTP 路径才允许 pickle family
 3. route-aware staging / DataRef 语义不因 HTTP raw-bytes body 而改变
 4. `gateway_public` 当前只适合小型 inline payload/result
 5. 它不是大对象上传/下载通道

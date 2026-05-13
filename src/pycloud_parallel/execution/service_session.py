@@ -63,7 +63,11 @@ from pycloud_parallel.controlplane.scheduling_policy import is_admitted_node, no
 from pycloud_parallel.data.ref import DataRef
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
-from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier, is_inline_transport_carrier
+from pycloud_parallel.controlplane.serialization import (
+    LOCAL_IPC_SERIALIZATION_MODE,
+    decode_inline_transport_carrier,
+    is_inline_transport_carrier,
+)
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.execution.failover import (
@@ -775,7 +779,11 @@ class _ConnectedService:
         self._async_call_executor_capacity = 0
         self.effective_policy: Optional[EffectivePolicy] = None
         self.serialization_mode = str(serialization_mode or "").strip()
-        if self._fixed_effective_policy is not None:
+        if self.route == "local":
+            self.effective_policy = None
+            self._fixed_effective_policy = None
+            self.serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
+        elif self._fixed_effective_policy is not None:
             self.effective_policy = self._fixed_effective_policy
             self._default_policy_id = self._fixed_effective_policy.policy_id
             self.serialization_mode = self._fixed_effective_policy.resolved_mode
@@ -1219,12 +1227,15 @@ class _ConnectedService:
         serialization_mode: str = "",
     ) -> Tuple[str, Dict[str, object]]:
         del refresh_status, max_attempts
-        self._ensure_effective_policy_loaded(force_refresh=(self.route == "discovery"))
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="gateway_public" if self.route == "gateway" else "service_call",
-            frozen_mode=self.serialization_mode,
-        )
+        if self.route == "local":
+            effective_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
+        else:
+            self._ensure_effective_policy_loaded(force_refresh=(self.route == "discovery"))
+            effective_serialization_mode = resolve_effective_serialization_mode(
+                request_mode=serialization_mode,
+                context="gateway_public" if self.route == "gateway" else "service_call",
+                frozen_mode=self.serialization_mode,
+            )
         if self.route == "discovery":
             route_cache = self._route_cache
             strategy_name, _profile = resolve_service_strategy(strategy)
@@ -1440,10 +1451,19 @@ class _ConnectedService:
             return [(node_id, None, exc)]
 
     async def call(self, method: str, **kwargs) -> Dict[str, object]:
+        """Asynchronously call a service method.
+
+        Use ``call_sync(...)`` for the synchronous variant.
+        """
         node_id, resp = await self.acall_balanced(method, kwargs, timeout_sec=self.timeout_sec)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
+    async def call_async(self, method: str, **kwargs) -> Dict[str, object]:
+        """Explicit alias for ``call(...)``."""
+        return await self.call(method, **kwargs)
+
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
+        """Synchronously call a service method."""
         node_id, resp = self.call_balanced(method, kwargs, timeout_sec=self.timeout_sec)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
@@ -1458,12 +1478,15 @@ class _ConnectedService:
         serialization_mode: str = "",
     ):
         del refresh_status
-        self._ensure_effective_policy_loaded(force_refresh=True)
-        effective_serialization_mode = resolve_effective_serialization_mode(
-            request_mode=serialization_mode,
-            context="gateway_public" if self.route == "gateway" else "service_call",
-            frozen_mode=self.serialization_mode,
-        )
+        if self.route == "local":
+            effective_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
+        else:
+            self._ensure_effective_policy_loaded(force_refresh=True)
+            effective_serialization_mode = resolve_effective_serialization_mode(
+                request_mode=serialization_mode,
+                context="gateway_public" if self.route == "gateway" else "service_call",
+                frozen_mode=self.serialization_mode,
+            )
         if self.route == "gateway":
             def _gateway_iter():
                 for event in self._transport_client.stream_call(
@@ -2522,7 +2545,7 @@ class Service(ServiceExecutionSession):
                 route="local",
                 protocol=normalized_protocol,
                 timeout_sec=timeout_sec,
-                serialization_mode=serialization_mode,
+                serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
                 validate_on_init=validate_on_init,
                 effective_policy_override=effective_policy_override,
                 prepare_discovery_payload=prepare_discovery_payload,
@@ -3648,9 +3671,16 @@ class Service(ServiceExecutionSession):
         data: Any,
         *,
         format: str = "",
+        object_format: str = "",
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         serialization_mode: str = "",
     ) -> DataRef:
+        """Upload data to the service object store and return a DataRef.
+
+        ``object_format`` is the preferred explicit name for the object-store
+        format hint. ``format`` remains accepted for compatibility.
+        """
+        effective_format = str(object_format or format or "")
         effective_serialization_mode = resolve_effective_serialization_mode(
             request_mode=serialization_mode,
             context="object_upload",
@@ -3659,7 +3689,7 @@ class Service(ServiceExecutionSession):
         return _put_data_via_clients(
             list(self._clients.values()),
             data,
-            format=format,
+            format=effective_format,
             chunk_size=chunk_size,
             serialization_mode=effective_serialization_mode,
         )
@@ -4254,6 +4284,12 @@ class Service(ServiceExecutionSession):
         return out
 
     def close(self, *, end_services: bool = False, reason: str = "group close") -> None:
+        """Close this owner handle.
+
+        By default this only closes the local owner/client resources and leaves
+        remote service replicas running. Pass ``end_services=True`` or call
+        ``shutdown_services()`` to stop remote replicas as well.
+        """
         if self._closed:
             return
         self._closed = True
@@ -4280,6 +4316,14 @@ class Service(ServiceExecutionSession):
             except FileNotFoundError:
                 pass
             self._delete_session_cache_on_close = False
+
+    def close_handle(self) -> None:
+        """Close only the local owner handle; remote service replicas keep running."""
+        self.close(end_services=False)
+
+    def shutdown_services(self, *, reason: str = "service shutdown") -> None:
+        """Stop remote service replicas and close this owner handle."""
+        self.close(end_services=True, reason=reason)
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -4322,10 +4366,19 @@ class Service(ServiceExecutionSession):
         return list(self._discovered_methods or [])
 
     async def call(self, method: str, **kwargs) -> Dict[str, object]:
+        """Asynchronously call a service method.
+
+        Use ``call_sync(...)`` for the synchronous variant.
+        """
         node_id, resp = await self.acall_balanced(method, kwargs)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 
+    async def call_async(self, method: str, **kwargs) -> Dict[str, object]:
+        """Explicit alias for ``call(...)``."""
+        return await self.call(method, **kwargs)
+
     def call_sync(self, method: str, **kwargs) -> Dict[str, object]:
+        """Synchronously call a service method."""
         node_id, resp = self.call_balanced(method, kwargs)
         return _resolve_high_level_service_data(self, node_id=node_id, response=resp)
 

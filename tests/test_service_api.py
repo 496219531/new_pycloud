@@ -682,7 +682,67 @@ def test_service_update_globals_fans_out_to_nodes_concurrently(monkeypatch):
     assert len(encoded_calls) == 1
 
 
-def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch):
+def test_service_close_handle_and_shutdown_services_aliases(monkeypatch):
+    from pycloud_parallel.execution.service_session import Service
+
+    calls = []
+    group = Service(
+        owner_client_id="owner-demo",
+        service_name="svc-close-alias",
+        sessions={},
+        nodes={},
+        _clients={},
+    )
+    monkeypatch.setattr(group, "close", lambda **kwargs: calls.append(dict(kwargs)))
+
+    group.close_handle()
+    group.shutdown_services(reason="test stop")
+
+    assert calls == [
+        {"end_services": False},
+        {"end_services": True, "reason": "test stop"},
+    ]
+
+
+def test_service_call_async_alias_delegates_to_call():
+    from pycloud_parallel.execution.service_session import Service
+
+    group = Service(
+        owner_client_id="owner-demo",
+        service_name="svc-call-alias",
+        sessions={},
+        nodes={},
+        _clients={},
+    )
+
+    async def _fake_call(method: str, **kwargs):
+        return {"method": method, "kwargs": kwargs}
+
+    group.call = _fake_call  # type: ignore[method-assign]
+
+    assert asyncio.run(group.call_async("ping", value=1)) == {"method": "ping", "kwargs": {"value": 1}}
+
+
+def test_connected_service_does_not_expose_owner_shutdown_methods():
+    from pycloud_parallel.execution.service_session import _ConnectedService
+
+    client = SimpleNamespace(close=lambda: None)
+    connected = _ConnectedService(
+        transport_client=client,
+        service_name="svc-public",
+        route="gateway",
+        timeout_sec=1.0,
+        validate_on_init=False,
+    )
+
+    with pytest.raises(AttributeError):
+        object.__getattribute__(connected, "shutdown_services")
+    with pytest.raises(AttributeError):
+        object.__getattribute__(connected, "end")
+    connected.close()
+
+
+def test_service_startup_uses_mounted_module_service(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_calc_service.py"
     module_path.write_text(
         "def add(x=0, y=0):\n"
@@ -705,42 +765,36 @@ def test_service_startup_uses_nodecontrol_executor_service(tmp_path, monkeypatch
 
         assert isinstance(node, NodeControlState)
         assert node.accept_service_deploy is False
-        session = next(iter(node._services.values()))  # noqa: SLF001
-        assert session.worker_count == 2
-        assert session.node_managed is True
+        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        assert mount.worker_count == 2
+        assert not node._services  # noqa: SLF001
         assert node.methods == ["add"]
         assert node.list_methods(include_docs=True)[0]["method"] == "add"
 
-        call_service_kwargs = []
-        original_call_service = node.call_service
+        invoke_calls = []
+        original_invoke = node._invoke_local_startup_service  # noqa: SLF001
 
-        def _record_call_service(**kwargs):
-            call_service_kwargs.append(dict(kwargs))
-            return original_call_service(**kwargs)
+        def _record_invoke(*args, **kwargs):
+            invoke_calls.append((args, dict(kwargs)))
+            return original_invoke(*args, **kwargs)
 
-        monkeypatch.setattr(node, "call_service", _record_call_service)
+        monkeypatch.setattr(node, "_invoke_local_startup_service", _record_invoke)
         assert node.add.sync(x=1, y=2) == {"value": 3}
-        assert call_service_kwargs
-        assert call_service_kwargs[0]["service_id"] == session.service_id
-        assert call_service_kwargs[0]["service_token"] == session.service_token
+        assert invoke_calls
+        assert invoke_calls[0][0][0] == "add"
+        assert invoke_calls[0][1]["stream_response"] is False
 
-        code, body = node.call_service(
-            service_id=session.service_id,
-            method="add",
-            payload={"args": [4], "kwargs": {"y": 5}},
-            service_token=session.service_token,
+        code, body = node._invoke_local_startup_service(  # noqa: SLF001
+            "add",
+            {"args": [4], "kwargs": {"y": 5}},
             timeout_sec=5.0,
+            serialization_mode="legacy_v1",
+            stream_response=False,
         )
         assert code == 200
         assert body["data"] == {"value": 9}
 
-        from pycloud_parallel.controlplane.state_time import utc_now
-        from datetime import timedelta
-        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
-
-        session.lease_expire_at = utc_now() - timedelta(seconds=1)
         node._handle_service_timeouts()  # noqa: SLF001
-        assert session.status == pb2.SERVICE_STATUS_RUNNING
         assert node.service_report_payloads()[0]["service_name"] == "startup-calc"
     finally:
         node.close()
@@ -878,7 +932,7 @@ def test_service_startup_local_proxy_streams(tmp_path, monkeypatch):
         node.close()
 
 
-def test_service_startup_local_sync_and_stream_share_invoke_helper(tmp_path, monkeypatch):
+def test_service_startup_local_stream_uses_direct_pickle_object_path(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_local_shared_invoke_service.py"
     module_path.write_text(
         "def add(x=0, y=0):\n"
@@ -909,7 +963,7 @@ def test_service_startup_local_sync_and_stream_share_invoke_helper(tmp_path, mon
     try:
         assert node.add.sync(x=2, y=5) == {"value": 7}
         assert list(node.count.stream(limit=2)) == [1, 2]
-        assert calls == [False, True]
+        assert calls == [False]
     finally:
         node.close()
 
@@ -1090,6 +1144,90 @@ def test_service_connect_local_startup_stream_restores_dataframe_items(tmp_path,
     assert items[0]["meta"] == {"rows": 2}
     assert isinstance(items[0]["chunk"], pd.DataFrame)
     assert items[0]["chunk"].equals(pd.DataFrame({"param": ["参数", "strategy"], "value": ["窗口", "demo"]}))
+
+
+def test_service_connect_local_startup_stream_supports_pickle_dataframe_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc-startup-df-pickle"))
+    module_path = tmp_path / "connect_local_startup_stream_pickle_dataframe_service.py"
+    module_path.write_text(
+        "import pandas as pd\n\n"
+        "def frames():\n"
+        "    frame = pd.DataFrame({'param': ['参数', 'strategy'], 'value': ['窗口', 'demo']})\n"
+        "    yield {'chunk': frame, 'meta': {'rows': len(frame)}}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="connect-local-startup-stream-pickle-dataframe",
+        entry_module="connect_local_startup_stream_pickle_dataframe_service",
+        export_methods=("frames",),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(
+            target="local",
+            service_name="connect-local-startup-stream-pickle-dataframe",
+            timeout_sec=5.0,
+            serialization_mode="pickle_stable_v1",
+        )
+        try:
+            items = list(client.stream_call("frames", {}, timeout_sec=5.0, serialization_mode="pickle_stable_v1"))
+        finally:
+            client.close()
+    finally:
+        node.close()
+
+    import pandas as pd
+
+    assert len(items) == 1
+    assert isinstance(items[0], dict)
+    assert items[0]["meta"] == {"rows": 2}
+    assert isinstance(items[0]["chunk"], pd.DataFrame)
+    assert items[0]["chunk"].equals(pd.DataFrame({"param": ["参数", "strategy"], "value": ["窗口", "demo"]}))
+
+
+def test_service_connect_local_startup_stream_preserves_native_python_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc-startup-native-stream"))
+    module_path = tmp_path / "connect_local_startup_stream_native_service.py"
+    module_path.write_text(
+        "import pandas as pd\n\n"
+        "class CustomChunk:\n"
+        "    def __init__(self, value):\n"
+        "        self.value = value\n\n"
+        "def chunks():\n"
+        "    frame = pd.DataFrame({'param': ['窗口'], 'value': [{'n': 20}]})\n"
+        "    yield {'chunk': frame, 'custom': CustomChunk('kept')}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="connect-local-startup-stream-native",
+        entry_module="connect_local_startup_stream_native_service",
+        export_methods=("chunks",),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(target="local", service_name="connect-local-startup-stream-native", timeout_sec=5.0)
+        try:
+            items = list(client.stream_call("chunks", {}, timeout_sec=5.0))
+        finally:
+            client.close()
+    finally:
+        node.close()
+
+    import pandas as pd
+
+    assert len(items) == 1
+    assert isinstance(items[0]["chunk"], pd.DataFrame)
+    assert items[0]["chunk"].equals(pd.DataFrame({"param": ["窗口"], "value": [{"n": 20}]}))
+    assert type(items[0]["custom"]).__name__ == "CustomChunk"
+    assert items[0]["custom"].value == "kept"
 
 
 def test_service_connect_local_fetches_large_result_dataref_via_ipc(tmp_path, monkeypatch):
@@ -1327,7 +1465,46 @@ def test_service_local_ipc_sends_payload_as_inline_pickle_transport(tmp_path, mo
     assert decode_inline_transport_carrier(captured["payload"], context="service_owner") == {"x": 1, "y": 2}
     with pytest.raises(ValueError, match="trusted internal"):
         decode_inline_transport_carrier(captured["payload"], context="gateway_public")
-    assert captured["kwargs"]["serialization_mode"] == "pickle_stable_v1"
+    assert captured["kwargs"]["serialization_mode"] == INTERNAL_PICKLE_NATIVE_V1
+
+
+def test_service_connect_local_ignores_external_serialization_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc-connect-ignore-mode"))
+    module_path = tmp_path / "connect_local_ignore_mode_service.py"
+    module_path.write_text(
+        "def inspect_mode(_serialization_mode=''):\n"
+        "    return {'mode': _serialization_mode}\n\n"
+        "def stream_mode(_serialization_mode=''):\n"
+        "    yield {'mode': _serialization_mode}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+
+    node = Service.startup(
+        target="local",
+        service_name="connect-local-ignore-mode",
+        entry_module="connect_local_ignore_mode_service",
+        export_methods=("inspect_mode", "stream_mode"),
+        worker_count=1,
+    )
+    try:
+        client = Service.connect(
+            target="local",
+            service_name="connect-local-ignore-mode",
+            timeout_sec=5.0,
+            serialization_mode="structured_v1",
+        )
+        try:
+            assert client.serialization_mode == "pickle_native_v1"
+            assert client.call_sync("inspect_mode") == {"mode": "pickle_native_v1"}
+            assert list(client.stream_call("stream_mode", {}, timeout_sec=5.0, serialization_mode="legacy_v1")) == [
+                {"mode": "pickle_native_v1"}
+            ]
+        finally:
+            client.close()
+    finally:
+        node.close()
 
 
 def test_service_local_ipc_uses_local_payload_thresholds_for_dataref(tmp_path, monkeypatch):
@@ -1733,7 +1910,7 @@ def test_service_startup_same_endpoint_binds_before_infocenter_register(tmp_path
 
     monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", _fake_infocenter)
     monkeypatch.setattr(
-        "pycloud_parallel.controlplane.nodecontrol_state.NodeControlState.start_node_service_gateway",
+        "pycloud_parallel.controlplane.node_runtime_base.NodeRuntimeBase.start_mounted_service_gateway",
         _fake_start_gateway,
     )
     monkeypatch.setattr(
@@ -1839,7 +2016,7 @@ def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
         from pycloud_parallel.data.ref import DataRef
         from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
 
-        session = next(iter(node._services.values()))  # noqa: SLF001
+        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
         source = tmp_path / "payload.txt"
         source.write_text("startup-http-result", encoding="utf-8")
         artifact = node.data_store.store_path(source)
@@ -1851,7 +2028,7 @@ def test_service_startup_http_gateway_serves_data_refs(tmp_path, monkeypatch):
             size_bytes=artifact.size_bytes,
             materialize_as="text",
             locator_kind="service_http",
-            locator_token=session.http_base_url,
+            locator_token=mount.http_base_url,
             node_id=node.node_id,
         )
 
@@ -1888,9 +2065,9 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
 
     try:
         assert node.service_worker_capacity == 3
-        session = next(iter(node._services.values()))  # noqa: SLF001
-        assert session.policy_id == "trusted_internal"
-        assert session.node_managed is True
+        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        assert mount.policy_id == "trusted_internal"
+        assert not node._services  # noqa: SLF001
         assert calls == [
                 {
                     "infocenter_target": "127.0.0.1:50051",
@@ -1911,9 +2088,7 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
         node.close()
 
 
-def test_service_startup_update_globals_uses_service_executor_path(tmp_path, monkeypatch):
-    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
-
+def test_service_startup_update_globals_uses_mounted_module_path(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_globals_service.py"
     module_path.write_text(
         "cfg = None\n"
@@ -1933,36 +2108,35 @@ def test_service_startup_update_globals_uses_service_executor_path(tmp_path, mon
     )
 
     try:
-        session = next(iter(node._services.values()))  # noqa: SLF001
-        assert session.status == pb2.SERVICE_STATUS_RUNNING
-        code, body = node.call_service(
-            service_id=session.service_id,
-            method="read_cfg",
-            payload={},
-            service_token=session.service_token,
+        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
+        code, body = node._invoke_local_startup_service(  # noqa: SLF001
+            "read_cfg",
+            {},
             timeout_sec=5.0,
+            serialization_mode="legacy_v1",
+            stream_response=False,
         )
         assert code == 200
         assert body["data"] == {}
 
         first_digest = node.update_globals({"cfg": {"value": 42}})
-        assert session.status == pb2.SERVICE_STATUS_RUNNING
-        code, body = node.call_service(
-            service_id=session.service_id,
-            method="read_cfg",
-            payload={},
-            service_token=session.service_token,
+        code, body = node._invoke_local_startup_service(  # noqa: SLF001
+            "read_cfg",
+            {},
             timeout_sec=5.0,
+            serialization_mode="legacy_v1",
+            stream_response=False,
         )
         assert code == 200
         assert body["data"] == {"value": 42}
         assert first_digest
-        assert node.globals_digests == {session.service_id: first_digest}
+        assert mount.globals_digest == first_digest
+        assert node.globals_digests == {mount.service_id: first_digest}
     finally:
         node.close()
 
 
-def test_service_startup_update_globals_recreates_missing_service_executor(tmp_path, monkeypatch):
+def test_service_startup_update_globals_applies_to_mounted_module(tmp_path, monkeypatch):
     module_path = tmp_path / "startup_globals_recreate_service.py"
     module_path.write_text(
         "cfg = None\n"
@@ -1982,21 +2156,21 @@ def test_service_startup_update_globals_recreates_missing_service_executor(tmp_p
     )
 
     try:
-        session = next(iter(node._services.values()))  # noqa: SLF001
-        node._executor_host.stop_service(service_id=session.service_id)  # noqa: SLF001
+        mount = next(iter(node._startup_services.values()))  # noqa: SLF001
 
         digest = node.update_globals({"cfg": {"value": 43}})
-        code, body = node.call_service(
-            service_id=session.service_id,
-            method="read_cfg",
-            payload={},
-            service_token=session.service_token,
+        code, body = node._invoke_local_startup_service(  # noqa: SLF001
+            "read_cfg",
+            {},
             timeout_sec=5.0,
+            serialization_mode="legacy_v1",
+            stream_response=False,
         )
 
         assert digest
         assert code == 200
         assert body["data"] == {"value": 43}
+        assert mount.globals_digest == digest
     finally:
         node.close()
 
@@ -2147,6 +2321,29 @@ class TestCallProxy:
 
         assert result == [{"value": 1}, {"value": 4}]
         mock_group.amap_calls.assert_awaited_once()
+
+    def test_map_values_alias_delegates_to_map(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+        proxy.map = MagicMock(return_value=[{"value": 1}])
+
+        assert proxy.map_values([1], arg_name="x") == [{"value": 1}]
+        proxy.map.assert_called_once_with([1], arg_name="x", timeout_sec=30.0)
+
+    def test_amap_values_alias_delegates_to_amap(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        proxy = _CallProxy("square", mock_group)
+        proxy.amap = AsyncMock(return_value=[{"value": 1}])
+
+        async def _run():
+            return await proxy.amap_values([1], arg_name="x")
+
+        assert asyncio.run(_run()) == [{"value": 1}]
+        proxy.amap.assert_awaited_once_with([1], arg_name="x", timeout_sec=30.0)
 
     def test_unordered_returns_stream_object(self):
         """测试 unordered 返回同步可迭代流对象。"""

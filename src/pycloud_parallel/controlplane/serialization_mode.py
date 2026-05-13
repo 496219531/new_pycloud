@@ -11,9 +11,15 @@ SUPPORTED_SERIALIZATION_MODES: Final[tuple[str, ...]] = (
     "legacy_v1",
     "structured_v1",
     "pickle_stable_v1",
+    "pickle_native_v1",
 )
 
 _SUPPORTED_SET: Final[set[str]] = set(SUPPORTED_SERIALIZATION_MODES)
+PICKLE_SERIALIZATION_MODES: Final[tuple[str, ...]] = (
+    "pickle_stable_v1",
+    "pickle_native_v1",
+)
+_PICKLE_SET: Final[set[str]] = set(PICKLE_SERIALIZATION_MODES)
 _PICKLE_RESTRICTED_CONTEXTS: Final[set[str]] = {
     "gateway_public",
     "untrusted_transport",
@@ -40,9 +46,9 @@ def validate_mode_for_context(
     normalized = normalize_serialization_mode(mode) or "legacy_v1"
     normalized_context = str(context or "").strip().lower()
     effective_trust_mode = str(trust_mode or get_trust_mode() or "trusted").strip().lower() or "trusted"
-    if normalized == "pickle_stable_v1" and normalized_context in _PICKLE_RESTRICTED_CONTEXTS:
+    if normalized in _PICKLE_SET and normalized_context in _PICKLE_RESTRICTED_CONTEXTS:
         raise ValueError(
-            f"pickle_stable_v1 is not allowed for {normalized_context or 'restricted'} transport; "
+            f"{normalized} is not allowed for {normalized_context or 'restricted'} transport; "
             "use structured_v1 or legacy_v1 instead"
         )
     del effective_trust_mode
@@ -130,6 +136,7 @@ def resolve_received_transport_mode(
 
 
 __all__ = [
+    "PICKLE_SERIALIZATION_MODES",
     "SUPPORTED_SERIALIZATION_MODES",
     "normalize_serialization_mode",
     "resolve_declared_transport_mode",

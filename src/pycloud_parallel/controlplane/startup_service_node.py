@@ -9,12 +9,16 @@ from types import SimpleNamespace
 from typing import Any
 from urllib.parse import unquote
 
-from pycloud_parallel.controlplane.client_transport import _restore_stream_transport_carrier
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
 from pycloud_parallel.execution.call_proxy import _CallProxy
-from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier, is_inline_transport_carrier
+from pycloud_parallel.controlplane.client_transport import _restore_stream_transport_carrier
+from pycloud_parallel.controlplane.serialization import (
+    LOCAL_IPC_SERIALIZATION_MODE,
+    decode_inline_transport_carrier,
+    is_inline_transport_carrier,
+)
 from pycloud_parallel.execution.support import _extract_result_ref, _resolve_high_level_service_data
 
 
@@ -261,13 +265,13 @@ class StartupServiceNode(NodeControlState):
         refresh_status: bool = False,
         **kwargs: Any,
     ):
-        serialization_mode = str(kwargs.pop("serialization_mode", "") or "")
+        kwargs.pop("serialization_mode", None)
         del strategy, refresh_status, kwargs
         status, body = self._invoke_local_startup_service(
             method,
             payload,
             timeout_sec=timeout_sec,
-            serialization_mode=serialization_mode,
+            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
             stream_response=False,
         )
         if int(status) >= 400 or not bool(body.get("ok", False)):
@@ -310,12 +314,26 @@ class StartupServiceNode(NodeControlState):
         refresh_status: bool = False,
         serialization_mode: str = "",
     ):
-        del strategy, refresh_status
+        del strategy, refresh_status, serialization_mode
+        node_id = str(self.node_instance_id or self.node_id or "startup")
+        service_id = self._resolve_local_startup_service_id()
+        mounted_service = self._mounted_service(service_id)
+        if mounted_service is not None and callable(mounted_service.stream_handler):
+            for item in mounted_service.stream_handler(
+                method,
+                dict(payload or {}),
+                self._local_service_token,
+                timeout_sec,
+                LOCAL_IPC_SERIALIZATION_MODE,
+            ):
+                yield _resolve_high_level_service_data(self, node_id=node_id, response={"data": item})
+            return
+
         handled = self._invoke_local_startup_service(
             method,
             payload,
             timeout_sec=timeout_sec,
-            serialization_mode=serialization_mode,
+            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
             stream_response=True,
         )
         if isinstance(handled, tuple):
@@ -324,7 +342,6 @@ class StartupServiceNode(NodeControlState):
         if not isinstance(handled, StreamingHttpResponse):
             raise RuntimeError("startup service stream failed: invalid streaming response")
 
-        node_id = str(self.node_instance_id or self.node_id or "startup")
         for raw_line in handled.body_iter:
             line = bytes(raw_line or b"").strip()
             if not line:

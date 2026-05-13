@@ -2840,7 +2840,7 @@ def test_submit_pool_tasks_rejects_bad_item_without_rolling_back_prior_accepts(t
         state.close()
 
 
-@pytest.mark.parametrize("mode", ["legacy_v1", "structured_v1", "pickle_stable_v1"])
+@pytest.mark.parametrize("mode", ["legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"])
 def test_submit_pool_transport_payload_adapter_stays_opaque_until_worker(tmp_path, monkeypatch, mode):
     state = NodeControlState(
         node_id=f"node-pool-opaque-{mode}",

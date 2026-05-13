@@ -18,6 +18,8 @@ def test_builtin_policy_profiles_expose_expected_defaults():
     assert {"default_safe", "trusted_internal", "pickle_internal_heavy"}.issubset(profiles)
     assert get_policy_profile().policy_id == "default_safe"
     assert get_policy_profile("trusted_internal").default_mode == "pickle_stable_v1"
+    assert "pickle_native_v1" in get_policy_profile("trusted_internal").allowed_modes
+    assert "pickle_native_v1" in get_policy_profile("pickle_internal_heavy").allowed_modes
 
 
 def test_builtin_policy_bindings_expose_expected_type_defaults():

@@ -18,6 +18,7 @@ from pycloud_parallel.controlplane.config import (
     get_gateway_http_body_limit_bytes,
     get_gateway_upload_limits,
 )
+from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
 from .client_transport import (
     _decode_http_request_body_with_mode,
     _decode_http_transport_request_body_with_mode,
@@ -688,7 +689,7 @@ class GatewayHttpApp:
         headers = {"Content-Type": "application/json"}
         if service_token:
             headers["X-Service-Token"] = service_token
-        if str(serialization_mode or "").strip().lower() == "pickle_stable_v1":
+        if str(serialization_mode or "").strip().lower() in set(PICKLE_SERIALIZATION_MODES):
             request_body, transport_headers, _codec = _encode_http_transport_body(
                 payload,
                 context="service_internal",

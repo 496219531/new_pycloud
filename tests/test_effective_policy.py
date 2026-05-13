@@ -51,7 +51,7 @@ def test_effective_policy_depends_only_on_profile_and_context():
 
     effective = resolve_effective_policy(profile, context="taskpool_session")
 
-    assert effective.allowed_modes == ("legacy_v1", "structured_v1", "pickle_stable_v1")
+    assert effective.allowed_modes == ("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1")
     assert effective.resolved_mode == "pickle_stable_v1"
     assert effective.inline_payload_hard_limit_bytes == profile.inline_payload_hard_limit_bytes
     assert effective.use_raw_bytes_payload is True
@@ -76,6 +76,26 @@ def test_effective_policy_rejects_gateway_pickle_when_profile_disallows_it():
             requested_mode="pickle_stable_v1",
             context="gateway_public",
         )
+    with pytest.raises(ValueError, match="requested_mode"):
+        resolve_effective_policy(
+            profile,
+            requested_mode="pickle_native_v1",
+            context="gateway_public",
+        )
+
+
+def test_effective_policy_allows_native_pickle_for_trusted_internal_context():
+    profile = get_policy_profile("trusted_internal")
+
+    effective = resolve_effective_policy(
+        profile,
+        requested_mode="pickle_native_v1",
+        context="service_connect",
+    )
+
+    assert effective.resolved_mode == "pickle_native_v1"
+    assert "pickle_native_v1" in effective.allowed_modes
+    assert effective.use_raw_bytes_payload is True
 
 
 def test_effective_policy_respects_requested_mode_without_capability_intersection():

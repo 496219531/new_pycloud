@@ -133,15 +133,17 @@ from pycloud_parallel.controlplane.serialization import (
     _adapt_blob_for_json_transport,
     decode_transport_payload_bytes,
     detect_transport_mode,
+    encode_transport_payload_bytes,
     is_inline_transport_carrier,
     log_payload_flow,
     make_validated_inline_transport_carrier,
+    serialize_by_mode,
     serialize_arrow_compatible,
-    stable_pickle_dumps,
     struct_to_python,
     validate_inline_request_size,
     validate_transport_payload_bytes,
 )
+from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.errors import normalize_invoke_error
@@ -666,10 +668,10 @@ class NodeControlState(NodeRuntimeBase):
                     f"managed globals must be data values, not callables/modules/classes: {[name]}"
                 )
             prepared_value = self._prepare_managed_globals_value_for_subprocess_locked(value)
-            if str(serialization_mode or "").strip().lower() == "pickle_stable_v1":
+            if str(serialization_mode or "").strip().lower() in set(PICKLE_SERIALIZATION_MODES):
                 current_values[name] = _managed_globals_binary_value(
-                    codec="pickle_stable_v1",
-                    payload=stable_pickle_dumps(prepared_value),
+                    codec=str(serialization_mode or "").strip().lower(),
+                    payload=serialize_by_mode(prepared_value, mode=serialization_mode),
                 )
             else:
                 current_values[name] = serialize_arrow_compatible(prepared_value)
@@ -1070,6 +1072,34 @@ class NodeControlState(NodeRuntimeBase):
         if isinstance(result, StoredResultArtifact):
             raise ValueError("service stream item exceeds inline result limit; stream does not support DataRef or large result items")
         return result
+
+    @staticmethod
+    def _stream_event_data_value(
+        result: Any,
+        *,
+        serialization_mode: str = "",
+        inline_result_limit_bytes: int = 0,
+    ) -> Any:
+        if result is None:
+            return {}
+        mode = str(serialization_mode or "").strip().lower()
+        if not mode or mode == "legacy_v1" or is_inline_transport_carrier(result):
+            return result
+        limit = max(1, int(inline_result_limit_bytes or get_payload_policy("result").inline_result_hard_limit_bytes))
+        transport = encode_transport_payload_bytes(
+            result,
+            mode=mode,
+            context="service stream item",
+            limit_bytes=limit,
+        )
+        raw = bytes(transport.payload or b"")
+        return make_validated_inline_transport_carrier(
+            codec=str(transport.codec or ""),
+            payload=raw,
+            content_size=len(raw),
+            payload_mode="result",
+            context="service_result",
+        )
 
     @staticmethod
     def _encode_stream_line(event: Dict[str, object]) -> bytes:
@@ -3232,7 +3262,11 @@ class NodeControlState(NodeRuntimeBase):
                             {
                                 "event": "item",
                                 "index": int(event.get("item_index", item_count - 1) or (item_count - 1)),
-                                "data": {} if result is None else result,
+                                "data": self._stream_event_data_value(
+                                    result,
+                                    serialization_mode=serialization_mode,
+                                    inline_result_limit_bytes=inline_result_limit_bytes,
+                                ),
                             },
                             inline_result_limit_bytes=inline_result_limit_bytes,
                         )

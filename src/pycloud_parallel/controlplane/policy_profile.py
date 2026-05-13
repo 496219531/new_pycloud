@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Dict, Sequence, Tuple
 
 from pycloud_parallel.controlplane.config import get_policy_limit_defaults, normalize_policy_limit_values
-from pycloud_parallel.controlplane.serialization_mode import normalize_serialization_mode
+from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES, normalize_serialization_mode
+
+_PICKLE_MODES = set(PICKLE_SERIALIZATION_MODES)
 
 
 def _normalize_modes(values: Sequence[str]) -> Tuple[str, ...]:
@@ -49,11 +51,11 @@ class PolicyProfile:
             normalized_default = normalized_modes[0]
         if normalized_default not in normalized_modes:
             raise ValueError(f"default_mode must be included in allowed_modes: {normalized_default!r}")
-        if not self.allow_pickle_stable and "pickle_stable_v1" in normalized_modes:
-            normalized_modes = tuple(mode for mode in normalized_modes if mode != "pickle_stable_v1")
+        if not self.allow_pickle_stable and any(mode in _PICKLE_MODES for mode in normalized_modes):
+            normalized_modes = tuple(mode for mode in normalized_modes if mode not in _PICKLE_MODES)
             if not normalized_modes:
                 raise ValueError("allowed_modes cannot become empty after pickle restriction")
-            if normalized_default == "pickle_stable_v1":
+            if normalized_default in _PICKLE_MODES:
                 normalized_default = normalized_modes[0]
         object.__setattr__(self, "policy_id", normalized_id)
         object.__setattr__(self, "version", max(1, int(self.version or 1)))
@@ -114,7 +116,7 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
     "trusted_internal": PolicyProfile(
         policy_id="trusted_internal",
         version=1,
-        allowed_modes=("legacy_v1", "structured_v1", "pickle_stable_v1"),
+        allowed_modes=("legacy_v1", "structured_v1", "pickle_stable_v1", "pickle_native_v1"),
         default_mode="pickle_stable_v1",
         inline_payload_threshold_bytes=get_policy_limit_defaults("trusted_internal")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("trusted_internal")[1],
@@ -129,7 +131,7 @@ _BUILTIN_POLICY_PROFILES: Dict[str, PolicyProfile] = {
     "pickle_internal_heavy": PolicyProfile(
         policy_id="pickle_internal_heavy",
         version=1,
-        allowed_modes=("pickle_stable_v1", "structured_v1", "legacy_v1"),
+        allowed_modes=("pickle_stable_v1", "pickle_native_v1", "structured_v1", "legacy_v1"),
         default_mode="pickle_stable_v1",
         inline_payload_threshold_bytes=get_policy_limit_defaults("pickle_internal_heavy")[0],
         inline_payload_hard_limit_bytes=get_policy_limit_defaults("pickle_internal_heavy")[1],

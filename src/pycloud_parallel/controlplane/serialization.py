@@ -31,6 +31,7 @@ from pycloud_parallel.controlplane.pickle_stable_v1 import (
     stable_pickle_loads,
 )
 from pycloud_parallel.controlplane.serialization_mode import (
+    PICKLE_SERIALIZATION_MODES,
     resolve_declared_transport_mode,
     resolve_effective_serialization_mode,
     resolve_received_transport_mode,
@@ -43,7 +44,10 @@ TRANSPORT_ENVELOPE_SENTINEL = "__pycloud_transport__"
 INLINE_TRANSPORT_CARRIER_SENTINEL = "__pycloud_inline_transport__"
 TRANSPORT_PAYLOAD_VERSION = 1
 INTERNAL_PICKLE_NATIVE_V1 = "pickle_native_v1"
+LOCAL_IPC_SERIALIZATION_MODE = INTERNAL_PICKLE_NATIVE_V1
+PICKLE_RAW_BYTES_MODES = frozenset(PICKLE_SERIALIZATION_MODES)
 _INTERNAL_PICKLE_NATIVE_CONTEXTS = {
+    "service_internal",
     "service_owner",
     "taskpool_session",
     "service_result",
@@ -249,6 +253,8 @@ def serialize_by_mode(value: Any, *, mode: str = "") -> Any:
         return structured_dumps(value)
     if normalized == "pickle_stable_v1":
         return stable_pickle_dumps(value)
+    if normalized == INTERNAL_PICKLE_NATIVE_V1:
+        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     return serialize_arrow_compatible(value)
 
 
@@ -261,6 +267,8 @@ def deserialize_by_mode(value: Any, *, mode: str = "") -> Any:
         return structured_loads(value)
     if normalized == "pickle_stable_v1":
         return stable_pickle_loads(value)
+    if normalized == INTERNAL_PICKLE_NATIVE_V1:
+        return pickle.loads(bytes(value or b""))
     return convert_dict_to_arrow(value)
 
 
@@ -314,8 +322,12 @@ def encode_transport_value(value: Any, *, mode: str = "", context: str = "payloa
                 "payload": payload,
             }
         }
-    if normalized == "pickle_stable_v1":
-        blob = stable_pickle_dumps(value)
+    if normalized in PICKLE_RAW_BYTES_MODES:
+        blob = (
+            stable_pickle_dumps(value)
+            if normalized == "pickle_stable_v1"
+            else pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        )
         log_payload_flow("transport_encode", context=context, codec=normalized, summary=summarize_payload_flow_value(value))
         return {
             TRANSPORT_ENVELOPE_SENTINEL: {
@@ -332,7 +344,7 @@ def prefers_raw_bytes_payload(mode: str = "") -> bool:
         request_mode=mode,
         context="transport_encode",
     )
-    return normalized in {"structured_v1", "pickle_stable_v1"}
+    return normalized in {"structured_v1", *PICKLE_RAW_BYTES_MODES}
 
 
 def encode_transport_payload_bytes(
@@ -354,6 +366,8 @@ def encode_transport_payload_bytes(
         ).encode("utf-8")
     elif normalized == "pickle_stable_v1":
         payload = stable_pickle_dumps(value)
+    elif normalized == INTERNAL_PICKLE_NATIVE_V1:
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     elif normalized == "structured_v1":
         payload = structured_dumps(value)
     else:
@@ -430,8 +444,9 @@ def decode_transport_value(
             decoded = convert_dict_to_arrow(envelope.get("payload"))
         elif codec == "structured_v1":
             decoded = structured_loads(json.dumps(envelope.get("payload"), ensure_ascii=False).encode("utf-8"))
-        elif codec == "pickle_stable_v1":
-            decoded = stable_pickle_loads(_restore_blob_from_json_transport(envelope.get("payload")))
+        elif codec in PICKLE_RAW_BYTES_MODES:
+            raw = _restore_blob_from_json_transport(envelope.get("payload"))
+            decoded = stable_pickle_loads(raw) if codec == "pickle_stable_v1" else pickle.loads(raw)
         else:
             raise ValueError(f"unsupported transport codec: {codec!r}")
         log_payload_flow("transport_decode", context=context, codec=codec, summary=summarize_payload_flow_value(decoded))
@@ -493,7 +508,10 @@ def validate_transport_payload_bytes(
     if declared_codec == INTERNAL_PICKLE_NATIVE_V1:
         normalized_context = str(context or "").strip().lower()
         if normalized_context not in _INTERNAL_PICKLE_NATIVE_CONTEXTS:
-            raise ValueError(f"{INTERNAL_PICKLE_NATIVE_V1} is only allowed on trusted internal transport")
+            raise ValueError(
+                f"{INTERNAL_PICKLE_NATIVE_V1} is only allowed on trusted internal transport; "
+                f"context={normalized_context or 'unknown'}"
+            )
         normalized = INTERNAL_PICKLE_NATIVE_V1
     else:
         normalized = resolve_received_transport_mode(
