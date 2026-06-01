@@ -26,7 +26,7 @@ def test_prepare_artifact_applies_service_and_task_defaults() -> None:
         consumer_kind="task",
     )
 
-    assert prepared_service.export_mode == "decorator"
+    assert prepared_service.export_mode == "all"
     assert prepared_service.export_methods == ()
     assert prepared_service.dependency_policy.mode == "prebuilt"
     assert prepared_service.code_version.startswith("sha256:")
@@ -34,6 +34,23 @@ def test_prepare_artifact_applies_service_and_task_defaults() -> None:
     assert prepared_task.export_mode == "single"
     assert prepared_task.export_methods == ("run",)
     assert prepared_task.dependency_policy.mode == "prebuilt"
+
+
+def test_prepare_service_source_module_accepts_explicit_export_methods() -> None:
+    from pycloud_parallel.controlplane.artifact import ArtifactExports, _normalize_artifact_input, _prepare_artifact
+
+    import pycloud_parallel.controlplane.artifact as artifact_module
+
+    prepared = _prepare_artifact(
+        _normalize_artifact_input(
+            consumer_kind="service",
+            source=artifact_module,
+            exports=ArtifactExports.explicit(["Artifact"]),
+        ),
+        consumer_kind="service",
+    )
+    assert prepared.export_mode == "explicit"
+    assert prepared.export_methods == ("Artifact",)
 
 
 def test_service_group_deploy_from_infocenter_accepts_artifact(tmp_path) -> None:

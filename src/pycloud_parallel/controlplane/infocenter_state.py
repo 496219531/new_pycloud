@@ -250,6 +250,51 @@ class InfoCenterState:
             capability=NodeCapability.from_dict(state.capability.to_dict()),
         )
 
+    @staticmethod
+    def _with_failure_timestamps(
+        *,
+        incoming_services: Dict[str, NodeServiceState],
+        incoming_task_pools: Dict[str, NodeTaskPoolInfo],
+        previous_state: Optional[NodeState],
+        now: datetime,
+    ) -> Tuple[Dict[str, NodeServiceState], Dict[str, NodeTaskPoolInfo]]:
+        previous_services = dict(getattr(previous_state, "services", {}) or {}) if previous_state is not None else {}
+        previous_pools = dict(getattr(previous_state, "task_pools", {}) or {}) if previous_state is not None else {}
+
+        services: Dict[str, NodeServiceState] = {}
+        for service_id, svc in incoming_services.items():
+            reason = str(getattr(svc, "stop_reason", "") or "").strip()
+            previous = previous_services.get(service_id)
+            previous_reason = str(getattr(previous, "stop_reason", "") or "").strip() if previous is not None else ""
+            failure_at = getattr(svc, "failure_at", None)
+            if reason:
+                if failure_at is None and previous_reason == reason:
+                    failure_at = getattr(previous, "failure_at", None)
+                if failure_at is None:
+                    failure_at = now
+            else:
+                failure_at = None
+            svc.failure_at = failure_at
+            services[service_id] = svc
+
+        task_pools: Dict[str, NodeTaskPoolInfo] = {}
+        for pool_id, pool in incoming_task_pools.items():
+            reason = str(getattr(pool, "failure_reason", "") or "").strip()
+            previous = previous_pools.get(pool_id)
+            previous_reason = str(getattr(previous, "failure_reason", "") or "").strip() if previous is not None else ""
+            failure_at = getattr(pool, "failure_at", None)
+            if reason:
+                if failure_at is None and previous_reason == reason:
+                    failure_at = getattr(previous, "failure_at", None)
+                if failure_at is None:
+                    failure_at = now
+            else:
+                failure_at = None
+            pool.failure_at = failure_at
+            task_pools[pool_id] = pool
+
+        return services, task_pools
+
     def update_node_profile(
         self,
         profile_key_or_endpoint: str,
@@ -575,6 +620,12 @@ class InfoCenterState:
                     python_version=str(python_version or "").strip(),
                 )
                 self._nodes[normalized_instance_id] = state
+            incoming_services, incoming_task_pools = self._with_failure_timestamps(
+                incoming_services=incoming_services,
+                incoming_task_pools=dict(task_pools or {}),
+                previous_state=state,
+                now=now,
+            )
             state.node_instance_id = normalized_instance_id
             state.node_id = str(node_id or state.node_id or "").strip() or normalized_instance_id
             state.control_addr = control_addr
@@ -592,7 +643,7 @@ class InfoCenterState:
                 if str(svc.service_name or "").strip()
             }
             state.services = incoming_services
-            state.task_pools = dict(task_pools or {})
+            state.task_pools = incoming_task_pools
             state.active_runtimes = [str(x).strip() for x in (active_runtimes or []) if str(x).strip()]
             state.service_worker_capacity = max(0, int(service_worker_capacity or 0))
             state.service_worker_used = max(0, min(int(service_worker_used or 0), state.service_worker_capacity or int(service_worker_used or 0)))
@@ -834,8 +885,14 @@ class InfoCenterState:
                 for svc in state.services.values()
                 if str(svc.service_name or "").strip()
             }
-            state.services = dict(services or {})
-            state.task_pools = dict(task_pools or {})
+            incoming_services, incoming_task_pools = self._with_failure_timestamps(
+                incoming_services=dict(services or {}),
+                incoming_task_pools=dict(task_pools or {}),
+                previous_state=state,
+                now=now,
+            )
+            state.services = incoming_services
+            state.task_pools = incoming_task_pools
             if python_version:
                 state.python_version = str(python_version).strip()
             if active_runtimes is not None:
@@ -962,6 +1019,7 @@ class InfoCenterState:
                     lease_expire_at=now,
                     http_base_url=svc.http_base_url,
                     stop_reason=str(svc.stop_reason or state.reason or "node lost"),
+                    failure_at=getattr(svc, "failure_at", None) or now,
                 )
             state.services = degraded
             self._reindex_node_services_locked(state, previous_names=previous_service_names)

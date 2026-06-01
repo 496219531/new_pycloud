@@ -33,6 +33,19 @@ def _coerce_bool(value: object, *, default: bool = False) -> bool:
     return bool(default)
 
 
+def _parse_optional_dt(value: object) -> Optional[datetime]:
+    if value is None:
+        return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 @dataclass(frozen=True)
 class InfoCenterNodeService:
     service_name: str
@@ -50,6 +63,7 @@ class InfoCenterNodeService:
     in_flight: int = 0
     http_base_url: str = ""
     stop_reason: str = ""
+    failure_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +77,7 @@ class InfoCenterNodeTaskPool:
     task_count: int = 0
     inflight: int = 0
     failure_reason: str = ""
+    failure_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -240,6 +255,7 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     in_flight=int(svc.get("in_flight", 0) or 0),
                     http_base_url=str(svc.get("http_base_url", "") or ""),
                     stop_reason=str(svc.get("stop_reason", svc.get("failure_reason", "")) or ""),
+                    failure_at=_parse_optional_dt(svc.get("failure_at")),
                 )
             )
         task_pools = []
@@ -255,6 +271,7 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     task_count=int(pool.get("task_count", 0) or 0),
                     inflight=int(pool.get("inflight", 0) or 0),
                     failure_reason=str(pool.get("failure_reason", "") or ""),
+                    failure_at=_parse_optional_dt(pool.get("failure_at")),
                 )
             )
         out.append(

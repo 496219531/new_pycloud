@@ -150,6 +150,8 @@ from pycloud_parallel.runtime.errors import normalize_invoke_error
 
 
 logger = logging.getLogger(__name__)
+_CODE_LAST_AT_TOUCH_INTERVAL_SEC = 60.0
+_CODE_LAST_AT_TOUCH_MAX_ENTRIES = 10000
 
 
 class NodeControlState(NodeRuntimeBase):
@@ -227,6 +229,8 @@ class NodeControlState(NodeRuntimeBase):
         self._code_write_locks: Dict[str, threading.Lock] = {}
         self._object_write_locks: Dict[str, threading.Lock] = {}
         self._artifact_method_cache: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str], Dict[str, Tuple[str, str]]] = {}
+        self._code_last_at_touch_lock = threading.Lock()
+        self._code_last_at_touch_times: Dict[str, float] = {}
 
         # 检测并保存当前 Python 版本
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
@@ -276,6 +280,38 @@ class NodeControlState(NodeRuntimeBase):
             self._dispatcher.start()
 
         self.start_node_service_gateway()
+
+    def _touch_code_last_at_throttled(self, *, code_version: str) -> None:
+        normalized = str(code_version or "").strip()
+        if not normalized:
+            return
+        now = time.monotonic()
+        with self._code_last_at_touch_lock:
+            last_touched_at = float(self._code_last_at_touch_times.get(normalized, 0.0) or 0.0)
+            if now - last_touched_at < _CODE_LAST_AT_TOUCH_INTERVAL_SEC:
+                return
+            if len(self._code_last_at_touch_times) >= _CODE_LAST_AT_TOUCH_MAX_ENTRIES:
+                cutoff = now - _CODE_LAST_AT_TOUCH_INTERVAL_SEC
+                stale_keys = [key for key, touched_at in self._code_last_at_touch_times.items() if touched_at < cutoff]
+                for key in stale_keys:
+                    self._code_last_at_touch_times.pop(key, None)
+                if len(self._code_last_at_touch_times) >= _CODE_LAST_AT_TOUCH_MAX_ENTRIES:
+                    self._code_last_at_touch_times.pop(next(iter(self._code_last_at_touch_times)), None)
+            self._code_last_at_touch_times[normalized] = now
+        try:
+            touch_code_last_at(self._artifact_dir, code_version=normalized)
+        except PermissionError as exc:
+            logger.warning(
+                "skip code_cache last_at touch after metadata replace permission error code_version=%s err=%s",
+                normalized,
+                exc,
+            )
+        except OSError as exc:
+            logger.warning(
+                "skip code_cache last_at touch after metadata replace os error code_version=%s err=%s",
+                normalized,
+                exc,
+            )
 
     def start_node_service_gateway(self) -> None:
         if self.enable_service_session and self.service_http_bind:
@@ -1195,7 +1231,12 @@ class NodeControlState(NodeRuntimeBase):
                 error = str(resp.get("error", "artifact prepare failed") or "artifact prepare failed")
                 if bool(resp.get("user_error", False)):
                     raise ValueError(error)
-                raise RuntimeError(error)
+                context = "artifact prepare failed"
+                normalized_scope = str(prepare_scope or "").strip()
+                normalized_key = str(prepare_key or "").strip()
+                if normalized_scope or normalized_key:
+                    context += f" scope={normalized_scope or '-'} key={normalized_key or '-'}"
+                raise RuntimeError(f"{context}: {error}")
             raw_methods = dict(resp.get("methods") or {})
             return {
                 str(name): (
@@ -2203,6 +2244,29 @@ class NodeControlState(NodeRuntimeBase):
                 reserved_attr="_service_worker_reserved",
                 reserved=reserved,
             )
+        except Exception as exc:
+            self._remember_failed_service_create(
+                service_id=service_id,
+                owner_client_id=owner_client_id,
+                service_name=effective_service_name,
+                code_version=artifact.code_version,
+                worker_count=actual_workers,
+                heartbeat_timeout_sec=actual_hb_timeout,
+                idle_ttl_sec=actual_idle_ttl,
+                expose_http=expose_http,
+                service_token=token,
+                policy_id=policy_id,
+                managed_global_names=normalized_managed_global_names,
+                reason=(
+                    f"service executor create/preload failed service_name={effective_service_name!r} "
+                    f"service_id={service_id!r} workers={actual_workers}: {exc!r}"
+                ),
+            )
+            raise RuntimeError(
+                f"service executor create/preload failed service_name={effective_service_name!r} "
+                f"service_id={service_id!r} workers={actual_workers}: {exc}"
+            ) from exc
+        try:
             session = ServiceSession(
                 service_id=service_id,
                 owner_client_id=owner_client_id,
@@ -2967,7 +3031,7 @@ class NodeControlState(NodeRuntimeBase):
                 if is_inline_transport_carrier(payload)
                 else self._resolve_memory_object_refs_in_payload_locked(payload or {})
             )
-        touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
+        self._touch_code_last_at_throttled(code_version=artifact.code_version)
         setup_end = time.perf_counter()
 
         try:
@@ -3210,7 +3274,7 @@ class NodeControlState(NodeRuntimeBase):
                 if is_inline_transport_carrier(payload)
                 else self._resolve_memory_object_refs_in_payload_locked(payload or {})
             )
-        touch_code_last_at(self._artifact_dir, code_version=artifact.code_version)
+        self._touch_code_last_at_throttled(code_version=artifact.code_version)
         setup_end = time.perf_counter()
         try:
             build_start = time.perf_counter()
@@ -3776,6 +3840,16 @@ class NodeControlState(NodeRuntimeBase):
                 return
             for item in self._executor_host.drain_events():
                 kind = str(item.get("kind", "") or "")
+                if kind == "executor_host_crash":
+                    logger.error(
+                        "[NodeControl] executor host crashed node_id=%s node_instance_id=%s error_type=%s error=%s traceback=%s",
+                        self.node_id,
+                        self.node_instance_id,
+                        str(item.get("error_type", "") or ""),
+                        str(item.get("error", "") or ""),
+                        str(item.get("traceback", "") or ""),
+                    )
+                    continue
                 if kind == "pool_executor_rebuilt":
                     pool_id = str(item.get("pool_id", "") or "")
                     pool = self._task_pools.get(pool_id)

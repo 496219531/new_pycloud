@@ -48,6 +48,25 @@
 
 这意味着 `submit(source=<module object>)` / `source=<path>` 这类入口现在更适合做稳定的本地源码闭包打包。
 
+### 项目根模块和运行时导入
+
+自动打包会继续沿着已打包 Python 文件里的本地 import 展开项目根模块。典型场景：
+
+```python
+from Api import local_db_api
+
+def run():
+    return local_db_api.get_bench_asset_ratio(...)
+```
+
+如果 `Api/local_db_api.py` 在函数内部延迟执行 `import DBCfg`，只要项目根目录存在 `DBCfg.py`，它会被收进 artifact 根目录。节点执行 service/task 方法时也会把 artifact 根目录重新加入 `sys.path`，所以这类延迟 import 不需要额外改成包内相对导入。
+
+注意：
+
+1. 自动打包仍只收 `.py / .pyd / .so`
+2. 不会把 `pycloud_parallel` 运行时自身打进业务 artifact；节点应使用已安装的运行时版本
+3. 如果修复了 artifact 执行或打包逻辑，需要重新构建 wheel 并升级节点，否则远端仍使用旧 `site-packages`
+
 ## 非 Python 资源如何处理
 
 如果业务必须依赖 `.csv` 等非 Python 文件，不要依赖自动打包。

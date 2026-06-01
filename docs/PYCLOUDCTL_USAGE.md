@@ -54,6 +54,8 @@ gc-local-services
 doctor
 cache-list
 gc
+upgrade-nodes
+admin-token
 ```
 
 完整帮助：
@@ -183,6 +185,14 @@ api_token = "owner-secret"
 2. `PYCLOUD_API_TOKEN`，包括 `--env PYCLOUD_API_TOKEN=...`
 3. `<runtime-root>/auth.toml`
 4. 空字符串，表示关闭创建鉴权
+
+管理鉴权：
+
+1. NodeControl 的 `/admin/*` 管理接口使用独立 `admin_token`，和上面的 owner API token 分开。
+2. `admin_token` 保存在 node 本地 `artifact_dir/admin_token` 文件里，也会保存在发起命令机器的 `<runtime-root>/admin_token` 文件里。
+3. 如果 node 本地没有 `admin_token`，会直接接收新 token；这时即使提供了旧 token，也会忽略旧 token。
+4. 如果 node 本地已经有 `admin_token`，更新时必须提供旧 token；CLI 默认从本地 `<runtime-root>/admin_token` 读取旧 token。
+5. `upgrade-nodes --restart`、远端 restart 等管理动作会使用 NodeControl admin token 校验；CLI 的 `--api-token` 只作为显式 admin token，省略时读取本机 `<runtime-root>/admin_token`，仍没有则传空 token。
 
 ## 3. `start`
 
@@ -961,7 +971,129 @@ pycloudctl \
 pycloudctl dev-restart --nodes 2
 ```
 
-## 10. `gc`
+## 10. `upgrade-nodes`
+
+用途：
+
+1. 从本机选择一个 `.whl` 包，推送到当前集群里的 NodeControl 节点执行 `pip install --upgrade`。
+2. 适合从 ControlPlane 主机快速把新版本发到计算节点；管理鉴权使用 NodeControl admin token，不复用 owner API token / `PYCLOUD_API_TOKEN`。
+3. 默认会从 `InfoCenter` 发现健康 node，并按 `control_addr` 的 host 去重：同一台机器有两个 node 时，只对其中一个 node 执行安装。
+4. 如果同时加 `--restart`，被同机去重跳过的 node 不会重复安装 wheel，但会收到轻量 restart 请求，确保同机多个 node 都能吃到新版。
+5. `--api-token` 是 NodeControl admin token；省略时读取本机 `<runtime-root>/admin_token`，没有本地 token 时传空 token。若目标 node 也没有 admin token，则不鉴权。
+
+先 dry-run 看会升级哪些机器：
+
+```bash
+pycloudctl upgrade-nodes \
+  --target 10.168.30.154:50051 \
+  --wheel dist/pycloud_parallel-0.2.15-py3-none-any.whl \
+  --dry-run
+```
+
+正式升级并重启 node：
+
+```bash
+pycloudctl upgrade-nodes \
+  --target 10.168.30.154:50051 \
+  --wheel dist/pycloud_parallel-0.2.15-py3-none-any.whl \
+  --restart
+```
+
+升级前先 drain / cordon，减少新任务打到正在升级的节点：
+
+```bash
+pycloudctl upgrade-nodes \
+  --target 10.168.30.154:50051 \
+  --wheel dist/pycloud_parallel-0.2.15-py3-none-any.whl \
+  --drain \
+  --restart
+```
+
+如果明确希望同一台机器上的每个 node 都各自执行一次 `pip install --upgrade`，再加：
+
+```bash
+pycloudctl upgrade-nodes \
+  --target 10.168.30.154:50051 \
+  --wheel dist/pycloud_parallel-0.2.15-py3-none-any.whl \
+  --no-dedupe-host \
+  --restart
+```
+
+常用过滤参数：
+
+1. `--node-ids node-1,node-2`：按 `node_id` 过滤。
+2. `--node-instance-ids xxx,yyy`：按 `node_instance_id` 精确过滤。
+3. `--tags compute,gpu`：只选择包含这些 tag 的节点。
+4. `--include-unhealthy`：默认只选健康节点；需要包含不健康节点时再打开。
+5. `--continue-on-error`：某个节点失败后继续升级后面的节点。
+6. `--json`：输出 JSON 汇总，适合脚本记录。
+
+注意：
+
+1. `--target` 指向 InfoCenter / ControlPlane HTTP 地址，例如 `10.168.30.154:50051`。
+2. 默认同机去重的 key 是 `control_addr` 里的 hostname/IP，不看端口；例如 `10.0.0.2:50061` 和 `10.0.0.2:50062` 会认为是同一台机器。
+3. `--restart` 是重启 NodeControl 进程，不会自动重启整台机器。
+4. wheel 目前会通过 NodeControl HTTP 管理接口传输；如果包非常大，后续可以再改成流式上传。
+
+## 11. `admin-token`
+
+用途：
+
+1. 生成一个新的 NodeControl 管理 token，并保存到本地 `<runtime-root>/admin_token`。
+2. 把新 token 分发到当前集群中选中的 node。
+3. 对首次 node 和已有 token 的 node 使用同一个命令；已有 token 时默认读取本地旧 token。
+4. 默认只能在 ControlPlane 所在机器上执行，避免从随便一台客户端误改集群管理 token。
+
+只生成并保存本地 token，不联系节点：
+
+```bash
+pycloudctl admin-token --generate-only
+```
+
+生成新 token 并同步到选中节点：
+
+```bash
+pycloudctl admin-token \
+  --target 10.168.30.154:50051 \
+  --show-token
+```
+
+指定新 token 并同步：
+
+```bash
+pycloudctl admin-token \
+  --target 10.168.30.154:50051 \
+  --token new-admin-token
+```
+
+如果本地没有旧 token 文件，也可以显式传旧 token：
+
+```bash
+pycloudctl admin-token \
+  --target 10.168.30.154:50051 \
+  --old-token old-admin-token \
+  --token new-admin-token
+```
+
+常用过滤参数和 `upgrade-nodes` 一致：
+
+1. `--node-ids node-1,node-2`：按 `node_id` 过滤。
+2. `--node-instance-ids xxx,yyy`：按 `node_instance_id` 精确过滤。
+3. `--tags compute,gpu`：只选择包含这些 tag 的节点。
+4. `--include-unhealthy`：默认只选健康节点；需要包含不健康节点时再打开。
+5. `--no-dedupe-host`：默认同一台机器只设置一个 node；需要每个 node 都设置时再打开。
+6. `--allow-remote`：默认只能在 ControlPlane 主机执行；确实要远程发起时再打开。
+7. `--dry-run` / `--json`：先看计划，再正式设置。
+
+注意：
+
+1. 默认按 host 去重，避免同一台机器跑多个 node 时重复设置。
+2. 如果同机多个 node 使用不同 `artifact_dir`，并且你希望每个 node 都有自己的 token 文件，需要加 `--no-dedupe-host`。
+3. 不传 `--token` 时会自动生成新 token；命令成功后会覆盖本地 `<runtime-root>/admin_token`。
+4. `--generate-only` 也会写本地 token 文件，适合先生成、再人工分发或备份。
+5. token 明文保存在节点和发起命令机器的本地文件中；请按内部运维规范保存和分发。
+
+## 12. `gc`
 
 用途：
 
@@ -1032,16 +1164,16 @@ pycloudctl \
 pycloudctl gc --scope all --older-than-hours 168 --dry-run | jq
 ```
 
-## 11. 常用工作流
+## 13. 常用工作流
 
-### 9.1 本地首次启动
+### 13.1 本地首次启动
 
 ```bash
 pycloudctl start
 pycloudctl status
 ```
 
-### 9.2 使用临时运行目录
+### 13.2 使用临时运行目录
 
 ```bash
 pycloudctl --runtime-root /tmp/pycloud-dev start
@@ -1049,14 +1181,14 @@ pycloudctl --runtime-root /tmp/pycloud-dev status
 pycloudctl --runtime-root /tmp/pycloud-dev stop
 ```
 
-### 9.3 只下掉一个 node 做排查
+### 13.3 只下掉一个 node 做排查
 
 ```bash
 pycloudctl stop-node node-1
 pycloudctl status
 ```
 
-### 9.4 每周清一次缓存
+### 13.4 每周清一次缓存
 
 先看计划删除内容：
 
@@ -1070,7 +1202,7 @@ pycloudctl gc --scope all --older-than-hours 168 --dry-run
 pycloudctl gc --scope all --older-than-hours 168
 ```
 
-### 11.5 新版本装好了，但旧服务没停掉
+### 13.5 新版本装好了，但旧服务没停掉
 
 推荐顺序：
 
@@ -1087,9 +1219,9 @@ pycloudctl doctor --ports 51051,51061,51062,18181,18182
 pycloudctl stopall --scan-ports --ports 51051,51061,51062,18181,18182
 ```
 
-## 12. 故障排查
+## 14. 故障排查
 
-### 12.1 `pycloudctl: command not found`
+### 14.1 `pycloudctl: command not found`
 
 说明你可能还没把包安装成可执行脚本。
 
@@ -1105,7 +1237,7 @@ pycloudctl stopall --scan-ports --ports 51051,51061,51062,18181,18182
 PYTHONPATH=src python -m pycloud_parallel.controlplane.ctl status
 ```
 
-### 12.2 `start` 后端口被占用
+### 14.2 `start` 后端口被占用
 
 先确认是不是已有旧实例：
 
@@ -1131,7 +1263,7 @@ pycloudctl dev-start \
   --node-service-http-port 18181
 ```
 
-### 12.3 `stop` 或 `status` 看不到之前启动的服务
+### 14.3 `stop` 或 `status` 看不到之前启动的服务
 
 最常见原因是这次命令使用的 `runtime-root` 和之前启动时不一致。
 
@@ -1143,7 +1275,7 @@ pycloudctl dev-start \
 
 只要目录不同，就会像在操作另一套环境。
 
-### 12.4 想看更详细错误
+### 14.4 想看更详细错误
 
 直接看日志：
 
@@ -1159,7 +1291,7 @@ tail -f logs/node-2.log
 tail -f /tmp/pycloud-dev/logs/controlplane.log
 ```
 
-## 13. 与脚本入口的关系
+## 15. 与脚本入口的关系
 
 仓库里的常用脚本：
 
@@ -1186,9 +1318,9 @@ scripts\start_services.bat stop
 1. 在 Windows 下，`pycloudctl start*` 现在会为每个服务进程打开独立控制台窗口
 2. 不再默认静默跑成不可见后台进程
 
-## 14. 推荐记法
+## 16. 推荐记法
 
-日常最常用的 6 个命令：
+日常最常用的命令：
 
 ```bash
 pycloudctl start
@@ -1198,6 +1330,8 @@ pycloudctl stop-node node-1
 pycloudctl restart
 pycloudctl doctor
 pycloudctl gc --dry-run
+pycloudctl upgrade-nodes --target 10.168.30.154:50051 --wheel dist/xxx.whl --dry-run
+pycloudctl admin-token --generate-only
 ```
 
 如果你只记一条原则，记这个就够了：
@@ -1206,3 +1340,4 @@ pycloudctl gc --dry-run
 2. 想看状态，用 `status`
 3. 想只关一个 node，用 `stop-node`
 4. 想清缓存，先 `gc --dry-run`，再正式 `gc`
+5. 想批量升级计算节点，先 `upgrade-nodes --dry-run`，确认后再加 `--restart`

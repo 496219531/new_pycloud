@@ -5,6 +5,7 @@ import inspect
 import pytest
 
 import pycloud_parallel.api as api_pkg
+import pycloud_parallel.easy as easy_pkg
 import pycloud_parallel.api.pool as api_pool_module
 import pycloud_parallel.api.queue as api_queue_module
 import pycloud_parallel.api.service as api_service_module
@@ -47,6 +48,80 @@ def test_top_level_no_longer_exposes_legacy_or_local_runtime_names():
 def test_api_package_exports_only_v1_semantic_names():
     assert api_pkg.__all__ == ["DataRef", "JobQueue", "Service", "TaskPool", "export"]
     assert dir(api_pkg) == api_pkg.__all__
+
+
+def test_easy_module_exposes_convenience_helpers_without_top_level_pollution():
+    expected = {
+        "call_service_method",
+        "deploy_module_service",
+        "run_tasks",
+        "serve_controlplane",
+        "serve_function",
+        "serve_module",
+        "serve_node",
+        "submit_tasks",
+    }
+
+    for name in expected:
+        assert callable(getattr(easy_pkg, name))
+        assert not hasattr(pycloud_parallel, name)
+    assert "run_db_server" not in easy_pkg.__all__
+
+
+def test_easy_run_module_forever_accepts_legacy_worker_num(monkeypatch):
+    captured = {}
+    module = object()
+
+    def fake_serve_module(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(easy_pkg, "serve_module", fake_serve_module)
+
+    easy_pkg.run_module_forever(
+        info_pub_addr="127.0.0.1:50051",
+        module=module,
+        service_name="public_data_source",
+        worker_num=3,
+        policy_id="trusted_internal",
+    )
+
+    assert captured["args"] == (module,)
+    assert captured["kwargs"] == {
+        "target": "127.0.0.1:50051",
+        "port": None,
+        "service_name": "public_data_source",
+        "worker_count": 3,
+        "policy_id": "trusted_internal",
+    }
+
+
+def test_easy_legacy_helpers_accept_old_positional_signatures(monkeypatch):
+    captured = []
+
+    def fake_serve_controlplane(*args, **kwargs):
+        captured.append(("controlplane", args, kwargs))
+
+    def fake_serve_node(*args, **kwargs):
+        captured.append(("node", args, kwargs))
+
+    def fake_serve_function(*args, **kwargs):
+        captured.append(("function", args, kwargs))
+
+    monkeypatch.setattr(easy_pkg, "serve_controlplane", fake_serve_controlplane)
+    monkeypatch.setattr(easy_pkg, "serve_node", fake_serve_node)
+    monkeypatch.setattr(easy_pkg, "serve_function", fake_serve_function)
+
+    fn = object()
+    easy_pkg.run_info_center(50051, 50052, 8038)
+    easy_pkg.run_worker_forever("127.0.0.1:50051", 18061)
+    easy_pkg.run_func_server_without_return(fn, "127.0.0.1:50051", 2)
+
+    assert captured == [
+        ("controlplane", (50051,), {"host": "0.0.0.0"}),
+        ("node", ("127.0.0.1:50051",), {"port": 18061}),
+        ("function", (fn,), {"target": "127.0.0.1:50051", "worker_count": 2, "join": True}),
+    ]
 
 
 def test_api_service_module_exposes_only_service():

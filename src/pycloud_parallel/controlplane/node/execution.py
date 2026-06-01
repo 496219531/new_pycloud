@@ -545,6 +545,25 @@ def _purge_module_tree(module_name: str) -> None:
         sys.modules.pop(key, None)
 
 
+def _iter_artifact_top_level_module_names(import_path: str) -> Tuple[str, ...]:
+    root = Path(str(import_path or "").strip())
+    if not root.is_dir():
+        return ()
+    names: list[str] = []
+    seen: set[str] = set()
+    for child in root.iterdir():
+        name = ""
+        if child.is_file() and child.suffix == ".py":
+            name = child.stem
+        elif child.is_dir():
+            name = child.name
+        if not name or name == "__pycache__" or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return tuple(names)
+
+
 def _load_user_module(
     artifact_path: str,
     *,
@@ -582,8 +601,18 @@ def _load_user_module(
     if path.is_file() and format_name in {"tar.gz", "zip", "whl"}:
         extract_dir = _safe_extract_archive_to_temp(artifact_path, package_format=format_name)
         import_path = str(extract_dir)
+    for module_name in _iter_artifact_top_level_module_names(import_path):
+        _purge_module_tree(module_name)
+    _purge_loaded_artifact_modules(
+        artifact_path,
+        entry_module=entry_module,
+        package_format=package_format,
+        dependency_path=dependency_path,
+        extra_prefixes=([import_path] if import_path != artifact_path else []),
+    )
     with _temporary_import_paths(dependency_path, import_path):
         module = importlib.import_module(entry_module)
+    setattr(module, "__pycloud_artifact_import_path__", import_path)
     if extract_dir is not None:
         setattr(module, "__pycloud_temp_extract_dir__", str(extract_dir))
     return module
@@ -1238,7 +1267,12 @@ def _execute_payload_in_subprocess(
                     )
                 return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
             try:
-                with _temporary_import_paths(dependency_path):
+                artifact_import_path = str(
+                    getattr(module, "__pycloud_artifact_import_path__", "")
+                    or getattr(module, "__pycloud_temp_extract_dir__", "")
+                    or ""
+                ).strip()
+                with _temporary_import_paths(dependency_path, artifact_import_path):
                     method = str(method_name or "").strip() or str(entry_callable or "run").strip() or "run"
                     fn = router.get(method)
                     if fn is None:
@@ -1289,72 +1323,72 @@ def _execute_payload_in_subprocess(
                     invoke_wrapper_ms = float(timed.get("invoke_wrapper_ms", 0.0) or 0.0)
                     user_fn_ms = float(timed.get("user_fn_ms", 0.0) or 0.0)
                     encode_start = invoke_end
-                if stream_queue is not None:
-                    emitted_count = 0
-                    try:
-                        if _is_streaming_user_return(ret):
-                            for emitted_count, item in enumerate(ret, start=1):
-                                normalized_item = _normalize_stream_item_value(
-                                    item,
+                    if stream_queue is not None:
+                        emitted_count = 0
+                        try:
+                            if _is_streaming_user_return(ret):
+                                for emitted_count, item in enumerate(ret, start=1):
+                                    normalized_item = _normalize_stream_item_value(
+                                        item,
+                                        object_dir=object_dir,
+                                        serialization_mode=serialization_mode,
+                                        use_transport_result=use_transport_result,
+                                    )
+                                    stream_queue.put(
+                                        {
+                                            "kind": "item",
+                                            "item_index": emitted_count - 1,
+                                            "result": normalized_item,
+                                        }
+                                    )
+                            else:
+                                status_text, result, error_type, error_message = _normalize_user_return(
+                                    ret,
                                     object_dir=object_dir,
                                     serialization_mode=serialization_mode,
                                     use_transport_result=use_transport_result,
                                 )
+                                if status_text != "SUCCEEDED":
+                                    encode_end = time.perf_counter()
+                                    return (status_text, result, error_type, error_message, _timings())
                                 stream_queue.put(
                                     {
                                         "kind": "item",
-                                        "item_index": emitted_count - 1,
-                                        "result": normalized_item,
+                                        "item_index": 0,
+                                        "result": result,
                                     }
                                 )
-                        else:
-                            status_text, result, error_type, error_message = _normalize_user_return(
-                                ret,
-                                object_dir=object_dir,
-                                serialization_mode=serialization_mode,
-                                use_transport_result=use_transport_result,
-                            )
-                            if status_text != "SUCCEEDED":
-                                encode_end = time.perf_counter()
-                                return (status_text, result, error_type, error_message, _timings())
-                            stream_queue.put(
-                                {
-                                    "kind": "item",
-                                    "item_index": 0,
-                                    "result": result,
-                                }
-                            )
-                            emitted_count = 1
+                                emitted_count = 1
+                        except LargeResultError:
+                            raise
+                        except Exception:
+                            raise
+                        encode_end = time.perf_counter()
+                        return (
+                            "SUCCEEDED",
+                            {
+                                "streamed": True,
+                                "item_count": emitted_count,
+                            },
+                            "",
+                            "",
+                            _timings(),
+                        )
+                    try:
+                        status_text, result, error_type, error_message = _normalize_user_return(
+                            ret,
+                            object_dir=object_dir,
+                            serialization_mode=serialization_mode,
+                            use_transport_result=use_transport_result,
+                        )
                     except LargeResultError:
                         raise
-                    except Exception:
-                        raise
-                    encode_end = time.perf_counter()
-                    return (
-                        "SUCCEEDED",
-                        {
-                            "streamed": True,
-                            "item_count": emitted_count,
-                        },
-                        "",
-                        "",
-                        _timings(),
-                    )
-                try:
-                    status_text, result, error_type, error_message = _normalize_user_return(
-                        ret,
-                        object_dir=object_dir,
-                        serialization_mode=serialization_mode,
-                        use_transport_result=use_transport_result,
-                    )
-                except LargeResultError:
-                    raise
-                except Exception as exc:
-                    encode_end = time.perf_counter()
-                    return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
-                else:
-                    encode_end = time.perf_counter()
-                return (status_text, result, error_type, error_message, _timings())
+                    except Exception as exc:
+                        encode_end = time.perf_counter()
+                        return ("FAILED_INFRA", None, exc.__class__.__name__, repr(exc), _timings())
+                    else:
+                        encode_end = time.perf_counter()
+                    return (status_text, result, error_type, error_message, _timings())
             except LargeResultError as exc:
                 if decode_end <= decode_start:
                     decode_end = time.perf_counter()

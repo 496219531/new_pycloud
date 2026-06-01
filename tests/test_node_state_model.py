@@ -845,6 +845,83 @@ def test_purge_loaded_artifact_modules_removes_temp_extracted_local_packages(tmp
     assert "calc_asset_ratio.calc_asset_ratio" not in sys.modules
 
 
+def test_execute_payload_tar_gz_keeps_artifact_root_on_sys_path_for_late_imports(tmp_path):
+    package_dir = tmp_path / "src"
+    service_dir = package_dir / "ServicePkg"
+    service_dir.mkdir(parents=True)
+    (service_dir / "__init__.py").write_text("", encoding="utf-8")
+    (service_dir / "worker.py").write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    import RootConfig\n"
+        "    return {'value': value + RootConfig.OFFSET}\n",
+        encoding="utf-8",
+    )
+    (package_dir / "RootConfig.py").write_text("OFFSET = 7\n", encoding="utf-8")
+    artifact_path = tmp_path / "artifact.tar.gz"
+    with tarfile.open(artifact_path, "w:gz") as tar:
+        tar.add(service_dir / "__init__.py", arcname="ServicePkg/__init__.py")
+        tar.add(service_dir / "worker.py", arcname="ServicePkg/worker.py")
+        tar.add(package_dir / "RootConfig.py", arcname="RootConfig.py")
+
+    status, result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+        str(artifact_path),
+        "ServicePkg.worker",
+        "tar.gz",
+        "",
+        "prebuilt",
+        str(tmp_path / "objects"),
+        str(tmp_path / "work"),
+        str(tmp_path / "globals"),
+        "",
+        "all",
+        (),
+        "pycloud_export",
+        "run",
+        "run",
+        {"value": 5},
+        payload_mode="http_call",
+    )
+
+    assert status == "SUCCEEDED", (err_type, err_message)
+    assert result == {"value": 12}
+
+
+def test_execute_payload_directory_keeps_artifact_root_on_sys_path_for_late_imports(tmp_path):
+    artifact_dir = tmp_path / "pkg"
+    service_dir = artifact_dir / "ServicePkg"
+    service_dir.mkdir(parents=True)
+    (service_dir / "__init__.py").write_text("", encoding="utf-8")
+    (service_dir / "worker.py").write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    import RootConfig\n"
+        "    return {'value': value + RootConfig.OFFSET}\n",
+        encoding="utf-8",
+    )
+    (artifact_dir / "RootConfig.py").write_text("OFFSET = 11\n", encoding="utf-8")
+
+    status, result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+        str(artifact_dir),
+        "ServicePkg.worker",
+        "tar.gz",
+        "",
+        "prebuilt",
+        str(tmp_path / "objects"),
+        str(tmp_path / "work"),
+        str(tmp_path / "globals"),
+        "",
+        "all",
+        (),
+        "pycloud_export",
+        "run",
+        "run",
+        {"value": 5},
+        payload_mode="http_call",
+    )
+
+    assert status == "SUCCEEDED", (err_type, err_message)
+    assert result == {"value": 16}
+
+
 def test_dict_to_struct_round_trips_temporal_scalars_and_series_index():
     pd = pytest.importorskip("pandas")
 
@@ -1155,6 +1232,49 @@ def test_data_ref_resolution_defaults_to_remote_fetch_and_caches(tmp_path, monke
     assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
     assert calls == [("127.0.0.1:50061", object_id)]
     assert object_storage_path(tmp_path, object_id=object_id, fmt="bin").read_bytes() == blob
+
+
+def test_data_ref_resolution_throttles_object_last_at_touch(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.node.object_meta import (
+        _OBJECT_LAST_AT_TOUCH_TIMES,
+        _write_object_meta,
+    )
+    from pycloud_parallel.data.ref import DataRef, object_storage_path
+
+    blob = b"cached payload"
+    object_id = "sha256:" + hashlib.sha256(blob).hexdigest()
+    object_path = object_storage_path(tmp_path, object_id=object_id, fmt="bin")
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_bytes(blob)
+    _write_object_meta(
+        tmp_path,
+        object_id=object_id,
+        fmt="bin",
+        size_bytes=len(blob),
+        created_at=utc_now(),
+        storage_backend="file",
+    )
+    ref = DataRef(
+        ref_id=object_id,
+        storage_id=object_id,
+        format="bin",
+        size_bytes=len(blob),
+        materialize_as="bytes",
+    )
+    touch_calls = []
+    real_replace = os.replace
+
+    def _count_meta_replace(source, target):
+        if str(target).endswith(".json"):
+            touch_calls.append((source, target))
+        return real_replace(source, target)
+
+    _OBJECT_LAST_AT_TOUCH_TIMES.clear()
+    monkeypatch.setattr(os, "replace", _count_meta_replace)
+
+    assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
+    assert _resolve_single_data_ref(ref, object_dir=str(tmp_path)) == blob
+    assert len(touch_calls) == 1
 
 
 def test_data_ref_resolution_rejects_large_bytes_materialize_after_file_fetch(tmp_path, monkeypatch, request):
@@ -4670,6 +4790,186 @@ def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     assert pool.status == "STOPPED"
     assert pool.stop_reason == "nodecontrol shutdown"
     assert state._executor_host is None  # noqa: SLF001
+
+
+def test_nodecontrol_service_call_throttles_code_last_at_touch(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-touch-throttle",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_touch_throttle"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    code_version = "sha256:" + "a" * 64
+    artifact = CodeArtifact(
+        code_version=code_version,
+        path=str(tmp_path),
+        runtime="py3",
+        entry_module="demo_service",
+        entry_callable="run",
+        package_format="py",
+        export_mode="module",
+        export_methods=(),
+        export_decorator="",
+        dependency_policy_mode="safe",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=1,
+        created_at=now,
+    )
+    service = ServiceSession(
+        service_id="svc-touch",
+        owner_client_id="owner",
+        service_name="svc-touch",
+        code_version=code_version,
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo_service", "run")},
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def call_service(self, **kwargs):  # noqa: ARG002
+            return {"ok": True, "status_text": "SUCCEEDED", "result": {"value": 1}}
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    calls = []
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.nodecontrol_state.touch_code_last_at",
+        lambda artifact_dir, *, code_version: calls.append((artifact_dir, code_version)),
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._codes[code_version] = artifact  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        first_code, first_body = state.call_service(
+            service_id=service.service_id,
+            method="run",
+            payload={},
+            service_token=service.service_token,
+            timeout_sec=1.0,
+        )
+        second_code, second_body = state.call_service(
+            service_id=service.service_id,
+            method="run",
+            payload={},
+            service_token=service.service_token,
+            timeout_sec=1.0,
+        )
+    finally:
+        state.close()
+
+    assert first_code == 200
+    assert second_code == 200
+    assert first_body["ok"] is True
+    assert second_body["ok"] is True
+    assert len(calls) == 1
+
+
+def test_nodecontrol_service_call_ignores_code_last_at_touch_permission_error(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-touch-permission",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_touch_permission"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    code_version = "sha256:" + "b" * 64
+    artifact = CodeArtifact(
+        code_version=code_version,
+        path=str(tmp_path),
+        runtime="py3",
+        entry_module="demo_service",
+        entry_callable="run",
+        package_format="py",
+        export_mode="module",
+        export_methods=(),
+        export_decorator="",
+        dependency_policy_mode="safe",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=1,
+        created_at=now,
+    )
+    service = ServiceSession(
+        service_id="svc-touch-permission",
+        owner_client_id="owner",
+        service_name="svc-touch-permission",
+        code_version=code_version,
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo_service", "run")},
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def call_service(self, **kwargs):  # noqa: ARG002
+            return {"ok": True, "status_text": "SUCCEEDED", "result": {"value": 2}}
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    def _raise_permission_error(*args, **kwargs):  # noqa: ARG001
+        raise PermissionError("locked")
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.nodecontrol_state.touch_code_last_at", _raise_permission_error)
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._codes[code_version] = artifact  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        code, body = state.call_service(
+            service_id=service.service_id,
+            method="run",
+            payload={},
+            service_token=service.service_token,
+            timeout_sec=1.0,
+        )
+    finally:
+        state.close()
+
+    assert code == 200
+    assert body["ok"] is True
+    assert body["data"] == {"value": 2}
 
 
 def test_nodecontrol_discards_late_pool_event_for_stale_pool_id(tmp_path):

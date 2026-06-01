@@ -796,6 +796,8 @@ class NodeRuntimeBase:
         return {"queued": 0, "inflight": 0, "running": 0, "credit": capacity}
 
     def startup_service_report_payloads(self) -> List[Dict[str, object]]:
+        if self._closed.is_set():
+            return []
         lease_expire_at = datetime.now(timezone.utc).isoformat()
         return [
             {

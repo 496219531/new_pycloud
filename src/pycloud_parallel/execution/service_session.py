@@ -83,6 +83,7 @@ from pycloud_parallel.execution.failover import (
     should_failover,
 )
 from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
+from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     normalize_initial_globals,
@@ -585,23 +586,38 @@ def _service_iter_item_calls(
     strategy: str,
     refresh_status: bool,
     max_in_flight: Optional[int],
+    progress: ProgressOption = False,
+    progress_interval_sec: float = 2.0,
 ) -> Iterator[ExecutionItem]:
     try:
         item_count = len(payloads)  # type: ignore[arg-type]
     except Exception:
         item_count = 2**31 - 1
     limit = _resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=max(1, int(item_count or 1)))
+    total = 0 if item_count == 2**31 - 1 else max(0, int(item_count or 0))
 
     def _generator() -> Iterator[ExecutionItem]:
         payload_iter = enumerate(
             payload if isinstance(payload, dict) else {}
             for payload in payloads
         )
+        reporter = ProgressReporter(
+            progress,
+            label=f"service.{method}",
+            total=total,
+            interval_sec=progress_interval_sec,
+        )
+        submitted = 0
+        completed = 0
+        succeeded = 0
+        failed = 0
+        last_error = ""
 
         with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="service-items") as executor:
             pending: Dict[object, int] = {}
 
             def _submit_next() -> bool:
+                nonlocal submitted
                 try:
                     idx, payload = next(payload_iter)
                 except StopIteration:
@@ -616,11 +632,21 @@ def _service_iter_item_calls(
                     refresh_status=refresh_status,
                 )
                 pending[future] = idx
+                submitted += 1
                 return True
 
             for _ in range(limit):
                 if not _submit_next():
                     break
+            reporter.emit(
+                phase="running",
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                inflight=len(pending),
+                submitted=submitted,
+                force=True,
+            )
 
             while pending:
                 for future in as_completed(tuple(pending.keys())):
@@ -628,11 +654,26 @@ def _service_iter_item_calls(
                     break
                 try:
                     node_id, result = future.result()
-                    yield _service_item_success(idx, result, node_id=node_id)
+                    item = _service_item_success(idx, result, node_id=node_id)
+                    succeeded += 1
                 except Exception as exc:
-                    yield _service_item_failure(idx, exc)
+                    item = _service_item_failure(idx, exc)
+                    failed += 1
+                    last_error = str(exc)
+                completed += 1
                 while len(pending) < limit and _submit_next():
                     pass
+                reporter.emit(
+                    phase="running",
+                    completed=completed,
+                    succeeded=succeeded,
+                    failed=failed,
+                    inflight=len(pending),
+                    submitted=submitted,
+                    last_error=last_error,
+                )
+                yield item
+            reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=submitted, last_error=last_error)
 
     return _generator()
 
@@ -646,11 +687,24 @@ async def _service_aiter_item_calls(
     strategy: str,
     refresh_status: bool,
     max_in_flight: Optional[int],
+    progress: ProgressOption = False,
+    progress_interval_sec: float = 2.0,
 ) -> AsyncIterator[ExecutionItem]:
     items = [payload if isinstance(payload, dict) else {} for payload in payloads]
     if not items:
         return
     semaphore = asyncio.Semaphore(_resolve_group_max_in_flight(group, max_in_flight=max_in_flight, item_count=len(items)))
+    reporter = ProgressReporter(
+        progress,
+        label=f"service.{method}",
+        total=len(items),
+        interval_sec=progress_interval_sec,
+    )
+    submitted = len(items)
+    completed = 0
+    succeeded = 0
+    failed = 0
+    last_error = ""
 
     async def _run_one(idx: int, payload: Dict[str, object]) -> ExecutionItem:
         async with semaphore:
@@ -668,9 +722,27 @@ async def _service_aiter_item_calls(
                 return _service_item_failure(idx, exc)
 
     tasks = [asyncio.create_task(_run_one(idx, payload)) for idx, payload in enumerate(items)]
+    reporter.emit(phase="running", completed=0, succeeded=0, failed=0, inflight=len(tasks), submitted=submitted, force=True)
     try:
         for task in asyncio.as_completed(tasks):
-            yield await task
+            item = await task
+            completed += 1
+            if item.ok:
+                succeeded += 1
+            else:
+                failed += 1
+                last_error = str(item.error_message or item.error_type or "")
+            reporter.emit(
+                phase="running",
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                inflight=max(0, submitted - completed),
+                submitted=submitted,
+                last_error=last_error,
+            )
+            yield item
+        reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=submitted, last_error=last_error)
     finally:
         for task in tasks:
             if not task.done():
@@ -686,6 +758,8 @@ def _service_collect_item_calls(
     strategy: str,
     refresh_status: bool,
     max_in_flight: Optional[int],
+    progress: ProgressOption = False,
+    progress_interval_sec: float = 2.0,
 ) -> List[ExecutionItem]:
     return sorted(
         list(
@@ -697,6 +771,8 @@ def _service_collect_item_calls(
                 strategy=strategy,
                 refresh_status=refresh_status,
                 max_in_flight=max_in_flight,
+                progress=progress,
+                progress_interval_sec=progress_interval_sec,
             )
         ),
         key=lambda item: int(item.index),
@@ -712,6 +788,8 @@ async def _service_acollect_item_calls(
     strategy: str,
     refresh_status: bool,
     max_in_flight: Optional[int],
+    progress: ProgressOption = False,
+    progress_interval_sec: float = 2.0,
 ) -> List[ExecutionItem]:
     items: List[ExecutionItem] = []
     async for item in _service_aiter_item_calls(
@@ -722,6 +800,8 @@ async def _service_acollect_item_calls(
         strategy=strategy,
         refresh_status=refresh_status,
         max_in_flight=max_in_flight,
+        progress=progress,
+        progress_interval_sec=progress_interval_sec,
     ):
         items.append(item)
     return sorted(items, key=lambda item: int(item.index))
@@ -1612,6 +1692,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[Optional[object]]:
         return [
             item.result if item.ok else None
@@ -1623,6 +1705,8 @@ class _ConnectedService:
                 strategy=strategy,
                 refresh_status=refresh_status,
                 max_in_flight=max_in_flight,
+                progress=progress,
+                progress_interval_sec=progress_interval_sec,
             )
         ]
 
@@ -1635,6 +1719,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[Optional[object]]:
         items = await _service_acollect_item_calls(
             self,
@@ -1644,6 +1730,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
         return [item.result if item.ok else None for item in items]
 
@@ -1657,6 +1745,8 @@ class _ConnectedService:
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Iterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         for item in _service_iter_item_calls(
             self,
@@ -1666,6 +1756,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -1679,6 +1771,8 @@ class _ConnectedService:
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> AsyncIterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         async for item in _service_aiter_item_calls(
             self,
@@ -1688,6 +1782,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -1700,6 +1796,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Iterator[ExecutionItem]:
         return _service_iter_item_calls(
             self,
@@ -1709,6 +1807,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     async def aiter_item_calls(
@@ -1720,6 +1820,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> AsyncIterator[ExecutionItem]:
         async for item in _service_aiter_item_calls(
             self,
@@ -1729,6 +1831,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         ):
             yield item
 
@@ -1741,6 +1845,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[ExecutionItem]:
         return _service_collect_item_calls(
             self,
@@ -1750,6 +1856,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     async def acollect_item_calls(
@@ -1761,6 +1869,8 @@ class _ConnectedService:
         strategy: str = "predicted_busy",
         refresh_status: bool = False,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[ExecutionItem]:
         return await _service_acollect_item_calls(
             self,
@@ -1770,6 +1880,8 @@ class _ConnectedService:
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     async def call_all(self, method: str, **kwargs) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:
@@ -1906,6 +2018,36 @@ class Service(ServiceExecutionSession):
             return
         self._compensation_spec = dict(spec)
 
+    @staticmethod
+    def _is_retryable_compensation_failure(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+        permanent_markers = (
+            "modulenotfounderror",
+            "importerror",
+            "syntaxerror",
+            "dependency install failed",
+            "method `",
+            "not exported",
+            "runtime mismatch",
+        )
+        if any(marker in text for marker in permanent_markers):
+            return False
+        retryable_markers = (
+            "heartbeat",
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily",
+            "refused",
+            "reset",
+            "unreachable",
+            "service is stopped",
+            "service not found",
+        )
+        return any(marker in text for marker in retryable_markers)
+
     def _after_keepalive_tick(self) -> None:
         spec = self._compensation_spec
         if not spec:
@@ -1926,10 +2068,21 @@ class Service(ServiceExecutionSession):
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
             active = {str(node_id) for node_id in self._active_replica_ids if str(node_id)}
-            failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
             if desired <= 0 or len(active) >= desired:
                 return 0
-            excluded = active | failed
+            failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
+            retryable_failed = {
+                node_id
+                for node_id, message in self.failures.items()
+                if self._is_retryable_compensation_failure(str(message or ""))
+            }
+            failed_by_base_node: Dict[str, str] = {}
+            for node_id in failed:
+                node = self.nodes.get(node_id)
+                base_node_id = str(getattr(node, "node_id", "") or "").strip()
+                if base_node_id:
+                    failed_by_base_node.setdefault(base_node_id, node_id)
+            excluded = set(active)
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 discovered_nodes = list(
                     infocenter.list_nodes(
@@ -1969,6 +2122,16 @@ class Service(ServiceExecutionSession):
                 node
                 for node in candidate_nodes
                 if _node_instance_key_from_node(node) not in excluded
+                and not (
+                    _node_instance_key_from_node(node) in failed
+                    and _node_instance_key_from_node(node) not in retryable_failed
+                )
+                and not (
+                    _node_instance_key_from_node(node) in retryable_failed
+                    and str(getattr(node, "node_id", "") or "").strip()
+                    and failed_by_base_node.get(str(getattr(node, "node_id", "") or "").strip())
+                    not in {"", _node_instance_key_from_node(node)}
+                )
                 and is_admitted_node(node, require_control_addr=True)
             ]
             if not candidates:
@@ -2023,9 +2186,10 @@ class Service(ServiceExecutionSession):
                         continue
                     if client is None or session is None:
                         continue
-                    if node_key in self.sessions:
-                        client.close()
-                        continue
+                    old_client = self._clients.pop(node_key, None)
+                    if old_client is not None and old_client is not client:
+                        with contextlib.suppress(Exception):
+                            old_client.close()
                     self.sessions[node_key] = session
                     self._clients[node_key] = client
                     self.nodes[node_key] = node
@@ -2297,6 +2461,7 @@ class Service(ServiceExecutionSession):
         package_format: str = "",
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
+        export_methods: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 10,
@@ -2330,6 +2495,7 @@ class Service(ServiceExecutionSession):
             entry_module=entry_module,
             entry_callable=entry_callable,
             package_format=package_format,
+            exports=ArtifactExports.explicit(export_methods) if export_methods else None,
             managed_global_names=effective_managed_global_names,
         )
         prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="service")
@@ -2397,6 +2563,7 @@ class Service(ServiceExecutionSession):
         package_format: str = "",
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
+        export_methods: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 10,
@@ -2439,6 +2606,7 @@ class Service(ServiceExecutionSession):
                 package_format=package_format,
                 serialization_mode=serialization_mode,
                 resource_paths=resource_paths,
+                export_methods=export_methods,
                 managed_global_names=managed_global_names,
                 initial_globals=initial_globals,
                 worker_count=worker_count,
@@ -2462,6 +2630,7 @@ class Service(ServiceExecutionSession):
             package_format=package_format,
             serialization_mode=serialization_mode,
             resource_paths=resource_paths,
+            export_methods=export_methods,
             managed_global_names=managed_global_names,
             initial_globals=initial_globals,
             worker_count=worker_count,
@@ -2607,6 +2776,7 @@ class Service(ServiceExecutionSession):
         package_format: str = "",
         serialization_mode: str = "",
         resource_paths: Optional[Sequence[Any]] = None,
+        export_methods: Optional[Sequence[str]] = None,
         managed_global_names: Optional[Sequence[str]] = None,
         initial_globals: Optional[Dict[str, object]] = None,
         worker_count: int = 10,
@@ -2687,6 +2857,7 @@ class Service(ServiceExecutionSession):
             entry_callable=entry_callable,
             package_format=package_format,
             managed_global_names=effective_managed_global_names,
+            export_methods=export_methods,
             resource_paths=resource_paths,
         )
         effective_blob = prepared_artifact.blob
@@ -4391,6 +4562,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[Optional[object]]:
         return [
             item.result if item.ok else None
@@ -4402,6 +4575,8 @@ class Service(ServiceExecutionSession):
                 strategy=strategy,
                 refresh_status=refresh_status,
                 max_in_flight=max_in_flight,
+                progress=progress,
+                progress_interval_sec=progress_interval_sec,
             )
         ]
 
@@ -4414,6 +4589,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[Optional[object]]:
         items = await _service_acollect_item_calls(
             self,
@@ -4423,6 +4600,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
         return [item.result if item.ok else None for item in items]
 
@@ -4436,6 +4615,8 @@ class Service(ServiceExecutionSession):
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Iterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         for item in _service_iter_item_calls(
             self,
@@ -4445,6 +4626,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -4458,6 +4641,8 @@ class Service(ServiceExecutionSession):
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> AsyncIterator[Union[Tuple[int, Optional[object]], ExecutionItem]]:
         async for item in _service_aiter_item_calls(
             self,
@@ -4467,6 +4652,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -4479,6 +4666,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Iterator[ExecutionItem]:
         return _service_iter_item_calls(
             self,
@@ -4488,6 +4677,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     async def aiter_item_calls(
@@ -4499,6 +4690,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> AsyncIterator[ExecutionItem]:
         async for item in _service_aiter_item_calls(
             self,
@@ -4508,6 +4701,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         ):
             yield item
 
@@ -4520,6 +4715,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[ExecutionItem]:
         return _service_collect_item_calls(
             self,
@@ -4529,6 +4726,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     async def acollect_item_calls(
@@ -4540,6 +4739,8 @@ class Service(ServiceExecutionSession):
         strategy: str = "predicted_busy",
         refresh_status: bool = True,
         max_in_flight: Optional[int] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> List[ExecutionItem]:
         return await _service_acollect_item_calls(
             self,
@@ -4549,6 +4750,8 @@ class Service(ServiceExecutionSession):
             strategy=strategy,
             refresh_status=refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     async def call_all(self, method: str, **kwargs) -> List[Tuple[Optional[str], Optional[object], Optional[Exception]]]:

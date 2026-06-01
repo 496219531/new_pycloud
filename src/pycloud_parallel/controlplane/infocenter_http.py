@@ -96,6 +96,24 @@ def _parse_dt(raw: object) -> datetime:
     return utc_now()
 
 
+def _parse_optional_dt(raw: object) -> Optional[datetime]:
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    return _parse_dt(raw)
+
+
+def _failure_text_with_time(reason: object, failure_at: object = None) -> str:
+    text = str(reason or "").strip()
+    if not text:
+        return "-"
+    parsed_at = _parse_optional_dt(failure_at)
+    if parsed_at is None:
+        return text
+    return f"[{_dt_text(parsed_at)}] {text}"
+
+
 def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
     out: Dict[str, NodeServiceState] = {}
     for item in payload or []:
@@ -125,6 +143,7 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             lease_expire_at=_parse_dt(item.get("lease_expire_at") or item.get("lease_expire_at_ts") or utc_now()),
             http_base_url=str(item.get("http_base_url", "") or ""),
             stop_reason=str(item.get("stop_reason", item.get("failure_reason", "")) or ""),
+            failure_at=_parse_optional_dt(item.get("failure_at") or item.get("failure_at_ts")),
         )
     return out
 
@@ -178,6 +197,14 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
                             if str(getattr(item, "stop_reason", "") or "").strip()
                         }
                     )
+                ),
+                "failure_at": max(
+                    (
+                        item.failure_at
+                        for item in ordered
+                        if getattr(item, "failure_at", None) is not None
+                    ),
+                    default=None,
                 ),
                 "duplicate_count": duplicate_count,
                 "service_ids": [str(item.service_id or "") for item in ordered],
@@ -305,6 +332,7 @@ def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
             last_heartbeat_at=_parse_dt(item.get("last_heartbeat_at") or utc_now()),
             lease_expire_at=_parse_dt(item.get("lease_expire_at") or utc_now()),
             failure_reason=str(item.get("failure_reason", item.get("stop_reason", "")) or ""),
+            failure_at=_parse_optional_dt(item.get("failure_at") or item.get("failure_at_ts")),
         )
     return out
 
@@ -353,6 +381,7 @@ def _ops_metric_card(label: str, value: object, subtext: str = "") -> str:
     detail = f"<div class='metric-sub'>{html.escape(str(subtext))}</div>" if str(subtext or "").strip() else ""
     return (
         "<div class='metric-card'>"
+        "<div class='metric-glow'></div>"
         f"<div class='metric-label'>{html.escape(label)}</div>"
         f"<div class='metric-value'>{html.escape(str(value))}</div>"
         f"{detail}"
@@ -363,9 +392,19 @@ def _ops_metric_card(label: str, value: object, subtext: str = "") -> str:
 def _ops_table(title: str, note: str, headers: List[str], body_id: str, body: str) -> str:
     note_html = f"<div class='section-note'>{html.escape(note)}</div>" if note else ""
     header_html = "".join(f"<th>{html.escape(item)}</th>" for item in headers)
+    table_key = re.sub(r"[^a-z0-9]+", "-", body_id.lower()).strip("-")
+    if table_key.startswith("ops-"):
+        table_key = table_key[4:]
+    if table_key.endswith("-body"):
+        table_key = table_key[:-5]
     return (
-        f"<section class='ops-section'><h2>{html.escape(title)}</h2>{note_html}"
-        "<div class='table-wrap'><table><thead><tr>"
+        "<section class='ops-section'>"
+        "<div class='section-head'>"
+        f"<h2>{html.escape(title)}</h2>"
+        f"<a class='section-anchor' href='#{html.escape(body_id, quote=True)}'>focus</a>"
+        "</div>"
+        f"{note_html}"
+        f"<div class='table-wrap'><table class='ops-table ops-table--{html.escape(table_key, quote=True)}'><thead><tr>"
         f"{header_html}"
         f"</tr></thead><tbody id='{html.escape(body_id, quote=True)}'>"
         f"{body}"
@@ -393,6 +432,7 @@ def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) 
         "lease_expire_at": _dt_text(service.lease_expire_at),
         "http_base_url": str(service.http_base_url or ""),
         "stop_reason": str(service.stop_reason or ""),
+        "failure_at": _dt_text(service.failure_at) if getattr(service, "failure_at", None) is not None else "",
     }
 
 
@@ -465,6 +505,7 @@ def _serialize_node(state) -> Dict[str, object]:
                 "last_heartbeat_at": _dt_text(pool.last_heartbeat_at),
                 "lease_expire_at": _dt_text(pool.lease_expire_at),
                 "failure_reason": str(pool.failure_reason or ""),
+                "failure_at": _dt_text(pool.failure_at) if getattr(pool, "failure_at", None) is not None else "",
             }
             for pool in task_pools
         ],
@@ -909,7 +950,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.lease_expire_at))}</td>"
-                f"<td>{html.escape(str(getattr(pool, 'failure_reason', '') or '-'))}</td>"
+                f"<td>{html.escape(_failure_text_with_time(getattr(pool, 'failure_reason', ''), getattr(pool, 'failure_at', None)))}</td>"
                 "</tr>"
             ))
         metadata = dict(node.metadata or {})
@@ -1006,15 +1047,15 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         duplicate_count = len(unique_service_ids) or len(ordered)
         if duplicate_count > 1:
             service_id_text = f"{service_id_text} (+{duplicate_count - 1})"
-        stop_reason = "; ".join(
-            sorted(
-                {
-                    str(entry["item"].get("stop_reason", "") or "").strip()
-                    for entry in ordered
-                    if str(entry["item"].get("stop_reason", "") or "").strip()
-                }
+        stop_reasons = [
+            _failure_text_with_time(
+                entry["item"].get("stop_reason", ""),
+                entry["item"].get("failure_at"),
             )
-        )
+            for entry in ordered
+            if str(entry["item"].get("stop_reason", "") or "").strip()
+        ]
+        stop_reason = "; ".join(sorted({text for text in stop_reasons if text and text != "-"}))
         stale_row = "" if any_healthy else " class='stale-row'"
         service_rows.append(
             f"<tr{stale_row}>"
@@ -1065,7 +1106,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     total_waiting_jobs = len(waiting_job_rows)
     total_recent_jobs = len(recent_job_rows)
     overview = (
-        "<div class='metrics-grid'>"
+        "<div class='metrics-grid' id='ops-overview'>"
         f"{_ops_metric_card('Nodes', f'{healthy_nodes}/{total_nodes}', 'healthy / total')}"
         f"{_ops_metric_card('Services', f'{running_services}/{total_services}', 'routable / known')}"
         f"{_ops_metric_card('Task Pools', total_pools, f'in-flight {pool_inflight}')}"
@@ -1096,32 +1137,50 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "last_heartbeat_at", "lease_expire_at", "failure_reason",
     ]
     return (
-        "<!doctype html><html><head><meta charset='utf-8'><title>InfoCenter Ops</title>"
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>InfoCenter Ops</title>"
         "<style>"
-        ":root{color-scheme:light;--bg:#f6f8fb;--panel:#ffffff;--line:#d8dee8;--line-soft:#e7ebf2;--text:#182230;--muted:#64748b;--head:#f1f5f9;--good:#087443;--good-bg:#dcfce7;--warn:#a15c00;--warn-bg:#fff4ce;--bad:#b42318;--bad-bg:#fee4e2;--neutral:#475467;--neutral-bg:#eef2f6;--accent:#2563eb;}"
-        "*{box-sizing:border-box;}body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:var(--bg);color:var(--text);}"
-        ".ops-shell{max-width:1600px;margin:0 auto;padding:24px;} .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px;}"
-        "h1{font-size:26px;line-height:1.2;margin:0 0 6px;font-weight:720;letter-spacing:0;}h2{font-size:18px;margin:0 0 8px;font-weight:700;letter-spacing:0;}"
-        ".muted{color:var(--muted);} .section-note{color:var(--muted);font-size:12px;line-height:1.45;margin:6px 0 10px;}"
-        ".refresh-pill{white-space:nowrap;border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:7px 10px;font-size:12px;color:var(--muted);box-shadow:0 1px 2px rgba(16,24,40,.05);}"
-        ".metrics-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:12px;margin:16px 0 20px;}"
-        ".metric-card{background:var(--panel);border:1px solid var(--line-soft);border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(16,24,40,.04);}"
-        ".metric-label{font-size:12px;color:var(--muted);font-weight:650;text-transform:uppercase;letter-spacing:.04em;}.metric-value{font-size:28px;line-height:1.1;margin-top:8px;font-weight:760;}.metric-sub{font-size:12px;color:var(--muted);margin-top:6px;}"
-        ".ops-section{margin:18px 0 22px;}.table-wrap{overflow:auto;max-height:68vh;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(16,24,40,.04);}"
-        "table{border-collapse:separate;border-spacing:0;width:100%;min-width:1120px;}th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);padding:8px 10px;font-size:12px;line-height:1.35;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}"
-        "th{position:sticky;top:0;z-index:1;background:var(--head);text-align:left;color:#334155;font-weight:700;}tr:last-child td{border-bottom:0;}td:last-child,th:last-child{border-right:0;}tbody tr:hover{background:#f8fafc;}"
-        ".badge{display:inline-flex;align-items:center;min-height:20px;border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700;line-height:1.2;border:1px solid transparent;white-space:nowrap;}"
-        ".badge-good{background:var(--good-bg);color:var(--good);}.badge-warn{background:var(--warn-bg);color:var(--warn);}.badge-bad{background:var(--bad-bg);color:var(--bad);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);}"
-        ".stale-row{background:#fff7f5;color:#8a1f11;}button{appearance:none;border:1px solid var(--line);border-radius:6px;background:#fff;color:#1f2937;padding:4px 8px;margin:1px;font:inherit;font-size:12px;cursor:pointer;}button:hover{border-color:#93c5fd;color:var(--accent);background:#eff6ff;}input,select{border:1px solid var(--line);border-radius:6px;padding:4px 6px;font:inherit;font-size:12px;background:#fff;max-width:180px;}"
-        "@media(max-width:900px){.ops-shell{padding:16px}.topbar{display:block}.refresh-pill{display:inline-block;margin-top:10px}.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.metric-value{font-size:23px;}}"
-        "@media(max-width:560px){.metrics-grid{grid-template-columns:1fr;}th,td{font-size:11px;padding:7px 8px;}}"
+        ":root{color-scheme:dark;--bg:#07111f;--bg2:#0b1530;--panel:#101b31;--panel2:#0d1729;--line:#263957;--line-soft:#1e2d47;--text:#e5edf7;--muted:#93a4bd;--head:#16243c;--good:#4ade80;--good-bg:#052e1a;--warn:#fbbf24;--warn-bg:#3b2a05;--bad:#fb7185;--bad-bg:#3b1018;--neutral:#cbd5e1;--neutral-bg:#263244;--accent:#60a5fa;--accent2:#22d3ee;--shadow:0 18px 50px rgba(0,0,0,.32);}"
+        "*{box-sizing:border-box;}html{scroll-behavior:smooth;}body{font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;min-height:100vh;background:radial-gradient(circle at 12% -10%,rgba(34,211,238,.22),transparent 30%),radial-gradient(circle at 88% 0,rgba(96,165,250,.18),transparent 28%),linear-gradient(180deg,var(--bg),#050a13 80%);color:var(--text);}"
+        "body:before{content:'';position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.02) 1px,transparent 1px);background-size:28px 28px;mask-image:linear-gradient(#000,transparent 75%);}"
+        ".ops-shell{max-width:1760px;margin:0 auto;padding:30px 26px 44px;position:relative;} .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px;padding:20px;border:1px solid rgba(96,165,250,.24);border-radius:22px;background:linear-gradient(135deg,rgba(16,27,49,.92),rgba(13,23,41,.72));box-shadow:var(--shadow);backdrop-filter:blur(10px);}"
+        ".eyebrow{color:var(--accent2);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px;}h1{font-size:32px;line-height:1.08;margin:0 0 8px;font-weight:820;letter-spacing:-.03em;}h2{font-size:18px;margin:0;font-weight:760;letter-spacing:-.01em;}"
+        ".muted{color:var(--muted);} .section-note{color:var(--muted);font-size:12px;line-height:1.55;margin:8px 0 12px;}.hero-sub{max-width:860px;color:#b6c4d8;font-size:13px;line-height:1.55;}"
+        ".top-actions{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;justify-content:flex-end;}.nav-pill,.refresh-pill{white-space:nowrap;border:1px solid rgba(148,163,184,.22);background:rgba(15,23,42,.72);border-radius:999px;padding:8px 11px;font-size:12px;color:#cbd5e1;text-decoration:none;box-shadow:0 1px 0 rgba(255,255,255,.05) inset;}.nav-pill:hover{border-color:rgba(96,165,250,.65);color:#fff;background:rgba(37,99,235,.22);}"
+        ".metrics-grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:14px;margin:18px 0 22px;}.metric-card{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(16,27,49,.96),rgba(10,18,32,.96));border:1px solid rgba(148,163,184,.18);border-radius:18px;padding:16px 18px;box-shadow:0 14px 34px rgba(0,0,0,.24);}.metric-glow{position:absolute;right:-34px;top:-34px;width:120px;height:120px;background:radial-gradient(circle,rgba(96,165,250,.24),transparent 70%);}.metric-label{position:relative;font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.09em;}.metric-value{position:relative;font-size:31px;line-height:1.05;margin-top:9px;font-weight:840;letter-spacing:-.03em;}.metric-sub{position:relative;font-size:12px;color:var(--muted);margin-top:7px;}"
+        ".ops-section{margin:20px 0 24px;}.section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 8px;}.section-anchor{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:4px 9px;background:rgba(15,23,42,.72);}.section-anchor:hover{color:#fff;border-color:var(--accent);}"
+        ".table-wrap{overflow:auto;max-height:70vh;background:rgba(16,27,49,.9);border:1px solid rgba(148,163,184,.2);border-radius:16px;box-shadow:0 16px 42px rgba(0,0,0,.26);}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1120px;}th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);padding:9px 11px;font-size:12px;line-height:1.42;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}th{position:sticky;top:0;z-index:2;background:linear-gradient(180deg,#1a2a46,#142138);text-align:left;color:#c9d7eb;font-weight:780;text-transform:uppercase;letter-spacing:.035em;font-size:11px;}tr:last-child td{border-bottom:0;}td:last-child,th:last-child{border-right:0;}tbody tr:nth-child(even){background:rgba(255,255,255,.018);}tbody tr:hover{background:rgba(96,165,250,.09);}"
+        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(6),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+8):nth-child(-n+21),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(27){display:none;}"
+        "body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(2),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(14){display:none;}"
+        "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
+        "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
+        "body:not(.show-details) .ops-table--waiting-jobs :is(th,td):nth-child(2){display:none;}"
+        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+13):nth-child(-n+16),body:not(.show-details) .ops-table--services :is(th,td):nth-child(18){display:none;}"
+        "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+13):nth-child(-n+22){display:none;}"
+        "body:not(.show-details) .ops-table{min-width:900px;}body.show-details .ops-table{min-width:1120px;}.density-toggle{border-color:rgba(34,211,238,.35);color:#cffafe;background:rgba(8,47,73,.5);}.density-toggle:hover{border-color:rgba(34,211,238,.72);background:rgba(14,116,144,.36);}.density-hint{color:#8fb2d9;font-size:12px;width:100%;text-align:right;}"
+        ".badge{display:inline-flex;align-items:center;min-height:21px;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:800;line-height:1.2;border:1px solid transparent;white-space:nowrap;box-shadow:0 1px 0 rgba(255,255,255,.06) inset;}.badge-good{background:var(--good-bg);color:var(--good);border-color:rgba(74,222,128,.2);}.badge-warn{background:var(--warn-bg);color:var(--warn);border-color:rgba(251,191,36,.22);}.badge-bad{background:var(--bad-bg);color:var(--bad);border-color:rgba(251,113,133,.22);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);border-color:rgba(203,213,225,.14);}"
+        ".stale-row{background:rgba(127,29,29,.24)!important;color:#fecaca;}form{margin:0;}td form{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;}button{appearance:none;border:1px solid rgba(148,163,184,.28);border-radius:9px;background:rgba(15,23,42,.9);color:#dbeafe;padding:5px 9px;margin:2px;font:inherit;font-size:12px;cursor:pointer;transition:.12s ease;}button:hover{transform:translateY(-1px);border-color:rgba(96,165,250,.72);color:#fff;background:rgba(37,99,235,.3);}input,select{border:1px solid rgba(148,163,184,.28);border-radius:9px;padding:5px 7px;font:inherit;font-size:12px;background:#08111f;color:var(--text);max-width:190px;}input::placeholder{color:#64748b;}"
+        "a{color:#93c5fd;}code{color:#67e8f9;}::-webkit-scrollbar{height:12px;width:12px;}::-webkit-scrollbar-track{background:#07111f;}::-webkit-scrollbar-thumb{background:#263957;border-radius:999px;border:3px solid #07111f;}::-webkit-scrollbar-thumb:hover{background:#3b5278;}"
+        "@media(max-width:1050px){.topbar{display:block}.top-actions{justify-content:flex-start;margin-top:14px}.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.metric-value{font-size:25px;}}"
+        "@media(max-width:620px){.ops-shell{padding:16px}.topbar{padding:16px;border-radius:16px}.metrics-grid{grid-template-columns:1fr;}h1{font-size:27px;}th,td{font-size:11px;padding:7px 8px;}}"
         "</style>"
         "</head><body>"
         "<div class='ops-shell'>"
         "<div class='topbar'><div>"
+        "<div class='eyebrow'>PyCloud Parallel Control Plane</div>"
         "<h1>InfoCenter Ops</h1>"
+        "<div class='hero-sub'>Live view of nodes, services, job queues and task pools. "
+        "Tables auto-refresh every 5 seconds while preserving the page chrome.</div>"
         f"<div class='section-note'>controlplane_version={html.escape(_pycloud_version())}</div>"
-        "</div><div class='refresh-pill' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div></div>"
+        "</div><div class='top-actions'>"
+        "<a class='nav-pill' href='/nodes?healthy_only=false&limit=500'>nodes json</a>"
+        "<a class='nav-pill' href='/services/routes?healthy_only=false&limit=500'>services json</a>"
+        "<a class='nav-pill' href='/ops/snapshot'>snapshot</a>"
+        "<button type='button' class='density-toggle' id='ops-density-toggle'>show details</button>"
+        "<div class='refresh-pill' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div>"
+        "<div class='density-hint' id='ops-density-hint'>compact view hides IDs, URLs and deep timing columns</div>"
+        "</div></div>"
         f"{overview}"
         "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
         "Service table below shows each deployed service instance, worker process counts, and reduced timing metrics. "
@@ -1129,7 +1188,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         f"{_ops_table('Nodes', '', node_headers, 'ops-nodes-body', node_body)}"
         f"{_ops_table('Job Queue', 'Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.', job_queue_headers, 'ops-job-queue-body', job_queue_body)}"
         "<section class='ops-section'><div class='section-note'>Job-orch timing is reduced timing for queue wait, pool prepare, globals fanout, task running, finalize, writeback and total. Windows-focused fields highlight executor create/rebuild, warmup, and first-result wait.</div>"
-        "<div class='table-wrap'><table><thead><tr>"
+        "<div class='table-wrap'><table class='ops-table ops-table--job-timing'><thead><tr>"
         "<th>scope</th><th>job_count</th><th>avg_queue_wait_ms</th><th>avg_pool_prepare_ms</th><th>avg_fanout_globals_ms</th><th>avg_running_tasks_ms</th><th>avg_finalize_ms</th><th>avg_terminal_writeback_ms</th><th>avg_total_ms</th><th>max_total_ms</th><th>executor_create_count</th><th>executor_rebuild_count</th><th>pool_reuse_count</th><th>pool_create_count</th><th>pool_rebuild_count</th><th>avg_first_result_wait_ms</th><th>avg_warmup_ms</th></tr></thead><tbody id='ops-job-timing-body'>"
         f"<tr><td>embedded-job-orch</td><td>{html.escape(str(queue_timing.get('job_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_queue_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_pool_prepare_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_fanout_globals_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_running_tasks_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_finalize_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_terminal_writeback_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('max_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_first_result_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_warmup_ms', '-')))}</td></tr>"
         f"<tr><td>current-job</td><td>1</td><td>{html.escape(str(current_job_timing.get('queue_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_prepare_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('fanout_globals_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('running_tasks_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('finalize_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('terminal_writeback_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'create' else 0))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'rebuild' else 0))}</td><td>{html.escape(str(current_job_timing.get('first_result_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('warmup_ms', '-')))}</td></tr>"
@@ -1140,13 +1199,23 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         f"{_ops_table('Task Pools', '', pool_headers, 'ops-pools-body', pool_body)}"
         "<script>"
         "(function(){"
+        "const densityKey='pycloud.ops.showDetails';"
+        "const densityBtn=document.getElementById('ops-density-toggle');"
+        "const densityHint=document.getElementById('ops-density-hint');"
+        "function getDensity(){try{return localStorage.getItem(densityKey)==='1';}catch(_err){return false;}}"
+        "function setDensity(show){try{localStorage.setItem(densityKey,show?'1':'0');}catch(_err){}}"
+        "function applyDensity(show){document.body.classList.toggle('show-details',!!show);if(densityBtn){densityBtn.textContent=show?'hide details':'show details';}if(densityHint){densityHint.textContent=show?'detail view shows all diagnostic IDs, URLs and timing columns':'compact view hides IDs, URLs and deep timing columns';}}"
+        "applyDensity(getDensity());"
+        "if(densityBtn){densityBtn.addEventListener('click',function(){const show=!document.body.classList.contains('show-details');setDensity(show);applyDensity(show);});}"
         "const ids=['ops-nodes-body','ops-job-queue-body','ops-job-timing-body','ops-recent-jobs-body','ops-waiting-jobs-body','ops-services-body','ops-pools-body'];"
+        "function card(label,value,sub){return '<div class=\"metric-card\"><div class=\"metric-glow\"></div><div class=\"metric-label\">'+label+'</div><div class=\"metric-value\">'+value+'</div><div class=\"metric-sub\">'+sub+'</div></div>';}"
+        "function updateOverview(data){const el=document.getElementById('ops-overview');if(!el||!data.metrics){return;}const m=data.metrics;el.innerHTML=card('Nodes',m.nodes||'-','healthy / total')+card('Services',m.services||'-','routable / known')+card('Task Pools',m.task_pools||'-','in-flight '+(m.pool_inflight||0))+card('Jobs',m.jobs||'-','waiting, '+(m.recent_jobs||0)+' recent');}"
         "async function refreshOps(){"
         "const status=document.getElementById('ops-refresh-status');"
         "try{const resp=await fetch('/ops/snapshot',{cache:'no-store',headers:{'Accept':'application/json'}});"
         "if(!resp.ok){throw new Error('http '+resp.status);}"
         "const data=await resp.json();if(!data.ok){throw new Error(data.error||'snapshot failed');}"
-        "const fragments=data.fragments||{};"
+        "updateOverview(data);const fragments=data.fragments||{};"
         "ids.forEach(function(id){const el=document.getElementById(id);if(el&&Object.prototype.hasOwnProperty.call(fragments,id)){el.innerHTML=fragments[id];}});"
         "if(status){status.textContent='auto_refresh_sec=5 mode=partial last_update='+new Date().toLocaleTimeString();}"
         "}catch(err){if(status){status.textContent='auto_refresh_sec=5 mode=partial refresh_error='+(err&&err.message?err.message:err);}}"
@@ -1178,9 +1247,33 @@ def _render_ops_snapshot(state: InfoCenterState, job_queue: Optional[JobQueueMan
             flags=re.DOTALL,
         )
         fragments[fragment_id] = match.group(1) if match else ""
+    metrics: Dict[str, str] = {}
+    overview_match = re.search(r"<div class='metrics-grid' id='ops-overview'>(.*?)</div>\s*<div class='section-note'>", raw, flags=re.DOTALL)
+    if overview_match is not None:
+        cards = re.findall(
+            r"<div class='metric-label'>(.*?)</div><div class='metric-value'>(.*?)</div><div class='metric-sub'>(.*?)</div>",
+            overview_match.group(1),
+            flags=re.DOTALL,
+        )
+        for label, value, subtext in cards:
+            key = re.sub(r"[^a-z0-9]+", "_", html.unescape(label).strip().lower()).strip("_")
+            if key:
+                metrics[key] = html.unescape(value).strip()
+                metrics[f"{key}_subtext"] = html.unescape(subtext).strip()
+    jobs_subtext = metrics.get("jobs_subtext", "")
+    recent_jobs_match = re.search(r",\s*(\d+)\s+recent", jobs_subtext)
+    pool_inflight_match = re.search(r"in-flight\s+(\d+)", metrics.get("task_pools_subtext", ""))
     return {
         "ok": True,
         "fragments": fragments,
+        "metrics": {
+            "nodes": metrics.get("nodes", "-"),
+            "services": metrics.get("services", "-"),
+            "task_pools": metrics.get("task_pools", "-"),
+            "pool_inflight": pool_inflight_match.group(1) if pool_inflight_match else "0",
+            "jobs": metrics.get("jobs", "-"),
+            "recent_jobs": recent_jobs_match.group(1) if recent_jobs_match else "0",
+        },
         "controlplane_version": _pycloud_version(),
         "auto_refresh_sec": 5,
     }

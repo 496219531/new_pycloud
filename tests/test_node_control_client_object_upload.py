@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from types import SimpleNamespace
 from pathlib import Path
 import pytest
 
@@ -13,6 +14,7 @@ from pycloud_parallel.controlplane.config import (
     resolve_object_transfer_mode,
 )
 from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
+from pycloud_parallel.controlplane import node_control_http
 from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.controlplane.node_object_http import HttpNodeObjectClient, NodeObjectHttpApp, NodeObjectHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
@@ -68,6 +70,110 @@ def test_object_transfer_mode_auto_rules(monkeypatch):
         monkeypatch.delenv("PYCLOUD_TRUST_MODE", raising=False)
         monkeypatch.delenv("PYCLOUD_OBJECT_TRANSFER_MODE", raising=False)
         reload_config()
+
+
+def test_nodecontrol_upgrade_from_wheel_file_invokes_pip(tmp_path, monkeypatch):
+    server, target, _state = _start_nodecontrol_server("node-upgrade-01", str(tmp_path / "node_upgrade_01"))
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return SimpleNamespace(returncode=0, stdout="installed", stderr="")
+
+    monkeypatch.setattr(node_control_http.subprocess, "run", fake_run)
+    monkeypatch.setattr(node_control_http, "_restart_current_process_delayed", lambda *_args, **_kwargs: calls.append(("restart", {})))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            result = client.upgrade_from_wheel_file(wheel_path=str(wheel), restart=True)
+    finally:
+        server.stop()
+
+    assert result["ok"] is True
+    assert result["restart_scheduled"] is True
+    assert calls[0][0][:4] == [node_control_http.sys.executable, "-m", "pip", "install"]
+    assert "--upgrade" in calls[0][0]
+    assert calls[1] == ("restart", {})
+
+
+def test_nodecontrol_restart_node_schedules_restart(tmp_path, monkeypatch):
+    server, target, _state = _start_nodecontrol_server("node-restart-01", str(tmp_path / "node_restart_01"))
+    calls = []
+    monkeypatch.setattr(node_control_http, "_restart_current_process_delayed", lambda **kwargs: calls.append(("restart", kwargs)))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            result = client.restart_node(delay_sec=2.0)
+    finally:
+        server.stop()
+
+    assert result["ok"] is True
+    assert result["restart_scheduled"] is True
+    assert calls == [("restart", {"delay_sec": 2.0})]
+
+
+def test_nodecontrol_admin_token_can_be_set_once_without_old_token(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-admin-token-01", str(tmp_path / "node_admin_token_01"))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            result = client.set_admin_token(admin_token="admin-a")
+
+        assert result["ok"] is True
+        assert result["updated"] is False
+        assert (state.artifact_dir / "admin_token").read_text(encoding="utf-8").strip() == "admin-a"
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_nodecontrol_first_admin_token_ignores_provided_old_token(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-admin-token-old-ignored", str(tmp_path / "node_admin_token_old_ignored"))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            result = client.set_admin_token(admin_token="admin-a", old_admin_token="stale")
+
+        assert result["ok"] is True
+        assert result["updated"] is False
+        assert (state.artifact_dir / "admin_token").read_text(encoding="utf-8").strip() == "admin-a"
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_nodecontrol_admin_token_update_requires_old_token(tmp_path):
+    server, target, state = _start_nodecontrol_server("node-admin-token-02", str(tmp_path / "node_admin_token_02"))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            assert client.set_admin_token(admin_token="admin-a")["ok"] is True
+            with pytest.raises(Exception):
+                client.set_admin_token(admin_token="admin-b")
+            with pytest.raises(Exception):
+                client.set_admin_token(admin_token="admin-b", old_admin_token="wrong")
+            result = client.set_admin_token(admin_token="admin-b", old_admin_token="admin-a")
+
+        assert result["ok"] is True
+        assert result["updated"] is True
+        assert (state.artifact_dir / "admin_token").read_text(encoding="utf-8").strip() == "admin-b"
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_nodecontrol_admin_actions_require_admin_token_after_configured(tmp_path, monkeypatch):
+    server, target, _state = _start_nodecontrol_server("node-admin-token-03", str(tmp_path / "node_admin_token_03"))
+    calls = []
+    monkeypatch.setattr(node_control_http, "_restart_current_process_delayed", lambda **kwargs: calls.append(kwargs))
+    try:
+        with NodeControlClient(target, timeout_sec=10.0) as client:
+            client.set_admin_token(admin_token="admin-a")
+            with pytest.raises(Exception):
+                client.restart_node()
+            result = client.restart_node(api_token="admin-a")
+
+        assert result["ok"] is True
+        assert calls == [{"delay_sec": 1.0}]
+    finally:
+        server.stop()
 
 
 def test_upload_object_server_authoritative_http_returns_final_object_id(tmp_path):

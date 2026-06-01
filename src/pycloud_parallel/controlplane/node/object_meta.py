@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -16,6 +19,12 @@ from pycloud_parallel.controlplane.node.filesystem import (
 )
 from pycloud_parallel.controlplane.state_time import utc_now
 from pycloud_parallel.data.ref import normalize_object_format, normalize_object_id
+
+logger = logging.getLogger(__name__)
+_OBJECT_LAST_AT_TOUCH_INTERVAL_SEC = 60.0
+_OBJECT_LAST_AT_TOUCH_MAX_ENTRIES = 10000
+_OBJECT_LAST_AT_TOUCH_LOCK = threading.Lock()
+_OBJECT_LAST_AT_TOUCH_TIMES: Dict[Tuple[str, str], float] = {}
 
 
 def _write_object_meta(
@@ -95,6 +104,39 @@ def _touch_object_last_at(object_dir: Path, *, object_id: str, fallback_path: Op
 
 def touch_object_last_at(object_dir: Path, *, object_id: str, fallback_path: Optional[Path] = None) -> None:
     _touch_object_last_at(object_dir, object_id=object_id, fallback_path=fallback_path)
+
+
+def touch_object_last_at_throttled(object_dir: Path, *, object_id: str, fallback_path: Optional[Path] = None) -> None:
+    object_root = Path(object_dir).resolve()
+    normalized_object_id = normalize_object_id(object_id)
+    key = (str(object_root), normalized_object_id)
+    now = time.monotonic()
+    with _OBJECT_LAST_AT_TOUCH_LOCK:
+        last_touched_at = float(_OBJECT_LAST_AT_TOUCH_TIMES.get(key, 0.0) or 0.0)
+        if now - last_touched_at < _OBJECT_LAST_AT_TOUCH_INTERVAL_SEC:
+            return
+        if len(_OBJECT_LAST_AT_TOUCH_TIMES) >= _OBJECT_LAST_AT_TOUCH_MAX_ENTRIES:
+            cutoff = now - _OBJECT_LAST_AT_TOUCH_INTERVAL_SEC
+            stale_keys = [item_key for item_key, touched_at in _OBJECT_LAST_AT_TOUCH_TIMES.items() if touched_at < cutoff]
+            for item_key in stale_keys:
+                _OBJECT_LAST_AT_TOUCH_TIMES.pop(item_key, None)
+            if len(_OBJECT_LAST_AT_TOUCH_TIMES) >= _OBJECT_LAST_AT_TOUCH_MAX_ENTRIES:
+                _OBJECT_LAST_AT_TOUCH_TIMES.pop(next(iter(_OBJECT_LAST_AT_TOUCH_TIMES)), None)
+        _OBJECT_LAST_AT_TOUCH_TIMES[key] = now
+    try:
+        _touch_object_last_at(object_root, object_id=normalized_object_id, fallback_path=fallback_path)
+    except PermissionError as exc:
+        logger.warning(
+            "skip object last_at touch after metadata permission error object_id=%s err=%s",
+            normalized_object_id,
+            exc,
+        )
+    except OSError as exc:
+        logger.warning(
+            "skip object last_at touch after metadata os error object_id=%s err=%s",
+            normalized_object_id,
+            exc,
+        )
 
 
 def _normalize_pinned_ref_ids(values: Sequence[str]) -> List[str]:
@@ -202,4 +244,5 @@ __all__ = [
     "_touch_object_last_at",
     "_write_object_meta",
     "touch_object_last_at",
+    "touch_object_last_at_throttled",
 ]

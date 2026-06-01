@@ -44,6 +44,28 @@ group = Service.deploy(
 4. 如果必须带资源文件，请预先自行构建 `zip / tar.gz / whl`，再通过 `source=<archive file>` 上传
 5. 代码里如果仍要走相对路径，建议在你自己构建的归档里保留所需目录结构
 
+## 3.1 项目根 Python 模块
+
+自动打包会处理项目根目录下的 Python 模块和 package 闭包。例如业务模块引用：
+
+```python
+from Api import local_db_api
+```
+
+而 `Api/local_db_api.py` 在运行到某个函数时才执行：
+
+```python
+import DBCfg
+```
+
+只要 `DBCfg.py` 位于同一项目根目录，自动打包会把它放在 artifact 根目录。节点加载和实际调用方法时都会保留该 artifact 根目录到 `sys.path`，因此延迟导入的根模块也能解析。
+
+如果远端仍报 `ModuleNotFoundError: No module named 'DBCfg'`，优先确认：
+
+1. 本地自动打包产物里是否有 `DBCfg.py`
+2. 目标 node 是否已经升级到包含该运行时修复的 `pycloud_parallel`
+3. 重新部署服务后，错误里的 `code_cache/codes/<code_version>/pkg` 是否对应新 artifact
+
 ## 4. 本地调试模块打包
 
 可以直接用调试脚本查看自动打包结果：

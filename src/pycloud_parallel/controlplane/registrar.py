@@ -85,6 +85,7 @@ class NodeInfoCenterRegistrar:
         self._lease_ttl_sec = max(self.fallback_heartbeat_sec * 3, self.fallback_heartbeat_sec + 1)
         self._last_successful_sync_at = 0.0
         self._sync_lock = threading.Lock()
+        self._closing = False
 
     @staticmethod
     def _pycloud_version() -> str:
@@ -98,7 +99,15 @@ class NodeInfoCenterRegistrar:
         self._thread = threading.Thread(target=self._loop, name=f"node-registrar-{self.node_id}", daemon=True)
         self._thread.start()
 
-    def close(self) -> None:
+    def close(self, *, mark_lost: bool = True) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            if bool(mark_lost):
+                self._mark_lost_before_close()
+        finally:
+            self._closing = False
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
@@ -109,6 +118,46 @@ class NodeInfoCenterRegistrar:
             self._thread = None
         with self._sync_lock:
             self._client.close()
+
+    def _mark_lost_before_close(self) -> None:
+        with self._sync_lock:
+            was_registered = bool(self._registered)
+        if not was_registered:
+            return
+        try:
+            close_state = getattr(self.state, "close", None)
+            if callable(close_state):
+                previous_registrar = getattr(self.state, "_infocenter_registrar", None)
+                if previous_registrar is self:
+                    setattr(self.state, "_infocenter_registrar", None)
+                close_state()
+                if previous_registrar is self and getattr(self.state, "_infocenter_registrar", None) is None:
+                    setattr(self.state, "_infocenter_registrar", self)
+        except Exception:
+            logger.exception(
+                "[Registrar] state close before unregister failed node_id=%s node_instance_id=%s",
+                self.node_id,
+                self.node_instance_id,
+            )
+        try:
+            self._heartbeat_once()
+        except Exception as exc:
+            if _is_expected_connect_failure(exc):
+                logger.warning(
+                    "[Registrar] final unregister heartbeat deferred node_id=%s node_instance_id=%s error=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    _error_summary(exc),
+                )
+            else:
+                logger.exception(
+                    "[Registrar] final unregister heartbeat failed node_id=%s node_instance_id=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                )
+        finally:
+            with self._sync_lock:
+                self._registered = False
 
     def sync_now(self) -> bool:
         if not self._sync_lock.acquire(blocking=False):

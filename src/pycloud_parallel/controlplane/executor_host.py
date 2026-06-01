@@ -3,9 +3,12 @@ from __future__ import annotations
 """Dedicated local executor host process for user-code execution."""
 
 from collections import deque
+import contextlib
+import traceback
 import multiprocessing as mp
 import os
 import signal
+import sys
 import threading
 import time
 from typing import Any, Deque, Dict, Optional
@@ -41,19 +44,42 @@ def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
         emit_response=_emit,
         emit_event=_emit,
     )
-    running = True
-    while running:
-        message = _simple_queue_get_if_ready(request_q, timeout=0.01)
-        if isinstance(message, dict):
-            running = core.handle_request(
-                str(message.get("request_id", "") or ""),
-                str(message.get("action", "") or ""),
-                dict(message.get("payload") or {}),
+    try:
+        running = True
+        while running:
+            message = _simple_queue_get_if_ready(request_q, timeout=0.01)
+            if isinstance(message, dict):
+                running = core.handle_request(
+                    str(message.get("request_id", "") or ""),
+                    str(message.get("action", "") or ""),
+                    dict(message.get("payload") or {}),
+                )
+            core.poll_once()
+            if message is None:
+                time.sleep(0.001)
+    except BaseException as exc:
+        with contextlib.suppress(Exception):
+            event_q.put(
+                {
+                    "kind": "executor_host_crash",
+                    "error_type": type(exc).__name__,
+                    "error": repr(exc),
+                    "traceback": traceback.format_exc(limit=40),
+                }
             )
-        core.poll_once()
-        if message is None:
-            time.sleep(0.001)
-    core.close()
+        raise
+    finally:
+        core.close()
+
+
+def _windows_spawn_entrypoint_hint() -> str:
+    if os.name != "nt":
+        return ""
+    main = sys.modules.get("__main__")
+    main_file = str(getattr(main, "__file__", "") or "")
+    if not main_file or main_file.startswith("<") or main_file.endswith("\\<stdin>") or main_file.endswith("/<stdin>"):
+        return "Windows spawn cannot re-import the current entrypoint; run from a .py file with if __name__ == '__main__' guard"
+    return "on Windows, ensure the caller script wraps pycloud/deploy startup in if __name__ == '__main__'"
 
 
 class ExecutorHostClient:
@@ -205,9 +231,24 @@ class ExecutorHostClient:
                     self._expired_requests.add(request_id)
                     raise TimeoutError(f"executor host request timed out: {action}")
                 if not self._process.is_alive():
-                    raise RuntimeError("executor host process died")
+                    raise RuntimeError(
+                        self._format_process_died_message(action)
+                    )
                 self._cv.wait(timeout=min(0.1, remaining))
             return self._responses.pop(request_id)
+
+    def _format_process_died_message(self, action: str) -> str:
+        pid = int(getattr(self._process, "pid", 0) or 0)
+        exitcode = getattr(self._process, "exitcode", None)
+        parts = [
+            f"executor host process died action={action}",
+            f"pid={pid}",
+            f"exitcode={exitcode}",
+        ]
+        hint = _windows_spawn_entrypoint_hint()
+        if hint:
+            parts.append(f"hint={hint}")
+        return " ".join(parts)
 
     def create_service(self, *, service_id: str, worker_count: int) -> None:
         resp = self._request(
@@ -310,7 +351,7 @@ class ExecutorHostClient:
                                 self._expired_requests.add(request_id)
                                 raise TimeoutError("executor host request timed out: call_service_stream")
                             if not self._process.is_alive():
-                                raise RuntimeError("executor host process died")
+                                raise RuntimeError(self._format_process_died_message("call_service_stream"))
                             self._cv.wait(timeout=min(0.1, remaining))
                         queue = self._stream_events.get(request_id)
                         if queue:

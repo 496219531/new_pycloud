@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pycloud_parallel.controlplane.node_capability import NodeCapability
 from pycloud_parallel.controlplane.state_time import utc_now
@@ -41,6 +41,7 @@ class NodeServiceState:
     lease_expire_at: datetime = field(default_factory=utc_now)
     http_base_url: str = ""
     stop_reason: str = ""
+    failure_at: Optional[datetime] = None
 
 
 @dataclass
@@ -62,6 +63,7 @@ class NodeTaskPoolInfo:
     last_heartbeat_at: datetime = field(default_factory=utc_now)
     lease_expire_at: datetime = field(default_factory=utc_now)
     failure_reason: str = ""
+    failure_at: Optional[datetime] = None
 
 
 @dataclass

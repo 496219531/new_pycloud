@@ -238,6 +238,8 @@ def _normalize_export_policy(
     normalized_callable = str(entry_callable or "").strip() or "run"
     if str(consumer_kind or "").strip() == "task":
         return ArtifactExports.single(normalized_callable)
+    if str(consumer_kind or "").strip() == "service":
+        return ArtifactExports.export_all()
     return ArtifactExports.use_decorator()
 
 

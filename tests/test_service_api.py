@@ -320,6 +320,109 @@ def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatc
     assert "node-inst-1" in group.failures
 
 
+def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    node_1 = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    created = []
+    closed = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node_1]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            return SimpleNamespace(
+                service_id="svc-recreated",
+                service_token="token-new",
+                http_base_url=f"http://{self.target}/svc/demo-new",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+            )
+
+        def close(self) -> None:
+            closed.append(self.target)
+
+    old_client = SimpleNamespace(close=lambda: closed.append("old-client"))
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={
+            "node-inst-1": SimpleNamespace(
+                service_id="svc-old",
+                service_token="token-old",
+                http_base_url="http://127.0.0.1:50061/svc/demo-old",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                failed=True,
+                last_error="RuntimeError('heartbeat failed: timed out')",
+            )
+        },
+        nodes={"node-inst-1": node_1},
+        _clients={"node-inst-1": old_client},
+    )
+    group._active_replica_ids.discard("node-inst-1")  # noqa: SLF001
+    group.failures["node-inst-1"] = "RuntimeError('heartbeat failed: timed out')"
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    added = group.try_compensate_replicas()
+
+    assert added == 1
+    assert created[0][0] == "127.0.0.1:50061"
+    assert group.sessions["node-inst-1"].service_id == "svc-recreated"
+    assert "node-inst-1" not in group.failures
+    assert "node-inst-1" in group._active_replica_ids  # noqa: SLF001
+    assert "old-client" in closed
+
+
 def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
@@ -1040,6 +1143,35 @@ def test_service_deploy_local_keeps_artifact_service_path(tmp_path, monkeypatch)
         assert service._services  # noqa: SLF001
         assert service._startup_services == {}  # noqa: SLF001
         assert service.run.sync(value=3) == {"value": 3}
+    finally:
+        service.close()
+
+
+def test_service_deploy_local_accepts_explicit_export_methods(tmp_path, monkeypatch):
+    module_path = tmp_path / "deploy_local_explicit_exports.py"
+    module_path.write_text(
+        "def visible(value=0):\n"
+        "    return {'value': value}\n\n"
+        "def hidden(value=0):\n"
+        "    return {'hidden': value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    worker_module = importlib.import_module("deploy_local_explicit_exports")
+
+    service = Service.deploy(
+        target="local",
+        service_name="deploy-local-explicit-exports",
+        source=worker_module,
+        export_methods=("visible",),
+        worker_count=1,
+    )
+    try:
+        assert service.visible.sync(value=5) == {"value": 5}
+        assert service.methods == ["visible"]
+        with pytest.raises(AttributeError):
+            service.hidden.sync(value=5)
     finally:
         service.close()
 
@@ -2405,6 +2537,20 @@ class TestCallProxy:
         assert result[0].result == {"value": 1}
         mock_group.collect_item_calls.assert_called_once()
 
+    def test_collect_items_forwards_progress_to_group(self):
+        from pycloud_parallel.execution.base import ExecutionItem
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        mock_group.collect_item_calls = MagicMock(return_value=[ExecutionItem(index=0, ok=True, result={"value": 1})])
+        proxy = _CallProxy("square", mock_group)
+        callback = lambda event: None
+
+        proxy.collect_items([{"x": 1}], progress=callback, progress_interval_sec=0.5)
+
+        assert mock_group.collect_item_calls.call_args.kwargs["progress"] is callback
+        assert mock_group.collect_item_calls.call_args.kwargs["progress_interval_sec"] == 0.5
+
     def test_map_uses_dynamic_default_max_in_flight_when_not_explicit(self):
         from pycloud_parallel.execution.call_proxy import _CallProxy
 
@@ -2416,6 +2562,31 @@ class TestCallProxy:
 
         assert result == [{"value": 1}, {"value": 4}]
         assert mock_group.map_calls.call_args.kwargs["max_in_flight"] is None
+
+    def test_map_forwards_progress_to_group(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        mock_group.map_calls = MagicMock(return_value=[{"value": 1}])
+        proxy = _CallProxy("square", mock_group)
+        callback = lambda event: None
+
+        proxy.map([1], arg_name="x", progress=callback, progress_interval_sec=0.25)
+
+        assert mock_group.map_calls.call_args.kwargs["progress"] is callback
+        assert mock_group.map_calls.call_args.kwargs["progress_interval_sec"] == 0.25
+
+    def test_map_keeps_non_option_progress_as_payload_field(self):
+        from pycloud_parallel.execution.call_proxy import _CallProxy
+
+        mock_group = MagicMock()
+        mock_group.map_calls = MagicMock(return_value=[{"value": 1}])
+        proxy = _CallProxy("square", mock_group)
+
+        proxy.map([1], arg_name="x", progress="business-progress")
+
+        assert mock_group.map_calls.call_args.args[1] == [{"x": 1, "progress": "business-progress"}]
+        assert "progress" not in mock_group.map_calls.call_args.kwargs
 
     def test_acollect_items_delegates_to_group_acollect_item_calls(self):
         from pycloud_parallel.execution.base import ExecutionItem
@@ -2458,6 +2629,36 @@ def test_service_iter_item_calls_uses_group_dynamic_default_max_in_flight():
     )
 
     assert len(items) == 4
+
+
+def test_service_iter_item_calls_reports_callback_progress():
+    from pycloud_parallel.execution.service_session import _service_iter_item_calls
+
+    events = []
+
+    class _Group:
+        def call_balanced(self, method, payload, *, timeout_sec, strategy, refresh_status):  # noqa: ARG002
+            return "node-1", {"data": payload}
+
+    items = list(
+        _service_iter_item_calls(
+            _Group(),
+            method="square",
+            payloads=[{"x": 1}, {"x": 2}],
+            timeout_sec=30.0,
+            strategy="predicted_busy",
+            refresh_status=True,
+            max_in_flight=1,
+            progress=events.append,
+        )
+    )
+
+    assert [item.ok for item in items] == [True, True]
+    assert events[0].phase == "running"
+    assert events[-1].phase == "done"
+    assert events[-1].total == 2
+    assert events[-1].completed == 2
+    assert events[-1].succeeded == 2
 
 
 def test_service_iter_item_calls_submits_streaming_window_only():
@@ -3884,7 +4085,7 @@ class TestOwnerServiceFacade:
             entry_module="demo_service",
             entry_callable="run",
             package_format="py",
-            export_mode="decorator",
+            export_mode="all",
         )
         fake_node = SimpleNamespace(
             node_id="node-1",

@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from pycloud_parallel.execution.base import ExecutionItem
+from pycloud_parallel.execution.progress import ProgressOption, is_progress_option
 from pycloud_parallel.execution.support import (
     _resolve_high_level_service_data,
     _resolve_high_level_service_results,
@@ -70,6 +71,8 @@ class _UnorderedCallProxyStream:
         refresh_status: bool,
         max_in_flight: int,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> None:
         self._method = method
         self._group = group
@@ -79,11 +82,17 @@ class _UnorderedCallProxyStream:
         self._refresh_status = refresh_status
         self._max_in_flight = max_in_flight
         self._return_items = bool(return_items)
+        self._progress = progress
+        self._progress_interval_sec = progress_interval_sec
 
     def __repr__(self) -> str:
         return f"<UnorderedCallProxyStream method={self._method!r} count={len(self._payloads)}>"
 
     def __iter__(self):
+        progress_kwargs = {}
+        if self._progress:
+            progress_kwargs["progress"] = self._progress
+            progress_kwargs["progress_interval_sec"] = self._progress_interval_sec
         yield from self._group.unordered_calls(
             self._method,
             self._payloads,
@@ -92,6 +101,7 @@ class _UnorderedCallProxyStream:
             refresh_status=self._refresh_status,
             max_in_flight=self._max_in_flight,
             return_items=self._return_items,
+            **progress_kwargs,
         )
 
 
@@ -107,6 +117,8 @@ class _AUnorderedCallProxyStream:
         refresh_status: bool,
         max_in_flight: int,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> None:
         self._method = method
         self._group = group
@@ -116,11 +128,17 @@ class _AUnorderedCallProxyStream:
         self._refresh_status = refresh_status
         self._max_in_flight = max_in_flight
         self._return_items = bool(return_items)
+        self._progress = progress
+        self._progress_interval_sec = progress_interval_sec
 
     def __repr__(self) -> str:
         return f"<AUnorderedCallProxyStream method={self._method!r} count={len(self._payloads)}>"
 
     def __aiter__(self):
+        progress_kwargs = {}
+        if self._progress:
+            progress_kwargs["progress"] = self._progress
+            progress_kwargs["progress_interval_sec"] = self._progress_interval_sec
         return self._group.aunordered_calls(
             self._method,
             self._payloads,
@@ -129,6 +147,7 @@ class _AUnorderedCallProxyStream:
             refresh_status=self._refresh_status,
             max_in_flight=self._max_in_flight,
             return_items=self._return_items,
+            **progress_kwargs,
         )
 
 
@@ -143,6 +162,8 @@ class _IterItemsProxyStream:
         strategy: str,
         refresh_status: bool,
         max_in_flight: int,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> None:
         self._method = method
         self._group = group
@@ -151,8 +172,14 @@ class _IterItemsProxyStream:
         self._strategy = strategy
         self._refresh_status = refresh_status
         self._max_in_flight = max_in_flight
+        self._progress = progress
+        self._progress_interval_sec = progress_interval_sec
 
     def __iter__(self):
+        progress_kwargs = {}
+        if self._progress:
+            progress_kwargs["progress"] = self._progress
+            progress_kwargs["progress_interval_sec"] = self._progress_interval_sec
         yield from self._group.iter_item_calls(
             self._method,
             self._payloads,
@@ -160,6 +187,7 @@ class _IterItemsProxyStream:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=self._max_in_flight,
+            **progress_kwargs,
         )
 
 
@@ -174,6 +202,8 @@ class _AIterItemsProxyStream:
         strategy: str,
         refresh_status: bool,
         max_in_flight: int,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> None:
         self._method = method
         self._group = group
@@ -182,8 +212,14 @@ class _AIterItemsProxyStream:
         self._strategy = strategy
         self._refresh_status = refresh_status
         self._max_in_flight = max_in_flight
+        self._progress = progress
+        self._progress_interval_sec = progress_interval_sec
 
     def __aiter__(self):
+        progress_kwargs = {}
+        if self._progress:
+            progress_kwargs["progress"] = self._progress
+            progress_kwargs["progress_interval_sec"] = self._progress_interval_sec
         return self._group.aiter_item_calls(
             self._method,
             self._payloads,
@@ -191,6 +227,7 @@ class _AIterItemsProxyStream:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=self._max_in_flight,
+            **progress_kwargs,
         )
 
 
@@ -293,9 +330,18 @@ class _CallProxy:
         *,
         arg_name: str = "value",
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[Optional[object]]:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         payloads = _normalize_batch_call_payloads(values, arg_name=arg_name, shared_kwargs=shared_kwargs)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return self._group.map_calls(
             self._method,
             payloads,
@@ -303,6 +349,7 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=None,
+            **progress_kwargs,
         )
 
     def map_values(
@@ -311,6 +358,8 @@ class _CallProxy:
         *,
         arg_name: str = "value",
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[Optional[object]]:
         """Explicit value-mapping alias for ``map(...)``.
@@ -319,7 +368,17 @@ class _CallProxy:
         service method; it does not accept a local Python callable like the
         built-in ``map``.
         """
-        return self.map(values, arg_name=arg_name, timeout_sec=timeout_sec, **shared_kwargs)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
+        return self.map(
+            values,
+            arg_name=arg_name,
+            timeout_sec=timeout_sec,
+            **progress_kwargs,
+            **shared_kwargs,
+        )
 
     async def amap(
         self,
@@ -327,9 +386,18 @@ class _CallProxy:
         *,
         arg_name: str = "value",
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[Optional[object]]:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         payloads = _normalize_batch_call_payloads(values, arg_name=arg_name, shared_kwargs=shared_kwargs)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return await self._group.amap_calls(
             self._method,
             payloads,
@@ -337,6 +405,7 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=None,
+            **progress_kwargs,
         )
 
     async def amap_values(
@@ -345,10 +414,22 @@ class _CallProxy:
         *,
         arg_name: str = "value",
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[Optional[object]]:
         """Explicit async value-mapping alias for ``amap(...)``."""
-        return await self.amap(values, arg_name=arg_name, timeout_sec=timeout_sec, **shared_kwargs)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
+        return await self.amap(
+            values,
+            arg_name=arg_name,
+            timeout_sec=timeout_sec,
+            **progress_kwargs,
+            **shared_kwargs,
+        )
 
     def unordered(
         self,
@@ -357,8 +438,13 @@ class _CallProxy:
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> _UnorderedCallProxyStream:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
         return _UnorderedCallProxyStream(
             method=self._method,
@@ -369,6 +455,8 @@ class _CallProxy:
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
             return_items=return_items,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     def aunordered(
@@ -378,8 +466,13 @@ class _CallProxy:
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> _AUnorderedCallProxyStream:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
         return _AUnorderedCallProxyStream(
             method=self._method,
@@ -390,6 +483,8 @@ class _CallProxy:
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
             return_items=return_items,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     def iter_items(
@@ -398,8 +493,13 @@ class _CallProxy:
         *,
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> _IterItemsProxyStream:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
         return _IterItemsProxyStream(
             method=self._method,
@@ -409,6 +509,8 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     def aiter_items(
@@ -417,8 +519,13 @@ class _CallProxy:
         *,
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> _AIterItemsProxyStream:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
         return _AIterItemsProxyStream(
             method=self._method,
@@ -428,6 +535,8 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
+            progress=progress,
+            progress_interval_sec=progress_interval_sec,
         )
 
     def collect_items(
@@ -436,9 +545,18 @@ class _CallProxy:
         *,
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[ExecutionItem]:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return self._group.collect_item_calls(
             self._method,
             normalized_payloads,
@@ -446,6 +564,7 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
+            **progress_kwargs,
         )
 
     async def acollect_items(
@@ -454,9 +573,18 @@ class _CallProxy:
         *,
         max_in_flight: int | None = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[ExecutionItem]:
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         normalized_payloads = _normalize_unordered_call_payloads(payloads, shared_kwargs=shared_kwargs)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return await self._group.acollect_item_calls(
             self._method,
             normalized_payloads,
@@ -464,6 +592,7 @@ class _CallProxy:
             strategy=self._strategy,
             refresh_status=self._refresh_status,
             max_in_flight=max_in_flight,
+            **progress_kwargs,
         )
 
 

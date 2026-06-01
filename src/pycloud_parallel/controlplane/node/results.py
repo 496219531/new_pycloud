@@ -41,7 +41,7 @@ from pycloud_parallel.controlplane.object_file_source import (
 )
 from pycloud_parallel.controlplane.node.object_meta import (
     _load_object_meta,
-    _touch_object_last_at,
+    touch_object_last_at_throttled,
     _write_object_meta,
 )
 from pycloud_parallel.controlplane.serialization import (
@@ -950,7 +950,7 @@ def _resolve_single_data_ref(ref: DataRef | object, *, object_dir: str) -> Any:
             )
     if artifact is not None:
         fallback_path = Path(artifact.path) if artifact.path else Path(artifact.segment_path)
-        _touch_object_last_at(root, object_id=data_ref.object_id, fallback_path=fallback_path)
+        touch_object_last_at_throttled(root, object_id=data_ref.object_id, fallback_path=fallback_path)
         materialize_started_at = time.perf_counter()
         resolved = _materialize_object_artifact(
             artifact,

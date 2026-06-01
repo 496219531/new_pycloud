@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -17,12 +18,16 @@ import socket
 import subprocess
 import sys
 import time
-import tomllib
 import uuid
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from pycloud_parallel.controlplane.config import (
     NODE_MAX_WORKERS,
@@ -31,8 +36,10 @@ from pycloud_parallel.controlplane.config import (
     SERVICE_DEFAULT_WORKERS,
     SERVICE_HEARTBEAT_TIMEOUT_SEC,
 )
+from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.netutil import detect_local_ip, format_host_port as _net_format_host_port
 from pycloud_parallel.controlplane.netutil import resolve_public_host, split_host_port as _net_split_host_port
+from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 from pycloud_parallel.data.ref import maybe_data_ref
 from pycloud_parallel.data.ref import normalize_object_format, normalize_object_id, object_format_suffix, object_storage_path
 from pycloud_parallel.controlplane.node.filesystem import (
@@ -156,6 +163,13 @@ def _probe_host(host: str) -> str:
     if text in {"", "0.0.0.0", "::", "[::]"}:
         return "127.0.0.1"
     return text
+
+
+def _controlplane_probe_host(bind_host: str, *, remote_hint: str = "") -> str:
+    text = str(bind_host or "").strip()
+    if text in {"", "0.0.0.0", "::", "[::]"}:
+        return resolve_public_host(text, remote_hint=remote_hint)
+    return _probe_host(text)
 
 
 def _default_bind_host(*, remote_hint: str = "") -> str:
@@ -948,7 +962,7 @@ def _spawn_server_debug_macos_terminal(
     token = uuid.uuid4().hex
     pid_path = temp_dir / f"{log_path.stem}-{token}.pid"
     script_path = temp_dir / f"{log_path.stem}-{token}.sh"
-    quoted_command = " ".join(shlex.quote(part) for part in _server_command(*args))
+    quoted_command = " ".join(shlex.quote(part) for part in _server_command(*args, "--log-file", str(log_path)))
     lines = [
         "#!/bin/bash",
         "set -e",
@@ -1002,11 +1016,10 @@ def _spawn_server(
     if extra_env:
         env.update({str(k): str(v) for k, v in extra_env.items()})
     if os.name == "nt":
+        command = _server_command(*args, "--log-file", str(log_path))
         creationflags = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
         proc = subprocess.Popen(
-            _server_command(*args),
-            stdout=None if debug else None,
-            stderr=None if debug else None,
+            command,
             cwd=str(root),
             env=env,
             close_fds=False,
@@ -1021,16 +1034,18 @@ def _spawn_server(
                 env=env,
             )
         if debug:
+            command = _server_command(*args, "--log-file", str(log_path))
             proc = subprocess.Popen(
-                _server_command(*args),
+                command,
                 cwd=str(root),
                 env=env,
                 close_fds=True,
             )
         else:
+            command = _server_command(*args)
             with log_path.open("ab") as fp:
                 proc = subprocess.Popen(
-                    _server_command(*args),
+                    command,
                     stdout=fp,
                     stderr=subprocess.STDOUT,
                     cwd=str(root),
@@ -1069,17 +1084,18 @@ def _start_controlplane(
     bind = _format_host_port(effective_bind_host, int(port))
     _assert_bind_available(bind)
     _log("INFO", f"Starting ControlPlane on {bind}...")
+    log_path = _logs_dir(root) / "controlplane.log"
     pid = _spawn_server(
         root,
-        _logs_dir(root) / "controlplane.log",
+        log_path,
         ["--role", "controlplane", "--bind", bind, "--log-level", "DEBUG" if debug else "INFO"],
         extra_env=extra_env,
         debug=debug,
     )
-    ready_host = _probe_host(effective_bind_host)
+    ready_host = _controlplane_probe_host(effective_bind_host, remote_hint=remote_hint)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_json_ok(ready_host, int(port), 0.5, path="/nodes?healthy_only=false&limit=1")):
         _remove_pid(_pid_file(root, "controlplane"))
-        raise RuntimeError("ControlPlane failed to become ready")
+        raise RuntimeError(f"ControlPlane failed to become ready; see log: {log_path}")
     _write_pid(_pid_file(root, "controlplane"), pid)
     _log("OK", f"ControlPlane started (PID: {pid}, Bind: {bind})")
 
@@ -1115,9 +1131,10 @@ def _start_standalone_controlplane(
     host, port = _split_host_port(bind)
     _assert_bind_available(bind)
     _log("INFO", f"Starting ControlPlane on {bind}...")
+    log_path = _logs_dir(root) / "controlplane.log"
     pid = _spawn_server(
         root,
-        _logs_dir(root) / "controlplane.log",
+        log_path,
         [
             "--role",
             "controlplane",
@@ -1137,7 +1154,7 @@ def _start_standalone_controlplane(
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_json_ok(host, port, 0.2, path="/nodes?healthy_only=false&limit=1")):
         _remove_pid(_pid_file(root, "controlplane"))
-        raise RuntimeError("ControlPlane failed to become ready")
+        raise RuntimeError(f"ControlPlane failed to become ready; see log: {log_path}")
     _write_pid(_pid_file(root, "controlplane"), pid)
     _log("OK", f"ControlPlane started (PID: {pid}, Bind: {bind})")
 
@@ -1839,6 +1856,9 @@ def _cmd_dev_restart(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     root = _runtime_root(args.runtime_root)
+    target = str(getattr(args, "target", "") or "").strip()
+    if not target:
+        _, _, target = _resolve_controlplane_target_for_start(args)
     print("============================================")
     print("  Service Status")
     print("============================================")
@@ -1854,7 +1874,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print()
     print("  Loaded Services By Node")
     print("  ------------------------------------------")
-    target = str(getattr(args, "target", "") or f"127.0.0.1:{int(args.controlplane_port)}")
     for line in _query_loaded_services(target):
         print(line)
     return status_code
@@ -2546,6 +2565,372 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _post_infocenter_node_action(target: str, node_instance_id: str, action: str, *, timeout_sec: float = 3.0) -> bool:
+    normalized_target = _normalize_http_target(target)
+    req = Request(
+        url=f"{normalized_target}/ops/nodes/{quote(str(node_instance_id).strip(), safe='')}/{quote(str(action).strip(), safe='')}",
+        method="POST",
+        data=b"",
+    )
+    with urlopen(req, timeout=max(0.1, float(timeout_sec))) as resp:
+        data = json.loads(resp.read().decode("utf-8") or "{}")
+    return isinstance(data, dict) and bool(data.get("ok", False))
+
+
+def _upgrade_node_host_key(control_addr: str) -> str:
+    text = str(control_addr or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(_normalize_http_target(text))
+        host = str(parsed.hostname or "").strip().lower()
+        return host or text.lower()
+    except Exception:
+        return text.lower()
+
+
+def _dedupe_nodes_for_host_upgrade(nodes: Sequence[object]) -> Tuple[List[object], List[Dict[str, str]]]:
+    selected: List[object] = []
+    skipped: List[Dict[str, str]] = []
+    seen: Dict[str, object] = {}
+    for node in nodes:
+        control_addr = str(getattr(node, "control_addr", "") or "").strip()
+        host_key = _upgrade_node_host_key(control_addr)
+        if host_key and host_key in seen:
+            first = seen[host_key]
+            skipped.append(
+                {
+                    "node_id": str(getattr(node, "node_id", "") or ""),
+                    "node_instance_id": str(getattr(node, "node_instance_id", "") or ""),
+                    "control_addr": control_addr,
+                    "host_key": host_key,
+                    "reason": "duplicate_host",
+                    "selected_node_instance_id": str(getattr(first, "node_instance_id", "") or ""),
+                }
+            )
+            continue
+        if host_key:
+            seen[host_key] = node
+        selected.append(node)
+    return selected, skipped
+
+
+def _cmd_upgrade_nodes(args: argparse.Namespace) -> int:
+    target = str(args.target or "").strip() or f"{_LOCALHOST}:{int(getattr(args, 'controlplane_port', 50051) or 50051)}"
+    wheel_path = Path(args.wheel).expanduser().resolve()
+    if not wheel_path.is_file():
+        raise FileNotFoundError(f"wheel not found: {wheel_path}")
+    if wheel_path.suffix.lower() != ".whl":
+        raise ValueError(f"--wheel must point to a .whl file: {wheel_path}")
+    node_ids = [item.strip() for item in str(args.node_ids or "").split(",") if item.strip()]
+    node_instance_ids = [item.strip() for item in str(args.node_instance_ids or "").split(",") if item.strip()]
+    tags = [item.strip() for item in str(args.tags or "").split(",") if item.strip()]
+    with InfoCenterClient(target, timeout_sec=float(args.timeout_sec)) as client:
+        nodes = list(
+            client.list_selected_nodes(
+                healthy_only=not bool(args.include_unhealthy),
+                tags=tags,
+                limit=max(1, int(args.limit or 1000)),
+                node_ids=node_ids or None,
+                node_instance_ids=node_instance_ids or None,
+            )
+        )
+    nodes = [node for node in nodes if str(getattr(node, "control_addr", "") or "").strip()]
+    if not nodes:
+        print("no nodes selected")
+        return 1
+    skipped_duplicates: List[Dict[str, str]] = []
+    if not bool(args.no_dedupe_host):
+        nodes, skipped_duplicates = _dedupe_nodes_for_host_upgrade(nodes)
+        for item in skipped_duplicates:
+            print(
+                "SKIP "
+                f"{item.get('node_instance_id') or item.get('node_id')} "
+                f"{item.get('control_addr')} reason=duplicate_host host={item.get('host_key')} "
+                f"selected={item.get('selected_node_instance_id')}"
+            )
+    if bool(args.dry_run):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "target": target,
+                    "wheel": str(wheel_path),
+                    "restart": bool(args.restart),
+                    "nodes": [
+                        {
+                            "node_id": node.node_id,
+                            "node_instance_id": node.node_instance_id,
+                            "control_addr": node.control_addr,
+                        }
+                        for node in nodes
+                    ],
+                    "skipped_duplicates": skipped_duplicates,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    wheel_bytes = wheel_path.read_bytes()
+    pip_args = list(args.pip_arg or [])
+    admin_token = _resolve_admin_token_for_ctl(
+        _runtime_root(str(getattr(args, "runtime_root", "") or "")),
+        explicit=str(args.api_token or ""),
+    )
+    rows = []
+    failures = 0
+    restart_only_nodes = {str(item.get("node_instance_id", "") or ""): item for item in skipped_duplicates if str(item.get("control_addr", "") or "").strip()}
+    for node in nodes:
+        node_instance_id = str(node.node_instance_id or node.node_id or node.control_addr)
+        if bool(args.drain):
+            try:
+                _post_infocenter_node_action(target, node_instance_id, "drain")
+                _post_infocenter_node_action(target, node_instance_id, "cordon")
+            except Exception as exc:
+                failures += 1
+                rows.append({"node_instance_id": node_instance_id, "control_addr": node.control_addr, "ok": False, "error": f"drain failed: {exc}"})
+                if not bool(args.continue_on_error):
+                    break
+                continue
+        try:
+            with NodeControlClient(node.control_addr, timeout_sec=float(args.timeout_sec), api_token=admin_token) as node_client:
+                result = node_client.upgrade_from_wheel_bytes(
+                    wheel_name=wheel_path.name,
+                    wheel_bytes=wheel_bytes,
+                    restart=bool(args.restart),
+                    pip_args=pip_args,
+                    timeout_sec=float(args.timeout_sec),
+                )
+            ok = bool(result.get("ok", False))
+            if not ok:
+                failures += 1
+            rows.append(
+                {
+                    "node_id": node.node_id,
+                    "node_instance_id": node_instance_id,
+                    "control_addr": node.control_addr,
+                    "ok": ok,
+                    "returncode": result.get("returncode"),
+                    "restart_scheduled": result.get("restart_scheduled"),
+                    "error": result.get("error", ""),
+                }
+            )
+            print(f"{'OK' if ok else 'FAIL'} {node_instance_id} {node.control_addr} restart_scheduled={result.get('restart_scheduled')}")
+            if not ok and not bool(args.continue_on_error):
+                break
+        except Exception as exc:
+            failures += 1
+            rows.append({"node_id": node.node_id, "node_instance_id": node_instance_id, "control_addr": node.control_addr, "ok": False, "error": str(exc)})
+            print(f"FAIL {node_instance_id} {node.control_addr} error={exc}")
+            if not bool(args.continue_on_error):
+                break
+    if bool(args.restart):
+        for item in restart_only_nodes.values():
+            node_instance_id = str(item.get("node_instance_id") or item.get("node_id") or item.get("control_addr") or "")
+            control_addr = str(item.get("control_addr", "") or "")
+            try:
+                with NodeControlClient(control_addr, timeout_sec=float(args.timeout_sec), api_token=admin_token) as node_client:
+                    result = node_client.restart_node(delay_sec=1.0, api_token=admin_token)
+                ok = bool(result.get("ok", False))
+                if not ok:
+                    failures += 1
+                rows.append(
+                    {
+                        "node_instance_id": node_instance_id,
+                        "control_addr": control_addr,
+                        "ok": ok,
+                        "install_skipped": True,
+                        "restart_scheduled": result.get("restart_scheduled"),
+                        "error": result.get("error", ""),
+                    }
+                )
+                print(f"{'OK' if ok else 'FAIL'} {node_instance_id} {control_addr} install_skipped=True restart_scheduled={result.get('restart_scheduled')}")
+                if not ok and not bool(args.continue_on_error):
+                    break
+            except Exception as exc:
+                failures += 1
+                rows.append({"node_instance_id": node_instance_id, "control_addr": control_addr, "ok": False, "install_skipped": True, "error": str(exc)})
+                print(f"FAIL {node_instance_id} {control_addr} install_skipped=True error={exc}")
+                if not bool(args.continue_on_error):
+                    break
+    if bool(args.json):
+        print(json.dumps({"ok": failures == 0, "target": target, "wheel": str(wheel_path), "nodes": rows, "skipped_duplicates": skipped_duplicates}, ensure_ascii=False, indent=2))
+    return 0 if failures == 0 else 1
+
+
+def _generate_admin_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _admin_token_file(root: Path) -> Path:
+    return Path(root) / "admin_token"
+
+
+def _load_local_admin_token(root: Path) -> str:
+    try:
+        return _admin_token_file(root).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _write_local_admin_token(root: Path, token: str) -> None:
+    normalized = str(token or "").strip()
+    if not normalized:
+        raise ValueError("admin token must not be empty")
+    path = _admin_token_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    tmp.write_text(normalized + "\n", encoding="utf-8")
+    try:
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+
+def _resolve_admin_token_for_ctl(root: Path, *, explicit: str = "") -> str:
+    cli_token = str(explicit or "").strip()
+    if cli_token:
+        return cli_token
+    return _load_local_admin_token(root)
+
+
+def _target_host_for_ctl(target: str) -> str:
+    text = str(target or "").strip()
+    if not text or _is_local_target(text):
+        return ""
+    parsed = urlparse(_normalize_http_target(text))
+    return str(parsed.hostname or "").strip().lower()
+
+
+def _local_host_names_for_ctl(remote_hint: str = "") -> set[str]:
+    names = {"localhost", "127.0.0.1", "::1"}
+    with contextlib.suppress(Exception):
+        host = socket.gethostname()
+        if host:
+            names.add(host.lower())
+    with contextlib.suppress(Exception):
+        fqdn = socket.getfqdn()
+        if fqdn:
+            names.add(fqdn.lower())
+    with contextlib.suppress(Exception):
+        ip = detect_local_ip(remote_hint=remote_hint)
+        if ip:
+            names.add(str(ip).strip().lower())
+    return names
+
+
+def _ensure_controlplane_host_command_allowed(target: str, *, allow_remote: bool = False) -> None:
+    if allow_remote:
+        return
+    target_host = _target_host_for_ctl(target)
+    if not target_host:
+        return
+    local_names = _local_host_names_for_ctl(remote_hint=target)
+    if target_host not in local_names:
+        raise RuntimeError(
+            "admin-token must be run on the ControlPlane host by default; "
+            "rerun on that host or pass --allow-remote if you intentionally manage it remotely"
+        )
+
+
+def _cmd_admin_token(args: argparse.Namespace) -> int:
+    root = _runtime_root(str(getattr(args, "runtime_root", "") or ""))
+    local_old_token = _load_local_admin_token(root)
+    admin_token = str(args.token or "").strip() or _generate_admin_token()
+    old_admin_token = str(args.old_token or "").strip() or local_old_token
+    target = str(args.target or "").strip()
+    if bool(args.generate_only):
+        _write_local_admin_token(root, admin_token)
+        print(admin_token)
+        return 0
+    if not target:
+        raise ValueError("--target is required unless --generate-only is used")
+    _ensure_controlplane_host_command_allowed(target, allow_remote=bool(args.allow_remote))
+    node_ids = [item.strip() for item in str(args.node_ids or "").split(",") if item.strip()]
+    node_instance_ids = [item.strip() for item in str(args.node_instance_ids or "").split(",") if item.strip()]
+    tags = [item.strip() for item in str(args.tags or "").split(",") if item.strip()]
+    with InfoCenterClient(target, timeout_sec=float(args.timeout_sec)) as client:
+        nodes = list(
+            client.list_selected_nodes(
+                healthy_only=not bool(args.include_unhealthy),
+                tags=tags,
+                limit=max(1, int(args.limit or 1000)),
+                node_ids=node_ids or None,
+                node_instance_ids=node_instance_ids or None,
+            )
+        )
+    nodes = [node for node in nodes if str(getattr(node, "control_addr", "") or "").strip()]
+    if not nodes:
+        print("no nodes selected")
+        return 1
+    skipped_duplicates: List[Dict[str, str]] = []
+    if not bool(args.no_dedupe_host):
+        nodes, skipped_duplicates = _dedupe_nodes_for_host_upgrade(nodes)
+        for item in skipped_duplicates:
+            print(
+                "SKIP "
+                f"{item.get('node_instance_id') or item.get('node_id')} "
+                f"{item.get('control_addr')} reason=duplicate_host host={item.get('host_key')} "
+                f"selected={item.get('selected_node_instance_id')}"
+            )
+    rows = []
+    failures = 0
+    for node in nodes:
+        node_instance_id = str(node.node_instance_id or node.node_id or node.control_addr)
+        if bool(args.dry_run):
+            rows.append({"node_id": node.node_id, "node_instance_id": node_instance_id, "control_addr": node.control_addr, "ok": True, "dry_run": True})
+            continue
+        try:
+            with NodeControlClient(node.control_addr, timeout_sec=float(args.timeout_sec)) as node_client:
+                result = node_client.set_admin_token(admin_token=admin_token, old_admin_token=old_admin_token)
+            ok = bool(result.get("ok", False))
+            if not ok:
+                failures += 1
+            rows.append(
+                {
+                    "node_id": node.node_id,
+                    "node_instance_id": node_instance_id,
+                    "control_addr": node.control_addr,
+                    "ok": ok,
+                    "updated": result.get("updated", False),
+                    "error": result.get("error", ""),
+                }
+            )
+            print(f"{'OK' if ok else 'FAIL'} {node_instance_id} {node.control_addr} updated={result.get('updated', False)}")
+            if not ok and not bool(args.continue_on_error):
+                break
+        except Exception as exc:
+            failures += 1
+            rows.append({"node_id": node.node_id, "node_instance_id": node_instance_id, "control_addr": node.control_addr, "ok": False, "error": str(exc)})
+            print(f"FAIL {node_instance_id} {node.control_addr} error={exc}")
+            if not bool(args.continue_on_error):
+                break
+    if bool(args.json) or bool(args.dry_run):
+        print(
+            json.dumps(
+                {
+                    "ok": failures == 0,
+                    "dry_run": bool(args.dry_run),
+                    "target": target,
+                    "admin_token": admin_token if bool(args.show_token) else "",
+                    "nodes": rows,
+                    "skipped_duplicates": skipped_duplicates,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if failures == 0 and not bool(args.dry_run):
+        _write_local_admin_token(root, admin_token)
+    if failures == 0 and bool(args.show_token) and not (bool(args.json) or bool(args.dry_run)):
+        print(f"admin_token={admin_token}")
+    return 0 if failures == 0 else 1
+
+
 def _add_env_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--env",
@@ -2779,6 +3164,40 @@ def build_parser() -> argparse.ArgumentParser:
     gc_parser.add_argument("--older-than-hours", type=int, default=24 * 7)
     gc_parser.add_argument("--dry-run", action="store_true")
     gc_parser.add_argument("--force", action="store_true", help="allow destructive gc even if managed local processes are still running")
+    upgrade_nodes_parser = subparsers.add_parser("upgrade-nodes", help="install a local wheel on selected NodeControl nodes")
+    _add_target_argument(upgrade_nodes_parser, help="InfoCenter/ControlPlane target used to discover nodes")
+    upgrade_nodes_parser.add_argument("--wheel", required=True, help="local .whl file to install on selected nodes")
+    upgrade_nodes_parser.add_argument("--node-ids", default="", help="comma-separated node_id filter")
+    upgrade_nodes_parser.add_argument("--node-instance-ids", default="", help="comma-separated node_instance_id filter")
+    upgrade_nodes_parser.add_argument("--tags", default="", help="comma-separated node tag filter")
+    upgrade_nodes_parser.add_argument("--limit", type=int, default=1000, help="max nodes to query")
+    upgrade_nodes_parser.add_argument("--include-unhealthy", action="store_true", help="include unhealthy nodes in discovery")
+    upgrade_nodes_parser.add_argument("--no-dedupe-host", action="store_true", help="upgrade every selected node, even when multiple nodes share the same host")
+    upgrade_nodes_parser.add_argument("--drain", action="store_true", help="cordon and drain each node before upgrading")
+    upgrade_nodes_parser.add_argument("--restart", action="store_true", help="ask each node to restart NodeControl after successful install")
+    upgrade_nodes_parser.add_argument("--continue-on-error", action="store_true", help="continue upgrading remaining nodes after a failure")
+    upgrade_nodes_parser.add_argument("--dry-run", action="store_true", help="show selected nodes without installing")
+    upgrade_nodes_parser.add_argument("--timeout-sec", type=float, default=300.0, help="per-node upgrade timeout")
+    upgrade_nodes_parser.add_argument("--api-token", default="", help="NodeControl admin token; defaults to local <runtime-root>/admin_token when omitted")
+    upgrade_nodes_parser.add_argument("--pip-arg", action="append", default=[], help="extra argument appended to pip install; may be repeated")
+    upgrade_nodes_parser.add_argument("--json", action="store_true", help="print JSON summary")
+    admin_token_parser = subparsers.add_parser("admin-token", help="generate or set NodeControl admin tokens")
+    _add_target_argument(admin_token_parser, help="InfoCenter/ControlPlane target used to discover nodes")
+    admin_token_parser.add_argument("--token", default="", help="new admin token; generated and saved locally when omitted")
+    admin_token_parser.add_argument("--old-token", default="", help="existing admin token; defaults to local <runtime-root>/admin_token when omitted")
+    admin_token_parser.add_argument("--generate-only", action="store_true", help="generate, save, and print a new local token without contacting nodes")
+    admin_token_parser.add_argument("--show-token", action="store_true", help="include/print the generated token after setting it")
+    admin_token_parser.add_argument("--node-ids", default="", help="comma-separated node_id filter")
+    admin_token_parser.add_argument("--node-instance-ids", default="", help="comma-separated node_instance_id filter")
+    admin_token_parser.add_argument("--tags", default="", help="comma-separated node tag filter")
+    admin_token_parser.add_argument("--limit", type=int, default=1000, help="max nodes to query")
+    admin_token_parser.add_argument("--include-unhealthy", action="store_true", help="include unhealthy nodes in discovery")
+    admin_token_parser.add_argument("--no-dedupe-host", action="store_true", help="set every selected node, even when multiple nodes share the same host")
+    admin_token_parser.add_argument("--allow-remote", action="store_true", help="allow running from a host other than the target ControlPlane host")
+    admin_token_parser.add_argument("--continue-on-error", action="store_true", help="continue updating remaining nodes after a failure")
+    admin_token_parser.add_argument("--dry-run", action="store_true", help="show selected nodes without updating")
+    admin_token_parser.add_argument("--timeout-sec", type=float, default=30.0, help="per-node token update timeout")
+    admin_token_parser.add_argument("--json", action="store_true", help="print JSON summary")
     parser.epilog = (
         "Environment overrides:\n"
         "  start / dev-start / start-infocenter / start-gateway / start-controlplane / start-job-orchestrator / start-node / restart / dev-restart\n"
@@ -2831,6 +3250,10 @@ def main(argv: List[str] | None = None) -> int:
         return _cmd_cache_list(args)
     if args.command == "gc":
         return _cmd_gc(args)
+    if args.command == "upgrade-nodes":
+        return _cmd_upgrade_nodes(args)
+    if args.command == "admin-token":
+        return _cmd_admin_token(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

@@ -372,6 +372,13 @@ group = Service.deploy(
 4. 运行时调用服务方法时，也会把该依赖目录加入 `sys.path`
 5. 同一个 `code_version` 不允许混用不同依赖策略
 
+补充说明：
+
+1. 对 `Service.deploy(source=<module>)` 生成的 artifact，节点在加载模块和调用服务方法时都会把 artifact 根目录加入 `sys.path`
+2. 因此项目根目录里的 `DBCfg.py`、`Config.py` 等 Python 模块，可以被 `Api/local_db_api.py` 这类延迟 import 正常解析
+3. 节点会清理当前 artifact 顶层模块名对应的旧 `sys.modules` 缓存，避免同名 `DBCfg` / `Config` 在不同 code version 间串包
+4. `pycloud_parallel` 运行时自身不会随业务 artifact 打包；运行时修复需要通过 wheel 升级到目标 node
+
 ## 5.2 managed globals
 
 服务模式现在支持声明可动态更新的全局变量：

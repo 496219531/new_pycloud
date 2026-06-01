@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -381,6 +382,7 @@ def test_ops_page_merges_duplicate_startup_nodes_with_same_control_addr():
 
 def test_ops_page_shows_service_and_taskpool_failure_reasons():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    failure_at = datetime(2026, 6, 1, 7, 30, 0, tzinfo=timezone.utc)
     info_state.register_node_record(
         node_instance_id="node-failed-1",
         node_id="node-failed",
@@ -396,6 +398,7 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
                 worker_count=2,
                 alive_workers=0,
                 stop_reason="ModuleNotFoundError: missing_pkg",
+                failure_at=failure_at,
             )
         },
         task_pools={
@@ -407,6 +410,7 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
                 status="STOPPED",
                 worker_count=2,
                 failure_reason="executor host restart failed: missing_pkg",
+                failure_at=failure_at,
             )
         },
     )
@@ -414,8 +418,72 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
     raw = _render_ops_page(info_state)
 
     assert "failure_reason" in raw
+    assert "2026-06-01T07:30:00+00:00" in raw
     assert "ModuleNotFoundError: missing_pkg" in raw
     assert "executor host restart failed: missing_pkg" in raw
+
+
+def test_infocenter_preserves_failure_timestamp_across_heartbeats():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-failed-1",
+        node_id="node-failed",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        services={
+            "svc-failed": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-failed",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                stop_reason="ModuleNotFoundError: missing_pkg",
+            )
+        },
+        task_pools={
+            "pool-failed": NodeTaskPoolInfo(
+                pool_id="pool-failed",
+                owner_client_id="owner-1",
+                pool_name="calc-pool",
+                code_version="sha256:test",
+                status="STOPPED",
+                failure_reason="executor host restart failed: missing_pkg",
+            )
+        },
+    )
+    first = info_state.list_nodes(healthy_only=False, tags=(), limit=10)[0]
+    service_failure_at = first.services["svc-failed"].failure_at
+    pool_failure_at = first.task_pools["pool-failed"].failure_at
+
+    time.sleep(0.01)
+    info_state.heartbeat_record(
+        node_instance_id="node-failed-1",
+        node_id="node-failed",
+        healthy=True,
+        services={
+            "svc-failed": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-failed",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                stop_reason="ModuleNotFoundError: missing_pkg",
+            )
+        },
+        task_pools={
+            "pool-failed": NodeTaskPoolInfo(
+                pool_id="pool-failed",
+                owner_client_id="owner-1",
+                pool_name="calc-pool",
+                code_version="sha256:test",
+                status="STOPPED",
+                failure_reason="executor host restart failed: missing_pkg",
+            )
+        },
+    )
+    second = info_state.list_nodes(healthy_only=False, tags=(), limit=10)[0]
+
+    assert service_failure_at is not None
+    assert pool_failure_at is not None
+    assert second.services["svc-failed"].failure_at == service_failure_at
+    assert second.task_pools["pool-failed"].failure_at == pool_failure_at
 
 
 def test_startup_service_registration_rejects_duplicate_service_name():
@@ -1563,6 +1631,98 @@ def test_infocenter_client_select_task_nodes_skips_startup_only_nodes():
             )
             assert [node.node_id for node in selected] == ["node-compute"]
     finally:
+        info_server.stop()
+
+
+def test_node_registrar_close_sends_final_empty_startup_service_snapshot():
+    from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    node_state = StartupServiceNode(
+        node_id="startup-close-node",
+        service_http_bind="",
+        service_http_base_url="http://127.0.0.1:19080",
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    node_state.mount_python_module_service(
+        service_name="startup-close-service",
+        entry_module="math",
+        export_methods=("sqrt",),
+        policy_id="trusted_internal",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_server.base_url,
+        node_id=node_state.node_id,
+        control_addr="",
+        state=node_state,
+        capacity=1,
+        queue_capacity=1,
+        tags=["startup-service"],
+        fallback_heartbeat_sec=1,
+    )
+    try:
+        assert registrar.sync_now() is True
+        routes = info_state.list_service_routes(service_name="startup-close-service", healthy_only=True, limit=10)
+        assert len(routes) == 1
+
+        registrar.close()
+
+        routes = info_state.list_service_routes(service_name="startup-close-service", healthy_only=True, limit=10)
+        assert routes == []
+        assert node_state._closed.is_set() is True  # noqa: SLF001
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+        info_server.stop()
+
+
+def test_node_runtime_close_unregisters_startup_service_route():
+    from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    node_state = StartupServiceNode(
+        node_id="startup-runtime-close-node",
+        service_http_bind="",
+        service_http_base_url="http://127.0.0.1:19081",
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    try:
+        node_state.mount_python_module_service(
+            service_name="startup-runtime-close-service",
+            entry_module="math",
+            export_methods=("sqrt",),
+            policy_id="trusted_internal",
+        )
+        node_state.start_infocenter_registration(
+            infocenter_target=info_server.base_url,
+            tags=["startup-service"],
+            heartbeat_sec=1,
+            rpc_timeout_sec=2.0,
+        )
+        assert _wait_until(
+            lambda: len(info_state.list_service_routes(
+                service_name="startup-runtime-close-service",
+                healthy_only=True,
+                limit=10,
+            )) == 1,
+            timeout_sec=3.0,
+        )
+
+        node_state.close()
+
+        assert info_state.list_service_routes(
+            service_name="startup-runtime-close-service",
+            healthy_only=True,
+            limit=10,
+        ) == []
+    finally:
+        node_state.close()
         info_server.stop()
 
 

@@ -3,8 +3,12 @@ from __future__ import annotations
 """HTTP implementation for the core NodeControl TaskPool and Service APIs."""
 
 import base64
+import contextlib
 import json
+import os
 import secrets
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -65,6 +69,22 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 MAX_NODE_CONTROL_HTTP_BODY_BYTES = get_node_control_http_body_limit_bytes()
+
+
+def _restart_current_process_delayed(delay_sec: float = 1.0) -> None:
+    def _restart() -> None:
+        time.sleep(max(0.1, float(delay_sec)))
+        args = [sys.executable, *sys.argv]
+        try:
+            if os.name == "nt":
+                creationflags = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
+                subprocess.Popen(args, cwd=os.getcwd(), env=os.environ.copy(), close_fds=False, creationflags=creationflags)
+            else:
+                subprocess.Popen(args, cwd=os.getcwd(), env=os.environ.copy(), close_fds=True)
+        finally:
+            os._exit(0)
+
+    threading.Thread(target=_restart, name="nodecontrol-delayed-restart", daemon=True).start()
 def _split_host_port(bind: str) -> Tuple[str, int]:
     if ":" not in bind:
         raise ValueError("bind must be host:port")
@@ -215,6 +235,31 @@ class NodeControlHttpApp:
     def _configured_api_token(self) -> str:
         return self.api_token
 
+    def _admin_token_path(self) -> Path:
+        return self.state.artifact_dir / "admin_token"
+
+    def _configured_admin_token(self) -> str:
+        path = self._admin_token_path()
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+
+    def _write_admin_token(self, token: str) -> None:
+        normalized = str(token or "").strip()
+        if not normalized:
+            raise ValueError("admin_token must not be empty")
+        path = self._admin_token_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        tmp.write_text(normalized + "\n", encoding="utf-8")
+        try:
+            os.replace(str(tmp), str(path))
+        finally:
+            if tmp.exists():
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+
     @staticmethod
     def _provided_api_token(headers) -> str:
         if not headers:
@@ -239,10 +284,26 @@ class NodeControlHttpApp:
             return self._err(403, "invalid owner api token for resource creation")
         return None
 
+    def _require_admin_token(self, headers) -> Optional[Tuple[int, Dict[str, str], bytes]]:
+        expected = self._configured_admin_token()
+        if not expected:
+            return None
+        provided = self._provided_api_token(headers)
+        if not provided:
+            return self._err(401, "admin token is required")
+        if not secrets.compare_digest(provided, expected):
+            return self._err(403, "invalid admin token")
+        return None
+
     @staticmethod
     def _is_resource_create_path(path: str) -> bool:
         parts = [unquote(x) for x in urlparse(path).path.split("/") if x]
         return parts == ["taskpools"] or parts == ["services"]
+
+    @staticmethod
+    def _is_admin_path(path: str) -> bool:
+        parts = [unquote(x) for x in urlparse(path).path.split("/") if x]
+        return bool(parts and parts[0] == "admin")
 
     def handle_get(self, path: str) -> Union[Tuple[int, Dict[str, str], bytes], StreamingHttpResponse]:
         parsed = urlparse(path)
@@ -273,10 +334,23 @@ class NodeControlHttpApp:
         if parts and parts[0] == "objects":
             return self.object_app.handle_post(path, headers or {}, body)
         try:
+            if self._is_admin_path(path) and parts != ["admin", "token"]:
+                auth_error = self._require_admin_token(headers or {})
+                if auth_error is not None:
+                    return auth_error
             if parts == ["taskpools"] or parts == ["services"]:
                 auth_error = self._require_create_api_token(headers or {})
                 if auth_error is not None:
                     return auth_error
+            if parts == ["admin", "token"]:
+                payload = _read_json(body)
+                return self._set_admin_token(payload)
+            if parts == ["admin", "upgrade"]:
+                payload = _read_json(body)
+                return self._upgrade_node(payload)
+            if parts == ["admin", "restart"]:
+                payload = _read_json(body)
+                return self._restart_node(payload)
             if len(parts) == 3 and parts[0] == "taskpools" and parts[2] == "submit-bytes":
                 return self._submit_pool_tasks_bytes(parts[1], body)
             if len(parts) == 3 and parts[0] == "taskpools" and parts[2] == "results-bytes":
@@ -310,6 +384,70 @@ class NodeControlHttpApp:
         except ValueError as exc:
             return self._err(400, str(exc))
         return self._err(404, "not found")
+
+    def _upgrade_node(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
+        wheel_b64 = str(payload.get("wheel_b64", "") or "").strip()
+        wheel_name = str(payload.get("wheel_name", "") or "pycloud_parallel_upgrade.whl").strip()
+        if not wheel_b64:
+            return self._err(400, "wheel_b64 is required")
+        if "/" in wheel_name or "\\" in wheel_name or not wheel_name.endswith(".whl"):
+            return self._err(400, "wheel_name must be a .whl filename")
+        try:
+            wheel_bytes = base64.b64decode(wheel_b64.encode("ascii"), validate=True)
+        except Exception:
+            return self._err(400, "invalid wheel_b64")
+        restart = bool(payload.get("restart", False))
+        pip_args = payload.get("pip_args") or []
+        if not isinstance(pip_args, list):
+            return self._err(400, "pip_args must be a list")
+        safe_pip_args = [str(arg) for arg in pip_args if str(arg).strip()]
+        with tempfile.TemporaryDirectory(prefix="pycloud-upgrade-") as tmpdir:
+            wheel_path = Path(tmpdir) / wheel_name
+            wheel_path.write_bytes(wheel_bytes)
+            cmd = [sys.executable, "-m", "pip", "install", "--upgrade", str(wheel_path), *safe_pip_args]
+            started_at = time.time()
+            completed = subprocess.run(
+                cmd,
+                cwd=str(Path.cwd()),
+                capture_output=True,
+                text=True,
+                timeout=max(30.0, float(payload.get("timeout_sec", 300.0) or 300.0)),
+            )
+        data = {
+            "ok": completed.returncode == 0,
+            "returncode": int(completed.returncode),
+            "cmd": cmd,
+            "duration_sec": round(time.time() - started_at, 3),
+            "stdout": (completed.stdout or "")[-4000:],
+            "stderr": (completed.stderr or "")[-4000:],
+            "restart_requested": restart,
+            "restart_scheduled": bool(restart and completed.returncode == 0),
+        }
+        if completed.returncode != 0:
+            data["error"] = "pip install failed"
+            return 500, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes(data)
+        if restart:
+            _restart_current_process_delayed()
+        return self._ok(data)
+
+    def _restart_node(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
+        delay_sec = max(0.1, float(payload.get("delay_sec", 1.0) or 1.0))
+        _restart_current_process_delayed(delay_sec=delay_sec)
+        return self._ok({"ok": True, "restart_scheduled": True, "delay_sec": delay_sec})
+
+    def _set_admin_token(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
+        new_token = str(payload.get("admin_token", "") or "").strip()
+        old_token = str(payload.get("old_admin_token", "") or "").strip()
+        if not new_token:
+            return self._err(400, "admin_token is required")
+        current = self._configured_admin_token()
+        if current:
+            if not old_token:
+                return self._err(401, "old_admin_token is required to update admin token")
+            if not secrets.compare_digest(old_token, current):
+                return self._err(403, "invalid old_admin_token")
+        self._write_admin_token(new_token)
+        return self._ok({"ok": True, "admin_token_configured": True, "updated": bool(current)})
 
     def handle_delete(self, path: str, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
         parts = [unquote(x) for x in urlparse(path).path.split("/") if x]
@@ -928,6 +1066,68 @@ class HttpNodeControlClient:
 
     def upload_object_from_file(self, **kwargs):
         return self._objects().upload_object_from_file(**kwargs)
+
+    def upgrade_from_wheel_bytes(
+        self,
+        *,
+        wheel_name: str,
+        wheel_bytes: bytes,
+        restart: bool = False,
+        pip_args: Optional[Sequence[str]] = None,
+        timeout_sec: float = 300.0,
+        api_token: str = "",
+    ) -> Dict[str, object]:
+        payload = {
+            "wheel_name": str(wheel_name or "pycloud_parallel_upgrade.whl"),
+            "wheel_b64": base64.b64encode(bytes(wheel_bytes)).decode("ascii"),
+            "restart": bool(restart),
+            "pip_args": [str(arg) for arg in (pip_args or ()) if str(arg).strip()],
+            "timeout_sec": max(30.0, float(timeout_sec or 300.0)),
+        }
+        return self._json(
+            "POST",
+            "/admin/upgrade",
+            payload,
+            timeout_sec=max(self.timeout_sec, float(timeout_sec or 300.0) + 5.0),
+            headers=self._api_headers(api_token),
+        )
+
+    def upgrade_from_wheel_file(
+        self,
+        *,
+        wheel_path: str,
+        restart: bool = False,
+        pip_args: Optional[Sequence[str]] = None,
+        timeout_sec: float = 300.0,
+        api_token: str = "",
+    ) -> Dict[str, object]:
+        path = Path(wheel_path).expanduser().resolve()
+        return self.upgrade_from_wheel_bytes(
+            wheel_name=path.name,
+            wheel_bytes=path.read_bytes(),
+            restart=restart,
+            pip_args=pip_args,
+            timeout_sec=timeout_sec,
+            api_token=api_token,
+        )
+
+    def restart_node(self, *, delay_sec: float = 1.0, api_token: str = "") -> Dict[str, object]:
+        return self._json(
+            "POST",
+            "/admin/restart",
+            {"delay_sec": max(0.1, float(delay_sec or 1.0))},
+            headers=self._api_headers(api_token),
+        )
+
+    def set_admin_token(self, *, admin_token: str, old_admin_token: str = "") -> Dict[str, object]:
+        return self._json(
+            "POST",
+            "/admin/token",
+            {
+                "admin_token": str(admin_token or "").strip(),
+                "old_admin_token": str(old_admin_token or "").strip(),
+            },
+        )
 
     def download_object_bytes(self, **kwargs) -> bytes:
         return self._objects().download_object_bytes(**kwargs)

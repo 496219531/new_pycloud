@@ -58,6 +58,7 @@ from pycloud_parallel.execution.failover import (
     mark_candidate_success,
 )
 from pycloud_parallel.execution.managed_globals import update_managed_globals_across_replicas
+from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter, is_progress_option
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     normalize_initial_globals,
@@ -127,6 +128,10 @@ class _IndexedPayloadBuffer:
     def has_retry(self) -> bool:
         return bool(self._retry_payloads)
 
+    @property
+    def submitted_count(self) -> int:
+        return max(0, int(self._next_index or 0))
+
     def next(self) -> Optional[Tuple[int, Dict[str, object]]]:
         if self._retry_payloads:
             index, payload = self._retry_payloads.popleft()
@@ -147,6 +152,18 @@ class _IndexedPayloadBuffer:
     def requeue_front(self, items: Sequence[Tuple[int, Dict[str, object], Any]]) -> None:
         for index, payload, _item in reversed(list(items)):
             self._retry_payloads.appendleft((int(index), payload if isinstance(payload, dict) else {}))
+
+
+class _SizedPayloadIterable:
+    def __init__(self, payloads: Iterable[Dict[str, object]], total: int) -> None:
+        self._payloads = payloads
+        self._total = max(0, int(total or 0))
+
+    def __iter__(self) -> Iterator[Dict[str, object]]:
+        return iter(self._payloads)
+
+    def __len__(self) -> int:
+        return self._total
 
 
 @dataclass
@@ -1576,6 +1593,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> Iterator[ExecutionItem]:
         """Iterate task results as structured items.
@@ -1586,7 +1605,60 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         """
         self._assert_session_available("iter_items")
         effective_wait_ms = self._resolve_server_wait_ms(server_wait_ms=server_wait_ms, wait_ms=wait_ms)
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
         if payloads is None:
+            if progress or callable(progress):
+                completed = 0
+                succeeded = 0
+                failed = 0
+                last_error = ""
+                progress_total = max(0, int(max_count or 0)) if max_count is not None else 0
+                reporter = ProgressReporter(
+                    progress,
+                    label=f"taskpool.{self._task_method}",
+                    total=progress_total,
+                    interval_sec=progress_interval_sec,
+                )
+                reporter.emit(phase="running", completed=0, succeeded=0, failed=0, submitted=progress_total, force=True)
+                try:
+                    for item in self._iter_execution_items(
+                        max_count=max_count,
+                        timeout_sec=timeout_sec,
+                        wait_ms=effective_wait_ms,
+                        limit=limit,
+                        job_id=job_id,
+                        task_ids=task_ids,
+                    ):
+                        completed += 1
+                        if item.ok:
+                            succeeded += 1
+                        else:
+                            failed += 1
+                            last_error = str(item.error_message or item.error_type or "")
+                        reporter.emit(
+                            phase="running",
+                            completed=completed,
+                            succeeded=succeeded,
+                            failed=failed,
+                            submitted=progress_total,
+                            last_error=last_error,
+                        )
+                        yield item
+                except Exception as exc:
+                    reporter.emit(
+                        phase="failed",
+                        completed=completed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        submitted=progress_total,
+                        last_error=str(exc),
+                        force=True,
+                    )
+                    raise
+                reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=progress_total, last_error=last_error)
+                return
             yield from self._iter_execution_items(
                 max_count=max_count,
                 timeout_sec=timeout_sec,
@@ -1598,6 +1670,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return
         normalized_payloads = self._merge_payloads_with_shared_kwargs(payloads, shared_kwargs=dict(shared_kwargs))
         resolved_max_in_flight = self._resolve_max_in_flight(max_in_flight)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         for item in self.imap_unordered(
             normalized_payloads,
             task_method=task_method,
@@ -1611,6 +1687,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             raise_on_error=False,
             node_window_factor=2.0,
             return_items=True,
+            **progress_kwargs,
         ):
             if not isinstance(item, ExecutionItem):
                 index, result = item
@@ -1639,11 +1716,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[ExecutionItem]:
         wait_kwargs = {"wait_ms": wait_ms}
         if server_wait_ms is not None:
             wait_kwargs["server_wait_ms"] = server_wait_ms
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         items = list(
             self.iter_items(
                 payloads,
@@ -1656,6 +1742,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 job_id=job_id,
                 task_ids=task_ids,
                 **wait_kwargs,
+                **progress_kwargs,
                 **shared_kwargs,
             )
         )
@@ -1677,12 +1764,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> AsyncIterator[ExecutionItem]:
         """Async counterpart of :meth:`iter_items` with the same dual-mode semantics."""
         wait_kwargs = {"wait_ms": wait_ms}
         if server_wait_ms is not None:
             wait_kwargs["server_wait_ms"] = server_wait_ms
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         iterator = self.iter_items(
             payloads,
             task_method=task_method,
@@ -1694,6 +1790,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             job_id=job_id,
             task_ids=task_ids,
             **wait_kwargs,
+            **progress_kwargs,
             **shared_kwargs,
         )
         async for item in _aiter_from_sync_iterator(iterator):
@@ -1713,12 +1810,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         limit: int = 100,
         job_id: str = "",
         task_ids: Optional[Set[str]] = None,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> List[ExecutionItem]:
         """Async counterpart of :meth:`collect_items` with the same dual-mode semantics."""
         wait_kwargs = {"wait_ms": wait_ms}
         if server_wait_ms is not None:
             wait_kwargs["server_wait_ms"] = server_wait_ms
+        if not is_progress_option(progress):
+            shared_kwargs = {"progress": progress, **shared_kwargs}
+            progress = False
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return await asyncio.to_thread(
             lambda: self.collect_items(
                 payloads,
@@ -1731,6 +1837,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 job_id=job_id,
                 task_ids=task_ids,
                 **wait_kwargs,
+                **progress_kwargs,
                 **shared_kwargs,
             )
         )
@@ -1753,20 +1860,66 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         wait_ms: int = 500,
         limit: int = 100,
         job_id: str = "",
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Sequence[pb2.TaskResult]:
         max_count = max(0, int(expected_count or 0))
         wait_kwargs = {"wait_ms": wait_ms}
         if server_wait_ms is not None:
             wait_kwargs["server_wait_ms"] = server_wait_ms
-        return list(
-            self.iter_results(
+        reporter = ProgressReporter(
+            progress,
+            label=f"taskpool.{self._task_method}",
+            total=max_count,
+            interval_sec=progress_interval_sec,
+        )
+        results: List[pb2.TaskResult] = []
+        succeeded = 0
+        failed = 0
+        last_error = ""
+        reporter.emit(phase="running", completed=0, succeeded=0, failed=0, submitted=max_count, force=True)
+        try:
+            for item in self.iter_results(
                 max_count=(max_count if max_count > 0 else None),
                 timeout_sec=timeout_sec,
                 limit=limit,
                 job_id=job_id,
                 **wait_kwargs,
+            ):
+                results.append(item)
+                if int(item.status) == int(pb2.TASK_STATUS_SUCCEEDED):
+                    succeeded += 1
+                else:
+                    failed += 1
+                    last_error = str(getattr(getattr(item, "error", None), "message", "") or item.task_id or "")
+                reporter.emit(
+                    phase="running",
+                    completed=len(results),
+                    succeeded=succeeded,
+                    failed=failed,
+                    submitted=max_count,
+                    last_error=last_error,
+                )
+        except Exception as exc:
+            last_error = str(exc)
+            reporter.emit(
+                phase="failed",
+                completed=len(results),
+                succeeded=succeeded,
+                failed=failed,
+                submitted=max_count,
+                last_error=last_error,
+                force=True,
             )
+            raise
+        reporter.done(
+            completed=len(results),
+            succeeded=succeeded,
+            failed=failed,
+            submitted=max_count,
+            last_error=last_error,
         )
+        return results
 
     def wait_for_data(
         self,
@@ -1775,20 +1928,57 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         timeout_sec: float = 30.0,
         server_wait_ms: Optional[int] = None,
         wait_ms: int = 500,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Sequence[Any]:
         max_count = max(0, int(expected_count or 0))
         wait_kwargs = {"wait_ms": wait_ms}
         if server_wait_ms is not None:
             wait_kwargs["server_wait_ms"] = server_wait_ms
-        return [
-            data
+        reporter = ProgressReporter(
+            progress,
+            label=f"taskpool.{self._task_method}",
+            total=max_count,
+            interval_sec=progress_interval_sec,
+        )
+        data_items: List[Any] = []
+        last_error = ""
+        reporter.emit(phase="running", completed=0, succeeded=0, failed=0, submitted=max_count, force=True)
+        try:
             for _task_id, data in self.iter_data(
                 max_count=(max_count if max_count > 0 else None),
                 timeout_sec=timeout_sec,
                 raise_on_error=True,
                 **wait_kwargs,
+            ):
+                data_items.append(data)
+                reporter.emit(
+                    phase="running",
+                    completed=len(data_items),
+                    succeeded=len(data_items),
+                    failed=0,
+                    submitted=max_count,
+                )
+        except Exception as exc:
+            last_error = str(exc)
+            reporter.emit(
+                phase="failed",
+                completed=len(data_items),
+                succeeded=len(data_items),
+                failed=1,
+                submitted=max_count,
+                last_error=last_error,
+                force=True,
             )
-        ]
+            raise
+        reporter.done(
+            completed=len(data_items),
+            succeeded=len(data_items),
+            failed=0,
+            submitted=max_count,
+            last_error=last_error,
+        )
+        return data_items
 
     def submit_values(
         self,
@@ -2233,10 +2423,27 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_infra_retries: int = 1,
         retry_backoff_ms: int = 0,
         node_window_factor: float = 2.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Iterator[Union[Tuple[int, Any], ExecutionItem]]:
         if self._closed:
             raise RuntimeError("task pool session is closed")
         self._enter_exclusive_mode("imap_unordered", require_clean=True)
+        completed = 0
+        succeeded = 0
+        failed = 0
+        last_error = ""
+        submitted = 0
+        try:
+            total = len(payloads)  # type: ignore[arg-type]
+        except Exception:
+            total = 0
+        reporter = ProgressReporter(
+            progress,
+            label=f"taskpool.{str(task_method or self._task_method).strip() or self._task_method}",
+            total=max(0, int(total or 0)),
+            interval_sec=progress_interval_sec,
+        )
         try:
             self._ensure_method(str(task_method or self._task_method).strip() or self._task_method)
             max_pending = self._resolve_max_in_flight(max_in_flight)
@@ -2261,6 +2468,15 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             poll_start_idx = 0
             wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
             cancelled_for_error = False
+            reporter.emit(
+                phase="running",
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                inflight=0,
+                submitted=submitted,
+                force=True,
+            )
 
             initial_quota = {node_id: max_pending for node_id in node_ids}
             self._fill_imap_from_quota(
@@ -2276,28 +2492,71 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 task_index_by_id=task_index_by_id,
                 scheduler_failures=scheduler_failures,
             )
+            submitted = payload_buffer.submitted_count
+            reporter.emit(
+                phase="running",
+                completed=completed,
+                succeeded=succeeded,
+                failed=failed,
+                inflight=sum(inflight_by_node.values()),
+                submitted=submitted,
+            )
             if self._pending_result_count() <= 0 and not payload_buffer.has_retry and payload_buffer.exhausted:
+                reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=submitted)
                 return
 
             while True:
                 yielded = 0
                 while ready_items and yielded < max_receive:
                     item = ready_items.popleft()
+                    completed += 1
                     if not item.ok:
+                        failed += 1
+                        last_error = str(item.error_message or item.error_type or "")
                         if raise_on_error:
                             if not cancelled_for_error:
                                 with contextlib.suppress(Exception):
                                     self.cancel_job(reason="imap_unordered task failure", job_id=self.job_id)
                                 cancelled_for_error = True
+                            reporter.emit(
+                                phase="failed",
+                                completed=completed,
+                                succeeded=succeeded,
+                                failed=failed,
+                                inflight=sum(inflight_by_node.values()),
+                                submitted=submitted,
+                                last_error=last_error,
+                                force=True,
+                            )
                             raise RuntimeError(item.error_message or f"task failed: {item.task_id}")
+                        reporter.emit(
+                            phase="running",
+                            completed=completed,
+                            succeeded=succeeded,
+                            failed=failed,
+                            inflight=sum(inflight_by_node.values()),
+                            submitted=submitted,
+                            last_error=last_error,
+                        )
                         yield item if return_items else (item.index, None)
                     else:
+                        succeeded += 1
+                        reporter.emit(
+                            phase="running",
+                            completed=completed,
+                            succeeded=succeeded,
+                            failed=failed,
+                            inflight=sum(inflight_by_node.values()),
+                            submitted=submitted,
+                            last_error=last_error,
+                        )
                         yield item if return_items else (item.index, item.data)
                     yielded += 1
                 if yielded > 0:
                     continue
 
                 if payload_buffer.exhausted and not payload_buffer.has_retry and self._pending_result_count() <= 0:
+                    reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=submitted, last_error=last_error)
                     return
 
                 if self._pending_result_count() <= 0:
@@ -2316,6 +2575,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         scheduler_failures=scheduler_failures,
                     )
                     if submitted_now > 0:
+                        submitted = payload_buffer.submitted_count
+                        reporter.emit(
+                            phase="running",
+                            completed=completed,
+                            succeeded=succeeded,
+                            failed=failed,
+                            inflight=sum(inflight_by_node.values()),
+                            submitted=submitted,
+                            last_error=last_error,
+                        )
                         wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
                         continue
                     if not payload_buffer.has_retry and not payload_buffer.exhausted:
@@ -2325,7 +2594,19 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         payload_buffer.requeue_front([(next_payload[0], next_payload[1], None)])
                     if payload_buffer.has_retry or not payload_buffer.exhausted:
                         failure_suffix = f"; failures={scheduler_failures}" if scheduler_failures else ""
-                        raise RuntimeError(f"imap_unordered could not submit tasks to any active task pool node{failure_suffix}")
+                        last_error = f"imap_unordered could not submit tasks to any active task pool node{failure_suffix}"
+                        reporter.emit(
+                            phase="failed",
+                            completed=completed,
+                            succeeded=succeeded,
+                            failed=failed,
+                            inflight=sum(inflight_by_node.values()),
+                            submitted=submitted,
+                            last_error=last_error,
+                            force=True,
+                        )
+                        raise RuntimeError(last_error)
+                    reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=submitted, last_error=last_error)
                     return
 
                 ordered_node_ids = node_ids[poll_start_idx:] + node_ids[:poll_start_idx]
@@ -2362,13 +2643,49 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                                 task_index_by_id=task_index_by_id,
                                 scheduler_failures=scheduler_failures,
                             )
+                            submitted = payload_buffer.submitted_count
+                            reporter.emit(
+                                phase="running",
+                                completed=completed,
+                                succeeded=succeeded,
+                                failed=failed,
+                                inflight=sum(inflight_by_node.values()),
+                                submitted=submitted,
+                                last_error=last_error,
+                            )
                     continue
 
                 if time.time() >= wait_deadline:
-                    raise TimeoutError(
+                    last_error = (
                         f"imap_unordered did not receive results before timeout; pending_task_ids={self._pending_result_count()}"
                     )
+                    reporter.emit(
+                        phase="failed",
+                        completed=completed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        inflight=sum(inflight_by_node.values()),
+                        submitted=submitted,
+                        last_error=last_error,
+                        force=True,
+                    )
+                    raise TimeoutError(last_error)
                 time.sleep(max(0.01, min(0.1, wait_ms / 1000.0 if wait_ms > 0 else 0.02)))
+        except GeneratorExit:
+            raise
+        except Exception as exc:
+            if not last_error:
+                last_error = str(exc)
+                reporter.emit(
+                    phase="failed",
+                    completed=completed,
+                    succeeded=succeeded,
+                    failed=failed,
+                    submitted=submitted,
+                    last_error=last_error,
+                    force=True,
+                )
+            raise
         finally:
             self._exit_exclusive_mode("imap_unordered")
 
@@ -2381,14 +2698,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> Iterator[Union[Tuple[int, Any], ExecutionItem]]:
         """Yield ``(index, result_or_none)`` in completion order for a submitted batch."""
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         for item in self.iter_items(
             payloads,
             task_method=task_method,
             strategy=strategy,
             max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
+            **progress_kwargs,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -2401,14 +2725,21 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
         return_items: bool = False,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> AsyncIterator[Union[Tuple[int, Any], ExecutionItem]]:
         """Async counterpart of :meth:`unordered` with the same return shape."""
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         async for item in self.aiter_items(
             payloads,
             task_method=task_method,
             strategy=strategy,
             max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
+            **progress_kwargs,
         ):
             yield item if return_items else (item.index, item.result if item.ok else None)
 
@@ -2427,10 +2758,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         wait_ms: int = 500,
         raise_on_error: bool = True,
         node_window_factor: float = 2.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
     ) -> int:
         if not callable(handle):
             raise TypeError("handle must be callable")
         processed = 0
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         for task_id, result in self.imap_unordered(
             payloads,
             task_method=task_method,
@@ -2443,6 +2780,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             raise_on_error=raise_on_error,
             node_window_factor=node_window_factor,
             return_items=False,
+            **progress_kwargs,
         ):
             index: Union[int, str] = task_id
             if isinstance(task_id, str) and task_id.rsplit("-", 1)[-1].isdigit():
@@ -2460,17 +2798,33 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> Sequence[Any]:
         normalized_arg = str(arg_name or "value").strip() or "value"
         shared = dict(shared_kwargs)
+        if not is_progress_option(progress):
+            shared = {"progress": progress, **shared}
+            progress = False
+        try:
+            progress_total = len(values)  # type: ignore[arg-type]
+        except Exception:
+            progress_total = None
         payloads = ({normalized_arg: value, **shared} for value in values)
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
+            if progress_total is not None:
+                payloads = _SizedPayloadIterable(payloads, progress_total)
         items = self.collect_items(
             payloads,
             task_method=task_method,
             strategy=strategy,
             max_in_flight=self._resolve_max_in_flight(max_in_flight),
             timeout_sec=timeout_sec,
+            **progress_kwargs,
         )
         return [item.result if item.ok else None for item in items]
 
@@ -2483,6 +2837,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> Sequence[Any]:
         """Map a sequence of local values to remote task calls.
@@ -2491,6 +2847,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         Python callable like the built-in ``map``; each value is sent as
         ``{arg_name: value}`` to the remote task method.
         """
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return self.map(
             values,
             arg_name=arg_name,
@@ -2498,6 +2858,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             strategy=strategy,
             max_in_flight=max_in_flight,
             timeout_sec=timeout_sec,
+            **progress_kwargs,
             **shared_kwargs,
         )
 
@@ -2510,8 +2871,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         strategy: str = "taskpool_default",
         max_in_flight: Optional[int] = None,
         timeout_sec: float = 30.0,
+        progress: ProgressOption = False,
+        progress_interval_sec: float = 2.0,
         **shared_kwargs,
     ) -> Sequence[Any]:
+        progress_kwargs = {}
+        if progress:
+            progress_kwargs["progress"] = progress
+            progress_kwargs["progress_interval_sec"] = progress_interval_sec
         return await asyncio.to_thread(
             lambda: self.map(
                 values,
@@ -2520,6 +2887,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 strategy=strategy,
                 max_in_flight=max_in_flight,
                 timeout_sec=timeout_sec,
+                **progress_kwargs,
                 **shared_kwargs,
             )
         )

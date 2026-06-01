@@ -1515,6 +1515,24 @@ def test_native_task_pool_session_iter_items_batch_uses_imap_unordered_core() ->
     mocked.assert_called_once()
 
 
+def test_native_task_pool_session_iter_items_forwards_progress_to_imap_core() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-iter-items-progress",
+    )
+    callback = lambda event: None
+
+    with patch.object(session, "imap_unordered", return_value=iter([])) as mocked:
+        assert list(session.iter_items([{"value": 1}], timeout_sec=0.1, progress=callback, progress_interval_sec=0.25)) == []
+
+    assert mocked.call_args.kwargs["progress"] is callback
+    assert mocked.call_args.kwargs["progress_interval_sec"] == 0.25
+
+
 def test_native_task_pool_session_map_forwards_strategy_to_collect_items() -> None:
     from pycloud_parallel import TaskPool
 
@@ -1529,6 +1547,43 @@ def test_native_task_pool_session_map_forwards_strategy_to_collect_items() -> No
         session.map([1, 2], strategy="taskpool_throughput")
 
     assert mocked.call_args.kwargs["strategy"] == "taskpool_throughput"
+
+
+def test_native_task_pool_session_map_forwards_progress_to_collect_items() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-map-progress",
+    )
+    callback = lambda event: None
+
+    with patch.object(session, "collect_items", return_value=[]) as mocked:
+        session.map([1, 2], progress=callback, progress_interval_sec=0.5)
+
+    assert mocked.call_args.kwargs["progress"] is callback
+    assert mocked.call_args.kwargs["progress_interval_sec"] == 0.5
+    assert len(mocked.call_args.args[0]) == 2
+
+
+def test_native_task_pool_session_map_keeps_non_option_progress_as_payload_field() -> None:
+    from pycloud_parallel import TaskPool
+
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-map-progress-payload",
+    )
+
+    with patch.object(session, "collect_items", return_value=[]) as mocked:
+        session.map([1], progress="business-progress")
+
+    payloads = list(mocked.call_args.args[0])
+    assert payloads == [{"value": 1, "progress": "business-progress"}]
+    assert "progress" not in mocked.call_args.kwargs
 
 
 def test_native_task_pool_session_map_values_alias_matches_map() -> None:
@@ -1697,6 +1752,59 @@ def test_native_task_pool_session_keepalive_degrades_per_node() -> None:
         assert session.is_alive() is True
     finally:
         session.close()
+
+
+def test_native_task_pool_session_keepalive_heartbeats_replicas_concurrently() -> None:
+    from pycloud_parallel import TaskPool
+
+    good_seen = threading.Event()
+    good_second_seen = threading.Event()
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    good_count = {"value": 0}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            if self.node_id == "node-slow":
+                slow_started.set()
+                release_slow.wait(1.0)
+            else:
+                good_count["value"] += 1
+                good_seen.set()
+                if good_count["value"] >= 2:
+                    good_second_seen.set()
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    session = TaskPool(
+        pools={
+            "node-slow": _Pool("node-slow"),
+            "node-good": _Pool("node-good"),
+        },
+        nodes={},
+        task_method="run",
+        job_id="job-hb-concurrent",
+    )
+
+    session._active_replica_ids = {"node-slow", "node-good"}  # noqa: SLF001
+    thread = threading.Thread(target=session._keepalive_loop, args=(0.01,), daemon=True)  # noqa: SLF001
+    thread.start()
+    try:
+        assert slow_started.wait(0.5)
+        assert good_seen.wait(0.2)
+        assert good_second_seen.wait(0.5)
+        assert "node-good" in session._active_replica_ids  # noqa: SLF001
+    finally:
+        release_slow.set()
+        session._hb_stop.set()  # noqa: SLF001
+        thread.join(timeout=1.0)
 
 
 def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:
@@ -3511,6 +3619,58 @@ def test_native_task_pool_imap_unordered_retries_lost_accepted_tasks_by_default(
     assert session._pending_task_ids == set()  # noqa: SLF001
 
 
+def test_native_task_pool_imap_unordered_reports_callback_progress() -> None:
+    from pycloud_parallel import TaskPool
+
+    events = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self) -> None:
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            for item in tasks:
+                self._ready.append(
+                    pb2.TaskResult(
+                        task_id=item.task_id,
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"task_id": item.task_id}),
+                    )
+                )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-imap-progress",
+    )
+
+    out = list(session.imap_unordered([{"value": 1}, {"value": 2}], max_in_flight=2, timeout_sec=0.1, progress=events.append))
+
+    assert sorted(index for index, _result in out) == [0, 1]
+    assert events[0].phase == "running"
+    assert events[-1].phase == "done"
+    assert events[-1].total == 2
+    assert events[-1].completed == 2
+    assert events[-1].succeeded == 2
+
+
 def test_native_task_pool_imap_unordered_does_not_retry_pull_lost_when_disabled() -> None:
     from pycloud_parallel import TaskPool
 
@@ -3884,6 +4044,56 @@ def test_native_task_pool_session_wait_for_results_replays_buffered_results_with
 
     assert len(results) == 1
     assert results[0].task_id == "task-buffered"
+
+
+def test_native_task_pool_wait_for_results_reports_callback_progress() -> None:
+    from pycloud_parallel import TaskPool
+
+    events = []
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-wait-progress",
+    )
+    result = pb2.TaskResult(task_id="task-1", status=pb2.TASK_STATUS_SUCCEEDED)
+
+    with patch.object(session, "iter_results", return_value=iter([result])) as mocked:
+        out = session.wait_for_results(expected_count=1, timeout_sec=1.0, progress=events.append)
+
+    assert out == [result]
+    mocked.assert_called_once_with(max_count=1, timeout_sec=1.0, limit=100, job_id="", wait_ms=500)
+    assert events[0].phase == "running"
+    assert events[-1].phase == "done"
+    assert events[-1].total == 1
+    assert events[-1].completed == 1
+    assert events[-1].succeeded == 1
+
+
+def test_native_task_pool_wait_for_data_reports_failed_progress_before_reraising() -> None:
+    from pycloud_parallel import TaskPool
+
+    events = []
+    session = TaskPool(
+        pools={"node-1": SimpleNamespace(owner_client_id="owner", code_version="sha256:test", heartbeat_timeout_sec=30)},
+        nodes={},
+        task_method="run",
+        job_id="job-wait-data-progress",
+    )
+
+    def _iter_data_failure(*args, **kwargs):  # noqa: ARG001
+        yield "task-1", {"value": 1}
+        raise RuntimeError("boom")
+
+    with patch.object(session, "iter_data", side_effect=_iter_data_failure):
+        with pytest.raises(RuntimeError, match="boom"):
+            session.wait_for_data(expected_count=2, timeout_sec=1.0, progress=events.append)
+
+    assert events[-1].phase == "failed"
+    assert events[-1].completed == 1
+    assert events[-1].succeeded == 1
+    assert events[-1].failed == 1
+    assert events[-1].last_error == "boom"
 
 
 def test_native_task_pool_async_batch_helpers_exist() -> None:

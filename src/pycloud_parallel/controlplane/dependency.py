@@ -33,6 +33,7 @@ class _TarSourceEntry:
 
 
 _PACKAGED_PYTHON_FILE_SUFFIXES = frozenset({".py", ".pyd", ".so"})
+_RUNTIME_PACKAGE_ROOTS = frozenset({"pycloud_parallel"})
 
 
 def _normalize_arcname(arcname: Path | str) -> str:
@@ -560,7 +561,10 @@ class DependencyAnalyzer:
         module_file = str(getattr(module, "__file__", "") or "").strip()
         if not module_file:
             return ""
-        return str(Path(module_file).resolve())
+        resolved = Path(module_file).resolve()
+        if not resolved.exists():
+            return ""
+        return str(resolved)
 
     def _extract_imports_from_source(self, source: str) -> List[Dict[str, str]]:
         """从源码提取 import 语句"""
@@ -659,6 +663,8 @@ class DependencyAnalyzer:
             return False
 
         path = Path(module_file)
+        if any(part in _RUNTIME_PACKAGE_ROOTS for part in path.parts):
+            return False
 
         # 排除标准库
         if 'site-packages' in path.parts or 'dist-packages' in path.parts:
@@ -851,6 +857,20 @@ class DependencyPackager:
             if not arcname:
                 continue
             entries[arcname] = _TarSourceEntry(arcname=arcname, source_path=path)
+        for arcname, source_path in self._iter_project_import_root_files(
+            module_name=module_name,
+            module_file=module_file,
+            deps=deps,
+            include_tests=include_tests,
+        ):
+            entries.setdefault(arcname, _TarSourceEntry(arcname=arcname, source_path=source_path))
+        project_root = self._infer_project_root(module_name=module_name, module_file=module_file)
+        if project_root is not None:
+            self._expand_entries_with_project_import_roots(
+                entries,
+                project_root=project_root,
+                include_tests=include_tests,
+            )
         return _synthesize_package_init_entries(entries.values())
 
     def _iter_dependency_module_files(
@@ -891,6 +911,174 @@ class DependencyPackager:
             return _normalize_arcname(path.name)
 
         return _normalize_arcname(Path(*module_parts[:-1]) / path.name)
+
+    def _iter_project_import_root_files(
+        self,
+        *,
+        module_name: str,
+        module_file: str,
+        deps: Dict[str, Any],
+        include_tests: bool,
+    ) -> List[Tuple[str, Path]]:
+        project_root = self._infer_project_root(module_name=module_name, module_file=module_file)
+        if project_root is None:
+            return []
+        root_names = self._collect_project_import_root_names(deps)
+        entries: List[Tuple[str, Path]] = []
+        for root_name in sorted(root_names):
+            if not root_name or root_name in self.analyzer.stdlib_modules:
+                continue
+            root_path = (project_root / root_name).resolve()
+            if root_path.is_dir():
+                for entry in _iter_directory_entries(
+                    root_path,
+                    include_tests=include_tests,
+                    prefix=Path(root_name),
+                    synthesize_missing_package_inits=True,
+                ):
+                    if entry.source_path is not None:
+                        entries.append((_normalize_arcname(entry.arcname), Path(entry.source_path).resolve()))
+                continue
+            py_path = project_root / f"{root_name}.py"
+            if _is_packaged_python_file(py_path, include_tests=include_tests):
+                entries.append((_normalize_arcname(py_path.name), py_path.resolve()))
+        return entries
+
+    def _collect_project_import_root_names(self, deps: Dict[str, Any]) -> Set[str]:
+        roots: Set[str] = set()
+        for item in deps.get("imports", []) or []:
+            roots.update(self._import_root_names_from_ast_item(item))
+        for item in deps.get("local_modules", []) or []:
+            item_name = str(item.get("name", "") or "").strip()
+            if item_name:
+                roots.add(item_name.split(".", 1)[0])
+        return roots
+
+    def _expand_entries_with_project_import_roots(
+        self,
+        entries: Dict[str, _TarSourceEntry],
+        *,
+        project_root: Path,
+        include_tests: bool,
+    ) -> None:
+        seen_roots: Set[str] = set()
+        while True:
+            root_names: Set[str] = set()
+            for entry in list(entries.values()):
+                source_path = entry.source_path
+                if source_path is None or Path(source_path).suffix.lower() != ".py":
+                    continue
+                source = self.analyzer._read_module_source(source_path)
+                if not source:
+                    continue
+                root_names.update(self._collect_import_root_names_from_source(source))
+                root_names.update(
+                    self._collect_relative_import_roots_from_entry(
+                        source,
+                        arcname=str(entry.arcname or ""),
+                    )
+                )
+
+            added = False
+            for root_name in sorted(root_names):
+                if not root_name or root_name in seen_roots or root_name in self.analyzer.stdlib_modules:
+                    continue
+                seen_roots.add(root_name)
+                for arcname, source_path in self._iter_project_root_files(
+                    project_root=project_root,
+                    root_name=root_name,
+                    include_tests=include_tests,
+                ):
+                    if arcname in entries:
+                        continue
+                    entries[arcname] = _TarSourceEntry(arcname=arcname, source_path=source_path)
+                    added = True
+            if not added:
+                return
+
+    def _collect_import_root_names_from_source(self, source: str) -> Set[str]:
+        roots: Set[str] = set()
+        for item in self.analyzer._extract_imports_from_source(source):
+            roots.update(self._import_root_names_from_ast_item(item))
+        return roots
+
+    def _collect_relative_import_roots_from_entry(self, source: str, *, arcname: str) -> Set[str]:
+        roots: Set[str] = set()
+        package_parts = list(PurePosixPath(_normalize_arcname(arcname)).parent.parts)
+        for item in self.analyzer._extract_imports_from_source(source):
+            if str(item.get("type", "") or "") != "from...import":
+                continue
+            level = int(item.get("level", 0) or 0)
+            if level <= 0:
+                continue
+            base_parts = package_parts[: max(0, len(package_parts) - level + 1)]
+            module_name = str(item.get("module", "") or "").strip()
+            if module_name:
+                base_parts.extend(part for part in module_name.split(".") if part)
+            alias_name = str(item.get("name", "") or "").strip()
+            if alias_name and alias_name != "*":
+                candidate_parts = [*base_parts, *[part for part in alias_name.split(".") if part]]
+            else:
+                candidate_parts = base_parts
+            if candidate_parts:
+                roots.add(candidate_parts[0])
+        return roots
+
+    def _import_root_names_from_ast_item(self, item: Dict[str, str]) -> Set[str]:
+        roots: Set[str] = set()
+        imp_type = str(item.get("type", "") or "")
+        module_name = str(item.get("module", "") or "").strip()
+        alias_name = str(item.get("name", "") or "").strip()
+        if imp_type == "import" and module_name:
+            roots.add(module_name.split(".", 1)[0])
+        elif imp_type == "from...import":
+            if module_name:
+                roots.add(module_name.split(".", 1)[0])
+            elif alias_name and int(item.get("level", 0) or 0) == 0:
+                roots.add(alias_name.split(".", 1)[0])
+        return roots
+
+    def _iter_project_root_files(
+        self,
+        *,
+        project_root: Path,
+        root_name: str,
+        include_tests: bool,
+    ) -> List[Tuple[str, Path]]:
+        root_path = (project_root / root_name).resolve()
+        if root_path.is_dir():
+            return [
+                (_normalize_arcname(entry.arcname), Path(entry.source_path).resolve())
+                for entry in _iter_directory_entries(
+                    root_path,
+                    include_tests=include_tests,
+                    prefix=Path(root_name),
+                    synthesize_missing_package_inits=True,
+                )
+                if entry.source_path is not None
+            ]
+        py_path = project_root / f"{root_name}.py"
+        if _is_packaged_python_file(py_path, include_tests=include_tests):
+            return [(_normalize_arcname(py_path.name), py_path.resolve())]
+        return []
+
+    def _infer_project_root(self, *, module_name: str, module_file: str) -> Optional[Path]:
+        normalized_name = str(module_name or "").strip()
+        normalized_file = str(module_file or "").strip()
+        if not normalized_name or not normalized_file:
+            return None
+        path = Path(normalized_file).resolve()
+        module_parts = [part for part in normalized_name.split(".") if part]
+        if not module_parts:
+            return path.parent if path.exists() else None
+        try:
+            relative = Path(*module_parts[:-1], "__init__.py") if path.name == "__init__.py" else Path(*module_parts[:-1], path.name)
+            root = path
+            for _ in relative.parts:
+                root = root.parent
+            return root
+        except Exception:
+            return path.parent if path.exists() else None
 
 
 def package_module_for_debug(

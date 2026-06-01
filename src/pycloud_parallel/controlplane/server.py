@@ -306,6 +306,7 @@ def main() -> None:
     parser.add_argument("--gateway-failure-threshold", type=int, default=3)
     parser.add_argument("--gateway-open-sec", type=float, default=5.0)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-file", default="", help="optional file path that receives a copy of process logs")
     parser.add_argument("--force", action="store_true", help="replace existing local IPC service for roles that support it")
     args = parser.parse_args()
     if not str(args.bind or "").strip():
@@ -320,9 +321,15 @@ def main() -> None:
 
     level_name = str(args.log_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
+    log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if str(args.log_file or "").strip():
+        log_path = Path(str(args.log_file)).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=log_handlers,
     )
 
     if args.role == "infocenter":

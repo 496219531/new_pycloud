@@ -3,10 +3,12 @@ from __future__ import annotations
 """Shared execution session base classes for the authoritative V1 execution layer."""
 
 import contextlib
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import logging
 import threading
 import time
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.controlplane.session_handle import ExecutionReplicaHandle
@@ -17,6 +19,10 @@ from pycloud_parallel.controlplane.session_model import (
     build_execution_session_status,
 )
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+
+logger = logging.getLogger(__name__)
+SLOW_HEARTBEAT_LOG_SEC = 2.0
 
 
 @dataclass(frozen=True)
@@ -123,12 +129,29 @@ class ExecutionSessionBase:
         del node_id
         return max(1, int(getattr(replica, "heartbeat_failure_threshold", 1) or 1))
 
+    def _heartbeat_max_workers(self) -> int:
+        return max(1, min(32, len(self.replicas)))
+
     def _heartbeat_replica(self, node_id: str, replica: ExecutionReplicaHandle, *, seq: int) -> Any:
         del node_id
         try:
             return replica.heartbeat(seq=seq)
         except TypeError:
             return replica.heartbeat()
+
+    def _timed_heartbeat_replica(self, node_id: str, replica: ExecutionReplicaHandle, *, seq: int) -> Any:
+        started_at = time.monotonic()
+        try:
+            return self._heartbeat_replica(node_id, replica, seq=seq)
+        finally:
+            elapsed = time.monotonic() - started_at
+            if elapsed >= SLOW_HEARTBEAT_LOG_SEC:
+                logger.warning(
+                    "%s keepalive heartbeat slow node_instance_id=%s elapsed_sec=%.3f",
+                    self.kind or "execution",
+                    node_id,
+                    elapsed,
+                )
 
     def _mark_replica_heartbeat_success(self, node_id: str, replica: ExecutionReplicaHandle) -> None:
         self._keepalive_failure_counts.pop(node_id, None)
@@ -151,37 +174,104 @@ class ExecutionSessionBase:
             replica.status = "STOPPED"
         self._active_replica_ids.discard(node_id)
 
+    def _record_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        count = int(self._keepalive_failure_counts.get(node_id, 0) or 0) + 1
+        self._keepalive_failure_counts[node_id] = count
+        if count >= self._heartbeat_failure_threshold(node_id, replica):
+            self._mark_replica_heartbeat_failure(node_id, replica, exc)
+
     def _keepalive_loop(self, interval_sec: float) -> None:
         next_tick = time.monotonic() + max(0.1, float(interval_sec))
-        while not self._hb_stop.is_set():
-            now = time.monotonic()
-            wait_sec = max(0.0, next_tick - now)
-            if self._hb_stop.wait(wait_sec):
-                break
-            next_tick += max(0.1, float(interval_sec))
-            self._keepalive_seq += 1
-            replicas = self.replicas
-            for node_id in list(self._active_replica_ids):
-                replica = replicas.get(node_id)
-                if replica is None:
-                    self._active_replica_ids.discard(node_id)
-                    continue
-                try:
-                    self._heartbeat_replica(node_id, replica, seq=self._keepalive_seq)
-                    self._mark_replica_heartbeat_success(node_id, replica)
-                except Exception as exc:
-                    count = int(self._keepalive_failure_counts.get(node_id, 0) or 0) + 1
-                    self._keepalive_failure_counts[node_id] = count
-                    if count >= self._heartbeat_failure_threshold(node_id, replica):
-                        self._mark_replica_heartbeat_failure(node_id, replica, exc)
-            if not self._active_replica_ids:
-                self.failed = True
-                self._hb_stop.set()
-                break
-            hook = getattr(self, "_after_keepalive_tick", None)
-            if callable(hook):
-                with contextlib.suppress(Exception):
-                    hook()
+        pending: Dict[str, Tuple[Future, ExecutionReplicaHandle, float, float]] = {}
+        executor = ThreadPoolExecutor(max_workers=self._heartbeat_max_workers(), thread_name_prefix=f"{self.kind or 'execution'}-hb")
+        try:
+            while not self._hb_stop.is_set():
+                now = time.monotonic()
+                for node_id, (future, replica, started_at, last_pending_report_at) in list(pending.items()):
+                    if not future.done():
+                        max_pending_sec = max(1.0, float(getattr(replica, "heartbeat_timeout_sec", 1) or 1))
+                        if now - started_at >= max_pending_sec and now - last_pending_report_at >= max_pending_sec:
+                            logger.warning(
+                                "%s keepalive heartbeat pending node_instance_id=%s elapsed_sec=%.3f",
+                                self.kind or "execution",
+                                node_id,
+                                now - started_at,
+                            )
+                            self._record_heartbeat_failure(
+                                node_id,
+                                replica,
+                                TimeoutError(f"heartbeat pending for {now - started_at:.3f}s"),
+                            )
+                            if node_id in self._active_replica_ids:
+                                pending[node_id] = (future, replica, started_at, now)
+                            else:
+                                future.cancel()
+                                pending.pop(node_id, None)
+                        continue
+                    pending.pop(node_id, None)
+                    try:
+                        future.result()
+                        self._mark_replica_heartbeat_success(node_id, replica)
+                    except Exception as exc:
+                        logger.warning(
+                            "%s keepalive heartbeat failed node_instance_id=%s error=%r",
+                            self.kind or "execution",
+                            node_id,
+                            exc,
+                        )
+                        self._record_heartbeat_failure(node_id, replica, exc)
+
+                wait_sec = max(0.0, next_tick - time.monotonic())
+                if self._hb_stop.wait(wait_sec):
+                    break
+                next_tick += max(0.1, float(interval_sec))
+                self._keepalive_seq += 1
+                replicas = self.replicas
+                active_ids = list(self._active_replica_ids)
+                if len(active_ids) == 1 and not pending:
+                    node_id = active_ids[0]
+                    replica = replicas.get(node_id)
+                    if replica is None:
+                        self._active_replica_ids.discard(node_id)
+                    else:
+                        try:
+                            self._timed_heartbeat_replica(node_id, replica, seq=self._keepalive_seq)
+                            self._mark_replica_heartbeat_success(node_id, replica)
+                        except Exception as exc:
+                            logger.warning(
+                                "%s keepalive heartbeat failed node_instance_id=%s error=%r",
+                                self.kind or "execution",
+                                node_id,
+                                exc,
+                            )
+                            self._record_heartbeat_failure(node_id, replica, exc)
+                for node_id in list(self._active_replica_ids):
+                    if len(active_ids) == 1 and not pending:
+                        continue
+                    if node_id in pending:
+                        continue
+                    replica = replicas.get(node_id)
+                    if replica is None:
+                        self._active_replica_ids.discard(node_id)
+                        continue
+                    pending[node_id] = (
+                        executor.submit(self._timed_heartbeat_replica, node_id, replica, seq=self._keepalive_seq),
+                        replica,
+                        time.monotonic(),
+                        time.monotonic(),
+                    )
+                if not self._active_replica_ids:
+                    self.failed = True
+                    self._hb_stop.set()
+                    break
+                hook = getattr(self, "_after_keepalive_tick", None)
+                if callable(hook):
+                    with contextlib.suppress(Exception):
+                        hook()
+            for future, _replica, _started_at, _last_pending_report_at in pending.values():
+                future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _start_keepalive(self, interval_sec: Optional[float] = None) -> None:
         with self._hb_lock:

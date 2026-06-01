@@ -169,6 +169,105 @@ def test_package_module_for_debug_writes_local_tar_and_lists_entries(tmp_path, m
     ]
 
 
+def test_dependency_packager_module_includes_project_root_imports(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    package_dir = tmp_path / "project_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "worker.py").write_text(
+        "import ProjectConfig\n"
+        "from project_helpers import calc\n\n"
+        "def run(value=0, **_kwargs):\n"
+        "    return calc.normalize(value) + ProjectConfig.OFFSET\n",
+        encoding="utf-8",
+    )
+    helper_dir = tmp_path / "project_helpers"
+    helper_dir.mkdir()
+    (helper_dir / "__init__.py").write_text("", encoding="utf-8")
+    (helper_dir / "calc.py").write_text("def normalize(value):\n    return int(value)\n", encoding="utf-8")
+    (tmp_path / "ProjectConfig.py").write_text("OFFSET = 10\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("ignore me\n", encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    worker = importlib.import_module("project_pkg.worker")
+
+    packager = DependencyPackager()
+    tar_path = Path(packager.package_module(worker))
+    try:
+        names = _tar_names(_tar_blob(tar_path))
+        assert "ProjectConfig.py" in names
+        assert "project_helpers/__init__.py" in names
+        assert "project_helpers/calc.py" in names
+        assert "README.md" not in names
+    finally:
+        tar_path.unlink(missing_ok=True)
+
+
+def test_dependency_packager_expands_project_relative_import_roots(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    package_dir = tmp_path / "root_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "service.py").write_text(
+        "from helper_pkg.entry import run\n",
+        encoding="utf-8",
+    )
+    helper_dir = tmp_path / "helper_pkg"
+    helper_dir.mkdir()
+    (helper_dir / "__init__.py").write_text("", encoding="utf-8")
+    (helper_dir / "entry.py").write_text(
+        "from .nested import normalize\n\n"
+        "def run(value=0):\n"
+        "    return normalize(value)\n",
+        encoding="utf-8",
+    )
+    (helper_dir / "nested.py").write_text("def normalize(value):\n    return int(value)\n", encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    service = importlib.import_module("root_pkg.service")
+
+    packager = DependencyPackager()
+    tar_path = Path(packager.package_module(service))
+    try:
+        names = _tar_names(_tar_blob(tar_path))
+        assert "helper_pkg/entry.py" in names
+        assert "helper_pkg/nested.py" in names
+    finally:
+        tar_path.unlink(missing_ok=True)
+
+
+def test_dependency_packager_does_not_bundle_pycloud_parallel_runtime(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    package_dir = tmp_path / "runtime_import_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "worker.py").write_text(
+        "from pycloud_parallel import Service\n\n"
+        "def run(value=0, **_kwargs):\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    worker = importlib.import_module("runtime_import_pkg.worker")
+
+    packager = DependencyPackager()
+    tar_path = Path(packager.package_module(worker))
+    try:
+        names = _tar_names(_tar_blob(tar_path))
+        assert "runtime_import_pkg/__init__.py" in names
+        assert "runtime_import_pkg/worker.py" in names
+        assert not any(name == "pycloud_parallel/__init__.py" or name.startswith("pycloud_parallel/") for name in names)
+    finally:
+        tar_path.unlink(missing_ok=True)
+
+
 def test_node_control_client_legacy_code_upload_wrappers_removed():
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 

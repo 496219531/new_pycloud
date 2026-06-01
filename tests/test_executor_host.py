@@ -82,6 +82,25 @@ def test_create_executor_backend_rejects_old_aliases():
             create_executor_backend(executor_backend=value, task_worker_capacity=1)
 
 
+def test_executor_host_process_died_message_includes_action_pid_exitcode(monkeypatch):
+    class _FakeProcess:
+        pid = 12345
+        exitcode = 1
+
+        @staticmethod
+        def is_alive():
+            return False
+
+    client = object.__new__(ExecutorHostClient)
+    client._process = _FakeProcess()  # noqa: SLF001
+    message = client._format_process_died_message("create_service")  # noqa: SLF001
+    assert "action=create_service" in message
+    assert "pid=12345" in message
+    assert "exitcode=1" in message
+    if os.name == "nt":
+        assert "if __name__ == '__main__'" in message
+
+
 def test_subprocess_backend_uses_distinct_hosts_per_session(tmp_path):
     state, artifact = _seed_artifact(
         tmp_path,

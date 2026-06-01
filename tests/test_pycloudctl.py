@@ -65,6 +65,397 @@ def test_ctl_parser_accepts_dev_profile_commands():
     assert args.command == "stopall"
 
 
+def test_ctl_parser_accepts_upgrade_nodes_command(tmp_path):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    parser = ctl.build_parser()
+
+    args = parser.parse_args(["upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel), "--restart"])
+
+    assert args.command == "upgrade-nodes"
+    assert args.target == "10.0.0.1:50051"
+    assert args.wheel == str(wheel)
+    assert args.restart is True
+
+
+def test_ctl_parser_accepts_admin_token_command():
+    parser = ctl.build_parser()
+
+    args = parser.parse_args(["admin-token", "--target", "10.0.0.1:50051", "--old-token", "old", "--token", "new"])
+
+    assert args.command == "admin-token"
+    assert args.target == "10.0.0.1:50051"
+    assert args.old_token == "old"
+    assert args.token == "new"
+
+
+def test_cmd_admin_token_generate_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ctl, "_generate_admin_token", lambda: "generated-token")
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "admin-token", "--generate-only"])
+
+    assert ctl._cmd_admin_token(args) == 0
+    assert capsys.readouterr().out.strip() == "generated-token"
+    assert (tmp_path / "admin_token").read_text(encoding="utf-8").strip() == "generated-token"
+
+
+def test_cmd_admin_token_sets_selected_nodes(tmp_path, monkeypatch):
+    calls = []
+    (tmp_path / "admin_token").write_text("old-local\n", encoding="utf-8")
+    monkeypatch.setattr(ctl, "_ensure_controlplane_host_command_allowed", lambda *_args, **_kwargs: None)
+
+    class FakeInfoCenterClient:
+        def __init__(self, target, *, timeout_sec=10.0):
+            calls.append(("infocenter", target, timeout_sec))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **kwargs):
+            calls.append(("list_nodes", kwargs))
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061"),
+                SimpleNamespace(node_id="node-b", node_instance_id="node-b-inst", control_addr="http://10.0.0.2:50062"),
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+            calls.append(("nodeclient", target))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def set_admin_token(self, **kwargs):
+            calls.append(("set_admin_token", self.target, kwargs))
+            return {"ok": True, "updated": True}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "admin-token", "--target", "10.0.0.1:50051", "--token", "new"])
+
+    assert ctl._cmd_admin_token(args) == 0
+    assert calls[0] == ("infocenter", "10.0.0.1:50051", 30.0)
+    assert [item for item in calls if item[0] == "nodeclient"] == [("nodeclient", "http://10.0.0.2:50061")]
+    assert [item for item in calls if item[0] == "set_admin_token"] == [
+        ("set_admin_token", "http://10.0.0.2:50061", {"admin_token": "new", "old_admin_token": "old-local"})
+    ]
+    assert (tmp_path / "admin_token").read_text(encoding="utf-8").strip() == "new"
+
+
+def test_cmd_admin_token_requires_controlplane_host_by_default(monkeypatch):
+    monkeypatch.setattr(ctl, "detect_local_ip", lambda *, remote_hint="": "10.0.0.9")
+
+    with pytest.raises(RuntimeError, match="ControlPlane host"):
+        ctl._ensure_controlplane_host_command_allowed("10.0.0.1:50051")
+
+    ctl._ensure_controlplane_host_command_allowed("10.0.0.1:50051", allow_remote=True)
+
+
+def test_cmd_upgrade_nodes_uses_infocenter_and_node_clients(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+    (tmp_path / "admin_token").write_text("admin-token-a\n", encoding="utf-8")
+
+    class FakeInfoCenterClient:
+        def __init__(self, target, *, timeout_sec=10.0):
+            calls.append(("infocenter", target, timeout_sec))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **kwargs):
+            calls.append(("list_nodes", kwargs))
+            return [
+                SimpleNamespace(
+                    node_id="node-a",
+                    node_instance_id="node-a-inst",
+                    control_addr="http://10.0.0.2:50061",
+                )
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, *, timeout_sec=10.0, api_token=""):
+            calls.append(("nodeclient", target, timeout_sec, api_token))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **kwargs):
+            calls.append(("upgrade", kwargs))
+            return {"ok": True, "returncode": 0, "restart_scheduled": True}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel), "--restart"])
+
+    assert ctl._cmd_upgrade_nodes(args) == 0
+    assert calls[0] == ("infocenter", "10.0.0.1:50051", 300.0)
+    assert calls[1][0] == "list_nodes"
+    assert calls[2] == ("nodeclient", "http://10.0.0.2:50061", 300.0, "admin-token-a")
+    assert calls[3][0] == "upgrade"
+    assert calls[3][1]["wheel_name"] == wheel.name
+    assert calls[3][1]["wheel_bytes"] == b"wheel"
+    assert calls[3][1]["restart"] is True
+
+
+def test_cmd_upgrade_nodes_explicit_admin_token_overrides_local(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+    (tmp_path / "admin_token").write_text("local-admin-token\n", encoding="utf-8")
+
+    class FakeInfoCenterClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **_kwargs):
+            return [SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061")]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, *, timeout_sec=10.0, api_token=""):
+            calls.append(("nodeclient", target, api_token))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **_kwargs):
+            return {"ok": True, "returncode": 0, "restart_scheduled": False}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args([
+        "--runtime-root",
+        str(tmp_path),
+        "upgrade-nodes",
+        "--target",
+        "10.0.0.1:50051",
+        "--wheel",
+        str(wheel),
+        "--api-token",
+        "explicit-admin-token",
+    ])
+
+    assert ctl._cmd_upgrade_nodes(args) == 0
+    assert calls == [("nodeclient", "http://10.0.0.2:50061", "explicit-admin-token")]
+
+
+def test_cmd_upgrade_nodes_uses_empty_token_when_no_local_admin_token(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+    monkeypatch.setenv("PYCLOUD_API_TOKEN", "owner-token-should-not-be-used")
+
+    class FakeInfoCenterClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **_kwargs):
+            return [SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061")]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, *, timeout_sec=10.0, api_token=""):
+            calls.append(("nodeclient", target, api_token))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **_kwargs):
+            return {"ok": True, "returncode": 0, "restart_scheduled": False}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel)])
+
+    assert ctl._cmd_upgrade_nodes(args) == 0
+    assert calls == [("nodeclient", "http://10.0.0.2:50061", "")]
+
+
+def test_cmd_upgrade_nodes_dedupes_same_host_by_default(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+
+    class FakeInfoCenterClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **_kwargs):
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061"),
+                SimpleNamespace(node_id="node-b", node_instance_id="node-b-inst", control_addr="http://10.0.0.2:50062"),
+                SimpleNamespace(node_id="node-c", node_instance_id="node-c-inst", control_addr="http://10.0.0.3:50061"),
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, **_kwargs):
+            calls.append(("nodeclient", target))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **_kwargs):
+            calls.append(("upgrade", None))
+            return {"ok": True, "returncode": 0, "restart_scheduled": False}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel)])
+
+    assert ctl._cmd_upgrade_nodes(args) == 0
+    assert [item for item in calls if item[0] == "nodeclient"] == [
+        ("nodeclient", "http://10.0.0.2:50061"),
+        ("nodeclient", "http://10.0.0.3:50061"),
+    ]
+
+
+def test_cmd_upgrade_nodes_restarts_same_host_duplicates_without_reinstall(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+
+    class FakeInfoCenterClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **_kwargs):
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061"),
+                SimpleNamespace(node_id="node-b", node_instance_id="node-b-inst", control_addr="http://10.0.0.2:50062"),
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+            calls.append(("nodeclient", target))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **_kwargs):
+            calls.append(("upgrade", self.target))
+            return {"ok": True, "returncode": 0, "restart_scheduled": True}
+
+        def restart_node(self, **_kwargs):
+            calls.append(("restart", self.target))
+            return {"ok": True, "restart_scheduled": True}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel), "--restart"])
+
+    assert ctl._cmd_upgrade_nodes(args) == 0
+    assert [item for item in calls if item[0] == "upgrade"] == [("upgrade", "http://10.0.0.2:50061")]
+    assert [item for item in calls if item[0] == "restart"] == [("restart", "http://10.0.0.2:50062")]
+
+
+def test_cmd_upgrade_nodes_can_upgrade_every_node_on_same_host(tmp_path, monkeypatch):
+    wheel = tmp_path / "pycloud_parallel-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    calls = []
+
+    class FakeInfoCenterClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_selected_nodes(self, **_kwargs):
+            return [
+                SimpleNamespace(node_id="node-a", node_instance_id="node-a-inst", control_addr="http://10.0.0.2:50061"),
+                SimpleNamespace(node_id="node-b", node_instance_id="node-b-inst", control_addr="http://10.0.0.2:50062"),
+            ]
+
+    class FakeNodeControlClient:
+        def __init__(self, target, **_kwargs):
+            calls.append(("nodeclient", target))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def upgrade_from_wheel_bytes(self, **_kwargs):
+            calls.append(("upgrade", None))
+            return {"ok": True, "returncode": 0, "restart_scheduled": False}
+
+    monkeypatch.setattr(ctl, "InfoCenterClient", FakeInfoCenterClient)
+    monkeypatch.setattr(ctl, "NodeControlClient", FakeNodeControlClient)
+    parser = ctl.build_parser()
+    args = parser.parse_args(["upgrade-nodes", "--target", "10.0.0.1:50051", "--wheel", str(wheel), "--no-dedupe-host"])
+
+    assert ctl._cmd_upgrade_nodes(args) == 0
+    assert [item for item in calls if item[0] == "nodeclient"] == [
+        ("nodeclient", "http://10.0.0.2:50061"),
+        ("nodeclient", "http://10.0.0.2:50062"),
+    ]
+
+
+def test_upgrade_node_host_key_ignores_port():
+    assert ctl._upgrade_node_host_key("http://10.0.0.2:50061") == "10.0.0.2"
+    assert ctl._upgrade_node_host_key("10.0.0.2:50062") == "10.0.0.2"
+
+
 def test_ctl_parser_accepts_target_alias_for_core_and_dev_start_commands():
     parser = ctl.build_parser()
     args = parser.parse_args(["start", "--target", "127.0.0.1:51051"])

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
 
 from pycloud_parallel.controlplane.artifact import (
+    ArtifactExports,
     _default_entry_module_for_module,
     _normalize_artifact_input,
     _prepare_artifact,
@@ -37,6 +38,7 @@ def prepare_deployment_artifact(
     entry_callable: Any,
     package_format: str,
     managed_global_names: Optional[Sequence[str]],
+    export_methods: Optional[Sequence[str]] = None,
     resource_paths: Optional[Sequence[Any]] = None,
 ):
     module_source = source if inspect.ismodule(source) else None
@@ -61,6 +63,7 @@ def prepare_deployment_artifact(
         entry_module=effective_entry_module,
         entry_callable=entry_callable,
         package_format=effective_package_format,
+        exports=ArtifactExports.explicit(export_methods) if export_methods else None,
         managed_global_names=managed_global_names,
     )
     return _prepare_artifact(normalized_artifact, consumer_kind=consumer_kind)

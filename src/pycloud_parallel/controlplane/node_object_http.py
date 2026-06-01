@@ -26,7 +26,7 @@ from pycloud_parallel.controlplane.config import (
     validate_object_size_bytes,
 )
 from pycloud_parallel.controlplane.http_gateway import StreamingHttpResponse
-from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at
+from pycloud_parallel.controlplane.node.object_meta import touch_object_last_at_throttled
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.data.ref import (
     DataRef,
@@ -264,14 +264,14 @@ class NodeObjectHttpApp:
             return 400, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": str(exc)})
         try:
             if getattr(artifact, "storage_backend", "file") == "segment":
-                touch_object_last_at(self.state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.segment_path))
+                touch_object_last_at_throttled(self.state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.segment_path))
                 source_path = Path(artifact.segment_path)
                 if not source_path.exists():
                     raise FileNotFoundError(str(source_path))
                 source_offset = max(0, int(getattr(artifact, "segment_offset", 0) or 0))
                 source_length = max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes))
             else:
-                touch_object_last_at(self.state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.path))
+                touch_object_last_at_throttled(self.state.object_dir, object_id=artifact.object_id, fallback_path=Path(artifact.path))
                 source_path = Path(artifact.path)
                 if not source_path.exists():
                     raise FileNotFoundError(str(source_path))

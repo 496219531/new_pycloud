@@ -21,9 +21,17 @@ scripts/code_cache/
 scripts/logs/
 scripts/pids/
 gateway_stage/
+.pycloud_monitor/
 calc_asset_ratio/
 test_calc_assset_ratio.py
 run_sync_calc_asset_ratio.py
 run_sync_calc_asset_ratio_old.py
 *.csv
 calc_asset_ratio_job_module.py
+test_benchmark.py
+test_calc_asset_ratio.py
+.thread_audit/2026-06-01-线程健康巡检日志.md
+.thread_audit/2026-06-01-线程巡检汇总.html
+.thread_audit/线程巡检连续性.md
+.thread_audit/2026-06-01-calc_asset_ratio-node1-timeout-diagnosis.md
+.thread_audit/2026-06-01-admin-token-upgrade-nodes-交接摘要.md
