@@ -9,8 +9,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+src/*.egg-info/
 build/
 dist/
+dist/*.whl
+dist/*.tar.gz
+dist/*.zip
+*.egg
 
 # Local runtime artifacts
 code_cache/

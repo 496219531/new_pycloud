@@ -224,6 +224,8 @@ class NodeControlState(NodeRuntimeBase):
         self._pool_result_hook = InMemoryResultHook()
         self._task_pools: Dict[str, TaskPoolState] = {}
         self._execution_fenced = False
+        self._execution_fenced_reason = ""
+        self._execution_fenced_at: Optional[datetime] = None
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
         self._code_write_locks: Dict[str, threading.Lock] = {}
@@ -521,19 +523,26 @@ class NodeControlState(NodeRuntimeBase):
     def reset_execution_state(self, *, reason: str = "node instance reset required") -> str:
         old_executor = None
         node_instance_id = str(self.node_instance_id or "")
+        fenced_at = utc_now()
+        normalized_reason = str(reason or "node instance reset required").strip() or "node instance reset required"
         with self._lock:
+            service_count = len(self._services)
+            task_pool_count = len(self._task_pools)
+            pool_task_count = len(self._pool_tasks)
+            code_token_count = len(self._client_code_tokens)
+            managed_global_count = len(self._client_code_managed_globals)
             for session in self._services.values():
                 session.status = pb2.SERVICE_STATUS_STOPPED
                 session.executor_ready = False
                 session.alive_workers = 0
-                session.stop_reason = reason
-                session.lease_expire_at = utc_now()
+                session.stop_reason = normalized_reason
+                session.lease_expire_at = fenced_at
             for pool in self._task_pools.values():
                 pool.status = "STOPPED"
                 pool.executor_ready = False
                 pool.alive_workers = 0
-                pool.stop_reason = reason
-                pool.lease_expire_at = utc_now()
+                pool.stop_reason = normalized_reason
+                pool.lease_expire_at = fenced_at
             self._services.clear()
             self._task_pools.clear()
             self._pool_tasks.clear()
@@ -543,6 +552,8 @@ class NodeControlState(NodeRuntimeBase):
             self._service_worker_reserved = 0
             self._task_pool_worker_reserved = 0
             self._execution_fenced = True
+            self._execution_fenced_reason = normalized_reason
+            self._execution_fenced_at = fenced_at
             old_executor = self._executor_host
             self._executor_host = None
             self._cv.notify_all()
@@ -550,10 +561,24 @@ class NodeControlState(NodeRuntimeBase):
             with contextlib.suppress(Exception):
                 old_executor.close(shutdown_timeout_sec=2.0)
         logger.warning(
-            "[NodeControl] execution state reset node_id=%s node_instance_id=%s reason=%s",
+            "[NodeControl] execution state reset node_id=%s node_instance_id=%s fenced_at=%s reason=%s",
             self.node_id,
             node_instance_id,
-            str(reason or ""),
+            fenced_at.isoformat(),
+            normalized_reason,
+        )
+        logger.warning(
+            "[NodeControl] execution fence cleanup node_id=%s node_instance_id=%s "
+            "services_cleared=%d task_pools_cleared=%d pool_tasks_cleared=%d "
+            "code_tokens_cleared=%d managed_globals_cleared=%d executor_closed=%s",
+            self.node_id,
+            node_instance_id,
+            service_count,
+            task_pool_count,
+            pool_task_count,
+            code_token_count,
+            managed_global_count,
+            "yes" if old_executor is not None else "no",
         )
         return node_instance_id
 
@@ -908,6 +933,24 @@ class NodeControlState(NodeRuntimeBase):
     def _executor_host_required(self) -> bool:
         return (not bool(getattr(self, "_execution_fenced", False))) and bool(
             self.enable_internal_executor or self.enable_service_session
+        )
+
+    @property
+    def execution_fenced(self) -> bool:
+        return bool(getattr(self, "_execution_fenced", False))
+
+    @property
+    def can_accept_service_deploy(self) -> bool:
+        return bool(getattr(self, "accept_service_deploy", True)) and not self.execution_fenced
+
+    def execution_fence_message(self) -> str:
+        reason = str(getattr(self, "_execution_fenced_reason", "") or "").strip() or "unknown"
+        fenced_at = getattr(self, "_execution_fenced_at", None)
+        fenced_at_text = fenced_at.isoformat() if isinstance(fenced_at, datetime) else "unknown"
+        return (
+            "node instance execution is fenced; restart NodeControl to create a new node_instance_id; "
+            f"node_id={self.node_id} node_instance_id={self.node_instance_id} "
+            f"fenced_at={fenced_at_text} reason={reason}"
         )
 
     def _executor_host_alive_locked(self) -> bool:
@@ -2138,7 +2181,7 @@ class NodeControlState(NodeRuntimeBase):
         service_id: str = "",
     ) -> ServiceSession:
         if bool(getattr(self, "_execution_fenced", False)):
-            raise RuntimeError("node instance execution is fenced; restart NodeControl to create a new node_instance_id")
+            raise RuntimeError(self.execution_fence_message())
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(
@@ -2385,7 +2428,7 @@ class NodeControlState(NodeRuntimeBase):
         chunks: Iterable[bytes],
     ) -> TaskPoolState:
         if bool(getattr(self, "_execution_fenced", False)):
-            raise RuntimeError("node instance execution is fenced; restart NodeControl to create a new node_instance_id")
+            raise RuntimeError(self.execution_fence_message())
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(
@@ -3822,6 +3865,14 @@ class NodeControlState(NodeRuntimeBase):
             "task_pool_worker_capacity": self.task_pool_worker_capacity,
             "task_pool_worker_used": task_pool_worker_used,
             "service_timing_metadata": service_timing_metadata,
+            "execution_fenced": bool(getattr(self, "_execution_fenced", False)),
+            "accept_service_deploy": self.can_accept_service_deploy,
+            "execution_fenced_reason": str(getattr(self, "_execution_fenced_reason", "") or ""),
+            "execution_fenced_at": (
+                self._execution_fenced_at.isoformat()
+                if isinstance(getattr(self, "_execution_fenced_at", None), datetime)
+                else ""
+            ),
         }
 
     @property

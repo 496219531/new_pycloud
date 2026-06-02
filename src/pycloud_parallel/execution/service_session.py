@@ -661,8 +661,6 @@ def _service_iter_item_calls(
                     failed += 1
                     last_error = str(exc)
                 completed += 1
-                while len(pending) < limit and _submit_next():
-                    pass
                 reporter.emit(
                     phase="running",
                     completed=completed,
@@ -673,6 +671,8 @@ def _service_iter_item_calls(
                     last_error=last_error,
                 )
                 yield item
+                while len(pending) < limit and _submit_next():
+                    pass
             reporter.done(completed=completed, succeeded=succeeded, failed=failed, submitted=submitted, last_error=last_error)
 
     return _generator()
@@ -3718,6 +3718,7 @@ class Service(ServiceExecutionSession):
             pass
 
     def __post_init__(self, policy_id: str = "") -> None:
+        self._keepalive_retry_forever = True
         self._init_execution_session_state()
         self._policy_id = str(policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal")
         if self.effective_policy is None:
@@ -4147,7 +4148,17 @@ class Service(ServiceExecutionSession):
     def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
         excluded = exclude or set()
         normalized_strategy, profile = resolve_service_strategy(strategy)
-        all_candidates = [nid for nid in sorted(self.sessions.keys()) if nid not in excluded]
+        raw_active_replica_ids = getattr(self, "_active_replica_ids", None)
+        active_replica_ids = (
+            {str(node_id) for node_id in raw_active_replica_ids if str(node_id)}
+            if raw_active_replica_ids is not None
+            else None
+        )
+        all_candidates = [
+            nid
+            for nid in sorted(self.sessions.keys())
+            if nid not in excluded and (active_replica_ids is None or nid in active_replica_ids)
+        ]
         candidates = []
         state_rank: Dict[str, int] = {}
         for node_id in all_candidates:
@@ -4403,15 +4414,37 @@ class Service(ServiceExecutionSession):
         """
         if not self.sessions:
             raise RuntimeError("Service session has no active replicas")
+        raw_active_replica_ids = getattr(self, "_active_replica_ids", None)
+        active_replica_ids = (
+            {str(node_id) for node_id in raw_active_replica_ids if str(node_id)}
+            if raw_active_replica_ids is not None
+            else None
+        )
 
-        nodes = list(self.sessions.keys())
+        session_node_ids = list(self.sessions.keys())
+        nodes = [
+            node_id
+            for node_id in session_node_ids
+            if active_replica_ids is None or node_id in active_replica_ids
+        ]
+        if not nodes:
+            raise RuntimeError("Service session has no active replicas")
         # 如果是单个 payload，复制给所有节点
         if isinstance(payloads, dict):
             payloads = [dict(payloads) for _ in nodes]
         elif isinstance(payloads, list):
-            if len(payloads) != len(nodes):
-                raise ValueError(f"payload list length ({len(payloads)}) must match node count ({len(nodes)})")
-            payloads = [dict(payload) for payload in payloads]
+            if active_replica_ids is not None:
+                if len(payloads) != len(session_node_ids):
+                    raise ValueError(f"payload list length ({len(payloads)}) must match node count ({len(session_node_ids)})")
+                payloads = [
+                    dict(payload)
+                    for node_id, payload in zip(session_node_ids, payloads)
+                    if node_id in active_replica_ids
+                ]
+            else:
+                if len(payloads) != len(nodes):
+                    raise ValueError(f"payload list length ({len(payloads)}) must match node count ({len(nodes)})")
+                payloads = [dict(payload) for payload in payloads]
 
         loop = asyncio.get_running_loop()
         semaphore = asyncio.Semaphore(max_concurrency)

@@ -3,10 +3,13 @@ from __future__ import annotations
 """Background registrar for NodeControl -> InfoCenter heartbeats."""
 
 import logging
+import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
-from typing import Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Optional
 from importlib import metadata as importlib_metadata
 from urllib.error import URLError
 
@@ -14,6 +17,13 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = str(os.getenv(name, "") or "").strip().lower()
+    if not value:
+        return bool(default)
+    return value not in {"0", "false", "no", "off"}
 
 
 def _is_expected_connect_failure(exc: BaseException) -> bool:
@@ -47,6 +57,22 @@ def _pycloud_version() -> str:
         return "unknown"
 
 
+def _restart_current_process_delayed(delay_sec: float = 1.0) -> None:
+    def _restart() -> None:
+        time.sleep(max(0.1, float(delay_sec)))
+        args = [sys.executable, *sys.argv]
+        try:
+            if os.name == "nt":
+                creationflags = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
+                subprocess.Popen(args, cwd=os.getcwd(), env=os.environ.copy(), close_fds=False, creationflags=creationflags)
+            else:
+                subprocess.Popen(args, cwd=os.getcwd(), env=os.environ.copy(), close_fds=True)
+        finally:
+            os._exit(0)
+
+    threading.Thread(target=_restart, name="node-registrar-fence-restart", daemon=True).start()
+
+
 class NodeInfoCenterRegistrar:
     def __init__(
         self,
@@ -62,6 +88,9 @@ class NodeInfoCenterRegistrar:
         metadata: Optional[Dict[str, str]] = None,
         fallback_heartbeat_sec: int = 10,
         rpc_timeout_sec: float = 5.0,
+        restart_on_fence: Optional[bool] = None,
+        restart_delay_sec: float = 1.0,
+        restart_callback: Optional[Callable[[float], None]] = None,
     ) -> None:
         self.infocenter_addr = infocenter_addr
         self.node_id = node_id
@@ -75,6 +104,9 @@ class NodeInfoCenterRegistrar:
         self.metadata = dict(metadata or {})
         self.fallback_heartbeat_sec = max(1, int(fallback_heartbeat_sec))
         self.rpc_timeout_sec = max(0.5, float(rpc_timeout_sec))
+        self.restart_on_fence = _env_bool("PYCLOUD_NODE_RESTART_ON_FENCE", True) if restart_on_fence is None else bool(restart_on_fence)
+        self.restart_delay_sec = max(0.1, float(restart_delay_sec or 1.0))
+        self._restart_callback = restart_callback or _restart_current_process_delayed
 
         self._client = InfoCenterClient(self.infocenter_addr, timeout_sec=self.rpc_timeout_sec)
         self._stop_event = threading.Event()
@@ -228,21 +260,55 @@ class NodeInfoCenterRegistrar:
         finally:
             self._stop_event.set()
             self._wake_event.set()
+        if self.restart_on_fence:
+            logger.warning(
+                "[Registrar] scheduling NodeControl restart after fence node_id=%s node_instance_id=%s delay_sec=%.3f reason=%s",
+                self.node_id,
+                self.node_instance_id,
+                self.restart_delay_sec,
+                str(reason or "node_instance_id fenced"),
+            )
+            self._restart_callback(self.restart_delay_sec)
+        else:
+            logger.warning(
+                "[Registrar] NodeControl restart after fence disabled node_id=%s node_instance_id=%s reason=%s",
+                self.node_id,
+                self.node_instance_id,
+                str(reason or "node_instance_id fenced"),
+            )
 
     def _self_fence_if_lease_expired(self, reason: str) -> bool:
         with self._sync_lock:
             last_success = float(self._last_successful_sync_at or 0.0)
             lease_ttl = max(1.0, float(self._lease_ttl_sec or self.fallback_heartbeat_sec))
-            if not last_success or (time.monotonic() - last_success) <= lease_ttl:
+            now_monotonic = time.monotonic()
+            elapsed_since_success = now_monotonic - last_success if last_success else 0.0
+            if not last_success or elapsed_since_success <= lease_ttl:
                 return False
             self._registered = False
+        detailed_reason = (
+            f"{reason or 'infocenter heartbeat lease expired'}; "
+            f"infocenter={self.infocenter_addr} control_addr={self.control_addr or '-'} "
+            f"last_success_age_sec={elapsed_since_success:.3f} lease_ttl_sec={lease_ttl:.3f} "
+            f"fallback_heartbeat_sec={self.fallback_heartbeat_sec} next_heartbeat_sec={self._next_hb_sec} "
+            f"rpc_timeout_sec={self.rpc_timeout_sec}"
+        )
         logger.warning(
-            "[Registrar] node self fence node_id=%s node_instance_id=%s reason=%s",
+            "[Registrar] node self fence node_id=%s node_instance_id=%s "
+            "infocenter=%s control_addr=%s last_success_age_sec=%.3f lease_ttl_sec=%.3f "
+            "fallback_heartbeat_sec=%s next_heartbeat_sec=%s rpc_timeout_sec=%.3f reason=%s",
             self.node_id,
             self.node_instance_id,
+            self.infocenter_addr,
+            self.control_addr or "-",
+            elapsed_since_success,
+            lease_ttl,
+            self.fallback_heartbeat_sec,
+            self._next_hb_sec,
+            self.rpc_timeout_sec,
             str(reason or "infocenter heartbeat lease expired"),
         )
-        self._reset_state_after_fence(reason or "infocenter heartbeat lease expired")
+        self._reset_state_after_fence(detailed_reason)
         return True
 
     def _register_once(self) -> bool:
@@ -250,8 +316,10 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(snapshot.get("service_timing_metadata", {}))
         metadata["pycloud_version"] = self._pycloud_version()
-        accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
+        accept_service_deploy = bool(snapshot.get("accept_service_deploy", getattr(self.state, "accept_service_deploy", True)))
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
+        if bool(snapshot.get("execution_fenced", False)):
+            metadata["execution_fenced"] = "true"
         task_pool_reports = list(snapshot.get("task_pool_reports") or [])
         service_reports = list(snapshot.get("service_reports") or [])
         active_runtimes = list(snapshot.get("active_runtimes") or [])
@@ -296,12 +364,19 @@ class NodeInfoCenterRegistrar:
             if bool(resp.get("reset_required", False)):
                 reason = str(resp.get("reason", resp.get("error", "")) or "node_instance_id fenced")
                 logger.warning(
-                    "[Registrar] node register reset required node_id=%s node_instance_id=%s reason=%s",
+                    "[Registrar] node register reset required node_id=%s node_instance_id=%s "
+                    "infocenter=%s control_addr=%s reason=%s response=%s",
                     self.node_id,
                     self.node_instance_id,
+                    self.infocenter_addr,
+                    self.control_addr or "-",
                     reason,
+                    resp,
                 )
-                self._reset_state_after_fence(reason)
+                self._reset_state_after_fence(
+                    f"register reset required; infocenter={self.infocenter_addr} "
+                    f"control_addr={self.control_addr or '-'} reason={reason}"
+                )
             return False
         with self._sync_lock:
             self._registered = True
@@ -325,8 +400,10 @@ class NodeInfoCenterRegistrar:
         metadata = dict(self.metadata)
         metadata.update(snapshot.get("service_timing_metadata", {}))
         metadata["pycloud_version"] = self._pycloud_version()
-        accept_service_deploy = bool(getattr(self.state, "accept_service_deploy", True))
+        accept_service_deploy = bool(snapshot.get("accept_service_deploy", getattr(self.state, "accept_service_deploy", True)))
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
+        if bool(snapshot.get("execution_fenced", False)):
+            metadata["execution_fenced"] = "true"
         task_pool_reports = list(snapshot.get("task_pool_reports") or [])
         service_reports = list(snapshot.get("service_reports") or [])
         active_runtimes = list(snapshot.get("active_runtimes") or [])
@@ -350,7 +427,7 @@ class NodeInfoCenterRegistrar:
         resp = self._client.heartbeat_node(
             node_id=self.node_id,
             node_instance_id=self.node_instance_id,
-            healthy=True,
+            healthy=not bool(snapshot.get("execution_fenced", False)),
             metrics={
                 "queued": metrics["queued"],
                 "inflight": metrics["inflight"],
@@ -375,14 +452,22 @@ class NodeInfoCenterRegistrar:
             if not resp.get("accepted", False):
                 self._registered = False
                 logger.warning(
-                    "[Registrar] node heartbeat rejected node_id=%s node_instance_id=%s reset_required=%s reason=%s",
+                    "[Registrar] node heartbeat rejected node_id=%s node_instance_id=%s "
+                    "infocenter=%s control_addr=%s reset_required=%s reason=%s response=%s",
                     self.node_id,
                     self.node_instance_id,
+                    self.infocenter_addr,
+                    self.control_addr or "-",
                     bool(resp.get("reset_required", False)),
                     str(resp.get("reason", resp.get("error", "")) or ""),
+                    resp,
                 )
                 if bool(resp.get("reset_required", False)):
-                    self._reset_state_after_fence(str(resp.get("reason", resp.get("error", "")) or "node_instance_id fenced"))
+                    reason = str(resp.get("reason", resp.get("error", "")) or "node_instance_id fenced")
+                    self._reset_state_after_fence(
+                        f"heartbeat reset required; infocenter={self.infocenter_addr} "
+                        f"control_addr={self.control_addr or '-'} reason={reason}"
+                    )
                 return False
             self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
             self._lease_ttl_sec = max(1, int(resp.get("lease_ttl_sec", self._lease_ttl_sec) or self._lease_ttl_sec))

@@ -246,12 +246,15 @@ def local_service_metadata_path(service_name: str) -> Path:
     return _registry_dir() / f"{_service_key(service_name)}.json"
 
 
-def _local_service_address(service_name: str) -> tuple[str, str]:
+def _local_service_address(service_name: str, *, ipc_token: str = "") -> tuple[str, str]:
     key = _service_key(service_name)
+    token_suffix = str(ipc_token or "").strip()[:8]
     if os.name == "nt":
-        return rf"\\.\pipe\pycloud-parallel-{key[:32]}", "AF_PIPE"
+        suffix = f"-{token_suffix}" if token_suffix else ""
+        return rf"\\.\pipe\pycloud-parallel-{key[:32]}{suffix}", "AF_PIPE"
     socket_root = Path("/tmp") if Path("/tmp").exists() else Path(tempfile.gettempdir())
-    return str(socket_root / f"pycloud-{key[:24]}.sock"), "AF_UNIX"
+    suffix = f"-{token_suffix}" if token_suffix else ""
+    return str(socket_root / f"pycloud-{key[:24]}{suffix}.sock"), "AF_UNIX"
 
 
 def _read_metadata(service_name: str) -> Dict[str, object]:
@@ -513,9 +516,9 @@ class LocalServiceIpcServer:
     def __init__(self, *, node: Any, service_name: str) -> None:
         self.node = node
         self.service_name = str(service_name or "").strip()
-        self.address, self.family = _local_service_address(self.service_name)
         self.authkey = os.urandom(32) if _local_ipc_auth_enabled() else None
         self.ipc_token = uuid.uuid4().hex
+        self.address, self.family = _local_service_address(self.service_name, ipc_token=self.ipc_token)
         self._listener: Optional[Listener] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None

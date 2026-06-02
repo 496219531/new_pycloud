@@ -4670,6 +4670,11 @@ def test_nodecontrol_reset_fences_execution_until_process_restart(tmp_path):
         assert state._executor_host is not None  # noqa: SLF001
         state.reset_execution_state(reason="test fence")
         assert state._executor_host is None  # noqa: SLF001
+        assert state.execution_fenced is True
+        assert state.can_accept_service_deploy is False
+        snapshot = state.registrar_snapshot()
+        assert snapshot["execution_fenced"] is True
+        assert snapshot["accept_service_deploy"] is False
 
         with state._cv:  # noqa: SLF001
             state._ensure_executor_host_alive_locked()  # noqa: SLF001

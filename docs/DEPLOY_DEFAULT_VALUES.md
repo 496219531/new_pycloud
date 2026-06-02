@@ -89,9 +89,11 @@ group = Service.deploy(
 
 1. 如果初次部署目标是 3 个 node，但当前只成功部署 2 个，owner 会先返回可用的 2 个。
 2. keepalive 后台会继续按目标副本数尝试补齐。
-3. 失败副本按 `node_instance_id` 记录并跳过，不按可重复的 `node_id` 永久拉黑。
-4. 如果同一个 `node_id` 重启后获得新的 `node_instance_id`，它会重新进入补偿候选。
-5. 创建失败或 host 失败的原因会在 InfoCenter `/ops` 的 `failure_reason` 中显示。
+3. `Service.deploy(...)` 返回的是长驻 owner handle；与一次性的 `Service.connect(...)` 调用不同，deploy owner 的 keepalive 遇到临时服务端异常不会直接停止，而是继续重试。
+4. 已判定失败的副本不会继续占用目标副本数，因此补偿逻辑可以重新部署到恢复后的同一实例，或部署到重启后新的 `node_instance_id`。
+5. 失败副本按 `node_instance_id` 记录并跳过，不按可重复的 `node_id` 永久拉黑。
+6. 如果同一个 `node_id` 重启后获得新的 `node_instance_id`，它会重新进入补偿候选。
+7. 创建失败或 host 失败的原因会在 InfoCenter `/ops` 的 `failure_reason` 中显示。
 
 调度状态边界：
 

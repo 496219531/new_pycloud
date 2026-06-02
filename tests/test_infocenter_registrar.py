@@ -172,6 +172,49 @@ def test_node_registrar_advertises_http_control_capability(tmp_path):
         info_server.stop()
 
 
+def test_node_registrar_marks_fenced_node_unhealthy_and_not_deployable(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    node_state = NodeControlState(
+        node_id="node-fenced-reg",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "code_cache_fenced_reg"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        control_base_url="http://127.0.0.1:18062",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_server.base_url,
+        node_id="node-fenced-reg",
+        control_addr="127.0.0.1:50062",
+        state=node_state,
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        fallback_heartbeat_sec=1,
+    )
+
+    try:
+        assert registrar.sync_now() is True
+        node_state.reset_execution_state(reason="test fence")
+        assert registrar.sync_now() is True
+
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as infocenter:
+            healthy_nodes = infocenter.list_nodes(healthy_only=True, tags=["compute"], limit=20)
+            all_nodes = infocenter.list_nodes(healthy_only=False, tags=["compute"], limit=20)
+
+        assert healthy_nodes == []
+        assert len(all_nodes) == 1
+        assert all_nodes[0].healthy is False
+        assert all_nodes[0].accept_service_deploy is False
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
 def test_ops_page_merges_duplicate_services_with_same_endpoint():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(
@@ -879,6 +922,7 @@ def test_node_registrar_handles_fenced_register_response(tmp_path):
         tags=["compute"],
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=5.0,
+        restart_on_fence=False,
     )
 
     try:
@@ -890,6 +934,96 @@ def test_node_registrar_handles_fenced_register_response(tmp_path):
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
         assert node_state.service_report_payloads(include_stopped=True) == []
         assert node_state.task_pool_reports() == {}
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
+def test_node_registrar_schedules_restart_after_fenced_register_response(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    node_state = NodeControlState(
+        node_id="node-fenced-reg-restart",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_fenced_reg_restart"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    restart_calls = []
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_target,
+        node_id="node-fenced-reg-restart",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        tags=["compute"],
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=5.0,
+        restart_delay_sec=1.5,
+        restart_callback=lambda delay_sec: restart_calls.append(delay_sec),
+    )
+
+    try:
+        assert registrar.sync_now() is True
+        info_state.mark_node_lost(node_state.node_instance_id, reason="test lost")
+        registrar._registered = False  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.execution_fenced is True
+        assert restart_calls == [1.5]
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
+def test_node_registrar_schedules_restart_after_fenced_heartbeat_response(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    node_state = NodeControlState(
+        node_id="node-fenced-heartbeat-restart",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_fenced_heartbeat_restart"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    restart_calls = []
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_target,
+        node_id="node-fenced-heartbeat-restart",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        tags=["compute"],
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=5.0,
+        restart_delay_sec=1.5,
+        restart_callback=lambda delay_sec: restart_calls.append(delay_sec),
+    )
+
+    try:
+        assert registrar.sync_now() is True
+        info_state.mark_node_lost(node_state.node_instance_id, reason="test lost")
+        registrar._registered = True  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.execution_fenced is True
+        assert restart_calls == [1.5]
     finally:
         registrar.close()
         node_state.close()
@@ -915,6 +1049,7 @@ def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
         queue_capacity=4,
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=0.5,
+        restart_on_fence=False,
     )
 
     try:
@@ -927,6 +1062,45 @@ def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
         assert node_state.service_report_payloads(include_stopped=True) == []
         assert node_state.task_pool_reports() == {}
+    finally:
+        registrar.close()
+        node_state.close()
+
+
+def test_node_registrar_schedules_restart_after_self_fence_by_default(tmp_path):
+    node_state = NodeControlState(
+        node_id="node-self-fence-restart",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_self_fence_restart"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    restart_calls = []
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-self-fence-restart",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+        restart_delay_sec=2.0,
+        restart_callback=lambda delay_sec: restart_calls.append(delay_sec),
+    )
+
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now - 10.0  # noqa: SLF001
+        registrar._lease_ttl_sec = 1  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert restart_calls == [2.0]
+        assert node_state.execution_fenced is True
     finally:
         registrar.close()
         node_state.close()

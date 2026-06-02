@@ -1500,6 +1500,24 @@ def test_service_connect_local_missing_service_fails_immediately(tmp_path, monke
     assert time.monotonic() - started < 0.5
 
 
+def test_service_local_ipc_address_changes_between_restarts(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane.local_ipc import LocalServiceIpcServer
+
+    monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
+
+    class _FakeNode:
+        node_id = "fake-local-node"
+        node_instance_id = "fake-local-node-inst"
+        object_dir = tmp_path / "objects"
+        methods = ["run"]
+
+    first = LocalServiceIpcServer(node=_FakeNode(), service_name="local-address-restart")
+    second = LocalServiceIpcServer(node=_FakeNode(), service_name="local-address-restart")
+
+    assert first.address != second.address
+    assert first.family == second.family
+
+
 def test_service_local_ipc_client_reuses_thread_connection(monkeypatch):
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
     from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
@@ -3626,6 +3644,409 @@ class TestOwnerServiceFacade:
         assert result is None
         assert elapsed < 0.5
         assert group._closed is False  # noqa: SLF001
+
+    def test_owner_keepalive_retries_after_transient_service_failure(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _FlakyReplica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc-flaky"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self):
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary server unavailable")
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _FlakyReplica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and (
+                replica.calls < 2 or "node-1" not in group._active_replica_ids  # noqa: SLF001
+            ):
+                time.sleep(0.02)
+            assert replica.calls >= 2
+            assert "node-1" in group._active_replica_ids  # noqa: SLF001
+            assert group.failed is False
+            assert replica.failed is False
+            assert "node-1" not in group.failures
+            with group._hb_lock:  # noqa: SLF001
+                assert group._hb_thread is not None and group._hb_thread.is_alive()  # noqa: SLF001
+        finally:
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_keepalive_failed_replica_does_not_count_as_active_while_retrying(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _RecoveringReplica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc-recovering"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self):
+                self.calls = 0
+                self.fail_first = True
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                if self.fail_first:
+                    self.fail_first = False
+                    raise RuntimeError("temporary server unavailable")
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _RecoveringReplica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+
+        group._record_heartbeat_failure("node-1", replica, RuntimeError("temporary server unavailable"))  # noqa: SLF001
+
+        assert "node-1" not in group._active_replica_ids  # noqa: SLF001
+        assert group.failed is False
+
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and (
+                replica.calls < 2 or "node-1" not in group._active_replica_ids  # noqa: SLF001
+            ):
+                time.sleep(0.02)
+            assert replica.calls >= 2
+            assert "node-1" in group._active_replica_ids  # noqa: SLF001
+            assert replica.failed is False
+            assert "node-1" not in group.failures
+        finally:
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_keepalive_ignores_stale_pending_replica_after_redeploy(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self, *, block: bool):
+                self.block = bool(block)
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                if self.block:
+                    time.sleep(1.5)
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        stale = _Replica(block=True)
+        fresh = _Replica(block=False)
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": stale},
+            nodes={},
+        )
+
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and stale.calls < 1:
+                time.sleep(0.02)
+            group.sessions["node-1"] = fresh
+            group._active_replica_ids.add("node-1")  # noqa: SLF001
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and fresh.calls < 1:
+                time.sleep(0.02)
+            assert fresh.calls >= 1
+            assert fresh.failed is False
+        finally:
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_calls_skip_failed_inactive_replica(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+            worker_count = 1
+
+            def __init__(self, node_id: str):
+                self.node_id = node_id
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def get_status(self):
+                return SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1)
+
+            def call(self, _method, _payload, **_kwargs):
+                self.calls += 1
+                return {"ok": True, "data": self.node_id}
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        failed = _Replica("node-failed")
+        healthy = _Replica("node-healthy")
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-failed": failed, "node-healthy": healthy},
+            nodes={},
+        )
+        group._record_heartbeat_failure("node-failed", failed, RuntimeError("heartbeat timeout"))  # noqa: SLF001
+
+        node_id, resp = group.call_balanced("run", {}, refresh_status=True)
+
+        assert node_id == "node-healthy"
+        assert resp["data"] == "node-healthy"
+        assert failed.calls == 0
+        assert healthy.calls == 1
+
+    def test_owner_calls_fail_fast_when_all_replicas_inactive(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+            worker_count = 1
+
+            def __init__(self):
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def call(self, _method, _payload, **_kwargs):
+                self.calls += 1
+                return {"ok": True}
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+        group._record_heartbeat_failure("node-1", replica, RuntimeError("heartbeat timeout"))  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match="no available service node"):
+            group.call_balanced("run", {}, refresh_status=False)
+        assert replica.calls == 0
+
+    def test_owner_broadcast_skips_failed_inactive_replica(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+            worker_count = 1
+
+            def __init__(self, node_id: str):
+                self.node_id = node_id
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def call(self, _method, _payload, **_kwargs):
+                self.calls += 1
+                return {"ok": True, "data": self.node_id}
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        failed = _Replica("node-failed")
+        healthy = _Replica("node-healthy")
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-failed": failed, "node-healthy": healthy},
+            nodes={},
+        )
+        group._record_heartbeat_failure("node-failed", failed, RuntimeError("heartbeat timeout"))  # noqa: SLF001
+
+        results = asyncio.run(group.acall_all("run", {}))
+
+        assert results == [("node-healthy", {"ok": True, "data": "node-healthy"}, None)]
+        assert failed.calls == 0
+        assert healthy.calls == 1
+
+    def test_owner_broadcast_list_payloads_follow_active_replica_filter(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+            worker_count = 1
+
+            def __init__(self, node_id: str):
+                self.node_id = node_id
+                self.payloads = []
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def call(self, _method, payload, **_kwargs):
+                self.payloads.append(dict(payload))
+                return {"ok": True, "data": {"node": self.node_id, **dict(payload)}}
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        failed = _Replica("node-failed")
+        healthy = _Replica("node-healthy")
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-failed": failed, "node-healthy": healthy},
+            nodes={},
+        )
+        group._record_heartbeat_failure("node-failed", failed, RuntimeError("heartbeat timeout"))  # noqa: SLF001
+
+        results = asyncio.run(group.acall_all("run", [{"x": 1}, {"x": 2}]))
+
+        assert results == [("node-healthy", {"ok": True, "data": {"node": "node-healthy", "x": 2}}, None)]
+        assert failed.payloads == []
+        assert healthy.payloads == [{"x": 2}]
 
     def test_join_keyboard_interrupt_closes_services_with_reason(self, monkeypatch):
         from pycloud_parallel.execution.service_session import Service

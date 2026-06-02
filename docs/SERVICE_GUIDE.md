@@ -76,7 +76,7 @@ group = Service.deploy(
 2. 部署成功
 3. 部分节点部署失败
 4. 无可用 node / 无可调度 node
-5. keepalive 失败导致 owner 退出 `join()`
+5. keepalive 记录失败节点，并由长驻 owner 继续重试或触发动态补偿
 
 节点侧现在还会记录服务调用 timing：
 
@@ -146,9 +146,10 @@ group.shutdown_services(reason="owner shutdown")
 1. keepalive 只在 owner 侧部署路径自动开启
 2. `join()` 用于把 owner 进程挂住
 3. `Ctrl+C` 是正常退出路径
-4. 如果所有已部署 session 的 keepalive 连续失败，`join()` 会退出，并在 `stderr` 打印失败节点与原因
+4. `Service.deploy(...)` 的 owner keepalive 面向长驻部署端：遇到临时服务端异常、网络抖动或节点重启，不会直接让 `join()` 退出，而是记录失败并继续重试
 5. 如果部署目标数未满足，owner keepalive 会定期尝试动态补偿；失败的旧实例不会占用目标副本数
-6. 如果需要动态扩容，应由同一个部署端提高 `node_count` 后重启/恢复 deploy session；快速重启会接回本 owner 已经部署的同 code version 服务，再由 keepalive 补齐新增节点
+6. 如果同一 `node_instance_id` 上的旧 heartbeat 卡住，但该节点已被重新部署为新 session，owner 会忽略旧 pending heartbeat，继续维护新 session
+7. 如果需要动态扩容，应由同一个部署端提高 `node_count` 后重启/恢复 deploy session；快速重启会接回本 owner 已经部署的同 code version 服务，再由 keepalive 补齐新增节点
 
 更多边界说明见：
 

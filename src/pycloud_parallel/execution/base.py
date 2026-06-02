@@ -58,6 +58,7 @@ class ExecutionSessionBase:
         self._hb_lock = threading.Lock()
         self._keepalive_seq = 0
         self._keepalive_failure_counts = {}
+        self._keepalive_retry_forever = bool(getattr(self, "_keepalive_retry_forever", False))
         self._active_replica_ids = set(self.replicas.keys())
         if hasattr(self, "_active_nodes"):
             self._active_nodes = self._active_replica_ids
@@ -130,7 +131,10 @@ class ExecutionSessionBase:
         return max(1, int(getattr(replica, "heartbeat_failure_threshold", 1) or 1))
 
     def _heartbeat_max_workers(self) -> int:
-        return max(1, min(32, len(self.replicas)))
+        replica_count = max(1, len(self.replicas))
+        if bool(getattr(self, "_keepalive_retry_forever", False)):
+            return max(4, min(32, replica_count * 2))
+        return max(1, min(32, replica_count))
 
     def _heartbeat_replica(self, node_id: str, replica: ExecutionReplicaHandle, *, seq: int) -> Any:
         del node_id
@@ -160,6 +164,7 @@ class ExecutionSessionBase:
         if hasattr(replica, "last_error"):
             replica.last_error = ""
         self.failures.pop(node_id, None)
+        self._active_replica_ids.add(node_id)
 
     def _mark_replica_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         message = repr(exc)
@@ -188,6 +193,10 @@ class ExecutionSessionBase:
             while not self._hb_stop.is_set():
                 now = time.monotonic()
                 for node_id, (future, replica, started_at, last_pending_report_at) in list(pending.items()):
+                    if self.replicas.get(node_id) is not replica:
+                        future.cancel()
+                        pending.pop(node_id, None)
+                        continue
                     if not future.done():
                         max_pending_sec = max(1.0, float(getattr(replica, "heartbeat_timeout_sec", 1) or 1))
                         if now - started_at >= max_pending_sec and now - last_pending_report_at >= max_pending_sec:
@@ -202,7 +211,7 @@ class ExecutionSessionBase:
                                 replica,
                                 TimeoutError(f"heartbeat pending for {now - started_at:.3f}s"),
                             )
-                            if node_id in self._active_replica_ids:
+                            if bool(getattr(self, "_keepalive_retry_forever", False)):
                                 pending[node_id] = (future, replica, started_at, now)
                             else:
                                 future.cancel()
@@ -228,7 +237,7 @@ class ExecutionSessionBase:
                 self._keepalive_seq += 1
                 replicas = self.replicas
                 active_ids = list(self._active_replica_ids)
-                if len(active_ids) == 1 and not pending:
+                if len(active_ids) == 1 and not pending and not bool(getattr(self, "_keepalive_retry_forever", False)):
                     node_id = active_ids[0]
                     replica = replicas.get(node_id)
                     if replica is None:
@@ -245,8 +254,16 @@ class ExecutionSessionBase:
                                 exc,
                             )
                             self._record_heartbeat_failure(node_id, replica, exc)
-                for node_id in list(self._active_replica_ids):
-                    if len(active_ids) == 1 and not pending:
+                heartbeat_ids = list(self._active_replica_ids)
+                if bool(getattr(self, "_keepalive_retry_forever", False)):
+                    heartbeat_ids = list(dict.fromkeys([*heartbeat_ids, *list(replicas.keys())]))
+                for node_id in heartbeat_ids:
+                    if (
+                        len(active_ids) == 1
+                        and not pending
+                        and node_id == active_ids[0]
+                        and not bool(getattr(self, "_keepalive_retry_forever", False))
+                    ):
                         continue
                     if node_id in pending:
                         continue
@@ -261,9 +278,10 @@ class ExecutionSessionBase:
                         time.monotonic(),
                     )
                 if not self._active_replica_ids:
-                    self.failed = True
-                    self._hb_stop.set()
-                    break
+                    if not (bool(getattr(self, "_keepalive_retry_forever", False)) and self.replicas):
+                        self.failed = True
+                        self._hb_stop.set()
+                        break
                 hook = getattr(self, "_after_keepalive_tick", None)
                 if callable(hook):
                     with contextlib.suppress(Exception):
