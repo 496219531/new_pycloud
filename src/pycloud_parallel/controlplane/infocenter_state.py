@@ -378,11 +378,16 @@ class InfoCenterState:
         node_instance_id = str(getattr(state, "node_instance_id", "") or "").strip()
         if not node_instance_id:
             return
+        normalized_reason = str(reason or "node_instance_id fenced")
+        existing = self._fenced_instances.get(node_instance_id)
+        if existing is not None and str(getattr(existing, "reason", "") or "").strip():
+            if normalized_reason == "node heartbeat timeout":
+                return
         fenced_at = now or utc_now()
         self._fenced_instances[node_instance_id] = FencedNodeInstance(
             node_instance_id=node_instance_id,
             fenced_at=fenced_at,
-            reason=str(reason or "node_instance_id fenced"),
+            reason=normalized_reason,
         )
 
     def _fence_if_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> None:
@@ -421,6 +426,14 @@ class InfoCenterState:
             return False
         with self._lock:
             return normalized_instance in self._fenced_instances
+
+    def fenced_instance_reason(self, node_instance_id: str) -> str:
+        normalized_instance = str(node_instance_id or "").strip()
+        if not normalized_instance:
+            return ""
+        with self._lock:
+            entry = self._fenced_instances.get(normalized_instance)
+            return str(getattr(entry, "reason", "") or "") if entry is not None else ""
 
     def _data_ref_is_expired_locked(self, entry: DataRegistryEntry, *, now: Optional[datetime] = None) -> bool:
         current_time = now or utc_now()
@@ -470,6 +483,35 @@ class InfoCenterState:
                 }
                 self._reindex_node_services_locked(old_state, previous_names=previous_service_names)
                 self._fence_instance_locked(old_state, reason="node control_addr replaced")
+
+    def control_addr_conflicting_instances(
+        self,
+        *,
+        node_instance_id: str,
+        control_addr: str,
+    ) -> List[NodeState]:
+        normalized_instance_id = str(node_instance_id or "").strip()
+        normalized_control_addr = str(control_addr or "").strip()
+        if not normalized_instance_id or not normalized_control_addr:
+            return []
+        incoming_profile_key = normalize_node_profile_key(normalized_control_addr)
+        with self._lock:
+            current = self._nodes.get(normalized_instance_id)
+            if current is not None and normalize_node_profile_key(current.control_addr) == incoming_profile_key:
+                return []
+            out = [
+                self._clone_node_locked(state)
+                for key, state in self._nodes.items()
+                if key != normalized_instance_id
+                and (
+                    str(state.control_addr or "").strip() == normalized_control_addr
+                    or (
+                        incoming_profile_key
+                        and normalize_node_profile_key(str(state.control_addr or "")) == incoming_profile_key
+                    )
+                )
+            ]
+        return out
 
     def _validate_startup_service_names_locked(
         self,

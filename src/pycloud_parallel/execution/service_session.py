@@ -110,6 +110,7 @@ from pycloud_parallel.execution.support import (
     _ensure_private_dir,
     _filter_nodes_by_runtime,
     _get_local_ip,
+    _is_node_identity_mismatch_error,
     _prepare_code_blob,
     _put_data_via_clients,
     _resolve_public_target_arg,
@@ -2067,7 +2068,7 @@ class Service(ServiceExecutionSession):
             return 0
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
-            active = {str(node_id) for node_id in self._active_replica_ids if str(node_id)}
+            active = self._active_replica_snapshot()
             if desired <= 0 or len(active) >= desired:
                 return 0
             failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
@@ -2169,6 +2170,7 @@ class Service(ServiceExecutionSession):
                         expose_http=bool(spec.get("expose_http", True)),
                         chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
                         api_token=str(spec.get("api_token", "") or ""),
+                        expected_node_instance_id=node_key,
                     )
                 except Exception as exc:
                     client.close()
@@ -2194,7 +2196,7 @@ class Service(ServiceExecutionSession):
                     self._clients[node_key] = client
                     self.nodes[node_key] = node
                     self.failures.pop(node_key, None)
-                    self._active_replica_ids.add(node_key)
+                    self._add_active_replica(node_key)
                     self._breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
             if added:
@@ -2924,7 +2926,11 @@ class Service(ServiceExecutionSession):
             int(node_limit),
             len(requested_node_ids),
             len(requested_node_instance_ids),
-            desired_node_count or required_success_nodes,
+            (
+                (desired_node_count or required_success_nodes) * 2
+                if not requested_node_ids and not requested_node_instance_ids
+                else desired_node_count or required_success_nodes
+            ),
         )
 
         _emit_owner_notice(
@@ -2961,6 +2967,37 @@ class Service(ServiceExecutionSession):
 
         normalized_runtime = normalize_python_runtime_spec(runtime)
 
+        def _auto_candidate_nodes(discovered_nodes: Sequence[InfoCenterNode]) -> List[InfoCenterNode]:
+            candidate_nodes = [
+                node
+                for node in discovered_nodes
+                if is_admitted_node(node, require_control_addr=True)
+            ]
+            if normalized_runtime:
+                candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=normalized_runtime)
+            candidate_nodes.sort(
+                key=lambda node: (
+                    -int(node.service_worker_available),
+                    -int(node.capacity),
+                    int(node.queued),
+                    _node_instance_key_from_node(node),
+                )
+            )
+            return list(candidate_nodes)
+
+        def _reject_non_deploy_nodes(nodes: Sequence[InfoCenterNode], *, scope: str) -> None:
+            rejected = [(node, node_admission_block_reason(node, require_control_addr=True)) for node in nodes]
+            rejected = [(node, reason) for node, reason in rejected if reason]
+            if rejected:
+                details = ", ".join(
+                    f"{node.node_id}/{_node_instance_key_from_node(node)}"
+                    f"(accept_deploy={'yes' if getattr(node, 'accept_service_deploy', True) else 'no'},"
+                    f" control_addr={str(getattr(node, 'control_addr', '') or '') or '-'},"
+                    f" reason={reason})"
+                    for node, reason in rejected
+                )
+                raise RuntimeError(f"{scope} contains nodes that do not accept service deployment: {details}")
+
         def _select_nodes_from_discovery(
             existing_routes: Sequence[InfoCenterServiceRoute],
             discovered_nodes: Sequence[InfoCenterNode],
@@ -2972,19 +3009,6 @@ class Service(ServiceExecutionSession):
                 )
 
             discovered_instance_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
-
-            def _reject_non_deploy_nodes(nodes: Sequence[InfoCenterNode], *, scope: str) -> None:
-                rejected = [(node, node_admission_block_reason(node, require_control_addr=True)) for node in nodes]
-                rejected = [(node, reason) for node, reason in rejected if reason]
-                if rejected:
-                    details = ", ".join(
-                        f"{node.node_id}/{_node_instance_key_from_node(node)}"
-                        f"(accept_deploy={'yes' if getattr(node, 'accept_service_deploy', True) else 'no'},"
-                        f" control_addr={str(getattr(node, 'control_addr', '') or '') or '-'},"
-                        f" reason={reason})"
-                        for node, reason in rejected
-                    )
-                    raise RuntimeError(f"{scope} contains nodes that do not accept service deployment: {details}")
 
             if requested_node_instance_ids:
                 missing_node_instance_ids = [
@@ -3039,13 +3063,7 @@ class Service(ServiceExecutionSession):
                         )
                 return selected_nodes
 
-            candidate_nodes = [
-                node
-                for node in discovered_nodes
-                if is_admitted_node(node, require_control_addr=True)
-            ]
-            if normalized_runtime:
-                candidate_nodes = _filter_nodes_by_runtime(candidate_nodes, runtime=normalized_runtime)
+            candidate_nodes = _auto_candidate_nodes(discovered_nodes)
             if not candidate_nodes:
                 if normalized_runtime:
                     raise RuntimeError(
@@ -3059,14 +3077,6 @@ class Service(ServiceExecutionSession):
                     f"no schedulable nodes from InfoCenter; target={infocenter_target}; "
                     f"candidates={_summarize_discovered_nodes(discovered_nodes)}"
                 )
-            candidate_nodes.sort(
-                key=lambda node: (
-                    -int(node.service_worker_available),
-                    -int(node.capacity),
-                    int(node.queued),
-                    _node_instance_key_from_node(node),
-                )
-            )
             effective_node_count = max(1, desired_node_count or required_success_nodes)
             selected_nodes = candidate_nodes[:effective_node_count]
             if len(selected_nodes) < required_success_nodes:
@@ -3312,6 +3322,7 @@ class Service(ServiceExecutionSession):
                         expose_http=expose_http,
                         chunk_size=chunk_size,
                         api_token=effective_api_token,
+                        expected_node_instance_id=node_key,
                     )
                 except Exception as exc:
                     client.close()
@@ -3320,39 +3331,92 @@ class Service(ServiceExecutionSession):
                 session.node_id = str(node.node_id or "")
                 return node_key, node, client, session, ""
 
-            dispatch_results = dispatch_create_requests(
-                selected_nodes,
-                create_one=_create_service_on_node,
-                thread_name_prefix="service-deploy",
-                describe_error=lambda node, exc: repr(exc),
+            first_failure: Tuple[str, str] = ("", "")
+
+            def _record_create_results(nodes_to_try: Sequence[InfoCenterNode]) -> None:
+                nonlocal first_failure
+                dispatch_results = dispatch_create_requests(
+                    nodes_to_try,
+                    create_one=_create_service_on_node,
+                    thread_name_prefix="service-deploy",
+                    describe_error=lambda node, exc: repr(exc),
+                )
+                for item in dispatch_results:
+                    if item.created is None:
+                        node_key = _node_instance_key_from_node(item.node)
+                        error_message = item.error_message
+                        failures[node_key] = error_message
+                        if _is_node_identity_mismatch_error(error_message):
+                            with contextlib.suppress(Exception):
+                                with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                                    mark_lost = getattr(infocenter, "mark_node_lost", None)
+                                    if callable(mark_lost):
+                                        mark_lost(
+                                            node_key,
+                                            reason=f"service deploy identity mismatch: {error_message}",
+                                        )
+                        if not first_failure[0]:
+                            first_failure = (node_key, error_message)
+                        continue
+                    node_key, node, client, session, error_message = item.created
+                    if error_message:
+                        failures[node_key] = error_message
+                        if _is_node_identity_mismatch_error(error_message):
+                            with contextlib.suppress(Exception):
+                                with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                                    mark_lost = getattr(infocenter, "mark_node_lost", None)
+                                    if callable(mark_lost):
+                                        mark_lost(
+                                            node_key,
+                                            reason=f"service deploy identity mismatch: {error_message}",
+                                        )
+                        if not first_failure[0]:
+                            first_failure = (node_key, error_message)
+                        continue
+                    if client is None or session is None:
+                        continue
+                    sessions[node_key] = session
+                    clients[node_key] = client
+                    nodes[node_key] = node
+
+            _record_create_results(selected_nodes)
+
+            strict_success_nodes = (
+                desired_node_count
+                or len(requested_node_instance_ids)
+                or len(requested_node_ids)
+                or required_success_nodes
             )
 
-            first_failure: Tuple[str, str] = ("", "")
-            for item in dispatch_results:
-                if item.created is None:
-                    node_key = _node_instance_key_from_node(item.node)
-                    error_message = item.error_message
-                    failures[node_key] = error_message
-                    if not first_failure[0]:
-                        first_failure = (node_key, error_message)
-                    continue
-                node_key, node, client, session, error_message = item.created
-                if error_message:
-                    failures[node_key] = error_message
-                    if not first_failure[0]:
-                        first_failure = (node_key, error_message)
-                    continue
-                if client is None or session is None:
-                    continue
-                sessions[node_key] = session
-                clients[node_key] = client
-                nodes[node_key] = node
+            if (
+                len(sessions) < strict_success_nodes
+                and not requested_node_ids
+                and not requested_node_instance_ids
+            ):
+                tried_node_keys = {_node_instance_key_from_node(node) for node in selected_nodes}
+                fallback_nodes = [
+                    node
+                    for node in _auto_candidate_nodes(discovered_nodes)
+                    if _node_instance_key_from_node(node) not in tried_node_keys
+                ]
+                if fallback_nodes:
+                    _emit_owner_notice(
+                        "deploy retrying alternate nodes after create failure "
+                        f"service_name={effective_service_name} success={len(sessions)} "
+                        f"required={strict_success_nodes} "
+                        f"fallback_candidates={[_node_instance_key_from_node(node) for node in fallback_nodes]}"
+                    )
+                    for fallback_node in fallback_nodes:
+                        if len(sessions) >= strict_success_nodes:
+                            break
+                        _record_create_results([fallback_node])
 
-            if failures and not allow_partial:
+            if failures and not allow_partial and len(sessions) < strict_success_nodes:
                 cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")
                 node_key, message = first_failure
                 raise RuntimeError(
-                    f"deploy failed on node={node_key}: {message}"
+                    f"deploy failed on node={node_key}: {message}; "
+                    f"success={len(sessions)} required={strict_success_nodes} failures={failures}"
                 )
 
             if len(sessions) < required_success_nodes:
@@ -4148,12 +4212,7 @@ class Service(ServiceExecutionSession):
     def _select_node(self, *, strategy: str, refresh_status: bool, exclude: Optional[Set[str]] = None) -> str:
         excluded = exclude or set()
         normalized_strategy, profile = resolve_service_strategy(strategy)
-        raw_active_replica_ids = getattr(self, "_active_replica_ids", None)
-        active_replica_ids = (
-            {str(node_id) for node_id in raw_active_replica_ids if str(node_id)}
-            if raw_active_replica_ids is not None
-            else None
-        )
+        active_replica_ids = self._active_replica_snapshot() if hasattr(self, "_active_replica_ids") else None
         all_candidates = [
             nid
             for nid in sorted(self.sessions.keys())
@@ -4414,12 +4473,7 @@ class Service(ServiceExecutionSession):
         """
         if not self.sessions:
             raise RuntimeError("Service session has no active replicas")
-        raw_active_replica_ids = getattr(self, "_active_replica_ids", None)
-        active_replica_ids = (
-            {str(node_id) for node_id in raw_active_replica_ids if str(node_id)}
-            if raw_active_replica_ids is not None
-            else None
-        )
+        active_replica_ids = self._active_replica_snapshot() if hasattr(self, "_active_replica_ids") else None
 
         session_node_ids = list(self.sessions.keys())
         nodes = [

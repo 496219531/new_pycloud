@@ -128,7 +128,7 @@ def test_local_pickle_payload_transport_reuses_exact_pickle_when_within_threshol
     assert len(dump_calls) == 1
 
 
-def test_local_pickle_payload_transport_repickles_after_prepare_when_over_threshold(tmp_path, monkeypatch) -> None:
+def test_local_pickle_payload_transport_prepares_bytes_before_pickling_when_estimated_over_threshold(tmp_path, monkeypatch) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
 
     real_pickle_dumps = pickle.dumps
@@ -151,7 +151,7 @@ def test_local_pickle_payload_transport_repickles_after_prepare_when_over_thresh
     monkeypatch.setattr(local_ipc_mod, "get_local_service_payload_policy", lambda: forced_policy)
 
     payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
-        {"items": [{"value": i} for i in range(8)]},
+        {"items": b"x" * 128},
         meta={"object_dir": str(tmp_path)},
     )
 
@@ -161,7 +161,8 @@ def test_local_pickle_payload_transport_repickles_after_prepare_when_over_thresh
         for value in dump_calls
         if isinstance(value, dict) and "items" in value
     ]
-    assert len(request_payload_dumps) == 2
+    assert len(request_payload_dumps) == 1
+    assert request_payload_dumps[0] != {"items": b"x" * 128}
 
 
 def test_local_pickle_payload_transport_normalizes_file_paths(tmp_path) -> None:
@@ -2010,6 +2011,32 @@ def test_prepare_job_blob_submit_fields_uses_object_ref_for_large_blob(monkeypat
     assert "blob_b64" not in fields
     assert fields["blob_control_addr"] == "127.0.0.1:50061"
     assert fields["blob_ref"].object_id == "sha256:" + ("a" * 64)
+
+
+def test_default_job_node_count_retries_transient_infocenter_failure(monkeypatch) -> None:
+    from pycloud_parallel.controlplane.job_queue import _default_job_node_count
+
+    calls = {"select": 0}
+
+    def _fake_select(self, **_kwargs):  # noqa: ANN001
+        calls["select"] += 1
+        if calls["select"] == 1:
+            raise ConnectionResetError(10054, "connection reset")
+        return [
+            SimpleNamespace(node_instance_id="node-inst-1", node_id="node-1", control_addr="127.0.0.1:50061"),
+            SimpleNamespace(node_instance_id="node-inst-2", node_id="node-2", control_addr="127.0.0.1:50062"),
+        ]
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.infocenter_client.InfoCenterClient.select_task_nodes",
+        _fake_select,
+    )
+
+    assert _default_job_node_count(
+        controlplane_target="127.0.0.1:50051",
+        payload={"timeout_sec": 1.0},
+    ) == 2
+    assert calls["select"] >= 2
 
 
 def test_prepare_job_submit_payload_for_call_preserves_staged_update_globals(monkeypatch) -> None:

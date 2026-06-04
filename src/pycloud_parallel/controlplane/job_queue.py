@@ -43,6 +43,7 @@ from pycloud_parallel.controlplane.node.execution import (
     _purge_loaded_artifact_modules,
 )
 from pycloud_parallel.execution.task_pool import TaskPool
+from pycloud_parallel.execution.support import _retry_infocenter_request
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
@@ -504,19 +505,29 @@ def _default_job_node_count(
     tags = list(payload.get("tags") or ())
     node_limit = int(payload.get("node_limit", 100) or 100)
     try:
-        with InfoCenterClient(controlplane_target, timeout_sec=float(payload.get("timeout_sec", 10.0) or 10.0)) as infocenter:
-            selected = list(
-                infocenter.select_task_nodes(
-                    healthy_only=bool(payload.get("healthy_only", True)),
-                    tags=tags,
-                    node_ids=explicit_node_ids or None,
-                    node_count=0,
-                    limit=node_limit,
-                    require_credit=False,
-                    preferred_runtime_key=str(payload.get("preferred_runtime_key", "") or "").strip(),
-                    runtime=runtime,
+        timeout_sec = float(payload.get("timeout_sec", 10.0) or 10.0)
+
+        def _select_nodes() -> List[Any]:
+            with InfoCenterClient(controlplane_target, timeout_sec=timeout_sec) as infocenter:
+                return list(
+                    infocenter.select_task_nodes(
+                        healthy_only=bool(payload.get("healthy_only", True)),
+                        tags=tags,
+                        node_ids=explicit_node_ids or None,
+                        node_count=0,
+                        limit=node_limit,
+                        require_credit=False,
+                        preferred_runtime_key=str(payload.get("preferred_runtime_key", "") or "").strip(),
+                        runtime=runtime,
+                    )
                 )
-            )
+
+        selected = _retry_infocenter_request(
+            _select_nodes,
+            timeout_sec=max(0.5, timeout_sec),
+            target=controlplane_target,
+            action="job default node discovery",
+        )
     except Exception:
         return 0
     return len(selected)

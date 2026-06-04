@@ -59,7 +59,9 @@ class ExecutionSessionBase:
         self._keepalive_seq = 0
         self._keepalive_failure_counts = {}
         self._keepalive_retry_forever = bool(getattr(self, "_keepalive_retry_forever", False))
+        self._active_replica_lock = threading.RLock()
         self._active_replica_ids = set(self.replicas.keys())
+        self._terminal_replica_ids = set()
         if hasattr(self, "_active_nodes"):
             self._active_nodes = self._active_replica_ids
         if not hasattr(self, "failed"):
@@ -117,7 +119,7 @@ class ExecutionSessionBase:
 
     def _default_keepalive_interval_sec(self, interval_sec: Optional[float] = None) -> float:
         if interval_sec is not None:
-            return max(0.5, float(interval_sec))
+            return max(0.05, float(interval_sec))
         timeouts = [
             max(1, int(getattr(replica, "heartbeat_timeout_sec", 0) or 1))
             for replica in self.replicas.values()
@@ -159,12 +161,13 @@ class ExecutionSessionBase:
 
     def _mark_replica_heartbeat_success(self, node_id: str, replica: ExecutionReplicaHandle) -> None:
         self._keepalive_failure_counts.pop(node_id, None)
+        self._discard_terminal_replica(node_id)
         if hasattr(replica, "failed"):
             replica.failed = False
         if hasattr(replica, "last_error"):
             replica.last_error = ""
         self.failures.pop(node_id, None)
-        self._active_replica_ids.add(node_id)
+        self._add_active_replica(node_id)
 
     def _mark_replica_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         message = repr(exc)
@@ -177,13 +180,111 @@ class ExecutionSessionBase:
             replica.status = pb2.SERVICE_STATUS_STOPPED
         elif getattr(replica, "kind", "") == "task_pool" and hasattr(replica, "status"):
             replica.status = "STOPPED"
-        self._active_replica_ids.discard(node_id)
+        self._discard_active_replica(node_id)
+
+    def _terminal_heartbeat_error_markers(self, replica: ExecutionReplicaHandle) -> Tuple[str, ...]:
+        common_markers = (
+            "node instance execution is fenced",
+            "node_instance_id fenced",
+            "control_addr replaced",
+        )
+        kind = str(getattr(replica, "kind", "") or "").strip()
+        if kind == "task_pool":
+            return common_markers + (
+                "task pool not running",
+                "task pool not found",
+                "pool is stopped",
+                "pool not found",
+            )
+        if kind == "service":
+            return common_markers + (
+                "service is stopped",
+                "service not found",
+            )
+        return common_markers
+
+    def _is_terminal_heartbeat_error(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> bool:
+        del node_id
+        text = f"{exc!r} {exc}".lower()
+        return any(marker in text for marker in self._terminal_heartbeat_error_markers(replica))
+
+    def _mark_terminal_replica(self, node_id: str) -> None:
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            self._terminal_replica_ids.add(node_id)
+            return
+        with lock:
+            self._terminal_replica_ids.add(node_id)
+
+    def _discard_terminal_replica(self, node_id: str) -> None:
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            getattr(self, "_terminal_replica_ids", set()).discard(node_id)
+            return
+        with lock:
+            getattr(self, "_terminal_replica_ids", set()).discard(node_id)
+
+    def _is_terminal_replica(self, node_id: str) -> bool:
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            return node_id in getattr(self, "_terminal_replica_ids", set())
+        with lock:
+            return node_id in getattr(self, "_terminal_replica_ids", set())
+
+    def _active_replica_snapshot(self) -> set[str]:
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            return {str(node_id) for node_id in list(getattr(self, "_active_replica_ids", set()) or []) if str(node_id)}
+        with lock:
+            return {str(node_id) for node_id in list(getattr(self, "_active_replica_ids", set()) or []) if str(node_id)}
+
+    def _add_active_replica(self, node_id: str) -> None:
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            getattr(self, "_terminal_replica_ids", set()).discard(node_id)
+            self._active_replica_ids.add(node_id)
+            return
+        with lock:
+            getattr(self, "_terminal_replica_ids", set()).discard(node_id)
+            self._active_replica_ids.add(node_id)
+
+    def _discard_active_replica(self, node_id: str) -> None:
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            self._active_replica_ids.discard(node_id)
+            return
+        with lock:
+            self._active_replica_ids.discard(node_id)
 
     def _record_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         count = int(self._keepalive_failure_counts.get(node_id, 0) or 0) + 1
         self._keepalive_failure_counts[node_id] = count
         if count >= self._heartbeat_failure_threshold(node_id, replica):
             self._mark_replica_heartbeat_failure(node_id, replica, exc)
+
+    def _record_terminal_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        self._keepalive_failure_counts[node_id] = self._heartbeat_failure_threshold(node_id, replica)
+        self._mark_replica_heartbeat_failure(node_id, replica, exc)
+        self._mark_terminal_replica(node_id)
+
+    def _handle_heartbeat_exception(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        if self._is_terminal_heartbeat_error(node_id, replica, exc):
+            if not self._is_terminal_replica(node_id):
+                logger.warning(
+                    "%s keepalive replica stopped node_instance_id=%s error=%r",
+                    self.kind or "execution",
+                    node_id,
+                    exc,
+                )
+            self._record_terminal_heartbeat_failure(node_id, replica, exc)
+            return
+        logger.warning(
+            "%s keepalive heartbeat failed node_instance_id=%s error=%r",
+            self.kind or "execution",
+            node_id,
+            exc,
+        )
+        self._record_heartbeat_failure(node_id, replica, exc)
 
     def _keepalive_loop(self, interval_sec: float) -> None:
         next_tick = time.monotonic() + max(0.1, float(interval_sec))
@@ -211,24 +312,15 @@ class ExecutionSessionBase:
                                 replica,
                                 TimeoutError(f"heartbeat pending for {now - started_at:.3f}s"),
                             )
-                            if bool(getattr(self, "_keepalive_retry_forever", False)):
-                                pending[node_id] = (future, replica, started_at, now)
-                            else:
-                                future.cancel()
-                                pending.pop(node_id, None)
+                            future.cancel()
+                            pending.pop(node_id, None)
                         continue
                     pending.pop(node_id, None)
                     try:
                         future.result()
                         self._mark_replica_heartbeat_success(node_id, replica)
                     except Exception as exc:
-                        logger.warning(
-                            "%s keepalive heartbeat failed node_instance_id=%s error=%r",
-                            self.kind or "execution",
-                            node_id,
-                            exc,
-                        )
-                        self._record_heartbeat_failure(node_id, replica, exc)
+                        self._handle_heartbeat_exception(node_id, replica, exc)
 
                 wait_sec = max(0.0, next_tick - time.monotonic())
                 if self._hb_stop.wait(wait_sec):
@@ -236,27 +328,22 @@ class ExecutionSessionBase:
                 next_tick += max(0.1, float(interval_sec))
                 self._keepalive_seq += 1
                 replicas = self.replicas
-                active_ids = list(self._active_replica_ids)
+                active_ids = list(self._active_replica_snapshot())
                 if len(active_ids) == 1 and not pending and not bool(getattr(self, "_keepalive_retry_forever", False)):
                     node_id = active_ids[0]
                     replica = replicas.get(node_id)
                     if replica is None:
-                        self._active_replica_ids.discard(node_id)
+                        self._discard_active_replica(node_id)
                     else:
                         try:
                             self._timed_heartbeat_replica(node_id, replica, seq=self._keepalive_seq)
                             self._mark_replica_heartbeat_success(node_id, replica)
                         except Exception as exc:
-                            logger.warning(
-                                "%s keepalive heartbeat failed node_instance_id=%s error=%r",
-                                self.kind or "execution",
-                                node_id,
-                                exc,
-                            )
-                            self._record_heartbeat_failure(node_id, replica, exc)
-                heartbeat_ids = list(self._active_replica_ids)
+                            self._handle_heartbeat_exception(node_id, replica, exc)
+                heartbeat_ids = list(self._active_replica_snapshot())
                 if bool(getattr(self, "_keepalive_retry_forever", False)):
                     heartbeat_ids = list(dict.fromkeys([*heartbeat_ids, *list(replicas.keys())]))
+                heartbeat_ids = [node_id for node_id in heartbeat_ids if not self._is_terminal_replica(node_id)]
                 for node_id in heartbeat_ids:
                     if (
                         len(active_ids) == 1
@@ -269,7 +356,7 @@ class ExecutionSessionBase:
                         continue
                     replica = replicas.get(node_id)
                     if replica is None:
-                        self._active_replica_ids.discard(node_id)
+                        self._discard_active_replica(node_id)
                         continue
                     pending[node_id] = (
                         executor.submit(self._timed_heartbeat_replica, node_id, replica, seq=self._keepalive_seq),
@@ -277,8 +364,15 @@ class ExecutionSessionBase:
                         time.monotonic(),
                         time.monotonic(),
                     )
-                if not self._active_replica_ids:
-                    if not (bool(getattr(self, "_keepalive_retry_forever", False)) and self.replicas):
+                if not self._active_replica_snapshot():
+                    retryable_replica_ids = [
+                        str(node_id)
+                        for node_id in self.replicas.keys()
+                        if str(node_id) and not self._is_terminal_replica(str(node_id))
+                    ]
+                    can_retry = bool(getattr(self, "_keepalive_retry_forever", False)) and bool(retryable_replica_ids)
+                    can_compensate = bool(getattr(self, "_compensation_spec", None))
+                    if not (can_retry or can_compensate):
                         self.failed = True
                         self._hb_stop.set()
                         break
@@ -297,7 +391,10 @@ class ExecutionSessionBase:
                 return
             self.failed = False
             self._keepalive_failure_counts = {}
-            self._active_replica_ids = set(self.replicas.keys())
+            self._active_replica_lock = getattr(self, "_active_replica_lock", threading.RLock())
+            with self._active_replica_lock:
+                self._active_replica_ids = set(self.replicas.keys())
+                self._terminal_replica_ids = set()
             if hasattr(self, "_active_nodes"):
                 self._active_nodes = self._active_replica_ids
             for replica in self.replicas.values():

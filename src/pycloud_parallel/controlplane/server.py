@@ -462,6 +462,7 @@ def main() -> None:
             tags=node_tags,
             version=args.node_version,
             metadata={"role": "compute-node"},
+            exit_on_fence=True,
         )
         registrar_holder["value"] = registrar
 

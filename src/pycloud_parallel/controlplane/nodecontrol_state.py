@@ -150,6 +150,8 @@ from pycloud_parallel.runtime.errors import normalize_invoke_error
 
 
 logger = logging.getLogger(__name__)
+NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC = 2.0
+NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC = 8.0
 _CODE_LAST_AT_TOUCH_INTERVAL_SEC = 60.0
 _CODE_LAST_AT_TOUCH_MAX_ENTRIES = 10000
 
@@ -461,7 +463,7 @@ class NodeControlState(NodeRuntimeBase):
         self._shutdown_all_task_pools()
         self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
         if self._executor_host is not None:
-            self._executor_host.close(shutdown_timeout_sec=2.0)
+            self._executor_host.close(shutdown_timeout_sec=NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC)
             self._executor_host = None
 
     def _token_node_instance_valid(self, token_node_instance_id: str) -> bool:
@@ -559,7 +561,7 @@ class NodeControlState(NodeRuntimeBase):
             self._cv.notify_all()
         if old_executor is not None:
             with contextlib.suppress(Exception):
-                old_executor.close(shutdown_timeout_sec=2.0)
+                old_executor.close(shutdown_timeout_sec=NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC)
         logger.warning(
             "[NodeControl] execution state reset node_id=%s node_instance_id=%s fenced_at=%s reason=%s",
             self.node_id,
@@ -570,7 +572,8 @@ class NodeControlState(NodeRuntimeBase):
         logger.warning(
             "[NodeControl] execution fence cleanup node_id=%s node_instance_id=%s "
             "services_cleared=%d task_pools_cleared=%d pool_tasks_cleared=%d "
-            "code_tokens_cleared=%d managed_globals_cleared=%d executor_closed=%s",
+            "code_tokens_cleared=%d managed_globals_cleared=%d executor_closed=%s "
+            "executor_shutdown_timeout_sec=%.3f",
             self.node_id,
             node_instance_id,
             service_count,
@@ -579,6 +582,7 @@ class NodeControlState(NodeRuntimeBase):
             code_token_count,
             managed_global_count,
             "yes" if old_executor is not None else "no",
+            NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC,
         )
         return node_instance_id
 
@@ -948,7 +952,7 @@ class NodeControlState(NodeRuntimeBase):
         fenced_at = getattr(self, "_execution_fenced_at", None)
         fenced_at_text = fenced_at.isoformat() if isinstance(fenced_at, datetime) else "unknown"
         return (
-            "node instance execution is fenced; restart NodeControl to create a new node_instance_id; "
+            "node instance execution is fenced; this NodeControl host should exit and a fresh process must create a new node_instance_id; "
             f"node_id={self.node_id} node_instance_id={self.node_instance_id} "
             f"fenced_at={fenced_at_text} reason={reason}"
         )

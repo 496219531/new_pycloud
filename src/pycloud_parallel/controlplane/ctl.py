@@ -258,7 +258,7 @@ def _terminate_pid(pid: int, *, force: bool = False) -> None:
     if not _is_pid_running(pid):
         return
     if os.name == "nt":
-        cmd = ["taskkill", "/PID", str(pid)]
+        cmd = ["taskkill", "/PID", str(pid), "/T"]
         if force:
             cmd.insert(1, "/F")
         subprocess.run(cmd, check=False, capture_output=True, text=True)
@@ -1304,6 +1304,8 @@ def _start_node(
     _assert_bind_available(service_http_bind)
     _log("INFO", f"Starting {name} on {control_bind} (HTTP: {service_http_bind}, workers: {worker_capacity})...")
     token_args = ["--api-token", str(api_token)] if str(api_token or "").strip() else []
+    node_env = dict(extra_env or {})
+    node_env["PYCLOUD_NODE_EXIT_ON_FENCE"] = "1"
     pid = _spawn_server(
         root,
         _logs_dir(root) / f"{name}.log",
@@ -1336,7 +1338,7 @@ def _start_node(
             "--log-level",
             "DEBUG" if debug else "INFO",
         ],
-        extra_env=extra_env,
+        extra_env=node_env,
         debug=debug,
     )
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_node_registered(infocenter_target, name, 0.2)):
@@ -1404,7 +1406,9 @@ def _start_standalone_node(
         args.extend(["--advertise-addr", advertise_addr])
     if str(api_token or "").strip():
         args.extend(["--api-token", str(api_token)])
-    pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=extra_env, debug=debug)
+    node_env = dict(extra_env or {})
+    node_env["PYCLOUD_NODE_EXIT_ON_FENCE"] = "1"
+    pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=node_env, debug=debug)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_ready(service_http_bind, 0.2)):
         _remove_pid(_pid_file(root, node_id))
         raise RuntimeError(f"{node_id} service HTTP failed to become ready")
@@ -1653,6 +1657,14 @@ def _cmd_dev_stop(args: argparse.Namespace) -> int:
         if name not in {"controlplane", "gateway", "infocenter", "job-orchestrator"}:
             _best_effort_mark_node_lost(target, name)
     _stop_all_managed_processes(root)
+    killed = _kill_machine_pycloud_processes(root=root, target=target)
+    if killed:
+        _log("OK", f"Stopped {len(killed)} additional machine-wide pycloud process(es)")
+    if bool(getattr(args, "scan_ports", False)):
+        scanned_ports = _collect_scan_ports(args)
+        scanned = _kill_scanned_port_processes(target=target, ports=scanned_ports)
+        if scanned:
+            _log("OK", f"Stopped {len(scanned)} additional scanned listener process(es)")
     _log("OK", "Dev services stopped")
     return 0
 
@@ -3119,6 +3131,8 @@ def build_parser() -> argparse.ArgumentParser:
     stopall_parser.add_argument("--timeout-sec", type=float, default=3.0, help="local IPC service shutdown timeout")
     dev_stop_parser = subparsers.add_parser("dev-stop", help="stop local dev profile services")
     dev_stop_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
+    dev_stop_parser.add_argument("--scan-ports", action="store_true", help="after process stop, scan configured ports and stop matching pycloud listener processes")
+    dev_stop_parser.add_argument("--ports", default="", help="comma-separated ports for scan-ports; default uses controlplane/node HTTP ports")
     stop_node_parser = subparsers.add_parser("stop-node", help="stop one local node control process")
     stop_node_parser.add_argument("node_name", type=_normalize_managed_name, help="node control process name to stop")
     stop_node_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for best-effort node cleanup before stop")
@@ -3130,6 +3144,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_env_argument(restart_parser)
     _add_debug_argument(restart_parser)
+    restart_parser.add_argument("--scan-ports", action="store_true", help="after stop phase, scan configured ports and stop matching pycloud listener processes")
+    restart_parser.add_argument("--ports", default="", help="comma-separated ports for restart stop scan; default uses controlplane/node HTTP ports")
     dev_restart_parser = subparsers.add_parser("dev-restart", help="restart local dev profile services")
     _add_local_argument(dev_restart_parser)
     _add_target_argument(
@@ -3139,6 +3155,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(dev_restart_parser)
     _add_debug_argument(dev_restart_parser)
     _add_dev_node_arguments(dev_restart_parser, restart=True)
+    dev_restart_parser.add_argument("--scan-ports", action="store_true", help="after stop phase, scan configured ports and stop matching pycloud listener processes")
+    dev_restart_parser.add_argument("--ports", default="", help="comma-separated ports for restart stop scan; default uses controlplane/node HTTP ports")
     status_parser = subparsers.add_parser("status", help="show local service status")
     status_parser.add_argument("--target", default="", help="InfoCenter/ControlPlane target for node/service query (default: 127.0.0.1:<controlplane-port>)")
     local_services_parser = subparsers.add_parser("local-services", help="list Service.startup(target='local') IPC services")

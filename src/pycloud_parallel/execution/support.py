@@ -115,12 +115,13 @@ def _summarize_discovered_nodes(nodes: Sequence["InfoCenterNode"], *, limit: int
     rows: List[str] = []
     for node in list(nodes)[: max(1, int(limit))]:
         rows.append(
-            f"{node.node_id}(healthy={'yes' if node.healthy else 'no'},"
-            f"schedulable={'yes' if node.schedulable else 'no'},"
+            f"{getattr(node, 'node_id', '-')}(healthy={'yes' if getattr(node, 'healthy', False) else 'no'},"
+            f"schedulable={'yes' if getattr(node, 'schedulable', False) else 'no'},"
             f"accept_deploy={'yes' if getattr(node, 'accept_service_deploy', True) else 'no'},"
-            f"drain={'yes' if node.drain else 'no'},"
-            f"svc_avail={int(node.service_worker_available)},"
-            f"py={node.python_version or '-'})"
+            f"drain={'yes' if getattr(node, 'drain', False) else 'no'},"
+            f"svc_avail={int(getattr(node, 'service_worker_available', 0) or 0)},"
+            f"pool_avail={int(getattr(node, 'task_pool_worker_available', 0) or 0)},"
+            f"py={getattr(node, 'python_version', '') or '-'})"
         )
     if len(nodes) > max(1, int(limit)):
         rows.append(f"...+{len(nodes) - max(1, int(limit))} more")
@@ -167,9 +168,14 @@ def _is_transient_infocenter_error(exc: Exception) -> bool:
         return (
             "connection refused" in lowered
             or "connection reset" in lowered
+            or "cannot connect to " in lowered
+            or "closed by the remote service" in lowered
+            or "http request to " in lowered
             or "timed out" in lowered
             or "temporarily unavailable" in lowered
         )
+    if isinstance(candidate, RuntimeError):
+        return _is_transient_infocenter_error(str(candidate))
     return False
 
 
@@ -199,6 +205,14 @@ def _retry_infocenter_request(
                     f"InfoCenter {target} not ready for {action} after {float(timeout_sec):.1f}s: {exc}"
                 ) from exc
             time.sleep(min(retry_interval_sec, max(0.05, deadline - time.monotonic())))
+
+
+def _is_node_identity_mismatch_error(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    return (
+        "node control_addr instance mismatch" in text
+        or "node control_addr is still served by another node instance" in text
+    )
 
 
 def _resolve_public_target_arg(
@@ -341,6 +355,7 @@ class _ObjectUploadSource:
     format: str
     blob: bytes = b""
     file_path: str = ""
+    cleanup_file: bool = False
 
     @property
     def is_file(self) -> bool:
@@ -363,19 +378,19 @@ def _file_upload_source(path: Path, *, format: str = "") -> _ObjectUploadSource:
 def _dataframe_upload_source(frame: Any) -> _ObjectUploadSource:
     log_payload_flow("object_ref_upload", path_type="dataframe", format="dfbundle", summary=summarize_payload_flow_value(frame))
     path = dataframe_bundle_temp_file(frame)
-    return _ObjectUploadSource(materialize_as="dataframe", format="dfbundle", file_path=str(path))
+    return _ObjectUploadSource(materialize_as="dataframe", format="dfbundle", file_path=str(path), cleanup_file=True)
 
 
 def _series_upload_source(series: Any) -> _ObjectUploadSource:
     log_payload_flow("object_ref_upload", path_type="series", format="seriesbundle", summary=summarize_payload_flow_value(series))
     path = series_bundle_temp_file(series)
-    return _ObjectUploadSource(materialize_as="series", format="seriesbundle", file_path=str(path))
+    return _ObjectUploadSource(materialize_as="series", format="seriesbundle", file_path=str(path), cleanup_file=True)
 
 
 def _ndarray_upload_source(array: Any, *, format: str = "") -> _ObjectUploadSource:
     log_payload_flow("object_ref_upload", path_type="ndarray", format=(format or "npy"), summary=summarize_payload_flow_value(array))
     path, normalized_format = ndarray_temp_file(array, format=format)
-    return _ObjectUploadSource(materialize_as="ndarray", format=normalized_format, file_path=str(path))
+    return _ObjectUploadSource(materialize_as="ndarray", format=normalized_format, file_path=str(path), cleanup_file=True)
 
 
 def _serialize_data_for_object_ref(
@@ -527,7 +542,7 @@ def _put_data_via_clients(
             no_clients_msg="no node clients available for object upload",
         )
     finally:
-        if source.is_file and str(source.file_path or "").strip().startswith(tempfile.gettempdir()):
+        if source.cleanup_file:
             Path(str(source.file_path)).unlink(missing_ok=True)
 
 
@@ -1008,17 +1023,25 @@ def _select_job_staging_clients(
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 
     desired = get_job_staging_replica_count(replica_count)
-    with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
-        nodes = list(
-            infocenter.select_task_nodes(
-                healthy_only=True,
-                node_count=max(desired, 1),
-                limit=max(16, desired * 4),
-                require_credit=False,
-                preferred_runtime_key="",
-                runtime=str(runtime or "py3"),
+    def _select_nodes() -> List[Any]:
+        with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
+            return list(
+                infocenter.select_task_nodes(
+                    healthy_only=True,
+                    node_count=max(desired, 1),
+                    limit=max(16, desired * 4),
+                    require_credit=False,
+                    preferred_runtime_key="",
+                    runtime=str(runtime or "py3"),
+                )
             )
-        )
+
+    nodes = _retry_infocenter_request(
+        _select_nodes,
+        timeout_sec=max(0.5, float(timeout_sec or 0.0)),
+        target=target,
+        action="job staging node discovery",
+    )
     selected = []
     seen: set[str] = set()
     for node in nodes:
@@ -1391,17 +1414,25 @@ def _prepare_job_blob_submit_fields(
     from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
     from pycloud_parallel.controlplane.node_control_client import NodeControlClient
 
-    with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
-        selected_nodes = list(
-            infocenter.select_task_nodes(
-                healthy_only=True,
-                node_count=1,
-                limit=32,
-                require_credit=False,
-                preferred_runtime_key="",
-                runtime=runtime,
+    def _select_nodes() -> List[Any]:
+        with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
+            return list(
+                infocenter.select_task_nodes(
+                    healthy_only=True,
+                    node_count=1,
+                    limit=32,
+                    require_credit=False,
+                    preferred_runtime_key="",
+                    runtime=runtime,
+                )
             )
-        )
+
+    selected_nodes = _retry_infocenter_request(
+        _select_nodes,
+        timeout_sec=max(0.5, float(timeout_sec or 0.0)),
+        target=target,
+        action="job code staging node discovery",
+    )
     if not selected_nodes:
         raise RuntimeError("job code blob exceeds inline limit and no task node is available for large-object upload")
 
@@ -1432,19 +1463,27 @@ def _job_submit_upload_clients(
     node_limit = max(1, int(payload.get("node_limit", 32) or 32))
     requested_count = max(0, int(payload.get("pool_node_count", payload.get("node_count", 0)) or 0))
     fetch_limit = requested_count if requested_count > 0 else node_limit
-    with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
-        selected_nodes = list(
-            infocenter.select_task_nodes(
-                healthy_only=bool(payload.get("healthy_only", True)),
-                tags=tags,
-                node_ids=node_ids,
-                node_count=fetch_limit,
-                limit=node_limit,
-                require_credit=False,
-                preferred_runtime_key=str(payload.get("preferred_runtime_key", "") or "").strip(),
-                runtime=runtime,
+    def _select_nodes() -> List[Any]:
+        with InfoCenterClient(target, timeout_sec=timeout_sec) as infocenter:
+            return list(
+                infocenter.select_task_nodes(
+                    healthy_only=bool(payload.get("healthy_only", True)),
+                    tags=tags,
+                    node_ids=node_ids,
+                    node_count=fetch_limit,
+                    limit=node_limit,
+                    require_credit=False,
+                    preferred_runtime_key=str(payload.get("preferred_runtime_key", "") or "").strip(),
+                    runtime=runtime,
+                )
             )
-        )
+
+    selected_nodes = _retry_infocenter_request(
+        _select_nodes,
+        timeout_sec=max(0.5, float(timeout_sec or 0.0)),
+        target=target,
+        action="job submit upload node discovery",
+    )
     return [
         NodeControlClient(node.control_addr, timeout_sec=timeout_sec)
         for node in selected_nodes
@@ -1506,7 +1545,7 @@ def _prepare_code_blob(
         DependencyPackager,
         _TarSourceEntry,
         _normalize_arcname,
-        _write_deterministic_targz,
+        _write_cached_deterministic_targz,
     )
 
     packager = DependencyPackager()
@@ -1562,7 +1601,7 @@ def _prepare_code_blob(
                         ) from exc
                     arcname = _normalize_arcname(base_arc_dir / rel)
                     entries.append(_TarSourceEntry(arcname=arcname, source_path=resource_path))
-                _write_deterministic_targz(entries, tmp_path)
+                _write_cached_deterministic_targz(entries, tmp_path, cache_scope="module-resource-paths")
             with open(tmp_path, "rb") as f:
                 blob = f.read()
             filename = f"{module.__name__}.tar.gz"

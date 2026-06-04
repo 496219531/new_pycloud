@@ -417,6 +417,7 @@ def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
 
     assert added == 1
     assert created[0][0] == "127.0.0.1:50061"
+    assert created[0][1]["expected_node_instance_id"] == "node-inst-1"
     assert group.sessions["node-inst-1"].service_id == "svc-recreated"
     assert "node-inst-1" not in group.failures
     assert "node-inst-1" in group._active_replica_ids  # noqa: SLF001
@@ -531,6 +532,7 @@ def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeyp
 
     assert added == 1
     assert created[0][0] == "127.0.0.1:50061"
+    assert created[0][1]["expected_node_instance_id"] == "node-inst-new"
     assert "node-inst-new" in group.sessions
     assert "node-inst-old" in group.failures
 
@@ -3280,6 +3282,100 @@ class TestOwnerServiceFacade:
         assert list(group.nodes.keys()) == ["node-1-a", "node-1-b"]
         for client in group._clients.values():  # noqa: SLF001
             client.close()
+
+    def test_deploy_from_infocenter_retries_alternate_node_for_required_node_count(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        nodes = [
+            SimpleNamespace(
+                node_id="node-bad",
+                node_instance_id="node-bad-inst",
+                control_addr="127.0.0.1:50061",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                accept_service_deploy=True,
+                service_worker_available=2,
+                capacity=2,
+                queued=0,
+                python_version="py3.11",
+            ),
+            SimpleNamespace(
+                node_id="node-good",
+                node_instance_id="node-good-inst",
+                control_addr="127.0.0.1:50062",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                accept_service_deploy=True,
+                service_worker_available=1,
+                capacity=1,
+                queued=0,
+                python_version="py3.11",
+            ),
+        ]
+        targets = []
+        expected_node_instance_ids = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+                targets.append(target)
+
+            def create_service_from_bytes(self, **kwargs):
+                expected_node_instance_ids.append(kwargs.get("expected_node_instance_id"))
+                if self.target.endswith(":50061"):
+                    raise RuntimeError("node instance execution is fenced; NodeControl host should exit")
+                return SimpleNamespace(
+                    service_id="svc-good",
+                    service_token="token-good",
+                    http_base_url=f"http://{self.target}/svc/demo",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=((), nodes),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service._deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-fallback-service",
+                source=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                entry_callable="run",
+                node_count=1,
+                min_success_nodes=1,
+                allow_partial=False,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert targets == ["127.0.0.1:50061", "127.0.0.1:50062"]
+            assert expected_node_instance_ids == ["node-bad-inst", "node-good-inst"]
+            assert list(group.nodes.keys()) == ["node-good-inst"]
+            assert "node-bad-inst" in group.failures
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
 
     def test_deploy_from_infocenter_retries_briefly_until_nodes_register(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service

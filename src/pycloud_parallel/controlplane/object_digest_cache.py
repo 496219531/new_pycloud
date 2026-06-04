@@ -11,6 +11,9 @@ from typing import Dict, Optional
 
 
 _CACHE_LOCK = threading.Lock()
+_INDEX_CACHE_PATH: Optional[Path] = None
+_INDEX_CACHE_MTIME_NS: int = -1
+_INDEX_CACHE: Optional[Dict[str, Dict[str, str]]] = None
 
 
 def _cache_root_dir() -> Path:
@@ -44,14 +47,36 @@ def _file_cache_key(path: Path, *, format: str) -> str:
 
 
 def _load_index() -> Dict[str, Dict[str, str]]:
+    global _INDEX_CACHE, _INDEX_CACHE_MTIME_NS, _INDEX_CACHE_PATH
     cache_path = _cache_path()
+    try:
+        stat = cache_path.stat()
+    except FileNotFoundError:
+        _INDEX_CACHE_PATH = cache_path
+        _INDEX_CACHE_MTIME_NS = -1
+        _INDEX_CACHE = {}
+        return {}
+    except OSError:
+        _INDEX_CACHE_PATH = cache_path
+        _INDEX_CACHE_MTIME_NS = -1
+        _INDEX_CACHE = {}
+        return {}
+    mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+    if _INDEX_CACHE is not None and _INDEX_CACHE_PATH == cache_path and _INDEX_CACHE_MTIME_NS == mtime_ns:
+        return {key: dict(value) for key, value in _INDEX_CACHE.items()}
     if not cache_path.exists():
         return {}
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8") or "{}")
     except Exception:
+        _INDEX_CACHE_PATH = cache_path
+        _INDEX_CACHE_MTIME_NS = mtime_ns
+        _INDEX_CACHE = {}
         return {}
     if not isinstance(payload, dict):
+        _INDEX_CACHE_PATH = cache_path
+        _INDEX_CACHE_MTIME_NS = mtime_ns
+        _INDEX_CACHE = {}
         return {}
     out: Dict[str, Dict[str, str]] = {}
     for key, value in payload.items():
@@ -60,15 +85,27 @@ def _load_index() -> Dict[str, Dict[str, str]]:
                 "object_id": str(value.get("object_id", "") or "").strip(),
                 "updated_at": str(value.get("updated_at", "") or "").strip(),
             }
+    _INDEX_CACHE_PATH = cache_path
+    _INDEX_CACHE_MTIME_NS = mtime_ns
+    _INDEX_CACHE = {key: dict(value) for key, value in out.items()}
     return out
 
 
 def _write_index(index: Dict[str, Dict[str, str]]) -> None:
+    global _INDEX_CACHE, _INDEX_CACHE_MTIME_NS, _INDEX_CACHE_PATH
     cache_path = _cache_path()
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(index, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
     os.replace(str(tmp_path), str(cache_path))
+    try:
+        stat = cache_path.stat()
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+    except OSError:
+        mtime_ns = -1
+    _INDEX_CACHE_PATH = cache_path
+    _INDEX_CACHE_MTIME_NS = mtime_ns
+    _INDEX_CACHE = {key: dict(value) for key, value in index.items()}
 
 
 def lookup_file_digest(path: Path, *, format: str) -> Optional[str]:

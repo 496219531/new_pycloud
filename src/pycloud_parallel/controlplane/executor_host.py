@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import contextlib
+import subprocess
 import traceback
 import multiprocessing as mp
 import os
@@ -92,6 +93,7 @@ class ExecutorHostClient:
         self._expired_requests: set[str] = set()
         self._async_events: Deque[Dict[str, Any]] = deque()
         self._worker_pids: set[int] = set()
+        self._worker_pid_sets: Dict[str, set[int]] = {}
         self._cv = threading.Condition()
         self._seq = 0
         self._closed = False
@@ -118,13 +120,21 @@ class ExecutorHostClient:
             kind = str(item.get("kind", "") or "")
             with self._cv:
                 if kind == "executor_worker_pids":
+                    pid_set: set[int] = set()
                     for pid in item.get("worker_pids", ()) or ():
                         try:
                             normalized_pid = int(pid)
                         except (TypeError, ValueError):
                             continue
                         if normalized_pid > 0:
-                            self._worker_pids.add(normalized_pid)
+                            pid_set.add(normalized_pid)
+                    scope = str(item.get("scope", "") or "")
+                    key = str(item.get("key", "") or "")
+                    worker_key = f"{scope}:{key}"
+                    previous = self._worker_pid_sets.get(worker_key, set())
+                    self._worker_pids.difference_update(previous)
+                    self._worker_pid_sets[worker_key] = pid_set
+                    self._worker_pids.update(pid_set)
                     self._async_events.append(item)
                     continue
                 if kind == "response":
@@ -147,6 +157,7 @@ class ExecutorHostClient:
     def close(self, *, shutdown_timeout_sec: float = 2.0) -> None:
         if self._closed:
             return
+        tracked_host_pid = int(getattr(self._process, "pid", 0) or 0)
         if self._process.is_alive():
             try:
                 self._request("shutdown", timeout_sec=max(0.1, float(shutdown_timeout_sec or 0.1)))
@@ -158,6 +169,9 @@ class ExecutorHostClient:
             self._reader.join(timeout=1.0)
         if self._process.is_alive():
             self._process.join(timeout=5.0)
+        if os.name == "nt" and self._process.is_alive():
+            self._kill_process_tree(tracked_host_pid)
+            self._process.join(timeout=2.0)
         if self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=2.0)
@@ -165,6 +179,8 @@ class ExecutorHostClient:
             self._process.kill()
             self._process.join(timeout=1.0)
         self._terminate_tracked_workers()
+        if self._process.is_alive():
+            self._kill_process_tree(tracked_host_pid)
         try:
             self._request_q.close()
         except Exception:
@@ -178,7 +194,14 @@ class ExecutorHostClient:
         with self._cv:
             worker_pids = list(self._worker_pids)
             self._worker_pids.clear()
+            self._worker_pid_sets.clear()
         current_pid = os.getpid()
+        if os.name == "nt":
+            for pid in worker_pids:
+                if pid <= 0 or pid == current_pid:
+                    continue
+                self._kill_process_tree(pid)
+            return
         for pid in worker_pids:
             if pid <= 0 or pid == current_pid:
                 continue
@@ -196,6 +219,22 @@ class ExecutorHostClient:
                 os.kill(pid, sigkill)
             except Exception:
                 continue
+
+    def _kill_process_tree(self, pid: int) -> None:
+        if pid <= 0 or pid == os.getpid():
+            return
+        if os.name == "nt":
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=False,
+                )
+            return
+        with contextlib.suppress(Exception):
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
     def drain_events(self) -> list[Dict[str, Any]]:
         with self._cv:

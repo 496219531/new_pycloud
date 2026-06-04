@@ -311,6 +311,29 @@ class NodeControlHttpApp:
         if parts and parts[0] == "objects":
             return self.object_app.handle_get(path)
         try:
+            if parts == ["node", "status"]:
+                snapshot = self.state.registrar_snapshot(include_stopped=True)
+                return self._ok(
+                    {
+                        "ok": True,
+                        "node": {
+                            "node_id": str(getattr(self.state, "node_id", "") or ""),
+                            "node_instance_id": str(getattr(self.state, "node_instance_id", "") or ""),
+                            "execution_fenced": bool(snapshot.get("execution_fenced", False)),
+                            "accept_service_deploy": bool(snapshot.get("accept_service_deploy", True)),
+                            "execution_fenced_reason": str(snapshot.get("execution_fenced_reason", "") or ""),
+                            "execution_fenced_at": str(snapshot.get("execution_fenced_at", "") or ""),
+                            "metrics": dict(snapshot.get("metrics") or {}),
+                            "active_runtimes": list(snapshot.get("active_runtimes") or []),
+                            "service_count": len(list(snapshot.get("service_reports") or [])),
+                            "task_pool_count": len(list(snapshot.get("task_pool_reports") or [])),
+                            "service_worker_capacity": int(snapshot.get("service_worker_capacity", 0) or 0),
+                            "service_worker_used": int(snapshot.get("service_worker_used", 0) or 0),
+                            "task_pool_worker_capacity": int(snapshot.get("task_pool_worker_capacity", 0) or 0),
+                            "task_pool_worker_used": int(snapshot.get("task_pool_worker_used", 0) or 0),
+                        },
+                    }
+                )
             if len(parts) == 2 and parts[0] == "taskpools" and parts[1]:
                 info = self.state.task_pool_status_info(parts[1])
                 return self._ok({"ok": True, "pool": _task_pool_status_to_dict(info)})
@@ -480,6 +503,16 @@ class NodeControlHttpApp:
         return self._err(404, "not found")
 
     def _create_task_pool(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
+        expected_node_instance_id = str(payload.get("expected_node_instance_id", "") or "").strip()
+        local_node_instance_id = str(getattr(self.state, "node_instance_id", "") or "").strip()
+        if expected_node_instance_id and local_node_instance_id and expected_node_instance_id != local_node_instance_id:
+            return self._err(
+                409,
+                "node control_addr instance mismatch; "
+                f"expected_node_instance_id={expected_node_instance_id} "
+                f"actual_node_instance_id={local_node_instance_id} "
+                f"node_id={getattr(self.state, 'node_id', '')}",
+            )
         meta = _parse_message(pb2.CreateTaskPoolMeta, payload.get("meta", {}))
         blob = base64.b64decode(str(payload.get("code_b64", "") or "").encode("utf-8"))
         try:
@@ -506,6 +539,16 @@ class NodeControlHttpApp:
         return self._ok(_created_task_pool_response(pool))
 
     def _create_service(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
+        expected_node_instance_id = str(payload.get("expected_node_instance_id", "") or "").strip()
+        local_node_instance_id = str(getattr(self.state, "node_instance_id", "") or "").strip()
+        if expected_node_instance_id and local_node_instance_id and expected_node_instance_id != local_node_instance_id:
+            return self._err(
+                409,
+                "node control_addr instance mismatch; "
+                f"expected_node_instance_id={expected_node_instance_id} "
+                f"actual_node_instance_id={local_node_instance_id} "
+                f"node_id={getattr(self.state, 'node_id', '')}",
+            )
         meta = _parse_message(pb2.CreateServiceMeta, payload.get("meta", {}))
         blob = base64.b64decode(str(payload.get("code_b64", "") or "").encode("utf-8"))
         try:
@@ -1056,6 +1099,11 @@ class HttpNodeControlClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def node_status(self) -> Dict[str, object]:
+        data = self._json("GET", "/node/status", None)
+        node = data.get("node")
+        return dict(node or {}) if isinstance(node, dict) else {}
+
     def _objects(self) -> HttpNodeObjectClient:
         if self._object_client is None:
             self._object_client = HttpNodeObjectClient(self.base_url, timeout_sec=self.timeout_sec)
@@ -1249,6 +1297,7 @@ class HttpNodeControlClient:
         idle_ttl_sec: int = 0,
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         api_token: str = "",
+        expected_node_instance_id: str = "",
     ) -> NativeTaskPoolClient:
         import hashlib
 
@@ -1286,6 +1335,8 @@ class HttpNodeControlClient:
             ),
         )
         payload = {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")}
+        if str(expected_node_instance_id or "").strip():
+            payload["expected_node_instance_id"] = str(expected_node_instance_id or "").strip()
         if initial_globals:
             payload["initial_globals"] = encode_payload_for_transport(
                 dict(initial_globals),
@@ -1337,6 +1388,7 @@ class HttpNodeControlClient:
         expose_http: bool = True,
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         api_token: str = "",
+        expected_node_instance_id: str = "",
     ) -> ServiceSessionClient:
         import hashlib
 
@@ -1377,6 +1429,8 @@ class HttpNodeControlClient:
             policy_id=str(policy_id or "").strip().lower() or "default_safe",
         )
         payload = {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")}
+        if str(expected_node_instance_id or "").strip():
+            payload["expected_node_instance_id"] = str(expected_node_instance_id or "").strip()
         if initial_globals:
             payload["initial_globals"] = encode_payload_for_transport(
                 dict(initial_globals),

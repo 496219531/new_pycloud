@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timezone
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -14,6 +15,7 @@ import pytest
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _render_ops_snapshot, _reorder_job_via_http
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeState, NodeTaskPoolInfo
+from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
 from pycloud_parallel.controlplane.server import build_job_orchestrator_server
@@ -107,7 +109,19 @@ def test_node_registrar_syncs_service_routes(tmp_path):
             assert "svc-reg-sync" in raw
             assert ">2</td><td>2</td>" in raw
             assert "controlplane_version=" in raw
-            assert "<th>node_id</th><th>instance_id</th><th>control_addr</th><th>healthy</th><th>schedulable</th><th>accept deploy</th><th>drain</th><th>enabled</th><th>pycloud</th>" in raw
+            for header in (
+                "<th>node_id</th>",
+                "<th>instance_id</th>",
+                "<th>control_addr</th>",
+                "<th>healthy</th>",
+                "<th>schedulable</th>",
+                "<th>proc quota</th>",
+                "<th>accept deploy</th>",
+                "<th>drain</th>",
+                "<th>enabled</th>",
+                "<th>pycloud</th>",
+            ):
+                assert header in raw
             assert "<th>effective tags</th><th>managed tags</th><th>capability tags</th><th>legacy node tags</th>" in raw
             assert "avg_total_ms" in raw
             assert "avg_child_decode_ms" in raw
@@ -248,9 +262,9 @@ def test_ops_page_merges_duplicate_services_with_same_endpoint():
 
     raw = _render_ops_page(info_state)
 
-    assert "merged×2" in raw
     assert raw.count("calc_asset_ratio") >= 1
     assert "svc-a (+1)" in raw or "svc-b (+1)" in raw
+    assert "merged×2" not in raw
 
 
 def test_ops_snapshot_returns_partial_table_fragments():
@@ -280,6 +294,8 @@ def test_ops_snapshot_returns_partial_table_fragments():
     assert snapshot["ok"] is True
     fragments = snapshot["fragments"]
     assert "node-snapshot" in fragments["ops-nodes-body"]
+    assert "svc 0/0" in fragments["ops-nodes-body"]
+    assert "svc-snapshot" not in fragments["ops-nodes-body"]
     assert "svc-snapshot" in fragments["ops-services-body"]
     assert "<tbody" not in fragments["ops-nodes-body"]
 
@@ -710,6 +726,52 @@ def test_infocenter_replaces_existing_node_with_same_control_addr():
     assert [route["service_id"] for route in routes] == ["svc-new"]
 
 
+def test_infocenter_http_rejects_new_instance_when_control_addr_serves_old_instance(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    old_state = NodeControlState(
+        node_id="node-same-port",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "old_code_cache"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    old_server = NodeControlHttpServer(bind="127.0.0.1:0", state=old_state)
+    info_server.start()
+    old_server.start()
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as client:
+            first = client.register_node(
+                node_id="node-same-port",
+                node_instance_id=old_state.node_instance_id,
+                control_addr=old_server.base_url,
+                capacity=1,
+                queue_capacity=4,
+                tags=["compute"],
+            )
+            assert first["accepted"] is True
+            second = client.register_node(
+                node_id="node-same-port",
+                node_instance_id="node-same-port-new",
+                control_addr=old_server.base_url,
+                capacity=1,
+                queue_capacity=4,
+                tags=["compute"],
+            )
+
+        assert second["accepted"] is False
+        assert second["reset_required"] is True
+        assert "actual_node_instance_id=" + old_state.node_instance_id in second["reason"]
+        nodes = info_state.list_nodes(healthy_only=True, tags=["compute"], limit=20)
+        assert [node.node_instance_id for node in nodes] == [old_state.node_instance_id]
+    finally:
+        old_server.stop()
+        old_state.close()
+        info_server.stop()
+
+
 def test_infocenter_http_version_prefers_runtime_package_version(monkeypatch):
     import pycloud_parallel
     from pycloud_parallel.controlplane import infocenter_http
@@ -851,7 +913,8 @@ def test_infocenter_http_rejects_fenced_instance_with_reset_required():
         assert body["accepted"] is False
         assert body["reset_required"] is True
         assert body["new_instance_required"] is True
-        assert body["reason"] == "node_instance_id fenced"
+        assert body["reason"] == "test lost"
+        assert body["error"] == "node_instance_id fenced"
     finally:
         info_server.stop()
 
@@ -892,7 +955,8 @@ def test_infocenter_client_returns_fenced_reset_response_for_node_sync():
             assert resp["accepted"] is False
             assert resp["reset_required"] is True
             assert resp["new_instance_required"] is True
-            assert resp["reason"] == "node_instance_id fenced"
+            assert resp["reason"] == "test lost"
+            assert resp["error"] == "node_instance_id fenced"
     finally:
         info_server.stop()
 
@@ -922,7 +986,7 @@ def test_node_registrar_handles_fenced_register_response(tmp_path):
         tags=["compute"],
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=5.0,
-        restart_on_fence=False,
+        exit_on_fence=False,
     )
 
     try:
@@ -940,7 +1004,7 @@ def test_node_registrar_handles_fenced_register_response(tmp_path):
         info_server.stop()
 
 
-def test_node_registrar_schedules_restart_after_fenced_register_response(tmp_path):
+def test_node_registrar_exits_host_after_fenced_register_response(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
     info_server.start()
@@ -955,7 +1019,7 @@ def test_node_registrar_schedules_restart_after_fenced_register_response(tmp_pat
         enable_service_session=True,
         service_http_bind="127.0.0.1:0",
     )
-    restart_calls = []
+    exit_calls = []
     registrar = NodeInfoCenterRegistrar(
         infocenter_addr=info_target,
         node_id="node-fenced-reg-restart",
@@ -966,8 +1030,9 @@ def test_node_registrar_schedules_restart_after_fenced_register_response(tmp_pat
         tags=["compute"],
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=5.0,
-        restart_delay_sec=1.5,
-        restart_callback=lambda delay_sec: restart_calls.append(delay_sec),
+        exit_delay_sec=1.5,
+        exit_on_fence=True,
+        exit_callback=lambda delay_sec: exit_calls.append(delay_sec),
     )
 
     try:
@@ -978,14 +1043,14 @@ def test_node_registrar_schedules_restart_after_fenced_register_response(tmp_pat
         assert registrar.sync_now() is False
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
         assert node_state.execution_fenced is True
-        assert restart_calls == [1.5]
+        assert exit_calls == [1.5]
     finally:
         registrar.close()
         node_state.close()
         info_server.stop()
 
 
-def test_node_registrar_schedules_restart_after_fenced_heartbeat_response(tmp_path):
+def test_node_registrar_exits_host_after_fenced_heartbeat_response(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
     info_server.start()
@@ -1000,7 +1065,7 @@ def test_node_registrar_schedules_restart_after_fenced_heartbeat_response(tmp_pa
         enable_service_session=True,
         service_http_bind="127.0.0.1:0",
     )
-    restart_calls = []
+    exit_calls = []
     registrar = NodeInfoCenterRegistrar(
         infocenter_addr=info_target,
         node_id="node-fenced-heartbeat-restart",
@@ -1011,8 +1076,9 @@ def test_node_registrar_schedules_restart_after_fenced_heartbeat_response(tmp_pa
         tags=["compute"],
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=5.0,
-        restart_delay_sec=1.5,
-        restart_callback=lambda delay_sec: restart_calls.append(delay_sec),
+        exit_delay_sec=1.5,
+        exit_on_fence=True,
+        exit_callback=lambda delay_sec: exit_calls.append(delay_sec),
     )
 
     try:
@@ -1023,7 +1089,114 @@ def test_node_registrar_schedules_restart_after_fenced_heartbeat_response(tmp_pa
         assert registrar.sync_now() is False
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
         assert node_state.execution_fenced is True
-        assert restart_calls == [1.5]
+        assert exit_calls == [1.5]
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
+def test_node_registrar_exits_only_after_fence_cleanup():
+    events = []
+
+    class _FakeState:
+        node_instance_id = "node-fence-order-inst"
+        close_on_registration_lost = False
+
+        def reset_execution_state(self, *, reason):
+            events.append(("reset", reason))
+
+        def close(self):
+            events.append(("close", "state"))
+
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-fence-order",
+        control_addr="127.0.0.1:50061",
+        state=_FakeState(),
+        capacity=1,
+        queue_capacity=1,
+        exit_on_fence=True,
+        exit_delay_sec=1.25,
+        exit_callback=lambda delay_sec: events.append(("exit", delay_sec)),
+    )
+
+    try:
+        registrar._reset_state_after_fence("test fence", restart=True)  # noqa: SLF001
+
+        assert events == [("reset", "test fence"), ("exit", 1.25)]
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+    finally:
+        registrar.close(mark_lost=False)
+
+
+def test_node_registrar_exits_when_replaced_by_confirmed_new_instance(tmp_path, monkeypatch):
+    import pycloud_parallel.controlplane.infocenter_http as infocenter_http
+
+    class _ConfirmedReplacementNodeControlClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def node_status(self):
+            return {
+                "node_id": "node-replaced-heartbeat",
+                "node_instance_id": "node-replaced-heartbeat-new",
+            }
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+    monkeypatch.setattr(infocenter_http, "NodeControlClient", _ConfirmedReplacementNodeControlClient)
+
+    node_state = NodeControlState(
+        node_id="node-replaced-heartbeat",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_replaced_heartbeat"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    exit_calls = []
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_target,
+        node_id="node-replaced-heartbeat",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        tags=["compute"],
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=5.0,
+        exit_delay_sec=1.5,
+        exit_on_fence=True,
+        exit_callback=lambda delay_sec: exit_calls.append(delay_sec),
+    )
+
+    try:
+        assert registrar.sync_now() is True
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-replaced-heartbeat",
+                node_instance_id="node-replaced-heartbeat-new",
+                control_addr="127.0.0.1:50061",
+                capacity=1,
+                queue_capacity=4,
+                tags=["compute"],
+            )
+
+        registrar._registered = True  # noqa: SLF001
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.execution_fenced is True
+        assert exit_calls == [1.5]
     finally:
         registrar.close()
         node_state.close()
@@ -1049,7 +1222,7 @@ def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
         queue_capacity=4,
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=0.5,
-        restart_on_fence=False,
+        exit_on_fence=False,
     )
 
     try:
@@ -1067,7 +1240,139 @@ def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
         node_state.close()
 
 
-def test_node_registrar_schedules_restart_after_self_fence_by_default(tmp_path):
+def test_node_registrar_transient_disconnect_does_not_close_before_lease_expires(tmp_path, monkeypatch):
+    node_state = NodeControlState(
+        node_id="node-transient-disconnect",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_transient_disconnect"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    node_state.close_on_registration_lost = True
+    closed = []
+    monkeypatch.setattr(node_state, "close", lambda: closed.append(True))
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-transient-disconnect",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+        exit_on_fence=False,
+    )
+
+    def _raise_transient():
+        raise URLError(ConnectionRefusedError("temporarily unavailable"))
+
+    monkeypatch.setattr(registrar, "_heartbeat_once", _raise_transient)
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now  # noqa: SLF001
+        registrar._lease_ttl_sec = 30  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert closed == []
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert node_state.execution_fenced is False
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+
+
+def test_node_registrar_wrapped_transient_disconnect_does_not_close_before_lease_expires(tmp_path, monkeypatch):
+    node_state = NodeControlState(
+        node_id="node-wrapped-transient-disconnect",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_wrapped_transient_disconnect"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    node_state.close_on_registration_lost = True
+    closed = []
+    monkeypatch.setattr(node_state, "close", lambda: closed.append(True))
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-wrapped-transient-disconnect",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+        exit_on_fence=False,
+    )
+
+    def _raise_wrapped_transient():
+        raise RuntimeError("http request to 127.0.0.1:9 failed: [WinError 10061] connection refused")
+
+    monkeypatch.setattr(registrar, "_heartbeat_once", _raise_wrapped_transient)
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now  # noqa: SLF001
+        registrar._lease_ttl_sec = 30  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert closed == []
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert node_state.execution_fenced is False
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+
+
+def test_node_registrar_closes_close_on_lost_after_wrapped_transient_lease_expires(tmp_path, monkeypatch):
+    node_state = NodeControlState(
+        node_id="node-wrapped-transient-expired",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_wrapped_transient_expired"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    node_state.close_on_registration_lost = True
+    closed = []
+    monkeypatch.setattr(node_state, "close", lambda: closed.append(True))
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-wrapped-transient-expired",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+        exit_on_fence=False,
+    )
+
+    def _raise_wrapped_transient():
+        raise RuntimeError("connection to 127.0.0.1:9 was closed by the remote service")
+
+    monkeypatch.setattr(registrar, "_heartbeat_once", _raise_wrapped_transient)
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now - 10.0  # noqa: SLF001
+        registrar._lease_ttl_sec = 1  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert closed == [True]
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.execution_fenced is True
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+
+
+def test_node_registrar_does_not_exit_after_self_fence_by_default(tmp_path):
     node_state = NodeControlState(
         node_id="node-self-fence-restart",
         queue_capacity=4,
@@ -1077,7 +1382,7 @@ def test_node_registrar_schedules_restart_after_self_fence_by_default(tmp_path):
         enable_service_session=True,
         service_http_bind="127.0.0.1:0",
     )
-    restart_calls = []
+    exit_calls = []
     registrar = NodeInfoCenterRegistrar(
         infocenter_addr="http://127.0.0.1:9",
         node_id="node-self-fence-restart",
@@ -1087,8 +1392,8 @@ def test_node_registrar_schedules_restart_after_self_fence_by_default(tmp_path):
         queue_capacity=4,
         fallback_heartbeat_sec=1,
         rpc_timeout_sec=0.5,
-        restart_delay_sec=2.0,
-        restart_callback=lambda delay_sec: restart_calls.append(delay_sec),
+        exit_delay_sec=2.0,
+        exit_callback=lambda delay_sec: exit_calls.append(delay_sec),
     )
 
     try:
@@ -1099,7 +1404,47 @@ def test_node_registrar_schedules_restart_after_self_fence_by_default(tmp_path):
 
         assert registrar.sync_now() is False
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
-        assert restart_calls == [2.0]
+        assert exit_calls == []
+        assert node_state.execution_fenced is True
+    finally:
+        registrar.close()
+        node_state.close()
+
+
+def test_node_registrar_exits_after_self_fence_when_enabled(tmp_path):
+    node_state = NodeControlState(
+        node_id="node-self-fence-restart-enabled",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_self_fence_restart_enabled"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    exit_calls = []
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-self-fence-restart-enabled",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+        exit_delay_sec=2.0,
+        exit_on_fence=True,
+        exit_callback=lambda delay_sec: exit_calls.append(delay_sec),
+    )
+
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now - 10.0  # noqa: SLF001
+        registrar._lease_ttl_sec = 1  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert exit_calls == [2.0]
         assert node_state.execution_fenced is True
     finally:
         registrar.close()
@@ -1572,10 +1917,29 @@ def test_infocenter_profile_enabled_and_drain_block_task_selection(tmp_path):
         server.stop()
 
 
-def test_ops_managed_tag_form_updates_endpoint_profile(tmp_path):
+def test_ops_managed_tag_form_updates_endpoint_profile(tmp_path, monkeypatch):
+    import pycloud_parallel.controlplane.infocenter_http as infocenter_http
+
+    class _ConfirmedReplacementNodeControlClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def node_status(self):
+            return {
+                "node_id": "node-ops-profile",
+                "node_instance_id": "node-ops-profile-new-inst",
+            }
+
     state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=5, profiles_path=tmp_path / "profiles.json")
     server = InfoCenterHttpServer(bind="127.0.0.1:0", state=state)
     server.start()
+    monkeypatch.setattr(infocenter_http, "NodeControlClient", _ConfirmedReplacementNodeControlClient)
 
     try:
         with InfoCenterClient(server.base_url, timeout_sec=5.0) as client:
@@ -1685,6 +2049,84 @@ def test_registering_restarted_node_prunes_stale_same_addr_instance():
 
     nodes = state.list_nodes(healthy_only=False, tags=[], limit=20)
     assert [node.node_instance_id for node in nodes] == ["node-a-new"]
+
+
+def test_infocenter_rejects_same_control_addr_when_status_probe_unconfirmed(monkeypatch):
+    import pycloud_parallel.controlplane.infocenter_http as infocenter_http
+
+    class _ProbeFailsNodeControlClient:
+        def __init__(self, *_args, **_kwargs):
+            return None
+
+        def __enter__(self):
+            raise TimeoutError("probe timed out")
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+    monkeypatch.setattr(infocenter_http, "NodeControlClient", _ProbeFailsNodeControlClient)
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            first = client.register_node(
+                node_id="node-a",
+                node_instance_id="node-a-old",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            assert first["accepted"] is True
+
+            second = client.register_node(
+                node_id="node-a",
+                node_instance_id="node-a-new",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+
+        assert second["accepted"] is False
+        assert second["retryable"] is True
+        assert second["error"] == "node control_addr replacement not confirmed"
+        nodes = info_state.list_nodes(healthy_only=False, tags=[], limit=20)
+        assert [node.node_instance_id for node in nodes] == ["node-a-old"]
+        assert info_state.is_instance_fenced("node-a-old") is False
+    finally:
+        info_server.stop()
+
+
+def test_infocenter_client_mark_node_lost_preserves_reason():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+
+    try:
+        with InfoCenterClient(info_server.base_url, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-lost-reason",
+                node_instance_id="node-lost-reason-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=20,
+                tags=["compute"],
+            )
+            response = client.mark_node_lost(
+                "node-lost-reason-inst",
+                reason="task pool create identity mismatch",
+            )
+
+        assert response["ok"] is True
+        nodes = info_state.list_nodes(healthy_only=False, tags=[], limit=20)
+        assert nodes[0].reason == "task pool create identity mismatch"
+        assert info_state.fenced_instance_reason("node-lost-reason-inst") == "task pool create identity mismatch"
+    finally:
+        info_server.stop()
 
 
 def test_runtime_spec_helpers_support_exact_major_and_comparators():
@@ -1847,6 +2289,55 @@ def test_node_registrar_close_sends_final_empty_startup_service_snapshot():
         routes = info_state.list_service_routes(service_name="startup-close-service", healthy_only=True, limit=10)
         assert routes == []
         assert node_state._closed.is_set() is True  # noqa: SLF001
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+        info_server.stop()
+
+
+def test_startup_service_registrar_closes_after_fenced_register_response():
+    from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    node_state = StartupServiceNode(
+        node_id="startup-fenced-node",
+        service_http_bind="",
+        service_http_base_url="http://127.0.0.1:19082",
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    node_state.close_on_registration_lost = True
+    node_state.mount_python_module_service(
+        service_name="startup-fenced-service",
+        entry_module="math",
+        export_methods=("sqrt",),
+        policy_id="trusted_internal",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_server.base_url,
+        node_id=node_state.node_id,
+        control_addr="",
+        state=node_state,
+        capacity=1,
+        queue_capacity=1,
+        tags=["startup-service"],
+        fallback_heartbeat_sec=1,
+    )
+    try:
+        assert registrar.sync_now() is True
+        info_state.mark_node_lost(registrar.node_instance_id, reason="test startup fence")
+        registrar._registered = False  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state._closed.is_set() is True  # noqa: SLF001
+        assert info_state.list_service_routes(
+            service_name="startup-fenced-service",
+            healthy_only=True,
+            limit=10,
+        ) == []
     finally:
         registrar.close(mark_lost=False)
         node_state.close()

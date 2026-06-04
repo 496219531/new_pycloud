@@ -3,6 +3,7 @@ from __future__ import annotations
 """Thin shared helpers for low-frequency service/taskpool creation flows."""
 
 import inspect
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
@@ -18,6 +19,16 @@ from pycloud_parallel.execution.support import _prepare_code_blob
 
 TNode = TypeVar("TNode")
 TCreated = TypeVar("TCreated")
+_DEFAULT_CREATE_DISPATCH_MAX_WORKERS = 32
+
+
+def _create_dispatch_max_workers(node_count: int) -> int:
+    raw = str(os.environ.get("PYCLOUD_DEPLOY_CREATE_MAX_WORKERS", "") or "").strip()
+    try:
+        configured = int(raw) if raw else _DEFAULT_CREATE_DISPATCH_MAX_WORKERS
+    except ValueError:
+        configured = _DEFAULT_CREATE_DISPATCH_MAX_WORKERS
+    return max(1, min(max(1, int(node_count or 1)), max(1, configured)))
 
 
 @dataclass(frozen=True)
@@ -107,7 +118,10 @@ def dispatch_create_requests(
         return [_run_create(node) for node in normalized_nodes]
 
     results: List[CreateDispatchResult[TNode, TCreated]] = []
-    with ThreadPoolExecutor(max_workers=max(1, len(normalized_nodes)), thread_name_prefix=thread_name_prefix) as executor:
+    with ThreadPoolExecutor(
+        max_workers=_create_dispatch_max_workers(len(normalized_nodes)),
+        thread_name_prefix=thread_name_prefix,
+    ) as executor:
         futures = {executor.submit(_run_create, node): node for node in normalized_nodes}
         for future in as_completed(futures):
             result = future.result()

@@ -493,6 +493,38 @@ def test_ctl_parser_accepts_local_flag_before_restart_command():
     assert args.local is True
 
 
+def test_ctl_parser_accepts_restart_scan_ports():
+    parser = ctl.build_parser()
+    args = parser.parse_args(["restart", "--scan-ports", "--ports", "50051,50061"])
+    assert args.command == "restart"
+    assert args.scan_ports is True
+    assert args.ports == "50051,50061"
+
+    args = parser.parse_args(["dev-restart", "--scan-ports", "--ports", "50051,50061"])
+    assert args.command == "dev-restart"
+    assert args.scan_ports is True
+    assert args.ports == "50051,50061"
+
+
+def test_terminate_pid_on_windows_kills_process_tree(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(ctl.os, "name", "nt", raising=False)
+    monkeypatch.setattr(ctl, "_is_pid_running", lambda pid: True)
+    monkeypatch.setattr(
+        ctl.subprocess,
+        "run",
+        lambda cmd, check=False, capture_output=True, text=True: calls.append(list(cmd)) or SimpleNamespace(stdout=""),
+    )
+
+    ctl._terminate_pid(123, force=False)
+    ctl._terminate_pid(456, force=True)
+
+    assert calls == [
+        ["taskkill", "/PID", "123", "/T"],
+        ["taskkill", "/F", "/PID", "456", "/T"],
+    ]
+
+
 def test_ctl_parser_accepts_env_overrides_for_start_commands():
     parser = ctl.build_parser()
     args = parser.parse_args(
@@ -1467,6 +1499,33 @@ def test_cmd_stopall_stops_pid_backed_and_local_ipc_processes(tmp_path, monkeypa
     assert local_calls == [(3.0, True)]
 
 
+def test_cmd_dev_stop_scans_machine_processes_and_ports(tmp_path, monkeypatch):
+    pids_dir = tmp_path / "pids"
+    pids_dir.mkdir(parents=True, exist_ok=True)
+    (pids_dir / "node-blue.pid").write_text("123\n", encoding="utf-8")
+    parser = ctl.build_parser()
+    args = parser.parse_args(["--runtime-root", str(tmp_path), "dev-stop", "--scan-ports", "--ports", "50051,50061"])
+    stopped: list[tuple[Path, str]] = []
+    cleaned: list[tuple[str, str]] = []
+    machine_scan_calls: list[tuple[Path, str]] = []
+    port_scan_calls: list[tuple[str, tuple[int, ...]]] = []
+    logs: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(ctl, "_stop_named_process", lambda root, name: stopped.append((root, name)))
+    monkeypatch.setattr(ctl, "_best_effort_mark_node_lost", lambda target, name: cleaned.append((target, name)) or True)
+    monkeypatch.setattr(ctl, "_kill_machine_pycloud_processes", lambda *, root, target: machine_scan_calls.append((root, target)) or [{"pid": 301}])
+    monkeypatch.setattr(ctl, "_kill_scanned_port_processes", lambda *, target, ports: port_scan_calls.append((target, tuple(ports))) or [{"pid": 302, "port": 50061}])
+    monkeypatch.setattr(ctl, "_log", lambda label, message: logs.append((label, message)))
+
+    assert ctl._cmd_dev_stop(args) == 0
+    assert ("127.0.0.1:50051", "node-blue") in cleaned
+    assert (tmp_path.resolve(), "node-blue") in stopped
+    assert machine_scan_calls == [(tmp_path.resolve(), "127.0.0.1:50051")]
+    assert port_scan_calls == [("127.0.0.1:50051", (50051, 50061))]
+    assert ("OK", "Stopped 1 additional machine-wide pycloud process(es)") in logs
+    assert ("OK", "Stopped 1 additional scanned listener process(es)") in logs
+
+
 def test_kill_machine_pycloud_processes_stops_discovered_server_processes(tmp_path, monkeypatch):
     target = "127.0.0.1:50051"
     killed: list[tuple[int, bool]] = []
@@ -1686,6 +1745,45 @@ def test_cmd_start_node_uses_explicit_target_and_local_advertise(tmp_path, monke
             "api_token": "",
         }
     ]
+
+
+def test_start_standalone_node_enables_managed_fence_exit(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
+    monkeypatch.setattr(ctl, "_wait_http_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ctl, "_wait_node_registered", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ctl, "_write_pid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ctl, "_log", lambda *_args, **_kwargs: None)
+
+    def fake_spawn(root, log_path, args, *, extra_env=None, debug=False):
+        captured["root"] = root
+        captured["log_path"] = log_path
+        captured["args"] = list(args)
+        captured["extra_env"] = dict(extra_env or {})
+        captured["debug"] = debug
+        return 12345
+
+    monkeypatch.setattr(ctl, "_spawn_server", fake_spawn)
+
+    ctl._start_standalone_node(
+        tmp_path,
+        node_id="node-blue",
+        bind="127.0.0.1:51061",
+        service_http_bind="127.0.0.1:18181",
+        infocenter_addr="127.0.0.1:50051",
+        advertise_addr="127.0.0.1:51061",
+        worker_capacity=2,
+        queue_capacity=4000,
+        max_workers=64,
+        service_default_workers=10,
+        service_heartbeat_timeout_sec=30,
+        node_tags="compute",
+        node_version="v1",
+    )
+
+    extra_env = captured["extra_env"]
+    assert extra_env["PYCLOUD_NODE_EXIT_ON_FENCE"] == "1"
 
 
 def test_cmd_start_node_passes_api_token_to_server(tmp_path, monkeypatch):

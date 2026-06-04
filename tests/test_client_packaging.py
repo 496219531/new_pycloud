@@ -205,6 +205,42 @@ def test_dependency_packager_module_includes_project_root_imports(tmp_path, monk
         tar_path.unlink(missing_ok=True)
 
 
+def test_dependency_packager_reuses_tar_cache_for_unchanged_module(tmp_path, monkeypatch):
+    from pycloud_parallel.controlplane import dependency as dependency_mod
+    from pycloud_parallel.controlplane.dependency import DependencyPackager
+
+    monkeypatch.setenv("PYCLOUD_PACKAGE_CACHE_DIR", str(tmp_path / "package-cache"))
+    package_dir = tmp_path / "cache_pkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "worker.py").write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': value}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    worker = importlib.import_module("cache_pkg.worker")
+
+    packager = DependencyPackager()
+    first = Path(packager.package_module(worker))
+    try:
+        first_blob = first.read_bytes()
+    finally:
+        first.unlink(missing_ok=True)
+
+    def _fail_write(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("unchanged package should be served from package cache")
+
+    monkeypatch.setattr(dependency_mod, "_write_deterministic_targz", _fail_write)
+    second = Path(packager.package_module(worker))
+    try:
+        assert second.read_bytes() == first_blob
+    finally:
+        second.unlink(missing_ok=True)
+
+
 def test_dependency_packager_expands_project_relative_import_roots(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane.dependency import DependencyPackager
 

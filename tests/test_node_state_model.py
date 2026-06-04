@@ -4715,6 +4715,41 @@ def test_nodecontrol_reset_fences_execution_until_process_restart(tmp_path):
         state.close()
 
 
+def test_nodecontrol_reset_closes_executor_with_fence_timeout(tmp_path):
+    state = NodeControlState(
+        node_id="node-reset-close-timeout",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_reset_close_timeout"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):
+            calls.append(("close", kwargs))
+
+    try:
+        with state._lock:  # noqa: SLF001
+            state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+
+        state.reset_execution_state(reason="test fence cleanup")
+
+        assert calls == [("close", {"shutdown_timeout_sec": 8.0})]
+        assert state._executor_host is None  # noqa: SLF001
+        assert state.execution_fenced is True
+    finally:
+        state.close()
+
+
 def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     state = NodeControlState(
         node_id="node-close-executors",

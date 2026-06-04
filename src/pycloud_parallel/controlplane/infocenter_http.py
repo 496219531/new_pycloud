@@ -764,7 +764,7 @@ def _reorder_job_via_http(http_base_url: str, job_id: str, *, direction: str, au
     return payload
 
 
-def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager] = None) -> str:
+def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager] = None, *, _snapshot_only: bool = False):
     nodes = _merge_nodes_for_display(state.list_nodes(healthy_only=False, tags=(), limit=10000))
     node_rows: List[str] = []
     service_rows: List[str] = []
@@ -844,15 +844,6 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         node_healthy = bool(node.healthy)
         timing_map = _parse_service_timing_metrics(dict(node.metadata))
         pool_timing_map = _parse_task_pool_timing_metrics(dict(node.metadata))
-        loaded = "<br>".join(
-            (
-                f"{html.escape(str(item['service_name']))} "
-                f"<span class='muted'>[{(int(item['alive_workers']) if node_healthy else 0)}/{int(item['worker_count'])} alive, "
-                f"in-flight {(int(item['in_flight']) if node_healthy else 0)}]"
-                f"{' merged×' + str(int(item['duplicate_count'])) if int(item['duplicate_count']) > 1 else ''}</span>"
-            )
-            for item in merged_services
-        ) or "-"
         active_runtimes = ", ".join(node.active_runtimes[:10]) or "-"
         effective_tags = ", ".join(getattr(node, "tags", []) or []) or "-"
         managed_tags = ", ".join(getattr(node, "managed_tags", []) or []) or "-"
@@ -861,6 +852,12 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         profile_key = str(getattr(node, "profile_key", "") or "").strip()
         profile_notes = str(getattr(node, "profile_notes", "") or "")
         action_node_id = html.escape(getattr(node, "action_node_instance_id", getattr(node, "node_instance_id", node.node_id)))
+        proc_quota = (
+            f"svc {node.service_worker_used}/{node.service_worker_capacity}"
+            f" <span class='muted'>free {node.service_worker_available()}</span><br>"
+            f"pool {node.task_pool_worker_used}/{node.task_pool_worker_capacity}"
+            f" <span class='muted'>free {node.task_pool_worker_available()}</span>"
+        )
         node_rows.append(
             "<tr>"
             f"<td>{html.escape(node.node_id)}</td>"
@@ -868,6 +865,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(node.control_addr)}</td>"
             f"<td>{_ops_bool_badge(node.healthy)}</td>"
             f"<td>{_ops_bool_badge(node.schedulable)}</td>"
+            f"<td class='quota-cell'>{proc_quota}</td>"
             f"<td>{_ops_bool_badge(getattr(node, 'accept_service_deploy', True))}</td>"
             f"<td>{_ops_bool_badge(node.drain, invert=True)}</td>"
             f"<td>{_ops_bool_badge(getattr(node, 'profile_enabled', True))}</td>"
@@ -884,10 +882,6 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{node.task_pool_worker_capacity}</td>"
             f"<td>{node.task_pool_worker_used}</td>"
             f"<td>{node.task_pool_worker_available()}</td>"
-            f"<td>{sum(int(getattr(pool, 'inflight', 0) or 0) for pool in task_pools)}</td>"
-            f"<td>{len(task_pools)}</td>"
-            f"<td>{len(merged_services)}</td>"
-            f"<td>{loaded}</td>"
             f"<td>{html.escape(node.reason or '')}</td>"
             f"<td>{html.escape(profile_notes or '-')}</td>"
             "<td>"
@@ -1079,7 +1073,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
             "</tr>"
         )
-    node_body = "\n".join(node_rows) or "<tr><td colspan='27'>no nodes</td></tr>"
+    node_body = "\n".join(node_rows) or "<tr><td colspan='25'>no nodes</td></tr>"
     service_body = "\n".join(service_rows) or "<tr><td colspan='18'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
@@ -1089,6 +1083,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     recent_job_body = "\n".join(row for _sort_key, row in recent_job_rows) or "<tr><td colspan='8'>no recent jobs</td></tr>"
     waiting_job_rows.sort(key=lambda item: item[0])
     waiting_job_body = "\n".join(row for _sort_key, row in waiting_job_rows) or "<tr><td colspan='7'>no waiting jobs</td></tr>"
+    job_timing_body = (
+        f"<tr><td>embedded-job-orch</td><td>{html.escape(str(queue_timing.get('job_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_queue_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_pool_prepare_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_fanout_globals_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_running_tasks_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_finalize_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_terminal_writeback_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('max_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_first_result_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_warmup_ms', '-')))}</td></tr>"
+        f"<tr><td>current-job</td><td>1</td><td>{html.escape(str(current_job_timing.get('queue_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_prepare_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('fanout_globals_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('running_tasks_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('finalize_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('terminal_writeback_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'create' else 0))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'rebuild' else 0))}</td><td>{html.escape(str(current_job_timing.get('first_result_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('warmup_ms', '-')))}</td></tr>"
+    )
     healthy_nodes = sum(1 for node in nodes if bool(getattr(node, "healthy", False)))
     total_nodes = len(nodes)
     total_services = len(service_entries)
@@ -1113,11 +1111,33 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         f"{_ops_metric_card('Jobs', total_waiting_jobs, f'waiting, {total_recent_jobs} recent')}"
         "</div>"
     )
+    if _snapshot_only:
+        return {
+            "ok": True,
+            "fragments": {
+                "ops-nodes-body": node_body,
+                "ops-job-queue-body": job_queue_body,
+                "ops-job-timing-body": job_timing_body,
+                "ops-recent-jobs-body": recent_job_body,
+                "ops-waiting-jobs-body": waiting_job_body,
+                "ops-services-body": service_body,
+                "ops-pools-body": pool_body,
+            },
+            "metrics": {
+                "nodes": f"{healthy_nodes}/{total_nodes}",
+                "services": f"{running_services}/{total_services}",
+                "task_pools": str(total_pools),
+                "pool_inflight": str(pool_inflight),
+                "jobs": str(total_waiting_jobs),
+                "recent_jobs": str(total_recent_jobs),
+            },
+            "controlplane_version": _pycloud_version(),
+            "auto_refresh_sec": 5,
+        }
     node_headers = [
-        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "accept deploy", "drain", "enabled", "pycloud",
+        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "proc quota", "accept deploy", "drain", "enabled", "pycloud",
         "python", "active runtimes", "effective tags", "managed tags", "capability tags", "legacy node tags", "svc cap",
-        "svc used", "svc avail", "pool cap", "pool used", "pool avail", "pool inflight", "pool count", "svc count",
-        "services", "reason", "notes", "actions",
+        "svc used", "svc avail", "pool cap", "pool used", "pool avail", "reason", "notes", "actions",
     ]
     job_queue_headers = [
         "owner", "instance_id", "healthy", "pycloud", "current_job_id", "current_status", "current_phase", "pool_action",
@@ -1151,7 +1171,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ".metrics-grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:14px;margin:18px 0 22px;}.metric-card{position:relative;overflow:hidden;background:linear-gradient(180deg,rgba(16,27,49,.96),rgba(10,18,32,.96));border:1px solid rgba(148,163,184,.18);border-radius:18px;padding:16px 18px;box-shadow:0 14px 34px rgba(0,0,0,.24);}.metric-glow{position:absolute;right:-34px;top:-34px;width:120px;height:120px;background:radial-gradient(circle,rgba(96,165,250,.24),transparent 70%);}.metric-label{position:relative;font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.09em;}.metric-value{position:relative;font-size:31px;line-height:1.05;margin-top:9px;font-weight:840;letter-spacing:-.03em;}.metric-sub{position:relative;font-size:12px;color:var(--muted);margin-top:7px;}"
         ".ops-section{margin:20px 0 24px;}.section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 8px;}.section-anchor{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:4px 9px;background:rgba(15,23,42,.72);}.section-anchor:hover{color:#fff;border-color:var(--accent);}"
         ".table-wrap{overflow:auto;max-height:70vh;background:rgba(16,27,49,.9);border:1px solid rgba(148,163,184,.2);border-radius:16px;box-shadow:0 16px 42px rgba(0,0,0,.26);}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1120px;}th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);padding:9px 11px;font-size:12px;line-height:1.42;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}th{position:sticky;top:0;z-index:2;background:linear-gradient(180deg,#1a2a46,#142138);text-align:left;color:#c9d7eb;font-weight:780;text-transform:uppercase;letter-spacing:.035em;font-size:11px;}tr:last-child td{border-bottom:0;}td:last-child,th:last-child{border-right:0;}tbody tr:nth-child(even){background:rgba(255,255,255,.018);}tbody tr:hover{background:rgba(96,165,250,.09);}"
-        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(6),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+8):nth-child(-n+21),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(27){display:none;}"
+        ".quota-cell{white-space:nowrap;line-height:1.45;}"
+        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(7),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+9):nth-child(-n+22),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(24){display:none;}"
         "body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(2),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(14){display:none;}"
         "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
@@ -1179,19 +1200,18 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "<a class='nav-pill' href='/ops/snapshot'>snapshot</a>"
         "<button type='button' class='density-toggle' id='ops-density-toggle'>show details</button>"
         "<div class='refresh-pill' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div>"
-        "<div class='density-hint' id='ops-density-hint'>compact view hides IDs, URLs and deep timing columns</div>"
+        "<div class='density-hint' id='ops-density-hint'>compact node view shows quota/usage and hides service/task details</div>"
         "</div></div>"
         f"{overview}"
-        "<div class='section-note'>Node table shows task-mode pressure plus service/task-pool capacity. "
-        "Service table below shows each deployed service instance, worker process counts, and reduced timing metrics. "
-        "Task pool table shows native temporary pools running on each node. Rows for stale nodes are highlighted and rendered as LOST.</div>"
+        "<div class='section-note'>Node table focuses on health plus service/task-pool process quota and usage. "
+        "Service details and task-pool task pressure live in the tables below, so node rows stay compact. "
+        "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         f"{_ops_table('Nodes', '', node_headers, 'ops-nodes-body', node_body)}"
         f"{_ops_table('Job Queue', 'Shows embedded controlplane job queue state and any standalone `job-orchestrator` processes registered via InfoCenter metadata.', job_queue_headers, 'ops-job-queue-body', job_queue_body)}"
         "<section class='ops-section'><div class='section-note'>Job-orch timing is reduced timing for queue wait, pool prepare, globals fanout, task running, finalize, writeback and total. Windows-focused fields highlight executor create/rebuild, warmup, and first-result wait.</div>"
         "<div class='table-wrap'><table class='ops-table ops-table--job-timing'><thead><tr>"
         "<th>scope</th><th>job_count</th><th>avg_queue_wait_ms</th><th>avg_pool_prepare_ms</th><th>avg_fanout_globals_ms</th><th>avg_running_tasks_ms</th><th>avg_finalize_ms</th><th>avg_terminal_writeback_ms</th><th>avg_total_ms</th><th>max_total_ms</th><th>executor_create_count</th><th>executor_rebuild_count</th><th>pool_reuse_count</th><th>pool_create_count</th><th>pool_rebuild_count</th><th>avg_first_result_wait_ms</th><th>avg_warmup_ms</th></tr></thead><tbody id='ops-job-timing-body'>"
-        f"<tr><td>embedded-job-orch</td><td>{html.escape(str(queue_timing.get('job_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_queue_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_pool_prepare_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_fanout_globals_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_running_tasks_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_finalize_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_terminal_writeback_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('max_total_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_create_count', '-')))}</td><td>{html.escape(str(queue_timing.get('pool_rebuild_count', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_first_result_wait_ms', '-')))}</td><td>{html.escape(str(queue_timing.get('avg_warmup_ms', '-')))}</td></tr>"
-        f"<tr><td>current-job</td><td>1</td><td>{html.escape(str(current_job_timing.get('queue_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_prepare_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('fanout_globals_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('running_tasks_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('finalize_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('terminal_writeback_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('total_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_create_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('executor_rebuild_count', '-')))}</td><td>{html.escape(str(current_job_timing.get('pool_reuse_count', '-')))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'create' else 0))}</td><td>{html.escape(str(1 if current_job_timing.get('pool_action', '') == 'rebuild' else 0))}</td><td>{html.escape(str(current_job_timing.get('first_result_wait_ms', '-')))}</td><td>{html.escape(str(current_job_timing.get('warmup_ms', '-')))}</td></tr>"
+        f"{job_timing_body}"
         "</tbody></table></div></section>"
         f"{_ops_table('Recent Jobs', '', recent_job_headers, 'ops-recent-jobs-body', recent_job_body)}"
         f"{_ops_table('Waiting Jobs', 'Only waiting jobs can be reordered. Running jobs keep their current slot.', waiting_job_headers, 'ops-waiting-jobs-body', waiting_job_body)}"
@@ -1204,7 +1224,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "const densityHint=document.getElementById('ops-density-hint');"
         "function getDensity(){try{return localStorage.getItem(densityKey)==='1';}catch(_err){return false;}}"
         "function setDensity(show){try{localStorage.setItem(densityKey,show?'1':'0');}catch(_err){}}"
-        "function applyDensity(show){document.body.classList.toggle('show-details',!!show);if(densityBtn){densityBtn.textContent=show?'hide details':'show details';}if(densityHint){densityHint.textContent=show?'detail view shows all diagnostic IDs, URLs and timing columns':'compact view hides IDs, URLs and deep timing columns';}}"
+        "function applyDensity(show){document.body.classList.toggle('show-details',!!show);if(densityBtn){densityBtn.textContent=show?'hide details':'show details';}if(densityHint){densityHint.textContent=show?'detail view shows diagnostic IDs, URLs and quota breakdown columns':'compact node view shows quota/usage and hides service/task details';}}"
         "applyDensity(getDensity());"
         "if(densityBtn){densityBtn.addEventListener('click',function(){const show=!document.body.classList.contains('show-details');setDensity(show);applyDensity(show);});}"
         "const ids=['ops-nodes-body','ops-job-queue-body','ops-job-timing-body','ops-recent-jobs-body','ops-waiting-jobs-body','ops-services-body','ops-pools-body'];"
@@ -1226,57 +1246,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     )
 
 
-_OPS_FRAGMENT_IDS = (
-    "ops-nodes-body",
-    "ops-job-queue-body",
-    "ops-job-timing-body",
-    "ops-recent-jobs-body",
-    "ops-waiting-jobs-body",
-    "ops-services-body",
-    "ops-pools-body",
-)
-
-
 def _render_ops_snapshot(state: InfoCenterState, job_queue: Optional[JobQueueManager] = None) -> Dict[str, object]:
-    raw = _render_ops_page(state, job_queue)
-    fragments: Dict[str, str] = {}
-    for fragment_id in _OPS_FRAGMENT_IDS:
-        match = re.search(
-            rf"<tbody id='{re.escape(fragment_id)}'>(.*?)</tbody>",
-            raw,
-            flags=re.DOTALL,
-        )
-        fragments[fragment_id] = match.group(1) if match else ""
-    metrics: Dict[str, str] = {}
-    overview_match = re.search(r"<div class='metrics-grid' id='ops-overview'>(.*?)</div>\s*<div class='section-note'>", raw, flags=re.DOTALL)
-    if overview_match is not None:
-        cards = re.findall(
-            r"<div class='metric-label'>(.*?)</div><div class='metric-value'>(.*?)</div><div class='metric-sub'>(.*?)</div>",
-            overview_match.group(1),
-            flags=re.DOTALL,
-        )
-        for label, value, subtext in cards:
-            key = re.sub(r"[^a-z0-9]+", "_", html.unescape(label).strip().lower()).strip("_")
-            if key:
-                metrics[key] = html.unescape(value).strip()
-                metrics[f"{key}_subtext"] = html.unescape(subtext).strip()
-    jobs_subtext = metrics.get("jobs_subtext", "")
-    recent_jobs_match = re.search(r",\s*(\d+)\s+recent", jobs_subtext)
-    pool_inflight_match = re.search(r"in-flight\s+(\d+)", metrics.get("task_pools_subtext", ""))
-    return {
-        "ok": True,
-        "fragments": fragments,
-        "metrics": {
-            "nodes": metrics.get("nodes", "-"),
-            "services": metrics.get("services", "-"),
-            "task_pools": metrics.get("task_pools", "-"),
-            "pool_inflight": pool_inflight_match.group(1) if pool_inflight_match else "0",
-            "jobs": metrics.get("jobs", "-"),
-            "recent_jobs": recent_jobs_match.group(1) if recent_jobs_match else "0",
-        },
-        "controlplane_version": _pycloud_version(),
-        "auto_refresh_sec": 5,
-    }
+    return _render_ops_page(state, job_queue, _snapshot_only=True)
 
 
 class InfoCenterHttpServer:
@@ -1327,6 +1298,7 @@ class InfoCenterHttpServer:
                         return
                     node_instance_id = str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip()
                     if state.is_instance_fenced(node_instance_id):
+                        fence_reason = state.fenced_instance_reason(node_instance_id)
                         self._send_json(
                             200,
                             {
@@ -1335,16 +1307,83 @@ class InfoCenterHttpServer:
                                 "reset_required": True,
                                 "new_instance_required": True,
                                 "lease_ttl_sec": state.lease_ttl_sec,
-                                "reason": "node_instance_id fenced",
+                                "reason": fence_reason or "node_instance_id fenced",
                                 "error": "node_instance_id fenced",
                             },
                         )
                         return
+                    control_addr = str(payload.get("control_addr", "")).strip()
+                    conflicts = state.control_addr_conflicting_instances(
+                        node_instance_id=node_instance_id,
+                        control_addr=control_addr,
+                    )
+                    if conflicts and control_addr:
+                        status_error = ""
+                        try:
+                            with NodeControlClient(control_addr, timeout_sec=0.35) as client:
+                                status = client.node_status()
+                        except Exception as exc:
+                            status = {}
+                            status_error = repr(exc)
+                        actual_instance_id = str(status.get("node_instance_id", "") or "").strip()
+                        if actual_instance_id and actual_instance_id != node_instance_id:
+                            logger.warning(
+                                "rejecting node registration because control_addr is served by another instance "
+                                "control_addr=%s expected_node_instance_id=%s actual_node_instance_id=%s conflicts=%s",
+                                control_addr,
+                                node_instance_id,
+                                actual_instance_id,
+                                [str(getattr(item, "node_instance_id", "") or "") for item in conflicts],
+                            )
+                            self._send_json(
+                                200,
+                                {
+                                    "ok": False,
+                                    "accepted": False,
+                                    "reset_required": True,
+                                    "new_instance_required": True,
+                                    "reason": (
+                                        "node control_addr is still served by another node instance; "
+                                        f"control_addr={control_addr} "
+                                        f"expected_node_instance_id={node_instance_id} "
+                                        f"actual_node_instance_id={actual_instance_id} "
+                                        f"actual_node_id={str(status.get('node_id', '') or '-')}"
+                                    ),
+                                    "error": "node control_addr instance mismatch",
+                                },
+                            )
+                            return
+                        if not actual_instance_id:
+                            logger.warning(
+                                "rejecting node registration because control_addr conflicts and status probe "
+                                "did not confirm replacement control_addr=%s expected_node_instance_id=%s "
+                                "conflicts=%s status_error=%s",
+                                control_addr,
+                                node_instance_id,
+                                [str(getattr(item, "node_instance_id", "") or "") for item in conflicts],
+                                status_error or "empty node status",
+                            )
+                            self._send_json(
+                                200,
+                                {
+                                    "ok": False,
+                                    "accepted": False,
+                                    "reset_required": False,
+                                    "retryable": True,
+                                    "lease_ttl_sec": state.lease_ttl_sec,
+                                    "reason": (
+                                        "node control_addr conflicts with an existing instance and status probe "
+                                        "did not confirm this replacement; retry after the old NodeControl exits"
+                                    ),
+                                    "error": "node control_addr replacement not confirmed",
+                                },
+                            )
+                            return
                     try:
                         node = state.register_node_record(
                             node_instance_id=node_instance_id,
                             node_id=str(payload.get("node_id", "")).strip(),
-                            control_addr=str(payload.get("control_addr", "")).strip(),
+                            control_addr=control_addr,
                             capacity=max(1, int(payload.get("capacity", 1) or 1)),
                             queue_capacity=max(1, int(payload.get("queue_capacity", 1) or 1)),
                             tags=payload.get("tags") or [],
@@ -1385,6 +1424,7 @@ class InfoCenterHttpServer:
                         return
                     node_instance_id = str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip()
                     if state.is_instance_fenced(node_instance_id):
+                        fence_reason = state.fenced_instance_reason(node_instance_id)
                         self._send_json(
                             200,
                             {
@@ -1393,7 +1433,7 @@ class InfoCenterHttpServer:
                                 "reset_required": True,
                                 "new_instance_required": True,
                                 "lease_ttl_sec": state.lease_ttl_sec,
-                                "reason": "node_instance_id fenced",
+                                "reason": fence_reason or "node_instance_id fenced",
                                 "error": "node_instance_id fenced",
                             },
                         )
@@ -1568,7 +1608,15 @@ class InfoCenterHttpServer:
                         elif action == "notes":
                             state.update_node_profile_for_instance(node_instance_id, notes=str(form.get("notes", "") or ""))
                         elif action == "mark-lost":
-                            state.mark_node_lost(node_instance_id, reason="marked lost via ops")
+                            reason = str(form.get("reason", "") or "").strip()
+                            if not reason and body:
+                                try:
+                                    parsed_body = json.loads(body.decode("utf-8") or "{}")
+                                except Exception:
+                                    parsed_body = {}
+                                if isinstance(parsed_body, dict):
+                                    reason = str(parsed_body.get("reason", "") or "").strip()
+                            state.mark_node_lost(node_instance_id, reason=reason or "marked lost via ops")
                         else:
                             self._send_json(404, {"ok": False, "error": "unknown ops action"})
                             return

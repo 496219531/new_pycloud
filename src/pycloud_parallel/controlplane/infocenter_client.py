@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 from typing import Dict, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 from pycloud_parallel.controlplane.http_client import http_json_request, target_to_base_url
 from pycloud_parallel.controlplane.node_capability import NodeCapability
@@ -710,6 +711,29 @@ class InfoCenterClient:
             healthy_only=True,
             limit=limit,
             route_scope="call",
+        )
+
+    def node_status(self, control_addr: str) -> Dict[str, object]:
+        resp = http_json_request(
+            base_url=target_to_base_url(str(control_addr or "").strip()),
+            path="/node/status",
+            method="GET",
+            timeout_sec=min(self.timeout_sec, 0.8),
+        )
+        node = resp.get("node")
+        return dict(node or {}) if isinstance(node, dict) else {}
+
+    def mark_node_lost(self, node_instance_id: str, *, reason: str = "") -> Dict[str, object]:
+        normalized = str(node_instance_id or "").strip()
+        if not normalized:
+            raise ValueError("node_instance_id is required")
+        return http_json_request(
+            base_url=self.base_url,
+            path=f"/ops/nodes/{quote(normalized, safe='')}/mark-lost",
+            method="POST",
+            timeout_sec=self.timeout_sec,
+            payload={"reason": str(reason or "marked lost via client")},
+            raise_on_error_response=False,
         )
 
     def list_service_routes_for_owner_command(

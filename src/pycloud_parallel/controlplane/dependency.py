@@ -9,16 +9,20 @@
 
 import ast
 import gzip
+import hashlib
 import importlib
 import importlib.util
 import inspect
 import io
+import json
 import os
+import shutil
 import sys
 import tempfile
 import sysconfig
 import importlib.machinery
 import tarfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -34,6 +38,8 @@ class _TarSourceEntry:
 
 _PACKAGED_PYTHON_FILE_SUFFIXES = frozenset({".py", ".pyd", ".so"})
 _RUNTIME_PACKAGE_ROOTS = frozenset({"pycloud_parallel"})
+_PACKAGE_CACHE_VERSION = 1
+_PACKAGE_CACHE_LOCK = threading.Lock()
 
 
 def _normalize_arcname(arcname: Path | str) -> str:
@@ -79,6 +85,90 @@ def _new_temp_targz_path(*, prefix: str) -> str:
     fd, output_file = tempfile.mkstemp(suffix=".tar.gz", prefix=prefix)
     os.close(fd)
     return output_file
+
+
+def _package_cache_root_dir() -> Optional[Path]:
+    raw = str(os.environ.get("PYCLOUD_PACKAGE_CACHE_DIR", "") or "").strip()
+    if raw.lower() in {"0", "false", "no", "off", "disabled"}:
+        return None
+    if raw:
+        return Path(raw).expanduser().resolve()
+    home = str(os.environ.get("PYCLOUD_HOME", "") or "").strip()
+    if home:
+        return (Path(home).expanduser().resolve() / "package_cache").resolve()
+    return (Path.home() / ".pycloud_parallel" / "package_cache").resolve()
+
+
+def _entry_fingerprint(entry: "_TarSourceEntry") -> Dict[str, object]:
+    arcname = _normalize_arcname(entry.arcname)
+    if entry.source_path is None:
+        data = bytes(entry.data or b"")
+        return {
+            "arcname": arcname,
+            "kind": "data",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    path = Path(entry.source_path).resolve()
+    stat = path.stat()
+    return {
+        "arcname": arcname,
+        "kind": "file",
+        "path": str(path),
+        "mode": _normalized_file_mode(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+    }
+
+
+def _entries_cache_key(entries: Iterable["_TarSourceEntry"], *, cache_scope: str) -> str:
+    payload = {
+        "version": _PACKAGE_CACHE_VERSION,
+        "scope": str(cache_scope or ""),
+        "entries": [_entry_fingerprint(entry) for entry in entries],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _copy_cached_targz_if_available(cache_key: str, output_file: str) -> bool:
+    root = _package_cache_root_dir()
+    if root is None:
+        return False
+    cached_path = root / f"{cache_key}.tar.gz"
+    if not cached_path.exists() or not cached_path.is_file():
+        return False
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(str(cached_path), str(output_file))
+    return True
+
+
+def _store_cached_targz(cache_key: str, output_file: str) -> None:
+    root = _package_cache_root_dir()
+    if root is None:
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    cached_path = root / f"{cache_key}.tar.gz"
+    if cached_path.exists():
+        return
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{cache_key}.", suffix=".tmp", dir=str(root))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    shutil.copyfile(str(output_file), str(tmp_path))
+    os.replace(str(tmp_path), str(cached_path))
+
+
+def _write_cached_deterministic_targz(entries: Iterable["_TarSourceEntry"], output_file: str, *, cache_scope: str) -> None:
+    materialized_entries = list(entries)
+    cache_key = _entries_cache_key(materialized_entries, cache_scope=cache_scope)
+    with _PACKAGE_CACHE_LOCK:
+        if _copy_cached_targz_if_available(cache_key, output_file):
+            return
+    _write_deterministic_targz(materialized_entries, output_file)
+    with _PACKAGE_CACHE_LOCK:
+        if _copy_cached_targz_if_available(cache_key, output_file):
+            return
+        _store_cached_targz(cache_key, output_file)
 
 
 def _iter_directory_entries(
@@ -717,7 +807,7 @@ class DependencyPackager:
             output_file = _new_temp_targz_path(prefix="pycloud_func_")
 
         module_entries = self._build_function_entries(func, deps=deps, include_tests=include_tests)
-        _write_deterministic_targz(module_entries, output_file)
+        _write_cached_deterministic_targz(module_entries, output_file, cache_scope="function")
 
         return output_file
 
@@ -756,7 +846,7 @@ class DependencyPackager:
             deps=deps,
             include_tests=include_tests,
         )
-        _write_deterministic_targz(module_entries, output_file)
+        _write_cached_deterministic_targz(module_entries, output_file, cache_scope="module")
 
         return output_file
 
@@ -775,7 +865,7 @@ class DependencyPackager:
             include_tests=include_tests,
             synthesize_missing_package_inits=synthesize_missing_package_inits,
         )
-        _write_deterministic_targz(entries, output_file)
+        _write_cached_deterministic_targz(entries, output_file, cache_scope="roots")
         return output_file
 
     def package_directory(
@@ -797,7 +887,7 @@ class DependencyPackager:
             include_tests=include_tests,
             synthesize_missing_package_inits=True,
         )
-        _write_deterministic_targz(entries, output_file)
+        _write_cached_deterministic_targz(entries, output_file, cache_scope="directory")
         return output_file
 
     def package_paths(
@@ -817,7 +907,7 @@ class DependencyPackager:
             include_tests=include_tests,
             synthesize_missing_package_inits=synthesize_missing_package_inits,
         )
-        _write_deterministic_targz(entries, output_file)
+        _write_cached_deterministic_targz(entries, output_file, cache_scope="paths")
         return output_file
 
     def _build_function_entries(

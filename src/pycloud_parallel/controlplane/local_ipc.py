@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from multiprocessing.connection import Client, Listener
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.config import OBJECT_SEGMENT_MAX_BYTES, get_local_service_payload_policy
@@ -36,6 +36,8 @@ _REGISTRY_VERSION = 1
 LOCAL_IPC_BACKLOG = 1024
 LOCAL_IPC_CONNECT_RETRY_INTERVAL_SEC = 0.02
 PYCLOUD_LOCAL_IPC_AUTH = "PYCLOUD_LOCAL_IPC_AUTH"
+_METADATA_FILE_RETRY_ATTEMPTS = 8
+_METADATA_FILE_RETRY_SLEEP_SEC = 0.05
 
 
 def _local_ipc_auth_enabled() -> bool:
@@ -158,6 +160,74 @@ def _estimate_local_inline_size(value: Any) -> int:
         return len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
 
 
+def _cheap_local_inline_size(value: Any) -> Optional[int]:
+    if isinstance(value, os.PathLike):
+        return len(str(Path(value).expanduser().resolve()).encode("utf-8")) + 16
+    if isinstance(value, str):
+        try:
+            path = Path(value).expanduser()
+            if path.exists() and path.is_file():
+                return len(str(path.resolve()).encode("utf-8")) + 16
+        except OSError:
+            pass
+        return len(value.encode("utf-8")) + 16
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    try:
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return int(value.nbytes)
+    except ImportError:
+        pass
+    try:
+        import pandas as pd
+
+        if isinstance(value, pd.DataFrame):
+            return int(value.memory_usage(index=True, deep=True).sum())
+        if isinstance(value, pd.Series):
+            return int(value.memory_usage(index=True, deep=True))
+    except ImportError:
+        pass
+    return None
+
+
+def _cheap_local_payload_inline_size(value: Any, *, _depth: int = 0, _items_left: Optional[List[int]] = None) -> Optional[int]:
+    cheap_size = _cheap_local_inline_size(value)
+    if cheap_size is not None:
+        return cheap_size
+    if _depth >= 4:
+        return None
+    if _items_left is None:
+        _items_left = [256]
+    if isinstance(value, dict):
+        total = 2
+        for key, item in value.items():
+            if _items_left[0] <= 0:
+                return None
+            _items_left[0] -= 1
+            key_size = _cheap_local_payload_inline_size(key, _depth=_depth + 1, _items_left=_items_left)
+            item_size = _cheap_local_payload_inline_size(item, _depth=_depth + 1, _items_left=_items_left)
+            if key_size is None or item_size is None:
+                return None
+            total += key_size + item_size + 4
+        return total
+    if isinstance(value, (list, tuple, set)):
+        total = 2
+        for item in value:
+            if _items_left[0] <= 0:
+                return None
+            _items_left[0] -= 1
+            item_size = _cheap_local_payload_inline_size(item, _depth=_depth + 1, _items_left=_items_left)
+            if item_size is None:
+                return None
+            total += item_size + 2
+        return total
+    if value is None or isinstance(value, (bool, int, float)):
+        return 32
+    return None
+
+
 def _normalize_local_path_value(value: Any) -> Any:
     if isinstance(value, os.PathLike):
         return Path(value).expanduser().resolve()
@@ -208,10 +278,17 @@ def _make_local_pickle_payload_transport(
     del serialization_mode
     policy = get_local_service_payload_policy()
     normalized_payload = dict(_normalize_local_payload_paths(payload or {}))
-    raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
-    if len(raw_payload) > max(1, int(policy.inline_payload_threshold_bytes)):
+    inline_threshold = max(1, int(policy.inline_payload_threshold_bytes))
+    estimated_size = _cheap_local_payload_inline_size(normalized_payload)
+    raw_payload: bytes
+    if estimated_size is not None and estimated_size > inline_threshold:
         prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
         raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
+        if len(raw_payload) > inline_threshold:
+            prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
+            raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
     size = validate_inline_payload_size(
         len(raw_payload),
         limit_bytes=policy.inline_payload_hard_limit_bytes,
@@ -270,13 +347,33 @@ def _write_metadata(service_name: str, payload: Dict[str, object]) -> None:
     tmp.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
     with contextlib.suppress(OSError):
         tmp.chmod(0o600)
-    os.replace(str(tmp), str(path))
+    last_exc: Optional[OSError] = None
+    for attempt in range(_METADATA_FILE_RETRY_ATTEMPTS):
+        try:
+            os.replace(str(tmp), str(path))
+            last_exc = None
+            break
+        except PermissionError as exc:
+            last_exc = exc
+            if attempt >= _METADATA_FILE_RETRY_ATTEMPTS - 1:
+                break
+            time.sleep(_METADATA_FILE_RETRY_SLEEP_SEC * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
     with contextlib.suppress(OSError):
         path.chmod(0o600)
 
 
 def _remove_metadata(service_name: str) -> None:
-    local_service_metadata_path(service_name).unlink(missing_ok=True)
+    path = local_service_metadata_path(service_name)
+    for attempt in range(_METADATA_FILE_RETRY_ATTEMPTS):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            if attempt >= _METADATA_FILE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_METADATA_FILE_RETRY_SLEEP_SEC * (attempt + 1))
 
 
 def _metadata_token(service_name: str) -> str:

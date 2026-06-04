@@ -72,10 +72,13 @@ from pycloud_parallel.execution.scheduler import (
 )
 from pycloud_parallel.execution.support import (
     _get_local_ip,
+    _is_node_identity_mismatch_error,
     _prepare_code_blob,
     _prepare_task_payload_for_submit,
     _put_data_via_clients,
     _resolve_public_target_arg,
+    _retry_infocenter_request,
+    _summarize_discovered_nodes,
 )
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref, normalize_object_format, object_id_from_sha256_hex
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
@@ -617,6 +620,39 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return
         self._compensation_spec = dict(spec)
 
+    @staticmethod
+    def _is_retryable_compensation_failure(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+        permanent_markers = (
+            "modulenotfounderror",
+            "importerror",
+            "syntaxerror",
+            "dependency install failed",
+            "method `",
+            "not exported",
+            "runtime mismatch",
+        )
+        if any(marker in text for marker in permanent_markers):
+            return False
+        retryable_markers = (
+            "heartbeat",
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily",
+            "refused",
+            "reset",
+            "unreachable",
+            "node instance execution is fenced",
+            "node_instance_id fenced",
+            "task pool not running",
+            "pool is stopped",
+            "pool not found",
+        )
+        return any(marker in text for marker in retryable_markers)
+
     def _after_keepalive_tick(self) -> None:
         spec = self._compensation_spec
         if not spec:
@@ -636,11 +672,16 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return 0
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
-            active = {str(node_id) for node_id in self._active_replica_ids if str(node_id)}
+            active = self._active_replica_snapshot()
             failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
+            retryable_failed = {
+                node_id
+                for node_id, message in self.failures.items()
+                if self._is_retryable_compensation_failure(str(message or ""))
+            }
             if desired <= 0 or len(active) >= desired:
                 return 0
-            excluded = active | failed
+            excluded = active | (failed - retryable_failed)
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 selected_nodes = list(
                     infocenter.select_task_nodes(
@@ -683,6 +724,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     idle_ttl_sec=max(0, int(spec.get("idle_ttl_sec", 0) or 0)),
                     chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
                     api_token=str(spec.get("api_token", "") or ""),
+                    expected_node_instance_id=_node_instance_key_from_node(node),
                 )
                 node_key = _node_instance_key_from_node(node)
                 pool.node_instance_id = node_key
@@ -701,14 +743,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             with self._pool_lock:
                 for node_key, node, pool in created:
                     if node_key in self._pools:
-                        _close_task_pool_replica(pool, reason="duplicate compensated task pool")
-                        with contextlib.suppress(Exception):
-                            pool._client.close()  # noqa: SLF001
-                        continue
+                        if node_key in active or node_key not in retryable_failed:
+                            _close_task_pool_replica(pool, reason="duplicate compensated task pool")
+                            with contextlib.suppress(Exception):
+                                pool._client.close()  # noqa: SLF001
+                            continue
+                        old_pool = self._pools.pop(node_key, None)
+                        if old_pool is not None and old_pool is not pool:
+                            _close_task_pool_replica(old_pool, reason="replace failed task pool replica")
+                            with contextlib.suppress(Exception):
+                                old_pool._client.close()  # noqa: SLF001
                     self._pools[node_key] = pool
                     self.nodes[node_key] = node
                     self.failures.pop(node_key, None)
-                    self._active_replica_ids.add(node_key)
+                    self._add_active_replica(node_key)
                     self._active_nodes.add(node_key)
                     self._submit_breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
@@ -749,14 +797,18 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def _available_pool_node_ids(self) -> List[str]:
         ordered_node_ids = [str(node_id) for node_id in self._pools.keys()]
         if hasattr(self, "_active_nodes"):
-            active = {str(node_id) for node_id in list(getattr(self, "_active_nodes") or [])}
+            active_nodes = getattr(self, "_active_nodes", None)
+            if active_nodes is getattr(self, "_active_replica_ids", None):
+                active = self._active_replica_snapshot()
+            else:
+                active = {str(node_id) for node_id in list(active_nodes or []) if str(node_id)}
             return [
                 node_id
                 for node_id in ordered_node_ids
                 if node_id in active and self._pool_candidate_allowed(node_id)
             ]
         if hasattr(self, "_active_replica_ids"):
-            active = {str(node_id) for node_id in list(getattr(self, "_active_replica_ids") or [])}
+            active = self._active_replica_snapshot()
             return [
                 node_id
                 for node_id in ordered_node_ids
@@ -3118,24 +3170,41 @@ def _build_task_pool_from_infocenter(
     requested_node_ids = [str(node_id).strip() for node_id in list(node_ids or ()) if str(node_id).strip()]
     requested_node_instance_ids = [str(node_id).strip() for node_id in list(node_instance_ids or ()) if str(node_id).strip()]
     compensation_target_count = requested_count or len(requested_node_instance_ids) or len(requested_node_ids)
-    fetch_limit = requested_count if requested_count > 0 else node_limit
-    with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
-        selected_nodes = list(
-            infocenter.select_task_nodes(
-                healthy_only=healthy_only,
-                tags=tags,
-                node_ids=requested_node_ids,
-                node_instance_ids=requested_node_instance_ids,
-                node_count=fetch_limit,
-                limit=node_limit,
-                require_credit=False,
-                preferred_runtime_key="",
-                runtime=runtime,
-            )
+    explicit_node_selection = bool(requested_node_ids or requested_node_instance_ids)
+    fetch_limit = requested_count if (requested_count > 0 and explicit_node_selection) else node_limit
+    create_failures: Dict[str, str] = {}
+
+    def _select_candidate_nodes() -> List[InfoCenterNode]:
+        def _select_once() -> List[InfoCenterNode]:
+            with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                return list(
+                    infocenter.select_task_nodes(
+                        healthy_only=healthy_only,
+                        tags=tags,
+                        node_ids=requested_node_ids,
+                        node_instance_ids=requested_node_instance_ids,
+                        node_count=fetch_limit,
+                        limit=node_limit,
+                        require_credit=False,
+                        preferred_runtime_key="",
+                        runtime=runtime,
+                    )
+                )
+
+        return _retry_infocenter_request(
+            _select_once,
+            timeout_sec=max(0.5, float(timeout_sec or 0.0)),
+            target=infocenter_target,
+            action="task pool node discovery",
         )
+
+    selected_nodes = _select_candidate_nodes()
     if not selected_nodes:
         raise RuntimeError("no task pool nodes selected from InfoCenter")
-    desired_nodes = selected_nodes[:requested_count] if requested_count > 0 else selected_nodes
+    all_selected_nodes: List[InfoCenterNode] = list(selected_nodes)
+    required_success_nodes = requested_count if requested_count > 0 else len(selected_nodes)
+    desired_nodes = selected_nodes[:required_success_nodes]
+    fallback_nodes = selected_nodes[required_success_nodes:] if not explicit_node_selection else []
     effective_pool_name = str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}").strip()
     effective_policy = resolve_effective_policy(
         get_policy_profile(policy_id or get_default_policy_id_for_binding("taskpool_default")),
@@ -3147,6 +3216,10 @@ def _build_task_pool_from_infocenter(
     def _create_pool_on_node(node: InfoCenterNode) -> Tuple[InfoCenterNode, NativeTaskPoolClient]:
         target = _node_control_target_for_node(node)
         client = _new_node_control_client(target, timeout_sec=timeout_sec)
+        node_worker_count = max(1, int(worker_count or 1))
+        node_available = int(getattr(node, "task_pool_worker_available", 0) or 0)
+        if node_available > 0:
+            node_worker_count = max(1, min(node_worker_count, node_available))
         try:
             pool = client.create_task_pool_from_bytes(
                 owner_client_id=effective_owner,
@@ -3159,11 +3232,12 @@ def _build_task_pool_from_infocenter(
                 deps=prepared_artifact.dependency_policy,
                 managed_global_names=managed_global_names,
                 initial_globals=initial_globals_values,
-                worker_count=worker_count,
+                worker_count=node_worker_count,
                 heartbeat_timeout_sec=heartbeat_timeout_sec,
                 idle_ttl_sec=idle_ttl_sec,
                 chunk_size=chunk_size,
                 api_token=effective_api_token,
+                expected_node_instance_id=_node_instance_key_from_node(node),
             )
         except Exception:
             with contextlib.suppress(Exception):
@@ -3171,33 +3245,84 @@ def _build_task_pool_from_infocenter(
             raise
         return node, pool
 
-    dispatch_results = dispatch_create_requests(
-        desired_nodes,
-        create_one=_create_pool_on_node,
-        thread_name_prefix="taskpool-create",
-        describe_error=lambda node, exc: repr(exc),
-    )
     created: List[Tuple[InfoCenterNode, NativeTaskPoolClient]] = []
-    create_failures: Dict[str, str] = {}
-    for item in dispatch_results:
-        node_key = _node_instance_key_from_node(item.node)
-        if item.error_message:
-            create_failures[node_key] = item.error_message
-            logger.warning(
-                "task pool replica create failed pool_name=%s node_id=%s node_instance_id=%s err=%s",
-                effective_pool_name,
-                getattr(item.node, "node_id", ""),
-                node_key,
-                item.error_message,
+
+    def _record_create_results(nodes_to_try: Sequence[InfoCenterNode]) -> None:
+        dispatch_results = dispatch_create_requests(
+            nodes_to_try,
+            create_one=_create_pool_on_node,
+            thread_name_prefix="taskpool-create",
+            describe_error=lambda node, exc: repr(exc),
+        )
+        for item in dispatch_results:
+            node_key = _node_instance_key_from_node(item.node)
+            if item.error_message:
+                create_failures[node_key] = item.error_message
+                if _is_node_identity_mismatch_error(item.error_message):
+                    with contextlib.suppress(Exception):
+                        with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                            mark_lost = getattr(infocenter, "mark_node_lost", None)
+                            if callable(mark_lost):
+                                mark_lost(
+                                    node_key,
+                                    reason=f"task pool create identity mismatch: {item.error_message}",
+                                )
+                logger.warning(
+                    "task pool replica create failed pool_name=%s node_id=%s node_instance_id=%s err=%s",
+                    effective_pool_name,
+                    getattr(item.node, "node_id", ""),
+                    node_key,
+                    item.error_message,
+                )
+                continue
+            if item.created is not None:
+                created.append(item.created)
+
+    _record_create_results(desired_nodes)
+    if len(created) < required_success_nodes and fallback_nodes:
+        _emit_taskpool_notice(
+            "open retrying alternate nodes after create failure "
+            f"pool_name={effective_pool_name} success={len(created)} "
+            f"required={required_success_nodes} "
+            f"fallback_candidates={[_node_instance_key_from_node(node) for node in fallback_nodes]} "
+            f"selected={_summarize_discovered_nodes(selected_nodes)}"
+        )
+        for fallback_node in fallback_nodes:
+            if len(created) >= required_success_nodes:
+                break
+            _record_create_results([fallback_node])
+    if not created and not explicit_node_selection:
+        retry_deadline = time.monotonic() + max(0.1, float(timeout_sec or 0.0))
+        retry_attempt = 0
+        while not created and time.monotonic() < retry_deadline:
+            retry_attempt += 1
+            time.sleep(min(0.5, max(0.05, retry_deadline - time.monotonic())))
+            try:
+                retry_nodes = _select_candidate_nodes()
+            except Exception as exc:
+                create_failures[f"infocenter-retry-{retry_attempt}"] = repr(exc)
+                continue
+            if not retry_nodes:
+                continue
+            all_selected_nodes.extend(retry_nodes)
+            retry_desired = retry_nodes[:required_success_nodes]
+            retry_fallback = retry_nodes[required_success_nodes:]
+            _emit_taskpool_notice(
+                "open retrying after all selected nodes failed "
+                f"pool_name={effective_pool_name} attempt={retry_attempt} "
+                f"required={required_success_nodes} "
+                f"candidates={_summarize_discovered_nodes(retry_nodes)}"
             )
-            continue
-        if item.created is not None:
-            created.append(item.created)
+            _record_create_results(retry_desired)
+            for fallback_node in retry_fallback:
+                if len(created) >= required_success_nodes:
+                    break
+                _record_create_results([fallback_node])
     if not created:
         raise RuntimeError(f"task pool create failed on all selected nodes; failures={create_failures}")
     desired_order = {
         _node_instance_key_from_node(node): index
-        for index, node in enumerate(desired_nodes)
+        for index, node in enumerate(all_selected_nodes)
     }
     created.sort(key=lambda item: desired_order.get(_node_instance_key_from_node(item[0]), len(desired_order)))
 

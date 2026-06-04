@@ -653,6 +653,47 @@ def test_executor_host_runtime_task_emits_done_event(tmp_path):
         state.close()
 
 
+def test_executor_host_worker_pid_tracking_replaces_scope_key_set(monkeypatch):
+    host = object.__new__(ExecutorHostClient)
+    host._reader_stop = type("_NeverSet", (), {"is_set": lambda self: False})()  # noqa: SLF001
+    host._event_q = object()  # noqa: SLF001
+    host._worker_pids = set()  # noqa: SLF001
+    host._worker_pid_sets = {}  # noqa: SLF001
+    host._async_events = []  # noqa: SLF001
+    host._responses = {}  # noqa: SLF001
+    host._stream_events = {}  # noqa: SLF001
+    host._expired_requests = set()  # noqa: SLF001
+    host._cv = type(
+        "_NoopCondition",
+        (),
+        {
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *_args: False,
+            "notify_all": lambda self: None,
+        },
+    )()  # noqa: SLF001
+    events = iter(
+        (
+            {"kind": "executor_worker_pids", "scope": "service", "key": "svc", "worker_pids": [101, 102]},
+            {"kind": "executor_worker_pids", "scope": "service", "key": "svc", "worker_pids": [103]},
+        )
+    )
+
+    def _next_event(_queue, *, timeout=0.0):  # noqa: ARG001
+        try:
+            return next(events)
+        except StopIteration:
+            host._reader_stop.is_set = lambda: True  # noqa: SLF001
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.executor_host._simple_queue_get_if_ready", _next_event)
+
+    host._reader_loop()  # noqa: SLF001
+
+    assert host._worker_pids == {103}  # noqa: SLF001
+    assert host._worker_pid_sets == {"service:svc": {103}}  # noqa: SLF001
+
+
 def test_executor_host_warmup_pool_does_not_kill_host_process(tmp_path):
     state, artifact = _seed_artifact(
         tmp_path,
