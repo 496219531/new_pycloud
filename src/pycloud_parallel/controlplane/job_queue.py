@@ -4,10 +4,12 @@ import base64
 import contextlib
 import gc
 import hashlib
+import importlib
 import json
 import os
 import logging
 import shutil
+import sys
 import threading
 import time
 import warnings
@@ -22,7 +24,12 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from pycloud_parallel.controlplane.artifact import Artifact, ArtifactDeps
 from pycloud_parallel.controlplane.data_registry import DataRegistryClient
-from pycloud_parallel.controlplane.config import get_job_staged_ref_ttl_sec, get_jobqueue_resolve_refs, get_payload_policy
+from pycloud_parallel.controlplane.config import (
+    get_job_staged_ref_ttl_sec,
+    get_jobqueue_resolve_refs,
+    get_payload_policy,
+    get_taskpool_heartbeat_timeout_sec,
+)
 from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.controlplane.effective_policy import resolve_effective_policy
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
@@ -89,6 +96,12 @@ def _create_job_task_pool(**kwargs: Any) -> TaskPool:
             )
         else:
             data["source"] = source
+            if entry_module:
+                data["entry_module"] = entry_module
+            if entry_callable:
+                data["entry_callable"] = entry_callable
+            if package_format:
+                data["package_format"] = package_format
     return TaskPool.open(target=target, **data)
 
 
@@ -311,6 +324,36 @@ def _resolve_job_blob_bytes(
         return client.download_object_bytes(object_id=ref.object_id)
 
 
+def _job_source_mode(payload: Dict[str, object]) -> str:
+    return str(payload.get("source_mode", "") or "").strip().lower()
+
+
+def _is_local_module_import_job(payload: Dict[str, object], *, controlplane_target: str) -> bool:
+    return (
+        str(controlplane_target or "").strip().lower() == "local"
+        and _job_source_mode(payload) == "module_import"
+    )
+
+
+@contextlib.contextmanager
+def _job_module_import_path(source_root: object):
+    normalized = str(source_root or "").strip()
+    if not normalized:
+        yield
+        return
+    path = str(Path(normalized).expanduser().resolve())
+    inserted = False
+    if path and path not in sys.path:
+        sys.path.insert(0, path)
+        inserted = True
+    try:
+        yield
+    finally:
+        if inserted:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(path)
+
+
 def _job_queue_object_dir() -> Path:
     custom = str(os.environ.get("PYCLOUD_JOB_QUEUE_OBJECT_DIR", "") or "").strip()
     if custom:
@@ -497,6 +540,8 @@ def _default_job_node_count(
     controlplane_target: str,
     payload: Dict[str, object],
 ) -> int:
+    if str(controlplane_target or "").strip().lower() == "local":
+        return 0
     explicit_node_ids = [str(item).strip() for item in list(payload.get("node_ids") or ()) if str(item).strip()]
     if explicit_node_ids:
         return len(explicit_node_ids)
@@ -615,6 +660,7 @@ class JobQueueManager:
         self._shared_pool: Optional[_SharedPoolState] = None
         self._controlplane_target = ""
         self._stop = False
+        self._started = False
         self._thread: Optional[threading.Thread] = None
         self._maintenance_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jobq-maint")
         self._summary_cache: Optional[Dict[str, object]] = None
@@ -740,6 +786,7 @@ class JobQueueManager:
     def start(self, *, controlplane_target: str) -> None:
         with self._lock:
             self._controlplane_target = str(controlplane_target or "").strip()
+            self._started = True
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop = False
@@ -749,6 +796,12 @@ class JobQueueManager:
     def close(self) -> None:
         with self._cv:
             self._stop = True
+            self._started = False
+            for state in self._jobs.values():
+                if state.status == "WAITING":
+                    state.cancel_requested = True
+                    state.status = "CANCELLED"
+                    state.finished_at = state.finished_at or utc_now()
             if self._running_job_id:
                 state = self._jobs.get(self._running_job_id)
                 if state is not None:
@@ -756,7 +809,7 @@ class JobQueueManager:
             self._cv.notify_all()
         thread = self._thread
         if thread is not None:
-            thread.join(timeout=1.0)
+            thread.join(timeout=5.0)
         self._thread = None
         with self._lock:
             executor = self._current_executor
@@ -768,7 +821,7 @@ class JobQueueManager:
             self._submit_executor_close(shared_executor)
         for state in release_states:
             self._release_job_refs(state)
-        self._maintenance_executor.shutdown(wait=False, cancel_futures=True)
+        self._maintenance_executor.shutdown(wait=True, cancel_futures=True)
 
     def _resolve_requested_task_mode(self, payload: Dict[str, object]) -> str:
         requested_mode = str(payload.get("task_serialization_mode", "") or "").strip()
@@ -902,7 +955,7 @@ class JobQueueManager:
         return executor
 
     def _ensure_scheduler_thread_locked(self) -> None:
-        if self._stop or not self._controlplane_target:
+        if self._stop or not self._started or not self._controlplane_target:
             return
         if self._thread is not None and self._thread.is_alive():
             return
@@ -1087,15 +1140,24 @@ class JobQueueManager:
         client_id: str,
         job_id_snapshot: str,
         pool_request: _JobSharedPoolRequest,
-        blob: bytes,
+        blob: Optional[bytes],
         package_format: str,
         entry_module: str,
         task_entry_callable: str,
         task_resource_paths: Sequence[str],
         effective_managed_global_names: Sequence[str],
     ) -> _JobTaskPoolSpec:
+        is_local_module_import = _is_local_module_import_job(
+            payload,
+            controlplane_target=self._controlplane_target,
+        )
         artifact_key = self._shared_pool_artifact_key(
-            blob=blob,
+            blob=None if is_local_module_import else blob,
+            artifact_path=(
+                f"module_import:{str(payload.get('source_root', '') or '').strip()}:{entry_module}"
+                if is_local_module_import
+                else ""
+            ),
             runtime=str(payload.get("runtime", "py3") or "py3"),
             entry_module=entry_module,
             entry_callable=task_entry_callable,
@@ -1118,7 +1180,9 @@ class JobQueueManager:
                 "deps": ArtifactDeps.allow_install(dependency_allowlist) if dependency_allowlist else None,
                 "managed_global_names": list(effective_managed_global_names or ()),
                 "worker_count": max(1, int(payload.get("pool_worker_count", payload.get("worker_count", pool_request.default_worker_count)) or pool_request.default_worker_count)),
-                "heartbeat_timeout_sec": max(5, int(payload.get("pool_heartbeat_timeout_sec", 30) or 30)),
+                "heartbeat_timeout_sec": get_taskpool_heartbeat_timeout_sec(
+                    int(payload.get("pool_heartbeat_timeout_sec", 0) or 0)
+                ),
                 "idle_ttl_sec": max(0, int(payload.get("pool_idle_ttl_sec", 0) or 0)),
                 "healthy_only": bool(payload.get("healthy_only", True)),
                 "tags": list(payload.get("tags") or ()),
@@ -1130,6 +1194,15 @@ class JobQueueManager:
             }
             if task_resource_paths:
                 task_pool_kwargs["resource_paths"] = list(task_resource_paths)
+            if str(self._controlplane_target or "").strip().lower() == "local":
+                task_pool_kwargs["node_count"] = 0
+            if is_local_module_import:
+                task_pool_kwargs.update(
+                    source=entry_module,
+                    entry_module=entry_module,
+                    entry_callable=task_entry_callable,
+                )
+                return _create_job_task_pool(**task_pool_kwargs)
             task_pool_kwargs.update(
                 source=blob,
                 entry_module=entry_module,
@@ -1666,13 +1739,19 @@ class JobQueueManager:
         client_id: str,
         job_id_snapshot: str,
     ) -> None:
-        blob = _resolve_job_blob_bytes(
+        is_local_module_import = _is_local_module_import_job(
             payload,
-            b64_key="blob_b64",
-            ref_key="blob_ref",
-            control_addr_key="blob_control_addr",
+            controlplane_target=self._controlplane_target,
         )
-        if not blob:
+        blob: Optional[bytes] = None
+        if not is_local_module_import:
+            blob = _resolve_job_blob_bytes(
+                payload,
+                b64_key="blob_b64",
+                ref_key="blob_ref",
+                control_addr_key="blob_control_addr",
+            )
+        if not is_local_module_import and not blob:
             with self._lock:
                 state = self._jobs.get(job_id)
                 if state is not None:
@@ -1695,9 +1774,7 @@ class JobQueueManager:
         raw_job_payload = payload.get("job_payload")
         raw_update_globals = payload.get("update_globals")
 
-        fd, tmp_name = tempfile.mkstemp(prefix="pycloud-job-hooks-", suffix=_artifact_suffix(package_format))
-        os.close(fd)
-        tmp_path = Path(tmp_name)
+        tmp_path: Optional[Path] = None
         executor: Optional[Any] = None
         module = None
         task_entry = None
@@ -1706,7 +1783,9 @@ class JobQueueManager:
         finalize = None
         produced = None
         stream = None
+        import_path_context = _job_module_import_path(payload.get("source_root")) if is_local_module_import else contextlib.nullcontext()
         try:
+            import_path_context.__enter__()
             logger.info(
                 "[JobQueue] run job_id=%s mode=hooks entry_module=%s requested_mode=%s reset_pool=%s",
                 job_id_snapshot,
@@ -1714,13 +1793,21 @@ class JobQueueManager:
                 pool_request.requested_mode,
                 pool_request.reset_pool,
             )
-            tmp_path.write_bytes(blob)
-            module = _load_user_module(
-                str(tmp_path),
-                entry_module=entry_module,
-                package_format=package_format,
-                dependency_path="",
-            )
+            if is_local_module_import:
+                if not entry_module:
+                    raise RuntimeError("local module_import job requires entry_module")
+                module = importlib.import_module(entry_module)
+            else:
+                fd, tmp_name = tempfile.mkstemp(prefix="pycloud-job-hooks-", suffix=_artifact_suffix(package_format))
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                tmp_path.write_bytes(blob or b"")
+                module = _load_user_module(
+                    str(tmp_path),
+                    entry_module=entry_module,
+                    package_format=package_format,
+                    dependency_path="",
+                )
             task_entry = getattr(module, task_entry_callable, None)
             if task_entry is None or not callable(task_entry):
                 raise RuntimeError(f"task entry callable not found: {task_entry_callable}")
@@ -1970,17 +2057,20 @@ class JobQueueManager:
             extracted_dir = str(getattr(module, "__pycloud_temp_extract_dir__", "") or "").strip() if module is not None else ""
             task_entry = None
             module = None
-            try:
-                _purge_loaded_artifact_modules(
-                    str(tmp_path),
-                    entry_module=entry_module,
-                    package_format=package_format,
-                    dependency_path="",
-                    extra_prefixes=([extracted_dir] if extracted_dir else []),
-                )
-            except Exception:
-                pass
-            tmp_path.unlink(missing_ok=True)
+            if tmp_path is not None:
+                try:
+                    _purge_loaded_artifact_modules(
+                        str(tmp_path),
+                        entry_module=entry_module,
+                        package_format=package_format,
+                        dependency_path="",
+                        extra_prefixes=([extracted_dir] if extracted_dir else []),
+                    )
+                except Exception:
+                    pass
+                tmp_path.unlink(missing_ok=True)
             if extracted_dir:
                 shutil.rmtree(extracted_dir, ignore_errors=True)
+            with contextlib.suppress(Exception):
+                import_path_context.__exit__(None, None, None)
             gc.collect()

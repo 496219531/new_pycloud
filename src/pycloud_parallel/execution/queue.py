@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from pathlib import Path
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence
@@ -68,6 +69,53 @@ def _jobqueue_effective_policy() -> EffectivePolicy:
 
 def _is_local_target(target: str) -> bool:
     return str(target or "").strip().lower() == "local"
+
+
+def _job_module_import_root(module: Any) -> str:
+    module_file = str(getattr(module, "__file__", "") or "").strip()
+    if not module_file:
+        return ""
+    try:
+        module_path = Path(module_file).resolve()
+    except Exception:
+        return ""
+    module_name = str(getattr(module, "__name__", "") or "").strip()
+    parts = [part for part in module_name.split(".") if part]
+    if not parts:
+        return str(module_path.parent)
+    if module_path.name == "__init__.py":
+        levels = len(parts) + 1
+    else:
+        levels = max(1, len(parts))
+    root = module_path
+    for _ in range(levels):
+        root = root.parent
+    return str(root)
+
+
+def _job_local_uses_module_import(
+    *,
+    target: str,
+    source: Any,
+    artifact: Optional[Any],
+    deps: Optional[Any],
+    package_format: str,
+    resource_paths: Optional[Sequence[Any]],
+    task_resource_paths: Optional[Sequence[Any]],
+) -> bool:
+    if not _is_local_target(target):
+        return False
+    if not inspect.ismodule(source):
+        return False
+    if artifact is not None or deps is not None:
+        return False
+    if str(package_format or "").strip():
+        return False
+    if any(str(item or "").strip() for item in list(resource_paths or ())):
+        return False
+    if any(str(item or "").strip() for item in list(task_resource_paths or ())):
+        return False
+    return bool(_default_entry_module_for_module(source))
 
 
 class QueueServiceClient:
@@ -230,12 +278,15 @@ class QueueServiceClient:
                 "policy is owned by startup node/deployment"
             )
         effective_policy = self._refresh_effective_policy()
-        prepared_payload = _stage_job_submit_payload_for_transport(
-            target=self.target,
-            payload=raw_payload,
-            timeout_sec=self.timeout_sec,
-            serialization_mode=self.serialization_mode,
-        )
+        if _is_local_target(self.target):
+            prepared_payload = dict(raw_payload)
+        else:
+            prepared_payload = _stage_job_submit_payload_for_transport(
+                target=self.target,
+                payload=raw_payload,
+                timeout_sec=self.timeout_sec,
+                serialization_mode=self.serialization_mode,
+            )
         if self.client_id and not str(prepared_payload.get("client_id", "") or "").strip():
             prepared_payload["client_id"] = self.client_id
         if not _is_local_target(self.target):
@@ -319,94 +370,133 @@ class QueueServiceClient:
                 seen_resource_keys.add(key)
                 bundled_module_resource_paths.append(item)
 
-        if bundled_module_resource_paths and module_source is not None:
-            module_blob, module_filename = _prepare_code_blob(
-                module=module_source,
-                resource_paths=bundled_module_resource_paths,
+        use_local_module_import = _job_local_uses_module_import(
+            target=self.target,
+            source=module_source,
+            artifact=artifact,
+            deps=deps,
+            package_format=package_format,
+            resource_paths=resource_paths,
+            task_resource_paths=task_resource_paths,
+        )
+        if use_local_module_import and module_source is not None:
+            local_entry_module = str(entry_module or _default_entry_module_for_module(module_source)).strip()
+            local_entry_callable = str(entry_callable or "run").strip() or "run"
+            normalized_update_globals = _normalize_job_update_globals_arg(
+                update_globals,
+                auto_default=getattr(module_source, "update_globals", None),
             )
-            normalized_artifact = _normalize_artifact_input(
-                source=module_blob,
-                consumer_kind="job",
-                deps=deps,
-                runtime=runtime,
-                entry_module=_default_entry_module_for_module(module_source),
-                entry_callable=entry_callable,
-                package_format=_resolve_package_format(package_format, module_filename, default="py"),
-            )
-        elif source is not None:
-            normalized_artifact = _normalize_artifact_input(source=source, **normalize_kwargs)
+            effective_task_generator_callable = _default_job_task_generator_for_module(module_source)
+            effective_handle_result_callable = str(
+                handle_result_callable or _default_job_handle_result_for_module(module_source) or ""
+            ).strip()
+            effective_finalize_callable = str(
+                finalize_callable or _default_job_finalize_for_module(module_source) or ""
+            ).strip()
+            payload: Dict[str, object] = {
+                "job_mode": "hooks",
+                "source_mode": "module_import",
+                "runtime": str(runtime or "py3"),
+                "entry_module": local_entry_module,
+                "entry_callable": local_entry_callable,
+                "package_format": "module_import",
+                "task_generator_callable": effective_task_generator_callable,
+                "job_payload": dict(job_payload or {}),
+                "timeout_sec": max(10.0, float(self.timeout_sec)),
+                "dependency_allowlist": [],
+            }
+            source_root = _job_module_import_root(module_source)
+            if source_root:
+                payload["source_root"] = source_root
         else:
-            normalized_artifact = _normalize_artifact_input(**normalize_kwargs)
-        prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="job")
+            if bundled_module_resource_paths and module_source is not None:
+                module_blob, module_filename = _prepare_code_blob(
+                    module=module_source,
+                    resource_paths=bundled_module_resource_paths,
+                )
+                normalized_artifact = _normalize_artifact_input(
+                    source=module_blob,
+                    consumer_kind="job",
+                    deps=deps,
+                    runtime=runtime,
+                    entry_module=_default_entry_module_for_module(module_source),
+                    entry_callable=entry_callable,
+                    package_format=_resolve_package_format(package_format, module_filename, default="py"),
+                )
+            elif source is not None:
+                normalized_artifact = _normalize_artifact_input(source=source, **normalize_kwargs)
+            else:
+                normalized_artifact = _normalize_artifact_input(**normalize_kwargs)
+            prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="job")
 
-        normalized_update_globals = _normalize_job_update_globals_arg(
-            update_globals,
-            auto_default=(
-                getattr(module_source, "update_globals", None)
-                if module_source is not None
-                else _default_job_update_globals_for_blob(
-                    prepared_artifact.blob,
-                    package_format=prepared_artifact.package_format,
-                )
-            ),
-        )
-        effective_task_generator_callable = (
-            _default_job_task_generator_for_module(module_source)
-            if module_source is not None
-            else _default_job_task_generator_for_blob(
-                prepared_artifact.blob,
-                package_format=prepared_artifact.package_format,
+            normalized_update_globals = _normalize_job_update_globals_arg(
+                update_globals,
+                auto_default=(
+                    getattr(module_source, "update_globals", None)
+                    if module_source is not None
+                    else _default_job_update_globals_for_blob(
+                        prepared_artifact.blob,
+                        package_format=prepared_artifact.package_format,
+                    )
+                ),
             )
-        )
-        effective_handle_result_callable = str(
-            handle_result_callable
-            or (
-                _default_job_handle_result_for_module(module_source)
+            effective_task_generator_callable = (
+                _default_job_task_generator_for_module(module_source)
                 if module_source is not None
-                else _default_job_handle_result_for_blob(
+                else _default_job_task_generator_for_blob(
                     prepared_artifact.blob,
                     package_format=prepared_artifact.package_format,
                 )
             )
-            or ""
-        ).strip()
-        effective_finalize_callable = str(
-            finalize_callable
-            or (
-                _default_job_finalize_for_module(module_source)
-                if module_source is not None
-                else _default_job_finalize_for_blob(
-                    prepared_artifact.blob,
-                    package_format=prepared_artifact.package_format,
+            effective_handle_result_callable = str(
+                handle_result_callable
+                or (
+                    _default_job_handle_result_for_module(module_source)
+                    if module_source is not None
+                    else _default_job_handle_result_for_blob(
+                        prepared_artifact.blob,
+                        package_format=prepared_artifact.package_format,
+                    )
                 )
-            )
-            or ""
-        ).strip()
+                or ""
+            ).strip()
+            effective_finalize_callable = str(
+                finalize_callable
+                or (
+                    _default_job_finalize_for_module(module_source)
+                    if module_source is not None
+                    else _default_job_finalize_for_blob(
+                        prepared_artifact.blob,
+                        package_format=prepared_artifact.package_format,
+                    )
+                )
+                or ""
+            ).strip()
 
-        payload: Dict[str, object] = {
-            "job_mode": "hooks",
-            "runtime": str(prepared_artifact.runtime or "py3"),
-            "entry_module": str(prepared_artifact.entry_module or "").strip(),
-            "entry_callable": str(prepared_artifact.entry_callable or "run").strip() or "run",
-            "package_format": str(prepared_artifact.package_format or "py").strip() or "py",
-            "task_generator_callable": effective_task_generator_callable,
-            "job_payload": dict(job_payload or {}),
-            "timeout_sec": max(10.0, float(self.timeout_sec)),
-            "dependency_allowlist": list(prepared_artifact.dependency_allowlist),
-        }
+            payload = {
+                "job_mode": "hooks",
+                "runtime": str(prepared_artifact.runtime or "py3"),
+                "entry_module": str(prepared_artifact.entry_module or "").strip(),
+                "entry_callable": str(prepared_artifact.entry_callable or "run").strip() or "run",
+                "package_format": str(prepared_artifact.package_format or "py").strip() or "py",
+                "task_generator_callable": effective_task_generator_callable,
+                "job_payload": dict(job_payload or {}),
+                "timeout_sec": max(10.0, float(self.timeout_sec)),
+                "dependency_allowlist": list(prepared_artifact.dependency_allowlist),
+            }
+            payload.update(
+                _prepare_job_blob_submit_fields(
+                    target=self.target,
+                    blob=prepared_artifact.blob,
+                    package_format=prepared_artifact.package_format,
+                    runtime=str(prepared_artifact.runtime or "py3"),
+                    timeout_sec=self.timeout_sec,
+                )
+            )
         if effective_handle_result_callable:
             payload["handle_result_callable"] = effective_handle_result_callable
         if effective_finalize_callable:
             payload["finalize_callable"] = effective_finalize_callable
-        payload.update(
-            _prepare_job_blob_submit_fields(
-                target=self.target,
-                blob=prepared_artifact.blob,
-                package_format=prepared_artifact.package_format,
-                runtime=str(prepared_artifact.runtime or "py3"),
-                timeout_sec=self.timeout_sec,
-            )
-        )
         if normalized_update_globals is not None:
             payload["update_globals"] = normalized_update_globals
         if normalized_task_resource_paths:

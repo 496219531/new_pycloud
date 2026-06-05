@@ -197,8 +197,8 @@ def _encode_dataframe_v1(df):
         raise TypeError(f"_encode_dataframe_v1 expects DataFrame, got {type(df).__name__}")
     (_, _, _serialize_pandas_label, _) = _lazy_serialization_helpers()
     columns = []
-    for column in list(df.columns):
-        series = df[column]
+    for idx, column in enumerate(list(df.columns)):
+        series = df.iloc[:, idx]
         values = np.asarray(series.to_numpy(copy=False))
         columns.append(
             {
@@ -220,12 +220,12 @@ def _decode_dataframe_v1(payload):
     import pandas as pd
 
     (_, _, _, _deserialize_pandas_label) = _lazy_serialization_helpers()
-    rows = {}
+    column_values = []
     for item in list(payload.get("data") or ()):
         normalized = dict(item or {})
-        name = _deserialize_pandas_label(normalized.get("name"))
-        rows[name] = _decode_ndarray_v1(dict(normalized.get("values") or {}))
-    frame = pd.DataFrame(rows)
+        _deserialize_pandas_label(normalized.get("name"))
+        column_values.append(_decode_ndarray_v1(dict(normalized.get("values") or {})))
+    frame = pd.DataFrame(dict(enumerate(column_values)))
     frame.index = _decode_pandas_index_v1(payload.get("index"))
     frame.columns = _decode_pandas_index_v1(payload.get("columns"))
     return frame

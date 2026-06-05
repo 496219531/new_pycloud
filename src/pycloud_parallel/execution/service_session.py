@@ -89,6 +89,7 @@ from pycloud_parallel.execution.deployment_create_helper import (
     normalize_initial_globals,
     prepare_deployment_artifact,
 )
+from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
@@ -111,6 +112,7 @@ from pycloud_parallel.execution.support import (
     _filter_nodes_by_runtime,
     _get_local_ip,
     _is_node_identity_mismatch_error,
+    _mark_infocenter_node_lost_on_identity_mismatch,
     _prepare_code_blob,
     _put_data_via_clients,
     _resolve_public_target_arg,
@@ -196,6 +198,36 @@ def _startup_active_routes(routes: Sequence[InfoCenterServiceRoute]) -> List[Inf
             int(pb2.SERVICE_STATUS_DRAINING),
         }
     ]
+
+
+def _local_direct_module_name(source: Any, entry_module: Any = "") -> str:
+    explicit = str(entry_module or "").strip()
+    if explicit:
+        return explicit
+    if inspect.ismodule(source):
+        return _default_entry_module_for_module(source)
+    if isinstance(source, str) and source.replace("_", "").replace(".", "").isalnum():
+        return str(source or "").strip()
+    return ""
+
+
+def _service_local_uses_direct_module(
+    *,
+    source: Any,
+    artifact: Optional[Any],
+    deps: Optional[Any],
+    package_format: str,
+    resource_paths: Optional[Sequence[Any]],
+) -> bool:
+    if artifact is not None:
+        return False
+    if deps is not None:
+        return False
+    if str(package_format or "").strip():
+        return False
+    if any(str(item or "").strip() for item in list(resource_paths or ())):
+        return False
+    return bool(_local_direct_module_name(source))
 
 
 def _route_attr(route: object, name: str, default: object = "") -> object:
@@ -1964,6 +1996,7 @@ class Service(ServiceExecutionSession):
     _compensation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _last_compensation_attempt_at: float = field(default=0.0, repr=False)
     _last_managed_globals: Optional[Dict[str, object]] = field(default=None, repr=False)
+    _keepalive_retry_forever: bool = field(default=False, repr=False)
     serialization_mode: str = ""
     policy_id: InitVar[str] = ""
     _policy_id: str = field(default="", repr=False)
@@ -2018,36 +2051,11 @@ class Service(ServiceExecutionSession):
             self._compensation_spec = None
             return
         self._compensation_spec = dict(spec)
+        self._keepalive_retry_forever = True
 
     @staticmethod
     def _is_retryable_compensation_failure(message: str) -> bool:
-        text = str(message or "").strip().lower()
-        if not text:
-            return False
-        permanent_markers = (
-            "modulenotfounderror",
-            "importerror",
-            "syntaxerror",
-            "dependency install failed",
-            "method `",
-            "not exported",
-            "runtime mismatch",
-        )
-        if any(marker in text for marker in permanent_markers):
-            return False
-        retryable_markers = (
-            "heartbeat",
-            "timeout",
-            "timed out",
-            "connection",
-            "temporarily",
-            "refused",
-            "reset",
-            "unreachable",
-            "service is stopped",
-            "service not found",
-        )
-        return any(marker in text for marker in retryable_markers)
+        return is_retryable_compensation_failure(message, resource_kind="service")
 
     def _after_keepalive_tick(self) -> None:
         spec = self._compensation_spec
@@ -2071,12 +2079,11 @@ class Service(ServiceExecutionSession):
             active = self._active_replica_snapshot()
             if desired <= 0 or len(active) >= desired:
                 return 0
-            failed = {str(node_id) for node_id in self.failures.keys() if str(node_id)}
-            retryable_failed = {
-                node_id
-                for node_id, message in self.failures.items()
-                if self._is_retryable_compensation_failure(str(message or ""))
-            }
+            recovery_states = self._build_replica_recovery_states(
+                is_retryable_failure=self._is_retryable_compensation_failure,
+            )
+            failed = {node_id for node_id, state in recovery_states.items() if not state.active}
+            retryable_failed = {node_id for node_id, state in recovery_states.items() if state.retryable}
             failed_by_base_node: Dict[str, str] = {}
             for node_id in failed:
                 node = self.nodes.get(node_id)
@@ -2173,7 +2180,8 @@ class Service(ServiceExecutionSession):
                         expected_node_instance_id=node_key,
                     )
                 except Exception as exc:
-                    client.close()
+                    with contextlib.suppress(Exception):
+                        client.close()
                     return node_key, node, None, None, repr(exc)
                 session.node_instance_id = node_key
                 session.node_id = str(node.node_id or "")
@@ -2185,6 +2193,25 @@ class Service(ServiceExecutionSession):
                 for node_key, node, client, session, error_message in create_results:
                     if error_message:
                         self.failures[node_key] = error_message
+                        category = classify_error(error_message, resource_kind="service").value
+                        _mark_infocenter_node_lost_on_identity_mismatch(
+                            infocenter_factory=_infocenter_client,
+                            infocenter_target=str(spec["infocenter_target"]),
+                            timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0),
+                            node_instance_id=node_key,
+                            error_message=error_message,
+                            reason_prefix="service compensation identity mismatch",
+                        )
+                        logger.warning(
+                            "service dynamic compensation create failed service_name=%s "
+                            "node_id=%s node_instance_id=%s control_addr=%s category=%s err=%s",
+                            self.service_name,
+                            getattr(node, "node_id", ""),
+                            node_key,
+                            getattr(node, "control_addr", ""),
+                            category,
+                            error_message,
+                        )
                         continue
                     if client is None or session is None:
                         continue
@@ -2476,6 +2503,14 @@ class Service(ServiceExecutionSession):
         from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
         initial_globals_values, effective_managed_global_names = normalize_initial_globals(initial_globals, managed_global_names)
 
+        direct_module_name = _local_direct_module_name(source)
+        direct_module_mount = _service_local_uses_direct_module(
+            source=source,
+            artifact=artifact,
+            deps=deps,
+            package_format=package_format,
+            resource_paths=resource_paths,
+        )
         module_source = source if inspect.ismodule(source) else None
         normalized_resource_paths = [item for item in list(resource_paths or ()) if str(item or "").strip()]
         if normalized_resource_paths and module_source is None:
@@ -2500,10 +2535,12 @@ class Service(ServiceExecutionSession):
             exports=ArtifactExports.explicit(export_methods) if export_methods else None,
             managed_global_names=effective_managed_global_names,
         )
-        prepared_artifact = _prepare_artifact(normalized_artifact, consumer_kind="service")
-        effective_entry_module = prepared_artifact.entry_module
-        if not effective_entry_module and prepared_artifact.filename.endswith(".py"):
-            effective_entry_module = Path(prepared_artifact.filename).stem
+        prepared_artifact = None if direct_module_mount else _prepare_artifact(normalized_artifact, consumer_kind="service")
+        effective_entry_module = direct_module_name
+        if prepared_artifact is not None:
+            effective_entry_module = prepared_artifact.entry_module
+            if not effective_entry_module and prepared_artifact.filename.endswith(".py"):
+                effective_entry_module = Path(prepared_artifact.filename).stem
         local_ip = _get_local_ip()
         effective_owner = str(owner_client_id or f"local-client-{local_ip}").strip()
         effective_service_name = str(service_name or effective_entry_module or f"local-service-{uuid.uuid4().hex[:10]}").strip()
@@ -2522,28 +2559,42 @@ class Service(ServiceExecutionSession):
             service_default_worker_count=effective_worker_count,
         )
         try:
-            node.mount_prepared_service(
-                owner_client_id=effective_owner,
-                service_name=effective_service_name,
-                sha256=prepared_artifact.content_sha256,
-                runtime=prepared_artifact.runtime,
-                entry_module=prepared_artifact.entry_module,
-                entry_callable=prepared_artifact.entry_callable,
-                package_format=prepared_artifact.package_format,
-                export_mode=prepared_artifact.export_mode,
-                export_methods=list(prepared_artifact.export_methods),
-                export_decorator=prepared_artifact.export_decorator,
-                dependency_policy_mode=prepared_artifact.dependency_policy_mode,
-                dependency_allowlist=list(prepared_artifact.dependency_allowlist),
-                managed_global_names=list(prepared_artifact.managed_global_names),
-                initial_globals=initial_globals_values,
-                policy_id=get_default_policy_id_for_binding("service_internal"),
-                worker_count=effective_worker_count,
-                heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
-                idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
-                expose_http=False,
-                chunks=[prepared_artifact.blob],
-            )
+            if direct_module_mount:
+                node.mount_python_module_service(
+                    service_name=effective_service_name,
+                    entry_module=effective_entry_module,
+                    export_methods=export_methods,
+                    worker_count=effective_worker_count,
+                    policy_id=get_default_policy_id_for_binding("service_internal"),
+                    managed_global_names=effective_managed_global_names,
+                )
+                node._local_owner_client_id = effective_owner  # noqa: SLF001
+                node._local_code_version = f"module:{effective_entry_module}"  # noqa: SLF001
+                if initial_globals_values:
+                    node.update_globals(initial_globals_values, service_name=effective_service_name)
+            else:
+                node.mount_prepared_service(
+                    owner_client_id=effective_owner,
+                    service_name=effective_service_name,
+                    sha256=prepared_artifact.content_sha256,
+                    runtime=prepared_artifact.runtime,
+                    entry_module=prepared_artifact.entry_module,
+                    entry_callable=prepared_artifact.entry_callable,
+                    package_format=prepared_artifact.package_format,
+                    export_mode=prepared_artifact.export_mode,
+                    export_methods=list(prepared_artifact.export_methods),
+                    export_decorator=prepared_artifact.export_decorator,
+                    dependency_policy_mode=prepared_artifact.dependency_policy_mode,
+                    dependency_allowlist=list(prepared_artifact.dependency_allowlist),
+                    managed_global_names=list(prepared_artifact.managed_global_names),
+                    initial_globals=initial_globals_values,
+                    policy_id=get_default_policy_id_for_binding("service_internal"),
+                    worker_count=effective_worker_count,
+                    heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
+                    idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+                    expose_http=False,
+                    chunks=[prepared_artifact.blob],
+                )
             node.start_local_ipc()
         except Exception:
             node.close()
@@ -3347,14 +3398,24 @@ class Service(ServiceExecutionSession):
                         error_message = item.error_message
                         failures[node_key] = error_message
                         if _is_node_identity_mismatch_error(error_message):
-                            with contextlib.suppress(Exception):
-                                with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
-                                    mark_lost = getattr(infocenter, "mark_node_lost", None)
-                                    if callable(mark_lost):
-                                        mark_lost(
-                                            node_key,
-                                            reason=f"service deploy identity mismatch: {error_message}",
-                                        )
+                            _mark_infocenter_node_lost_on_identity_mismatch(
+                                infocenter_factory=_infocenter_client,
+                                infocenter_target=infocenter_target,
+                                timeout_sec=timeout_sec,
+                                node_instance_id=node_key,
+                                error_message=error_message,
+                                reason_prefix="service deploy identity mismatch",
+                            )
+                        logger.warning(
+                            "service replica create failed service_name=%s node_id=%s "
+                            "node_instance_id=%s control_addr=%s category=%s err=%s",
+                            effective_service_name,
+                            getattr(item.node, "node_id", ""),
+                            node_key,
+                            getattr(item.node, "control_addr", ""),
+                            classify_error(error_message, resource_kind="service").value,
+                            error_message,
+                        )
                         if not first_failure[0]:
                             first_failure = (node_key, error_message)
                         continue
@@ -3362,14 +3423,24 @@ class Service(ServiceExecutionSession):
                     if error_message:
                         failures[node_key] = error_message
                         if _is_node_identity_mismatch_error(error_message):
-                            with contextlib.suppress(Exception):
-                                with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
-                                    mark_lost = getattr(infocenter, "mark_node_lost", None)
-                                    if callable(mark_lost):
-                                        mark_lost(
-                                            node_key,
-                                            reason=f"service deploy identity mismatch: {error_message}",
-                                        )
+                            _mark_infocenter_node_lost_on_identity_mismatch(
+                                infocenter_factory=_infocenter_client,
+                                infocenter_target=infocenter_target,
+                                timeout_sec=timeout_sec,
+                                node_instance_id=node_key,
+                                error_message=error_message,
+                                reason_prefix="service deploy identity mismatch",
+                            )
+                        logger.warning(
+                            "service replica create failed service_name=%s node_id=%s "
+                            "node_instance_id=%s control_addr=%s category=%s err=%s",
+                            effective_service_name,
+                            getattr(node, "node_id", ""),
+                            node_key,
+                            getattr(node, "control_addr", ""),
+                            classify_error(error_message, resource_kind="service").value,
+                            error_message,
+                        )
                         if not first_failure[0]:
                             first_failure = (node_key, error_message)
                         continue
@@ -3782,7 +3853,7 @@ class Service(ServiceExecutionSession):
             pass
 
     def __post_init__(self, policy_id: str = "") -> None:
-        self._keepalive_retry_forever = True
+        self._keepalive_retry_forever = bool(getattr(self, "_keepalive_retry_forever", False))
         self._init_execution_session_state()
         self._policy_id = str(policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal")
         if self.effective_policy is None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import errno
 import hashlib
 import inspect
 import json
@@ -18,7 +17,6 @@ import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
-from urllib.error import URLError
 from urllib.parse import urlparse
 
 from google.protobuf import timestamp_pb2
@@ -66,6 +64,7 @@ from pycloud_parallel.controlplane.serialization import (
     summarize_payload_flow_value,
 )
 from pycloud_parallel.controlplane.serialization_mode import resolve_effective_serialization_mode
+from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
 
 if TYPE_CHECKING:
@@ -150,33 +149,7 @@ def _filter_nodes_by_runtime(
 
 
 def _is_transient_infocenter_error(exc: Exception) -> bool:
-    candidate: object = exc
-    if isinstance(candidate, URLError):
-        candidate = candidate.reason
-    if isinstance(candidate, TimeoutError):
-        return True
-    if isinstance(candidate, OSError):
-        return getattr(candidate, "errno", None) in {
-            errno.ECONNREFUSED,
-            errno.ECONNRESET,
-            errno.ETIMEDOUT,
-            errno.EHOSTUNREACH,
-            errno.ENETUNREACH,
-        }
-    if isinstance(candidate, str):
-        lowered = candidate.lower()
-        return (
-            "connection refused" in lowered
-            or "connection reset" in lowered
-            or "cannot connect to " in lowered
-            or "closed by the remote service" in lowered
-            or "http request to " in lowered
-            or "timed out" in lowered
-            or "temporarily unavailable" in lowered
-        )
-    if isinstance(candidate, RuntimeError):
-        return _is_transient_infocenter_error(str(candidate))
-    return False
+    return classify_error(exc) == ErrorCategory.TRANSIENT_NETWORK
 
 
 def _retry_infocenter_request(
@@ -208,11 +181,33 @@ def _retry_infocenter_request(
 
 
 def _is_node_identity_mismatch_error(message: str) -> bool:
-    text = str(message or "").strip().lower()
-    return (
-        "node control_addr instance mismatch" in text
-        or "node control_addr is still served by another node instance" in text
-    )
+    return classify_error(message) == ErrorCategory.IDENTITY_MISMATCH
+
+
+def _mark_infocenter_node_lost_on_identity_mismatch(
+    *,
+    infocenter_factory: Callable[..., Any],
+    infocenter_target: str,
+    timeout_sec: float,
+    node_instance_id: str,
+    error_message: str,
+    reason_prefix: str,
+) -> bool:
+    if not _is_node_identity_mismatch_error(error_message):
+        return False
+    normalized_node_instance_id = str(node_instance_id or "").strip()
+    if not normalized_node_instance_id:
+        return False
+    with contextlib.suppress(Exception):
+        with infocenter_factory(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+            mark_lost = getattr(infocenter, "mark_node_lost", None)
+            if callable(mark_lost):
+                mark_lost(
+                    normalized_node_instance_id,
+                    reason=f"{str(reason_prefix or 'identity mismatch').strip()}: {error_message}",
+                )
+                return True
+    return False
 
 
 def _resolve_public_target_arg(
@@ -1777,6 +1772,8 @@ __all__ = [
     "_filter_nodes_by_runtime",
     "_get_local_ip",
     "_load_job_client_session_cache",
+    "_is_node_identity_mismatch_error",
+    "_mark_infocenter_node_lost_on_identity_mismatch",
     "_normalize_job_update_globals_arg",
     "_prepare_code_blob",
     "_prepare_job_blob_submit_fields",

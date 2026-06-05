@@ -112,6 +112,31 @@ def test_pickle_stable_v1_roundtrips_dataframe_object_dtype():
     assert restored.equals(frame)
 
 
+def test_pickle_stable_v1_roundtrips_dataframe_with_duplicate_columns():
+    frame = pd.concat(
+        [
+            pd.Series([1, 2], name="dup", dtype=np.int64),
+            pd.Series([3.5, 4.5], name="dup", dtype=np.float64),
+            pd.Series(["x", "y"], name="label"),
+        ],
+        axis=1,
+    )
+
+    normalized = normalize_for_pickle_stable(frame)
+    restored = stable_pickle_loads(stable_pickle_dumps(frame))
+
+    assert [item["name"] for item in normalized["data"]] == [
+        {"__type__": "pd.label", "kind": "str", "value": "dup"},
+        {"__type__": "pd.label", "kind": "str", "value": "dup"},
+        {"__type__": "pd.label", "kind": "str", "value": "label"},
+    ]
+    assert normalized["data"][0]["dtype"] == "int64"
+    assert normalized["data"][1]["dtype"] == "float64"
+    assert list(restored.columns) == ["dup", "dup", "label"]
+    assert list(restored.dtypes.astype(str)) == list(frame.dtypes.astype(str))
+    assert restored.equals(frame)
+
+
 def test_pickle_stable_v1_roundtrips_series_object_dtype():
     series = pd.Series(["中文", {"x": 1}, ["a", "b"]], name="value")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import io
+import logging
 import sys
 import tarfile
 import threading
@@ -136,6 +137,43 @@ def test_task_pool_open_local_uses_private_node_pool(tmp_path) -> None:
         assert pool.route_summary()[0]["control_addr"] == "local"
 
 
+def test_task_pool_open_local_module_defaults_to_direct_no_package(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    worker_module = _build_task_entry_module(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "pycloud_parallel.execution.task_pool._prepare_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct module must not package")),
+    )
+
+    with TaskPool.open(
+        target="local",
+        source=worker_module,
+        worker_count=1,
+    ) as pool:
+        assert pool.collect_items([{"value": 6}], timeout_sec=10.0)[0].result == {"value": 6}
+        assert pool.route_summary()[0]["control_addr"] == "local"
+
+
+def test_task_pool_open_local_callable_defaults_to_direct_no_package(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    def run(value=0, **_kwargs):
+        return {"value": int(value) + 2}
+
+    monkeypatch.setattr(
+        "pycloud_parallel.execution.task_pool._prepare_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct callable must not package")),
+    )
+
+    with TaskPool.open(
+        target="local",
+        source=run,
+        worker_count=1,
+    ) as pool:
+        assert pool.collect_items([{"value": 6}], timeout_sec=10.0)[0].result == {"value": 8}
+
+
 def test_task_pool_open_local_supports_unordered_wrappers(tmp_path) -> None:
     from pycloud_parallel import TaskPool
 
@@ -173,6 +211,7 @@ def test_task_pool_open_local_supports_unordered_wrappers(tmp_path) -> None:
 
 def test_task_pool_open_local_ignores_external_serialization_mode(tmp_path) -> None:
     from pycloud_parallel import TaskPool
+    from pycloud_parallel.controlplane.serialization import struct_to_python
 
     blob = (
         b"def run(value=0, **_kwargs):\n"
@@ -191,18 +230,20 @@ def test_task_pool_open_local_ignores_external_serialization_mode(tmp_path) -> N
         serialization_mode="structured_v1",
     ) as pool:
         assert pool.serialization_mode == "pickle_native_v1"
-        captured_codecs = []
+        captured_items = []
         original_build_item = pool._build_task_submit_item
 
         def _capture_build_item(*args, **kwargs):
             item = original_build_item(*args, **kwargs)
-            captured_codecs.append(item.transport_payload.codec)
+            captured_items.append(item)
             return item
 
         pool._build_task_submit_item = _capture_build_item
         resp = pool.submit_payloads([{"value": 1}], serialization_mode="legacy_v1")
         assert len(resp.accepted) == 1
-        assert captured_codecs == ["pickle_native_v1"]
+        assert len(captured_items) == 1
+        assert not captured_items[0].HasField("transport_payload")
+        assert struct_to_python(captured_items[0].payload) == {"value": 1}
         values = pool.wait_for_data(expected_count=1, timeout_sec=10.0)
         assert values == [{"value": 2}]
 
@@ -236,6 +277,43 @@ def test_task_pool_open_local_supports_imap_unordered_return_items(tmp_path) -> 
         assert [item.result for item in items] == [{"value": 8}, {"value": 12}]
         assert all(item.ok for item in items)
         assert all(item.task_id for item in items)
+
+
+def test_task_pool_open_local_unordered_uses_plain_payload_struct(tmp_path) -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.controlplane.serialization import struct_to_python
+
+    blob = (
+        b"def run(value=0, **_kwargs):\n"
+        b"    return {'value': int(value) * 5}\n"
+    )
+
+    with TaskPool.open(
+        target="local",
+        artifact=Artifact.from_bytes(
+            blob,
+            package_format="py",
+            entry_module="local_task_pool_plain_unordered",
+            entry_callable="run",
+        ),
+        worker_count=1,
+    ) as pool:
+        captured_items = []
+        original_build_item = pool._build_task_submit_item
+
+        def _capture_build_item(*args, **kwargs):
+            item = original_build_item(*args, **kwargs)
+            captured_items.append(item)
+            return item
+
+        pool._build_task_submit_item = _capture_build_item
+        items = list(pool.imap_unordered([{"value": 2}], timeout_sec=10.0, return_items=True))
+
+        assert items[0].ok is True
+        assert items[0].result == {"value": 10}
+        assert len(captured_items) == 1
+        assert not captured_items[0].HasField("transport_payload")
+        assert struct_to_python(captured_items[0].payload) == {"value": 2}
 
 
 def test_task_pool_open_local_supports_async_unordered_wrapper(tmp_path) -> None:
@@ -1590,6 +1668,102 @@ def test_native_task_pool_session_submit_payloads_avoids_degraded_nodes() -> Non
     assert submitted_to == ["node-good", "node-good", "node-good"]
 
 
+def test_native_task_pool_session_submit_payloads_splits_by_node_http_limit() -> None:
+    from pycloud_parallel import TaskPool
+
+    batch_sizes: list[int] = []
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace()
+
+        def submit_tasks(self, tasks, job_id=""):
+            batch_sizes.append(len(tasks))
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={
+            "node-1": SimpleNamespace(
+                capability={
+                    "max_http_body_bytes": 4096,
+                    "max_control_send_bytes": 4096,
+                    "max_control_recv_bytes": 4096,
+                },
+                inflight=0,
+                task_pool_worker_available=1,
+            )
+        },
+        task_method="run",
+        job_id="job-split-submit",
+    )
+
+    payloads = [{"value": "x" * 2048} for _ in range(4)]
+    resp = session.submit_payloads(payloads, serialization_mode="pickle_stable_v1")
+
+    assert len(resp.accepted) == 4
+    assert len(batch_sizes) > 1
+    assert sum(batch_sizes) == 4
+
+
+def test_native_task_pool_session_imap_unordered_logs_zero_submitted(caplog) -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        kind = "task_pool"
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        heartbeat_failure_threshold = 1
+        worker_count = 1
+        pool_id = "pool-zero"
+        pool_name = "pool-zero-name"
+        node_id = "node-1"
+        status = "RUNNING"
+
+        def __init__(self) -> None:
+            self._client = SimpleNamespace()
+
+        def get_status(self):
+            return SimpleNamespace(
+                status=self.status,
+                task_count=0,
+                worker_count=self.worker_count,
+                pool_name=self.pool_name,
+            )
+
+        def lease(self):
+            return SimpleNamespace(last_heartbeat_at=None, lease_expire_at=None)
+
+        def close(self, *, reason: str = ""):
+            self.status = "STOPPED"
+
+    session = TaskPool(
+        pools={"node-1": _Pool()},
+        nodes={},
+        task_method="run",
+        job_id="job-zero-submit",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert list(session.imap_unordered([], timeout_sec=1.0, result_timeout_sec=1.0)) == []
+
+    assert any(
+        "zero submitted tasks" in record.getMessage()
+        and "pool-zero-name" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_native_task_pool_session_submit_payloads_fail_when_no_active_nodes() -> None:
     from pycloud_parallel import TaskPool
 
@@ -1961,6 +2135,47 @@ def test_native_task_pool_session_keepalive_heartbeats_replicas_concurrently() -
         thread.join(timeout=1.0)
 
 
+def test_native_task_pool_session_single_replica_heartbeat_does_not_block_loop(caplog) -> None:
+    from pycloud_parallel import TaskPool
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowPool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            started.set()
+            release.wait(2.0)
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    session = TaskPool(
+        pools={"node-slow": _SlowPool()},
+        nodes={},
+        task_method="run",
+        job_id="job-single-hb",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        session._start_keepalive(interval_sec=0.01)  # noqa: SLF001
+        try:
+            assert started.wait(0.5)
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                if any("keepalive heartbeat pending" in record.getMessage() for record in caplog.records):
+                    break
+                time.sleep(0.05)
+            assert any("keepalive heartbeat pending" in record.getMessage() for record in caplog.records)
+            assert session._hb_thread is not None  # noqa: SLF001
+            assert session._hb_thread.is_alive()  # noqa: SLF001
+        finally:
+            release.set()
+            session.close()
+
+
 def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:
     from pycloud_parallel import TaskPool
 
@@ -2003,6 +2218,9 @@ def test_native_task_pool_session_keepalive_stops_terminal_pool_errors(caplog) -
         code_version = "sha256:test"
         heartbeat_timeout_sec = 1
         heartbeat_failure_threshold = 3
+        pool_id = "pool-terminal-1"
+        pool_name = "pool-terminal"
+        node_id = "node-1"
         status = "RUNNING"
 
         def __init__(self) -> None:
@@ -2050,6 +2268,10 @@ def test_native_task_pool_session_keepalive_stops_terminal_pool_errors(caplog) -
         if "keepalive heartbeat failed" in record.getMessage()
     ]
     assert len(stopped_logs) == 1
+    stopped_message = stopped_logs[0].getMessage()
+    assert "pool-terminal-1" in stopped_message
+    assert "pool-terminal" in stopped_message
+    assert "node-1" in stopped_message
     assert failed_logs == []
 
 

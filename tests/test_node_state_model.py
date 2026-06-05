@@ -4832,6 +4832,48 @@ def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     assert state._executor_host is None  # noqa: SLF001
 
 
+def test_close_task_pool_preserves_existing_stop_reason(tmp_path):
+    state = NodeControlState(
+        node_id="node-close-preserve",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_close_preserve"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    pool = TaskPoolState(
+        pool_id="pool-preserve",
+        owner_client_id="owner",
+        pool_name="pool-preserve",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="STOPPED",
+        stop_reason="owner heartbeat timeout",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now,
+        executor_ready=False,
+        alive_workers=0,
+    )
+    with state._lock:  # noqa: SLF001
+        state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+
+    state.close_task_pool(
+        owner_client_id="owner",
+        pool_id="pool-preserve",
+        pool_token="pool-token",
+        reason="task pool session close",
+    )
+
+    assert pool.status == "STOPPED"
+    assert pool.stop_reason == "owner heartbeat timeout"
+
+
 def test_nodecontrol_service_call_throttles_code_last_at_touch(tmp_path, monkeypatch):
     state = NodeControlState(
         node_id="node-touch-throttle",

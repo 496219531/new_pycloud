@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
+from pycloud_parallel.controlplane.artifact import Artifact
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.execution.service_session import Service
 
@@ -1132,13 +1133,49 @@ def test_service_deploy_local_returns_direct_proxy(tmp_path, monkeypatch):
         service.close()
 
 
-def test_service_deploy_local_keeps_artifact_service_path(tmp_path, monkeypatch):
+def test_service_deploy_local_defaults_to_direct_module_path(tmp_path, monkeypatch):
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+
+    service = Service.deploy(
+        target="local",
+        service_name="deploy-local-direct-module-path",
+        source=worker_module,
+        worker_count=1,
+    )
+    try:
+        assert service._services == {}  # noqa: SLF001
+        assert service._startup_services  # noqa: SLF001
+        assert service.run.sync(value=3) == {"value": 3}
+    finally:
+        service.close()
+
+
+def test_service_deploy_local_direct_module_does_not_prepare_artifact(tmp_path, monkeypatch):
+    worker_module = _build_service_entry_module(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "pycloud_parallel.execution.service_session._prepare_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct module must not package")),
+    )
+
+    service = Service.deploy(
+        target="local",
+        service_name="deploy-local-no-package",
+        source=worker_module,
+        worker_count=1,
+    )
+    try:
+        assert service.run.sync(value=4) == {"value": 4}
+    finally:
+        service.close()
+
+
+def test_service_deploy_local_keeps_explicit_artifact_service_path(tmp_path, monkeypatch):
     worker_module = _build_service_entry_module(tmp_path, monkeypatch)
 
     service = Service.deploy(
         target="local",
         service_name="deploy-local-artifact-path",
-        source=worker_module,
+        artifact=Artifact.from_module(worker_module),
         worker_count=1,
     )
     try:
@@ -1581,13 +1618,9 @@ def test_service_local_ipc_client_reuses_thread_connection(monkeypatch):
     assert connect_count == 2
 
 
-def test_service_local_ipc_sends_payload_as_inline_pickle_transport(tmp_path, monkeypatch):
+def test_service_local_ipc_sends_small_payload_directly(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane.local_ipc import LocalServiceClient, start_local_service_ipc
-    from pycloud_parallel.controlplane.serialization import (
-        INTERNAL_PICKLE_NATIVE_V1,
-        decode_inline_transport_carrier,
-        is_inline_transport_carrier,
-    )
+    from pycloud_parallel.controlplane.serialization import is_inline_transport_carrier
 
     monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
     captured = {}
@@ -1604,20 +1637,17 @@ def test_service_local_ipc_sends_payload_as_inline_pickle_transport(tmp_path, mo
             captured["kwargs"] = dict(kwargs)
             return "fake-local-node-inst", {"ok": True, "data": {"value": 3}}
 
-    server = start_local_service_ipc(node=_FakeNode(), service_name="local-pickle-transport")
+    server = start_local_service_ipc(node=_FakeNode(), service_name="local-direct-payload")
     try:
-        client = LocalServiceClient(service_name="local-pickle-transport", timeout_sec=5.0)
+        client = LocalServiceClient(service_name="local-direct-payload", timeout_sec=5.0)
         assert client.call(method="run", payload={"x": 1, "y": 2}, serialization_mode="pickle_stable_v1")["data"] == {"value": 3}
     finally:
         server.close()
 
     assert captured["method"] == "run"
-    assert is_inline_transport_carrier(captured["payload"])
-    assert captured["payload"]["__pycloud_inline_transport__"]["codec"] == INTERNAL_PICKLE_NATIVE_V1
-    assert decode_inline_transport_carrier(captured["payload"], context="service_owner") == {"x": 1, "y": 2}
-    with pytest.raises(ValueError, match="trusted internal"):
-        decode_inline_transport_carrier(captured["payload"], context="gateway_public")
-    assert captured["kwargs"]["serialization_mode"] == INTERNAL_PICKLE_NATIVE_V1
+    assert captured["payload"] == {"x": 1, "y": 2}
+    assert not is_inline_transport_carrier(captured["payload"])
+    assert captured["kwargs"]["serialization_mode"] == "pickle_native_v1"
 
 
 def test_service_connect_local_ignores_external_serialization_mode(tmp_path, monkeypatch):
@@ -1662,7 +1692,6 @@ def test_service_connect_local_ignores_external_serialization_mode(tmp_path, mon
 def test_service_local_ipc_uses_local_payload_thresholds_for_dataref(tmp_path, monkeypatch):
     from pycloud_parallel.controlplane import config
     from pycloud_parallel.controlplane.local_ipc import LocalServiceClient, start_local_service_ipc
-    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
     from pycloud_parallel.data.ref import DataRef
 
     monkeypatch.setenv("PYCLOUD_LOCAL_IPC_DIR", str(tmp_path / "local-ipc"))
@@ -1691,10 +1720,9 @@ def test_service_local_ipc_uses_local_payload_thresholds_for_dataref(tmp_path, m
         monkeypatch.delenv("PYCLOUD_LOCAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES", raising=False)
         config.reload_config()
 
-    decoded = decode_inline_transport_carrier(captured["payload"], context="service_owner")
-    assert isinstance(decoded["blob"], DataRef)
-    assert decoded["blob"].locator_kind == "node_local"
-    assert decoded["blob"].node_instance_id == "fake-local-node-inst"
+    assert isinstance(captured["payload"]["blob"], DataRef)
+    assert captured["payload"]["blob"].locator_kind == "node_local"
+    assert captured["payload"]["blob"].node_instance_id == "fake-local-node-inst"
 
 
 def test_service_local_ipc_fetch_result_data_materializes_dataref_directly(tmp_path, monkeypatch):

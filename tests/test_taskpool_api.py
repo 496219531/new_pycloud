@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
+from pycloud_parallel.controlplane.artifact import Artifact
 from pycloud_parallel.execution.task_pool import TaskPool
 
 
@@ -63,6 +64,118 @@ def test_taskpool_runtime_boundary_keeps_taskpool_protocol_and_capacity_account(
     assert "pull_pool_results" in taskpool_text
     assert "task_pool_worker_capacity" in node_text
     assert "service_worker_capacity" in node_text
+
+
+def test_taskpool_open_rejects_main_module_callable_source() -> None:
+    import pytest
+    from pycloud_parallel.execution.deployment_create_helper import prepare_deployment_artifact
+
+    def run(value=0):
+        return value
+
+    run.__module__ = "__main__"
+
+    with pytest.raises(ValueError, match="defined in __main__"):
+        prepare_deployment_artifact(
+            consumer_kind="task",
+            source=run,
+            artifact=None,
+            deps=None,
+            runtime="py3",
+            entry_module="",
+            entry_callable="run",
+            package_format="",
+            managed_global_names=None,
+        )
+
+
+def test_taskpool_open_uses_configured_default_heartbeat_timeout(monkeypatch) -> None:
+    import pycloud_parallel.execution.task_pool as task_pool_mod
+    from pycloud_parallel.controlplane import config as config_mod
+
+    monkeypatch.setenv("PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC", "456")
+    config_mod.reload_config()
+    monkeypatch.setattr(task_pool_mod, "get_taskpool_heartbeat_timeout_sec", config_mod.get_taskpool_heartbeat_timeout_sec)
+    created: list[dict[str, object]] = []
+
+    node = InfoCenterNode(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        capacity=4,
+        queue_capacity=32,
+        queued=0,
+        inflight=0,
+        credit=32,
+    )
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            created.append(dict(kwargs))
+            return SimpleNamespace(
+                owner_client_id=kwargs["owner_client_id"],
+                pool_id="pool-1",
+                pool_name=kwargs["pool_name"],
+                pool_token="token",
+                code_version="sha256:test",
+                worker_count=kwargs["worker_count"],
+                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                _client=SimpleNamespace(close=lambda: None),
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(task_pool_mod, "_infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr(task_pool_mod, "_new_node_control_client", _FakeNodeControlClient)
+
+    try:
+        pool = TaskPool.open(
+            target="127.0.0.1:50051",
+            artifact=Artifact.from_bytes(
+                b"def run(**_kwargs): return {'ok': True}\n",
+                package_format="py",
+                entry_module="demo_task",
+                entry_callable="run",
+            ),
+            worker_count=1,
+        )
+        pool.close()
+        assert created[0]["heartbeat_timeout_sec"] == 456
+
+        created.clear()
+        pool = TaskPool.open(
+            target="127.0.0.1:50051",
+            artifact=Artifact.from_bytes(
+                b"def run(**_kwargs): return {'ok': True}\n",
+                package_format="py",
+                entry_module="demo_task",
+                entry_callable="run",
+            ),
+            worker_count=1,
+            heartbeat_timeout_sec=12,
+        )
+        pool.close()
+        assert created[0]["heartbeat_timeout_sec"] == 12
+    finally:
+        monkeypatch.delenv("PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC", raising=False)
+        config_mod.reload_config()
 
 
 def test_taskpool_try_compensate_replicas_adds_newly_available_node(monkeypatch) -> None:

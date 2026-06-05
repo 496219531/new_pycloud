@@ -56,6 +56,10 @@ def test_ctl_parser_accepts_dev_profile_commands():
     args = parser.parse_args(["dev-start", "--nodes", "3"])
     assert args.command == "dev-start"
     assert args.nodes == 3
+    args = parser.parse_args(["stack-start", "--nodes", "2", "--loopback"])
+    assert args.command == "stack-start"
+    assert args.nodes == 2
+    assert args.local is True
     args = parser.parse_args(["dev-restart", "--nodes", "0"])
     assert args.command == "dev-restart"
     assert args.nodes == 0

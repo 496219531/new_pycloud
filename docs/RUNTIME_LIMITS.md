@@ -37,6 +37,7 @@
 | `PYCLOUD_NODE_MAX_WORKERS` | `64` | NodeControl HTTP server 的默认线程池大小 |
 | `PYCLOUD_SERVICE_DEFAULT_WORKERS` | `10` | 单个 service 默认 worker 数 |
 | `PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC` | `30` | service 默认 heartbeat timeout |
+| `PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC` | `60` | TaskPool owner heartbeat timeout；可按长批量任务或慢网络场景调大 |
 
 ## 1. 适合调什么
 

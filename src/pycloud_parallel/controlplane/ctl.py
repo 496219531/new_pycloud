@@ -47,6 +47,7 @@ from pycloud_parallel.controlplane.node.filesystem import (
     _code_index_meta_path,
     _ensure_code_index_entry,
     _managed_globals_scope_dir,
+    _segment_path_from_relpath,
 )
 
 _LOCALHOST = "127.0.0.1"
@@ -64,6 +65,7 @@ class _CtlArgumentParser(argparse.ArgumentParser):
                 "start-job-orchestrator",
                 "start-node",
                 "dev-start",
+                "stack-start",
                 "dev-restart",
                 "restart",
             }
@@ -2221,10 +2223,14 @@ def _cmd_cache_list(args: argparse.Namespace) -> int:
 
 def _collect_current_globals_object_ids(artifact_dir: Path) -> set[str]:
     live: set[str] = set()
+    current_paths: List[Path] = []
     codes_dir = artifact_dir / "codes"
-    if not codes_dir.exists():
-        return live
-    for current_path in codes_dir.glob("*/subversions/*/globals/*/*/current.json"):
+    if codes_dir.exists():
+        current_paths.extend(codes_dir.glob("*/subversions/*/globals/*/*/current.json"))
+    managed_globals_dir = artifact_dir / "mg"
+    if managed_globals_dir.exists():
+        current_paths.extend(managed_globals_dir.glob("*/*/current.json"))
+    for current_path in current_paths:
         current = _load_json(current_path)
         globals_digest = str(current.get("globals_digest", "") or "").strip()
         if not globals_digest:
@@ -2295,7 +2301,7 @@ def _object_backing_path_from_meta(object_dir: Path, *, object_id: str, meta: Di
     storage_backend = str(meta.get("storage_backend", "file") or "file").strip() or "file"
     if storage_backend == "segment":
         relpath = str(meta.get("segment_relpath", "") or "").strip()
-        return (_segment_dir(object_dir).parent / relpath).resolve() if relpath else None
+        return _segment_path_from_relpath(object_dir, relpath) if relpath else None
     candidates = [
         object_storage_path(object_dir, object_id=normalized_id, fmt=fmt),
         object_dir / f"{digest}{object_format_suffix(fmt)}",
@@ -2360,7 +2366,7 @@ def _segment_compaction_plan(segment_path: Path, refs: List[Dict[str, object]]) 
 
 
 def _compact_segment_file(object_dir: Path, *, relpath: str, refs: List[Dict[str, object]]) -> Dict[str, object]:
-    segment_path = (object_dir / relpath).resolve()
+    segment_path = _segment_path_from_relpath(object_dir, relpath)
     plan = _segment_compaction_plan(segment_path, refs)
     if not plan["needs_compaction"]:
         return {
@@ -2524,7 +2530,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         segments_root = _segment_dir(object_dir)
         if segments_root.exists():
             for segment_path in sorted(path for path in segments_root.glob("**/*") if path.is_file()):
-                relpath = str(segment_path.resolve().relative_to(object_dir.resolve()))
+                relpath = segment_path.resolve().relative_to(object_dir.resolve()).as_posix()
                 refs = segment_refs.get(relpath, [])
                 if not refs:
                     row = {
@@ -3057,6 +3063,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_env_argument(dev_start_parser)
     _add_debug_argument(dev_start_parser)
     _add_dev_node_arguments(dev_start_parser)
+    stack_start_parser = subparsers.add_parser("stack-start", help="alias for dev-start: start a local development stack")
+    _add_local_argument(stack_start_parser)
+    _add_target_argument(
+        stack_start_parser,
+        help="ControlPlane host:port for this dev stack; --infocenter-addr is a compatibility alias",
+    )
+    _add_env_argument(stack_start_parser)
+    _add_debug_argument(stack_start_parser)
+    _add_dev_node_arguments(stack_start_parser)
     start_infocenter = subparsers.add_parser("start-infocenter", help="start one local infocenter process")
     _add_local_argument(start_infocenter)
     _add_env_argument(start_infocenter)
@@ -3230,7 +3245,7 @@ def main(argv: List[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "start":
         return _cmd_start(args)
-    if args.command == "dev-start":
+    if args.command in {"dev-start", "stack-start"}:
         return _cmd_dev_start(args)
     if args.command == "start-infocenter":
         return _cmd_start_infocenter(args)

@@ -198,6 +198,22 @@ def test_local_pickle_payload_transport_keeps_large_file_path_inline(tmp_path) -
     assert restored["file_path"] == source.resolve()
 
 
+def test_local_ipc_payload_keeps_small_payload_unwrapped(tmp_path, monkeypatch) -> None:
+    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
+
+    def _fail_pickle_dumps(*_args, **_kwargs):
+        raise AssertionError("local IPC small payload should rely on send/recv serialization")
+
+    monkeypatch.setattr(local_ipc_mod.pickle, "dumps", _fail_pickle_dumps)
+
+    payload = local_ipc_mod._prepare_local_ipc_payload(
+        {"items": [{"value": i} for i in range(2)]},
+        meta={"object_dir": str(tmp_path)},
+    )
+
+    assert payload == {"items": [{"value": 0}, {"value": 1}]}
+
+
 def test_local_put_payload_data_uses_file_commit_without_reading_whole_file(tmp_path, monkeypatch) -> None:
     from pathlib import Path
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
@@ -2601,6 +2617,117 @@ def test_job_queue_manager_local_creates_local_taskpool(monkeypatch) -> None:
     assert captured["artifact"].entry_callable == "run"
     assert captured["node_count"] == 0
     assert state.status in {"WAITING", "RUNNING", "SUCCEEDED", "FAILED"}
+
+
+def test_job_queue_client_local_submit_source_module_uses_import_metadata(tmp_path, monkeypatch) -> None:
+    import importlib
+
+    from pycloud_parallel import JobQueue
+    from pycloud_parallel.execution.service_session import Service
+
+    module_path = tmp_path / "local_job_module_demo.py"
+    module_path.write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': value}\n\n"
+        "def task_generator(value=0, **_kwargs):\n"
+        "    return [{'value': value}]\n\n"
+        "def handle_result(index, result, state=None, **_kwargs):\n"
+        "    state.setdefault('items', []).append((index, result))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = importlib.import_module("local_job_module_demo")
+    monkeypatch.setattr(Service, "_connect_route", staticmethod(lambda **_kwargs: SimpleNamespace(close=lambda: None)))
+    client = JobQueue.connect("local", client_id="client-module")
+    captured = {}
+
+    def _fake_submit(payload):
+        captured.update(payload)
+        return {"ok": True}
+
+    client.submit_job = _fake_submit  # type: ignore[method-assign]
+
+    with patch("pycloud_parallel.execution.queue._prepare_artifact") as mocked_prepare:
+        resp = client.submit(source=module, job_payload={"value": 3})
+
+    assert resp == {"ok": True}
+    mocked_prepare.assert_not_called()
+    assert captured["source_mode"] == "module_import"
+    assert captured["entry_module"] == "local_job_module_demo"
+    assert captured["entry_callable"] == "run"
+    assert captured["task_generator_callable"] == "task_generator"
+    assert captured["handle_result_callable"] == "handle_result"
+    assert captured["source_root"] == str(tmp_path.resolve())
+    assert "blob_b64" not in captured
+    assert "blob_ref" not in captured
+
+
+def test_job_queue_manager_local_module_import_creates_direct_local_taskpool(tmp_path, monkeypatch) -> None:
+    import importlib
+
+    from pycloud_parallel.controlplane.job_queue import JobQueueManager
+
+    module_path = tmp_path / "local_job_pool_demo.py"
+    module_path.write_text(
+        "def run(value=0, **_kwargs):\n"
+        "    return {'value': value}\n\n"
+        "def task_generator(value=0, **_kwargs):\n"
+        "    return [{'value': value}]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.import_module("local_job_pool_demo")
+    captured: dict[str, object] = {}
+
+    class _FakePool:
+        def update_globals(self, values):
+            del values
+
+        def imap_unordered(self, items, **kwargs):
+            del kwargs
+            for index, item in enumerate(items):
+                yield index, {"value": item["value"]}
+
+        def close(self):
+            return None
+
+    def _fake_open(**kwargs):
+        captured.update(kwargs)
+        return _FakePool()
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.job_queue.TaskPool.open", _fake_open)
+    queue = JobQueueManager()
+    queue.start(controlplane_target="local")
+    try:
+        state = queue.submit_job(
+            {
+                "job_mode": "hooks",
+                "source_mode": "module_import",
+                "entry_module": "local_job_pool_demo",
+                "entry_callable": "run",
+                "task_generator_callable": "task_generator",
+                "source_root": str(tmp_path),
+                "job_payload": {"value": 7},
+                "pool_name": "local-job-pool",
+            },
+            auth_token="token",
+        )
+        deadline = time.monotonic() + 2.0
+        while not captured and time.monotonic() < deadline:
+            current = queue.get_job(state.job_id)
+            if current is not None and current.status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(0.01)
+    finally:
+        queue.close()
+
+    assert captured["target"] == "local"
+    assert captured["source"] == "local_job_pool_demo"
+    assert captured["entry_module"] == "local_job_pool_demo"
+    assert captured["entry_callable"] == "run"
+    assert "artifact" not in captured
+    assert "package_format" not in captured
+    assert captured["node_count"] == 0
 
 
 def test_job_queue_client_submit_source_module_builds_payloads() -> None:

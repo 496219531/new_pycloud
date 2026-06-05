@@ -852,6 +852,18 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         profile_key = str(getattr(node, "profile_key", "") or "").strip()
         profile_notes = str(getattr(node, "profile_notes", "") or "")
         action_node_id = html.escape(getattr(node, "action_node_instance_id", getattr(node, "node_instance_id", node.node_id)))
+        task_capacity = max(1, int(getattr(node, "capacity", 0) or 0))
+        task_running = max(0, int(getattr(getattr(node, "metrics", None), "running", 0) or 0))
+        task_queued = max(0, int(getattr(getattr(node, "metrics", None), "queued", 0) or 0))
+        task_credit = max(0, int(getattr(getattr(node, "metrics", None), "credit", 0) or 0))
+        task_used = min(task_capacity, task_running)
+        task_free = max(0, task_capacity - task_used)
+        node_quota = (
+            f"task {task_used}/{task_capacity}"
+            f" <span class='muted'>free {task_free}</span><br>"
+            f"queue {task_queued}/{node.queue_capacity}"
+            f" <span class='muted'>credit {task_credit}</span>"
+        )
         proc_quota = (
             f"svc {node.service_worker_used}/{node.service_worker_capacity}"
             f" <span class='muted'>free {node.service_worker_available()}</span><br>"
@@ -865,6 +877,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(node.control_addr)}</td>"
             f"<td>{_ops_bool_badge(node.healthy)}</td>"
             f"<td>{_ops_bool_badge(node.schedulable)}</td>"
+            f"<td class='quota-cell'>{node_quota}</td>"
             f"<td class='quota-cell'>{proc_quota}</td>"
             f"<td>{_ops_bool_badge(getattr(node, 'accept_service_deploy', True))}</td>"
             f"<td>{_ops_bool_badge(node.drain, invert=True)}</td>"
@@ -876,6 +889,11 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(managed_tags)}</td>"
             f"<td>{html.escape(capability_tags)}</td>"
             f"<td>{html.escape(legacy_node_tags)}</td>"
+            f"<td>{task_capacity}</td>"
+            f"<td>{task_used}</td>"
+            f"<td>{task_free}</td>"
+            f"<td>{task_queued}</td>"
+            f"<td>{task_running}</td>"
             f"<td>{node.service_worker_capacity}</td>"
             f"<td>{node.service_worker_used}</td>"
             f"<td>{node.service_worker_available()}</td>"
@@ -1073,7 +1091,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
             "</tr>"
         )
-    node_body = "\n".join(node_rows) or "<tr><td colspan='25'>no nodes</td></tr>"
+    node_body = "\n".join(node_rows) or "<tr><td colspan='31'>no nodes</td></tr>"
     service_body = "\n".join(service_rows) or "<tr><td colspan='18'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
@@ -1135,8 +1153,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "auto_refresh_sec": 5,
         }
     node_headers = [
-        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "proc quota", "accept deploy", "drain", "enabled", "pycloud",
-        "python", "active runtimes", "effective tags", "managed tags", "capability tags", "legacy node tags", "svc cap",
+        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "node quota", "proc quota", "accept deploy", "drain", "enabled", "pycloud",
+        "python", "active runtimes", "effective tags", "managed tags", "capability tags", "legacy node tags", "task cap",
+        "task used", "task free", "queued", "running", "svc cap",
         "svc used", "svc avail", "pool cap", "pool used", "pool avail", "reason", "notes", "actions",
     ]
     job_queue_headers = [
@@ -1172,7 +1191,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ".ops-section{margin:20px 0 24px;}.section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 8px;}.section-anchor{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:4px 9px;background:rgba(15,23,42,.72);}.section-anchor:hover{color:#fff;border-color:var(--accent);}"
         ".table-wrap{overflow:auto;max-height:70vh;background:rgba(16,27,49,.9);border:1px solid rgba(148,163,184,.2);border-radius:16px;box-shadow:0 16px 42px rgba(0,0,0,.26);}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1120px;}th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);padding:9px 11px;font-size:12px;line-height:1.42;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}th{position:sticky;top:0;z-index:2;background:linear-gradient(180deg,#1a2a46,#142138);text-align:left;color:#c9d7eb;font-weight:780;text-transform:uppercase;letter-spacing:.035em;font-size:11px;}tr:last-child td{border-bottom:0;}td:last-child,th:last-child{border-right:0;}tbody tr:nth-child(even){background:rgba(255,255,255,.018);}tbody tr:hover{background:rgba(96,165,250,.09);}"
         ".quota-cell{white-space:nowrap;line-height:1.45;}"
-        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(7),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+9):nth-child(-n+22),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(24){display:none;}"
+        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(8),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+10):nth-child(-n+28),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(30){display:none;}"
         "body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(2),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(14){display:none;}"
         "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
@@ -1200,10 +1219,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "<a class='nav-pill' href='/ops/snapshot'>snapshot</a>"
         "<button type='button' class='density-toggle' id='ops-density-toggle'>show details</button>"
         "<div class='refresh-pill' id='ops-refresh-status'>auto_refresh_sec=5 mode=partial</div>"
-        "<div class='density-hint' id='ops-density-hint'>compact node view shows quota/usage and hides service/task details</div>"
+        "<div class='density-hint' id='ops-density-hint'>compact node view shows node/process quota and hides raw capacity columns</div>"
         "</div></div>"
         f"{overview}"
-        "<div class='section-note'>Node table focuses on health plus service/task-pool process quota and usage. "
+        "<div class='section-note'>Node table focuses on health, task queue capacity, and service/task-pool process quota. "
         "Service details and task-pool task pressure live in the tables below, so node rows stay compact. "
         "Rows for stale nodes are highlighted and rendered as LOST.</div>"
         f"{_ops_table('Nodes', '', node_headers, 'ops-nodes-body', node_body)}"

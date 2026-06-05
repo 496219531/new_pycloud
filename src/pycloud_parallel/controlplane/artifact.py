@@ -217,6 +217,19 @@ def _coerce_source_input(source: Any) -> Tuple[str, Any]:
     )
 
 
+def _is_main_module_callable(value: Any) -> bool:
+    return callable(value) and not inspect.ismodule(value) and str(getattr(value, "__module__", "") or "") == "__main__"
+
+
+def _raise_if_unsafe_main_callable(value: Any) -> None:
+    if not _is_main_module_callable(value):
+        return
+    raise ValueError(
+        "source callable is defined in __main__; package it from an importable module or pass an explicit Artifact. "
+        "On Windows spawn, __main__ callables can re-import and re-run the caller script."
+    )
+
+
 def _coerce_artifact_deps(
     deps: "ArtifactDeps | None",
 ) -> "ArtifactDeps":
@@ -605,6 +618,7 @@ def _normalize_artifact_input(
             if inspect.ismodule(entry_module) or (not isinstance(entry_callable, str) and callable(entry_callable)):
                 raise ValueError("source cannot be combined with module/callable entry inputs")
             if source_kind == "function":
+                _raise_if_unsafe_main_callable(source_value)
                 source_func = source_value
             elif source_kind == "module":
                 source_module = source_value

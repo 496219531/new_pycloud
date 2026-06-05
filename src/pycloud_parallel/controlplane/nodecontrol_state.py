@@ -150,10 +150,17 @@ from pycloud_parallel.runtime.errors import normalize_invoke_error
 
 
 logger = logging.getLogger(__name__)
+_NATIVE_PATH = type(Path())
 NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC = 2.0
 NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC = 8.0
 _CODE_LAST_AT_TOUCH_INTERVAL_SEC = 60.0
 _CODE_LAST_AT_TOUCH_MAX_ENTRIES = 10000
+
+
+def _path(value: Any = ".") -> Path:
+    if isinstance(value, Path):
+        return value
+    return _NATIVE_PATH(value)
 
 
 class NodeControlState(NodeRuntimeBase):
@@ -239,7 +246,7 @@ class NodeControlState(NodeRuntimeBase):
         # 检测并保存当前 Python 版本
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
 
-        self._artifact_dir = Path(artifact_dir).expanduser().resolve()
+        self._artifact_dir = _path(artifact_dir).expanduser().resolve()
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
         self._codes_dir = self._artifact_dir / "codes"
         self._codes_dir.mkdir(parents=True, exist_ok=True)
@@ -658,7 +665,7 @@ class NodeControlState(NodeRuntimeBase):
             globals_digest="",
         )
         state.globals_digest = _write_managed_globals_snapshot(state, values_serialized={})
-        _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
+        _write_managed_globals_current(_path(state.scope_dir), globals_digest=state.globals_digest)
         return state
 
     def _ensure_service_managed_globals_state_locked(self, session: ServiceSession) -> Optional[ManagedGlobalsState]:
@@ -742,7 +749,7 @@ class NodeControlState(NodeRuntimeBase):
                 current_values[name] = serialize_arrow_compatible(prepared_value)
             updated_names.append(name)
         state.globals_digest = _write_managed_globals_snapshot(state, values_serialized=current_values)
-        _write_managed_globals_current(Path(state.scope_dir), globals_digest=state.globals_digest)
+        _write_managed_globals_current(_path(state.scope_dir), globals_digest=state.globals_digest)
         return state.globals_digest, sorted(updated_names)
 
     def _warmup_service_managed_globals(
@@ -881,8 +888,6 @@ class NodeControlState(NodeRuntimeBase):
 
     @staticmethod
     def _preload_after_create_required() -> bool:
-        if os.name == "nt":
-            return True
         requested = str(os.getenv("PYCLOUD_WORKER_START_METHOD", "") or "").strip().lower()
         if requested in {"spawn", "forkserver"}:
             return True
@@ -967,10 +972,10 @@ class NodeControlState(NodeRuntimeBase):
         segment_relpath = ""
         if artifact.storage_backend == "segment" and artifact.segment_path:
             with contextlib.suppress(Exception):
-                segment_relpath = _segment_relpath(self._object_dir, Path(artifact.segment_path))
+                segment_relpath = _segment_relpath(self._object_dir, _path(artifact.segment_path))
         if artifact.storage_backend != "segment" and artifact.path:
             with contextlib.suppress(FileNotFoundError):
-                Path(artifact.path).unlink()
+                _path(artifact.path).unlink()
         with contextlib.suppress(FileNotFoundError):
             _object_meta_path(self._object_dir, object_id=object_id).unlink()
         if segment_relpath:
@@ -990,7 +995,7 @@ class NodeControlState(NodeRuntimeBase):
                     artifact = _object_artifact_from_meta(self._object_dir, object_id=normalized, meta=meta)
                     self._objects[normalized] = artifact
             if artifact is not None:
-                fallback_path = Path(artifact.path) if artifact.path else Path(artifact.segment_path or "")
+                fallback_path = _path(artifact.path) if artifact.path else _path(artifact.segment_path or "")
             return _pin_object_meta(self._object_dir, object_id=normalized, ref_id=normalized_ref_id, fallback_path=fallback_path)
 
     def release_object(self, object_id: str, *, ref_id: str = "") -> bool:
@@ -1754,7 +1759,7 @@ class NodeControlState(NodeRuntimeBase):
                         )
                     return existing, True
 
-            tmp_path = Path(uploaded_path)
+            tmp_path = _path(uploaded_path)
             if not tmp_path.exists():
                 raise ValueError(f"uploaded file missing: {uploaded_path}")
 
@@ -1852,7 +1857,7 @@ class NodeControlState(NodeRuntimeBase):
         if expected and expected != actual_object_id:
             raise ValueError(f"sha256 mismatch: expected={expected}, actual={actual_object_id}")
 
-        tmp_path = Path(uploaded_path)
+        tmp_path = _path(uploaded_path)
         if not tmp_path.exists():
             raise ValueError(f"uploaded object missing: {uploaded_path}")
 
@@ -1970,7 +1975,7 @@ class NodeControlState(NodeRuntimeBase):
         suffix = _package_suffix(package_format)
         fd, tmp_name = tempfile.mkstemp(prefix="pycloud-upload-", suffix=suffix, dir=str(self._artifact_dir))
         os.close(fd)
-        tmp_path = Path(tmp_name)
+        tmp_path = _path(tmp_name)
         try:
             with tmp_path.open("wb") as fp:
                 for part in chunks:
@@ -2870,12 +2875,14 @@ class NodeControlState(NodeRuntimeBase):
             if pool.owner_client_id != str(owner_client_id or "").strip():
                 raise PermissionError("owner_client_id mismatch")
             self._require_pool_token(pool, pool_token)
-            if self._executor_host is not None and pool.executor_ready:
+            was_running = pool.is_running()
+            if was_running and self._executor_host is not None and pool.executor_ready:
                 stop_executor = (self._executor_host, str(pool.pool_id))
             pool.executor_ready = False
             pool.alive_workers = 0
             pool.status = "STOPPED"
-            pool.stop_reason = reason or "owner requested"
+            if was_running or not str(pool.stop_reason or "").strip():
+                pool.stop_reason = reason or "owner requested"
             pool.lease_expire_at = utc_now()
             closed_pool = pool
 
@@ -3465,11 +3472,11 @@ class NodeControlState(NodeRuntimeBase):
         object_id = unquote(str(path_parts[1] or ""))
         artifact = self.get_object_artifact(object_id)
         if getattr(artifact, "storage_backend", "file") == "segment":
-            source_path = Path(artifact.segment_path)
+            source_path = _path(artifact.segment_path)
             source_offset = max(0, int(getattr(artifact, "segment_offset", 0) or 0))
             source_length = max(0, int(getattr(artifact, "segment_length", artifact.size_bytes) or artifact.size_bytes))
         else:
-            source_path = Path(artifact.path)
+            source_path = _path(artifact.path)
             source_offset = 0
             source_length = max(0, int(getattr(artifact, "size_bytes", 0) or source_path.stat().st_size))
 

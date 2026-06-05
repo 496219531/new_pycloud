@@ -63,6 +63,13 @@ _MANAGED_GLOBALS_CACHE_LOCK = threading.Lock()
 _MANAGED_GLOBALS_CACHE: Dict[str, str] = {}
 _MANAGED_GLOBALS_APPLY_LOCKS_LOCK = threading.Lock()
 _MANAGED_GLOBALS_APPLY_LOCKS: Dict[str, threading.Lock] = {}
+_NATIVE_PATH = type(Path())
+
+
+def _path(value: Any = ".") -> Path:
+    if isinstance(value, Path):
+        return value
+    return _NATIVE_PATH(value)
 
 
 @dataclass(frozen=True)
@@ -218,9 +225,9 @@ def _package_suffix(package_format: str) -> str:
 
 
 def _safe_extract_archive_to_temp(artifact_path: str, *, package_format: str) -> Path:
-    archive_path = Path(artifact_path)
+    archive_path = _path(artifact_path)
     normalized_format = _normalize_package_format(package_format, archive_path.name)
-    out_dir = Path(tempfile.mkdtemp(prefix="pycloud-artifact-"))
+    out_dir = _path(tempfile.mkdtemp(prefix="pycloud-artifact-"))
 
     def _safe_join(member_name: str) -> Path:
         target = (out_dir / member_name).resolve()
@@ -480,7 +487,7 @@ def _temporary_working_dir(path: str):
     if not target:
         yield
         return
-    target_path = Path(target)
+    target_path = _path(target)
     target_path.mkdir(parents=True, exist_ok=True)
     previous = Path.cwd()
     os.chdir(target_path)
@@ -494,7 +501,7 @@ def _install_dependency_allowlist(requirements: Sequence[str], *, target_dir: Pa
     normalized = _normalize_dependency_allowlist(requirements)
     if not normalized:
         return
-    target_dir = Path(target_dir)
+    target_dir = _path(target_dir)
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = target_dir.with_name(f"{target_dir.name}.tmp-{uuid.uuid4().hex}")
     shutil.rmtree(staging_dir, ignore_errors=True)
@@ -546,7 +553,7 @@ def _purge_module_tree(module_name: str) -> None:
 
 
 def _iter_artifact_top_level_module_names(import_path: str) -> Tuple[str, ...]:
-    root = Path(str(import_path or "").strip())
+    root = _path(str(import_path or "").strip())
     if not root.is_dir():
         return ()
     names: list[str] = []
@@ -571,7 +578,7 @@ def _load_user_module(
     package_format: str,
     dependency_path: str = "",
 ):
-    path = Path(artifact_path)
+    path = _path(artifact_path)
     format_name = _normalize_package_format(package_format, path.name)
 
     if format_name == "py" and path.is_file() and path.suffix.lower() == ".py":
@@ -626,7 +633,7 @@ def _purge_loaded_artifact_modules(
     dependency_path: str = "",
     extra_prefixes: Sequence[str] = (),
 ) -> None:
-    format_name = _normalize_package_format(package_format, Path(artifact_path).name)
+    format_name = _normalize_package_format(package_format, _path(artifact_path).name)
     if format_name == "py":
         _purge_module_tree(_artifact_module_name(artifact_path))
     else:
@@ -635,20 +642,20 @@ def _purge_loaded_artifact_modules(
             _purge_module_tree(root_module)
         _purge_module_tree(str(entry_module or "").strip())
 
-    prefixes = [str(Path(artifact_path).resolve())]
+    prefixes = [str(_path(artifact_path).resolve())]
     if dependency_path:
-        prefixes.append(str(Path(dependency_path).resolve()))
+        prefixes.append(str(_path(dependency_path).resolve()))
     for raw_prefix in list(extra_prefixes or ()):
         normalized = str(raw_prefix or "").strip()
         if not normalized:
             continue
         with contextlib.suppress(Exception):
-            prefixes.append(str(Path(normalized).resolve()))
+            prefixes.append(str(_path(normalized).resolve()))
 
     for name, module in list(sys.modules.items()):
         module_file = getattr(module, "__file__", None)
         if module_file:
-            resolved_file = str(Path(module_file).resolve())
+            resolved_file = str(_path(module_file).resolve())
             if any(resolved_file.startswith(prefix) for prefix in prefixes):
                 sys.modules.pop(name, None)
                 continue
@@ -663,7 +670,7 @@ def _purge_loaded_artifact_modules(
         if module_paths is None:
             continue
         try:
-            resolved_paths = [str(Path(p).resolve()) for p in list(module_paths)]
+            resolved_paths = [str(_path(p).resolve()) for p in list(module_paths)]
         except Exception:
             sys.modules.pop(name, None)
             continue
@@ -1057,7 +1064,7 @@ def _apply_managed_globals_to_router(
                 }
 
         manifest_started = time.perf_counter()
-        manifest_path = _managed_globals_manifest_path(Path(normalized_scope_dir), normalized_digest)
+        manifest_path = _managed_globals_manifest_path(_path(normalized_scope_dir), normalized_digest)
         if not manifest_path.exists():
             raise RuntimeError(f"managed globals manifest missing: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
@@ -1077,7 +1084,7 @@ def _apply_managed_globals_to_router(
                 continue
             value_codec = str(item.get("codec", "json") or "json").strip().lower()
             value_path = _managed_globals_value_path(
-                Path(normalized_scope_dir),
+                _path(normalized_scope_dir),
                 value_digest=value_digest,
                 codec=value_codec,
             )
@@ -1086,7 +1093,8 @@ def _apply_managed_globals_to_router(
             key_started = time.perf_counter()
             value_json_started = time.perf_counter()
             if value_codec in set(PICKLE_SERIALIZATION_MODES):
-                serialized_value = deserialize_by_mode(value_path.read_bytes(), mode=value_codec)
+                with value_path.open("rb") as value_file:
+                    serialized_value = deserialize_by_mode(value_file.read(), mode=value_codec)
             else:
                 serialized_value = json.loads(value_path.read_text(encoding="utf-8") or "null")
             key_value_json_ms = (time.perf_counter() - value_json_started) * 1000.0

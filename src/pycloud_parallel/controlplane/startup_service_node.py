@@ -136,6 +136,8 @@ class StartupServiceNode(NodeControlState):
         if not self._local_service_id:
             return {}
         session = getattr(self, "_services", {}).get(self._local_service_id)
+        if session is None:
+            session = self._mounted_service(self._local_service_id)
         return {self._local_node_key(): session} if session is not None else {}
 
     @property

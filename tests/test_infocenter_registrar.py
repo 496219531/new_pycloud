@@ -115,6 +115,7 @@ def test_node_registrar_syncs_service_routes(tmp_path):
                 "<th>control_addr</th>",
                 "<th>healthy</th>",
                 "<th>schedulable</th>",
+                "<th>node quota</th>",
                 "<th>proc quota</th>",
                 "<th>accept deploy</th>",
                 "<th>drain</th>",
@@ -122,6 +123,10 @@ def test_node_registrar_syncs_service_routes(tmp_path):
                 "<th>pycloud</th>",
             ):
                 assert header in raw
+            assert "task 0/4" in raw
+            assert "free 4" in raw
+            assert "queue 0/32" in raw
+            assert "credit 32" in raw
             assert "<th>effective tags</th><th>managed tags</th><th>capability tags</th><th>legacy node tags</th>" in raw
             assert "avg_total_ms" in raw
             assert "avg_child_decode_ms" in raw

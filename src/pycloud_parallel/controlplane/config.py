@@ -125,6 +125,7 @@ _INT_SETTINGS: dict[str, EnvIntSetting] = {
     "NODE_MAX_WORKERS": EnvIntSetting(("PYCLOUD_NODE_MAX_WORKERS",), 64),
     "SERVICE_DEFAULT_WORKERS": EnvIntSetting(("PYCLOUD_SERVICE_DEFAULT_WORKERS",), 10),
     "SERVICE_HEARTBEAT_TIMEOUT_SEC": EnvIntSetting(("PYCLOUD_SERVICE_HEARTBEAT_TIMEOUT_SEC",), 30),
+    "TASKPOOL_HEARTBEAT_TIMEOUT_SEC": EnvIntSetting(("PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC",), 60),
 }
 
 _BOOL_SETTINGS: dict[str, EnvBoolSetting] = {
@@ -236,6 +237,7 @@ class CapacityDefaults:
     node_max_workers: int
     service_default_workers: int
     service_heartbeat_timeout_sec: int
+    taskpool_heartbeat_timeout_sec: int
 
 
 @dataclass(frozen=True)
@@ -373,8 +375,13 @@ def get_config_limit_authority() -> ConfigLimitAuthority:
             node_max_workers=int(NODE_MAX_WORKERS),
             service_default_workers=int(SERVICE_DEFAULT_WORKERS),
             service_heartbeat_timeout_sec=int(SERVICE_HEARTBEAT_TIMEOUT_SEC),
+            taskpool_heartbeat_timeout_sec=int(TASKPOOL_HEARTBEAT_TIMEOUT_SEC),
         ),
     )
+
+
+def get_taskpool_heartbeat_timeout_sec(value: int = 0) -> int:
+    return max(5, int(value or TASKPOOL_HEARTBEAT_TIMEOUT_SEC or 60))
 
 
 def get_policy_limit_defaults(policy_id: str) -> tuple[int, int, int, int]:
@@ -789,6 +796,7 @@ STABLE_CONFIG_API_EXPORTS = [
     "get_serialization_mode",
     "get_service_http_body_limit_bytes",
     "get_system_mode",
+    "get_taskpool_heartbeat_timeout_sec",
     "get_transport_bounds",
     "get_trust_mode",
     "load_config_from_env",
@@ -867,6 +875,7 @@ COMPATIBILITY_CONFIG_EXPORTS = [
     "SYSTEM_MODE",
     "SerializationMode",
     "SystemMode",
+    "TASKPOOL_HEARTBEAT_TIMEOUT_SEC",
     "TRUST_MODE",
     "TRUSTED_INTERNAL_INLINE_PAYLOAD_HARD_LIMIT_BYTES",
     "TRUSTED_INTERNAL_INLINE_PAYLOAD_THRESHOLD_BYTES",

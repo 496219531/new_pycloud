@@ -27,6 +27,14 @@ _SEGMENT_WRITER_LOCKS_LOCK = threading.Lock()
 _SEGMENT_WRITER_LOCKS: Dict[Tuple[str, int], threading.Lock] = {}
 _MANAGED_GLOBAL_BINARY_SENTINEL = "__pycloud_managed_global_binary__"
 _PICKLE_MODES = set(PICKLE_SERIALIZATION_MODES)
+_NATIVE_PATH = type(Path())
+_NATIVE_OS_NAME = os.name
+
+
+def _path(value: Any = ".") -> Path:
+    if isinstance(value, Path):
+        return value
+    return _NATIVE_PATH(value)
 
 
 def _is_transient_metadata_replace_error(exc: BaseException) -> bool:
@@ -38,8 +46,8 @@ def _is_transient_metadata_replace_error(exc: BaseException) -> bool:
 
 
 def _replace_metadata_file_with_retry(source_path: Path | str, target_path: Path | str, *, max_attempts: int = 8) -> None:
-    source = Path(source_path)
-    target = Path(target_path)
+    source = _path(source_path)
+    target = _path(target_path)
     last_exc: Optional[BaseException] = None
     for attempt in range(max(1, int(max_attempts))):
         try:
@@ -64,8 +72,22 @@ def _replace_metadata_file_with_retry(source_path: Path | str, target_path: Path
 def _managed_globals_scope_dir(base_dir: Path, *, scope_kind: str, scope_key: str) -> Path:
     import hashlib
 
-    digest = hashlib.sha1(f"{scope_kind}:{scope_key}".encode("utf-8")).hexdigest()
-    return Path(base_dir) / scope_kind / digest
+    digest = hashlib.sha1(f"{scope_kind}:{scope_key}".encode("utf-8")).hexdigest()[:20]
+    base_path = _path(base_dir)
+    candidate = base_path / scope_kind / digest
+    max_child_suffix_len = len(str(_path("manifests") / ("f" * 64 + ".json")))
+    if _NATIVE_OS_NAME != "nt" or len(str(candidate)) + max_child_suffix_len < 240:
+        return candidate
+    parts = list(base_path.parts)
+    artifact_dir: Optional[Path] = None
+    if "codes" in parts:
+        idx = parts.index("codes")
+        if idx > 0:
+            artifact_dir = _NATIVE_PATH(*parts[:idx])
+    if artifact_dir is None:
+        artifact_dir = base_path.parent
+    base_digest = hashlib.sha1(str(base_path).encode("utf-8")).hexdigest()[:12]
+    return artifact_dir / "mg" / base_digest / digest[:16]
 
 
 def _normalize_code_version(code_version: str) -> str:
@@ -100,7 +122,7 @@ def _code_content_storage_key(code_version: str) -> str:
 
 
 def _code_content_dir(base_dir: Path, *, code_version: str) -> Path:
-    return Path(base_dir) / "codes" / _code_content_storage_key(code_version)
+    return _path(base_dir) / "codes" / _code_content_storage_key(code_version)
 
 
 def _code_variant_dir(base_dir: Path, *, code_version: str) -> Path:
@@ -120,7 +142,7 @@ def _code_data_dir(base_dir: Path, *, code_version: str) -> Path:
 
 
 def _code_index_dir(base_dir: Path) -> Path:
-    return Path(base_dir) / "code_index"
+    return _path(base_dir) / "code_index"
 
 
 def _sanitize_code_index_part(value: str, *, fallback: str) -> str:
@@ -157,7 +179,7 @@ def _code_index_meta_path(base_dir: Path, *, code_version: str, entry_module: st
         entry_module=entry_module,
         entry_callable=entry_callable,
     )
-    return Path(f"{link_path}.meta.json")
+    return _path(f"{link_path}.meta.json")
 
 
 def _code_dependency_dir(base_dir: Path, *, code_version: str) -> Path:
@@ -199,7 +221,7 @@ def _code_exec_path(base_dir: Path, *, code_version: str, package_format: str) -
 
 
 def _objects_meta_dir(object_dir: Path) -> Path:
-    return Path(object_dir) / "meta"
+    return _path(object_dir) / "meta"
 
 
 def _object_meta_path(object_dir: Path, *, object_id: str) -> Path:
@@ -208,15 +230,15 @@ def _object_meta_path(object_dir: Path, *, object_id: str) -> Path:
 
 
 def _segments_dir(object_dir: Path) -> Path:
-    return Path(object_dir) / "segments"
+    return _path(object_dir) / "segments"
 
 
 def _materialized_objects_dir(object_dir: Path) -> Path:
-    return Path(object_dir) / "materialized"
+    return _path(object_dir) / "materialized"
 
 
 def _segment_writer_key(object_dir: Path) -> Tuple[str, int]:
-    return (str(Path(object_dir).resolve()), os.getpid())
+    return (str(_path(object_dir).resolve()), os.getpid())
 
 
 def _segment_writer_lock(object_dir: Path) -> threading.Lock:
@@ -230,18 +252,18 @@ def _segment_writer_lock(object_dir: Path) -> threading.Lock:
 
 
 def _segment_relpath(object_dir: Path, segment_path: Path) -> str:
-    return str(segment_path.resolve().relative_to(Path(object_dir).resolve()))
+    return _path(segment_path).resolve().relative_to(_path(object_dir).resolve()).as_posix()
 
 
 def _segment_path_from_relpath(object_dir: Path, relpath: str) -> Path:
-    return Path(object_dir).resolve() / str(relpath or "").strip()
+    return _path(object_dir).resolve() / str(relpath or "").strip()
 
 
 def _managed_globals_manifest_path(scope_dir: Path, globals_digest: str) -> Path:
     normalized = str(globals_digest or "").replace("sha256:", "").strip().lower()
     if not normalized:
         raise ValueError("globals_digest is required")
-    return Path(scope_dir) / "manifests" / f"{normalized}.json"
+    return _path(scope_dir) / "manifests" / f"{normalized}.json"
 
 
 def _managed_globals_value_path(scope_dir: Path, *, value_digest: str, codec: str = "json") -> Path:
@@ -249,11 +271,11 @@ def _managed_globals_value_path(scope_dir: Path, *, value_digest: str, codec: st
     if not normalized:
         raise ValueError("value_digest is required")
     suffix = ".bin" if str(codec or "").strip().lower() in _PICKLE_MODES else ".json"
-    return Path(scope_dir) / "values" / f"{normalized}{suffix}"
+    return _path(scope_dir) / "values" / f"{normalized}{suffix}"
 
 
 def _managed_globals_current_path(scope_dir: Path) -> Path:
-    return Path(scope_dir) / "current.json"
+    return _path(scope_dir) / "current.json"
 
 
 def _normalize_managed_global_names(names: Sequence[str]) -> Tuple[str, ...]:
@@ -295,7 +317,7 @@ def _managed_globals_binary_payload(value: Any) -> Optional[Tuple[str, bytes]]:
 def _load_managed_globals_snapshot_serialized(state: ManagedGlobalsState) -> Dict[str, Any]:
     if not state.globals_digest:
         return {}
-    scope_dir = Path(state.scope_dir)
+    scope_dir = _path(state.scope_dir)
     manifest_path = _managed_globals_manifest_path(scope_dir, state.globals_digest)
     if not manifest_path.exists():
         return {}
@@ -325,7 +347,7 @@ def _write_managed_globals_snapshot(
     *,
     values_serialized: Dict[str, Any],
 ) -> str:
-    scope_dir = Path(state.scope_dir)
+    scope_dir = _path(state.scope_dir)
     manifests_dir = scope_dir / "manifests"
     values_dir = scope_dir / "values"
     manifests_dir.mkdir(parents=True, exist_ok=True)
@@ -467,7 +489,18 @@ def _write_code_index(base_dir: Path, artifact: CodeArtifact, *, created_at: str
                 link_path.unlink()
         os.symlink(relative_target, str(link_path), target_is_directory=True)
     except (FileExistsError, NotImplementedError, OSError):
-        return
+        if link_path.exists() and not link_path.is_dir():
+            with contextlib.suppress(FileNotFoundError, OSError):
+                link_path.unlink()
+        if not link_path.exists():
+            link_path.mkdir(parents=True, exist_ok=True)
+        pointer_payload = {
+            "target": str(code_dir),
+            "relative_target": relative_target,
+            "created_as": "directory_pointer",
+        }
+        with contextlib.suppress(Exception):
+            _atomic_write_json(link_path / "target.json", pointer_payload, prefix=".target-")
 
 
 def _ensure_code_index_entry(base_dir: Path, *, code_version: str) -> bool:
@@ -560,7 +593,7 @@ def _write_managed_globals_current(scope_dir: Path, *, globals_digest: str) -> N
 
 
 def _code_artifact_exists(artifact: CodeArtifact) -> bool:
-    return bool(str(artifact.path or "").strip()) and Path(artifact.path).exists()
+    return bool(str(artifact.path or "").strip()) and _path(artifact.path).exists()
 
 
 __all__ = [

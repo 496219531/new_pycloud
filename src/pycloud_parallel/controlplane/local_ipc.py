@@ -303,6 +303,29 @@ def _make_local_pickle_payload_transport(
     )
 
 
+def _prepare_local_ipc_payload(
+    payload: Dict[str, object],
+    *,
+    meta: Dict[str, object],
+    serialization_mode: str = "",
+) -> Dict[str, object]:
+    del serialization_mode
+    policy = get_local_service_payload_policy()
+    normalized_payload = dict(_normalize_local_payload_paths(payload or {}))
+    inline_threshold = max(1, int(policy.inline_payload_threshold_bytes))
+    estimated_size = _cheap_local_payload_inline_size(normalized_payload)
+    if estimated_size is not None and estimated_size > inline_threshold:
+        return _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
+    inline_size = validate_inline_payload_size(
+        _estimate_local_inline_size(normalized_payload),
+        limit_bytes=policy.inline_payload_hard_limit_bytes,
+        context="local IPC service payload",
+    )
+    if inline_size > inline_threshold:
+        return _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
+    return normalized_payload
+
+
 def _registry_dir() -> Path:
     root = os.environ.get("PYCLOUD_LOCAL_IPC_DIR", "")
     path = Path(root).expanduser() if root else Path(tempfile.gettempdir()) / "pycloud_parallel" / "local_services"
@@ -921,7 +944,7 @@ class LocalServiceClient:
         **kwargs: object,
     ) -> Dict[str, object]:
         del service_name, serialization_mode, kwargs
-        payload_transport = _make_local_pickle_payload_transport(
+        ipc_payload = _prepare_local_ipc_payload(
             payload,
             meta=self._meta,
             serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
@@ -929,7 +952,7 @@ class LocalServiceClient:
         response = self._request(
             "call",
             method=method,
-            payload_transport=payload_transport,
+            payload=ipc_payload,
             timeout_sec=max(0.1, float(timeout_sec or self.timeout_sec)),
             serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
         )
@@ -951,7 +974,7 @@ class LocalServiceClient:
         **kwargs: object,
     ):
         del service_name, serialization_mode, kwargs
-        payload_transport = _make_local_pickle_payload_transport(
+        ipc_payload = _prepare_local_ipc_payload(
             payload,
             meta=self._meta,
             serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
@@ -959,7 +982,7 @@ class LocalServiceClient:
         request = {
             "action": "stream_call",
             "method": method,
-            "payload_transport": payload_transport,
+            "payload": ipc_payload,
             "timeout_sec": max(0.1, float(timeout_sec or self.timeout_sec)),
             "serialization_mode": LOCAL_IPC_SERIALIZATION_MODE,
         }

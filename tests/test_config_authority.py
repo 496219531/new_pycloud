@@ -45,6 +45,8 @@ def test_stable_config_api_matches_compatibility_constants() -> None:
         config.GATEWAY_MAX_UPLOAD_FILE_BYTES,
         config.GATEWAY_MAX_UPLOAD_TOTAL_BYTES,
     )
+    assert authority.capacity_defaults.taskpool_heartbeat_timeout_sec == config.TASKPOOL_HEARTBEAT_TIMEOUT_SEC
+    assert config.get_taskpool_heartbeat_timeout_sec() == config.TASKPOOL_HEARTBEAT_TIMEOUT_SEC
 
 
 def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
@@ -53,6 +55,7 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
     monkeypatch.setenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", "567890")
     monkeypatch.setenv("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", "123456")
     monkeypatch.setenv("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", "234567")
+    monkeypatch.setenv("PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC", "456")
 
     config.reload_config()
     try:
@@ -72,12 +75,16 @@ def test_recommended_config_api_tracks_reload_config(monkeypatch) -> None:
         assert object_store.gateway_max_upload_file_bytes == 123456
         assert object_store.gateway_max_upload_total_bytes == 234567
         assert config.get_gateway_upload_limits() == (123456, 234567)
+        assert config.TASKPOOL_HEARTBEAT_TIMEOUT_SEC == 456
+        assert config.get_taskpool_heartbeat_timeout_sec() == 456
+        assert config.get_taskpool_heartbeat_timeout_sec(12) == 12
     finally:
         monkeypatch.delenv("PYCLOUD_SERVICE_HTTP_BODY_MAX_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_NODE_CONTROL_HTTP_BODY_MAX_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_OBJECT_SIZE_HARD_LIMIT_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_GATEWAY_MAX_UPLOAD_FILE_BYTES", raising=False)
         monkeypatch.delenv("PYCLOUD_GATEWAY_MAX_UPLOAD_TOTAL_BYTES", raising=False)
+        monkeypatch.delenv("PYCLOUD_TASKPOOL_HEARTBEAT_TIMEOUT_SEC", raising=False)
         config.reload_config()
 
 
