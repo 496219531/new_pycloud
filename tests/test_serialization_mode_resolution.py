@@ -56,18 +56,33 @@ def test_detect_transport_mode_without_envelope_defaults_to_legacy(monkeypatch):
         config.reload_config()
 
 
-def test_validate_mode_for_context_rejects_untrusted_gateway_pickle(monkeypatch):
+def test_validate_mode_for_context_falls_back_untrusted_gateway_pickle(monkeypatch, caplog):
+    try:
+        monkeypatch.setenv("PYCLOUD_TRUST_MODE", "balanced")
+        config.reload_config()
+
+        with caplog.at_level("WARNING"):
+            assert validate_mode_for_context("pickle_stable_v1", context="gateway_public") == "structured_v1"
+            assert validate_mode_for_context("pickle_native_v1", context="gateway_public") == "structured_v1"
+
+        assert "using structured_v1 instead" in caplog.text
+
+        assert validate_mode_for_context("pickle_stable_v1", context="taskpool_session") == "pickle_stable_v1"
+        assert validate_mode_for_context("pickle_native_v1", context="taskpool_session") == "pickle_native_v1"
+    finally:
+        monkeypatch.delenv("PYCLOUD_TRUST_MODE", raising=False)
+        config.reload_config()
+
+
+def test_validate_mode_for_context_strict_rejects_untrusted_gateway_pickle(monkeypatch):
     try:
         monkeypatch.setenv("PYCLOUD_TRUST_MODE", "balanced")
         config.reload_config()
 
         with pytest.raises(ValueError, match="pickle_stable_v1"):
-            validate_mode_for_context("pickle_stable_v1", context="gateway_public")
+            validate_mode_for_context("pickle_stable_v1", context="gateway_public", strict=True)
         with pytest.raises(ValueError, match="pickle_native_v1"):
-            validate_mode_for_context("pickle_native_v1", context="gateway_public")
-
-        assert validate_mode_for_context("pickle_stable_v1", context="taskpool_session") == "pickle_stable_v1"
-        assert validate_mode_for_context("pickle_native_v1", context="taskpool_session") == "pickle_native_v1"
+            validate_mode_for_context("pickle_native_v1", context="gateway_public", strict=True)
     finally:
         monkeypatch.delenv("PYCLOUD_TRUST_MODE", raising=False)
         config.reload_config()

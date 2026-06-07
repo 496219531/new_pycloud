@@ -67,7 +67,27 @@ def test_taskpool_owner_enables_http_raw_bytes_body_for_internal_policy():
     assert effective.use_http_raw_bytes_body is True
 
 
-def test_effective_policy_rejects_gateway_pickle_when_profile_disallows_it():
+def test_effective_policy_falls_back_gateway_pickle_when_profile_disallows_it(caplog):
+    profile = get_policy_profile("pickle_internal_heavy")
+
+    with caplog.at_level("WARNING"):
+        stable = resolve_effective_policy(
+            profile,
+            requested_mode="pickle_stable_v1",
+            context="gateway_public",
+        )
+        native = resolve_effective_policy(
+            profile,
+            requested_mode="pickle_native_v1",
+            context="gateway_public",
+        )
+
+    assert stable.resolved_mode == "structured_v1"
+    assert native.resolved_mode == "structured_v1"
+    assert "using fallback='structured_v1'" in caplog.text
+
+
+def test_effective_policy_can_strictly_reject_gateway_pickle():
     profile = get_policy_profile("pickle_internal_heavy")
 
     with pytest.raises(ValueError, match="requested_mode"):
@@ -75,12 +95,14 @@ def test_effective_policy_rejects_gateway_pickle_when_profile_disallows_it():
             profile,
             requested_mode="pickle_stable_v1",
             context="gateway_public",
+            strict=True,
         )
     with pytest.raises(ValueError, match="requested_mode"):
         resolve_effective_policy(
             profile,
             requested_mode="pickle_native_v1",
             context="gateway_public",
+            strict=True,
         )
 
 

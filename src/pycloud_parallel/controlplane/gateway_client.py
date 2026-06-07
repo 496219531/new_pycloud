@@ -56,15 +56,14 @@ def _resolve_gateway_service_policy(
     effective_policy: Optional[EffectivePolicy] = None,
 ) -> Tuple[str, Optional[EffectivePolicy]]:
     mode = str(serialization_mode or "").strip()
-    if effective_policy is not None or mode:
-        return mode, effective_policy
-    if str(service_name or "").strip() != "job-orchestrator":
-        return mode, effective_policy
-    default_mode = get_default_mode_for_binding(_JOBQUEUE_BINDING_ID)
+    if effective_policy is not None:
+        return str(effective_policy.resolved_mode or mode).strip() or mode, effective_policy
+    binding_id = _JOBQUEUE_BINDING_ID if str(service_name or "").strip() == "job-orchestrator" else "gateway_public"
+    default_mode = get_default_mode_for_binding(binding_id)
     policy = resolve_effective_policy(
-        get_policy_profile(get_default_policy_id_for_binding(_JOBQUEUE_BINDING_ID)),
-        requested_mode=default_mode,
-        context="jobqueue_session",
+        get_policy_profile(get_default_policy_id_for_binding(binding_id)),
+        requested_mode=mode or default_mode,
+        context="jobqueue_session" if binding_id == _JOBQUEUE_BINDING_ID else "gateway_public",
     )
     return str(policy.resolved_mode or default_mode).strip() or default_mode, policy
 

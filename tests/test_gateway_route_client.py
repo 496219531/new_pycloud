@@ -77,6 +77,32 @@ def test_gateway_service_client_rejects_oversized_inline_payload_before_http():
     assert mocked.call_args.kwargs["path"] == "/svc/svc-demo/status"
 
 
+def test_gateway_service_client_falls_back_pickle_request_to_structured(caplog):
+    from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
+
+    client = GatewayServiceClient("127.0.0.1:50051", timeout_sec=5.0)
+    with (
+        patch.object(client, "get_status", return_value={"ok": True, "route_count": 1, "routes": []}),
+        patch(
+            "pycloud_parallel.controlplane.gateway_client.client_mod._http_json_request",
+            return_value={"ok": True, "data": {"y": 49}},
+        ) as mocked_http,
+        caplog.at_level("WARNING"),
+    ):
+        result = client.call(
+            service_name="svc-demo",
+            method="run",
+            payload={"x": 7},
+            timeout_sec=5.0,
+            serialization_mode="pickle_stable_v1",
+        )
+
+    assert result == {"ok": True, "data": {"y": 49}}
+    assert "using fallback='structured_v1'" in caplog.text
+    payload = mocked_http.call_args.kwargs["payload"]
+    assert payload["__pycloud_transport__"]["codec"] == "structured_v1"
+
+
 def test_gateway_service_client_does_not_use_route_aware_staging_when_status_succeeds(monkeypatch):
     from pycloud_parallel.controlplane.gateway_client import GatewayServiceClient
 

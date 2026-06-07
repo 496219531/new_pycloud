@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Centralized serialization-mode authority helpers."""
 
+import logging
 from typing import Final
 
 from pycloud_parallel.controlplane.config import get_serialization_mode, get_trust_mode
@@ -24,6 +25,7 @@ _PICKLE_RESTRICTED_CONTEXTS: Final[set[str]] = {
     "gateway_public",
     "untrusted_transport",
 }
+logger = logging.getLogger(__name__)
 
 
 def normalize_serialization_mode(value: str) -> str:
@@ -42,11 +44,19 @@ def validate_mode_for_context(
     *,
     context: str = "",
     trust_mode: str = "",
+    strict: bool = False,
 ) -> str:
     normalized = normalize_serialization_mode(mode) or "legacy_v1"
     normalized_context = str(context or "").strip().lower()
     effective_trust_mode = str(trust_mode or get_trust_mode() or "trusted").strip().lower() or "trusted"
     if normalized in _PICKLE_SET and normalized_context in _PICKLE_RESTRICTED_CONTEXTS:
+        message = (
+            f"{normalized} is not allowed for {normalized_context or 'restricted'} transport; "
+            "using structured_v1 instead"
+        )
+        if not strict:
+            logger.warning(message)
+            return "structured_v1"
         raise ValueError(
             f"{normalized} is not allowed for {normalized_context or 'restricted'} transport; "
             "use structured_v1 or legacy_v1 instead"
@@ -64,11 +74,24 @@ def resolve_effective_serialization_mode(
     trust_mode: str = "",
     allowed_modes: tuple[str, ...] | list[str] | None = None,
     frozen_mode: str = "",
+    strict: bool = False,
 ) -> str:
     normalized_frozen_mode = normalize_serialization_mode(frozen_mode)
     if normalized_frozen_mode:
         normalized_request_mode = normalize_serialization_mode(request_mode)
         if normalized_request_mode and normalized_request_mode != normalized_frozen_mode:
+            if not strict:
+                logger.warning(
+                    "serialization_mode is frozen for this session: requested=%r, resolved=%r; using resolved mode",
+                    normalized_request_mode,
+                    normalized_frozen_mode,
+                )
+                return validate_mode_for_context(
+                    normalized_frozen_mode,
+                    context=context,
+                    trust_mode=trust_mode,
+                    strict=strict,
+                )
             raise ValueError(
                 f"serialization_mode is frozen for this session: requested={normalized_request_mode!r}, "
                 f"resolved={normalized_frozen_mode!r}"
@@ -77,6 +100,7 @@ def resolve_effective_serialization_mode(
             normalized_frozen_mode,
             context=context,
             trust_mode=trust_mode,
+            strict=strict,
         )
 
     normalized_allowed_modes = {
@@ -94,6 +118,20 @@ def resolve_effective_serialization_mode(
         normalized = normalize_serialization_mode(candidate)
         if normalized_allowed_modes and normalized and normalized not in normalized_allowed_modes:
             if candidate == request_mode and normalize_serialization_mode(request_mode):
+                if not strict:
+                    fallback = "structured_v1" if "structured_v1" in normalized_allowed_modes else sorted(normalized_allowed_modes)[0]
+                    logger.warning(
+                        "serialization_mode=%r is not allowed; allowed modes: %s; using fallback=%r",
+                        normalized,
+                        sorted(normalized_allowed_modes),
+                        fallback,
+                    )
+                    return validate_mode_for_context(
+                        fallback,
+                        context=context,
+                        trust_mode=trust_mode,
+                        strict=strict,
+                    )
                 raise ValueError(
                     f"serialization_mode={normalized!r} is not allowed; allowed modes: {sorted(normalized_allowed_modes)}"
                 )
@@ -103,6 +141,7 @@ def resolve_effective_serialization_mode(
                 normalized,
                 context=context,
                 trust_mode=trust_mode,
+                strict=strict,
             )
     return "legacy_v1"
 
@@ -132,6 +171,7 @@ def resolve_received_transport_mode(
         resolved,
         context=context,
         trust_mode=trust_mode,
+        strict=True,
     )
 
 

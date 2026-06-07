@@ -141,11 +141,14 @@ def test_shared_pool_soft_switch_logs_reason_before_rebuild(caplog):
     assert "shared pool soft switch failed" in caplog.text
 
 
-def test_invalid_mode_rejected_against_fixed_policy():
+def test_invalid_mode_falls_back_against_fixed_policy(caplog):
     manager = JobQueueManager(taskpool_policy_id="default_safe")
 
-    with pytest.raises(ValueError, match="requested_mode"):
-        manager._resolve_requested_task_mode({"task_serialization_mode": "pickle_stable_v1"})
+    with caplog.at_level("WARNING"):
+        mode = manager._resolve_requested_task_mode({"task_serialization_mode": "pickle_stable_v1"})
+
+    assert mode == "structured_v1"
+    assert "using fallback='structured_v1'" in caplog.text
 
 
 def test_shared_pool_idle_expiry_detected():

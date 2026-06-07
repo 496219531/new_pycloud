@@ -3,6 +3,7 @@ from __future__ import annotations
 """Effective-policy resolution from centralized profiles and session context."""
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Optional, Tuple
 
 from pycloud_parallel.controlplane.config import (
@@ -16,6 +17,7 @@ from pycloud_parallel.controlplane.policy_profile import PolicyProfile
 from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES, normalize_serialization_mode
 
 _PICKLE_MODES = set(PICKLE_SERIALIZATION_MODES)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,7 @@ class EffectivePolicy:
     use_raw_bytes_payload: bool
     use_http_raw_bytes_body: bool
     allow_pickle_stable: bool
+    fallback_warning: str = ""
 
     def __post_init__(self) -> None:
         normalized_allowed = tuple(normalize_serialization_mode(item) for item in self.allowed_modes if str(item or "").strip())
@@ -58,10 +61,18 @@ class EffectivePolicy:
         object.__setattr__(self, "use_raw_bytes_payload", bool(self.use_raw_bytes_payload))
         object.__setattr__(self, "use_http_raw_bytes_body", bool(self.use_http_raw_bytes_body))
         object.__setattr__(self, "allow_pickle_stable", bool(self.allow_pickle_stable))
+        object.__setattr__(self, "fallback_warning", str(self.fallback_warning or "").strip())
 
-    def assert_frozen_mode(self, request_mode: str = "") -> str:
+    def assert_frozen_mode(self, request_mode: str = "", *, strict: bool = False) -> str:
         normalized_request = normalize_serialization_mode(request_mode)
         if normalized_request and normalized_request != self.resolved_mode:
+            message = (
+                f"serialization_mode is frozen for this session: requested={normalized_request!r}, "
+                f"resolved={self.resolved_mode!r}; using resolved mode"
+            )
+            if not strict:
+                logger.warning(message)
+                return self.resolved_mode
             raise ValueError(
                 f"serialization_mode is frozen for this session: requested={normalized_request!r}, "
                 f"resolved={self.resolved_mode!r}"
@@ -85,6 +96,8 @@ def resolve_effective_policy(
     profile: PolicyProfile,
     requested_mode: str = "",
     context: str = "",
+    *,
+    strict: bool = False,
 ) -> EffectivePolicy:
     allowed_modes = _allowed_modes_for_context(profile, context=context)
     if not allowed_modes:
@@ -93,13 +106,24 @@ def resolve_effective_policy(
         )
 
     normalized_request_mode = normalize_serialization_mode(requested_mode)
+    fallback_warning = ""
     if normalized_request_mode:
         if normalized_request_mode not in allowed_modes:
-            raise ValueError(
+            fallback_mode = "structured_v1" if "structured_v1" in allowed_modes else allowed_modes[0]
+            fallback_warning = (
                 f"requested_mode={normalized_request_mode!r} is not allowed by profile={profile.policy_id!r} "
-                f"for context={context!r}; allowed={list(allowed_modes)}"
+                f"for context={context!r}; allowed={list(allowed_modes)}; using fallback={fallback_mode!r}"
             )
-        resolved_mode = normalized_request_mode
+            if not strict:
+                logger.warning(fallback_warning)
+                resolved_mode = fallback_mode
+            else:
+                raise ValueError(
+                    f"requested_mode={normalized_request_mode!r} is not allowed by profile={profile.policy_id!r} "
+                    f"for context={context!r}; allowed={list(allowed_modes)}"
+                )
+        else:
+            resolved_mode = normalized_request_mode
     elif profile.default_mode in allowed_modes:
         resolved_mode = profile.default_mode
     else:
@@ -132,6 +156,7 @@ def resolve_effective_policy(
         use_raw_bytes_payload=use_raw_bytes_payload,
         use_http_raw_bytes_body=use_http_raw_bytes_body,
         allow_pickle_stable=allow_pickle_stable,
+        fallback_warning=fallback_warning,
     )
 
 
