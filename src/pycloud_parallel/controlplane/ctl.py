@@ -198,6 +198,10 @@ def _log(label: str, message: str) -> None:
     print(f"[{label}] {time.strftime('%H:%M:%S')} {message}")
 
 
+def _text_run_kwargs() -> Dict[str, object]:
+    return {"text": True, "encoding": "utf-8", "errors": "replace"}
+
+
 def _is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -205,8 +209,8 @@ def _is_pid_running(pid: int) -> bool:
         result = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}"],
             capture_output=True,
-            text=True,
             check=False,
+            **_text_run_kwargs(),
         )
         return str(pid) in (result.stdout or "")
     try:
@@ -263,11 +267,65 @@ def _terminate_pid(pid: int, *, force: bool = False) -> None:
         cmd = ["taskkill", "/PID", str(pid), "/T"]
         if force:
             cmd.insert(1, "/F")
-        subprocess.run(cmd, check=False, capture_output=True, text=True)
+        subprocess.run(cmd, check=False, capture_output=True, **_text_run_kwargs())
         return
     sig = signal.SIGKILL if force else signal.SIGTERM
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, sig)
+
+
+def _windows_descendant_pids(pid: int) -> List[int]:
+    if os.name != "nt" or pid <= 0:
+        return []
+    result = _run_windows_shell(
+        "Get-CimInstance Win32_Process | "
+        "ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }"
+    )
+    if result is None or int(getattr(result, "returncode", 1) or 1) != 0:
+        return []
+    children_by_parent: Dict[int, List[int]] = {}
+    for raw in str(getattr(result, "stdout", "") or "").splitlines():
+        text = raw.strip()
+        if not text or "," not in text:
+            continue
+        child_text, parent_text = text.split(",", 1)
+        try:
+            child_pid = int(child_text.strip())
+            parent_pid = int(parent_text.strip())
+        except (TypeError, ValueError):
+            continue
+        if child_pid <= 0 or parent_pid <= 0:
+            continue
+        children_by_parent.setdefault(parent_pid, []).append(child_pid)
+    descendants: List[int] = []
+    stack = list(children_by_parent.get(int(pid), ()))
+    seen: set[int] = set()
+    current_pid = os.getpid()
+    while stack:
+        child_pid = stack.pop()
+        if child_pid <= 0 or child_pid in seen or child_pid == current_pid:
+            continue
+        seen.add(child_pid)
+        descendants.append(child_pid)
+        stack.extend(children_by_parent.get(child_pid, ()))
+    return descendants
+
+
+def _terminate_windows_pid_list(pids: Sequence[int], *, force: bool = True) -> None:
+    if os.name != "nt":
+        return
+    current_pid = os.getpid()
+    for raw_pid in pids:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or pid == current_pid or not _is_pid_running(pid):
+            continue
+        cmd = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            cmd.insert(1, "/F")
+        subprocess.run(cmd, check=False, capture_output=True, **_text_run_kwargs())
 
 
 def _stop_named_process(root: Path, name: str) -> None:
@@ -277,6 +335,7 @@ def _stop_named_process(root: Path, name: str) -> None:
         _remove_pid(pid_path)
         return
     _log("INFO", f"Stopping {name} (PID: {pid})...")
+    descendant_pids = _windows_descendant_pids(pid) if os.name == "nt" else []
     _terminate_pid(pid, force=False)
     deadline = time.time() + 3.0
     while time.time() < deadline:
@@ -285,6 +344,8 @@ def _stop_named_process(root: Path, name: str) -> None:
         time.sleep(0.2)
     if _is_pid_running(pid):
         _terminate_pid(pid, force=True)
+    if descendant_pids:
+        _terminate_windows_pid_list(reversed(descendant_pids), force=True)
     _remove_pid(pid_path)
 
 
@@ -377,8 +438,8 @@ def _listener_pids_for_port(port: int) -> List[int]:
         result = subprocess.run(
             ["netstat", "-ano", "-p", "tcp"],
             capture_output=True,
-            text=True,
             check=False,
+            **_text_run_kwargs(),
         )
         pids: List[int] = []
         for raw in (result.stdout or "").splitlines():
@@ -406,8 +467,8 @@ def _listener_pids_for_port(port: int) -> List[int]:
     result = subprocess.run(
         ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
         capture_output=True,
-        text=True,
         check=False,
+        **_text_run_kwargs(),
     )
     pids = []
     for raw in (result.stdout or "").splitlines():
@@ -461,8 +522,8 @@ def _run_windows_shell(command: str) -> subprocess.CompletedProcess[str] | None:
             return subprocess.run(
                 [executable, "-NoProfile", "-Command", shell_command],
                 capture_output=True,
-                text=True,
                 check=False,
+                **_text_run_kwargs(),
             )
         except FileNotFoundError:
             continue
@@ -483,8 +544,8 @@ def _command_for_pid(pid: int) -> str:
             tasklist_result = subprocess.run(
                 ["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {int(pid)}"],
                 capture_output=True,
-                text=True,
                 check=False,
+                **_text_run_kwargs(),
             )
         except FileNotFoundError:
             return ""
@@ -492,8 +553,8 @@ def _command_for_pid(pid: int) -> str:
     result = subprocess.run(
         ["ps", "-p", str(int(pid)), "-o", "command="],
         capture_output=True,
-        text=True,
         check=False,
+        **_text_run_kwargs(),
     )
     return str(result.stdout or "").strip()
 
@@ -610,8 +671,8 @@ def _inspect_machine_processes() -> List[Dict[str, object]]:
     result = subprocess.run(
         ["ps", "-ax", "-o", "pid=", "-o", "command="],
         capture_output=True,
-        text=True,
         check=False,
+        **_text_run_kwargs(),
     )
     for raw in (result.stdout or "").splitlines():
         line = raw.strip()
@@ -1024,7 +1085,7 @@ def _spawn_server(
             command,
             cwd=str(root),
             env=env,
-            close_fds=False,
+            close_fds=True,
             creationflags=creationflags,
         )
     else:
@@ -1861,7 +1922,7 @@ def _cmd_restart(args: argparse.Namespace) -> int:
 
 
 def _cmd_dev_restart(args: argparse.Namespace) -> int:
-    stop_code = _cmd_dev_stop(args)
+    stop_code = _cmd_stopall(args)
     if stop_code != 0:
         return stop_code
     time.sleep(2.0)

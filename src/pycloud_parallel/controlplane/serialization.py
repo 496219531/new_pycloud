@@ -714,10 +714,11 @@ def serialize_inline_payload(
     mode: str = "",
 ) -> tuple[dict, struct_pb2.Struct, int]:
     normalized_data = {} if data is None else data
+    inline_data = _normalize_inline_struct_scalars(normalized_data)
     transport_value = (
-        data
-        if (isinstance(data, dict) and TRANSPORT_ENVELOPE_SENTINEL in data)
-        else encode_transport_value(normalized_data, mode=mode, context=context)
+        inline_data
+        if (isinstance(inline_data, dict) and TRANSPORT_ENVELOPE_SENTINEL in inline_data)
+        else encode_transport_value(inline_data, mode=mode, context=context)
     )
     serialized = serialize_arrow_compatible(transport_value)
     out = struct_pb2.Struct()
@@ -730,6 +731,28 @@ def serialize_inline_payload(
         summary=summarize_payload_flow_value(normalized_data),
     )
     return serialized, out, size_bytes
+
+
+def _normalize_inline_struct_scalars(value: Any) -> Any:
+    """Downgrade common Python date/time scalars for protobuf Struct lanes."""
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return str(value)
+    try:
+        import pandas as pd
+
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, pd.Timedelta):
+            return str(value)
+    except ImportError:
+        pass
+    if isinstance(value, dict):
+        return {key: _normalize_inline_struct_scalars(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_inline_struct_scalars(item) for item in value]
+    return value
 
 
 def serialize_arrow_compatible(obj: Any) -> Any:

@@ -517,7 +517,7 @@ def test_terminate_pid_on_windows_kills_process_tree(monkeypatch):
     monkeypatch.setattr(
         ctl.subprocess,
         "run",
-        lambda cmd, check=False, capture_output=True, text=True: calls.append(list(cmd)) or SimpleNamespace(stdout=""),
+        lambda cmd, check=False, capture_output=True, **_kwargs: calls.append(list(cmd)) or SimpleNamespace(stdout=""),
     )
 
     ctl._terminate_pid(123, force=False)
@@ -527,6 +527,39 @@ def test_terminate_pid_on_windows_kills_process_tree(monkeypatch):
         ["taskkill", "/PID", "123", "/T"],
         ["taskkill", "/F", "/PID", "456", "/T"],
     ]
+
+
+def test_stop_named_process_on_windows_force_kills_descendant_snapshot(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+    pid_file = tmp_path / "node-1.pid"
+    pid_file.write_text("123\n", encoding="utf-8")
+
+    monkeypatch.setattr(ctl.os, "name", "nt", raising=False)
+    monkeypatch.setattr(ctl, "_pid_file", lambda _root, name: tmp_path / f"{name}.pid")
+    monkeypatch.setattr(ctl, "_windows_descendant_pids", lambda pid: [456, 789] if pid == 123 else [])
+    running_checks: dict[int, int] = {}
+
+    def fake_is_pid_running(pid):
+        running_checks[pid] = running_checks.get(pid, 0) + 1
+        if pid == 123:
+            return running_checks[pid] == 1
+        return pid in {456, 789}
+
+    monkeypatch.setattr(ctl, "_is_pid_running", fake_is_pid_running)
+    monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
+    monkeypatch.setattr(ctl, "_log", lambda *_args: None)
+    monkeypatch.setattr(
+        ctl.subprocess,
+        "run",
+        lambda cmd, check=False, capture_output=True, **_kwargs: calls.append(list(cmd)) or SimpleNamespace(stdout=""),
+    )
+
+    ctl._stop_named_process(tmp_path, "node-1")
+
+    assert ["taskkill", "/PID", "123", "/T"] in calls
+    assert ["taskkill", "/F", "/PID", "789", "/T"] in calls
+    assert ["taskkill", "/F", "/PID", "456", "/T"] in calls
+    assert not pid_file.exists()
 
 
 def test_ctl_parser_accepts_env_overrides_for_start_commands():
@@ -2427,7 +2460,7 @@ def test_spawn_server_uses_new_console_on_windows(tmp_path, monkeypatch):
     assert pid == 23456
     assert captured["stdout"] is None
     assert captured["stderr"] is None
-    assert captured["close_fds"] is False
+    assert captured["close_fds"] is True
     assert captured["creationflags"] == 16
 
 

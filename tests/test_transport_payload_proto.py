@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -369,6 +370,31 @@ def test_service_pickle_struct_request_keeps_struct_response_lane():
         mode="pickle_stable_v1",
         context="service_result",
     ) == {"value": 7}
+
+
+def test_inline_payload_converts_date_time_scalars_to_strings():
+    pd = pytest.importorskip("pandas")
+
+    _serialized, payload_struct, _size = serialize_inline_payload(
+        {
+            "trade_date": date(2024, 1, 2),
+            "asof": datetime(2024, 1, 2, 9, 30),
+            "nested": [pd.Timestamp("2024-01-03 10:15:00")],
+        },
+        context="task pool payload",
+        mode="structured_v1",
+    )
+
+    assert decode_payload_from_transport(
+        struct_to_python(payload_struct),
+        policy=get_payload_policy("task_submit"),
+        mode="structured_v1",
+        context="task pool payload",
+    ) == {
+        "trade_date": "2024-01-02",
+        "asof": "2024-01-02T09:30:00",
+        "nested": ["2024-01-03T10:15:00"],
+    }
 
 
 def test_task_result_can_follow_struct_lane_even_for_pickle_mode():

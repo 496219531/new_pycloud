@@ -890,8 +890,6 @@ def _normalize_local_invoke_payload(payload: Any) -> Any:
         if not other_keys:
             args = payload.get("args", [])
             kwargs = payload.get("kwargs", {})
-            _validate_arrow_compatible(args)
-            _validate_arrow_compatible(kwargs)
             args = convert_dict_to_arrow(args)
             kwargs = convert_dict_to_arrow(kwargs)
             if not isinstance(args, list):

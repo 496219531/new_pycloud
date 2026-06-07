@@ -22,6 +22,8 @@ import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 import uuid
 
+from google.protobuf import struct_pb2
+
 from pycloud_parallel.controlplane.artifact import (
     _default_entry_module_for_module,
     _normalize_artifact_input,
@@ -580,6 +582,8 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
         self._lock = threading.Condition()
         self._results: "deque[pb2.TaskResult]" = deque()
         self._futures = {}
+        self._direct_payloads: Dict[str, object] = {}
+        self._direct_results: Dict[str, object] = {}
         self._closed = False
         self._object_root = Path(tempfile.mkdtemp(prefix="pycloud-local-taskpool-"))
         self.artifact_dir = self._object_root
@@ -591,6 +595,13 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
         )
         if initial_globals:
             self._apply_globals(dict(initial_globals or {}))
+
+    def put_direct_payload(self, task_id: str, payload: object) -> None:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            return
+        with self._lock:
+            self._direct_payloads[normalized] = payload
 
     @property
     def _state(self):
@@ -740,8 +751,16 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
         task_id = str(item.task_id or "").strip()
         started_at = utc_now()
         item_uses_transport_payload = False
+        item_uses_direct_payload = False
         try:
-            if item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
+            with self._lock:
+                has_direct_payload = task_id in self._direct_payloads
+                direct_payload = self._direct_payloads.pop(task_id, None) if has_direct_payload else None
+            if has_direct_payload:
+                item_uses_direct_payload = True
+                item_serialization_mode = LOCAL_IPC_SERIALIZATION_MODE
+                payload = direct_payload
+            elif item.HasField("transport_payload") and str(item.transport_payload.codec or "").strip():
                 from pycloud_parallel.controlplane.serialization import decode_transport_payload_bytes
 
                 item_uses_transport_payload = True
@@ -785,7 +804,11 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
                 "finished_at": dt_to_ts(utc_now()),
                 "error": pb2.TaskError(type=err_type, message=err_message),
             }
-            if item_uses_transport_payload:
+            if item_uses_direct_payload:
+                with self._lock:
+                    self._direct_results[task_id] = {} if result is None else result
+                result_kwargs["result"] = struct_pb2.Struct()
+            elif item_uses_transport_payload:
                 result_kwargs["transport_result"] = encode_transport_payload_bytes(
                     {} if result is None else result,
                     mode=item_serialization_mode,
@@ -934,6 +957,10 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
             raise RuntimeError("invalid task pool token")
 
     def fetch_result_data(self, task_result: pb2.TaskResult, *, target_path: str = ""):
+        task_id = str(task_result.task_id or "").strip()
+        with self._lock:
+            if task_id in self._direct_results:
+                return self._direct_results.pop(task_id)
         if target_path:
             raise ValueError("local task pool fetch_result_data does not support target_path")
         if task_result.HasField("transport_result") and str(task_result.transport_result.codec or "").strip():
@@ -1511,6 +1538,18 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         priority: int = 1,
         serialization_mode: str = "",
     ) -> pb2.TaskSubmitItem:
+        pool_client = self._pools[node_id]._client  # noqa: SLF001
+        if isinstance(pool_client, _DirectLocalTaskPoolNodeClient):
+            task_id = self._next_task_id()
+            prefix = str(task_id_prefix or f"{self.job_id}-task").strip()
+            if prefix:
+                task_id = f"{prefix}-{task_id.rsplit('-', 1)[-1]}"
+            pool_client.put_direct_payload(task_id, dict(payload or {}))
+            return pb2.TaskSubmitItem(
+                task_id=task_id,
+                timeout_hint_sec=max(0, int(timeout_hint_sec)),
+                priority=max(1, int(priority)),
+            )
         if self._is_local_session():
             return self._build_task_submit_item(
                 node_id=node_id,
@@ -1518,8 +1557,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 task_id_prefix=task_id_prefix,
                 timeout_hint_sec=timeout_hint_sec,
                 priority=priority,
-                serialization_mode="legacy_v1",
-                use_transport_payload=False,
+                serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
+                use_transport_payload=True,
             )
         return self._build_task_submit_item(
             node_id=node_id,

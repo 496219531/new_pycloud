@@ -3,6 +3,7 @@ from __future__ import annotations
 """Execution-focused tests for the V1 TaskPool implementation."""
 
 import asyncio
+from datetime import date, datetime
 import importlib
 import io
 import logging
@@ -172,6 +173,65 @@ def test_task_pool_open_local_callable_defaults_to_direct_no_package(monkeypatch
         worker_count=1,
     ) as pool:
         assert pool.collect_items([{"value": 6}], timeout_sec=10.0)[0].result == {"value": 8}
+
+
+def test_task_pool_open_local_callable_preserves_dict_int_scalar(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    def run(inner_code=None, **_kwargs):
+        return {"value": inner_code, "type": type(inner_code).__name__}
+
+    monkeypatch.setattr(
+        "pycloud_parallel.execution.task_pool._prepare_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct callable must not package")),
+    )
+
+    with TaskPool.open(
+        target="local",
+        source=run,
+        worker_count=1,
+    ) as pool:
+        result = pool.collect_items([{"inner_code": 83996}], timeout_sec=10.0)[0].result
+        assert result == {"value": 83996, "type": "int"}
+
+
+def test_task_pool_open_local_callable_accepts_date_time_args_kwargs(monkeypatch) -> None:
+    pd = pytest.importorskip("pandas")
+    from pycloud_parallel import TaskPool
+
+    def run(day, *, asof=None, timestamp=None):
+        return {
+            "day_type": type(day).__name__,
+            "day": day.isoformat(),
+            "asof_type": type(asof).__name__,
+            "asof": asof.isoformat(),
+            "timestamp_type": type(timestamp).__name__,
+            "timestamp": timestamp.isoformat(),
+        }
+
+    monkeypatch.setattr(
+        "pycloud_parallel.execution.task_pool._prepare_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local direct callable must not package")),
+    )
+
+    with TaskPool.open(
+        target="local",
+        source=run,
+        worker_count=1,
+    ) as pool:
+        result = pool.run.sync(
+            date(2024, 1, 2),
+            asof=datetime(2024, 1, 2, 9, 30),
+            timestamp=pd.Timestamp("2024-01-03 10:15:00"),
+        )
+        assert result == {
+            "day_type": "date",
+            "day": "2024-01-02",
+            "asof_type": "datetime",
+            "asof": "2024-01-02T09:30:00",
+            "timestamp_type": "Timestamp",
+            "timestamp": "2024-01-03T10:15:00",
+        }
 
 
 def test_task_pool_open_local_supports_unordered_wrappers(tmp_path) -> None:
