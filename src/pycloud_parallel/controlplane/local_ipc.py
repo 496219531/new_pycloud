@@ -27,7 +27,6 @@ from pycloud_parallel.controlplane.node.results import (
 from pycloud_parallel.controlplane.payload_transport import estimate_payload_inline_size, prepare_outbound_payload
 from pycloud_parallel.controlplane.serialization import (
     LOCAL_IPC_SERIALIZATION_MODE,
-    make_validated_inline_transport_carrier,
     validate_inline_payload_size,
 )
 
@@ -266,40 +265,6 @@ def _prepare_local_payload(payload: Dict[str, object], *, meta: Dict[str, object
         ),
         estimate_inline_size=_estimate_local_inline_size,
         policy=get_local_service_payload_policy(),
-    )
-
-
-def _make_local_pickle_payload_transport(
-    payload: Dict[str, object],
-    *,
-    meta: Dict[str, object],
-    serialization_mode: str = "",
-) -> Dict[str, object]:
-    del serialization_mode
-    policy = get_local_service_payload_policy()
-    normalized_payload = dict(_normalize_local_payload_paths(payload or {}))
-    inline_threshold = max(1, int(policy.inline_payload_threshold_bytes))
-    estimated_size = _cheap_local_payload_inline_size(normalized_payload)
-    raw_payload: bytes
-    if estimated_size is not None and estimated_size > inline_threshold:
-        prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
-        raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        raw_payload = pickle.dumps(normalized_payload, protocol=pickle.HIGHEST_PROTOCOL)
-        if len(raw_payload) > inline_threshold:
-            prepared_payload = _prepare_local_payload(payload, meta=meta, serialization_mode=LOCAL_IPC_SERIALIZATION_MODE)
-            raw_payload = pickle.dumps(prepared_payload, protocol=pickle.HIGHEST_PROTOCOL)
-    size = validate_inline_payload_size(
-        len(raw_payload),
-        limit_bytes=policy.inline_payload_hard_limit_bytes,
-        context="local IPC service payload",
-    )
-    return make_validated_inline_transport_carrier(
-        codec=LOCAL_IPC_SERIALIZATION_MODE,
-        payload=raw_payload,
-        content_size=size,
-        payload_mode="service_call",
-        context="service_owner",
     )
 
 

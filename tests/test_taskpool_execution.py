@@ -2823,28 +2823,15 @@ def test_native_task_pool_session_aunordered_can_return_execution_items() -> Non
     assert asyncio.run(_collect()) == [item]
 
 
-def test_native_task_pool_session_imap_unordered_rejects_non_mapping_payloads() -> None:
-    from pycloud_parallel import TaskPool
+def test_indexed_payload_buffer_wraps_non_mapping_payloads(caplog) -> None:
+    from pycloud_parallel.execution.task_pool import _IndexedPayloadBuffer
 
-    fake_pool = SimpleNamespace(
-        owner_client_id="owner",
-        code_version="sha256:test",
-        heartbeat_timeout_sec=30,
-        worker_count=1,
-        close=lambda reason="": None,
-        _client=SimpleNamespace(close=lambda: None),
-    )
-    session = TaskPool(
-        pools={"node-1": fake_pool},
-        nodes={"node-1": SimpleNamespace(node_id="node-1", task_pool_worker_available=1)},
-        task_method="run",
-        job_id="job-invalid-payload",
-    )
-    try:
-        with pytest.raises(TypeError, match="payloads must yield dict items"):
-            list(session.imap_unordered([None], max_in_flight=1, timeout_sec=0.1))
-    finally:
-        session.close()
+    buffer = _IndexedPayloadBuffer([None, {"x": 1}])
+
+    with caplog.at_level("WARNING"):
+        assert buffer.next() == (0, {"value": None})
+    assert buffer.next() == (1, {"x": 1})
+    assert "wrapping it as {'value': item}" in caplog.text
 
 
 def test_native_task_pool_session_submit_payloads_keeps_round_robin_without_polling() -> None:

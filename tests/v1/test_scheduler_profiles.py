@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from pycloud_parallel.execution.scheduler import (
     JOBQUEUE_DEFAULT,
     SERVICE_DEFAULT,
@@ -9,6 +11,7 @@ from pycloud_parallel.execution.scheduler import (
     SchedulerState,
     filter_candidates,
     resolve_taskpool_strategy,
+    resolve_service_strategy,
     score_candidate,
     select_one_candidate,
 )
@@ -130,3 +133,40 @@ def test_resolve_taskpool_strategy_accepts_throughput_profile():
 
     default_profile = resolve_taskpool_strategy("taskpool_default")
     assert default_profile == TASKPOOL_DEFAULT
+
+
+def test_unknown_strategies_fallback_to_defaults(caplog):
+    with caplog.at_level("WARNING"):
+        service_name, service_profile = resolve_service_strategy("not-a-strategy")
+        taskpool_profile = resolve_taskpool_strategy("not-a-strategy")
+
+    assert service_name == "predicted_busy"
+    assert service_profile == SERVICE_DEFAULT
+    assert taskpool_profile == TASKPOOL_DEFAULT
+    assert "using fallback='predicted_busy'" in caplog.text
+    assert "using fallback='taskpool_default'" in caplog.text
+
+
+def test_unknown_infocenter_route_strategy_falls_back(caplog):
+    from pycloud_parallel.controlplane.infocenter_client import InfoCenterServiceRoute, _route_sort_key
+
+    route = InfoCenterServiceRoute(
+        service_name="svc-demo",
+        service_id="svc-1",
+        status=2,
+        node_instance_id="node-1-inst",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        node_healthy=True,
+        worker_count=2,
+        alive_workers=2,
+        in_flight=1,
+        lease_expire_at=datetime.now(timezone.utc),
+        http_base_url="http://127.0.0.1:50061",
+    )
+
+    with caplog.at_level("WARNING"):
+        key = _route_sort_key(route, strategy="bad-route-strategy")
+
+    assert key == _route_sort_key(route, strategy="predicted_busy")
+    assert "using fallback='predicted_busy'" in caplog.text

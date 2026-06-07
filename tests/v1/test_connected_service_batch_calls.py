@@ -7,6 +7,39 @@ from unittest.mock import patch
 import pytest
 
 from pycloud_parallel.api import Service
+from pycloud_parallel.execution.call_proxy import _normalize_batch_call_payloads, _normalize_unordered_call_payloads
+
+
+def test_batch_payload_normalizers_fallback_single_mapping(caplog):
+    with caplog.at_level("WARNING"):
+        payloads = _normalize_batch_call_payloads({"x": 1}, shared_kwargs={"y": 2})
+
+    assert payloads == [{"x": 1, "y": 2}]
+    assert "one-item batch" in caplog.text
+
+
+def test_batch_payload_normalizer_wraps_scalar_input(caplog):
+    with caplog.at_level("WARNING"):
+        payloads = _normalize_batch_call_payloads("abc", arg_name="name")
+
+    assert payloads == [{"name": "abc"}]
+    assert "scalar input" in caplog.text
+
+
+def test_unordered_payload_normalizer_wraps_scalar_items(caplog):
+    with caplog.at_level("WARNING"):
+        payloads = _normalize_unordered_call_payloads([1, {"x": 2}], shared_kwargs={"y": 3})
+
+    assert payloads == [{"value": 1, "y": 3}, {"x": 2, "y": 3}]
+    assert "wrapping it as {'value': item}" in caplog.text
+
+
+def test_unordered_payload_normalizer_wraps_scalar_input(caplog):
+    with caplog.at_level("WARNING"):
+        payloads = _normalize_unordered_call_payloads("abc")
+
+    assert payloads == [{"value": "abc"}]
+    assert "scalar input" in caplog.text
 
 
 def test_connected_service_map_preserves_input_order_for_discovery():

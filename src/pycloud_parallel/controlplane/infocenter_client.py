@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 import math
 from typing import Dict, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -19,6 +20,9 @@ from pycloud_parallel.execution.scheduler import (
     select_one_candidate,
 )
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_nodes
+
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
@@ -192,7 +196,11 @@ def _route_sort_key(route: InfoCenterServiceRoute, *, strategy: str) -> Tuple[ob
             _node_instance_key_from_route(route),
             str(getattr(route, "service_id", "") or ""),
         )
-    raise ValueError("strategy must be one of: predicted_busy, least_inflight, round_robin")
+    logger.warning(
+        "unsupported route strategy=%r; using fallback='predicted_busy'",
+        strategy,
+    )
+    return _route_sort_key(route, strategy="predicted_busy")
 
 
 def _build_unique_node_id_map(nodes: Sequence[InfoCenterNode], *, requested_ids: Optional[Sequence[str]] = None) -> Dict[str, InfoCenterNode]:

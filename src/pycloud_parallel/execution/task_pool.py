@@ -160,7 +160,8 @@ class _IndexedPayloadBuffer:
             self._input_exhausted = True
             return None
         if not isinstance(raw_payload, dict):
-            raise TypeError("payloads must yield dict items")
+            logger.warning("task payload item is not a mapping; wrapping it as {'value': item}")
+            raw_payload = {"value": raw_payload}
         index = self._next_index
         self._next_index += 1
         return index, raw_payload
@@ -268,11 +269,27 @@ def _taskpool_local_uses_direct_callable(
 
 
 class _LocalTaskPoolNodeClient:
-    def __init__(self, state) -> None:
+    def __init__(self, state, *, pool: Any = None) -> None:
         self._state = state
         self.target = ""
         self.node_id = str(getattr(state, "node_id", "") or "")
         self.node_instance_id = str(getattr(state, "node_instance_id", "") or "")
+        self.owner_client_id = str(getattr(pool, "owner_client_id", "") or "")
+        self.pool_id = str(getattr(pool, "pool_id", "") or "")
+        self.pool_token = str(getattr(pool, "pool_token", "") or "")
+        self.code_version = str(getattr(pool, "code_version", "") or "")
+        self.worker_count = max(1, int(getattr(pool, "worker_count", 1) or 1))
+        self.heartbeat_timeout_sec = max(1, int(getattr(pool, "heartbeat_timeout_sec", 30) or 30))
+        self.pool_name = str(getattr(pool, "pool_name", "") or self.pool_id or "local-task-pool")
+        self.idle_ttl_sec = max(0, int(getattr(pool, "idle_ttl_sec", 0) or 0))
+        self.status = str(getattr(pool, "status", "") or "RUNNING")
+        self.created_at = getattr(pool, "created_at", utc_now())
+        self.last_heartbeat_at = getattr(pool, "last_heartbeat_at", self.created_at)
+        self.lease_expire_at = getattr(
+            pool,
+            "lease_expire_at",
+            self.last_heartbeat_at + timedelta(seconds=self.heartbeat_timeout_sec),
+        )
 
     def close(self) -> None:
         self._state.close()
@@ -4116,43 +4133,12 @@ def _build_local_task_pool(
             idle_ttl_sec=idle_ttl_sec,
             chunks=[prepared_artifact.blob],
         )
-        adapter = _LocalTaskPoolNodeClient(node)
-        native = NativeTaskPoolClient(
-            _client=adapter,
-            owner_client_id=pool.owner_client_id,
-            pool_id=pool.pool_id,
-            pool_token=pool.pool_token,
-            code_version=pool.code_version,
-            worker_count=pool.worker_count,
-            heartbeat_timeout_sec=pool.heartbeat_timeout_sec,
-            pool_name=pool.pool_name,
-            idle_ttl_sec=pool.idle_ttl_sec,
-            node_instance_id=adapter.node_instance_id,
-            node_id=adapter.node_id,
-            status=pool.status,
-            created_at=pool.created_at,
-            last_heartbeat_at=pool.last_heartbeat_at,
-            lease_expire_at=pool.lease_expire_at,
-        )
-        node_info = InfoCenterNode(
-            node_instance_id=adapter.node_instance_id,
-            node_id=adapter.node_id,
-            control_addr="local",
-            healthy=True,
-            capacity=effective_worker_count,
-            queue_capacity=0,
-            queued=0,
-            inflight=0,
-            credit=effective_worker_count,
-            task_pool_worker_capacity=effective_worker_count,
-            task_pool_worker_available=effective_worker_count,
-        )
-        session = cls(
-            pools={adapter.node_instance_id: native},
-            nodes={adapter.node_instance_id: node_info},
+        adapter = _LocalTaskPoolNodeClient(node, pool=pool)
+        session = _build_local_taskpool_session(
+            cls,
+            adapter=adapter,
             task_method=prepared_artifact.entry_callable,
             job_id=job_id,
-            serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
             policy_id=effective_policy_id,
             effective_policy=effective_policy,
         )
@@ -4165,6 +4151,56 @@ def _build_local_task_pool(
         f"routes={_format_pool_route_summary(session.route_summary())}"
     )
     return session
+
+
+def _build_local_taskpool_session(
+    cls,
+    *,
+    adapter: "_LocalTaskPoolNodeClient",
+    task_method: str,
+    job_id: str,
+    policy_id: str,
+    effective_policy: EffectivePolicy,
+) -> "TaskPool":
+    native = NativeTaskPoolClient(
+        _client=adapter,
+        owner_client_id=adapter.owner_client_id,
+        pool_id=adapter.pool_id,
+        pool_token=adapter.pool_token,
+        code_version=adapter.code_version,
+        worker_count=adapter.worker_count,
+        heartbeat_timeout_sec=adapter.heartbeat_timeout_sec,
+        pool_name=adapter.pool_name,
+        idle_ttl_sec=adapter.idle_ttl_sec,
+        node_instance_id=adapter.node_instance_id,
+        node_id=adapter.node_id,
+        status=adapter.status,
+        created_at=adapter.created_at,
+        last_heartbeat_at=adapter.last_heartbeat_at,
+        lease_expire_at=adapter.lease_expire_at,
+    )
+    node_info = InfoCenterNode(
+        node_instance_id=adapter.node_instance_id,
+        node_id=adapter.node_id,
+        control_addr="local",
+        healthy=True,
+        capacity=adapter.worker_count,
+        queue_capacity=0,
+        queued=0,
+        inflight=0,
+        credit=adapter.worker_count,
+        task_pool_worker_capacity=adapter.worker_count,
+        task_pool_worker_available=adapter.worker_count,
+    )
+    return cls(
+        pools={adapter.node_instance_id: native},
+        nodes={adapter.node_instance_id: node_info},
+        task_method=task_method,
+        job_id=job_id,
+        serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
+        policy_id=policy_id,
+        effective_policy=effective_policy,
+    )
 
 
 def _resolve_direct_local_task_callable(source: Any, *, entry_module: Any = "", entry_callable: Any = "run") -> Tuple[Callable[..., Any], str, str]:
@@ -4227,42 +4263,11 @@ def _build_direct_local_task_pool(
         managed_global_names=managed_global_names or (),
         initial_globals=dict(initial_globals or {}),
     )
-    native = NativeTaskPoolClient(
-        _client=adapter,
-        owner_client_id=adapter.owner_client_id,
-        pool_id=adapter.pool_id,
-        pool_token=adapter.pool_token,
-        code_version=adapter.code_version,
-        worker_count=adapter.worker_count,
-        heartbeat_timeout_sec=adapter.heartbeat_timeout_sec,
-        pool_name=adapter.pool_name,
-        idle_ttl_sec=adapter.idle_ttl_sec,
-        node_instance_id=adapter.node_instance_id,
-        node_id=adapter.node_id,
-        status=adapter.status,
-        created_at=adapter.created_at,
-        last_heartbeat_at=adapter.last_heartbeat_at,
-        lease_expire_at=adapter.lease_expire_at,
-    )
-    node_info = InfoCenterNode(
-        node_instance_id=adapter.node_instance_id,
-        node_id=adapter.node_id,
-        control_addr="local",
-        healthy=True,
-        capacity=effective_worker_count,
-        queue_capacity=0,
-        queued=0,
-        inflight=0,
-        credit=effective_worker_count,
-        task_pool_worker_capacity=effective_worker_count,
-        task_pool_worker_available=effective_worker_count,
-    )
-    session = cls(
-        pools={adapter.node_instance_id: native},
-        nodes={adapter.node_instance_id: node_info},
+    session = _build_local_taskpool_session(
+        cls,
+        adapter=adapter,
         task_method=method_name,
         job_id=job_id,
-        serialization_mode=LOCAL_IPC_SERIALIZATION_MODE,
         policy_id=effective_policy_id,
         effective_policy=effective_policy,
     )

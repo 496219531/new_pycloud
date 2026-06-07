@@ -14,6 +14,36 @@ from pycloud_parallel.execution.call_proxy import _CallProxy
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
+def test_service_connect_falls_back_invalid_route_and_protocol(monkeypatch, caplog):
+    captured = {}
+
+    class _FakeDiscoveryClient:
+        def __init__(self, target, *, timeout_sec=10.0, service_token="", shared_route_cache=False):
+            captured["target"] = target
+            captured["timeout_sec"] = timeout_sec
+            captured["service_token"] = service_token
+            captured["shared_route_cache"] = shared_route_cache
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.discovery_client.DiscoveryServiceClient",
+        _FakeDiscoveryClient,
+    )
+
+    with caplog.at_level("WARNING"):
+        client = Service.connect(
+            target="127.0.0.1:50051",
+            service_name="svc-demo",
+            route="bad-route",
+            protocol="grpc",
+        )
+
+    assert client.route == "discovery"
+    assert client.protocol == "http"
+    assert captured["target"] == "127.0.0.1:50051"
+    assert "using fallback='http'" in caplog.text
+    assert "using fallback='discovery'" in caplog.text
+
+
 def test_service_connect_discovery_returns_unified_service_object():
     client = Service.connect(
         target="127.0.0.1:50051",

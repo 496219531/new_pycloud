@@ -3,6 +3,7 @@ from __future__ import annotations
 """Module-style service call proxies for authoritative execution/service clients."""
 
 from collections.abc import Mapping, Sequence
+import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from pycloud_parallel.execution.base import ExecutionItem
@@ -13,6 +14,19 @@ from pycloud_parallel.execution.support import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+def _is_scalar_batch_input(value: object) -> bool:
+    if isinstance(value, (str, bytes, bytearray)):
+        return True
+    try:
+        iter(value)  # type: ignore[arg-type]
+    except TypeError:
+        return True
+    return False
+
+
 def _normalize_batch_call_payloads(
     values: Iterable[object],
     *,
@@ -20,7 +34,11 @@ def _normalize_batch_call_payloads(
     shared_kwargs: Optional[Mapping[str, object]] = None,
 ) -> List[Dict[str, object]]:
     if isinstance(values, Mapping):
-        raise TypeError("batch call inputs must be a sequence, not a single mapping payload")
+        logger.warning("batch call received a single mapping payload; treating it as one-item batch")
+        values = [values]
+    elif _is_scalar_batch_input(values):
+        logger.warning("batch call received a scalar input; treating it as one-item batch")
+        values = [values]
 
     normalized_arg_name = "value" if arg_name is None else str(arg_name).strip()
     shared = dict(shared_kwargs or {})
@@ -43,18 +61,19 @@ def _normalize_unordered_call_payloads(
     shared_kwargs: Optional[Mapping[str, object]] = None,
 ) -> List[Dict[str, object]]:
     if isinstance(values, Mapping):
-        raise TypeError(
-            "unordered()/aunordered()/iter_items() inputs must be a sequence, not a single mapping payload"
-        )
+        logger.warning("unordered call received a single mapping payload; treating it as one-item batch")
+        values = [values]
+    elif _is_scalar_batch_input(values):
+        logger.warning("unordered call received a scalar input; treating it as one-item batch")
+        values = [values]
 
     shared = dict(shared_kwargs or {})
     payloads: List[Dict[str, object]] = []
     for item in values:
         if not isinstance(item, Mapping):
-            raise TypeError(
-                "unordered()/aunordered()/iter_items() inputs must be mapping payloads; "
-                "use map_values(..., arg_name=...) for scalar batches"
-            )
+            logger.warning("unordered call received scalar payload; wrapping it as {'value': item}")
+            payloads.append({"value": item, **shared})
+            continue
         payloads.append({**dict(item), **shared})
     return payloads
 

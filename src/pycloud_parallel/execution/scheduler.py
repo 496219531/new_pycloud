@@ -3,7 +3,11 @@ from __future__ import annotations
 """Shared candidate filtering and scoring helpers for execution scheduling."""
 
 from dataclasses import dataclass, field
+import logging
 from typing import Dict, Sequence
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -107,7 +111,11 @@ def resolve_service_strategy(strategy: str) -> tuple[str, StrategyProfile | None
         return "service_latency_first", SERVICE_LATENCY_FIRST
     if normalized in {"least_inflight", "round_robin"}:
         return normalized, None
-    raise ValueError("strategy must be one of: predicted_busy, service_default, service_latency_first, least_inflight, round_robin")
+    logger.warning(
+        "unsupported service strategy=%r; using fallback='predicted_busy'",
+        normalized,
+    )
+    return "predicted_busy", SERVICE_DEFAULT
 
 
 def resolve_taskpool_strategy(strategy: str) -> StrategyProfile:
@@ -123,7 +131,11 @@ def resolve_taskpool_strategy(strategy: str) -> StrategyProfile:
             tie_break="round_robin",
             failure_penalty=TASKPOOL_DEFAULT.failure_penalty,
         )
-    raise ValueError("strategy must be one of: taskpool_default, taskpool_throughput, least_inflight, predicted_busy, round_robin")
+    logger.warning(
+        "unsupported taskpool strategy=%r; using fallback='taskpool_default'",
+        normalized,
+    )
+    return TASKPOOL_DEFAULT
 
 
 def filter_candidates(

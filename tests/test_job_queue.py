@@ -5,7 +5,6 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
-import pickle
 import socket
 import time
 from types import SimpleNamespace
@@ -24,7 +23,7 @@ from pycloud_parallel.controlplane.job_orchestrator import (
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 from pycloud_parallel.controlplane.serialization import serialize_arrow_compatible
-from pycloud_parallel.data.ref import DataRef, data_ref_to_payload
+from pycloud_parallel.data.ref import DataRef, data_ref_to_payload, maybe_data_ref
 
 
 def test_startup_service_node_rejects_dynamic_service_deploy() -> None:
@@ -80,7 +79,7 @@ def test_startup_service_node_call_balanced_uses_python_module_mount(tmp_path, m
     assert body["data"] == {"value": 10}
 
 
-def test_startup_module_mount_decodes_inline_transport_adapter_at_invoke(tmp_path, monkeypatch) -> None:
+def test_startup_module_mount_accepts_local_ipc_payload_at_invoke(tmp_path, monkeypatch) -> None:
     module_path = tmp_path / "startup_payload_call.py"
     module_path.write_text(
         "def echo(**payload):\n"
@@ -89,56 +88,25 @@ def test_startup_module_mount_decodes_inline_transport_adapter_at_invoke(tmp_pat
     )
     monkeypatch.syspath_prepend(str(tmp_path))
 
-    from pycloud_parallel.controlplane.local_ipc import (
-        _make_local_pickle_payload_transport,
-    )
+    from pycloud_parallel.controlplane.local_ipc import _prepare_local_ipc_payload
 
     node = StartupServiceNode(node_id="startup-only", service_http_bind="")
     node.mount_python_module_service(service_name="startup-payload", entry_module="startup_payload_call")
-    payload_transport = _make_local_pickle_payload_transport(
+    payload = _prepare_local_ipc_payload(
         {"job_mode": "hooks", "task_generator_callable": "task_generator"},
         meta={"object_dir": str(tmp_path)},
     )
 
-    _node_key, body = node.call_balanced("echo", payload_transport, timeout_sec=5.0)
+    _node_key, body = node.call_balanced("echo", payload, timeout_sec=5.0)
 
     assert body["ok"] is True
     assert body["data"]["job_mode"] == "hooks"
     assert body["data"]["task_generator_callable"] == "task_generator"
 
 
-def test_local_pickle_payload_transport_reuses_exact_pickle_when_within_threshold(tmp_path, monkeypatch) -> None:
+def test_local_ipc_payload_prepares_bytes_when_estimated_over_threshold(tmp_path, monkeypatch) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
 
-    real_pickle_dumps = pickle.dumps
-    dump_calls: list[object] = []
-
-    def _counting_dumps(value, protocol=None):
-        dump_calls.append(value)
-        return real_pickle_dumps(value, protocol=protocol)
-
-    monkeypatch.setattr(local_ipc_mod.pickle, "dumps", _counting_dumps)
-
-    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
-        {"items": [{"value": i} for i in range(2)]},
-        meta={"object_dir": str(tmp_path)},
-    )
-
-    assert payload_transport
-    assert len(dump_calls) == 1
-
-
-def test_local_pickle_payload_transport_prepares_bytes_before_pickling_when_estimated_over_threshold(tmp_path, monkeypatch) -> None:
-    from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
-
-    real_pickle_dumps = pickle.dumps
-    dump_calls: list[object] = []
-
-    def _counting_dumps(value, protocol=None):
-        dump_calls.append(value)
-        return real_pickle_dumps(value, protocol=protocol)
-
-    monkeypatch.setattr(local_ipc_mod.pickle, "dumps", _counting_dumps)
     base_policy = local_ipc_mod.get_local_service_payload_policy()
     forced_policy = replace(
         base_policy,
@@ -150,52 +118,42 @@ def test_local_pickle_payload_transport_prepares_bytes_before_pickling_when_esti
     )
     monkeypatch.setattr(local_ipc_mod, "get_local_service_payload_policy", lambda: forced_policy)
 
-    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+    payload = local_ipc_mod._prepare_local_ipc_payload(
         {"items": b"x" * 128},
         meta={"object_dir": str(tmp_path)},
     )
 
-    assert payload_transport
-    request_payload_dumps = [
-        value
-        for value in dump_calls
-        if isinstance(value, dict) and "items" in value
-    ]
-    assert len(request_payload_dumps) == 1
-    assert request_payload_dumps[0] != {"items": b"x" * 128}
+    assert payload != {"items": b"x" * 128}
+    assert maybe_data_ref(payload["items"]) is not None
 
 
-def test_local_pickle_payload_transport_normalizes_file_paths(tmp_path) -> None:
+def test_local_ipc_payload_normalizes_file_paths(tmp_path) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
-    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
 
     source = tmp_path / "demo.txt"
     source.write_text("hello", encoding="utf-8")
 
-    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+    payload = local_ipc_mod._prepare_local_ipc_payload(
         {"file_path": source, "file_name": str(source)},
         meta={"object_dir": str(tmp_path)},
     )
 
-    restored = decode_inline_transport_carrier(payload_transport, context="service_owner")
-    assert restored["file_path"] == source.resolve()
-    assert restored["file_name"] == str(source.resolve())
+    assert payload["file_path"] == source.resolve()
+    assert payload["file_name"] == str(source.resolve())
 
 
-def test_local_pickle_payload_transport_keeps_large_file_path_inline(tmp_path) -> None:
+def test_local_ipc_payload_keeps_large_file_path_inline(tmp_path) -> None:
     from pycloud_parallel.controlplane import local_ipc as local_ipc_mod
-    from pycloud_parallel.controlplane.serialization import decode_inline_transport_carrier
 
     source = tmp_path / "large.bin"
     source.write_bytes(b"x" * (1024 * 1024))
 
-    payload_transport = local_ipc_mod._make_local_pickle_payload_transport(
+    payload = local_ipc_mod._prepare_local_ipc_payload(
         {"file_path": source},
         meta={"object_dir": str(tmp_path)},
     )
 
-    restored = decode_inline_transport_carrier(payload_transport, context="service_owner")
-    assert restored["file_path"] == source.resolve()
+    assert payload["file_path"] == source.resolve()
 
 
 def test_local_ipc_payload_keeps_small_payload_unwrapped(tmp_path, monkeypatch) -> None:

@@ -861,7 +861,11 @@ class _ConnectedService:
         self.route = str(route or "").strip().lower() or "discovery"
         self.protocol = str(protocol or "http").strip().lower() or "http"
         if self.protocol != "http":
-            raise ValueError("Service.connect() protocol must be 'http'")
+            logger.warning(
+                "Service.connect() protocol=%r is unsupported; using fallback='http'",
+                self.protocol,
+            )
+            self.protocol = "http"
         self.timeout_sec = max(0.1, float(timeout_sec))
         self._requested_serialization_mode = str(serialization_mode or "").strip()
         self._fixed_effective_policy = effective_policy_override
@@ -2753,7 +2757,11 @@ class Service(ServiceExecutionSession):
     ):
         normalized_protocol = str(protocol or "http").strip().lower() or "http"
         if normalized_protocol != "http":
-            raise ValueError("Service.connect() protocol must be 'http'")
+            logger.warning(
+                "Service.connect() protocol=%r is unsupported; using fallback='http'",
+                normalized_protocol,
+            )
+            normalized_protocol = "http"
         normalized_route = str(route or "discovery").strip().lower() or "discovery"
         if str(target or "").strip().lower() == "local":
             from pycloud_parallel.controlplane.local_ipc import LocalServiceClient
@@ -2791,9 +2799,11 @@ class Service(ServiceExecutionSession):
                 prepare_discovery_payload=prepare_discovery_payload,
             )
         if normalized_route != "discovery":
-            raise ValueError(
-                "Service.connect() route must be one of: discovery, gateway"
+            logger.warning(
+                "Service.connect() route=%r is unsupported; using fallback='discovery'",
+                normalized_route,
             )
+            normalized_route = "discovery"
         from pycloud_parallel.controlplane.discovery_client import DiscoveryServiceClient
 
         return _ConnectedService(
@@ -4307,9 +4317,6 @@ class Service(ServiceExecutionSession):
                 idx = self._route_index % len(ranked_candidates)
                 self._route_index += 1
             return ranked_candidates[idx]
-
-        if normalized_strategy not in {"predicted_busy", "least_inflight", "service_latency_first"}:
-            raise ValueError("strategy must be one of: predicted_busy, service_default, service_latency_first, least_inflight, round_robin")
 
         best_node_id = ""
         best_key: Optional[Tuple[object, ...]] = None
