@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +16,7 @@ from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 
 logger = logging.getLogger(__name__)
+MAX_RECENT_INACTIVE_TASK_POOL_REPORTS = 32
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -70,12 +72,48 @@ def _pycloud_version() -> str:
         return "unknown"
 
 
+def _task_pool_report_sort_ts(item: object) -> float:
+    for attr in ("last_heartbeat_at", "lease_expire_at", "created_at"):
+        value = getattr(item, attr, None)
+        timestamp = getattr(value, "timestamp", None)
+        if callable(timestamp):
+            try:
+                return float(timestamp())
+            except Exception:
+                continue
+    return 0.0
+
+
+def _limit_task_pool_reports(
+    reports: Iterable[object],
+    *,
+    inactive_limit: int = MAX_RECENT_INACTIVE_TASK_POOL_REPORTS,
+) -> list[object]:
+    running: list[object] = []
+    inactive: list[object] = []
+    for item in list(reports or []):
+        if str(getattr(item, "status", "") or "").strip().upper() == "RUNNING":
+            running.append(item)
+        else:
+            inactive.append(item)
+    inactive.sort(key=_task_pool_report_sort_ts, reverse=True)
+    return [*running, *inactive[: max(0, int(inactive_limit or 0))]]
+
+
 def _exit_current_process_delayed(delay_sec: float = 0.25) -> None:
     def _exit() -> None:
         time.sleep(max(0.0, float(delay_sec or 0.0)))
         os._exit(0)
 
     threading.Thread(target=_exit, name="node-registrar-fence-exit", daemon=True).start()
+
+
+def _restart_current_process_delayed(delay_sec: float = 0.25) -> None:
+    def _restart() -> None:
+        time.sleep(max(0.0, float(delay_sec or 0.0)))
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    threading.Thread(target=_restart, name="node-registrar-fence-restart", daemon=True).start()
 
 
 class NodeInfoCenterRegistrar:
@@ -112,16 +150,17 @@ class NodeInfoCenterRegistrar:
         self.metadata = dict(metadata or {})
         self.fallback_heartbeat_sec = max(1, int(fallback_heartbeat_sec))
         self.rpc_timeout_sec = max(0.5, float(rpc_timeout_sec))
+        self.restart_on_fence = (
+            _env_bool("PYCLOUD_NODE_RESTART_ON_FENCE", False)
+            if restart_on_fence is None
+            else bool(restart_on_fence)
+        )
         if exit_on_fence is None:
-            legacy_restart_flag = (
-                _env_bool("PYCLOUD_NODE_RESTART_ON_FENCE", False)
-                if restart_on_fence is None
-                else bool(restart_on_fence)
-            )
-            exit_on_fence = _env_bool("PYCLOUD_NODE_EXIT_ON_FENCE", legacy_restart_flag)
+            exit_on_fence = _env_bool("PYCLOUD_NODE_EXIT_ON_FENCE", self.restart_on_fence)
         self.exit_on_fence = bool(exit_on_fence)
         self.exit_delay_sec = max(0.0, float(exit_delay_sec if exit_delay_sec is not None else restart_delay_sec or 0.25))
-        self._exit_callback = exit_callback or restart_callback or _exit_current_process_delayed
+        self._exit_callback = exit_callback or _exit_current_process_delayed
+        self._restart_callback = restart_callback or _restart_current_process_delayed
 
         self._client = InfoCenterClient(self.infocenter_addr, timeout_sec=self.rpc_timeout_sec)
         self._stop_event = threading.Event()
@@ -287,8 +326,17 @@ class NodeInfoCenterRegistrar:
             self._wake_event.set()
         if close_lost:
             self._close_state_if_registration_lost(reason or "node_instance_id fenced")
-        should_exit = self.exit_on_fence and bool(exit_host)
-        if should_exit:
+        should_exit_or_restart = self.exit_on_fence and bool(exit_host)
+        if should_exit_or_restart and self.restart_on_fence:
+            logger.warning(
+                "[Registrar] restarting NodeControl host after fence node_id=%s node_instance_id=%s delay_sec=%.3f reason=%s",
+                self.node_id,
+                self.node_instance_id,
+                self.exit_delay_sec,
+                str(reason or "node_instance_id fenced"),
+            )
+            self._restart_callback(self.exit_delay_sec)
+        elif should_exit_or_restart:
             logger.warning(
                 "[Registrar] exiting NodeControl host after fence node_id=%s node_instance_id=%s delay_sec=%.3f reason=%s",
                 self.node_id,
@@ -348,7 +396,7 @@ class NodeInfoCenterRegistrar:
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
         if bool(snapshot.get("execution_fenced", False)):
             metadata["execution_fenced"] = "true"
-        task_pool_reports = list(snapshot.get("task_pool_reports") or [])
+        task_pool_reports = _limit_task_pool_reports(snapshot.get("task_pool_reports") or [])
         service_reports = list(snapshot.get("service_reports") or [])
         active_runtimes = list(snapshot.get("active_runtimes") or [])
         task_pools = [
@@ -432,7 +480,7 @@ class NodeInfoCenterRegistrar:
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
         if bool(snapshot.get("execution_fenced", False)):
             metadata["execution_fenced"] = "true"
-        task_pool_reports = list(snapshot.get("task_pool_reports") or [])
+        task_pool_reports = _limit_task_pool_reports(snapshot.get("task_pool_reports") or [])
         service_reports = list(snapshot.get("service_reports") or [])
         active_runtimes = list(snapshot.get("active_runtimes") or [])
         task_pools = [

@@ -41,6 +41,33 @@ def test_default_node_worker_capacity_handles_single_cpu(monkeypatch):
     assert ctl._default_node_worker_capacity() == 1
 
 
+def test_node_registration_match_requires_control_addr_and_instance_id():
+    row = {
+        "node_id": "node-a",
+        "node_instance_id": "node-a-new",
+        "control_addr": "10.0.0.9:50061",
+    }
+
+    assert ctl._node_registration_matches(
+        row,
+        node_id="node-a",
+        control_addr="10.0.0.9:50061",
+        node_instance_id="node-a-new",
+    )
+    assert not ctl._node_registration_matches(
+        row,
+        node_id="node-a",
+        control_addr="10.0.0.8:50061",
+        node_instance_id="node-a-new",
+    )
+    assert not ctl._node_registration_matches(
+        row,
+        node_id="node-a",
+        control_addr="10.0.0.9:50061",
+        node_instance_id="node-a-old",
+    )
+
+
 def test_ctl_parser_accepts_start_command():
     parser = ctl.build_parser()
     args = parser.parse_args(["start"])
@@ -1821,6 +1848,42 @@ def test_start_standalone_node_enables_managed_fence_exit(tmp_path, monkeypatch)
 
     extra_env = captured["extra_env"]
     assert extra_env["PYCLOUD_NODE_EXIT_ON_FENCE"] == "1"
+    assert extra_env["PYCLOUD_NODE_RESTART_ON_FENCE"] == "1"
+
+
+def test_start_dev_node_enables_managed_fence_restart(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
+    monkeypatch.setattr(ctl, "_wait_node_registered", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ctl, "_write_pid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ctl, "_log", lambda *_args, **_kwargs: None)
+
+    def fake_spawn(root, log_path, args, *, extra_env=None, debug=False):
+        captured["root"] = root
+        captured["log_path"] = log_path
+        captured["args"] = list(args)
+        captured["extra_env"] = dict(extra_env or {})
+        captured["debug"] = debug
+        return 12345
+
+    monkeypatch.setattr(ctl, "_spawn_server", fake_spawn)
+
+    ctl._start_node(
+        tmp_path,
+        "node-blue",
+        51061,
+        18181,
+        "127.0.0.1:50051",
+        2,
+        bind_host="127.0.0.1",
+        service_http_host="127.0.0.1",
+        advertise_host="127.0.0.1",
+    )
+
+    extra_env = captured["extra_env"]
+    assert extra_env["PYCLOUD_NODE_EXIT_ON_FENCE"] == "1"
+    assert extra_env["PYCLOUD_NODE_RESTART_ON_FENCE"] == "1"
 
 
 def test_cmd_start_node_passes_api_token_to_server(tmp_path, monkeypatch):

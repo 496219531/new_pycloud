@@ -815,7 +815,34 @@ def _wait_http_ready(bind: str, timeout_sec: float, *, path: str = "/") -> bool:
     return False
 
 
-def _wait_node_registered(infocenter_target: str, node_id: str, timeout_sec: float) -> bool:
+def _node_registration_matches(
+    item: object,
+    *,
+    node_id: str,
+    control_addr: str = "",
+    node_instance_id: str = "",
+) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("node_id", "") or "").strip() != str(node_id or "").strip():
+        return False
+    expected_control_addr = str(control_addr or "").strip()
+    if expected_control_addr and str(item.get("control_addr", "") or "").strip() != expected_control_addr:
+        return False
+    expected_node_instance_id = str(node_instance_id or "").strip()
+    if expected_node_instance_id and str(item.get("node_instance_id", "") or "").strip() != expected_node_instance_id:
+        return False
+    return True
+
+
+def _wait_node_registered(
+    infocenter_target: str,
+    node_id: str,
+    timeout_sec: float,
+    *,
+    control_addr: str = "",
+    node_instance_id: str = "",
+) -> bool:
     target = str(infocenter_target or "").strip()
     if not target.startswith(("http://", "https://")):
         target = f"http://{target}"
@@ -826,7 +853,15 @@ def _wait_node_registered(infocenter_target: str, node_id: str, timeout_sec: flo
             with urlopen(url, timeout=1.0) as resp:
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             nodes = data.get("nodes") or []
-            if any(str(item.get("node_id", "")) == node_id for item in nodes if isinstance(item, dict)):
+            if any(
+                _node_registration_matches(
+                    item,
+                    node_id=node_id,
+                    control_addr=control_addr,
+                    node_instance_id=node_instance_id,
+                )
+                for item in nodes
+            ):
                 return True
         except Exception:
             pass
@@ -1369,6 +1404,7 @@ def _start_node(
     token_args = ["--api-token", str(api_token)] if str(api_token or "").strip() else []
     node_env = dict(extra_env or {})
     node_env["PYCLOUD_NODE_EXIT_ON_FENCE"] = "1"
+    node_env["PYCLOUD_NODE_RESTART_ON_FENCE"] = "1"
     pid = _spawn_server(
         root,
         _logs_dir(root) / f"{name}.log",
@@ -1404,7 +1440,16 @@ def _start_node(
         extra_env=node_env,
         debug=debug,
     )
-    if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_node_registered(infocenter_target, name, 0.2)):
+    if not _wait_ready_with_pid(
+        pid,
+        15.0,
+        lambda: _wait_node_registered(
+            infocenter_target,
+            name,
+            0.2,
+            control_addr=advertise_addr,
+        ),
+    ):
         _remove_pid(_pid_file(root, name))
         raise RuntimeError(f"{name} failed to register to InfoCenter")
     _write_pid(_pid_file(root, name), pid)
@@ -1471,11 +1516,21 @@ def _start_standalone_node(
         args.extend(["--api-token", str(api_token)])
     node_env = dict(extra_env or {})
     node_env["PYCLOUD_NODE_EXIT_ON_FENCE"] = "1"
+    node_env["PYCLOUD_NODE_RESTART_ON_FENCE"] = "1"
     pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=node_env, debug=debug)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_ready(service_http_bind, 0.2)):
         _remove_pid(_pid_file(root, node_id))
         raise RuntimeError(f"{node_id} service HTTP failed to become ready")
-    if infocenter_addr and not _wait_ready_with_pid(pid, 15.0, lambda: _wait_node_registered(infocenter_addr, node_id, 0.2)):
+    if infocenter_addr and not _wait_ready_with_pid(
+        pid,
+        15.0,
+        lambda: _wait_node_registered(
+            infocenter_addr,
+            node_id,
+            0.2,
+            control_addr=advertise_addr or bind,
+        ),
+    ):
         _remove_pid(_pid_file(root, node_id))
         raise RuntimeError(f"{node_id} failed to register to InfoCenter")
     _write_pid(_pid_file(root, node_id), pid)

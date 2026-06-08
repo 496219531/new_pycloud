@@ -43,6 +43,11 @@ def _timestamp_to_datetime(value) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _heartbeat_rpc_timeout_sec(heartbeat_timeout_sec: int) -> float:
+    lease_sec = max(1.0, float(heartbeat_timeout_sec or 1))
+    return max(0.5, min(5.0, lease_sec / 4.0))
+
+
 def _extract_result_ref(value: object) -> Optional[DataRef]:
     direct = maybe_data_ref(value)
     if direct is not None:
@@ -180,6 +185,7 @@ class NativeTaskPoolClient:
             pool_id=self.pool_id,
             pool_token=self.pool_token,
             seq=seq,
+            timeout_sec=_heartbeat_rpc_timeout_sec(self.heartbeat_timeout_sec),
         )
         now = _utc_now()
         self.last_heartbeat_at = now
@@ -330,6 +336,7 @@ class ServiceSessionClient:
             service_id=self.service_id,
             service_token=self.service_token,
             seq=0,
+            timeout_sec=_heartbeat_rpc_timeout_sec(self.heartbeat_timeout_sec),
         )
         self.status = resp.status
         self.failed = False

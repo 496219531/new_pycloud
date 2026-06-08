@@ -450,8 +450,9 @@ class _LocalTaskPoolNodeClient:
         pool_id: str,
         pool_token: str,
         seq: int = 0,
+        timeout_sec: Optional[float] = None,
     ) -> pb2.HeartbeatTaskPoolResponse:
-        del seq
+        del seq, timeout_sec
         pool = self._state.heartbeat_task_pool(
             owner_client_id=owner_client_id,
             pool_id=pool_id,
@@ -910,8 +911,9 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
         pool_id: str,
         pool_token: str,
         seq: int = 0,
+        timeout_sec: Optional[float] = None,
     ) -> pb2.HeartbeatTaskPoolResponse:
-        del owner_client_id, seq
+        del owner_client_id, seq, timeout_sec
         self._require_pool(pool_id=pool_id, pool_token=pool_token)
         self.last_heartbeat_at = utc_now()
         self.lease_expire_at = self.last_heartbeat_at + timedelta(seconds=self.heartbeat_timeout_sec)
@@ -1199,6 +1201,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 for node_id, state in recovery_states.items()
                 if state.retryable or self._is_retryable_compensation_failure(state.error)
             }
+            retry_probe = self._retry_probe_replica_snapshot()
+            if retry_probe:
+                return 0
             if desired <= 0 or len(active) >= desired:
                 return 0
             excluded = active | (failed - retryable_failed)

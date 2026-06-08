@@ -119,6 +119,7 @@ from pycloud_parallel.controlplane.node.session_views import (
 )
 from pycloud_parallel.controlplane.node.timing import (
     ExecutionTimingSample,
+    build_execution_timing_event,
     record_execution_timing,
 )
 from pycloud_parallel.data.ref import (
@@ -155,6 +156,9 @@ NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC = 2.0
 NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC = 8.0
 _CODE_LAST_AT_TOUCH_INTERVAL_SEC = 60.0
 _CODE_LAST_AT_TOUCH_MAX_ENTRIES = 10000
+HEARTBEAT_LOCK_WAIT_LOG_SEC = 0.25
+HEARTBEAT_TOTAL_LOG_SEC = 0.5
+EXECUTOR_EVENT_DRAIN_BATCH_SIZE = 128
 
 
 def _path(value: Any = ".") -> Path:
@@ -394,7 +398,7 @@ class NodeControlState(NodeRuntimeBase):
         subprocess_timings: Optional[Dict[str, object]] = None,
         error_type: str = "",
         error_message: str = "",
-    ) -> None:
+    ) -> Optional[Tuple[ExecutionTimingSample, str, str]]:
         try:
             sample = ExecutionTimingSample(
                 method=str(method or ""),
@@ -419,11 +423,13 @@ class NodeControlState(NodeRuntimeBase):
                 id_value=pool.pool_id,
                 name_key="pool_name",
                 name_value=pool.pool_name,
-                logger=service_timing_logger,
+                logger=None,
             )
+            return sample, str(pool.pool_id or ""), str(pool.pool_name or "")
         except Exception as exc:
             logger = logging.getLogger(__name__)
             logger.debug("failed to record task pool timing: %r", exc)
+            return None
 
     def _record_task_pool_lifecycle_timing_locked(
         self,
@@ -2950,7 +2956,11 @@ class NodeControlState(NodeRuntimeBase):
         pool_token: str,
     ) -> TaskPoolState:
         normalized = str(pool_id or "").strip()
-        with self._lock:
+        started_at = time.perf_counter()
+        lock_wait_started_at = started_at
+        self._lock.acquire()
+        lock_wait_sec = time.perf_counter() - lock_wait_started_at
+        try:
             pool = self._task_pools.get(normalized)
             if pool is None:
                 raise KeyError("task pool not found")
@@ -2964,10 +2974,26 @@ class NodeControlState(NodeRuntimeBase):
             pool.lease_expire_at = now + timedelta(seconds=pool.heartbeat_timeout_sec)
             pool.alive_workers = max(0, int(pool.worker_count or 0))
             return pool
+        finally:
+            total_sec = time.perf_counter() - started_at
+            self._lock.release()
+            if lock_wait_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC or total_sec >= HEARTBEAT_TOTAL_LOG_SEC:
+                logger.warning(
+                    "task pool heartbeat slow pool_id=%s owner_client_id=%s lock_wait_sec=%.3f total_sec=%.3f",
+                    normalized,
+                    str(owner_client_id or "").strip(),
+                    lock_wait_sec,
+                    total_sec,
+                )
 
     def heartbeat_service(self, *, owner_client_id: str, service_id: str, service_token: str) -> ServiceSession:
         now = utc_now()
-        with self._lock:
+        normalized = str(service_id or "").strip()
+        started_at = time.perf_counter()
+        lock_wait_started_at = started_at
+        self._lock.acquire()
+        lock_wait_sec = time.perf_counter() - lock_wait_started_at
+        try:
             session = self._services.get(service_id)
             if session is None:
                 raise KeyError("service not found")
@@ -2981,6 +3007,17 @@ class NodeControlState(NodeRuntimeBase):
             if session.status == pb2.SERVICE_STATUS_STARTING:
                 session.status = pb2.SERVICE_STATUS_RUNNING
             return session
+        finally:
+            total_sec = time.perf_counter() - started_at
+            self._lock.release()
+            if lock_wait_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC or total_sec >= HEARTBEAT_TOTAL_LOG_SEC:
+                logger.warning(
+                    "service heartbeat slow service_id=%s owner_client_id=%s lock_wait_sec=%.3f total_sec=%.3f",
+                    normalized,
+                    str(owner_client_id or "").strip(),
+                    lock_wait_sec,
+                    total_sec,
+                )
 
     def end_service(self, *, owner_client_id: str, service_id: str, service_token: str, reason: str) -> ServiceSession:
         with self._lock:
@@ -3896,11 +3933,27 @@ class NodeControlState(NodeRuntimeBase):
         return self._python_version
 
     def _drain_executor_events(self) -> None:
+        drain_started_at = time.perf_counter()
         with self._cv:
             self._ensure_executor_host_alive_locked()
             if self._executor_host is None:
                 return
-            for item in self._executor_host.drain_events():
+            events = self._executor_host.drain_events()
+        if len(events) > EXECUTOR_EVENT_DRAIN_BATCH_SIZE:
+            logger.warning(
+                "executor event drain batch large node_id=%s node_instance_id=%s event_count=%s batch_size=%s",
+                self.node_id,
+                self.node_instance_id,
+                len(events),
+                EXECUTOR_EVENT_DRAIN_BATCH_SIZE,
+            )
+        total_lock_sec = 0.0
+        total_timing_log_sec = 0.0
+        slow_event_count = 0
+        for item in events:
+            timing_event = None
+            event_lock_started_at = time.perf_counter()
+            with self._cv:
                 kind = str(item.get("kind", "") or "")
                 if kind == "executor_host_crash":
                     logger.error(
@@ -3976,7 +4029,7 @@ class NodeControlState(NodeRuntimeBase):
                         task.error_message = ""
                     queued_result = task.as_result()
                     pool.returned_count += 1
-                    self._record_task_pool_timing_locked(
+                    timing_event = self._record_task_pool_timing_locked(
                         pool,
                         method=pool.task_method,
                         ok=ok,
@@ -3993,7 +4046,54 @@ class NodeControlState(NodeRuntimeBase):
                     self._cv.notify_all()
                     if queued_result is not None:
                         result_hook.push(pool_id, queued_result)
-                    continue
+            event_lock_sec = time.perf_counter() - event_lock_started_at
+            total_lock_sec += event_lock_sec
+            if event_lock_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC:
+                slow_event_count += 1
+                logger.warning(
+                    "executor event handling slow node_id=%s node_instance_id=%s kind=%s lock_sec=%.3f",
+                    self.node_id,
+                    self.node_instance_id,
+                    str(item.get("kind", "") or ""),
+                    event_lock_sec,
+                )
+            if timing_event is not None:
+                sample, timing_pool_id, timing_pool_name = timing_event
+                timing_payload = build_execution_timing_event(
+                    event="task_pool_timing",
+                    id_key="pool_id",
+                    id_value=timing_pool_id,
+                    name_key="pool_name",
+                    name_value=timing_pool_name,
+                    sample=sample,
+                    include_http_status=False,
+                    include_queue_wait=True,
+                )
+                timing_log_started_at = time.perf_counter()
+                service_timing_logger.info(json.dumps(timing_payload, ensure_ascii=False))
+                timing_log_sec = time.perf_counter() - timing_log_started_at
+                total_timing_log_sec += timing_log_sec
+                if timing_log_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC:
+                    logger.warning(
+                        "task pool timing log slow node_id=%s node_instance_id=%s pool_id=%s log_sec=%.3f",
+                        self.node_id,
+                        self.node_instance_id,
+                        str(timing_payload.get("pool_id", "") or ""),
+                        timing_log_sec,
+                    )
+        total_sec = time.perf_counter() - drain_started_at
+        if events and (total_sec >= HEARTBEAT_TOTAL_LOG_SEC or total_lock_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC):
+            logger.warning(
+                "executor event drain slow node_id=%s node_instance_id=%s event_count=%s total_sec=%.3f lock_sec=%.3f timing_log_sec=%.3f slow_events=%s",
+                self.node_id,
+                self.node_instance_id,
+                len(events),
+                total_sec,
+                total_lock_sec,
+                total_timing_log_sec,
+                slow_event_count,
+            )
+
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
             self._drain_executor_events()

@@ -1548,8 +1548,21 @@ class HttpNodeControlClient:
         data = self._json("DELETE", f"/taskpools/{quote(str(pool_id), safe='')}", {"owner_client_id": owner_client_id, "pool_token": pool_token, "reason": reason})
         return _parse_message(pb2.CloseTaskPoolResponse, data)
 
-    def heartbeat_task_pool(self, *, owner_client_id: str, pool_id: str, pool_token: str, seq: int = 0) -> pb2.HeartbeatTaskPoolResponse:
-        data = self._json("POST", f"/taskpools/{quote(str(pool_id), safe='')}/heartbeat", {"owner_client_id": owner_client_id, "pool_token": pool_token, "seq": int(seq)})
+    def heartbeat_task_pool(
+        self,
+        *,
+        owner_client_id: str,
+        pool_id: str,
+        pool_token: str,
+        seq: int = 0,
+        timeout_sec: Optional[float] = None,
+    ) -> pb2.HeartbeatTaskPoolResponse:
+        data = self._json(
+            "POST",
+            f"/taskpools/{quote(str(pool_id), safe='')}/heartbeat",
+            {"owner_client_id": owner_client_id, "pool_token": pool_token, "seq": int(seq)},
+            timeout_sec=timeout_sec,
+        )
         return _parse_message(pb2.HeartbeatTaskPoolResponse, data)
 
     def cancel_pool_job(self, *, pool_id: str, pool_token: str, job_id: str, reason: str = "") -> pb2.CancelJobResponse:
@@ -1725,8 +1738,21 @@ class HttpNodeControlClient:
             transport_values=transport_values,
         )
 
-    def heartbeat_service(self, *, owner_client_id: str, service_id: str, service_token: str, seq: int = 0) -> pb2.HeartbeatServiceResponse:
-        data = self._json("POST", f"/services/{quote(str(service_id), safe='')}/heartbeat", {"owner_client_id": owner_client_id, "service_token": service_token, "seq": int(seq)})
+    def heartbeat_service(
+        self,
+        *,
+        owner_client_id: str,
+        service_id: str,
+        service_token: str,
+        seq: int = 0,
+        timeout_sec: Optional[float] = None,
+    ) -> pb2.HeartbeatServiceResponse:
+        data = self._json(
+            "POST",
+            f"/services/{quote(str(service_id), safe='')}/heartbeat",
+            {"owner_client_id": owner_client_id, "service_token": service_token, "seq": int(seq)},
+            timeout_sec=timeout_sec,
+        )
         return _parse_message(pb2.HeartbeatServiceResponse, data)
 
     def end_service(self, *, owner_client_id: str, service_id: str, service_token: str, reason: str = "") -> pb2.EndServiceResponse:

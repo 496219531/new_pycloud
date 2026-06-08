@@ -120,6 +120,33 @@ def test_service_session_client_identity_and_snapshot() -> None:
     assert snap.alive is True
 
 
+def test_service_session_client_heartbeat_uses_short_rpc_timeout() -> None:
+    from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
+
+    control_client = MagicMock()
+    control_client.heartbeat_service.return_value = SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING)
+    service = ServiceSessionClient(
+        _client=control_client,
+        owner_client_id="owner-a",
+        service_id="svc-1",
+        service_token="svc-token",
+        http_base_url="http://127.0.0.1:18080/svc/svc-1",
+        heartbeat_timeout_sec=60,
+        worker_count=2,
+        status=pb2.SERVICE_STATUS_RUNNING,
+    )
+
+    service.heartbeat()
+
+    control_client.heartbeat_service.assert_called_once_with(
+        owner_client_id="owner-a",
+        service_id="svc-1",
+        service_token="svc-token",
+        seq=0,
+        timeout_sec=5.0,
+    )
+
+
 def test_native_task_pool_client_update_globals_prepared_uses_pool_identity() -> None:
     from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
 

@@ -271,7 +271,7 @@ def test_task_pool_open_local_supports_unordered_wrappers(tmp_path) -> None:
 
 def test_task_pool_open_local_ignores_external_serialization_mode(tmp_path) -> None:
     from pycloud_parallel import TaskPool
-    from pycloud_parallel.controlplane.serialization import struct_to_python
+    from pycloud_parallel.controlplane.serialization import decode_transport_payload_bytes
 
     blob = (
         b"def run(value=0, **_kwargs):\n"
@@ -302,8 +302,16 @@ def test_task_pool_open_local_ignores_external_serialization_mode(tmp_path) -> N
         resp = pool.submit_payloads([{"value": 1}], serialization_mode="legacy_v1")
         assert len(resp.accepted) == 1
         assert len(captured_items) == 1
-        assert not captured_items[0].HasField("transport_payload")
-        assert struct_to_python(captured_items[0].payload) == {"value": 1}
+        assert captured_items[0].transport_payload.codec == "pickle_native_v1"
+        assert (
+            decode_transport_payload_bytes(
+                captured_items[0].transport_payload.codec,
+                captured_items[0].transport_payload.version,
+                captured_items[0].transport_payload.payload,
+                context="taskpool_session",
+            )
+            == {"value": 1}
+        )
         values = pool.wait_for_data(expected_count=1, timeout_sec=10.0)
         assert values == [{"value": 2}]
 
@@ -339,9 +347,9 @@ def test_task_pool_open_local_supports_imap_unordered_return_items(tmp_path) -> 
         assert all(item.task_id for item in items)
 
 
-def test_task_pool_open_local_unordered_uses_plain_payload_struct(tmp_path) -> None:
+def test_task_pool_open_local_unordered_uses_local_transport_payload(tmp_path) -> None:
     from pycloud_parallel import TaskPool
-    from pycloud_parallel.controlplane.serialization import struct_to_python
+    from pycloud_parallel.controlplane.serialization import decode_transport_payload_bytes
 
     blob = (
         b"def run(value=0, **_kwargs):\n"
@@ -372,8 +380,16 @@ def test_task_pool_open_local_unordered_uses_plain_payload_struct(tmp_path) -> N
         assert items[0].ok is True
         assert items[0].result == {"value": 10}
         assert len(captured_items) == 1
-        assert not captured_items[0].HasField("transport_payload")
-        assert struct_to_python(captured_items[0].payload) == {"value": 2}
+        assert captured_items[0].transport_payload.codec == "pickle_native_v1"
+        assert (
+            decode_transport_payload_bytes(
+                captured_items[0].transport_payload.codec,
+                captured_items[0].transport_payload.version,
+                captured_items[0].transport_payload.payload,
+                context="taskpool_session",
+            )
+            == {"value": 2}
+        )
 
 
 def test_task_pool_open_local_supports_async_unordered_wrapper(tmp_path) -> None:
@@ -2234,6 +2250,211 @@ def test_native_task_pool_session_single_replica_heartbeat_does_not_block_loop(c
         finally:
             release.set()
             session.close()
+
+
+def test_native_task_pool_session_transient_timeout_keeps_retrying_replica() -> None:
+    from pycloud_parallel import TaskPool
+
+    calls = {"value": 0}
+
+    class _FlakyPool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+        heartbeat_failure_threshold = 1
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            calls["value"] += 1
+            if calls["value"] == 1:
+                raise TimeoutError("temporary heartbeat timeout")
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    session = TaskPool(
+        pools={"node-flaky": _FlakyPool()},
+        nodes={},
+        task_method="run",
+        job_id="job-flaky-hb",
+    )
+
+    session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
+    try:
+        deadline = time.monotonic() + 1.0
+        while (
+            time.monotonic() < deadline
+            and (
+                calls["value"] < 2
+                or "node-flaky" not in session._active_replica_ids  # noqa: SLF001
+                or "node-flaky" in session.failures
+            )
+        ):
+            time.sleep(0.02)
+
+        assert calls["value"] >= 2
+        assert session.failed is False
+        assert "node-flaky" in session._active_replica_ids  # noqa: SLF001
+        assert "node-flaky" not in session.failures
+    finally:
+        session.close()
+
+
+def test_native_task_pool_session_started_stuck_heartbeat_does_not_block_retry() -> None:
+    from pycloud_parallel import TaskPool
+
+    first_started = threading.Event()
+    second_seen = threading.Event()
+    release_first = threading.Event()
+    calls = {"value": 0}
+
+    class _StuckThenHealthyPool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+        heartbeat_failure_threshold = 1
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            calls["value"] += 1
+            if calls["value"] == 1:
+                first_started.set()
+                release_first.wait(3.0)
+                return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+            second_seen.set()
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    session = TaskPool(
+        pools={"node-stuck": _StuckThenHealthyPool()},
+        nodes={},
+        task_method="run",
+        job_id="job-stuck-hb",
+    )
+
+    session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
+    try:
+        assert first_started.wait(0.5)
+        assert second_seen.wait(2.5)
+        assert session.failed is False
+    finally:
+        release_first.set()
+        session.close()
+
+
+def test_native_task_pool_session_stale_heartbeat_pending_is_bounded(caplog) -> None:
+    from pycloud_parallel import TaskPool
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _AlwaysStuckPool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+        heartbeat_failure_threshold = 1
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            started.set()
+            release.wait(5.0)
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    session = TaskPool(
+        pools={
+            "node-stuck-1": _AlwaysStuckPool(),
+            "node-stuck-2": _AlwaysStuckPool(),
+        },
+        nodes={},
+        task_method="run",
+        job_id="job-stale-hb",
+    )
+    session._stale_heartbeat_pending_limit = lambda: 1  # type: ignore[method-assign]  # noqa: SLF001
+
+    with caplog.at_level(logging.WARNING):
+        session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
+        try:
+            assert started.wait(0.5)
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                if any("stale heartbeat pending limit reached" in record.getMessage() for record in caplog.records):
+                    break
+                time.sleep(0.05)
+            assert any("stale heartbeat pending limit reached" in record.getMessage() for record in caplog.records)
+            assert session.failed is False
+        finally:
+            release.set()
+            session.close()
+
+
+def test_native_task_pool_client_heartbeat_uses_short_rpc_timeout() -> None:
+    from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
+
+    seen = {}
+
+    class _Client:
+        def heartbeat_task_pool(self, **kwargs):
+            seen.update(kwargs)
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=30)
+
+    pool = NativeTaskPoolClient(
+        _client=_Client(),
+        owner_client_id="owner",
+        pool_id="pool-1",
+        pool_token="token-1",
+        code_version="sha256:test",
+        worker_count=1,
+        heartbeat_timeout_sec=60,
+    )
+
+    pool.heartbeat(seq=7)
+
+    assert seen["seq"] == 7
+    assert seen["timeout_sec"] == 5.0
+
+
+def test_native_task_pool_client_local_adapter_accepts_heartbeat_timeout() -> None:
+    from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient
+    from pycloud_parallel.execution.task_pool import _LocalTaskPoolNodeClient
+
+    pool_state = SimpleNamespace(
+        owner_client_id="owner-local",
+        pool_id="pool-local-hb",
+        pool_token="token-local-hb",
+        code_version="sha256:local",
+        worker_count=1,
+        heartbeat_timeout_sec=5,
+        pool_name="pool-local-hb",
+        idle_ttl_sec=0,
+        status="RUNNING",
+        created_at=datetime.utcnow(),
+        last_heartbeat_at=datetime.utcnow(),
+    )
+
+    class _State:
+        node_id = "node-local-hb"
+        node_instance_id = "node-local-hb-instance"
+
+        def heartbeat_task_pool(self, **kwargs):
+            assert kwargs == {
+                "owner_client_id": "owner-local",
+                "pool_id": "pool-local-hb",
+                "pool_token": "token-local-hb",
+            }
+            return pool_state
+
+    adapter = _LocalTaskPoolNodeClient(_State(), pool=pool_state)
+    pool = NativeTaskPoolClient(
+        _client=adapter,
+        owner_client_id=adapter.owner_client_id,
+        pool_id=adapter.pool_id,
+        pool_token=adapter.pool_token,
+        code_version=adapter.code_version,
+        worker_count=adapter.worker_count,
+        heartbeat_timeout_sec=adapter.heartbeat_timeout_sec,
+    )
+
+    response = pool.heartbeat(seq=3)
+
+    assert response.ok is True
+    assert response.accepted is True
 
 
 def test_native_task_pool_session_keepalive_fails_when_all_nodes_fail() -> None:

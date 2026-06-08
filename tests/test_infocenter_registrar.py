@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -31,6 +32,29 @@ def _wait_until(predicate, timeout_sec: float = 5.0, interval_sec: float = 0.1) 
             return True
         time.sleep(interval_sec)
     return False
+
+
+def test_node_registrar_limits_inactive_task_pool_reports():
+    from pycloud_parallel.controlplane.registrar import _limit_task_pool_reports
+
+    base = datetime(2026, 6, 1, 8, 0, 0, tzinfo=timezone.utc)
+    running = [
+        SimpleNamespace(pool_id=f"running-{idx}", status="RUNNING", last_heartbeat_at=base)
+        for idx in range(3)
+    ]
+    stopped = [
+        SimpleNamespace(
+            pool_id=f"stopped-{idx}",
+            status="STOPPED",
+            last_heartbeat_at=base.replace(minute=idx),
+        )
+        for idx in range(40)
+    ]
+
+    limited = _limit_task_pool_reports([*stopped, *running], inactive_limit=5)
+
+    assert [item.pool_id for item in limited[:3]] == ["running-0", "running-1", "running-2"]
+    assert [item.pool_id for item in limited[3:]] == ["stopped-39", "stopped-38", "stopped-37", "stopped-36", "stopped-35"]
 
 
 def test_node_registrar_syncs_service_routes(tmp_path):
@@ -1130,6 +1154,39 @@ def test_node_registrar_exits_only_after_fence_cleanup():
         registrar._reset_state_after_fence("test fence", restart=True)  # noqa: SLF001
 
         assert events == [("reset", "test fence"), ("exit", 1.25)]
+        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+    finally:
+        registrar.close(mark_lost=False)
+
+
+def test_node_registrar_restarts_after_fence_when_enabled():
+    events = []
+
+    class _FakeState:
+        node_instance_id = "node-fence-restart-inst"
+        close_on_registration_lost = False
+
+        def reset_execution_state(self, *, reason):
+            events.append(("reset", reason))
+
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-fence-restart",
+        control_addr="127.0.0.1:50061",
+        state=_FakeState(),
+        capacity=1,
+        queue_capacity=1,
+        exit_on_fence=True,
+        restart_on_fence=True,
+        exit_delay_sec=1.25,
+        restart_callback=lambda delay_sec: events.append(("restart", delay_sec)),
+        exit_callback=lambda delay_sec: events.append(("exit", delay_sec)),
+    )
+
+    try:
+        registrar._reset_state_after_fence("test fence", restart=True)  # noqa: SLF001
+
+        assert events == [("reset", "test fence"), ("restart", 1.25)]
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
     finally:
         registrar.close(mark_lost=False)
