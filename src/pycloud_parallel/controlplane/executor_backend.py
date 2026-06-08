@@ -34,7 +34,9 @@ class ExecutorBackend(Protocol):
 
     def create_service(self, *, service_id: str, worker_count: int) -> None: ...
 
-    def stop_service(self, *, service_id: str) -> None: ...
+    def stop_service(self, *, service_id: str, reason: str = "") -> None: ...
+
+    def service_worker_liveness(self) -> Dict[str, int]: ...
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None: ...
 
@@ -174,15 +176,24 @@ class SubprocessExecutorBackend:
     def create_service(self, *, service_id: str, worker_count: int) -> None:
         self._ensure_service_client(service_id).create_service(service_id=service_id, worker_count=worker_count)
 
-    def stop_service(self, *, service_id: str) -> None:
+    def stop_service(self, *, service_id: str, reason: str = "") -> None:
         key = str(service_id or "").strip()
         client = self._service_clients.pop(key, None)
         if client is None:
             return
         try:
-            client.stop_service(service_id=service_id)
+            client.stop_service(service_id=service_id, reason=reason)
         finally:
             client.close()
+
+    def service_worker_liveness(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for service_id, client in list(self._service_clients.items()):
+            if client is None or not client.is_alive():
+                out[str(service_id)] = 0
+                continue
+            out.update(client.service_worker_liveness())
+        return out
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         self._ensure_pool_client(pool_id).create_task_pool(pool_id=pool_id, worker_count=worker_count)

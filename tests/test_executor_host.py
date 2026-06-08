@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 import time
 
@@ -132,6 +133,45 @@ def test_create_executor_backend_defaults_to_subprocess_host():
         assert backend.backend_name == "subprocess_host"
     finally:
         backend.close()
+
+
+def test_subprocess_backend_stop_service_accepts_reason_and_reports_liveness():
+    calls = []
+
+    class _FakeClient:
+        def __init__(self, liveness):
+            self._liveness = dict(liveness)
+
+        def is_alive(self):
+            return True
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop_service", kwargs))
+
+        def service_worker_liveness(self):
+            return dict(self._liveness)
+
+        def close(self, **kwargs):
+            calls.append(("close", kwargs))
+
+    backend = SubprocessExecutorBackend(task_worker_capacity=1)
+    backend._service_clients["svc-a"] = _FakeClient({"svc-a": 2})  # noqa: SLF001
+    backend._service_clients["svc-b"] = _FakeClient({"svc-b": 0})  # noqa: SLF001
+
+    assert backend.service_worker_liveness() == {"svc-a": 2, "svc-b": 0}
+    backend.stop_service(service_id="svc-a", reason="owner heartbeat timeout")
+
+    assert ("stop_service", {"service_id": "svc-a", "reason": "owner heartbeat timeout"}) in calls
+    assert any(name == "close" for name, _kwargs in calls)
+    assert "svc-a" not in backend._service_clients  # noqa: SLF001
+    assert backend.service_worker_liveness() == {"svc-b": 0}
+
+
+def test_executor_backend_interface_exposes_service_stop_reason_and_liveness():
+    stop_signature = inspect.signature(SubprocessExecutorBackend.stop_service)
+    assert "reason" in stop_signature.parameters
+    assert stop_signature.parameters["reason"].default == ""
+    assert hasattr(SubprocessExecutorBackend, "service_worker_liveness")
 
 
 def test_create_executor_backend_rejects_embedded():

@@ -5596,6 +5596,100 @@ def test_nodecontrol_service_call_throttles_code_last_at_touch(tmp_path, monkeyp
     assert len(calls) == 1
 
 
+def test_nodecontrol_service_stream_reports_stop_reason_from_inflight_stop(tmp_path):
+    state = NodeControlState(
+        node_id="node-stream-stop-reason",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_stream_stop_reason"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    code_version = "sha256:" + "f" * 64
+    artifact = CodeArtifact(
+        code_version=code_version,
+        path=str(tmp_path),
+        runtime="py3",
+        entry_module="stream_stop_service",
+        entry_callable="run",
+        package_format="py",
+        export_mode="module",
+        export_methods=(),
+        export_decorator="",
+        dependency_policy_mode="safe",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=1,
+        created_at=now,
+    )
+    service = ServiceSession(
+        service_id="svc-stream-stop",
+        owner_client_id="owner",
+        service_name="svc-stream-stop",
+        code_version=code_version,
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-stream",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("stream_stop_service", "run")},
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def call_service_stream(self, **kwargs):  # noqa: ARG002
+            yield {
+                "kind": "service_stream_done",
+                "status_text": "FAILED_INFRA",
+                "err_type": "ServiceStopped",
+                "err_message": "owner heartbeat timeout",
+                "result": {"item_count": 0},
+            }
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._codes[code_version] = artifact  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        response = state._invoke_service_stream_http(  # noqa: SLF001
+            service_id=service.service_id,
+            method="run",
+            payload={},
+            service_token=service.service_token,
+            timeout_sec=1.0,
+        )
+        lines = [json.loads(line.decode("utf-8")) for line in response.body_iter]
+    finally:
+        state.close()
+
+    assert lines == [
+        {
+            "event": "done",
+            "ok": False,
+            "item_count": 0,
+            "error_type": "ServiceStopped",
+            "error": "owner heartbeat timeout",
+        }
+    ]
+
+
 def test_nodecontrol_service_call_ignores_code_last_at_touch_permission_error(tmp_path, monkeypatch):
     state = NodeControlState(
         node_id="node-touch-permission",
