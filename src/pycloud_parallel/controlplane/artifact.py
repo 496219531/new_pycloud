@@ -464,9 +464,24 @@ def _package_function_blob(func: Callable) -> Tuple[bytes, str]:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-def _package_roots_blob(paths: Iterable[Path]) -> Tuple[bytes, str]:
+def _package_roots_blob(paths: Iterable[Path], *, entry_module: str = "") -> Tuple[bytes, str]:
+    normalized_paths = [Path(str(path)).expanduser() for path in paths]
+    normalized_module = _normalize_entry_module_arg(entry_module)
+    root_module = normalized_module.split(".", 1)[0].strip()
+    if len(normalized_paths) == 1 and root_module:
+        root = normalized_paths[0].resolve()
+        if root.is_dir() and root.name != root_module and (root / root_module).exists():
+            tmp_path = DependencyPackager().package_directory(
+                root,
+                **_packaging_kwargs(),
+            )
+            try:
+                return _read_temp_file(tmp_path), "artifact_paths.tar.gz"
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
     tmp_path = DependencyPackager().package_roots(
-        paths,
+        normalized_paths,
         **_packaging_kwargs(synthesize_missing_package_inits=True),
     )
     try:
@@ -522,7 +537,10 @@ def _prepare_artifact_blob(artifact: Artifact) -> Tuple[bytes, str]:
             raise TypeError("Artifact(source_kind='paths') requires an ArtifactPaths source")
         if artifact.source_value.mode == "paths":
             return _package_relative_paths_blob(artifact.source_value)
-        return _package_roots_blob(Path(str(path)).expanduser() for path in artifact.source_value.paths)
+        return _package_roots_blob(
+            (Path(str(path)).expanduser() for path in artifact.source_value.paths),
+            entry_module=artifact.entry_module,
+        )
 
     raise ValueError(f"unsupported artifact source kind: {artifact.source_kind}")
 

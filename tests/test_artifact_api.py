@@ -241,3 +241,32 @@ def test_artifact_from_paths_packages_single_directory(tmp_path) -> None:
         names = set(tf.getnames())
     assert "demo_pkg/__init__.py" in names
     assert "demo_pkg/worker.py" in names
+
+
+def test_artifact_from_paths_project_root_keeps_entry_root_importable(tmp_path) -> None:
+    from pycloud_parallel.controlplane.artifact import Artifact, ArtifactExports, _prepare_artifact
+
+    project_root = tmp_path / "ProjectRoot"
+    package_dir = project_root / "Task" / "calc_asset_ratio"
+    package_dir.mkdir(parents=True)
+    (project_root / "Task" / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "calc_asset_ratio.py").write_text(
+        "def run(**_kwargs):\n    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    artifact = Artifact.from_paths(
+        project_root,
+        entry_module="Task.calc_asset_ratio.calc_asset_ratio",
+        exports=ArtifactExports.export_all(),
+    )
+
+    prepared = _prepare_artifact(artifact, consumer_kind="service")
+
+    assert prepared.package_format == "tar.gz"
+    with tarfile.open(fileobj=io.BytesIO(prepared.blob), mode="r:gz") as tf:
+        names = set(tf.getnames())
+    assert "Task/__init__.py" in names
+    assert "Task/calc_asset_ratio/__init__.py" in names
+    assert "Task/calc_asset_ratio/calc_asset_ratio.py" in names
+    assert "ProjectRoot/Task/calc_asset_ratio/calc_asset_ratio.py" not in names
