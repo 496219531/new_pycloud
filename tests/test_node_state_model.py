@@ -4929,6 +4929,129 @@ def test_service_zero_alive_workers_stops_only_that_service(tmp_path):
         state.close()
 
 
+def test_executor_host_crash_disables_service_deploy_without_fencing_node(tmp_path):
+    state = NodeControlState(
+        node_id="node-executor-crash-deploy-health",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_executor_crash"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def drain_events(self):
+            return [
+                {
+                    "kind": "executor_host_crash",
+                    "error_type": "RuntimeError",
+                    "error": "executor crashed",
+                    "traceback": "trace",
+                }
+            ]
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+
+    try:
+        state._drain_executor_events()  # noqa: SLF001
+        snapshot = state.registrar_snapshot()
+
+        assert state.execution_fenced is False
+        assert state.can_accept_service_deploy is False
+        assert "executor host crashed" in state.deploy_health_reason
+        assert snapshot["accept_service_deploy"] is False
+        assert "executor host crashed" in snapshot["deploy_health_reason"]
+    finally:
+        state.close()
+
+
+def test_executor_host_rebuild_restores_service_deploy_health(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-executor-rebuild-deploy-health",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_executor_rebuild"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    created = []
+
+    class _DeadExecutorHost:
+        def is_alive(self):
+            return False
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    class _FreshExecutorHost:
+        def is_alive(self):
+            return True
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    monkeypatch.setattr(state, "_create_executor_backend", lambda: created.append(True) or _FreshExecutorHost())
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _DeadExecutorHost()  # noqa: SLF001
+        state._set_deploy_health_block_locked("executor host crashed: RuntimeError old")  # noqa: SLF001
+
+    try:
+        with state._cv:  # noqa: SLF001
+            rebuilt = state._ensure_executor_host_alive_locked()  # noqa: SLF001
+
+        assert rebuilt is True
+        assert created == [True]
+        assert state.can_accept_service_deploy is True
+        assert state.deploy_health_reason == ""
+        assert state.registrar_snapshot()["accept_service_deploy"] is True
+    finally:
+        state.close()
+
+
+def test_service_create_rejects_when_deploy_health_blocked(tmp_path):
+    state = NodeControlState(
+        node_id="node-create-deploy-blocked",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_create_blocked"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+    digest = hashlib.sha256(blob).hexdigest()
+    with state._lock:  # noqa: SLF001
+        state._set_deploy_health_block_locked("executor host crashed: blocked")  # noqa: SLF001
+
+    try:
+        with pytest.raises(RuntimeError, match="executor host crashed: blocked"):
+            state.create_service(
+                owner_client_id="owner",
+                service_name="svc-blocked",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="svc_blocked",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                expose_http=False,
+                chunks=[blob],
+            )
+    finally:
+        state.close()
+
+
 def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     state = NodeControlState(
         node_id="node-close-executors",

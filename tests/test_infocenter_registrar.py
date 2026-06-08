@@ -258,6 +258,47 @@ def test_node_registrar_marks_fenced_node_unhealthy_and_not_deployable(tmp_path)
         info_server.stop()
 
 
+def test_node_registrar_reports_deploy_health_reason(tmp_path):
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    node_state = NodeControlState(
+        node_id="node-deploy-health-reg",
+        queue_capacity=32,
+        worker_capacity=4,
+        artifact_dir=str(tmp_path / "code_cache_deploy_health_reg"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        control_base_url="http://127.0.0.1:18063",
+    )
+    with node_state._lock:  # noqa: SLF001
+        node_state._set_deploy_health_block_locked("executor host crashed: test")  # noqa: SLF001
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_server.base_url,
+        node_id="node-deploy-health-reg",
+        control_addr="127.0.0.1:50063",
+        state=node_state,
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        fallback_heartbeat_sec=1,
+    )
+
+    try:
+        assert registrar.sync_now() is True
+
+        nodes = info_state.list_nodes(healthy_only=False, tags=["compute"], limit=20)
+
+        assert len(nodes) == 1
+        assert nodes[0].healthy is True
+        assert nodes[0].accept_service_deploy is False
+        assert nodes[0].metadata["deploy_health_reason"] == "executor host crashed: test"
+    finally:
+        registrar.close()
+        node_state.close()
+        info_server.stop()
+
+
 def test_ops_page_merges_duplicate_services_with_same_endpoint():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(

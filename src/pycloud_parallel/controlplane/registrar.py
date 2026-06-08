@@ -446,6 +446,9 @@ class NodeInfoCenterRegistrar:
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
         if bool(snapshot.get("execution_fenced", False)):
             metadata["execution_fenced"] = "true"
+        deploy_health_reason = str(snapshot.get("deploy_health_reason", "") or "").strip()
+        if deploy_health_reason:
+            metadata["deploy_health_reason"] = deploy_health_reason
         task_pool_reports = _limit_task_pool_reports(snapshot.get("task_pool_reports") or [])
         service_reports = list(snapshot.get("service_reports") or [])
         active_runtimes = list(snapshot.get("active_runtimes") or [])
@@ -530,6 +533,9 @@ class NodeInfoCenterRegistrar:
         metadata["accept_service_deploy"] = "true" if accept_service_deploy else "false"
         if bool(snapshot.get("execution_fenced", False)):
             metadata["execution_fenced"] = "true"
+        deploy_health_reason = str(snapshot.get("deploy_health_reason", "") or "").strip()
+        if deploy_health_reason:
+            metadata["deploy_health_reason"] = deploy_health_reason
         task_pool_reports = _limit_task_pool_reports(snapshot.get("task_pool_reports") or [])
         service_reports = list(snapshot.get("service_reports") or [])
         active_runtimes = list(snapshot.get("active_runtimes") or [])

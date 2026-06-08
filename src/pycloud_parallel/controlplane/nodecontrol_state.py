@@ -240,6 +240,7 @@ class NodeControlState(NodeRuntimeBase):
         self._execution_fenced = False
         self._execution_fenced_reason = ""
         self._execution_fenced_at: Optional[datetime] = None
+        self._deploy_health_block_reason = ""
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
         self._service_zero_alive_counts: Dict[str, int] = {}
@@ -572,6 +573,7 @@ class NodeControlState(NodeRuntimeBase):
             self._execution_fenced = True
             self._execution_fenced_reason = normalized_reason
             self._execution_fenced_at = fenced_at
+            self._deploy_health_block_reason = normalized_reason
             old_executor = self._executor_host
             self._executor_host = None
             self._cv.notify_all()
@@ -970,7 +972,30 @@ class NodeControlState(NodeRuntimeBase):
 
     @property
     def can_accept_service_deploy(self) -> bool:
-        return bool(getattr(self, "accept_service_deploy", True)) and not self.execution_fenced
+        return (
+            bool(getattr(self, "accept_service_deploy", True))
+            and not self.execution_fenced
+            and not str(getattr(self, "_deploy_health_block_reason", "") or "").strip()
+        )
+
+    @property
+    def deploy_health_reason(self) -> str:
+        return str(getattr(self, "_deploy_health_block_reason", "") or "").strip()
+
+    def _set_deploy_health_block_locked(self, reason: str) -> None:
+        normalized = str(reason or "").strip()
+        if not normalized:
+            return
+        self._deploy_health_block_reason = normalized
+
+    def _clear_deploy_health_block_locked(self, *, reason_prefix: str = "") -> None:
+        current = str(getattr(self, "_deploy_health_block_reason", "") or "").strip()
+        if not current:
+            return
+        normalized_prefix = str(reason_prefix or "").strip()
+        if normalized_prefix and not current.startswith(normalized_prefix):
+            return
+        self._deploy_health_block_reason = ""
 
     def execution_fence_message(self) -> str:
         reason = str(getattr(self, "_execution_fenced_reason", "") or "").strip() or "unknown"
@@ -1046,8 +1071,13 @@ class NodeControlState(NodeRuntimeBase):
 
         current_time = now or utc_now()
         old_host = self._executor_host
-        self._executor_host = self._create_executor_backend()
+        try:
+            self._executor_host = self._create_executor_backend()
+        except Exception as exc:
+            self._set_deploy_health_block_locked(f"executor host create failed: {exc!r}")
+            raise
 
+        rebuild_failures = 0
         for session in self._services.values():
             if session.status != pb2.SERVICE_STATUS_RUNNING or not session.executor_ready:
                 continue
@@ -1069,6 +1099,7 @@ class NodeControlState(NodeRuntimeBase):
                 )
                 session.alive_workers = session.worker_count
             except Exception as exc:
+                rebuild_failures += 1
                 session.executor_ready = False
                 session.alive_workers = 0
                 session.status = pb2.SERVICE_STATUS_STOPPED
@@ -1095,6 +1126,7 @@ class NodeControlState(NodeRuntimeBase):
                 )
                 pool.alive_workers = pool.worker_count
             except Exception as exc:
+                rebuild_failures += 1
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
@@ -1106,6 +1138,12 @@ class NodeControlState(NodeRuntimeBase):
                 old_host.close()
             except Exception:
                 pass
+        if rebuild_failures:
+            self._set_deploy_health_block_locked(
+                f"executor host rebuilt with resource restore failures: {rebuild_failures}"
+            )
+        else:
+            self._clear_deploy_health_block_locked(reason_prefix="executor host")
         return True
 
     def get_object_artifact(self, object_id: str) -> ObjectArtifact:
@@ -2211,6 +2249,9 @@ class NodeControlState(NodeRuntimeBase):
     ) -> ServiceSession:
         if bool(getattr(self, "_execution_fenced", False)):
             raise RuntimeError(self.execution_fence_message())
+        if not self.can_accept_service_deploy:
+            reason = self.deploy_health_reason or "service deploy is disabled"
+            raise RuntimeError(f"service deploy is disabled: {reason}")
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(
@@ -3939,6 +3980,7 @@ class NodeControlState(NodeRuntimeBase):
             "service_timing_metadata": service_timing_metadata,
             "execution_fenced": bool(getattr(self, "_execution_fenced", False)),
             "accept_service_deploy": self.can_accept_service_deploy,
+            "deploy_health_reason": self.deploy_health_reason,
             "execution_fenced_reason": str(getattr(self, "_execution_fenced_reason", "") or ""),
             "execution_fenced_at": (
                 self._execution_fenced_at.isoformat()
@@ -3980,6 +4022,10 @@ class NodeControlState(NodeRuntimeBase):
             with self._cv:
                 kind = str(item.get("kind", "") or "")
                 if kind == "executor_host_crash":
+                    self._set_deploy_health_block_locked(
+                        "executor host crashed: "
+                        f"{str(item.get('error_type', '') or '')} {str(item.get('error', '') or '')}".strip()
+                    )
                     logger.error(
                         "[NodeControl] executor host crashed node_id=%s node_instance_id=%s error_type=%s error=%s traceback=%s",
                         self.node_id,
