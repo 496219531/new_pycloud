@@ -5254,6 +5254,71 @@ def test_stop_service_cleanup_failure_blocks_deploy(tmp_path):
         state.close()
 
 
+def test_service_worker_liveness_success_clears_probe_deploy_block(tmp_path):
+    state = NodeControlState(
+        node_id="node-liveness-clear",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_liveness_clear"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    fail_probe = {"value": True}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def service_worker_liveness(self):
+            if fail_probe["value"]:
+                raise RuntimeError("probe timeout")
+            return {"svc-liveness-clear": 1}
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    service = ServiceSession(
+        service_id="svc-liveness-clear",
+        owner_client_id="owner",
+        service_name="svc-liveness-clear",
+        code_version="sha256:liveness-clear",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-liveness-clear",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert state.can_accept_service_deploy is False
+        assert state.deploy_health_reason.startswith("service worker liveness failed")
+
+        fail_probe["value"] = False
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert state.can_accept_service_deploy is True
+        assert state.deploy_health_reason == ""
+        assert service.alive_workers == 1
+    finally:
+        state.close()
+
+
 def test_executor_host_crash_disables_service_deploy_without_fencing_node(tmp_path):
     state = NodeControlState(
         node_id="node-executor-crash-deploy-health",

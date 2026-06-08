@@ -4255,6 +4255,7 @@ class NodeControlState(NodeRuntimeBase):
                 exc,
             )
             return
+        self._clear_deploy_health_block_locked(reason_prefix="service worker liveness failed")
         for service_id, alive_count in liveness.items():
             session = self._services.get(str(service_id or ""))
             if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
