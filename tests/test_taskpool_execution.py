@@ -2450,6 +2450,126 @@ def test_task_pool_compensation_replaces_retryable_failed_same_node(monkeypatch)
         session.close()
 
 
+def test_task_pool_keepalive_compensates_pool_not_running(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    node = SimpleNamespace(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+    )
+    created = []
+    closed_reasons = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            pool = SimpleNamespace(
+                kind="task_pool",
+                owner_client_id=kwargs["owner_client_id"],
+                pool_id=f"new-pool-{len(created) + 1}",
+                pool_name=kwargs["pool_name"],
+                pool_token="token-new",
+                code_version="sha256:test",
+                worker_count=kwargs["worker_count"],
+                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1),
+                submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+                pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+                cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
+                close=lambda reason="": closed_reasons.append(("new", reason)),
+                _client=self,
+            )
+            created.append(pool)
+            return pool
+
+    class _StoppedPool:
+        kind = "task_pool"
+        owner_client_id = "owner-demo"
+        pool_id = "old-pool"
+        pool_name = "demo-pool"
+        pool_token = "token-old"
+        code_version = "sha256:test"
+        worker_count = 1
+        heartbeat_timeout_sec = 1
+        status = "RUNNING"
+        _client = SimpleNamespace(close=lambda: closed_reasons.append(("old-client", "")))
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            raise RuntimeError("task pool not running")
+
+        def close(self, reason=""):
+            closed_reasons.append(("old", reason))
+
+    session = TaskPool(
+        pools={"node-inst-1": _StoppedPool()},
+        nodes={"node-inst-1": node},
+        task_method="run",
+        job_id="job-keepalive-compensate-pool-stopped",
+    )
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "owner_client_id": "owner-demo",
+            "pool_name": "demo-pool",
+            "blob": b"def run(**kwargs):\n    return kwargs\n",
+            "runtime": "py3",
+            "entry_module": "task_demo",
+            "entry_callable": "run",
+            "package_format": "",
+            "deps": None,
+            "managed_global_names": [],
+            "initial_globals": {},
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 1,
+            "idle_ttl_sec": 0,
+            "chunk_size": 1024,
+            "healthy_only": True,
+            "tags": [],
+            "node_ids": [],
+            "node_instance_ids": [],
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+            "api_token": "",
+            "check_interval_sec": 0.01,
+        }
+    )
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    try:
+        session._start_keepalive(interval_sec=0.02)  # noqa: SLF001
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and not created:
+            time.sleep(0.02)
+        assert created
+        assert session.failed is False
+        assert session._pools["node-inst-1"] is created[0]  # noqa: SLF001
+        assert "node-inst-1" in session._active_replica_ids  # noqa: SLF001
+        assert "node-inst-1" not in session.failures
+        assert ("old", "replace failed task pool replica") in closed_reasons
+    finally:
+        session.close()
+
+
 def test_native_task_pool_session_close_retries_replica_close() -> None:
     from pycloud_parallel import TaskPool
 
@@ -3852,6 +3972,68 @@ def test_native_task_pool_imap_unordered_requeues_after_submit_failure_to_health
     assert "node-bad" in session._scheduler_state.disabled_candidates
 
 
+def test_native_task_pool_imap_unordered_requeues_when_pool_not_running() -> None:
+    from pycloud_parallel import TaskPool
+
+    submitted_by_node = {"node-dead": [], "node-good": []}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"value": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            submitted_by_node[self.node_id].extend(item.task_id for item in tasks)
+            if self.node_id == "node-dead":
+                raise RuntimeError("task pool not running")
+            for item in tasks:
+                self._ready.append(
+                    pb2.TaskResult(
+                        task_id=item.task_id,
+                        status=pb2.TASK_STATUS_SUCCEEDED,
+                        result=dict_to_struct({"value": item.task_id}),
+                    )
+                )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-dead": _Pool("node-dead"), "node-good": _Pool("node-good")},
+        nodes={},
+        task_method="run",
+        job_id="job-pool-not-running-requeue",
+    )
+
+    with patch(
+        "pycloud_parallel.execution.task_pool.select_one_candidate",
+        side_effect=lambda candidates, *, profile, state, round_robin_counter=0: (
+            next(candidate for candidate in candidates if candidate.id == "node-dead")
+            if "node-dead" in [candidate.id for candidate in candidates] and "node-dead" not in state.disabled_candidates
+            else next(candidate for candidate in candidates if candidate.id == "node-good")
+        ),
+    ):
+        out = list(session.imap_unordered([{"value": 1}, {"value": 2}], timeout_sec=0.2))
+
+    assert [index for index, _ in out] == [0, 1]
+    assert submitted_by_node["node-dead"]
+    assert len(submitted_by_node["node-good"]) >= 2
+    assert "node-dead" in session._scheduler_state.disabled_candidates
+
+
 def test_native_task_pool_imap_unordered_retries_accepted_task_after_pull_lost() -> None:
     from pycloud_parallel import TaskPool
 
@@ -3922,6 +4104,225 @@ def test_native_task_pool_imap_unordered_retries_accepted_task_after_pull_lost()
     assert session.task_retry_success_count == 1
     assert session._pending_task_ids == set()  # noqa: SLF001
     assert "node-bad" in session._scheduler_state.disabled_candidates
+
+
+def test_native_task_pool_imap_unordered_retries_accepted_task_after_result_timeout() -> None:
+    from pycloud_parallel import TaskPool
+
+    submitted_by_node = {"node-stalled": [], "node-good": []}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            submitted_by_node[self.node_id].extend(item.task_id for item in tasks)
+            if self.node_id == "node-good":
+                for item in tasks:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"task_id": item.task_id}),
+                        )
+                    )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            if self.node_id == "node-stalled":
+                return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-stalled": _Pool("node-stalled"), "node-good": _Pool("node-good")},
+        nodes={},
+        task_method="run",
+        job_id="job-retry-after-result-timeout",
+    )
+
+    with patch(
+        "pycloud_parallel.execution.task_pool.select_one_candidate",
+        side_effect=lambda candidates, *, profile, state, round_robin_counter=0: (
+            next(candidate for candidate in candidates if candidate.id == "node-stalled")
+            if "node-stalled" in [candidate.id for candidate in candidates] and "node-stalled" not in state.disabled_candidates
+            else next(candidate for candidate in candidates if candidate.id == "node-good")
+        ),
+    ):
+        out = list(
+            session.imap_unordered(
+                [{"value": 1}],
+                max_in_flight=1,
+                receive_batch=1,
+                result_timeout_sec=0.05,
+                wait_ms=1,
+                max_infra_retries=1,
+            )
+        )
+
+    assert out == [(0, {"task_id": submitted_by_node["node-good"][0]})]
+    assert len(submitted_by_node["node-stalled"]) == 1
+    assert len(submitted_by_node["node-good"]) == 1
+    assert submitted_by_node["node-stalled"][0] != submitted_by_node["node-good"][0]
+    assert session.task_retry_success_count == 1
+    assert session._pending_task_ids == set()  # noqa: SLF001
+    assert "node-stalled" not in session._scheduler_state.disabled_candidates
+
+
+def test_native_task_pool_imap_unordered_spreads_result_timeout_retries() -> None:
+    from pycloud_parallel import TaskPool
+
+    submitted_by_node = {"node-stalled": [], "node-good-1": [], "node-good-2": []}
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 4
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            submitted_by_node[self.node_id].extend(item.task_id for item in tasks)
+            if self.node_id != "node-stalled":
+                for item in tasks:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"task_id": item.task_id}),
+                        )
+                    )
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            if self.node_id == "node-stalled":
+                return pb2.PullResultsResponse(ok=True, results=[], next_cursor="")
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={
+            "node-stalled": _Pool("node-stalled"),
+            "node-good-1": _Pool("node-good-1"),
+            "node-good-2": _Pool("node-good-2"),
+        },
+        nodes={},
+        task_method="run",
+        job_id="job-spread-timeout-retry",
+    )
+
+    with patch(
+        "pycloud_parallel.execution.task_pool.select_one_candidate",
+        side_effect=lambda candidates, *, profile, state, round_robin_counter=0: (
+            next(candidate for candidate in candidates if candidate.id == "node-stalled")
+            if "node-stalled" in [candidate.id for candidate in candidates] and "node-stalled" not in state.disabled_candidates
+            else next(candidate for candidate in candidates if candidate.id == "node-good-1")
+        ),
+    ):
+        out = list(
+            session.imap_unordered(
+                [{"value": idx} for idx in range(4)],
+                max_in_flight=4,
+                receive_batch=4,
+                result_timeout_sec=0.05,
+                wait_ms=1,
+                max_infra_retries=1,
+            )
+        )
+
+    assert len(out) == 4
+    assert len(submitted_by_node["node-stalled"]) == 4
+    assert len(submitted_by_node["node-good-1"]) == 2
+    assert len(submitted_by_node["node-good-2"]) == 2
+    assert session.task_retry_success_count == 4
+    assert session._pending_task_ids == set()  # noqa: SLF001
+
+
+def test_native_task_pool_imap_unordered_spreads_timeout_retries_when_all_nodes_pending() -> None:
+    from pycloud_parallel import TaskPool
+
+    submitted_by_node = {"node-1": [], "node-2": []}
+    successful_retry_ids: set[str] = set()
+
+    class _Pool:
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 30
+        worker_count = 2
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self._ready: list[pb2.TaskResult] = []
+            self._client = SimpleNamespace(fetch_result_data=lambda task_result, target_path="": {"task_id": task_result.task_id})
+
+        def submit_tasks(self, tasks, job_id=""):
+            submitted_before = sum(len(values) for values in submitted_by_node.values())
+            submitted_by_node[self.node_id].extend(item.task_id for item in tasks)
+            for item in tasks:
+                if submitted_before >= 4:
+                    self._ready.append(
+                        pb2.TaskResult(
+                            task_id=item.task_id,
+                            status=pb2.TASK_STATUS_SUCCEEDED,
+                            result=dict_to_struct({"task_id": item.task_id}),
+                        )
+                    )
+                successful_retry_ids.add(item.task_id)
+            return pb2.SubmitTasksResponse(
+                ok=True,
+                accepted=[pb2.TaskAccepted(task_id=item.task_id, status=pb2.TASK_STATUS_QUEUED) for item in tasks],
+                rejected=[],
+            )
+
+        def pull_results(self, limit=100, wait_ms=0, cursor=""):
+            batch = self._ready[:limit]
+            self._ready = self._ready[limit:]
+            return pb2.PullResultsResponse(ok=True, results=batch, next_cursor="")
+
+    session = TaskPool(
+        pools={"node-1": _Pool("node-1"), "node-2": _Pool("node-2")},
+        nodes={},
+        task_method="run",
+        job_id="job-spread-all-pending-timeout-retry",
+    )
+
+    out = list(
+        session.imap_unordered(
+            [{"value": idx} for idx in range(4)],
+            max_in_flight=4,
+            receive_batch=4,
+            result_timeout_sec=0.05,
+            wait_ms=1,
+            max_infra_retries=1,
+        )
+    )
+
+    assert len(out) == 4
+    assert len(submitted_by_node["node-1"]) == 4
+    assert len(submitted_by_node["node-2"]) == 4
+    assert session.task_retry_success_count == 4
+    assert session._pending_task_ids == set()  # noqa: SLF001
 
 
 def test_native_task_pool_imap_unordered_reprepares_payload_for_retry_node() -> None:

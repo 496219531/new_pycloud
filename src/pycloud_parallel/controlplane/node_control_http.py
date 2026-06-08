@@ -601,6 +601,8 @@ class NodeControlHttpApp:
             return self._err(401, str(exc))
         except ValueError as exc:
             return self._err(400, str(exc))
+        except RuntimeError as exc:
+            return self._runtime_err(exc)
         return self._ok(
             {
                 "ok": True,
@@ -654,6 +656,8 @@ class NodeControlHttpApp:
             return self._err(401, str(exc))
         except ValueError as exc:
             return self._err(400, str(exc))
+        except RuntimeError as exc:
+            return self._runtime_err(exc)
         return self._ok(
             {
                 "ok": True,
@@ -676,6 +680,8 @@ class NodeControlHttpApp:
             return self._err(404, str(exc))
         except PermissionError as exc:
             return self._err(401, str(exc))
+        except RuntimeError as exc:
+            return self._runtime_err(exc)
         return self._ok({"ok": True, "results": [_message_to_dict(item) for item in results], "next_cursor": next_cursor})
 
     def _pull_pool_results_bytes(self, pool_id: str, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
@@ -691,6 +697,8 @@ class NodeControlHttpApp:
             return self._err(404, str(exc))
         except PermissionError as exc:
             return self._err(401, str(exc))
+        except RuntimeError as exc:
+            return self._runtime_err(exc)
         meta_results = []
         chunks = []
         for item in results:
@@ -955,6 +963,13 @@ class NodeControlHttpApp:
 
     def _err(self, status_code: int, message: str) -> Tuple[int, Dict[str, str], bytes]:
         return int(status_code), {"Content-Type": "application/json; charset=utf-8"}, _json_bytes({"ok": False, "error": str(message)})
+
+    def _runtime_err(self, exc: RuntimeError) -> Tuple[int, Dict[str, str], bytes]:
+        message = str(exc)
+        lower = message.lower()
+        if any(marker in lower for marker in ("not running", "not found", "is stopped", "stopped")):
+            return self._err(409, message)
+        return self._err(500, f"{exc.__class__.__name__}: {message}")
 
 
 class NodeControlHttpServer:

@@ -492,6 +492,7 @@ class ExecutionSessionBase:
                         time.monotonic(),
                     )
                 if not self._active_replica_snapshot():
+                    can_compensate = bool(getattr(self, "_compensation_spec", None))
                     retryable_replica_ids = [
                         str(node_id)
                         for node_id in self.replicas.keys()
@@ -505,7 +506,6 @@ class ExecutionSessionBase:
                         )
                     ]
                     can_retry = bool(retryable_replica_ids)
-                    can_compensate = bool(getattr(self, "_compensation_spec", None))
                     if not (can_retry or can_compensate):
                         self.failed = True
                         self._hb_stop.set()

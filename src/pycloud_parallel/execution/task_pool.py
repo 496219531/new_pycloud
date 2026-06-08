@@ -193,6 +193,7 @@ class _TaskReplayRecord:
     attempt: int
     submitted_at: float
     last_error: str = ""
+    timeout_retry_count: int = 0
 
 
 def _infocenter_client(*args, **kwargs):
@@ -1173,7 +1174,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if not spec:
             return
         now = time.monotonic()
-        interval_sec = max(5.0, float(spec.get("check_interval_sec", 15.0) or 15.0))
+        interval_floor_sec = 0.1 if not self._active_replica_snapshot() else 5.0
+        interval_sec = max(interval_floor_sec, float(spec.get("check_interval_sec", 15.0) or 15.0))
         if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
             return
         self._last_compensation_attempt_at = now
@@ -1192,7 +1194,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 is_retryable_failure=self._is_retryable_compensation_failure,
             )
             failed = {node_id for node_id, state in recovery_states.items() if not state.active}
-            retryable_failed = {node_id for node_id, state in recovery_states.items() if state.retryable}
+            retryable_failed = {
+                node_id
+                for node_id, state in recovery_states.items()
+                if state.retryable or self._is_retryable_compensation_failure(state.error)
+            }
             if desired <= 0 or len(active) >= desired:
                 return 0
             excluded = active | (failed - retryable_failed)
@@ -1204,7 +1210,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         node_ids=list(spec.get("node_ids") or ()),
                         node_instance_ids=list(spec.get("node_instance_ids") or ()),
                         node_count=desired,
-                        limit=max(desired, int(spec.get("node_limit", 100) or 100)),
+                        limit=max(desired * 2, int(spec.get("node_limit", 100) or 100)),
                         require_credit=False,
                         preferred_runtime_key="",
                         runtime=str(spec.get("runtime", "") or ""),
@@ -1611,6 +1617,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         node_id: str,
         attempt: int,
         last_error: str = "",
+        timeout_retry_count: int = 0,
     ) -> None:
         normalized_task_id = str(task_id or "").strip()
         normalized_node_id = str(node_id or "").strip()
@@ -1625,6 +1632,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             attempt=max(0, int(attempt or 0)),
             submitted_at=time.time(),
             last_error=str(last_error or ""),
+            timeout_retry_count=max(0, int(timeout_retry_count or 0)),
         )
         with self._result_state_lock:
             self._replay_records[normalized_task_id] = record
@@ -1657,6 +1665,30 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._scheduler_state.disabled_candidates.add(normalized_node_id)
         self.failures[normalized_node_id] = str(error or "task pool node lost")
         self._mark_pool_submit_failure(normalized_node_id, failure_kind=REMOTE_INFRA_FAILED, error=error)
+        with self._result_state_lock:
+            task_ids = set(self._replay_node_index.get(normalized_node_id, set()))
+            task_ids.update(
+                task_id
+                for task_id, mapped_node_id in self._pending_task_node_ids.items()
+                if str(mapped_node_id or "").strip() == normalized_node_id
+            )
+            records: List[_TaskReplayRecord] = []
+            orphan_task_ids: List[str] = []
+            for task_id in task_ids:
+                self._pending_task_ids.discard(task_id)
+                self._pending_task_node_ids.pop(task_id, None)
+                record = self._remove_replay_record_unlocked(task_id)
+                if record is not None:
+                    records.append(record)
+                else:
+                    orphan_task_ids.append(str(task_id))
+            self._scheduler_state.local_inflight_by_candidate[normalized_node_id] = 0
+        return records, orphan_task_ids
+
+    def _take_pending_replay_records_for_node(self, node_id: str) -> Tuple[List[_TaskReplayRecord], List[str]]:
+        normalized_node_id = str(node_id or "").strip()
+        if not normalized_node_id:
+            return [], []
         with self._result_state_lock:
             task_ids = set(self._replay_node_index.get(normalized_node_id, set()))
             task_ids.update(
@@ -1828,6 +1860,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
     def _pending_result_count(self) -> int:
         with self._result_state_lock:
             return len(self._pending_task_ids)
+
+    def _pending_result_count_by_node(self) -> Dict[str, int]:
+        with self._result_state_lock:
+            counts: Dict[str, int] = {}
+            for task_id in self._pending_task_ids:
+                node_id = str(self._pending_task_node_ids.get(task_id, "") or "<unmapped>")
+                counts[node_id] = int(counts.get(node_id, 0) or 0) + 1
+            return counts
 
     def _is_pending_task_id_unlocked(self, task_id: str) -> bool:
         normalized = str(task_id or "").strip()
@@ -2861,6 +2901,85 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 failed.append(item)
         return failed
 
+    def _retry_timeout_replay_records_evenly(
+        self,
+        records: Sequence[_TaskReplayRecord],
+        *,
+        reason: str,
+        target_node_ids: Sequence[str],
+        disabled_submit_nodes: Set[str],
+        scheduler_failures: Dict[str, str],
+        inflight_by_node: Dict[str, int],
+        task_index_by_id: Dict[str, int],
+    ) -> List[ExecutionItem]:
+        failed: List[ExecutionItem] = []
+        targets = [node_id for node_id in target_node_ids if node_id not in disabled_submit_nodes]
+        if not targets:
+            return [self._replay_failure_item(record, message="no healthy task pool node available for timeout retry") for record in records]
+        target_offset = 0
+        for record in records:
+            if int(record.timeout_retry_count or 0) >= 1:
+                failed.append(self._replay_failure_item(record, message=reason or "task result timeout after retry"))
+                continue
+            last_error = reason or "task result timeout"
+            accepted = False
+            attempted = 0
+            record_targets = [node_id for node_id in targets if node_id != record.current_node_id] or list(targets)
+            while attempted < len(record_targets):
+                target_node_id = record_targets[(target_offset + attempted) % len(record_targets)]
+                attempted += 1
+                if target_node_id in disabled_submit_nodes:
+                    continue
+                try:
+                    prepare_start = time.perf_counter()
+                    item = self._build_task_submit_item_for_node(
+                        node_id=target_node_id,
+                        payload=dict(record.original_payload or {}),
+                        timeout_hint_sec=0,
+                        priority=1,
+                    )
+                    self.retry_prepare_payload_ms += (time.perf_counter() - prepare_start) * 1000.0
+                    submit_start = time.perf_counter()
+                    resp = self._submit_task_items_to_node(target_node_id, [item], job_id=self.job_id)
+                    self.retry_submit_ms += (time.perf_counter() - submit_start) * 1000.0
+                    new_task_id = str(item.task_id or "").strip()
+                    accepted_ids = {
+                        str(accepted_item.task_id or "").strip()
+                        for accepted_item in resp.accepted
+                        if str(accepted_item.task_id or "").strip()
+                    }
+                    if new_task_id not in accepted_ids:
+                        raise RuntimeError("timeout retry submit was not accepted")
+                except Exception as exc:
+                    last_error = repr(exc)
+                    disabled_submit_nodes.add(target_node_id)
+                    scheduler_failures[target_node_id] = last_error
+                    self._mark_pool_submit_failure(target_node_id, failure_kind=SUBMIT_FAILED, error=exc)
+                    continue
+                self.task_retry_count += 1
+                self.task_retry_success_count += 1
+                self.node_lost_replayed_tasks += 1
+                task_index_by_id.pop(str(record.current_task_id or ""), None)
+                task_index_by_id[new_task_id] = int(record.logical_index)
+                self._register_replay_record(
+                    logical_index=int(record.logical_index),
+                    logical_key=record.logical_key,
+                    original_payload=dict(record.original_payload or {}),
+                    task_id=new_task_id,
+                    node_id=target_node_id,
+                    attempt=int(record.attempt or 0),
+                    last_error=reason,
+                    timeout_retry_count=int(record.timeout_retry_count or 0) + 1,
+                )
+                inflight_by_node[target_node_id] = int(inflight_by_node.get(target_node_id, 0) or 0) + 1
+                self._mark_pool_submit_success(target_node_id)
+                target_offset = (targets.index(target_node_id) + 1) % len(targets)
+                accepted = True
+                break
+            if not accepted:
+                failed.append(self._replay_failure_item(record, message=last_error))
+        return failed
+
     def _submit_imap_entries_to_nodes(
         self,
         grouped: Dict[str, List[Tuple[int, Dict[str, object], pb2.TaskSubmitItem]]],
@@ -3349,9 +3468,80 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     continue
 
                 if time.time() >= wait_deadline:
+                    pending_by_node = self._pending_result_count_by_node()
                     last_error = (
                         f"imap_unordered did not receive results before timeout; pending_task_ids={self._pending_result_count()}"
                     )
+                    if pending_by_node:
+                        last_error += f"; pending_by_node={pending_by_node}"
+                    stalled_node_ids = [
+                        node_id
+                        for node_id in node_ids
+                        if int(inflight_by_node.get(node_id, 0) or 0) > 0 and node_id not in disabled_submit_nodes
+                    ]
+                    retry_candidate_ids = [
+                        node_id
+                        for node_id in node_ids
+                        if node_id not in disabled_submit_nodes and node_id not in stalled_node_ids
+                    ]
+                    if not retry_candidate_ids:
+                        retry_candidate_ids = [
+                            node_id
+                            for node_id in node_ids
+                            if node_id not in disabled_submit_nodes and int(inflight_by_node.get(node_id, 0) or 0) > 0
+                        ]
+                    if max_infra_retries > 0 and stalled_node_ids and retry_candidate_ids:
+                        replay_records: List[_TaskReplayRecord] = []
+                        for stalled_node_id in stalled_node_ids:
+                            records, _orphan_task_ids = self._take_pending_replay_records_for_node(stalled_node_id)
+                            if not records:
+                                continue
+                            inflight_by_node[stalled_node_id] = 0
+                            scheduler_failures[stalled_node_id] = last_error
+                            replay_records.extend(records)
+                        if replay_records:
+                            exhausted_timeout_records = [
+                                record for record in replay_records if int(record.timeout_retry_count or 0) >= 1
+                            ]
+                            if exhausted_timeout_records:
+                                last_error += f"; timeout_retry_exhausted={len(exhausted_timeout_records)}"
+                                reporter.emit(
+                                    phase="failed",
+                                    completed=completed,
+                                    succeeded=succeeded,
+                                    failed=failed,
+                                    inflight=sum(inflight_by_node.values()),
+                                    submitted=submitted,
+                                    last_error=last_error,
+                                    force=True,
+                                )
+                                raise TimeoutError(last_error)
+                            replay_records = [
+                                record for record in replay_records if int(record.timeout_retry_count or 0) < 1
+                            ]
+                            retry_failed_items = self._retry_timeout_replay_records_evenly(
+                                replay_records,
+                                reason=last_error,
+                                target_node_ids=retry_candidate_ids,
+                                disabled_submit_nodes=disabled_submit_nodes,
+                                scheduler_failures=scheduler_failures,
+                                inflight_by_node=inflight_by_node,
+                                task_index_by_id=task_index_by_id,
+                            )
+                            if retry_failed_items:
+                                ready_items.extend(retry_failed_items)
+                            submitted = payload_buffer.submitted_count
+                            wait_deadline = time.time() + max(0.1, float(result_timeout_sec))
+                            reporter.emit(
+                                phase="running",
+                                completed=completed,
+                                succeeded=succeeded,
+                                failed=failed,
+                                inflight=sum(inflight_by_node.values()),
+                                submitted=submitted,
+                                last_error=f"{last_error}; replayed_timed_out_tasks={len(replay_records)}",
+                            )
+                            continue
                     reporter.emit(
                         phase="failed",
                         completed=completed,

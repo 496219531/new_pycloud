@@ -165,6 +165,38 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
         state.close()
 
 
+def test_http_taskpool_submit_closed_pool_returns_structured_error(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) * 2}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http-closed-pool",
+                pool_name="pool-http-closed-pool",
+                blob=blob,
+                runtime="py3",
+                entry_module="pool_http_closed_pool",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+            )
+            assert pool.close().accepted is True
+            task = pb2.TaskSubmitItem(
+                task_id="task-http-closed-pool",
+                payload=dict_to_struct({"value": 4}),
+                timeout_hint_sec=10,
+            )
+            try:
+                pool.submit_tasks([task], job_id="job-http-closed-pool")
+            except RuntimeError as exc:
+                assert "task pool not running" in str(exc)
+            else:
+                raise AssertionError("submit to closed task pool should fail")
+    finally:
+        server.stop()
+        state.close()
+
+
 def test_http_create_service_initial_globals_visible_before_first_call(tmp_path):
     server, state = _start_http_node(tmp_path)
     blob = (
