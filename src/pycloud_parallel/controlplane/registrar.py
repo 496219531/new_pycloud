@@ -50,6 +50,18 @@ def _is_expected_connect_failure(exc: BaseException) -> bool:
     return False
 
 
+def _is_unknown_node_error(exc: BaseException) -> bool:
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current or "").strip().lower()
+        if "unknown node" in text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _error_summary(exc: BaseException) -> str:
     reason = getattr(exc, "reason", None)
     if reason is not None:
@@ -262,6 +274,44 @@ class NodeInfoCenterRegistrar:
                 self._state_closed_after_lost = False
             return ok
         except Exception as exc:
+            if was_registered and _is_unknown_node_error(exc):
+                logger.warning(
+                    "[Registrar] node heartbeat target missing; re-registering node_id=%s node_instance_id=%s "
+                    "infocenter=%s control_addr=%s error=%s",
+                    self.node_id,
+                    self.node_instance_id,
+                    self.infocenter_addr,
+                    self.control_addr or "-",
+                    _error_summary(exc),
+                )
+                with self._sync_lock:
+                    self._registered = False
+                try:
+                    ok = self._register_once()
+                    if ok:
+                        self._state_closed_after_lost = False
+                    return ok
+                except Exception as register_exc:
+                    if _is_expected_connect_failure(register_exc):
+                        logger.warning(
+                            "[Registrar] node re-register after missing heartbeat target deferred "
+                            "node_id=%s node_instance_id=%s error=%s",
+                            self.node_id,
+                            self.node_instance_id,
+                            _error_summary(register_exc),
+                        )
+                        logger.debug("[Registrar] node re-register traceback", exc_info=True)
+                    else:
+                        logger.exception(
+                            "[Registrar] node re-register after missing heartbeat target failed "
+                            "node_id=%s node_instance_id=%s",
+                            self.node_id,
+                            self.node_instance_id,
+                        )
+                    lease_expired = self._self_fence_if_lease_expired("infocenter re-register lease expired")
+                    if not _is_expected_connect_failure(register_exc) or lease_expired:
+                        self._close_state_if_registration_lost(_error_summary(register_exc))
+                    return False
             if _is_expected_connect_failure(exc):
                 logger.warning(
                     "[Registrar] node sync deferred node_id=%s node_instance_id=%s should_register=%s error=%s",

@@ -2406,6 +2406,63 @@ def test_startup_service_registrar_closes_after_fenced_register_response():
         info_server.stop()
 
 
+def test_startup_service_registrar_re_registers_after_unknown_node_heartbeat():
+    from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    node_state = StartupServiceNode(
+        node_id="startup-reregister-node",
+        service_http_bind="",
+        service_http_base_url="http://127.0.0.1:19083",
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    node_state.close_on_registration_lost = True
+    node_state.mount_python_module_service(
+        service_name="startup-reregister-service",
+        entry_module="math",
+        export_methods=("sqrt",),
+        policy_id="trusted_internal",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr=info_server.base_url,
+        node_id=node_state.node_id,
+        control_addr="",
+        state=node_state,
+        capacity=1,
+        queue_capacity=1,
+        tags=["startup-service"],
+        fallback_heartbeat_sec=1,
+    )
+    try:
+        assert registrar.sync_now() is True
+        assert len(info_state.list_service_routes(
+            service_name="startup-reregister-service",
+            healthy_only=True,
+            limit=10,
+        )) == 1
+        with info_state._lock:  # noqa: SLF001
+            info_state._nodes.pop(registrar.node_instance_id, None)  # noqa: SLF001
+
+        assert registrar.sync_now() is True
+        assert registrar._registered is True  # noqa: SLF001
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert node_state._closed.is_set() is False  # noqa: SLF001
+        routes = info_state.list_service_routes(
+            service_name="startup-reregister-service",
+            healthy_only=True,
+            limit=10,
+        )
+        assert len(routes) == 1
+        assert routes[0]["node_instance_id"] == registrar.node_instance_id
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+        info_server.stop()
+
+
 def test_node_runtime_close_unregisters_startup_service_route():
     from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
 
