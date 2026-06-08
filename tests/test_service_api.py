@@ -4741,6 +4741,175 @@ class TestOwnerServiceFacade:
         finally:
             group.close(end_services=False)
 
+    def test_deploy_from_infocenter_keeps_partially_reused_service_group(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.execution.support import _artifact_code_version
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        effective_code_version = _artifact_code_version(
+            blob=blob,
+            runtime="py3",
+            entry_module="demo_service",
+            entry_callable="run",
+            package_format="py",
+            export_mode="all",
+        )
+        fake_nodes = [
+            SimpleNamespace(
+                node_id="node-1",
+                node_instance_id="node-1-inst",
+                control_addr="127.0.0.1:50061",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                service_worker_available=2,
+                capacity=2,
+                queued=0,
+                python_version="py3.11",
+            ),
+            SimpleNamespace(
+                node_id="node-2",
+                node_instance_id="node-2-inst",
+                control_addr="127.0.0.1:50062",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                service_worker_available=2,
+                capacity=2,
+                queued=0,
+                python_version="py3.11",
+            ),
+        ]
+        fake_routes = [
+            SimpleNamespace(
+                service_name="demo-partial-reuse-service",
+                service_id="svc-node-1",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                node_id="node-1",
+                node_instance_id="node-1-inst",
+                control_addr="127.0.0.1:50061",
+                http_base_url="http://127.0.0.1:18081/svc/svc-node-1",
+                worker_count=1,
+            ),
+            SimpleNamespace(
+                service_name="demo-partial-reuse-service",
+                service_id="svc-node-2",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                node_id="node-2",
+                node_instance_id="node-2-inst",
+                control_addr="127.0.0.1:50062",
+                http_base_url="http://127.0.0.1:18082/svc/svc-node-2",
+                worker_count=1,
+            ),
+        ]
+        running_infos = [
+            SimpleNamespace(
+                owner_client_id="owner-demo",
+                code_version=effective_code_version,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                service_name="demo-partial-reuse-service",
+                http_base_url=route.http_base_url,
+                worker_count=1,
+                created_at=None,
+                last_heartbeat_at=None,
+                lease_expire_at=None,
+            )
+            for route in fake_routes
+        ]
+        create_calls = []
+        heartbeat_calls = []
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def heartbeat_service(self, **kwargs):
+                heartbeat_calls.append((self.target, dict(kwargs)))
+                if self.target.endswith("50062"):
+                    raise RuntimeError("service is stopped")
+                return SimpleNamespace(
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    next_heartbeat_in_sec=15,
+                )
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18083/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=(fake_routes, fake_nodes),
+        ), patch.object(
+            Service,
+            "_inspect_existing_routes",
+            return_value=list(zip(fake_routes, running_infos)),
+        ), patch(
+            "pycloud_parallel.execution.service_session._node_control_client",
+            _FakeNodeControlClient,
+        ), patch(
+            "pycloud_parallel.execution.service_session._new_node_control_client",
+            _FakeNodeControlClient,
+        ), patch(
+            "pycloud_parallel.execution.service_session._load_service_session_cache",
+            return_value={
+                "artifact_code_version": effective_code_version,
+                "nodes": {
+                    "node-1-inst": {
+                        "service_id": "svc-node-1",
+                        "service_token": "token-node-1",
+                        "http_base_url": fake_routes[0].http_base_url,
+                        "worker_count": 1,
+                        "heartbeat_timeout_sec": 30,
+                    },
+                    "node-2-inst": {
+                        "service_id": "svc-node-2",
+                        "service_token": "token-node-2",
+                        "http_base_url": fake_routes[1].http_base_url,
+                        "worker_count": 1,
+                        "heartbeat_timeout_sec": 30,
+                    },
+                },
+            },
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service._deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-partial-reuse-service",
+                source=blob,
+                runtime="py3",
+                entry_module="demo_service",
+                entry_callable="run",
+                node_count=2,
+                min_success_nodes=1,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert len(create_calls) == 0
+            assert [target for target, _kwargs in heartbeat_calls] == ["127.0.0.1:50061", "127.0.0.1:50062"]
+            assert list(group.sessions.keys()) == ["node-1-inst"]
+            assert "node-2-inst" in group.failures
+            assert group._compensation_spec is not None  # noqa: SLF001
+            assert group._compensation_spec["node_count"] == 2  # noqa: SLF001
+        finally:
+            group.close(end_services=False)
+
     def test_deploy_from_infocenter_replaces_different_code_using_cached_token(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2

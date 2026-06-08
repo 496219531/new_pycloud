@@ -321,8 +321,11 @@ class ExecutionSessionBase:
     def _mark_replica_heartbeat_probe_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         message = repr(exc)
         self.failures[node_id] = message
+        if hasattr(replica, "failed"):
+            replica.failed = True
         if hasattr(replica, "last_error"):
             replica.last_error = message
+        self._discard_active_replica(node_id)
         self._mark_retry_probe_replica(node_id)
 
     def _terminal_heartbeat_error_markers(self, replica: ExecutionReplicaHandle) -> Tuple[str, ...]:

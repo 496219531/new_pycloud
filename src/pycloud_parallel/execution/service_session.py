@@ -2083,6 +2083,17 @@ class Service(ServiceExecutionSession):
             active = self._active_replica_snapshot()
             if desired <= 0 or len(active) >= desired:
                 return 0
+            retry_probe = self._retry_probe_replica_snapshot()
+            if retry_probe:
+                logger.warning(
+                    "service compensation deferred while heartbeat retry probes are pending "
+                    "service_name=%s retry_probe=%s active=%s desired=%s",
+                    self.service_name,
+                    sorted(retry_probe),
+                    sorted(active),
+                    desired,
+                )
+                return 0
             recovery_states = self._build_replica_recovery_states(
                 is_retryable_failure=self._is_retryable_compensation_failure,
             )
@@ -3193,6 +3204,35 @@ class Service(ServiceExecutionSession):
             context="service_owner",
         )
 
+        def _dynamic_compensation_spec() -> Dict[str, Any]:
+            return {
+                "infocenter_target": infocenter_target,
+                "blob": effective_blob,
+                "runtime": runtime,
+                "entry_module": effective_entry_module,
+                "entry_callable": entry_callable,
+                "package_format": effective_package_format,
+                "export_mode": export_mode,
+                "export_methods": export_methods,
+                "deps": prepared_artifact.dependency_policy,
+                "managed_global_names": managed_global_names,
+                "initial_globals": dict(initial_globals_values),
+                "policy_id": normalized_policy_id,
+                "worker_count": worker_count,
+                "heartbeat_timeout_sec": heartbeat_timeout_sec,
+                "idle_ttl_sec": idle_ttl_sec,
+                "expose_http": expose_http,
+                "chunk_size": chunk_size,
+                "healthy_only": healthy_only,
+                "tags": list(tags or ()),
+                "node_ids": requested_node_ids,
+                "node_instance_ids": requested_node_instance_ids,
+                "node_count": compensation_target_count,
+                "node_limit": node_limit,
+                "timeout_sec": timeout_sec,
+                "api_token": effective_api_token,
+            }
+
         if ensure_unique_service_name:
             active_routes = cls._select_active_routes(existing_routes)
             if active_routes:
@@ -3276,6 +3316,7 @@ class Service(ServiceExecutionSession):
                                 session_cache_file=session_cache_file,
                                 session_cache_lock=session_cache_lock,
                                 policy_id=existing_bound_policy_id,
+                                compensation_spec=_dynamic_compensation_spec(),
                             )
                         except RuntimeError as exc:
                             if "service is stopped" not in str(exc):
@@ -3530,35 +3571,7 @@ class Service(ServiceExecutionSession):
                 policy_id=normalized_policy_id,
                 effective_policy=effective_policy,
             )
-            group._configure_dynamic_compensation(
-                {
-                    "infocenter_target": infocenter_target,
-                    "blob": effective_blob,
-                    "runtime": runtime,
-                    "entry_module": effective_entry_module,
-                    "entry_callable": entry_callable,
-                    "package_format": effective_package_format,
-                    "export_mode": export_mode,
-                    "export_methods": export_methods,
-                    "deps": prepared_artifact.dependency_policy,
-                    "managed_global_names": managed_global_names,
-                    "initial_globals": dict(initial_globals_values),
-                    "policy_id": normalized_policy_id,
-                    "worker_count": worker_count,
-                    "heartbeat_timeout_sec": heartbeat_timeout_sec,
-                    "idle_ttl_sec": idle_ttl_sec,
-                    "expose_http": expose_http,
-                    "chunk_size": chunk_size,
-                    "healthy_only": healthy_only,
-                    "tags": list(tags or ()),
-                    "node_ids": requested_node_ids,
-                    "node_instance_ids": requested_node_instance_ids,
-                    "node_count": compensation_target_count,
-                    "node_limit": node_limit,
-                    "timeout_sec": timeout_sec,
-                    "api_token": effective_api_token,
-                }
-            )
+            group._configure_dynamic_compensation(_dynamic_compensation_spec())
             group._persist_session_cache()
             group._start_keepalive()
             if failures:
@@ -3650,6 +3663,7 @@ class Service(ServiceExecutionSession):
         session_cache_file: Path,
         session_cache_lock: _ServiceSessionFileLock,
         policy_id: str = "",
+        compensation_spec: Optional[Dict[str, Any]] = None,
     ) -> "Service":
         cache_nodes = cache_payload.get("nodes")
         if not isinstance(cache_nodes, dict):
@@ -3658,31 +3672,32 @@ class Service(ServiceExecutionSession):
         sessions: Dict[str, ServiceSessionClient] = {}
         clients: Dict[str, Any] = {}
         nodes: Dict[str, InfoCenterNode] = {}
+        failures: Dict[str, str] = {}
 
         try:
             for route, info in active_routes:
                 route_key = _node_instance_key_from_route(route)
                 node = discovered_node_map.get(route_key)
                 if node is None:
-                    raise RuntimeError(
-                        f"existing service route is outside current discovery scope: node_instance_id={route_key}"
-                    )
+                    failures[route_key] = "existing service route is outside current discovery scope"
+                    continue
 
                 cached_node = cache_nodes.get(route_key)
                 if not isinstance(cached_node, dict):
-                    raise RuntimeError(
-                        f"local service session cache missing node entry for reuse: node_instance_id={route_key}"
-                    )
+                    failures[route_key] = "local service session cache missing node entry for reuse"
+                    continue
 
                 cached_service_id = str(cached_node.get("service_id", "")).strip()
                 cached_token = str(cached_node.get("service_token", "")).strip()
                 if cached_service_id != route.service_id:
-                    raise RuntimeError(
-                        f"local service session cache is stale for node_instance_id={route_key}: "
+                    failures[route_key] = (
+                        "local service session cache is stale for reuse: "
                         f"cached_service_id={cached_service_id} route_service_id={route.service_id}"
                     )
+                    continue
                 if not cached_token:
-                    raise RuntimeError(f"local service session cache missing token for node_instance_id={route_key}")
+                    failures[route_key] = "local service session cache missing token for reuse"
+                    continue
 
                 client = _node_control_client(route.control_addr, timeout_sec=timeout_sec)
                 try:
@@ -3692,9 +3707,10 @@ class Service(ServiceExecutionSession):
                         service_token=cached_token,
                         seq=0,
                     )
-                except Exception:
+                except Exception as exc:
                     client.close()
-                    raise
+                    failures[route_key] = repr(exc)
+                    continue
 
                 sessions[route_key] = ServiceSessionClient(
                     _client=client,
@@ -3722,6 +3738,15 @@ class Service(ServiceExecutionSession):
                 )
                 clients[route_key] = client
                 nodes[route_key] = node
+            if failures and sessions:
+                logger.warning(
+                    "service reuse skipped some existing routes service_name=%s reused=%s failures=%s",
+                    service_name,
+                    sorted(sessions.keys()),
+                    failures,
+                )
+            if not sessions:
+                raise RuntimeError(f"failed to reuse existing active service routes: {failures}")
         except Exception:
             for client in clients.values():
                 try:
@@ -3739,7 +3764,7 @@ class Service(ServiceExecutionSession):
             service_name=service_name,
             sessions=sessions,
             nodes=nodes,
-            failures={},
+            failures=failures,
             breaker_enabled=bool(breaker_enabled),
             breaker_failure_threshold=max(1, int(breaker_failure_threshold)),
             breaker_cooldown_sec=max(0.1, float(breaker_cooldown_sec)),
@@ -3750,6 +3775,8 @@ class Service(ServiceExecutionSession):
             _artifact_code_version=artifact_code_version,
             policy_id=str(policy_id or "").strip().lower() or get_default_policy_id_for_binding("service_internal"),
         )
+        if compensation_spec:
+            group._configure_dynamic_compensation(compensation_spec)
         group._persist_session_cache()
         group._start_keepalive()
         return group

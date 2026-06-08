@@ -175,6 +175,59 @@ def test_service_compensation_identity_mismatch_marks_node_lost(monkeypatch) -> 
     assert "service compensation identity mismatch" in marked_lost[0][1]
 
 
+def test_service_compensation_defers_while_retry_probe_pending(monkeypatch) -> None:
+    from pycloud_parallel import Service
+
+    node = _node(instance_id="node-inst-1")
+    captured: list[dict[str, object]] = []
+
+    class _InfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node]
+
+    class _NodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            captured.append(dict(kwargs))
+            return SimpleNamespace(
+                kind="service",
+                service_id="svc-new",
+                service_token="token-new",
+                http_base_url=f"http://{self.target}/svc/svc-new",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda: pb2.HeartbeatServiceResponse(ok=True, accepted=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _InfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _NodeControlClient)
+
+    service = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-inst-old": SimpleNamespace(kind="service", failed=False, last_error="timeout")},
+        nodes={"node-inst-old": _node(instance_id="node-inst-old")},
+    )
+    service._configure_dynamic_compensation(_service_compensation_spec())  # noqa: SLF001
+    service._mark_retry_probe_replica("node-inst-old")  # noqa: SLF001
+
+    assert service.try_compensate_replicas() == 0
+    assert captured == []
+
+
 def test_taskpool_compensation_create_fences_expected_node_instance(monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
