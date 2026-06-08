@@ -148,6 +148,7 @@ class ServiceSession:
     queued: int = 0
     alive_workers: int = 0
     stop_reason: str = ""
+    failure_at: Optional[datetime] = None
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
     managed_global_names: Tuple[str, ...] = ()
     managed_globals_scope_dir: str = ""
@@ -262,6 +263,7 @@ class TaskPoolState:
     timing_metrics: Dict[str, object] = field(default_factory=dict)
     returned_count: int = 0
     stop_reason: str = ""
+    failure_at: Optional[datetime] = None
 
     def is_running(self) -> bool:
         return str(self.status or "").strip().upper() == "RUNNING"

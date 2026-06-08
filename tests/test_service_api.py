@@ -981,6 +981,7 @@ def test_service_startup_explicit_package_format_keeps_prepared_service_path(tmp
     try:
         assert node._services  # noqa: SLF001
         assert node._startup_services == {}  # noqa: SLF001
+        assert node.accept_service_deploy is False
         assert node.add.sync(x=2, y=6) == {"value": 8}
     finally:
         node.close()
@@ -1181,6 +1182,7 @@ def test_service_deploy_local_keeps_explicit_artifact_service_path(tmp_path, mon
     try:
         assert service._services  # noqa: SLF001
         assert service._startup_services == {}  # noqa: SLF001
+        assert service.accept_service_deploy is False
         assert service.run.sync(value=3) == {"value": 3}
     finally:
         service.close()

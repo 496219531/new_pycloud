@@ -38,6 +38,27 @@ def test_shared_service_and_task_pool_view_builders_use_resource_snapshot():
         alive_workers=2,
         request_count=7,
         returned_count=4,
+        stop_reason="",
+    )
+    service_failure_at = now - timedelta(seconds=5)
+    failed_service = ServiceSession(
+        service_id="svc-failed",
+        owner_client_id="owner-a",
+        service_name="svc-failed",
+        code_version="sha256:" + ("c" * 64),
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=True,
+        service_token="token-failed",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_STOPPED,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=service_failure_at,
+        alive_workers=0,
+        stop_reason="owner heartbeat timeout",
+        failure_at=service_failure_at,
     )
     pool = TaskPoolState(
         pool_id="pool-1",
@@ -57,6 +78,24 @@ def test_shared_service_and_task_pool_view_builders_use_resource_snapshot():
         task_count=9,
         returned_count=5,
     )
+    pool_failure_at = now - timedelta(seconds=7)
+    failed_pool = TaskPoolState(
+        pool_id="pool-failed",
+        owner_client_id="owner-a",
+        pool_name="pool-failed",
+        code_version="sha256:" + ("d" * 64),
+        task_method="run",
+        worker_count=2,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token-failed",
+        status="STOPPED",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=pool_failure_at,
+        stop_reason="owner heartbeat timeout",
+        failure_at=pool_failure_at,
+    )
 
     service_status = build_service_status_info(service, in_flight=3)
     service_report = build_service_report_payload(service, in_flight=3)
@@ -64,12 +103,19 @@ def test_shared_service_and_task_pool_view_builders_use_resource_snapshot():
     pool_status = build_task_pool_status_info(pool, in_flight=4)
 
     assert service_status["worker_count"] == 3
+    assert service_status["status_text"] == "SERVICE_STATUS_RUNNING"
     assert service_status["alive_workers"] == 2
     assert service_status["received_count"] == 7
     assert service_status["returned_count"] == 4
     assert service_status["in_flight"] == 3
     assert service_report["received_count"] == 7
     assert service_report["returned_count"] == 4
+    failed_service_status = build_service_status_info(failed_service, in_flight=0)
+    failed_service_report = build_service_report_payload(failed_service, in_flight=0)
+    assert failed_service_status["status_text"] == "SERVICE_STATUS_STOPPED"
+    assert failed_service_status["stop_reason"] == "owner heartbeat timeout"
+    assert failed_service_status["failure_at"] == service_failure_at
+    assert failed_service_report["failure_at"] == service_failure_at.isoformat()
 
     assert pool_info.worker_count == 4
     assert pool_info.alive_workers == 3
@@ -79,6 +125,11 @@ def test_shared_service_and_task_pool_view_builders_use_resource_snapshot():
     assert pool_status["received_count"] == 9
     assert pool_status["returned_count"] == 5
     assert pool_status["inflight"] == 4
+    failed_pool_info = build_task_pool_info(failed_pool, in_flight=0)
+    failed_pool_status = build_task_pool_status_info(failed_pool, in_flight=0)
+    assert failed_pool_info.failure_reason == "owner heartbeat timeout"
+    assert failed_pool_info.failure_at == pool_failure_at
+    assert failed_pool_status["failure_at"] == pool_failure_at
 
 
 def test_execute_warmup_dispatches_scope_and_normalizes_result():

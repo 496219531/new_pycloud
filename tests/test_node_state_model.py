@@ -4750,6 +4750,66 @@ def test_nodecontrol_reset_closes_executor_with_fence_timeout(tmp_path):
         state.close()
 
 
+def test_startup_service_report_tracks_local_status_failure_and_recovery():
+    from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
+
+    runtime = NodeRuntimeBase(
+        node_id="startup-status-node",
+        service_http_base_url="http://127.0.0.1:18080",
+        accept_service_deploy=False,
+    )
+    status_mode = {"failed": True}
+
+    def _invoke(*_args, **_kwargs):
+        return 200, {"ok": True}
+
+    def _methods(_include_docs):
+        return 200, {"ok": True, "methods": []}
+
+    def _status():
+        if status_mode["failed"]:
+            return 503, {"ok": False, "error": "worker process exited"}
+        return 200, {
+            "ok": True,
+            "service": {
+                "status": pb2.SERVICE_STATUS_RUNNING,
+                "alive_workers": 1,
+                "custom": "kept",
+            },
+        }
+
+    mount = runtime.mount_startup_service(
+        service_id="startup-svc",
+        service_name="startup-svc",
+        worker_count=1,
+        invoke_handler=_invoke,
+        methods_handler=_methods,
+        status_handler=_status,
+    )
+
+    failed = runtime.startup_service_report_payloads()[0]
+    assert failed["service_id"] == "startup-svc"
+    assert failed["status"] == pb2.SERVICE_STATUS_STOPPED
+    assert failed["status_text"] == "SERVICE_STATUS_STOPPED"
+    assert failed["alive_workers"] == 0
+    assert "worker process exited" in failed["stop_reason"]
+    assert failed["failure_at"]
+    assert mount.failure_at is not None
+
+    status_mode["failed"] = False
+    recovered = runtime.startup_service_report_payloads()[0]
+    assert recovered["status"] == pb2.SERVICE_STATUS_RUNNING
+    assert recovered["status_text"] == "SERVICE_STATUS_RUNNING"
+    assert recovered["alive_workers"] == 1
+    assert recovered["stop_reason"] == ""
+    assert recovered["failure_at"] == ""
+
+    code, body = runtime._status_mounted_startup_service("startup-svc")  # noqa: SLF001
+    assert code == 200
+    assert body["service"]["custom"] == "kept"
+    assert body["service"]["status_text"] == "SERVICE_STATUS_RUNNING"
+
+
 def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tmp_path):
     state = NodeControlState(
         node_id="node-service-owner-timeout",

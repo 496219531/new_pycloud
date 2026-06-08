@@ -293,6 +293,10 @@ def test_node_registrar_reports_deploy_health_reason(tmp_path):
         assert nodes[0].healthy is True
         assert nodes[0].accept_service_deploy is False
         assert nodes[0].metadata["deploy_health_reason"] == "executor host crashed: test"
+
+        raw = _render_ops_page(info_state)
+        assert "<th>deploy reason</th>" in raw
+        assert "executor host crashed: test" in raw
     finally:
         registrar.close()
         node_state.close()

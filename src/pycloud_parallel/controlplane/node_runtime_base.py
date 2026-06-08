@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Shared runtime shell for node-like components."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import importlib
@@ -78,6 +78,11 @@ class StaticServiceMount:
     module: Optional[ModuleType] = None
     managed_global_names: Tuple[str, ...] = ()
     globals_digest: str = ""
+    status: int = int(pb2.SERVICE_STATUS_RUNNING)
+    alive_workers: int = 1
+    stop_reason: str = ""
+    failure_at: Optional[datetime] = None
+    status_payload: Dict[str, object] = field(default_factory=dict)
 
 
 class NodeRuntimeBase:
@@ -140,8 +145,59 @@ class NodeRuntimeBase:
         )
         mount.http_base_url = f"{self.service_http_base_url}/svc/{mount.service_id}" if self.service_http_base_url else ""
         self._startup_services[normalized_service_id] = mount
+        mount.alive_workers = int(mount.worker_count)
         self._apply_pending_startup_globals(mount)
         return mount
+
+    @staticmethod
+    def _service_status_text(status: int) -> str:
+        try:
+            return pb2.ServiceStatus.Name(int(status or pb2.SERVICE_STATUS_UNSPECIFIED))
+        except Exception:
+            return str(status or pb2.SERVICE_STATUS_UNSPECIFIED)
+
+    def _startup_service_status_info(self, mount: StaticServiceMount) -> Dict[str, object]:
+        status = int(getattr(mount, "status", pb2.SERVICE_STATUS_RUNNING) or pb2.SERVICE_STATUS_RUNNING)
+        alive_workers = max(0, int(getattr(mount, "alive_workers", mount.worker_count) or 0))
+        stop_reason = str(getattr(mount, "stop_reason", "") or "")
+        failure_at = getattr(mount, "failure_at", None)
+        if mount.status_handler is not None:
+            try:
+                code, body = mount.status_handler()
+                if int(code or 0) >= 400:
+                    raise RuntimeError(str((body or {}).get("error") or f"status handler failed status={code}"))
+                service_body = dict((body or {}).get("service", body or {}))
+                mount.status_payload = dict(service_body)
+                status = int(service_body.get("status", status) or status)
+                alive_workers = max(0, int(service_body.get("alive_workers", alive_workers) or 0))
+                stop_reason = str(service_body.get("stop_reason", stop_reason) or "")
+                raw_failure_at = service_body.get("failure_at")
+                if isinstance(raw_failure_at, datetime):
+                    failure_at = raw_failure_at
+                elif str(raw_failure_at or "").strip():
+                    failure_at = failure_at or datetime.now(timezone.utc)
+            except Exception as exc:
+                status = int(pb2.SERVICE_STATUS_STOPPED)
+                alive_workers = 0
+                stop_reason = f"startup service status failed: {exc!r}"
+                failure_at = failure_at or datetime.now(timezone.utc)
+                mount.status_payload = {}
+        if status == int(pb2.SERVICE_STATUS_RUNNING):
+            stop_reason = ""
+            failure_at = None
+            if alive_workers <= 0:
+                alive_workers = max(1, int(mount.worker_count or 1))
+        mount.status = status
+        mount.alive_workers = alive_workers
+        mount.stop_reason = stop_reason
+        mount.failure_at = failure_at
+        return {
+            "status": status,
+            "status_text": self._service_status_text(status),
+            "alive_workers": alive_workers,
+            "stop_reason": stop_reason,
+            "failure_at": failure_at,
+        }
 
     @staticmethod
     def _startup_globals_digest(values: Dict[str, Any]) -> str:
@@ -800,22 +856,29 @@ class NodeRuntimeBase:
         if self._closed.is_set():
             return []
         lease_expire_at = datetime.now(timezone.utc).isoformat()
-        return [
-            {
-                "service_name": mount.service_name,
-                "service_id": mount.service_id,
-                "status": int(pb2.SERVICE_STATUS_RUNNING),
-                "worker_count": int(mount.worker_count),
-                "alive_workers": int(mount.worker_count),
-                "in_flight": 0,
-                "lease_expire_at": lease_expire_at,
-                "http_base_url": mount.http_base_url,
-                "policy_id": mount.policy_id,
-                "managed_global_names": list(mount.managed_global_names),
-                "managed_globals_digest": mount.globals_digest,
-            }
-            for mount in self._startup_services.values()
-        ]
+        reports: List[Dict[str, object]] = []
+        for mount in self._startup_services.values():
+            status_info = self._startup_service_status_info(mount)
+            failure_at = status_info.get("failure_at")
+            reports.append(
+                {
+                    "service_name": mount.service_name,
+                    "service_id": mount.service_id,
+                    "status": int(status_info["status"]),
+                    "status_text": str(status_info["status_text"]),
+                    "worker_count": int(mount.worker_count),
+                    "alive_workers": int(status_info["alive_workers"]),
+                    "in_flight": 0,
+                    "lease_expire_at": lease_expire_at,
+                    "http_base_url": mount.http_base_url,
+                    "policy_id": mount.policy_id,
+                    "stop_reason": str(status_info["stop_reason"]),
+                    "failure_at": failure_at.isoformat() if isinstance(failure_at, datetime) else "",
+                    "managed_global_names": list(mount.managed_global_names),
+                    "managed_globals_digest": mount.globals_digest,
+                }
+            )
+        return reports
 
     def service_report_payloads(self, *, include_stopped: bool = False) -> List[Dict[str, object]]:
         del include_stopped
@@ -865,19 +928,28 @@ class NodeRuntimeBase:
         mount = self._mounted_service(service_id)
         if mount is None:
             return 404, {"ok": False, "error": "service not found"}
-        if mount.status_handler is not None:
-            return mount.status_handler()
-        return 200, {
-            "ok": True,
-            "service": {
+        status_info = self._startup_service_status_info(mount)
+        status = int(status_info["status"])
+        failure_at = status_info.get("failure_at")
+        service_payload = dict(getattr(mount, "status_payload", None) or {})
+        service_payload.update(
+            {
                 "service_id": mount.service_id,
                 "service_name": mount.service_name,
-                "status": int(pb2.SERVICE_STATUS_RUNNING),
-                "status_text": pb2.ServiceStatus.Name(pb2.SERVICE_STATUS_RUNNING),
+                "status": status,
+                "status_text": str(status_info["status_text"]),
+                "worker_count": int(mount.worker_count),
+                "alive_workers": int(status_info["alive_workers"]),
+                "stop_reason": str(status_info["stop_reason"]),
+                "failure_at": failure_at.isoformat() if isinstance(failure_at, datetime) else "",
                 "http_base_url": mount.http_base_url,
                 "managed_global_names": list(mount.managed_global_names),
                 "managed_globals_digest": mount.globals_digest,
-            },
+            }
+        )
+        return 200, {
+            "ok": True,
+            "service": service_payload,
         }
 
     def _methods_mounted_startup_service(self, service_id: str, include_docs: bool) -> Tuple[int, Dict[str, object]]:

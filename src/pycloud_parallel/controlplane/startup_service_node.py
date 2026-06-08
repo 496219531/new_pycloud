@@ -60,7 +60,12 @@ class StartupServiceNode(NodeControlState):
         self._local_ipc_server = None
 
     def mount_prepared_service(self, **kwargs: Any):
-        session = super().create_service(**kwargs)
+        previous_accept_service_deploy = bool(getattr(self, "accept_service_deploy", False))
+        self.accept_service_deploy = True
+        try:
+            session = super().create_service(**kwargs)
+        finally:
+            self.accept_service_deploy = previous_accept_service_deploy
         session.node_managed = True
         self._local_service_id = str(session.service_id or "")
         self._local_service_token = str(session.service_token or "")

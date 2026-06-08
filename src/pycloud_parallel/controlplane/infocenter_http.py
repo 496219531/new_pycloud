@@ -870,6 +870,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"pool {node.task_pool_worker_used}/{node.task_pool_worker_capacity}"
             f" <span class='muted'>free {node.task_pool_worker_available()}</span>"
         )
+        metadata = dict(node.metadata or {})
+        deploy_reason = str(metadata.get("deploy_health_reason", "") or "")
+        if not deploy_reason:
+            deploy_reason = "accepting service deploy" if bool(getattr(node, "accept_service_deploy", True)) else "service deploy disabled"
         node_rows.append(
             "<tr>"
             f"<td>{html.escape(node.node_id)}</td>"
@@ -880,6 +884,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td class='quota-cell'>{node_quota}</td>"
             f"<td class='quota-cell'>{proc_quota}</td>"
             f"<td>{_ops_bool_badge(getattr(node, 'accept_service_deploy', True))}</td>"
+            f"<td>{html.escape(deploy_reason or '-')}</td>"
             f"<td>{_ops_bool_badge(node.drain, invert=True)}</td>"
             f"<td>{_ops_bool_badge(getattr(node, 'profile_enabled', True))}</td>"
             f"<td>{html.escape(str((node.metadata or {}).get('pycloud_version', '-') or '-'))}</td>"
@@ -965,7 +970,6 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(_failure_text_with_time(getattr(pool, 'failure_reason', ''), getattr(pool, 'failure_at', None)))}</td>"
                 "</tr>"
             ))
-        metadata = dict(node.metadata or {})
         component = str(metadata.get("component", "") or "").strip()
         if component == "job-orchestrator":
             job_service = next((item["primary"] for item in merged_services if str(item["service_name"]) == "job-orchestrator"), None)
@@ -1153,7 +1157,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "auto_refresh_sec": 5,
         }
     node_headers = [
-        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "node quota", "proc quota", "accept deploy", "drain", "enabled", "pycloud",
+        "node_id", "instance_id", "control_addr", "healthy", "schedulable", "node quota", "proc quota", "accept deploy", "deploy reason", "drain", "enabled", "pycloud",
         "python", "active runtimes", "effective tags", "managed tags", "capability tags", "legacy node tags", "task cap",
         "task used", "task free", "queued", "running", "svc cap",
         "svc used", "svc avail", "pool cap", "pool used", "pool avail", "reason", "notes", "actions",
@@ -1191,7 +1195,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ".ops-section{margin:20px 0 24px;}.section-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 8px;}.section-anchor{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);border-radius:999px;padding:4px 9px;background:rgba(15,23,42,.72);}.section-anchor:hover{color:#fff;border-color:var(--accent);}"
         ".table-wrap{overflow:auto;max-height:70vh;background:rgba(16,27,49,.9);border:1px solid rgba(148,163,184,.2);border-radius:16px;box-shadow:0 16px 42px rgba(0,0,0,.26);}table{border-collapse:separate;border-spacing:0;width:100%;min-width:1120px;}th,td{border-right:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);padding:9px 11px;font-size:12px;line-height:1.42;vertical-align:top;word-break:break-word;overflow-wrap:anywhere;white-space:normal;}th{position:sticky;top:0;z-index:2;background:linear-gradient(180deg,#1a2a46,#142138);text-align:left;color:#c9d7eb;font-weight:780;text-transform:uppercase;letter-spacing:.035em;font-size:11px;}tr:last-child td{border-bottom:0;}td:last-child,th:last-child{border-right:0;}tbody tr:nth-child(even){background:rgba(255,255,255,.018);}tbody tr:hover{background:rgba(96,165,250,.09);}"
         ".quota-cell{white-space:nowrap;line-height:1.45;}"
-        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(8),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+10):nth-child(-n+28),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(30){display:none;}"
+        "body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(2),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(3),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(8),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(n+11):nth-child(-n+29),body:not(.show-details) .ops-table--nodes :is(th,td):nth-child(31){display:none;}"
         "body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(2),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-queue :is(th,td):nth-child(14){display:none;}"
         "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"

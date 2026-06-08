@@ -554,12 +554,14 @@ class NodeControlState(NodeRuntimeBase):
                 session.executor_ready = False
                 session.alive_workers = 0
                 session.stop_reason = normalized_reason
+                session.failure_at = fenced_at
                 session.lease_expire_at = fenced_at
             for pool in self._task_pools.values():
                 pool.status = "STOPPED"
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.stop_reason = normalized_reason
+                pool.failure_at = fenced_at
                 pool.lease_expire_at = fenced_at
             self._services.clear()
             self._service_zero_alive_counts.clear()
@@ -634,7 +636,9 @@ class NodeControlState(NodeRuntimeBase):
         pool.alive_workers = 0
         pool.status = "STOPPED"
         pool.stop_reason = reason
-        pool.lease_expire_at = utc_now()
+        stopped_at = utc_now()
+        pool.failure_at = stopped_at
+        pool.lease_expire_at = stopped_at
         return stop_executor
 
     @staticmethod
@@ -1104,6 +1108,7 @@ class NodeControlState(NodeRuntimeBase):
                 session.alive_workers = 0
                 session.status = pb2.SERVICE_STATUS_STOPPED
                 session.stop_reason = f"executor host restart failed: {exc!r}"
+                session.failure_at = current_time
                 session.lease_expire_at = current_time
         for pool in self._task_pools.values():
             if not pool.is_running() or not pool.executor_ready:
@@ -1131,6 +1136,7 @@ class NodeControlState(NodeRuntimeBase):
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
                 pool.stop_reason = f"executor host restart failed: {exc!r}"
+                pool.failure_at = current_time
                 pool.lease_expire_at = current_time
 
         if old_host is not None:
@@ -2103,6 +2109,7 @@ class NodeControlState(NodeRuntimeBase):
             alive_workers=0,
             managed_global_names=tuple(str(name) for name in managed_global_names or ()),
             stop_reason=str(reason or "create service failed"),
+            failure_at=now,
         )
         with self._lock:
             self._services[service_id] = session
@@ -2143,6 +2150,7 @@ class NodeControlState(NodeRuntimeBase):
             alive_workers=0,
             task_count=0,
             stop_reason=str(reason or "create task pool failed"),
+            failure_at=now,
         )
         with self._lock:
             self._task_pools[pool_id] = pool
@@ -2945,7 +2953,9 @@ class NodeControlState(NodeRuntimeBase):
             pool.status = "STOPPED"
             if was_running or not str(pool.stop_reason or "").strip():
                 pool.stop_reason = reason or "owner requested"
-            pool.lease_expire_at = utc_now()
+            stopped_at = utc_now()
+            pool.failure_at = stopped_at
+            pool.lease_expire_at = stopped_at
             closed_pool = pool
 
         if stop_executor is not None:
@@ -3029,6 +3039,8 @@ class NodeControlState(NodeRuntimeBase):
             pool.last_heartbeat_at = now
             pool.lease_expire_at = now + timedelta(seconds=pool.heartbeat_timeout_sec)
             pool.alive_workers = max(0, int(pool.worker_count or 0))
+            pool.stop_reason = ""
+            pool.failure_at = None
             return pool
         finally:
             total_sec = time.perf_counter() - started_at
@@ -3062,6 +3074,8 @@ class NodeControlState(NodeRuntimeBase):
             session.lease_expire_at = now + timedelta(seconds=session.heartbeat_timeout_sec)
             if session.status == pb2.SERVICE_STATUS_STARTING:
                 session.status = pb2.SERVICE_STATUS_RUNNING
+            session.stop_reason = ""
+            session.failure_at = None
             return session
         finally:
             total_sec = time.perf_counter() - started_at
@@ -3102,7 +3116,9 @@ class NodeControlState(NodeRuntimeBase):
         session.stop_reason = stop_reason
         session.alive_workers = 0
         session.status = pb2.SERVICE_STATUS_STOPPED
-        session.lease_expire_at = utc_now()
+        stopped_at = utc_now()
+        session.failure_at = stopped_at
+        session.lease_expire_at = stopped_at
         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
         if self._executor_host is not None:
             try:
@@ -4226,3 +4242,5 @@ class NodeControlState(NodeRuntimeBase):
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
                 pool.stop_reason = "owner heartbeat timeout"
+                pool.failure_at = now
+                pool.lease_expire_at = now

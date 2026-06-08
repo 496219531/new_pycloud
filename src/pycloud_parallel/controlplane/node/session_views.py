@@ -96,6 +96,13 @@ def _service_lease_expire_at(session: ServiceSession):
     return session.lease_expire_at
 
 
+def _service_status_name(status: int) -> str:
+    try:
+        return pb2.ServiceStatus.Name(int(status or pb2.SERVICE_STATUS_UNSPECIFIED))
+    except Exception:
+        return str(status or pb2.SERVICE_STATUS_UNSPECIFIED)
+
+
 def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
     resource = session.resource_snapshot(in_flight=in_flight)
     lease_expire_at = _service_lease_expire_at(session)
@@ -106,6 +113,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "policy_id": str(session.policy_id or "").strip().lower() or "default_safe",
         "code_version": session.code_version,
         "status": int(session.status),
+        "status_text": _service_status_name(session.status),
         "worker_count": resource.worker_count,
         "alive_workers": resource.alive_workers,
         "in_flight": resource.in_flight,
@@ -115,6 +123,8 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "created_at": session.created_at,
         "last_heartbeat_at": session.last_heartbeat_at,
         "lease_expire_at": lease_expire_at,
+        "stop_reason": str(session.stop_reason or ""),
+        "failure_at": getattr(session, "failure_at", None),
         "http_base_url": session.http_base_url,
         "methods": sorted(session.methods.keys()),
         "timing_metrics": dict(session.timing_metrics or {}),
@@ -151,6 +161,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "entry_callable": str(getattr(session, "entry_callable", "") or ""),
         "serialization_mode": str(getattr(session, "serialization_mode", "") or ""),
         "status": int(session.status),
+        "status_text": _service_status_name(session.status),
         "worker_count": int(resource.worker_count),
         "alive_workers": int(resource.alive_workers),
         "in_flight": int(resource.in_flight),
@@ -159,6 +170,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "ema_child_invoke_ms": float(metrics.get("ema_child_invoke_ms", 0.0) or 0.0),
         "ema_samples": int(metrics.get("ema_samples", 0) or 0),
         "lease_expire_at": lease_expire_at.isoformat(),
+        "failure_at": session.failure_at.isoformat() if getattr(session, "failure_at", None) is not None else "",
         "http_base_url": session.http_base_url,
         "stop_reason": str(session.stop_reason or ""),
     }
@@ -185,6 +197,7 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
         last_heartbeat_at=pool.last_heartbeat_at,
         lease_expire_at=pool.lease_expire_at,
         failure_reason=str(pool.stop_reason or ""),
+        failure_at=getattr(pool, "failure_at", None),
     )
 
 
@@ -209,6 +222,7 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "lease_expire_at": pool.lease_expire_at,
         "timing_metrics": dict(pool.timing_metrics or {}),
         "failure_reason": str(pool.stop_reason or ""),
+        "failure_at": getattr(pool, "failure_at", None),
     }
 
 
