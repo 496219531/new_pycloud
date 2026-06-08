@@ -31,6 +31,9 @@ class NodeServiceState:
     entry_module: str = ""
     entry_callable: str = ""
     serialization_mode: str = ""
+    status_text: str = ""
+    resource_health: str = ""
+    degraded: bool = False
     worker_count: int = 0
     alive_workers: int = 0
     in_flight: int = 0

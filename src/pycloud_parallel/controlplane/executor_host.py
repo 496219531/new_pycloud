@@ -34,6 +34,33 @@ def _simple_queue_get_if_ready(simple_queue, *, timeout: float = 0.0):
         return None
 
 
+def _pid_alive(pid: int) -> bool:
+    normalized = int(pid or 0)
+    if normalized <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {normalized}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            return str(normalized) in str(proc.stdout or "")
+        except Exception:
+            return True
+    try:
+        os.kill(normalized, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 def _executor_host_main(request_q, event_q, task_worker_capacity: int) -> None:
     os.environ["PYCLOUD_EXECUTOR_PARENT_KIND"] = "executor_host"
 
@@ -220,6 +247,24 @@ class ExecutorHostClient:
             except Exception:
                 continue
 
+    def _terminate_worker_pids(self, worker_pids: list[int]) -> None:
+        current_pid = os.getpid()
+        normalized = [int(pid) for pid in (worker_pids or []) if int(pid or 0) > 0 and int(pid or 0) != current_pid]
+        if not normalized:
+            return
+        if os.name == "nt":
+            for pid in normalized:
+                self._kill_process_tree(pid)
+            return
+        for pid in normalized:
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGTERM)
+        time.sleep(0.05)
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        for pid in normalized:
+            with contextlib.suppress(Exception):
+                os.kill(pid, sigkill)
+
     def _kill_process_tree(self, pid: int) -> None:
         if pid <= 0 or pid == os.getpid():
             return
@@ -297,10 +342,29 @@ class ExecutorHostClient:
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "create_service failed")))
 
-    def stop_service(self, *, service_id: str) -> None:
-        resp = self._request("stop_service", payload={"service_id": service_id})
+    def stop_service(self, *, service_id: str, reason: str = "") -> None:
+        worker_key = f"service:{str(service_id or '').strip()}"
+        with self._cv:
+            service_worker_pids = list(self._worker_pid_sets.pop(worker_key, set()))
+            self._worker_pids.difference_update(service_worker_pids)
+        resp = self._request("stop_service", payload={"service_id": service_id, "reason": str(reason or "")})
+        self._terminate_worker_pids(service_worker_pids)
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "stop_service failed")))
+
+    def service_worker_liveness(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        with self._cv:
+            for worker_key, pid_set in self._worker_pid_sets.items():
+                if not worker_key.startswith("service:"):
+                    continue
+                service_id = worker_key.split(":", 1)[1]
+                alive = 0
+                for pid in list(pid_set):
+                    if _pid_alive(int(pid)):
+                        alive += 1
+                out[service_id] = alive
+        return out
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         resp = self._request(

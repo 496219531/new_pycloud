@@ -124,15 +124,22 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
         if not service_id or not service_name:
             continue
         out[service_id] = NodeServiceState(
+            status=max(0, int(item.get("status", 0) or 0)),
             service_name=service_name,
             service_id=service_id,
-            status=max(0, int(item.get("status", 0) or 0)),
             policy_id=str(item.get("policy_id", "") or "default_safe"),
             owner_client_id=str(item.get("owner_client_id", "") or ""),
             code_version=str(item.get("code_version", "") or ""),
             entry_module=str(item.get("entry_module", "") or ""),
             entry_callable=str(item.get("entry_callable", "") or ""),
             serialization_mode=str(item.get("serialization_mode", "") or ""),
+            status_text=str(item.get("status_text", "") or ""),
+            resource_health=str(item.get("resource_health", "") or "") or (
+                "degraded"
+                if _coerce_bool(item.get("degraded"), default=False)
+                else ""
+            ),
+            degraded=_coerce_bool(item.get("degraded"), default=False),
             worker_count=max(0, int(item.get("worker_count", 0) or 0)),
             alive_workers=max(0, int(item.get("alive_workers", 0) or 0)),
             in_flight=max(0, int(item.get("in_flight", 0) or 0)),
@@ -354,6 +361,18 @@ def _effective_service_status_text(*, node_healthy: bool, service_status: int) -
     return _service_status_text(service_status)
 
 
+def _service_resource_health_text(*, node_healthy: bool, service_status: int, alive_workers: int, stop_reason: object = "") -> str:
+    if not bool(node_healthy):
+        return "node_lost"
+    if int(service_status) == int(pb2.SERVICE_STATUS_STOPPED):
+        return "stopped"
+    if str(stop_reason or "").strip():
+        return "failed"
+    if int(alive_workers or 0) <= 0:
+        return "degraded"
+    return "running"
+
+
 def _ops_badge(text: object, tone: str = "neutral") -> str:
     return f"<span class='badge badge-{html.escape(str(tone), quote=True)}'>{html.escape(str(text))}</span>"
 
@@ -414,11 +433,18 @@ def _ops_table(title: str, note: str, headers: List[str], body_id: str, body: st
 
 def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) -> Dict[str, object]:
     status_text = _effective_service_status_text(node_healthy=node_healthy, service_status=service.status)
+    alive_workers = int(service.alive_workers if node_healthy else 0)
     return {
         "service_name": str(service.service_name),
         "service_id": str(service.service_id),
         "status": int(service.status),
         "status_text": status_text,
+        "resource_health": _service_resource_health_text(
+            node_healthy=node_healthy,
+            service_status=service.status,
+            alive_workers=alive_workers,
+            stop_reason=service.stop_reason,
+        ),
         "policy_id": str(service.policy_id or "").strip().lower() or "default_safe",
         "owner_client_id": str(getattr(service, "owner_client_id", "") or ""),
         "code_version": str(getattr(service, "code_version", "") or ""),
@@ -427,7 +453,7 @@ def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) 
         "serialization_mode": str(getattr(service, "serialization_mode", "") or ""),
         "node_healthy": bool(node_healthy),
         "worker_count": int(service.worker_count),
-        "alive_workers": int(service.alive_workers if node_healthy else 0),
+        "alive_workers": alive_workers,
         "in_flight": int(service.in_flight if node_healthy else 0),
         "lease_expire_at": _dt_text(service.lease_expire_at),
         "http_base_url": str(service.http_base_url or ""),
@@ -1072,6 +1098,13 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             if str(entry["item"].get("stop_reason", "") or "").strip()
         ]
         stop_reason = "; ".join(sorted({text for text in stop_reasons if text and text != "-"}))
+        max_alive_workers = max(int(entry["item"].get("alive_workers", 0) or 0) for entry in ordered) if any_healthy else 0
+        resource_health = str(item.get("resource_health", "") or "") or _service_resource_health_text(
+            node_healthy=any_healthy,
+            service_status=int(item["status"]),
+            alive_workers=max_alive_workers,
+            stop_reason=stop_reason,
+        )
         stale_row = "" if any_healthy else " class='stale-row'"
         service_rows.append(
             f"<tr{stale_row}>"
@@ -1081,8 +1114,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{service_id_text}</td>"
             f"<td>{_ops_bool_badge(any_healthy)}</td>"
             f"<td>{_ops_status_badge(_effective_service_status_text(node_healthy=any_healthy, service_status=int(item['status'])))}</td>"
+            f"<td>{_ops_status_badge(resource_health)}</td>"
             f"<td>{max(int(entry['item'].get('worker_count', 0) or 0) for entry in ordered)}</td>"
-            f"<td>{max(int(entry['item'].get('alive_workers', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
+            f"<td>{max_alive_workers}</td>"
             f"<td>{max(int(entry['item'].get('in_flight', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
             f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
             f"<td>{html.escape(str(timing.get('error_count', '-')))}</td>"
@@ -1096,7 +1130,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             "</tr>"
         )
     node_body = "\n".join(node_rows) or "<tr><td colspan='31'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='18'>no services</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='19'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
     pool_body = "\n".join(pool_rows) or "<tr><td colspan='23'>no task pools</td></tr>"
@@ -1169,7 +1203,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     recent_job_headers = ["owner", "instance_id", "job_id", "status", "submitted_at", "finished_at", "final_result", "error"]
     waiting_job_headers = ["owner", "instance_id", "job_id", "priority", "submitted_at", "position", "actions"]
     service_headers = [
-        "node_id", "instance_id", "service_name", "service_id", "node_healthy", "status", "workers", "alive", "in_flight",
+        "node_id", "instance_id", "service_name", "service_id", "node_healthy", "status", "resource", "workers", "alive", "in_flight",
         "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
         "lease_expire_at", "failure_reason", "http_base_url",
     ]
@@ -1200,7 +1234,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
         "body:not(.show-details) .ops-table--waiting-jobs :is(th,td):nth-child(2){display:none;}"
-        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+13):nth-child(-n+16),body:not(.show-details) .ops-table--services :is(th,td):nth-child(18){display:none;}"
+        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+14):nth-child(-n+17),body:not(.show-details) .ops-table--services :is(th,td):nth-child(19){display:none;}"
         "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+13):nth-child(-n+22){display:none;}"
         "body:not(.show-details) .ops-table{min-width:900px;}body.show-details .ops-table{min-width:1120px;}.density-toggle{border-color:rgba(34,211,238,.35);color:#cffafe;background:rgba(8,47,73,.5);}.density-toggle:hover{border-color:rgba(34,211,238,.72);background:rgba(14,116,144,.36);}.density-hint{color:#8fb2d9;font-size:12px;width:100%;text-align:right;}"
         ".badge{display:inline-flex;align-items:center;min-height:21px;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:800;line-height:1.2;border:1px solid transparent;white-space:nowrap;box-shadow:0 1px 0 rgba(255,255,255,.06) inset;}.badge-good{background:var(--good-bg);color:var(--good);border-color:rgba(74,222,128,.2);}.badge-warn{background:var(--warn-bg);color:var(--warn);border-color:rgba(251,191,36,.22);}.badge-bad{background:var(--bad-bg);color:var(--bad);border-color:rgba(251,113,133,.22);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);border-color:rgba(203,213,225,.14);}"

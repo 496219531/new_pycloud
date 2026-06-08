@@ -238,6 +238,33 @@ class ExecutorCore:
             if manager is not None:
                 manager.shutdown()
 
+    def _fail_service_inflight(self, service_id: str, *, reason: str) -> int:
+        normalized_service_id = str(service_id or "").strip()
+        failed_count = 0
+        for future, meta in list(self._inflight.items()):
+            if str(meta.get("kind", "") or "") != "service":
+                continue
+            if str(meta.get("service_id", "") or "") != normalized_service_id:
+                continue
+            self._inflight.pop(future, None)
+            request_id = str(meta.get("request_id", "") or "")
+            failed_count += 1
+            with contextlib.suppress(Exception):
+                future.cancel()
+            if meta.get("streaming"):
+                self._stream_state.pop(future, None)
+                self._cleanup_stream_state(meta)
+            self._emit_response(
+                request_id,
+                ok=True,
+                status_text="FAILED_INFRA",
+                result=None,
+                err_type="ServiceStopped",
+                err_message=str(reason or "service stopped"),
+                timings={},
+            )
+        return failed_count
+
     def _drain_stream_meta(self, meta: Dict[str, Any]) -> None:
         request_id = str(meta.get("request_id", "") or "")
         stream_queue = meta.get("stream_queue")
@@ -474,10 +501,12 @@ class ExecutorCore:
 
         if action == "stop_service":
             service_id = str(payload.get("service_id", "") or "")
+            reason = str(payload.get("reason", "") or "") or "service stopped"
             executor = self._service_executors.pop(service_id, None)
             self._service_workers.pop(service_id, None)
-            self._shutdown_executor(executor, wait=True)
-            self._emit_response(request_id, ok=True)
+            failed_inflight = self._fail_service_inflight(service_id, reason=reason)
+            self._shutdown_executor(executor, wait=False)
+            self._emit_response(request_id, ok=True, failed_inflight=failed_inflight)
             return True
 
         if action == "create_task_pool":

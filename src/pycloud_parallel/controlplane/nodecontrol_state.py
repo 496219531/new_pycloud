@@ -1102,10 +1102,12 @@ class NodeControlState(NodeRuntimeBase):
                     worker_count=session.worker_count,
                 )
                 session.alive_workers = session.worker_count
+                session.degraded = False
             except Exception as exc:
                 rebuild_failures += 1
                 session.executor_ready = False
                 session.alive_workers = 0
+                session.degraded = False
                 session.status = pb2.SERVICE_STATUS_STOPPED
                 session.stop_reason = f"executor host restart failed: {exc!r}"
                 session.failure_at = current_time
@@ -2407,6 +2409,7 @@ class NodeControlState(NodeRuntimeBase):
                 policy_id=str(policy_id or "").strip().lower() or "default_safe",
                 executor_ready=True,
                 alive_workers=actual_workers,
+                degraded=False,
                 methods=method_info,
                 managed_global_names=normalized_managed_global_names,
             )
@@ -3076,6 +3079,8 @@ class NodeControlState(NodeRuntimeBase):
                 session.status = pb2.SERVICE_STATUS_RUNNING
             session.stop_reason = ""
             session.failure_at = None
+            if int(session.alive_workers or 0) > 0:
+                session.degraded = False
             return session
         finally:
             total_sec = time.perf_counter() - started_at
@@ -3115,6 +3120,7 @@ class NodeControlState(NodeRuntimeBase):
         session.executor_ready = False
         session.stop_reason = stop_reason
         session.alive_workers = 0
+        session.degraded = False
         session.status = pb2.SERVICE_STATUS_STOPPED
         stopped_at = utc_now()
         session.failure_at = stopped_at
@@ -3122,9 +3128,51 @@ class NodeControlState(NodeRuntimeBase):
         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
         if self._executor_host is not None:
             try:
-                self._executor_host.stop_service(service_id=session.service_id)
-            except Exception:
-                pass
+                self._executor_host.stop_service(service_id=session.service_id, reason=stop_reason)
+                self._clear_deploy_health_block_locked(reason_prefix=f"service cleanup failed service_id={session.service_id}")
+            except Exception as exc:
+                reason_text = f"service cleanup failed service_id={session.service_id} reason={exc!r}"
+                self._set_deploy_health_block_locked(reason_text)
+                logger.exception("[NodeControl] %s", reason_text)
+
+    def _recover_node_managed_service_locked(self, session: ServiceSession) -> bool:
+        if self._executor_host is None:
+            return False
+        artifact = self._get_live_code_artifact_locked(session.code_version)
+        if artifact is None:
+            session.stop_reason = "startup service recovery failed: code artifact not found"
+            return False
+        try:
+            self._ensure_artifact_ready(
+                artifact,
+                dependency_policy_mode=artifact.dependency_policy_mode,
+                dependency_allowlist=artifact.dependency_allowlist,
+                managed_global_names=session.managed_global_names,
+                prepare_scope="service",
+                prepare_key=session.service_id,
+            )
+            self._executor_host.create_service(service_id=session.service_id, worker_count=session.worker_count)
+            session.executor_ready = True
+            session.alive_workers = max(1, int(session.worker_count or 1))
+            session.degraded = False
+            session.stop_reason = ""
+            session.failure_at = None
+            self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
+            logger.warning(
+                "[NodeControl] startup service executor recovered service_id=%s service_name=%s worker_count=%s",
+                session.service_id,
+                session.service_name,
+                session.worker_count,
+            )
+            return True
+        except Exception as exc:
+            session.stop_reason = f"startup service recovery failed: {exc!r}"
+            logger.exception(
+                "[NodeControl] startup service executor recovery failed service_id=%s service_name=%s",
+                session.service_id,
+                session.service_name,
+            )
+            return False
 
     def _shutdown_all_services(self) -> None:
         with self._lock:
@@ -4193,9 +4241,30 @@ class NodeControlState(NodeRuntimeBase):
         while not self._stop_event.wait(self.monitor_interval_sec):
             self._handle_service_timeouts()
 
+    def _refresh_service_worker_liveness_locked(self) -> None:
+        if self._executor_host is None:
+            return
+        try:
+            liveness = self._executor_host.service_worker_liveness()
+        except Exception as exc:
+            self._set_deploy_health_block_locked(f"service worker liveness failed: {exc!r}")
+            logger.warning(
+                "[NodeControl] service worker liveness probe failed node_id=%s node_instance_id=%s err=%r",
+                self.node_id,
+                self.node_instance_id,
+                exc,
+            )
+            return
+        for service_id, alive_count in liveness.items():
+            session = self._services.get(str(service_id or ""))
+            if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
+                continue
+            session.alive_workers = max(0, int(alive_count or 0))
+
     def _handle_service_timeouts(self) -> None:
         now = utc_now()
         with self._lock:
+            self._refresh_service_worker_liveness_locked()
             for session in self._services.values():
                 if session.status != pb2.SERVICE_STATUS_RUNNING:
                     self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
@@ -4204,15 +4273,20 @@ class NodeControlState(NodeRuntimeBase):
                     if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
                         count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
                         self._service_zero_alive_counts[session.service_id] = count
+                        session.degraded = True
                         if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
-                            self._stop_service_locked(
-                                session,
-                                reason=(
-                                    "startup service worker unavailable; "
-                                    f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
-                                ),
-                            )
+                            recovered = self._recover_node_managed_service_locked(session)
+                            if not recovered:
+                                self._stop_service_locked(
+                                    session,
+                                    reason=(
+                                        str(session.stop_reason or "").strip()
+                                        or "startup service worker unavailable; "
+                                        f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
+                                    ),
+                                )
                     else:
+                        session.degraded = False
                         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
                 else:
                     if now > session.lease_expire_at:
@@ -4221,6 +4295,7 @@ class NodeControlState(NodeRuntimeBase):
                     if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
                         count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
                         self._service_zero_alive_counts[session.service_id] = count
+                        session.degraded = True
                         if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
                             self._stop_service_locked(
                                 session,
@@ -4230,6 +4305,7 @@ class NodeControlState(NodeRuntimeBase):
                                 ),
                             )
                     else:
+                        session.degraded = False
                         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
             for pool in self._task_pools.values():
                 if not pool.is_running():

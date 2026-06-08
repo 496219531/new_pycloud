@@ -556,6 +556,74 @@ def test_ops_page_shows_service_and_taskpool_failure_reasons():
     assert "executor host restart failed: missing_pkg" in raw
 
 
+def test_ops_page_separates_node_deploy_and_resource_health():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-layered-health-1",
+        node_id="node-layered-health",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        metadata={"deploy_health_reason": "service cleanup failed service_id=svc-stopped reason=RuntimeError('x')"},
+        accept_service_deploy=False,
+        services={
+            "svc-stopped": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-stopped",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                worker_count=2,
+                alive_workers=0,
+                stop_reason="service worker unavailable",
+            )
+        },
+    )
+
+    nodes = info_state.list_nodes(healthy_only=True, tags=["compute"], limit=10)
+    routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=False, limit=10)
+    healthy_routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=10)
+    raw = _render_ops_page(info_state)
+
+    assert len(nodes) == 1
+    assert nodes[0].healthy is True
+    assert nodes[0].accept_service_deploy is False
+    assert routes[0]["resource_health"] == "stopped"
+    assert "service worker unavailable" in routes[0]["stop_reason"]
+    assert healthy_routes == []
+    assert "service cleanup failed service_id=svc-stopped" in raw
+    assert ">stopped</span>" in raw
+
+
+def test_degraded_service_route_is_not_healthy_call_route():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-degraded-route-1",
+        node_id="node-degraded-route",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-degraded": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-degraded",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                status_text="DEGRADED",
+                resource_health="degraded",
+                worker_count=2,
+                alive_workers=0,
+            )
+        },
+    )
+
+    all_routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=False, limit=10)
+    healthy_routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=10)
+
+    assert all_routes[0]["status"] == pb2.SERVICE_STATUS_RUNNING
+    assert all_routes[0]["resource_health"] == "degraded"
+    assert healthy_routes == []
+
+
 def test_infocenter_preserves_failure_timestamp_across_heartbeats():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(

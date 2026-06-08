@@ -4830,6 +4830,9 @@ def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tm
         def stop_service(self, **kwargs):
             calls.append(("stop_service", kwargs))
 
+        def service_worker_liveness(self):
+            return {"svc-expired": 1, "svc-healthy": 1}
+
         def drain_events(self):
             return []
 
@@ -4889,7 +4892,7 @@ def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tm
         assert state.execution_fenced is False
         assert state.can_accept_service_deploy is True
         assert state.service_worker_used() == 1
-        assert calls == [("stop_service", {"service_id": "svc-expired"})]
+        assert calls == [("stop_service", {"service_id": "svc-expired", "reason": "owner heartbeat timeout"})]
 
         code, body = state.call_service(
             service_id=expired.service_id,
@@ -4924,6 +4927,9 @@ def test_service_zero_alive_workers_stops_only_that_service(tmp_path):
 
         def stop_service(self, **kwargs):
             calls.append(("stop_service", kwargs))
+
+        def service_worker_liveness(self):
+            return {"svc-dead-workers": 0, "svc-healthy": 1}
 
         def drain_events(self):
             return []
@@ -4984,7 +4990,266 @@ def test_service_zero_alive_workers_stops_only_that_service(tmp_path):
         assert state.execution_fenced is False
         assert state.can_accept_service_deploy is True
         assert state.service_worker_used() == 1
-        assert calls == [("stop_service", {"service_id": "svc-dead-workers"})]
+        assert calls == [
+            (
+                "stop_service",
+                {
+                    "service_id": "svc-dead-workers",
+                    "reason": "service worker unavailable; owner should redeploy or compensate; alive_workers=0 worker_count=1",
+                },
+            )
+        ]
+    finally:
+        state.close()
+
+
+def test_service_worker_liveness_drives_degraded_then_stopped(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-liveness",
+        queue_capacity=4,
+        worker_capacity=2,
+        service_worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_liveness"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def service_worker_liveness(self):
+            return {"svc-live-probe": 0, "svc-other": 1}
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop_service", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    probe = ServiceSession(
+        service_id="svc-live-probe",
+        owner_client_id="owner",
+        service_name="svc-live-probe",
+        code_version="sha256:probe",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-probe",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    other = ServiceSession(
+        service_id="svc-other",
+        owner_client_id="owner",
+        service_name="svc-other",
+        code_version="sha256:other",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-other",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[probe.service_id] = probe  # noqa: SLF001
+        state._services[other.service_id] = other  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert probe.status == pb2.SERVICE_STATUS_RUNNING
+        assert probe.alive_workers == 0
+        assert probe.degraded is True
+        assert other.status == pb2.SERVICE_STATUS_RUNNING
+        assert other.alive_workers == 1
+
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert probe.status == pb2.SERVICE_STATUS_STOPPED
+        assert "service worker unavailable" in probe.stop_reason
+        assert other.status == pb2.SERVICE_STATUS_RUNNING
+        assert calls
+    finally:
+        state.close()
+
+
+def test_startup_managed_service_zero_workers_recovers_executor(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-startup-recover",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_startup_recover"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    now = utc_now()
+    create_calls = []
+    stop_calls = []
+    code_version = "sha256:" + "e" * 64
+    artifact = CodeArtifact(
+        code_version=code_version,
+        path=str(tmp_path),
+        runtime="py3",
+        entry_module="startup_recover",
+        entry_callable="run",
+        package_format="py",
+        export_mode="module",
+        export_methods=(),
+        export_decorator="",
+        dependency_policy_mode="safe",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=1,
+        created_at=now,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def service_worker_liveness(self):
+            return {"svc-startup-recover": 0}
+
+        def create_service(self, **kwargs):
+            create_calls.append(kwargs)
+
+        def stop_service(self, **kwargs):
+            stop_calls.append(kwargs)
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    service = ServiceSession(
+        service_id="svc-startup-recover",
+        owner_client_id="owner",
+        service_name="svc-startup-recover",
+        code_version=code_version,
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-startup",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=0,
+        methods={"run": ("startup_recover", "run")},
+        node_managed=True,
+    )
+    monkeypatch.setattr(state, "_get_live_code_artifact_locked", lambda _code_version: artifact)
+    monkeypatch.setattr(state, "_ensure_artifact_ready", lambda *args, **kwargs: None)
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert create_calls == [{"service_id": "svc-startup-recover", "worker_count": 1}]
+        assert service.status == pb2.SERVICE_STATUS_RUNNING
+        assert service.executor_ready is True
+        assert service.alive_workers == 1
+        assert service.degraded is False
+        assert service.stop_reason == ""
+        assert stop_calls == []
+    finally:
+        state.close()
+
+
+def test_stop_service_cleanup_failure_blocks_deploy(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-cleanup-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_cleanup_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def service_worker_liveness(self):
+            return {"svc-cleanup-fail": 0}
+
+        def stop_service(self, **kwargs):  # noqa: ARG002
+            raise RuntimeError("taskkill denied")
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    service = ServiceSession(
+        service_id="svc-cleanup-fail",
+        owner_client_id="owner",
+        service_name="svc-cleanup-fail",
+        code_version="sha256:cleanup",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-cleanup",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=0,
+        methods={"run": ("demo", "run")},
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert service.status == pb2.SERVICE_STATUS_STOPPED
+        assert state.can_accept_service_deploy is False
+        assert "service cleanup failed service_id=svc-cleanup-fail" in state.deploy_health_reason
+        assert "taskkill denied" in state.deploy_health_reason
+        snapshot = state.registrar_snapshot()
+        assert snapshot["accept_service_deploy"] is False
+        assert "svc-cleanup-fail" in snapshot["deploy_health_reason"]
     finally:
         state.close()
 
@@ -5184,7 +5449,7 @@ def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
 
     state.close()
 
-    assert ("stop_service", {"service_id": "svc-close"}) in calls
+    assert ("stop_service", {"service_id": "svc-close", "reason": "nodecontrol shutdown"}) in calls
     assert ("stop_task_pool", {"pool_id": "pool-close"}) in calls
     assert ("close", {"shutdown_timeout_sec": 2.0}) in calls
     assert service.status == pb2.SERVICE_STATUS_STOPPED

@@ -147,6 +147,7 @@ class ServiceSession:
     in_flight: int = 0
     queued: int = 0
     alive_workers: int = 0
+    degraded: bool = False
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)

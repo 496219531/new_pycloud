@@ -63,6 +63,7 @@ class InfoCenterNodeService:
     entry_callable: str = ""
     serialization_mode: str = ""
     status_text: str = ""
+    resource_health: str = ""
     worker_count: int = 0
     alive_workers: int = 0
     in_flight: int = 0
@@ -259,6 +260,7 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     entry_callable=str(svc.get("entry_callable", "") or ""),
                     serialization_mode=str(svc.get("serialization_mode", "") or ""),
                     status_text=str(svc.get("status_text", "") or ""),
+                    resource_health=str(svc.get("resource_health", "") or ""),
                     worker_count=int(svc.get("worker_count", 0) or 0),
                     alive_workers=int(svc.get("alive_workers", 0) or 0),
                     in_flight=int(svc.get("in_flight", 0) or 0),

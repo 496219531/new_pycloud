@@ -1105,7 +1105,10 @@ class InfoCenterState:
             )
             if healthy_only:
                 if normalized_scope == "call":
-                    if not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain)):
+                    if (
+                        not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain))
+                        or int(effective_alive or 0) <= 0
+                    ):
                         continue
                 elif normalized_scope == "owner_command":
                     if not is_owner_target(healthy=is_healthy, service_status=effective_status):
@@ -1126,6 +1129,15 @@ class InfoCenterState:
             ema_samples = max(0, int(svc.ema_samples or 0))
             raw_ema_child_invoke_ms = max(0.0, float(svc.ema_child_invoke_ms or 0.0))
             effective_ema_child_invoke_ms = raw_ema_child_invoke_ms if ema_samples >= 10 else 0.0
+            resource_health = str(getattr(svc, "resource_health", "") or "")
+            if not resource_health:
+                if int(effective_status) == int(pb2.SERVICE_STATUS_STOPPED):
+                    resource_health = "stopped"
+                elif int(effective_alive or 0) <= 0:
+                    resource_health = "degraded"
+                else:
+                    resource_health = "running"
+            reported_status_text = str(getattr(svc, "status_text", "") or status_text or "")
             predicted_busy = self._predicted_busy_score(
                 inflight=effective_computed_inflight,
                 ema_child_invoke_ms=effective_ema_child_invoke_ms,
@@ -1137,7 +1149,10 @@ class InfoCenterState:
                     "service_id": svc.service_id,
                     "status": effective_status,
                     "service_status": effective_status,
-                    "status_text": status_text,
+                    "status_text": reported_status_text,
+                    "resource_health": resource_health,
+                    "stop_reason": str(getattr(svc, "stop_reason", "") or ""),
+                    "failure_at": getattr(svc, "failure_at", None),
                     "policy_id": str(svc.policy_id or "").strip().lower() or "default_safe",
                     "owner_client_id": str(getattr(svc, "owner_client_id", "") or ""),
                     "code_version": str(getattr(svc, "code_version", "") or ""),

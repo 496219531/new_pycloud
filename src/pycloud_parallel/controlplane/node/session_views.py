@@ -103,6 +103,12 @@ def _service_status_name(status: int) -> str:
         return str(status or pb2.SERVICE_STATUS_UNSPECIFIED)
 
 
+def _service_report_status_text(session: ServiceSession) -> str:
+    if bool(getattr(session, "degraded", False)):
+        return "DEGRADED"
+    return _service_status_name(session.status)
+
+
 def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
     resource = session.resource_snapshot(in_flight=in_flight)
     lease_expire_at = _service_lease_expire_at(session)
@@ -113,7 +119,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "policy_id": str(session.policy_id or "").strip().lower() or "default_safe",
         "code_version": session.code_version,
         "status": int(session.status),
-        "status_text": _service_status_name(session.status),
+        "status_text": _service_report_status_text(session),
         "worker_count": resource.worker_count,
         "alive_workers": resource.alive_workers,
         "in_flight": resource.in_flight,
@@ -128,6 +134,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "http_base_url": session.http_base_url,
         "methods": sorted(session.methods.keys()),
         "timing_metrics": dict(session.timing_metrics or {}),
+        "degraded": bool(getattr(session, "degraded", False)),
     }
 
 
@@ -161,7 +168,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "entry_callable": str(getattr(session, "entry_callable", "") or ""),
         "serialization_mode": str(getattr(session, "serialization_mode", "") or ""),
         "status": int(session.status),
-        "status_text": _service_status_name(session.status),
+        "status_text": _service_report_status_text(session),
         "worker_count": int(resource.worker_count),
         "alive_workers": int(resource.alive_workers),
         "in_flight": int(resource.in_flight),
@@ -173,6 +180,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "failure_at": session.failure_at.isoformat() if getattr(session, "failure_at", None) is not None else "",
         "http_base_url": session.http_base_url,
         "stop_reason": str(session.stop_reason or ""),
+        "degraded": bool(getattr(session, "degraded", False)),
     }
 
 

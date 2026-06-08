@@ -63,6 +63,69 @@ def _wait_for_backend_event(backend, kind: str, *, timeout_sec: float = 8.0):
     raise AssertionError(f"timed out waiting for backend event: {kind}")
 
 
+class _NeverDoneFuture:
+    def __init__(self):
+        self.cancelled = False
+
+    def add_done_callback(self, _callback):
+        return None
+
+    def cancel(self):
+        self.cancelled = True
+        return True
+
+
+def test_executor_core_stop_service_fails_inflight_call_and_stream():
+    responses = []
+    core = ExecutorCore(
+        task_worker_capacity=1,
+        emit_response=lambda item: responses.append(dict(item)),
+        emit_event=lambda _item: None,
+    )
+    call_future = _NeverDoneFuture()
+    stream_future = _NeverDoneFuture()
+    stream_manager = type("_Manager", (), {"shutdown": lambda self: None})()
+    core._service_workers["svc-stop"] = 1  # noqa: SLF001
+    core._service_executors["svc-stop"] = None  # noqa: SLF001
+    core._track_inflight(  # noqa: SLF001
+        call_future,
+        {
+            "kind": "service",
+            "service_id": "svc-stop",
+            "request_id": "req-call",
+            "streaming": False,
+        },
+    )
+    core._track_inflight(  # noqa: SLF001
+        stream_future,
+        {
+            "kind": "service",
+            "service_id": "svc-stop",
+            "request_id": "req-stream",
+            "streaming": True,
+            "stream_manager": stream_manager,
+        },
+    )
+
+    core.handle_request(
+        "req-stop",
+        "stop_service",
+        {"service_id": "svc-stop", "reason": "owner heartbeat timeout"},
+    )
+
+    by_request = {item["request_id"]: item for item in responses}
+    assert by_request["req-call"]["status_text"] == "FAILED_INFRA"
+    assert by_request["req-call"]["err_message"] == "owner heartbeat timeout"
+    assert by_request["req-stream"]["status_text"] == "FAILED_INFRA"
+    assert by_request["req-stream"]["err_message"] == "owner heartbeat timeout"
+    assert by_request["req-stop"]["ok"] is True
+    assert by_request["req-stop"]["failed_inflight"] == 2
+    assert call_future.cancelled is True
+    assert stream_future.cancelled is True
+    assert core._inflight == {}  # noqa: SLF001
+    assert core._stream_state == {}  # noqa: SLF001
+
+
 def test_create_executor_backend_defaults_to_subprocess_host():
     backend = create_executor_backend(task_worker_capacity=1)
     try:
