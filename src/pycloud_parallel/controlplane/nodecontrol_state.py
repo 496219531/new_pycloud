@@ -159,6 +159,7 @@ _CODE_LAST_AT_TOUCH_MAX_ENTRIES = 10000
 HEARTBEAT_LOCK_WAIT_LOG_SEC = 0.25
 HEARTBEAT_TOTAL_LOG_SEC = 0.5
 EXECUTOR_EVENT_DRAIN_BATCH_SIZE = 128
+SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
 
 
 def _path(value: Any = ".") -> Path:
@@ -241,6 +242,7 @@ class NodeControlState(NodeRuntimeBase):
         self._execution_fenced_at: Optional[datetime] = None
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
+        self._service_zero_alive_counts: Dict[str, int] = {}
         self._code_write_locks: Dict[str, threading.Lock] = {}
         self._object_write_locks: Dict[str, threading.Lock] = {}
         self._artifact_method_cache: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str], Dict[str, Tuple[str, str]]] = {}
@@ -559,6 +561,7 @@ class NodeControlState(NodeRuntimeBase):
                 pool.stop_reason = normalized_reason
                 pool.lease_expire_at = fenced_at
             self._services.clear()
+            self._service_zero_alive_counts.clear()
             self._task_pools.clear()
             self._pool_tasks.clear()
             self._pool_task_reserved_ids.clear()
@@ -631,6 +634,17 @@ class NodeControlState(NodeRuntimeBase):
         pool.stop_reason = reason
         pool.lease_expire_at = utc_now()
         return stop_executor
+
+    @staticmethod
+    def _service_stopped_error_payload(session: ServiceSession, *, fallback: str = "service not running") -> Dict[str, object]:
+        stop_reason = str(getattr(session, "stop_reason", "") or "").strip()
+        error = stop_reason or str(fallback or "service not running")
+        return {
+            "ok": False,
+            "error": error,
+            "stop_reason": stop_reason,
+            "status": int(session.status),
+        }
 
     @property
     def data_store(self) -> DataStore:
@@ -2367,6 +2381,7 @@ class NodeControlState(NodeRuntimeBase):
                 session.managed_globals_digest = managed_state.globals_digest
             with self._lock:
                 self._services[service_id] = session
+                self._service_zero_alive_counts.pop(service_id, None)
             self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
             return session
         except Exception as exc:
@@ -3040,12 +3055,14 @@ class NodeControlState(NodeRuntimeBase):
     def _stop_service_locked(self, session: ServiceSession, *, reason: str) -> None:
         if session.status == pb2.SERVICE_STATUS_STOPPED:
             return
+        stop_reason = str(reason or "owner requested").strip() or "owner requested"
         session.status = pb2.SERVICE_STATUS_DRAINING
         session.executor_ready = False
-        session.stop_reason = reason
+        session.stop_reason = stop_reason
         session.alive_workers = 0
         session.status = pb2.SERVICE_STATUS_STOPPED
         session.lease_expire_at = utc_now()
+        self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
         if self._executor_host is not None:
             try:
                 self._executor_host.stop_service(service_id=session.service_id)
@@ -3104,7 +3121,7 @@ class NodeControlState(NodeRuntimeBase):
             if session is None:
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
-                return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
+                return 409, self._service_stopped_error_payload(session)
             if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
             if requested_method not in session.methods:
@@ -3114,7 +3131,7 @@ class NodeControlState(NodeRuntimeBase):
                 return 500, {"ok": False, "error": "artifact missing"}
             self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
-                return 409, {"ok": False, "error": "service executor stopped"}
+                return 409, self._service_stopped_error_payload(session, fallback="service executor stopped")
             session.request_count += 1
             session.in_flight = self._service_inflight_locked(session)
             prepared_payload = (
@@ -3186,6 +3203,11 @@ class NodeControlState(NodeRuntimeBase):
                 if session is not None:
                     session.returned_count += 1
                     session.in_flight = self._service_inflight_locked(session)
+                    stopped_payload = (
+                        self._service_stopped_error_payload(session, fallback=repr(exc))
+                        if session.status != pb2.SERVICE_STATUS_RUNNING or str(session.stop_reason or "").strip()
+                        else None
+                    )
                     self._record_service_timing_locked(
                         session,
                         method=requested_method,
@@ -3200,6 +3222,8 @@ class NodeControlState(NodeRuntimeBase):
                         error_type=exc.__class__.__name__,
                         error_message=repr(exc),
                     )
+                    if stopped_payload is not None:
+                        return 409, stopped_payload
             return 500, {"ok": False, "error": repr(exc)}
 
         with self._lock:
@@ -3347,7 +3371,7 @@ class NodeControlState(NodeRuntimeBase):
             if session is None:
                 return 404, {"ok": False, "error": "service not found"}
             if session.status != pb2.SERVICE_STATUS_RUNNING:
-                return 409, {"ok": False, "error": "service not running", "status": int(session.status)}
+                return 409, self._service_stopped_error_payload(session)
             if not self._service_token_allowed(session, service_token):
                 return 401, {"ok": False, "error": "invalid service token"}
             if requested_method not in session.methods:
@@ -3357,7 +3381,7 @@ class NodeControlState(NodeRuntimeBase):
                 return 500, {"ok": False, "error": "artifact missing"}
             self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
-                return 409, {"ok": False, "error": "service executor stopped"}
+                return 409, self._service_stopped_error_payload(session, fallback="service executor stopped")
             session.request_count += 1
             session.in_flight = self._service_inflight_locked(session)
             prepared_payload = (
@@ -4112,12 +4136,39 @@ class NodeControlState(NodeRuntimeBase):
         with self._lock:
             for session in self._services.values():
                 if session.status != pb2.SERVICE_STATUS_RUNNING:
+                    self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
                     continue
                 if bool(getattr(session, "node_managed", False)):
-                    continue
-                if now <= session.lease_expire_at:
-                    continue
-                self._stop_service_locked(session, reason="owner heartbeat timeout")
+                    if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
+                        count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
+                        self._service_zero_alive_counts[session.service_id] = count
+                        if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
+                            self._stop_service_locked(
+                                session,
+                                reason=(
+                                    "startup service worker unavailable; "
+                                    f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
+                                ),
+                            )
+                    else:
+                        self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
+                else:
+                    if now > session.lease_expire_at:
+                        self._stop_service_locked(session, reason="owner heartbeat timeout")
+                        continue
+                    if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
+                        count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
+                        self._service_zero_alive_counts[session.service_id] = count
+                        if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
+                            self._stop_service_locked(
+                                session,
+                                reason=(
+                                    "service worker unavailable; owner should redeploy or compensate; "
+                                    f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
+                                ),
+                            )
+                    else:
+                        self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
             for pool in self._task_pools.values():
                 if not pool.is_running():
                     continue

@@ -4750,6 +4750,185 @@ def test_nodecontrol_reset_closes_executor_with_fence_timeout(tmp_path):
         state.close()
 
 
+def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-owner-timeout",
+        queue_capacity=4,
+        worker_capacity=2,
+        service_worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_owner_timeout"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop_service", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    expired = ServiceSession(
+        service_id="svc-expired",
+        owner_client_id="owner",
+        service_name="svc-expired",
+        code_version="sha256:expired",
+        worker_count=1,
+        heartbeat_timeout_sec=5,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-expired",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now - timedelta(seconds=10),
+        lease_expire_at=now - timedelta(seconds=1),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    healthy = ServiceSession(
+        service_id="svc-healthy",
+        owner_client_id="owner",
+        service_name="svc-healthy",
+        code_version="sha256:healthy",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-healthy",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[expired.service_id] = expired  # noqa: SLF001
+        state._services[healthy.service_id] = healthy  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert expired.status == pb2.SERVICE_STATUS_STOPPED
+        assert expired.stop_reason == "owner heartbeat timeout"
+        assert expired.alive_workers == 0
+        assert healthy.status == pb2.SERVICE_STATUS_RUNNING
+        assert state.execution_fenced is False
+        assert state.can_accept_service_deploy is True
+        assert state.service_worker_used() == 1
+        assert calls == [("stop_service", {"service_id": "svc-expired"})]
+
+        code, body = state.call_service(
+            service_id=expired.service_id,
+            method="run",
+            payload={},
+            service_token=expired.service_token,
+            timeout_sec=1.0,
+        )
+        assert code == 409
+        assert body["error"] == "owner heartbeat timeout"
+        assert body["stop_reason"] == "owner heartbeat timeout"
+    finally:
+        state.close()
+
+
+def test_service_zero_alive_workers_stops_only_that_service(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-zero-workers",
+        queue_capacity=4,
+        worker_capacity=2,
+        service_worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_zero_workers"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop_service", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    dead_workers = ServiceSession(
+        service_id="svc-dead-workers",
+        owner_client_id="owner",
+        service_name="svc-dead-workers",
+        code_version="sha256:dead",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-dead",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=0,
+        methods={"run": ("demo", "run")},
+    )
+    healthy = ServiceSession(
+        service_id="svc-still-running",
+        owner_client_id="owner",
+        service_name="svc-still-running",
+        code_version="sha256:healthy",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-healthy",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[dead_workers.service_id] = dead_workers  # noqa: SLF001
+        state._services[healthy.service_id] = healthy  # noqa: SLF001
+
+    try:
+        for _idx in range(3):
+            state._handle_service_timeouts()  # noqa: SLF001
+
+        assert dead_workers.status == pb2.SERVICE_STATUS_STOPPED
+        assert "service worker unavailable" in dead_workers.stop_reason
+        assert healthy.status == pb2.SERVICE_STATUS_RUNNING
+        assert state.execution_fenced is False
+        assert state.can_accept_service_deploy is True
+        assert state.service_worker_used() == 1
+        assert calls == [("stop_service", {"service_id": "svc-dead-workers"})]
+    finally:
+        state.close()
+
+
 def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     state = NodeControlState(
         node_id="node-close-executors",
