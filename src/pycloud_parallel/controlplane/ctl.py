@@ -827,12 +827,24 @@ def _node_registration_matches(
     if str(item.get("node_id", "") or "").strip() != str(node_id or "").strip():
         return False
     expected_control_addr = str(control_addr or "").strip()
-    if expected_control_addr and str(item.get("control_addr", "") or "").strip() != expected_control_addr:
+    actual_control_addr = _normalize_control_addr_for_match(str(item.get("control_addr", "") or ""))
+    if expected_control_addr and actual_control_addr != _normalize_control_addr_for_match(expected_control_addr):
         return False
     expected_node_instance_id = str(node_instance_id or "").strip()
     if expected_node_instance_id and str(item.get("node_instance_id", "") or "").strip() != expected_node_instance_id:
         return False
     return True
+
+
+def _normalize_control_addr_for_match(value: str) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"http://{text}")
+    netloc = str(parsed.netloc or "").strip()
+    if netloc:
+        return netloc.rstrip("/")
+    return text.removeprefix("http://").removeprefix("https://").rstrip("/")
 
 
 def _wait_node_registered(

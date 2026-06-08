@@ -45,7 +45,7 @@ def test_node_registration_match_requires_control_addr_and_instance_id():
     row = {
         "node_id": "node-a",
         "node_instance_id": "node-a-new",
-        "control_addr": "10.0.0.9:50061",
+        "control_addr": "http://10.0.0.9:50061",
     }
 
     assert ctl._node_registration_matches(
@@ -58,6 +58,12 @@ def test_node_registration_match_requires_control_addr_and_instance_id():
         row,
         node_id="node-a",
         control_addr="10.0.0.8:50061",
+        node_instance_id="node-a-new",
+    )
+    assert not ctl._node_registration_matches(
+        row,
+        node_id="node-a",
+        control_addr="10.0.0.9:50062",
         node_instance_id="node-a-new",
     )
     assert not ctl._node_registration_matches(
