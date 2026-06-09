@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, TypeVar
@@ -87,6 +88,34 @@ def next_replica_create_interval(
     normalized_attempt = max(1, int(attempt or 1))
     interval = min(max(0.05, float(max_sec or 1.0)), max(0.05, float(base_sec or 0.25)) * normalized_attempt)
     return min(interval, remaining)
+
+
+def run_replica_create_recovery_loop(
+    *,
+    timeout_sec: float,
+    should_continue: Callable[[], bool],
+    attempt_once: Callable[[int], None],
+    base_interval_sec: float = 0.25,
+    max_interval_sec: float = 1.0,
+) -> int:
+    retry_deadline = time.monotonic() + max(0.0, float(timeout_sec or 0.0))
+    if retry_deadline <= time.monotonic():
+        return 0
+    attempt = 0
+    while should_continue() and time.monotonic() < retry_deadline:
+        attempt += 1
+        sleep_sec = next_replica_create_interval(
+            attempt,
+            deadline_remaining_sec=retry_deadline - time.monotonic(),
+            base_sec=base_interval_sec,
+            max_sec=max_interval_sec,
+        )
+        if sleep_sec > 0.0:
+            time.sleep(sleep_sec)
+        if not should_continue() or time.monotonic() >= retry_deadline:
+            break
+        attempt_once(attempt)
+    return attempt
 
 
 def prepare_deployment_artifact(
@@ -189,5 +218,6 @@ __all__ = [
     "normalize_initial_globals",
     "next_replica_create_interval",
     "prepare_deployment_artifact",
+    "run_replica_create_recovery_loop",
     "should_retry_replica_create_failures",
 ]

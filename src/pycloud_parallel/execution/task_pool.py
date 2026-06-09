@@ -73,8 +73,8 @@ from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     normalize_initial_globals,
-    next_replica_create_interval,
     prepare_deployment_artifact,
+    run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
 )
 from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
@@ -4151,34 +4151,22 @@ def _build_task_pool_from_infocenter(
             resource_kind="task_pool",
         )
     ):
-        retry_deadline = time.monotonic() + max(0.1, float(timeout_sec or 0.0))
-        retry_attempt = 0
-        while (
-            len(created) < required_success_nodes
-            and should_retry_replica_create_failures(
+        def _should_continue_create_recovery() -> bool:
+            return should_retry_replica_create_failures(
                 create_failures,
                 success=len(created),
                 required=required_success_nodes,
                 resource_kind="task_pool",
             )
-            and time.monotonic() < retry_deadline
-        ):
-            retry_attempt += 1
-            sleep_sec = next_replica_create_interval(
-                retry_attempt,
-                deadline_remaining_sec=retry_deadline - time.monotonic(),
-                base_sec=0.5,
-                max_sec=0.5,
-            )
-            if sleep_sec > 0.0:
-                time.sleep(sleep_sec)
+
+        def _attempt_create_recovery(retry_attempt: int) -> None:
             try:
                 retry_nodes = _select_candidate_nodes()
             except Exception as exc:
                 create_failures[f"infocenter-retry-{retry_attempt}"] = repr(exc)
-                continue
+                return
             if not retry_nodes:
-                continue
+                return
             all_selected_nodes.extend(retry_nodes)
             retry_desired = retry_nodes[:required_success_nodes]
             retry_fallback = retry_nodes[required_success_nodes:]
@@ -4193,6 +4181,14 @@ def _build_task_pool_from_infocenter(
                 if len(created) >= required_success_nodes:
                     break
                 _record_create_results([fallback_node])
+
+        run_replica_create_recovery_loop(
+            timeout_sec=max(0.1, float(timeout_sec or 0.0)),
+            should_continue=_should_continue_create_recovery,
+            attempt_once=_attempt_create_recovery,
+            base_interval_sec=0.5,
+            max_interval_sec=0.5,
+        )
     if not created:
         raise RuntimeError(f"task pool create failed on all selected nodes; failures={create_failures}")
     desired_order = {

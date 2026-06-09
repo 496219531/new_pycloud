@@ -70,3 +70,34 @@ def test_next_replica_create_interval_is_bounded():
     assert next_replica_create_interval(10, deadline_remaining_sec=10.0, base_sec=0.25, max_sec=1.0) == 1.0
     assert next_replica_create_interval(10, deadline_remaining_sec=0.2, base_sec=0.25, max_sec=1.0) == 0.2
     assert next_replica_create_interval(1, deadline_remaining_sec=0.0) == 0.0
+
+
+def test_run_replica_create_recovery_loop_stops_when_condition_clears(monkeypatch):
+    import pycloud_parallel.execution.deployment_create_helper as helper
+
+    now = {"value": 0.0}
+    attempts = []
+
+    monkeypatch.setattr(helper.time, "monotonic", lambda: now["value"])
+
+    def _sleep(seconds):
+        now["value"] += float(seconds)
+
+    monkeypatch.setattr(helper.time, "sleep", _sleep)
+
+    def _should_continue():
+        return len(attempts) < 2
+
+    def _attempt_once(attempt):
+        attempts.append(attempt)
+
+    count = helper.run_replica_create_recovery_loop(
+        timeout_sec=10.0,
+        should_continue=_should_continue,
+        attempt_once=_attempt_once,
+        base_interval_sec=0.5,
+        max_interval_sec=0.5,
+    )
+
+    assert count == 2
+    assert attempts == [1, 2]

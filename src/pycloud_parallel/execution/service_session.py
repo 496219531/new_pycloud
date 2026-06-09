@@ -87,8 +87,8 @@ from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     normalize_initial_globals,
-    next_replica_create_interval,
     prepare_deployment_artifact,
+    run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
 )
 from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
@@ -3517,30 +3517,22 @@ class Service(ServiceExecutionSession):
                 wait_timeout = _ready_retry_timeout(timeout_sec, grace_sec=_SERVICE_READY_GRACE_SEC)
                 if wait_timeout <= 0.0:
                     return
-                deadline = time.monotonic() + wait_timeout
                 logged_retry = False
-                while (
-                    len(sessions) < target_success_nodes
-                    and should_retry_replica_create_failures(
+
+                def _should_continue() -> bool:
+                    return should_retry_replica_create_failures(
                         failures,
                         success=len(sessions),
                         required=target_success_nodes,
                         resource_kind="service",
                     )
-                    and time.monotonic() < deadline
-                ):
-                    sleep_sec = next_replica_create_interval(
-                        1,
-                        deadline_remaining_sec=deadline - time.monotonic(),
-                        base_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
-                        max_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
-                    )
-                    if sleep_sec > 0.0:
-                        time.sleep(sleep_sec)
+
+                def _attempt_once(_attempt: int) -> None:
+                    nonlocal logged_retry
                     try:
                         _existing_routes, fresh_discovered_nodes, _fresh_selected_nodes = _discover_and_select_nodes()
                     except _RetryableReadyError:
-                        continue
+                        return
                     tried_node_keys = set(failures.keys()) | set(sessions.keys())
                     if requested_node_ids:
                         fresh_node_map = _build_unique_node_id_map(
@@ -3560,7 +3552,7 @@ class Service(ServiceExecutionSession):
                             if _node_instance_key_from_node(node) not in tried_node_keys
                         ]
                     if not rediscovered_candidates:
-                        continue
+                        return
                     if not logged_retry:
                         _emit_owner_notice(
                             "deploy rediscovering nodes after transient create failure "
@@ -3572,6 +3564,14 @@ class Service(ServiceExecutionSession):
                         if len(sessions) >= target_success_nodes:
                             break
                         _record_create_results([node])
+
+                run_replica_create_recovery_loop(
+                    timeout_sec=wait_timeout,
+                    should_continue=_should_continue,
+                    attempt_once=_attempt_once,
+                    base_interval_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
+                    max_interval_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
+                )
 
             if (
                 len(sessions) < strict_success_nodes
