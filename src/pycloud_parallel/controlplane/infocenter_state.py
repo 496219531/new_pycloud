@@ -279,9 +279,13 @@ class InfoCenterState:
 
         task_pools: Dict[str, NodeTaskPoolInfo] = {}
         for pool_id, pool in incoming_task_pools.items():
-            reason = str(getattr(pool, "failure_reason", "") or "").strip()
+            reason = str(getattr(pool, "stop_reason", "") or getattr(pool, "failure_reason", "") or "").strip()
             previous = previous_pools.get(pool_id)
-            previous_reason = str(getattr(previous, "failure_reason", "") or "").strip() if previous is not None else ""
+            previous_reason = (
+                str(getattr(previous, "stop_reason", "") or getattr(previous, "failure_reason", "") or "").strip()
+                if previous is not None
+                else ""
+            )
             failure_at = getattr(pool, "failure_at", None)
             if reason:
                 if failure_at is None and previous_reason == reason:
@@ -290,6 +294,8 @@ class InfoCenterState:
                     failure_at = now
             else:
                 failure_at = None
+            pool.stop_reason = reason
+            pool.failure_reason = reason
             pool.failure_at = failure_at
             task_pools[pool_id] = pool
 

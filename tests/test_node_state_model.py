@@ -265,6 +265,10 @@ def test_failed_create_task_pool_is_reported_for_ops(tmp_path, monkeypatch):
         report = next(iter(reports.values()))
         assert report.pool_name == "pool-fail"
         assert report.status == "STOPPED"
+        assert report.resource_health == "stopped"
+        assert report.alive_workers == 0
+        assert report.inflight == 0
+        assert "missing_pkg" in report.stop_reason
         assert "missing_pkg" in report.failure_reason
     finally:
         state.close()

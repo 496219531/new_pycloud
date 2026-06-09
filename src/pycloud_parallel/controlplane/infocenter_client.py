@@ -79,9 +79,16 @@ class InfoCenterNodeTaskPool:
     pool_name: str
     code_version: str
     status: str
+    resource_health: str = ""
+    degraded: bool = False
     worker_count: int = 0
+    alive_workers: int = 0
     task_count: int = 0
+    in_flight: int = 0
     inflight: int = 0
+    received_count: int = 0
+    returned_count: int = 0
+    stop_reason: str = ""
     failure_reason: str = ""
     failure_at: Optional[datetime] = None
 
@@ -278,10 +285,17 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     pool_name=str(pool.get("pool_name", "") or ""),
                     code_version=str(pool.get("code_version", "") or ""),
                     status=str(pool.get("status", "") or ""),
+                    resource_health=str(pool.get("resource_health", "") or ""),
+                    degraded=_coerce_bool(pool.get("degraded"), default=False),
                     worker_count=int(pool.get("worker_count", 0) or 0),
+                    alive_workers=int(pool.get("alive_workers", 0) or 0),
                     task_count=int(pool.get("task_count", 0) or 0),
-                    inflight=int(pool.get("inflight", 0) or 0),
-                    failure_reason=str(pool.get("failure_reason", "") or ""),
+                    in_flight=int(pool.get("in_flight", pool.get("inflight", 0)) or 0),
+                    inflight=int(pool.get("inflight", pool.get("in_flight", 0)) or 0),
+                    received_count=int(pool.get("received_count", pool.get("task_count", 0)) or 0),
+                    returned_count=int(pool.get("returned_count", 0) or 0),
+                    stop_reason=str(pool.get("stop_reason", pool.get("failure_reason", "")) or ""),
+                    failure_reason=str(pool.get("failure_reason", pool.get("stop_reason", "")) or ""),
                     failure_at=_parse_optional_dt(pool.get("failure_at")),
                 )
             )

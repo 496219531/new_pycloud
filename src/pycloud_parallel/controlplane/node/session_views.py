@@ -109,6 +109,16 @@ def _service_report_status_text(session: ServiceSession) -> str:
     return _service_status_name(session.status)
 
 
+def _task_pool_resource_health(pool: TaskPoolState, *, alive_workers: int) -> str:
+    if not pool.is_running():
+        return "stopped"
+    if str(pool.stop_reason or "").strip():
+        return "failed"
+    if bool(getattr(pool, "degraded", False)) or int(alive_workers or 0) <= 0:
+        return "degraded"
+    return "running"
+
+
 def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dict[str, object]:
     resource = session.resource_snapshot(in_flight=in_flight)
     lease_expire_at = _service_lease_expire_at(session)
@@ -188,12 +198,15 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
     resource = pool.resource_snapshot(in_flight=in_flight)
     metrics = dict(pool.timing_metrics or {})
     status = "DEGRADED" if pool.is_running() and bool(getattr(pool, "degraded", False)) else str(pool.status)
+    stop_reason = str(pool.stop_reason or "")
     return NodeTaskPoolInfo(
         pool_id=pool.pool_id,
         owner_client_id=pool.owner_client_id,
         pool_name=pool.pool_name,
         code_version=pool.code_version,
         status=status,
+        resource_health=_task_pool_resource_health(pool, alive_workers=resource.alive_workers),
+        degraded=bool(getattr(pool, "degraded", False)),
         worker_count=resource.worker_count,
         alive_workers=resource.alive_workers,
         task_count=pool.task_count,
@@ -205,7 +218,8 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
         created_at=pool.created_at,
         last_heartbeat_at=pool.last_heartbeat_at,
         lease_expire_at=pool.lease_expire_at,
-        failure_reason=str(pool.stop_reason or ""),
+        stop_reason=stop_reason,
+        failure_reason=stop_reason,
         failure_at=getattr(pool, "failure_at", None),
     )
 
@@ -223,6 +237,7 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "alive_workers": resource.alive_workers,
         "heartbeat_timeout_sec": pool.heartbeat_timeout_sec,
         "status": status,
+        "resource_health": _task_pool_resource_health(pool, alive_workers=resource.alive_workers),
         "degraded": bool(getattr(pool, "degraded", False)),
         "task_count": int(resource.received_count),
         "received_count": int(resource.received_count),
@@ -232,6 +247,7 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "last_heartbeat_at": pool.last_heartbeat_at,
         "lease_expire_at": pool.lease_expire_at,
         "timing_metrics": dict(pool.timing_metrics or {}),
+        "stop_reason": str(pool.stop_reason or ""),
         "failure_reason": str(pool.stop_reason or ""),
         "failure_at": getattr(pool, "failure_at", None),
     }

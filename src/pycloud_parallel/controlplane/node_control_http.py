@@ -160,6 +160,8 @@ def _task_pool_status_to_dict(info: Dict[str, object]) -> Dict[str, object]:
         "alive_workers": int(info.get("alive_workers", 0) or 0),
         "heartbeat_timeout_sec": int(info.get("heartbeat_timeout_sec", 0) or 0),
         "status": str(info.get("status", "")),
+        "resource_health": str(info.get("resource_health", "") or ""),
+        "degraded": bool(info.get("degraded", False)),
         "task_count": int(info.get("task_count", 0) or 0),
         "received_count": int(info.get("received_count", info.get("task_count", 0)) or 0),
         "returned_count": int(info.get("returned_count", 0) or 0),
@@ -167,7 +169,9 @@ def _task_pool_status_to_dict(info: Dict[str, object]) -> Dict[str, object]:
         "created_at": info["created_at"].isoformat(),
         "last_heartbeat_at": info["last_heartbeat_at"].isoformat(),
         "lease_expire_at": info["lease_expire_at"].isoformat(),
+        "stop_reason": str(info.get("stop_reason", info.get("failure_reason", "")) or ""),
         "failure_reason": str(info.get("failure_reason", "") or ""),
+        "failure_at": info["failure_at"].isoformat() if info.get("failure_at") is not None else "",
     }
 
 

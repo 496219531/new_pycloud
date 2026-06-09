@@ -577,6 +577,20 @@ def test_ops_page_separates_node_deploy_and_resource_health():
                 stop_reason="service worker unavailable",
             )
         },
+        task_pools={
+            "pool-stopped": NodeTaskPoolInfo(
+                pool_id="pool-stopped",
+                owner_client_id="owner-1",
+                pool_name="calc-pool",
+                code_version="sha256:test",
+                status="STOPPED",
+                resource_health="stopped",
+                worker_count=2,
+                alive_workers=0,
+                stop_reason="task pool worker unavailable",
+                failure_reason="task pool worker unavailable",
+            )
+        },
     )
 
     nodes = info_state.list_nodes(healthy_only=True, tags=["compute"], limit=10)
@@ -592,6 +606,7 @@ def test_ops_page_separates_node_deploy_and_resource_health():
     assert healthy_routes == []
     assert "service cleanup failed service_id=svc-stopped" in raw
     assert ">stopped</span>" in raw
+    assert "task pool worker unavailable" in raw
 
 
 def test_degraded_service_route_is_not_healthy_call_route():

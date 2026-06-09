@@ -119,17 +119,56 @@ def test_shared_service_and_task_pool_view_builders_use_resource_snapshot():
 
     assert pool_info.worker_count == 4
     assert pool_info.alive_workers == 3
+    assert pool_info.resource_health == "running"
+    assert pool_info.degraded is False
     assert pool_info.received_count == 9
     assert pool_info.returned_count == 5
     assert pool_info.inflight == 4
+    assert pool_status["resource_health"] == "running"
+    assert pool_status["degraded"] is False
     assert pool_status["received_count"] == 9
     assert pool_status["returned_count"] == 5
     assert pool_status["inflight"] == 4
     failed_pool_info = build_task_pool_info(failed_pool, in_flight=0)
     failed_pool_status = build_task_pool_status_info(failed_pool, in_flight=0)
+    assert failed_pool_info.resource_health == "stopped"
+    assert failed_pool_info.stop_reason == "owner heartbeat timeout"
     assert failed_pool_info.failure_reason == "owner heartbeat timeout"
     assert failed_pool_info.failure_at == pool_failure_at
+    assert failed_pool_status["resource_health"] == "stopped"
+    assert failed_pool_status["stop_reason"] == "owner heartbeat timeout"
     assert failed_pool_status["failure_at"] == pool_failure_at
+
+
+def test_task_pool_zero_alive_reports_degraded_without_worker_fallback():
+    now = _utc_now()
+    pool = TaskPoolState(
+        pool_id="pool-degraded",
+        owner_client_id="owner-a",
+        pool_name="pool-degraded",
+        code_version="sha256:" + ("e" * 64),
+        task_method="run",
+        worker_count=3,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        alive_workers=0,
+        degraded=True,
+    )
+
+    pool_info = build_task_pool_info(pool, in_flight=2)
+    pool_status = build_task_pool_status_info(pool, in_flight=2)
+
+    assert pool_info.status == "DEGRADED"
+    assert pool_info.resource_health == "degraded"
+    assert pool_info.alive_workers == 0
+    assert pool_status["status"] == "DEGRADED"
+    assert pool_status["resource_health"] == "degraded"
+    assert pool_status["alive_workers"] == 0
 
 
 def test_execute_warmup_dispatches_scope_and_normalizes_result():

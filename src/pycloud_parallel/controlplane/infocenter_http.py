@@ -327,6 +327,12 @@ def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
             pool_name=str(item.get("pool_name", "") or ""),
             code_version=str(item.get("code_version", "") or ""),
             status=str(item.get("status", "") or ""),
+            resource_health=str(item.get("resource_health", "") or "") or (
+                "degraded"
+                if _coerce_bool(item.get("degraded"), default=False)
+                else ""
+            ),
+            degraded=_coerce_bool(item.get("degraded"), default=False),
             worker_count=max(0, int(item.get("worker_count", 0) or 0)),
             alive_workers=max(0, int(item.get("alive_workers", 0) or 0)),
             task_count=max(0, int(item.get("task_count", 0) or 0)),
@@ -338,6 +344,7 @@ def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
             created_at=_parse_dt(item.get("created_at") or utc_now()),
             last_heartbeat_at=_parse_dt(item.get("last_heartbeat_at") or utc_now()),
             lease_expire_at=_parse_dt(item.get("lease_expire_at") or utc_now()),
+            stop_reason=str(item.get("stop_reason", item.get("failure_reason", "")) or ""),
             failure_reason=str(item.get("failure_reason", item.get("stop_reason", "")) or ""),
             failure_at=_parse_optional_dt(item.get("failure_at") or item.get("failure_at_ts")),
         )
@@ -369,6 +376,26 @@ def _service_resource_health_text(*, node_healthy: bool, service_status: int, al
     if str(stop_reason or "").strip():
         return "failed"
     if int(alive_workers or 0) <= 0:
+        return "degraded"
+    return "running"
+
+
+def _task_pool_resource_health_text(
+    *,
+    node_healthy: bool,
+    status: object,
+    alive_workers: int,
+    stop_reason: object = "",
+    degraded: object = False,
+) -> str:
+    if not bool(node_healthy):
+        return "node_lost"
+    normalized = str(status or "").strip().upper()
+    if normalized == "STOPPED":
+        return "stopped"
+    if str(stop_reason or "").strip():
+        return "failed"
+    if normalized == "DEGRADED" or _coerce_bool(degraded, default=False) or int(alive_workers or 0) <= 0:
         return "degraded"
     return "running"
 
@@ -468,7 +495,7 @@ def _serialize_node(state) -> Dict[str, object]:
         for svc in sorted(state.services.values(), key=lambda item: (item.service_name, item.service_id))
     ]
     task_pools = sorted(state.task_pools.values(), key=lambda item: (item.created_at, item.pool_name, item.pool_id), reverse=True)
-    active_task_pools = [pool for pool in task_pools if str(pool.status or "").strip().upper() == "RUNNING"]
+    active_task_pools = [pool for pool in task_pools if str(pool.status or "").strip().upper() in {"RUNNING", "DEGRADED"}]
     loaded_services = sorted({svc["service_name"] for svc in services})
     return {
         "node_instance_id": state.node_instance_id,
@@ -519,10 +546,19 @@ def _serialize_node(state) -> Dict[str, object]:
                 "pool_name": str(pool.pool_name),
                 "code_version": str(pool.code_version),
                 "status": str(pool.status),
+                "resource_health": str(getattr(pool, "resource_health", "") or "") or _task_pool_resource_health_text(
+                    node_healthy=bool(state.healthy),
+                    status=pool.status,
+                    alive_workers=int(pool.alive_workers if state.healthy else 0),
+                    stop_reason=getattr(pool, "stop_reason", "") or getattr(pool, "failure_reason", ""),
+                    degraded=getattr(pool, "degraded", False),
+                ),
+                "degraded": bool(getattr(pool, "degraded", False)),
                 "worker_count": int(pool.worker_count),
-                "alive_workers": int(pool.alive_workers),
+                "alive_workers": int(pool.alive_workers if state.healthy else 0),
                 "task_count": int(pool.task_count),
-                "inflight": int(pool.inflight),
+                "in_flight": int(pool.inflight if state.healthy else 0),
+                "inflight": int(pool.inflight if state.healthy else 0),
                 "received_count": int(pool.received_count),
                 "returned_count": int(pool.returned_count),
                 "ema_child_invoke_ms": float(pool.ema_child_invoke_ms),
@@ -530,6 +566,7 @@ def _serialize_node(state) -> Dict[str, object]:
                 "created_at": _dt_text(pool.created_at),
                 "last_heartbeat_at": _dt_text(pool.last_heartbeat_at),
                 "lease_expire_at": _dt_text(pool.lease_expire_at),
+                "stop_reason": str(getattr(pool, "stop_reason", "") or getattr(pool, "failure_reason", "") or ""),
                 "failure_reason": str(pool.failure_reason or ""),
                 "failure_at": _dt_text(pool.failure_at) if getattr(pool, "failure_at", None) is not None else "",
             }
@@ -968,6 +1005,15 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         for pool in task_pools:
             stale_row = "" if node_healthy else " class='stale-row'"
             timing = pool_timing_map.get(str(pool.pool_id), {})
+            pool_alive_workers = int(getattr(pool, "alive_workers", 0) if node_healthy else 0)
+            pool_stop_reason = str(getattr(pool, "stop_reason", "") or getattr(pool, "failure_reason", "") or "")
+            pool_resource_health = str(getattr(pool, "resource_health", "") or "") or _task_pool_resource_health_text(
+                node_healthy=node_healthy,
+                status=getattr(pool, "status", ""),
+                alive_workers=pool_alive_workers,
+                stop_reason=pool_stop_reason,
+                degraded=getattr(pool, "degraded", False),
+            )
             pool_entries.append((
                 getattr(pool, "created_at", None),
                 f"<tr{stale_row}>"
@@ -977,7 +1023,9 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(pool.pool_id)}</td>"
                 f"<td>{html.escape(pool.owner_client_id)}</td>"
                 f"<td>{_ops_status_badge(pool.status)}</td>"
+                f"<td>{_ops_status_badge(pool_resource_health)}</td>"
                 f"<td>{pool.worker_count}</td>"
+                f"<td>{pool_alive_workers}</td>"
                 f"<td>{pool.task_count}</td>"
                 f"<td>{int(getattr(pool, 'inflight', 0) or 0)}</td>"
                 f"<td>{html.escape(str(timing.get('call_count', '-')))}</td>"
@@ -993,7 +1041,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.lease_expire_at))}</td>"
-                f"<td>{html.escape(_failure_text_with_time(getattr(pool, 'failure_reason', ''), getattr(pool, 'failure_at', None)))}</td>"
+                f"<td>{html.escape(_failure_text_with_time(pool_stop_reason, getattr(pool, 'failure_at', None)))}</td>"
                 "</tr>"
             ))
         component = str(metadata.get("component", "") or "").strip()
@@ -1208,7 +1256,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "lease_expire_at", "failure_reason", "http_base_url",
     ]
     pool_headers = [
-        "node_id", "instance_id", "pool_name", "pool_id", "owner_client_id", "status", "workers", "tasks", "in_flight",
+        "node_id", "instance_id", "pool_name", "pool_id", "owner_client_id", "status", "resource", "workers", "alive", "tasks", "in_flight",
         "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
         "last_executor_create_ms", "avg_warmup_ms", "executor_rebuild_count", "code_version", "created_at",
         "last_heartbeat_at", "lease_expire_at", "failure_reason",
@@ -1235,7 +1283,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
         "body:not(.show-details) .ops-table--waiting-jobs :is(th,td):nth-child(2){display:none;}"
         "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+14):nth-child(-n+17),body:not(.show-details) .ops-table--services :is(th,td):nth-child(19){display:none;}"
-        "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+13):nth-child(-n+22){display:none;}"
+        "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+15):nth-child(-n+24){display:none;}"
         "body:not(.show-details) .ops-table{min-width:900px;}body.show-details .ops-table{min-width:1120px;}.density-toggle{border-color:rgba(34,211,238,.35);color:#cffafe;background:rgba(8,47,73,.5);}.density-toggle:hover{border-color:rgba(34,211,238,.72);background:rgba(14,116,144,.36);}.density-hint{color:#8fb2d9;font-size:12px;width:100%;text-align:right;}"
         ".badge{display:inline-flex;align-items:center;min-height:21px;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:800;line-height:1.2;border:1px solid transparent;white-space:nowrap;box-shadow:0 1px 0 rgba(255,255,255,.06) inset;}.badge-good{background:var(--good-bg);color:var(--good);border-color:rgba(74,222,128,.2);}.badge-warn{background:var(--warn-bg);color:var(--warn);border-color:rgba(251,191,36,.22);}.badge-bad{background:var(--bad-bg);color:var(--bad);border-color:rgba(251,113,133,.22);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);border-color:rgba(203,213,225,.14);}"
         ".stale-row{background:rgba(127,29,29,.24)!important;color:#fecaca;}form{margin:0;}td form{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;}button{appearance:none;border:1px solid rgba(148,163,184,.28);border-radius:9px;background:rgba(15,23,42,.9);color:#dbeafe;padding:5px 9px;margin:2px;font:inherit;font-size:12px;cursor:pointer;transition:.12s ease;}button:hover{transform:translateY(-1px);border-color:rgba(96,165,250,.72);color:#fff;background:rgba(37,99,235,.3);}input,select{border:1px solid rgba(148,163,184,.28);border-radius:9px;padding:5px 7px;font:inherit;font-size:12px;background:#08111f;color:var(--text);max-width:190px;}input::placeholder{color:#64748b;}"

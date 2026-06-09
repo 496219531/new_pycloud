@@ -54,6 +54,8 @@ class NodeTaskPoolInfo:
     pool_name: str
     code_version: str
     status: str
+    resource_health: str = ""
+    degraded: bool = False
     worker_count: int = 0
     alive_workers: int = 0
     task_count: int = 0
@@ -65,6 +67,7 @@ class NodeTaskPoolInfo:
     created_at: datetime = field(default_factory=utc_now)
     last_heartbeat_at: datetime = field(default_factory=utc_now)
     lease_expire_at: datetime = field(default_factory=utc_now)
+    stop_reason: str = ""
     failure_reason: str = ""
     failure_at: Optional[datetime] = None
 
