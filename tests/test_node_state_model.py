@@ -5278,6 +5278,82 @@ def test_startup_managed_service_zero_workers_recovers_executor(tmp_path, monkey
         state.close()
 
 
+def test_startup_managed_service_recovery_failure_stops_service(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-startup-recover-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_startup_recover_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    now = utc_now()
+    stop_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def service_worker_liveness(self):
+            return {"svc-startup-recover-fail": 0}
+
+        def stop_service(self, **kwargs):
+            stop_calls.append(kwargs)
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    service = ServiceSession(
+        service_id="svc-startup-recover-fail",
+        owner_client_id="owner",
+        service_name="svc-startup-recover-fail",
+        code_version="sha256:" + "f" * 64,
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-startup-fail",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=0,
+        methods={"run": ("startup_recover_fail", "run")},
+        node_managed=True,
+    )
+    monkeypatch.setattr(state, "_get_live_code_artifact_locked", lambda _code_version: None)
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert service.status == pb2.SERVICE_STATUS_STOPPED
+        assert service.executor_ready is False
+        assert service.alive_workers == 0
+        assert service.degraded is False
+        assert service.failure_at is not None
+        assert service.stop_reason == "startup service recovery failed: code artifact not found"
+        assert stop_calls == [
+            {
+                "service_id": "svc-startup-recover-fail",
+                "reason": "startup service recovery failed: code artifact not found",
+            }
+        ]
+    finally:
+        state.close()
+
+
 def test_stop_service_cleanup_failure_blocks_deploy(tmp_path):
     state = NodeControlState(
         node_id="node-service-cleanup-fail",

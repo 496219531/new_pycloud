@@ -4432,56 +4432,58 @@ class NodeControlState(NodeRuntimeBase):
     def _refresh_service_worker_liveness_locked(self) -> None:
         self._refresh_resource_liveness_locked()
 
+    def _handle_service_resource_health_locked(self, session: ServiceSession, *, now: datetime) -> None:
+        service_id = str(session.service_id or "")
+        if session.status != pb2.SERVICE_STATUS_RUNNING:
+            self._service_zero_alive_counts.pop(service_id, None)
+            return
+
+        if not bool(getattr(session, "node_managed", False)) and now > session.lease_expire_at:
+            self._stop_service_locked(session, reason=_resource_stop_reason("owner heartbeat timeout"))
+            return
+
+        has_workers = int(session.worker_count or 0) > 0
+        has_live_workers = int(session.alive_workers or 0) > 0
+        if not has_workers or has_live_workers:
+            session.degraded = False
+            self._service_zero_alive_counts.pop(service_id, None)
+            return
+
+        count = int(self._service_zero_alive_counts.get(service_id, 0) or 0) + 1
+        self._service_zero_alive_counts[service_id] = count
+        session.degraded = True
+        if count < SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
+            return
+
+        if bool(getattr(session, "node_managed", False)):
+            recovered = self._recover_node_managed_service_locked(session)
+            if not recovered:
+                self._stop_service_locked(
+                    session,
+                    reason=(
+                        str(session.stop_reason or "").strip()
+                        or "startup service worker unavailable; "
+                        f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
+                    ),
+                )
+            return
+
+        self._stop_service_locked(
+            session,
+            reason=_resource_stop_reason(
+                "service worker unavailable",
+                resource_kind="service",
+                alive_workers=0,
+                worker_count=int(session.worker_count or 0),
+            ),
+        )
+
     def _handle_service_timeouts(self) -> None:
         now = utc_now()
         with self._lock:
             self._refresh_resource_liveness_locked()
             for session in self._services.values():
-                if session.status != pb2.SERVICE_STATUS_RUNNING:
-                    self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
-                    continue
-                if bool(getattr(session, "node_managed", False)):
-                    if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
-                        count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
-                        self._service_zero_alive_counts[session.service_id] = count
-                        session.degraded = True
-                        if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
-                            recovered = self._recover_node_managed_service_locked(session)
-                            if not recovered:
-                                self._stop_service_locked(
-                                    session,
-                                    reason=(
-                                        str(session.stop_reason or "").strip()
-                                        or "startup service worker unavailable; "
-                                        f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
-                                    ),
-                                )
-                    else:
-                        session.degraded = False
-                        self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
-                else:
-                    if now > session.lease_expire_at:
-                        self._stop_service_locked(session, reason=_resource_stop_reason("owner heartbeat timeout"))
-                        continue
-                    if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
-                        count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
-                        self._service_zero_alive_counts[session.service_id] = count
-                        session.degraded = True
-                        if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
-                            self._stop_service_locked(
-                    session,
-                    reason=(
-                        _resource_stop_reason(
-                            "service worker unavailable",
-                            resource_kind="service",
-                            alive_workers=0,
-                            worker_count=int(session.worker_count or 0),
-                        )
-                    ),
-                )
-                    else:
-                        session.degraded = False
-                        self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
+                self._handle_service_resource_health_locked(session, now=now)
             for pool in self._task_pools.values():
                 if not pool.is_running():
                     continue
