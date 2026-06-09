@@ -1393,7 +1393,7 @@ def test_node_registrar_exits_when_replaced_by_confirmed_new_instance(tmp_path, 
         info_server.stop()
 
 
-def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
+def test_node_registrar_marks_registration_stale_after_transient_local_lease_expires(tmp_path):
     node_state = NodeControlState(
         node_id="node-self-fence",
         queue_capacity=4,
@@ -1422,9 +1422,9 @@ def test_node_registrar_self_fences_after_local_lease_expires(tmp_path):
         registrar._lease_ttl_sec = 1  # noqa: SLF001
 
         assert registrar.sync_now() is False
-        assert registrar._stop_event.is_set() is True  # noqa: SLF001
-        assert node_state.service_report_payloads(include_stopped=True) == []
-        assert node_state.task_pool_reports() == {}
+        assert registrar._registered is False  # noqa: SLF001
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert node_state.execution_fenced is False
     finally:
         registrar.close()
         node_state.close()
@@ -1518,7 +1518,7 @@ def test_node_registrar_wrapped_transient_disconnect_does_not_close_before_lease
         node_state.close()
 
 
-def test_node_registrar_closes_close_on_lost_after_wrapped_transient_lease_expires(tmp_path, monkeypatch):
+def test_node_registrar_keeps_close_on_lost_runtime_after_wrapped_transient_lease_expires(tmp_path, monkeypatch):
     node_state = NodeControlState(
         node_id="node-wrapped-transient-expired",
         queue_capacity=4,
@@ -1554,15 +1554,16 @@ def test_node_registrar_closes_close_on_lost_after_wrapped_transient_lease_expir
         registrar._lease_ttl_sec = 1  # noqa: SLF001
 
         assert registrar.sync_now() is False
-        assert closed == [True]
-        assert registrar._stop_event.is_set() is True  # noqa: SLF001
-        assert node_state.execution_fenced is True
+        assert closed == []
+        assert registrar._registered is False  # noqa: SLF001
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert node_state.execution_fenced is False
     finally:
         registrar.close(mark_lost=False)
         node_state.close()
 
 
-def test_node_registrar_does_not_exit_after_self_fence_by_default(tmp_path):
+def test_node_registrar_does_not_exit_after_transient_local_lease_expires_by_default(tmp_path):
     node_state = NodeControlState(
         node_id="node-self-fence-restart",
         queue_capacity=4,
@@ -1593,15 +1594,16 @@ def test_node_registrar_does_not_exit_after_self_fence_by_default(tmp_path):
         registrar._lease_ttl_sec = 1  # noqa: SLF001
 
         assert registrar.sync_now() is False
-        assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert registrar._registered is False  # noqa: SLF001
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
         assert exit_calls == []
-        assert node_state.execution_fenced is True
+        assert node_state.execution_fenced is False
     finally:
         registrar.close()
         node_state.close()
 
 
-def test_node_registrar_exits_after_self_fence_when_enabled(tmp_path):
+def test_node_registrar_does_not_exit_after_transient_local_lease_expires_when_exit_enabled(tmp_path):
     node_state = NodeControlState(
         node_id="node-self-fence-restart-enabled",
         queue_capacity=4,
@@ -1633,9 +1635,10 @@ def test_node_registrar_exits_after_self_fence_when_enabled(tmp_path):
         registrar._lease_ttl_sec = 1  # noqa: SLF001
 
         assert registrar.sync_now() is False
-        assert registrar._stop_event.is_set() is True  # noqa: SLF001
-        assert exit_calls == [2.0]
-        assert node_state.execution_fenced is True
+        assert registrar._registered is False  # noqa: SLF001
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert exit_calls == []
+        assert node_state.execution_fenced is False
     finally:
         registrar.close()
         node_state.close()
@@ -2589,6 +2592,58 @@ def test_startup_service_registrar_re_registers_after_unknown_node_heartbeat():
         registrar.close(mark_lost=False)
         node_state.close()
         info_server.stop()
+
+
+def test_startup_service_registrar_keeps_running_after_infocenter_disconnect_lease_expires(monkeypatch):
+    from pycloud_parallel.controlplane.startup_service_node import StartupServiceNode
+
+    node_state = StartupServiceNode(
+        node_id="startup-transient-lease-node",
+        service_http_bind="",
+        service_http_base_url="http://127.0.0.1:19084",
+        enable_internal_executor=False,
+        enable_service_session=True,
+    )
+    node_state.close_on_registration_lost = True
+    closed = []
+    monkeypatch.setattr(node_state, "close", lambda: closed.append(True))
+    node_state.mount_python_module_service(
+        service_name="startup-transient-lease-service",
+        entry_module="math",
+        export_methods=("sqrt",),
+        policy_id="trusted_internal",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id=node_state.node_id,
+        control_addr="",
+        state=node_state,
+        capacity=1,
+        queue_capacity=1,
+        tags=["startup-service"],
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.5,
+        exit_on_fence=False,
+    )
+
+    def _raise_transient():
+        raise RuntimeError("connection to 127.0.0.1:9 was closed by the remote service")
+
+    monkeypatch.setattr(registrar, "_heartbeat_once", _raise_transient)
+    try:
+        now = time.monotonic()
+        registrar._registered = True  # noqa: SLF001
+        registrar._last_successful_sync_at = now - 10.0  # noqa: SLF001
+        registrar._lease_ttl_sec = 1  # noqa: SLF001
+
+        assert registrar.sync_now() is False
+        assert registrar._registered is False  # noqa: SLF001
+        assert registrar._stop_event.is_set() is False  # noqa: SLF001
+        assert node_state.execution_fenced is False
+        assert closed == []
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
 
 
 def test_node_runtime_close_unregisters_startup_service_route():

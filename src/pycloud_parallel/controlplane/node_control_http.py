@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import logging
 import os
 import secrets
 import subprocess
@@ -68,6 +69,7 @@ from pycloud_parallel.data.ref import DataRef, maybe_data_ref
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
+logger = logging.getLogger(__name__)
 MAX_NODE_CONTROL_HTTP_BODY_BYTES = get_node_control_http_body_limit_bytes()
 
 
@@ -1003,20 +1005,29 @@ class NodeControlHttpServer:
 
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                result = app.handle_get(self.path)
-                if isinstance(result, StreamingHttpResponse):
-                    self._send_stream(result)
-                else:
-                    self._send(*result)
+                try:
+                    result = app.handle_get(self.path)
+                    if isinstance(result, StreamingHttpResponse):
+                        self._send_stream(result)
+                    else:
+                        self._send(*result)
+                except Exception as exc:
+                    self._send_unexpected_error("GET", exc)
 
             def do_POST(self):  # noqa: N802
-                if urlparse(self.path).path.rstrip("/") == "/objects/upload":
-                    self._handle_object_upload_stream()
-                    return
-                self._handle_with_body(app.handle_post, pass_headers=True)
+                try:
+                    if urlparse(self.path).path.rstrip("/") == "/objects/upload":
+                        self._handle_object_upload_stream()
+                        return
+                    self._handle_with_body(app.handle_post, pass_headers=True)
+                except Exception as exc:
+                    self._send_unexpected_error("POST", exc)
 
             def do_DELETE(self):  # noqa: N802
-                self._handle_with_body(app.handle_delete)
+                try:
+                    self._handle_with_body(app.handle_delete)
+                except Exception as exc:
+                    self._send_unexpected_error("DELETE", exc)
 
             def _handle_with_body(self, handler, *, pass_headers: bool = False) -> None:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -1074,6 +1085,23 @@ class NodeControlHttpServer:
                 for chunk in response.body_iter:
                     if chunk:
                         self.wfile.write(bytes(chunk))
+
+            def _send_unexpected_error(self, method: str, exc: BaseException) -> None:
+                logger.exception(
+                    "NodeControl HTTP handler failed method=%s path=%s node_id=%s node_instance_id=%s",
+                    method,
+                    self.path,
+                    getattr(app.state, "node_id", ""),
+                    getattr(app.state, "node_instance_id", ""),
+                )
+                body = _json_bytes(
+                    {
+                        "ok": False,
+                        "error": f"NodeControl internal error: {exc.__class__.__name__}: {exc}",
+                    }
+                )
+                with contextlib.suppress(Exception):
+                    self._send(500, {"Content-Type": "application/json; charset=utf-8"}, body)
 
             def log_message(self, _format, *args):  # noqa: A002
                 return

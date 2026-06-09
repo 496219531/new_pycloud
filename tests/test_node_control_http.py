@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import time
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient, NodeControlHttpServer
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
@@ -72,6 +75,37 @@ def test_http_create_service_call_heartbeat_status_close(tmp_path):
                 service_id=session.service_id,
                 service_token=session.service_token,
             ).accepted is True
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_handler_unexpected_exception_returns_json_500(tmp_path):
+    server, state = _start_http_node(tmp_path)
+
+    def _raise_handler_error(*_args, **_kwargs):
+        raise RuntimeError("boom during create")
+
+    server.app.handle_post = _raise_handler_error
+    try:
+        req = Request(
+            f"{server.base_url}/services",
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            data=b"{}",
+        )
+        status_code = 0
+        try:
+            urlopen(req, timeout=5.0)
+        except HTTPError as exc:
+            status_code = int(exc.code)
+            body = json.loads(exc.read().decode("utf-8"))
+        else:
+            raise AssertionError("expected HTTP 500")
+
+        assert status_code == 500
+        assert body["ok"] is False
+        assert "NodeControl internal error: RuntimeError: boom during create" in body["error"]
     finally:
         server.stop()
         state.close()

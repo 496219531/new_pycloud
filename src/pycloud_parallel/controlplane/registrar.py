@@ -308,8 +308,10 @@ class NodeInfoCenterRegistrar:
                             self.node_id,
                             self.node_instance_id,
                         )
-                    lease_expired = self._self_fence_if_lease_expired("infocenter re-register lease expired")
-                    if not _is_expected_connect_failure(register_exc) or lease_expired:
+                    if _is_expected_connect_failure(register_exc):
+                        self._mark_registration_stale_if_lease_expired("infocenter re-register lease expired")
+                    else:
+                        self._self_fence_if_lease_expired("infocenter re-register lease expired")
                         self._close_state_if_registration_lost(_error_summary(register_exc))
                     return False
             if _is_expected_connect_failure(exc):
@@ -330,8 +332,10 @@ class NodeInfoCenterRegistrar:
                 )
             with self._sync_lock:
                 self._registered = False
-            lease_expired = self._self_fence_if_lease_expired("infocenter heartbeat lease expired")
-            if not _is_expected_connect_failure(exc) or lease_expired:
+            if _is_expected_connect_failure(exc):
+                self._mark_registration_stale_if_lease_expired("infocenter heartbeat lease expired")
+            else:
+                self._self_fence_if_lease_expired("infocenter heartbeat lease expired")
                 self._close_state_if_registration_lost(_error_summary(exc))
             return False
 
@@ -404,21 +408,9 @@ class NodeInfoCenterRegistrar:
             )
 
     def _self_fence_if_lease_expired(self, reason: str) -> bool:
-        with self._sync_lock:
-            last_success = float(self._last_successful_sync_at or 0.0)
-            lease_ttl = max(1.0, float(self._lease_ttl_sec or self.fallback_heartbeat_sec))
-            now_monotonic = time.monotonic()
-            elapsed_since_success = now_monotonic - last_success if last_success else 0.0
-            if not last_success or elapsed_since_success <= lease_ttl:
-                return False
-            self._registered = False
-        detailed_reason = (
-            f"{reason or 'infocenter heartbeat lease expired'}; "
-            f"infocenter={self.infocenter_addr} control_addr={self.control_addr or '-'} "
-            f"last_success_age_sec={elapsed_since_success:.3f} lease_ttl_sec={lease_ttl:.3f} "
-            f"fallback_heartbeat_sec={self.fallback_heartbeat_sec} next_heartbeat_sec={self._next_hb_sec} "
-            f"rpc_timeout_sec={self.rpc_timeout_sec}"
-        )
+        lease_expired, detailed_reason, elapsed_since_success, lease_ttl = self._registration_lease_expiry_state(reason)
+        if not lease_expired:
+            return False
         logger.warning(
             "[Registrar] node self fence node_id=%s node_instance_id=%s "
             "infocenter=%s control_addr=%s last_success_age_sec=%.3f lease_ttl_sec=%.3f "
@@ -436,6 +428,47 @@ class NodeInfoCenterRegistrar:
         )
         self._reset_state_after_fence(detailed_reason)
         return True
+
+    def _mark_registration_stale_if_lease_expired(self, reason: str) -> bool:
+        lease_expired, detailed_reason, elapsed_since_success, lease_ttl = self._registration_lease_expiry_state(reason)
+        if not lease_expired:
+            return False
+        logger.warning(
+            "[Registrar] node registration stale; keeping local runtime alive for re-register "
+            "node_id=%s node_instance_id=%s infocenter=%s control_addr=%s "
+            "last_success_age_sec=%.3f lease_ttl_sec=%.3f fallback_heartbeat_sec=%s "
+            "next_heartbeat_sec=%s rpc_timeout_sec=%.3f reason=%s",
+            self.node_id,
+            self.node_instance_id,
+            self.infocenter_addr,
+            self.control_addr or "-",
+            elapsed_since_success,
+            lease_ttl,
+            self.fallback_heartbeat_sec,
+            self._next_hb_sec,
+            self.rpc_timeout_sec,
+            str(reason or "infocenter heartbeat lease expired"),
+        )
+        logger.debug("[Registrar] stale registration detail: %s", detailed_reason)
+        return True
+
+    def _registration_lease_expiry_state(self, reason: str) -> tuple[bool, str, float, float]:
+        with self._sync_lock:
+            last_success = float(self._last_successful_sync_at or 0.0)
+            lease_ttl = max(1.0, float(self._lease_ttl_sec or self.fallback_heartbeat_sec))
+            now_monotonic = time.monotonic()
+            elapsed_since_success = now_monotonic - last_success if last_success else 0.0
+            if not last_success or elapsed_since_success <= lease_ttl:
+                return False, "", elapsed_since_success, lease_ttl
+            self._registered = False
+        detailed_reason = (
+            f"{reason or 'infocenter heartbeat lease expired'}; "
+            f"infocenter={self.infocenter_addr} control_addr={self.control_addr or '-'} "
+            f"last_success_age_sec={elapsed_since_success:.3f} lease_ttl_sec={lease_ttl:.3f} "
+            f"fallback_heartbeat_sec={self.fallback_heartbeat_sec} next_heartbeat_sec={self._next_hb_sec} "
+            f"rpc_timeout_sec={self.rpc_timeout_sec}"
+        )
+        return True, detailed_reason, elapsed_since_success, lease_ttl
 
     def _register_once(self) -> bool:
         snapshot = self.state.registrar_snapshot(include_stopped=True, runtime_limit=10)

@@ -39,6 +39,11 @@ from pycloud_parallel.execution.support import (
             ErrorCategory.PERMANENT_ARTIFACT,
         ),
         ("temporary server unavailable", "", ErrorCategory.TRANSIENT_NETWORK),
+        (
+            "ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接。', None, 10054, None)",
+            "",
+            ErrorCategory.TRANSIENT_NETWORK,
+        ),
         ("python runtime mismatch: requested_runtime=py3.12", "", ErrorCategory.PERMANENT_ARTIFACT),
         ("ModuleNotFoundError: No module named 'missing_pkg'", "", ErrorCategory.IMPORT_ERROR),
         ("ImportError: cannot import name 'run'", "", ErrorCategory.IMPORT_ERROR),

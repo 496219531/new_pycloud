@@ -91,6 +91,7 @@ _HEARTBEAT_MARKERS = (
 _TRANSIENT_NETWORK_MARKERS = (
     "connection refused",
     "connection reset",
+    "connectionreseterror",
     "connection aborted",
     "connection error",
     "cannot connect to ",
@@ -114,6 +115,9 @@ _TRANSIENT_NETWORK_MARKERS = (
     "winerror 10054",
     "winerror 10060",
     "winerror 10061",
+    " 10054",
+    "(10054",
+    ", 10054",
     "errno 104",
     "errno 110",
     "errno 111",
