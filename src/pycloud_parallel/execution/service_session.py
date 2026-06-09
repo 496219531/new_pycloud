@@ -2083,16 +2083,11 @@ class Service(ServiceExecutionSession):
             active = self._active_replica_snapshot()
             if desired <= 0 or len(active) >= desired:
                 return 0
-            retry_probe = self._retry_probe_replica_snapshot()
-            if retry_probe:
-                logger.warning(
-                    "service compensation deferred while heartbeat retry probes are pending "
-                    "service_name=%s retry_probe=%s active=%s desired=%s",
-                    self.service_name,
-                    sorted(retry_probe),
-                    sorted(active),
-                    desired,
-                )
+            if self._compensation_deferred_by_retry_probe(
+                resource_name=self.service_name,
+                active=active,
+                desired=desired,
+            ):
                 return 0
             recovery_states = self._build_replica_recovery_states(
                 is_retryable_failure=self._is_retryable_compensation_failure,

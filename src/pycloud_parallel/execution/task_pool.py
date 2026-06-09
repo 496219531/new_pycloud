@@ -1201,8 +1201,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 for node_id, state in recovery_states.items()
                 if state.retryable or self._is_retryable_compensation_failure(state.error)
             }
-            retry_probe = self._retry_probe_replica_snapshot()
-            if retry_probe:
+            if self._compensation_deferred_by_retry_probe(
+                resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or ""),
+                active=active,
+                desired=desired,
+            ):
                 return 0
             if desired <= 0 or len(active) >= desired:
                 return 0

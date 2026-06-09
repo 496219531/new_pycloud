@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum
 import json
 import logging
 import threading
@@ -57,6 +58,13 @@ class _HeartbeatPending:
     last_pending_report_at: float
     future: Optional[Future] = None
     started_at: float = 0.0
+
+
+class HeartbeatErrorKind(str, Enum):
+    SUCCESS = "success"
+    TRANSIENT = "transient"
+    TERMINAL = "terminal"
+    UNKNOWN = "unknown"
 
 
 class ExecutionSessionBase:
@@ -358,6 +366,13 @@ class ExecutionSessionBase:
         del node_id, replica
         return classify_error(exc) == ErrorCategory.TRANSIENT_NETWORK
 
+    def _classify_heartbeat_error(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> HeartbeatErrorKind:
+        if self._is_terminal_heartbeat_error(node_id, replica, exc):
+            return HeartbeatErrorKind.TERMINAL
+        if isinstance(exc, TimeoutError) or self._is_retry_probe_heartbeat_error(node_id, replica, exc):
+            return HeartbeatErrorKind.TRANSIENT
+        return HeartbeatErrorKind.UNKNOWN
+
     def _mark_terminal_replica(self, node_id: str) -> None:
         lock = getattr(self, "_active_replica_lock", None)
         if lock is None:
@@ -404,6 +419,27 @@ class ExecutionSessionBase:
         with lock:
             return {str(node_id) for node_id in list(getattr(self, "_retry_probe_replica_ids", set()) or []) if str(node_id)}
 
+    def _compensation_deferred_by_retry_probe(
+        self,
+        *,
+        resource_name: str = "",
+        active: Optional[set[str]] = None,
+        desired: int = 0,
+    ) -> bool:
+        retry_probe = self._retry_probe_replica_snapshot()
+        if not retry_probe:
+            return False
+        logger.warning(
+            "%s compensation deferred while heartbeat retry probes are pending "
+            "resource_name=%s retry_probe=%s active=%s desired=%s",
+            self.kind or "execution",
+            str(resource_name or ""),
+            sorted(retry_probe),
+            sorted(active or set()),
+            int(desired or 0),
+        )
+        return True
+
     def _active_replica_snapshot(self) -> set[str]:
         lock = getattr(self, "_active_replica_lock", None)
         if lock is None:
@@ -432,12 +468,13 @@ class ExecutionSessionBase:
     def _record_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         count = int(self._keepalive_failure_counts.get(node_id, 0) or 0) + 1
         self._keepalive_failure_counts[node_id] = count
+        error_kind = self._classify_heartbeat_error(node_id, replica, exc)
         if count >= self._heartbeat_failure_threshold(node_id, replica):
-            if isinstance(exc, TimeoutError) or self._is_retry_probe_heartbeat_error(node_id, replica, exc):
+            if error_kind == HeartbeatErrorKind.TRANSIENT:
                 self._mark_replica_heartbeat_probe_failure(node_id, replica, exc)
             else:
                 self._mark_replica_heartbeat_failure(node_id, replica, exc)
-        if isinstance(exc, TimeoutError) or self._is_retry_probe_heartbeat_error(node_id, replica, exc):
+        if error_kind == HeartbeatErrorKind.TRANSIENT:
             self._mark_retry_probe_replica(node_id)
 
     def _record_terminal_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
@@ -446,19 +483,22 @@ class ExecutionSessionBase:
         self._mark_terminal_replica(node_id)
 
     def _handle_heartbeat_exception(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
-        if self._is_terminal_heartbeat_error(node_id, replica, exc):
+        error_kind = self._classify_heartbeat_error(node_id, replica, exc)
+        if error_kind == HeartbeatErrorKind.TERMINAL:
             if not self._is_terminal_replica(node_id):
                 logger.warning(
-                    "%s keepalive replica stopped context=%s error=%r",
+                    "%s keepalive replica stopped heartbeat_error_kind=%s context=%s error=%r",
                     self.kind or "execution",
+                    error_kind.value,
                     self._replica_log_context(node_id, replica),
                     exc,
                 )
             self._record_terminal_heartbeat_failure(node_id, replica, exc)
             return
         logger.warning(
-            "%s keepalive heartbeat failed context=%s error=%r",
+            "%s keepalive heartbeat failed heartbeat_error_kind=%s context=%s error=%r",
             self.kind or "execution",
+            error_kind.value,
             self._replica_log_context(node_id, replica),
             exc,
         )
@@ -499,19 +539,22 @@ class ExecutionSessionBase:
                         elapsed_sec = now - pending_state.submitted_at
                         if elapsed_sec >= max_pending_sec and now - pending_state.last_pending_report_at >= max_pending_sec:
                             started_text = "yes" if pending_state.started_at > 0 else "no"
+                            pending_exc = TimeoutError(f"heartbeat pending for {elapsed_sec:.3f}s")
+                            error_kind = self._classify_heartbeat_error(node_id, replica, pending_exc)
                             logger.warning(
-                                "%s keepalive heartbeat pending node_instance_id=%s elapsed_sec=%.3f timeout_sec=%.3f started=%s stale_pending=%s",
+                                "%s keepalive heartbeat pending node_instance_id=%s elapsed_sec=%.3f timeout_sec=%.3f started=%s stale_pending=%s heartbeat_error_kind=%s",
                                 self.kind or "execution",
                                 node_id,
                                 elapsed_sec,
                                 max_pending_sec,
                                 started_text,
                                 len(stale_pending),
+                                error_kind.value,
                             )
                             self._record_heartbeat_failure(
                                 node_id,
                                 replica,
-                                TimeoutError(f"heartbeat pending for {elapsed_sec:.3f}s"),
+                                pending_exc,
                             )
                             if future.cancel():
                                 pending.pop(node_id, None)
@@ -524,10 +567,11 @@ class ExecutionSessionBase:
                                     dropped = len(stale_pending) - stale_limit
                                     stale_pending = stale_pending[-stale_limit:]
                                     logger.warning(
-                                        "%s keepalive stale heartbeat pending limit reached dropped=%s kept=%s",
+                                        "%s keepalive stale heartbeat pending limit reached dropped=%s kept=%s heartbeat_error_kind=%s",
                                         self.kind or "execution",
                                         dropped,
                                         stale_limit,
+                                        HeartbeatErrorKind.TRANSIENT.value,
                                     )
                         continue
                     pending.pop(node_id, None)

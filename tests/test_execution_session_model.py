@@ -369,6 +369,34 @@ def test_build_execution_session_status_is_shared_for_service_and_task_pool() ->
     assert task_status.replicas["node-inst-1"].session_id == "pool-1"
 
 
+def test_heartbeat_error_classification_is_shared_for_service_and_task_pool() -> None:
+    from pycloud_parallel import TaskPool
+    from pycloud_parallel.execution.base import HeartbeatErrorKind
+    from pycloud_parallel.execution.service_session import Service
+
+    service_replica = SimpleNamespace(kind="service")
+    pool_replica = SimpleNamespace(kind="task_pool")
+    service = Service(owner_client_id="owner-a", service_name="svc-demo", sessions={"node-1": service_replica}, nodes={})
+    task_pool = TaskPool(pools={"node-1": pool_replica}, nodes={}, task_method="run", job_id="job-1")
+
+    assert (
+        service._classify_heartbeat_error("node-1", service_replica, TimeoutError("temporary timeout"))  # noqa: SLF001
+        == HeartbeatErrorKind.TRANSIENT
+    )
+    assert (
+        task_pool._classify_heartbeat_error("node-1", pool_replica, TimeoutError("temporary timeout"))  # noqa: SLF001
+        == HeartbeatErrorKind.TRANSIENT
+    )
+    assert (
+        service._classify_heartbeat_error("node-1", service_replica, RuntimeError("service is stopped"))  # noqa: SLF001
+        == HeartbeatErrorKind.TERMINAL
+    )
+    assert (
+        task_pool._classify_heartbeat_error("node-1", pool_replica, RuntimeError("task pool not running"))  # noqa: SLF001
+        == HeartbeatErrorKind.TERMINAL
+    )
+
+
 def test_shared_session_model_does_not_imply_shared_runtime_protocol() -> None:
     from pycloud_parallel.controlplane.session_model import ExecutionReplicaSnapshot, SessionLease, build_execution_session_status
 
