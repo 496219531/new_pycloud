@@ -4007,6 +4007,7 @@ def _build_task_pool_from_infocenter(
     requested_node_instance_ids = [str(node_id).strip() for node_id in list(node_instance_ids or ()) if str(node_id).strip()]
     compensation_target_count = requested_count or len(requested_node_instance_ids) or len(requested_node_ids)
     explicit_node_selection = bool(requested_node_ids or requested_node_instance_ids)
+    pinned_instance_selection = bool(requested_node_instance_ids)
     fetch_limit = requested_count if (requested_count > 0 and explicit_node_selection) else node_limit
     create_failures: Dict[str, str] = {}
 
@@ -4132,7 +4133,7 @@ def _build_task_pool_from_infocenter(
             _record_create_results([fallback_node])
     if (
         len(created) < required_success_nodes
-        and not explicit_node_selection
+        and not pinned_instance_selection
         and should_retry_replica_create_failures(
             create_failures,
             success=len(created),
@@ -4154,6 +4155,16 @@ def _build_task_pool_from_infocenter(
             except Exception as exc:
                 create_failures[f"infocenter-retry-{retry_attempt}"] = repr(exc)
                 return
+            if not retry_nodes:
+                return
+            tried_node_keys = set(create_failures.keys()) | {
+                _node_instance_key_from_node(node) for node, _pool in created
+            }
+            retry_nodes = [
+                node
+                for node in retry_nodes
+                if _node_instance_key_from_node(node) not in tried_node_keys
+            ]
             if not retry_nodes:
                 return
             all_selected_nodes.extend(retry_nodes)

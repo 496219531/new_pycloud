@@ -1457,6 +1457,150 @@ def test_task_pool_from_infocenter_does_not_rediscover_permanent_create_failure(
     assert calls["select"] == 1
 
 
+def test_task_pool_from_infocenter_rediscover_restarted_requested_node_id(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    old_node = SimpleNamespace(
+        node_instance_id="node-1-old",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    new_node = SimpleNamespace(
+        node_instance_id="node-1-new",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    calls = {"select": 0}
+    expected_node_instance_ids = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **kwargs):
+            calls["select"] += 1
+            assert kwargs["node_ids"] == ["node-1"]
+            if calls["select"] == 1:
+                return [old_node]
+            return [new_node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            expected_node_instance_id = kwargs.get("expected_node_instance_id")
+            expected_node_instance_ids.append(expected_node_instance_id)
+            if expected_node_instance_id == "node-1-old":
+                raise RuntimeError("cannot connect to 127.0.0.1:50061")
+            return SimpleNamespace(
+                owner_client_id=kwargs["owner_client_id"],
+                pool_id="pool-node-1-new",
+                pool_name=kwargs["pool_name"],
+                pool_token="token",
+                code_version="sha256:test",
+                worker_count=kwargs["worker_count"],
+                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+                pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+                heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+                cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
+                close=lambda reason="": None,
+                _client=self,
+            )
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    session = TaskPool._from_infocenter(
+        infocenter_target="127.0.0.1:50051",
+        job_id="job-requested-node-id-restart",
+        source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+        entry_module="task_demo",
+        entry_callable="run",
+        worker_count=1,
+        node_ids=["node-1"],
+        timeout_sec=1.0,
+    )
+    try:
+        assert calls["select"] >= 2
+        assert expected_node_instance_ids == ["node-1-old", "node-1-new"]
+        assert session.node_instance_ids == ["node-1-new"]
+        assert "node-1-old" in session.failures
+    finally:
+        session.close()
+
+
+def test_task_pool_from_infocenter_does_not_rediscover_requested_node_instance_id(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    old_node = SimpleNamespace(
+        node_instance_id="node-1-old",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    new_node = SimpleNamespace(
+        node_instance_id="node-1-new",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    calls = {"select": 0}
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **kwargs):
+            calls["select"] += 1
+            assert kwargs["node_instance_ids"] == ["node-1-old"]
+            return [old_node] if calls["select"] == 1 else [new_node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **_kwargs):
+            raise RuntimeError("cannot connect to 127.0.0.1:50061")
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    with pytest.raises(RuntimeError, match="task pool create failed"):
+        TaskPool._from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-requested-node-instance-fixed",
+            source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+            entry_module="task_demo",
+            entry_callable="run",
+            worker_count=1,
+            node_instance_ids=["node-1-old"],
+            timeout_sec=1.0,
+        )
+    assert calls["select"] == 1
+
+
 def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
