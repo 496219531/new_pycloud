@@ -89,7 +89,7 @@ from pycloud_parallel.execution.deployment_create_helper import (
     normalize_initial_globals,
     prepare_deployment_artifact,
 )
-from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
+from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
@@ -3506,6 +3506,67 @@ class Service(ServiceExecutionSession):
                 or required_success_nodes
             )
 
+            def _has_transient_create_failure() -> bool:
+                return any(
+                    classify_error(message, resource_kind="service") == ErrorCategory.TRANSIENT_NETWORK
+                    for message in failures.values()
+                )
+
+            def _retry_create_after_rediscovery(*, target_success_nodes: int) -> None:
+                if requested_node_instance_ids:
+                    return
+                wait_timeout = _ready_retry_timeout(timeout_sec, grace_sec=_SERVICE_READY_GRACE_SEC)
+                if wait_timeout <= 0.0:
+                    return
+                deadline = time.monotonic() + wait_timeout
+                logged_retry = False
+                while (
+                    len(sessions) < target_success_nodes
+                    and _has_transient_create_failure()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(
+                        min(
+                            max(0.05, float(_SERVICE_READY_RETRY_INTERVAL_SEC or 0.25)),
+                            max(0.05, deadline - time.monotonic()),
+                        )
+                    )
+                    try:
+                        _existing_routes, fresh_discovered_nodes, _fresh_selected_nodes = _discover_and_select_nodes()
+                    except _RetryableReadyError:
+                        continue
+                    tried_node_keys = set(failures.keys()) | set(sessions.keys())
+                    if requested_node_ids:
+                        fresh_node_map = _build_unique_node_id_map(
+                            fresh_discovered_nodes,
+                            requested_ids=requested_node_ids,
+                        )
+                        rediscovered_candidates = [
+                            fresh_node_map[node_id]
+                            for node_id in requested_node_ids
+                            if node_id in fresh_node_map
+                            and _node_instance_key_from_node(fresh_node_map[node_id]) not in tried_node_keys
+                        ]
+                    else:
+                        rediscovered_candidates = [
+                            node
+                            for node in _auto_candidate_nodes(fresh_discovered_nodes)
+                            if _node_instance_key_from_node(node) not in tried_node_keys
+                        ]
+                    if not rediscovered_candidates:
+                        continue
+                    if not logged_retry:
+                        _emit_owner_notice(
+                            "deploy rediscovering nodes after transient create failure "
+                            f"service_name={effective_service_name} success={len(sessions)} "
+                            f"required={target_success_nodes}"
+                        )
+                        logged_retry = True
+                    for node in rediscovered_candidates:
+                        if len(sessions) >= target_success_nodes:
+                            break
+                        _record_create_results([node])
+
             if (
                 len(sessions) < strict_success_nodes
                 and not requested_node_ids
@@ -3528,6 +3589,10 @@ class Service(ServiceExecutionSession):
                         if len(sessions) >= strict_success_nodes:
                             break
                         _record_create_results([fallback_node])
+
+            retry_target_success_nodes = strict_success_nodes if not allow_partial else required_success_nodes
+            if len(sessions) < retry_target_success_nodes:
+                _retry_create_after_rediscovery(target_success_nodes=retry_target_success_nodes)
 
             if failures and not allow_partial and len(sessions) < strict_success_nodes:
                 cls._cleanup_created_services(sessions=sessions, clients=clients, reason="rollback deploy")

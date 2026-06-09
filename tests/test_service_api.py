@@ -3507,6 +3507,118 @@ class TestOwnerServiceFacade:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()
 
+    def test_deploy_from_infocenter_rediscover_restarted_node_after_transient_create_failure(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        old_node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-old",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            accept_service_deploy=True,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        new_node = SimpleNamespace(
+            node_id="node-1",
+            node_instance_id="node-1-new",
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            accept_service_deploy=True,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+        discovery_calls = {"count": 0}
+        expected_node_instance_ids = []
+
+        class _FakeInfoCenter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def list_service_routes(self, **_kwargs):
+                return []
+
+            def list_nodes(self, **_kwargs):
+                discovery_calls["count"] += 1
+                if discovery_calls["count"] == 1:
+                    return [old_node]
+                return [new_node]
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **kwargs):
+                expected_node_instance_id = kwargs.get("expected_node_instance_id")
+                expected_node_instance_ids.append(expected_node_instance_id)
+                if expected_node_instance_id == "node-1-old":
+                    raise RuntimeError("cannot connect to 127.0.0.1:50061")
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._infocenter_client",
+            return_value=_FakeInfoCenter(),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ), patch(
+            "pycloud_parallel.execution.service_session.time.sleep",
+            return_value=None,
+        ):
+            group = Service._deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-restarted-node-service",
+                source=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                entry_callable="run",
+                node_count=1,
+                min_success_nodes=1,
+                allow_partial=False,
+                timeout_sec=1.0,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert discovery_calls["count"] >= 2
+            assert expected_node_instance_ids == ["node-1-old", "node-1-new"]
+            assert list(group.nodes.keys()) == ["node-1-new"]
+            assert group.failures["node-1-old"] == "RuntimeError('cannot connect to 127.0.0.1:50061')"
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
     def test_deploy_from_infocenter_retries_briefly_until_nodes_register(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
