@@ -87,9 +87,11 @@ from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     normalize_initial_globals,
+    next_replica_create_interval,
     prepare_deployment_artifact,
+    should_retry_replica_create_failures,
 )
-from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
+from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
@@ -3509,12 +3511,6 @@ class Service(ServiceExecutionSession):
                 or required_success_nodes
             )
 
-            def _has_transient_create_failure() -> bool:
-                return any(
-                    classify_error(message, resource_kind="service") == ErrorCategory.TRANSIENT_NETWORK
-                    for message in failures.values()
-                )
-
             def _retry_create_after_rediscovery(*, target_success_nodes: int) -> None:
                 if requested_node_instance_ids:
                     return
@@ -3525,15 +3521,22 @@ class Service(ServiceExecutionSession):
                 logged_retry = False
                 while (
                     len(sessions) < target_success_nodes
-                    and _has_transient_create_failure()
+                    and should_retry_replica_create_failures(
+                        failures,
+                        success=len(sessions),
+                        required=target_success_nodes,
+                        resource_kind="service",
+                    )
                     and time.monotonic() < deadline
                 ):
-                    time.sleep(
-                        min(
-                            max(0.05, float(_SERVICE_READY_RETRY_INTERVAL_SEC or 0.25)),
-                            max(0.05, deadline - time.monotonic()),
-                        )
+                    sleep_sec = next_replica_create_interval(
+                        1,
+                        deadline_remaining_sec=deadline - time.monotonic(),
+                        base_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
+                        max_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
                     )
+                    if sleep_sec > 0.0:
+                        time.sleep(sleep_sec)
                     try:
                         _existing_routes, fresh_discovered_nodes, _fresh_selected_nodes = _discover_and_select_nodes()
                     except _RetryableReadyError:

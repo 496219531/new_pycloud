@@ -15,6 +15,7 @@ from pycloud_parallel.controlplane.artifact import (
     _prepare_artifact,
     _resolve_package_format,
 )
+from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error
 from pycloud_parallel.execution.support import _prepare_code_blob
 
 TNode = TypeVar("TNode")
@@ -36,6 +37,56 @@ class CreateDispatchResult(Generic[TNode, TCreated]):
     node: TNode
     created: Optional[TCreated]
     error_message: str = ""
+
+
+RETRYABLE_REPLICA_CREATE_CATEGORIES = frozenset(
+    {
+        ErrorCategory.TRANSIENT_NETWORK,
+        ErrorCategory.IDENTITY_MISMATCH,
+    }
+)
+
+
+def classify_replica_create_failures(
+    failures: Dict[str, str],
+    *,
+    resource_kind: str,
+) -> Dict[str, ErrorCategory]:
+    return {
+        str(node_id): classify_error(message, resource_kind=resource_kind)
+        for node_id, message in dict(failures or {}).items()
+        if str(node_id)
+    }
+
+
+def should_retry_replica_create_failures(
+    failures: Dict[str, str],
+    *,
+    success: int,
+    required: int,
+    resource_kind: str,
+) -> bool:
+    if int(success or 0) >= int(required or 0):
+        return False
+    categories = classify_replica_create_failures(failures, resource_kind=resource_kind)
+    if not categories:
+        return False
+    return any(category in RETRYABLE_REPLICA_CREATE_CATEGORIES for category in categories.values())
+
+
+def next_replica_create_interval(
+    attempt: int,
+    *,
+    deadline_remaining_sec: float,
+    base_sec: float = 0.25,
+    max_sec: float = 1.0,
+) -> float:
+    remaining = max(0.0, float(deadline_remaining_sec or 0.0))
+    if remaining <= 0.0:
+        return 0.0
+    normalized_attempt = max(1, int(attempt or 1))
+    interval = min(max(0.05, float(max_sec or 1.0)), max(0.05, float(base_sec or 0.25)) * normalized_attempt)
+    return min(interval, remaining)
 
 
 def prepare_deployment_artifact(
@@ -133,7 +184,10 @@ def dispatch_create_requests(
 
 __all__ = [
     "CreateDispatchResult",
+    "classify_replica_create_failures",
     "dispatch_create_requests",
     "normalize_initial_globals",
+    "next_replica_create_interval",
     "prepare_deployment_artifact",
+    "should_retry_replica_create_failures",
 ]

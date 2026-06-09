@@ -73,7 +73,9 @@ from pycloud_parallel.execution.progress import ProgressOption, ProgressReporter
 from pycloud_parallel.execution.deployment_create_helper import (
     dispatch_create_requests,
     normalize_initial_globals,
+    next_replica_create_interval,
     prepare_deployment_artifact,
+    should_retry_replica_create_failures,
 )
 from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.scheduler import (
@@ -4139,12 +4141,37 @@ def _build_task_pool_from_infocenter(
             if len(created) >= required_success_nodes:
                 break
             _record_create_results([fallback_node])
-    if not created and not explicit_node_selection:
+    if (
+        len(created) < required_success_nodes
+        and not explicit_node_selection
+        and should_retry_replica_create_failures(
+            create_failures,
+            success=len(created),
+            required=required_success_nodes,
+            resource_kind="task_pool",
+        )
+    ):
         retry_deadline = time.monotonic() + max(0.1, float(timeout_sec or 0.0))
         retry_attempt = 0
-        while not created and time.monotonic() < retry_deadline:
+        while (
+            len(created) < required_success_nodes
+            and should_retry_replica_create_failures(
+                create_failures,
+                success=len(created),
+                required=required_success_nodes,
+                resource_kind="task_pool",
+            )
+            and time.monotonic() < retry_deadline
+        ):
             retry_attempt += 1
-            time.sleep(min(0.5, max(0.05, retry_deadline - time.monotonic())))
+            sleep_sec = next_replica_create_interval(
+                retry_attempt,
+                deadline_remaining_sec=retry_deadline - time.monotonic(),
+                base_sec=0.5,
+                max_sec=0.5,
+            )
+            if sleep_sec > 0.0:
+                time.sleep(sleep_sec)
             try:
                 retry_nodes = _select_candidate_nodes()
             except Exception as exc:

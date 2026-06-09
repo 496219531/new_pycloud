@@ -32,3 +32,41 @@ def test_dispatch_create_requests_respects_configured_worker_limit(monkeypatch):
 
     assert [item.created for item in results] == list(range(12))
     assert max_active <= 3
+
+
+def test_should_retry_replica_create_failures_uses_shared_categories():
+    from pycloud_parallel.execution.deployment_create_helper import should_retry_replica_create_failures
+
+    assert should_retry_replica_create_failures(
+        {"node-old": "RuntimeError('cannot connect to 127.0.0.1:50061')"},
+        success=0,
+        required=1,
+        resource_kind="service",
+    )
+    assert should_retry_replica_create_failures(
+        {"node-old": "expected_node_instance_id mismatch"},
+        success=0,
+        required=1,
+        resource_kind="task_pool",
+    )
+    assert not should_retry_replica_create_failures(
+        {"node-bad": "ModuleNotFoundError: No module named 'missing_pkg'"},
+        success=0,
+        required=1,
+        resource_kind="service",
+    )
+    assert not should_retry_replica_create_failures(
+        {"node-ok": "RuntimeError('cannot connect to 127.0.0.1:50061')"},
+        success=1,
+        required=1,
+        resource_kind="service",
+    )
+
+
+def test_next_replica_create_interval_is_bounded():
+    from pycloud_parallel.execution.deployment_create_helper import next_replica_create_interval
+
+    assert next_replica_create_interval(1, deadline_remaining_sec=10.0, base_sec=0.25, max_sec=1.0) == 0.25
+    assert next_replica_create_interval(10, deadline_remaining_sec=10.0, base_sec=0.25, max_sec=1.0) == 1.0
+    assert next_replica_create_interval(10, deadline_remaining_sec=0.2, base_sec=0.25, max_sec=1.0) == 0.2
+    assert next_replica_create_interval(1, deadline_remaining_sec=0.0) == 0.0

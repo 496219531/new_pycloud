@@ -1406,6 +1406,57 @@ def test_task_pool_from_infocenter_retries_transient_discovery_failure(monkeypat
         session.close()
 
 
+def test_task_pool_from_infocenter_does_not_rediscover_permanent_create_failure(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    node = SimpleNamespace(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    calls = {"select": 0}
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            calls["select"] += 1
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **_kwargs):
+            raise ModuleNotFoundError("No module named 'missing_pkg'")
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    with pytest.raises(RuntimeError, match="task pool create failed"):
+        TaskPool._from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-permanent-create-failure",
+            source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+            entry_module="task_demo",
+            entry_callable="run",
+            worker_count=1,
+            node_count=1,
+            timeout_sec=1.0,
+        )
+    assert calls["select"] == 1
+
+
 def test_task_pool_session_packages_module_object_entry_module(tmp_path, monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 
