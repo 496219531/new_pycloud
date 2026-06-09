@@ -374,8 +374,8 @@ class ExecutorHostClient:
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "create_task_pool failed")))
 
-    def stop_task_pool(self, *, pool_id: str) -> None:
-        resp = self._request("stop_task_pool", payload={"pool_id": pool_id})
+    def stop_task_pool(self, *, pool_id: str, reason: str = "") -> None:
+        resp = self._request("stop_task_pool", payload={"pool_id": pool_id, "reason": str(reason or "")})
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "stop_task_pool failed")))
 

@@ -40,7 +40,7 @@ class ExecutorBackend(Protocol):
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None: ...
 
-    def stop_task_pool(self, *, pool_id: str) -> None: ...
+    def stop_task_pool(self, *, pool_id: str, reason: str = "") -> None: ...
 
     def prepare_artifact(
         self,
@@ -198,13 +198,13 @@ class SubprocessExecutorBackend:
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         self._ensure_pool_client(pool_id).create_task_pool(pool_id=pool_id, worker_count=worker_count)
 
-    def stop_task_pool(self, *, pool_id: str) -> None:
+    def stop_task_pool(self, *, pool_id: str, reason: str = "") -> None:
         key = str(pool_id or "").strip()
         client = self._pool_clients.pop(key, None)
         if client is None:
             return
         try:
-            client.stop_task_pool(pool_id=pool_id)
+            client.stop_task_pool(pool_id=pool_id, reason=reason)
         finally:
             client.close()
 

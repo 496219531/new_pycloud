@@ -661,14 +661,15 @@ class NodeControlState(NodeRuntimeBase):
             task_worker_capacity=self.worker_capacity,
         )
 
-    def _submit_stop_task_pool(self, executor_host: ExecutorBackend, *, pool_id: str) -> None:
+    def _submit_stop_task_pool(self, executor_host: ExecutorBackend, *, pool_id: str, reason: str = "") -> None:
         normalized = str(pool_id or "").strip()
         if not normalized:
             return
+        stop_reason = str(reason or "").strip()
 
         def _stop() -> None:
             try:
-                executor_host.stop_task_pool(pool_id=normalized)
+                executor_host.stop_task_pool(pool_id=normalized, reason=stop_reason)
             except Exception:
                 logger.exception("[NodeControl] async stop_task_pool failed pool_id=%s", normalized)
 
@@ -677,18 +678,55 @@ class NodeControlState(NodeRuntimeBase):
         except RuntimeError:
             _stop()
 
-    def _stop_task_pool_for_shutdown_locked(self, pool: TaskPoolState, *, reason: str) -> Optional[Tuple[ExecutorBackend, str]]:
+    def _stop_task_pool_resource_locked(
+        self,
+        pool: TaskPoolState,
+        *,
+        reason: str,
+        async_stop: bool = True,
+    ) -> Optional[Tuple[ExecutorBackend, str]]:
         stop_executor = None
         if self._executor_host is not None and pool.executor_ready:
             stop_executor = (self._executor_host, str(pool.pool_id))
         pool.executor_ready = False
         pool.alive_workers = 0
+        if hasattr(pool, "degraded"):
+            pool.degraded = False
         pool.status = "STOPPED"
-        pool.stop_reason = reason
+        pool.stop_reason = str(reason or "owner requested").strip() or "owner requested"
         stopped_at = utc_now()
         pool.failure_at = stopped_at
         pool.lease_expire_at = stopped_at
+        if stop_executor is not None and async_stop:
+            executor_host, pool_id = stop_executor
+            self._submit_stop_task_pool(executor_host, pool_id=pool_id, reason=pool.stop_reason)
+            return None
         return stop_executor
+
+    def _stop_task_pool_for_shutdown_locked(self, pool: TaskPoolState, *, reason: str) -> Optional[Tuple[ExecutorBackend, str]]:
+        return self._stop_task_pool_resource_locked(pool, reason=reason, async_stop=False)
+
+    def _stop_resource_locked(
+        self,
+        *,
+        kind: str,
+        resource_id: str,
+        reason: str,
+    ) -> Optional[Tuple[ExecutorBackend, str]]:
+        normalized_kind = str(kind or "").strip()
+        normalized_id = str(resource_id or "").strip()
+        if normalized_kind == "service":
+            session = self._services.get(normalized_id)
+            if session is None:
+                raise KeyError("service not found")
+            self._stop_service_resource_locked(session, reason=reason)
+            return None
+        if normalized_kind == "task_pool":
+            pool = self._task_pools.get(normalized_id)
+            if pool is None:
+                raise KeyError("task pool not found")
+            return self._stop_task_pool_resource_locked(pool, reason=reason)
+        raise ValueError(f"unsupported resource kind: {kind!r}")
 
     @staticmethod
     def _service_stopped_error_payload(session: ServiceSession, *, fallback: str = "service not running") -> Dict[str, object]:
@@ -3038,21 +3076,16 @@ class NodeControlState(NodeRuntimeBase):
                 raise PermissionError("owner_client_id mismatch")
             self._require_pool_token(pool, pool_token)
             was_running = pool.is_running()
-            if was_running and self._executor_host is not None and pool.executor_ready:
-                stop_executor = (self._executor_host, str(pool.pool_id))
-            pool.executor_ready = False
-            pool.alive_workers = 0
-            pool.status = "STOPPED"
-            if was_running or not str(pool.stop_reason or "").strip():
-                pool.stop_reason = reason or "owner requested"
-            stopped_at = utc_now()
-            pool.failure_at = stopped_at
-            pool.lease_expire_at = stopped_at
+            previous_reason = str(pool.stop_reason or "").strip()
+            stop_reason = str(reason or "owner requested").strip() or "owner requested"
+            if not was_running and previous_reason:
+                stop_reason = previous_reason
+            stop_executor = self._stop_task_pool_resource_locked(pool, reason=stop_reason, async_stop=False)
             closed_pool = pool
 
         if stop_executor is not None:
             executor_host, closed_pool_id = stop_executor
-            self._submit_stop_task_pool(executor_host, pool_id=closed_pool_id)
+            self._submit_stop_task_pool(executor_host, pool_id=closed_pool_id, reason=closed_pool.stop_reason)
         return closed_pool
 
     def cancel_pool_job(
@@ -3202,6 +3235,9 @@ class NodeControlState(NodeRuntimeBase):
             return session
 
     def _stop_service_locked(self, session: ServiceSession, *, reason: str) -> None:
+        self._stop_service_resource_locked(session, reason=reason)
+
+    def _stop_service_resource_locked(self, session: ServiceSession, *, reason: str) -> None:
         if session.status == pb2.SERVICE_STATUS_STOPPED:
             return
         stop_reason = str(reason or "owner requested").strip() or "owner requested"
@@ -4439,11 +4475,8 @@ class NodeControlState(NodeRuntimeBase):
                     continue
                 if now <= pool.lease_expire_at:
                     continue
-                if self._executor_host is not None and pool.executor_ready:
-                    self._submit_stop_task_pool(self._executor_host, pool_id=pool.pool_id)
-                pool.executor_ready = False
-                pool.alive_workers = 0
-                pool.status = "STOPPED"
-                pool.stop_reason = _resource_stop_reason("owner heartbeat timeout")
-                pool.failure_at = now
-                pool.lease_expire_at = now
+                self._stop_task_pool_resource_locked(
+                    pool,
+                    reason=_resource_stop_reason("owner heartbeat timeout"),
+                    async_stop=True,
+                )
