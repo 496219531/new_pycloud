@@ -425,6 +425,106 @@ def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
     assert "old-client" in closed
 
 
+def test_service_compensation_allows_retry_probe_when_no_active_replicas(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    node_1 = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    created = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node_1]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            return SimpleNamespace(
+                service_id="svc-recovered",
+                service_token="token-new",
+                http_base_url=f"http://{self.target}/svc/demo-new",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={
+            "node-inst-1": SimpleNamespace(
+                service_id="svc-old",
+                service_token="token-old",
+                http_base_url="http://127.0.0.1:50061/svc/demo-old",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                failed=True,
+                last_error="ConnectionResetError(10054, 'connection reset')",
+            )
+        },
+        nodes={"node-inst-1": node_1},
+    )
+    group._discard_active_replica("node-inst-1")  # noqa: SLF001
+    group._mark_retry_probe_replica("node-inst-1")  # noqa: SLF001
+    group.failures["node-inst-1"] = "ConnectionResetError(10054, 'connection reset')"
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    added = group.try_compensate_replicas()
+
+    assert added == 1
+    assert created[0][1]["expected_node_instance_id"] == "node-inst-1"
+    assert group.sessions["node-inst-1"].service_id == "svc-recovered"
+    assert "node-inst-1" in group._active_replica_ids  # noqa: SLF001
+    assert "node-inst-1" not in group.failures
+
+
 def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 

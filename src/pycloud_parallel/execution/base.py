@@ -429,14 +429,26 @@ class ExecutionSessionBase:
         retry_probe = self._retry_probe_replica_snapshot()
         if not retry_probe:
             return False
+        active_snapshot = {str(node_id) for node_id in list(active or set()) if str(node_id)}
+        desired_count = int(desired or 0)
+        if desired_count > 0 and not active_snapshot:
+            logger.warning(
+                "%s compensation allowed despite heartbeat retry probes because no active replicas remain "
+                "resource_name=%s retry_probe=%s desired=%s",
+                self.kind or "execution",
+                str(resource_name or ""),
+                sorted(retry_probe),
+                desired_count,
+            )
+            return False
         logger.warning(
             "%s compensation deferred while heartbeat retry probes are pending "
             "resource_name=%s retry_probe=%s active=%s desired=%s",
             self.kind or "execution",
             str(resource_name or ""),
             sorted(retry_probe),
-            sorted(active or set()),
-            int(desired or 0),
+            sorted(active_snapshot),
+            desired_count,
         )
         return True
 
