@@ -12,7 +12,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Deque, Dict, Optional, Tuple
 
 from pycloud_parallel.controlplane.executor_core import ExecutorCore
 
@@ -365,6 +365,9 @@ class ExecutorHostClient:
                         alive += 1
                 out[service_id] = alive
         return out
+
+    def resource_worker_liveness(self) -> Dict[Tuple[str, str], int]:
+        return {("service", str(service_id)): int(alive) for service_id, alive in self.service_worker_liveness().items()}
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         resp = self._request(

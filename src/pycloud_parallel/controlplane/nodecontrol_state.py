@@ -4378,11 +4378,17 @@ class NodeControlState(NodeRuntimeBase):
         while not self._stop_event.wait(self.monitor_interval_sec):
             self._handle_service_timeouts()
 
-    def _refresh_service_worker_liveness_locked(self) -> None:
+    def _refresh_resource_liveness_locked(self) -> None:
         if self._executor_host is None:
             return
         try:
-            liveness = self._executor_host.service_worker_liveness()
+            if hasattr(self._executor_host, "resource_worker_liveness"):
+                liveness = self._executor_host.resource_worker_liveness()
+            else:
+                liveness = {
+                    ("service", str(service_id)): int(alive)
+                    for service_id, alive in self._executor_host.service_worker_liveness().items()
+                }
         except Exception as exc:
             self._set_deploy_health_block_locked(repr(exc), source="service worker liveness failed")
             logger.warning(
@@ -4393,8 +4399,11 @@ class NodeControlState(NodeRuntimeBase):
             )
             return
         self._clear_deploy_health_block_locked(source="service worker liveness failed")
-        seen_service_ids = {str(service_id or "") for service_id in liveness.keys()}
-        for service_id, alive_count in liveness.items():
+        seen_service_ids = {str(resource_id or "") for (kind, resource_id) in liveness.keys() if str(kind or "") == "service"}
+        for (kind, resource_id), alive_count in liveness.items():
+            if str(kind or "") != "service":
+                continue
+            service_id = str(resource_id or "")
             session = self._services.get(str(service_id or ""))
             if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
                 continue
@@ -4420,10 +4429,13 @@ class NodeControlState(NodeRuntimeBase):
                     previous_alive,
                 )
 
+    def _refresh_service_worker_liveness_locked(self) -> None:
+        self._refresh_resource_liveness_locked()
+
     def _handle_service_timeouts(self) -> None:
         now = utc_now()
         with self._lock:
-            self._refresh_service_worker_liveness_locked()
+            self._refresh_resource_liveness_locked()
             for session in self._services.values():
                 if session.status != pb2.SERVICE_STATUS_RUNNING:
                     self._service_zero_alive_counts.pop(str(session.service_id or ""), None)

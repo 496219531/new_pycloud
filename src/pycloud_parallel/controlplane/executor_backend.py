@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Executor backend boundary used by NodeControl."""
 
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 from pycloud_parallel.controlplane.executor_host import ExecutorHostClient
 
@@ -37,6 +37,8 @@ class ExecutorBackend(Protocol):
     def stop_service(self, *, service_id: str, reason: str = "") -> None: ...
 
     def service_worker_liveness(self) -> Dict[str, int]: ...
+
+    def resource_worker_liveness(self) -> Dict[Tuple[str, str], int]: ...
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None: ...
 
@@ -194,6 +196,9 @@ class SubprocessExecutorBackend:
                 continue
             out.update(client.service_worker_liveness())
         return out
+
+    def resource_worker_liveness(self) -> Dict[Tuple[str, str], int]:
+        return {("service", str(service_id)): int(alive) for service_id, alive in self.service_worker_liveness().items()}
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         self._ensure_pool_client(pool_id).create_task_pool(pool_id=pool_id, worker_count=worker_count)

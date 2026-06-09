@@ -159,12 +159,14 @@ def test_subprocess_backend_stop_service_accepts_reason_and_reports_liveness():
     backend._service_clients["svc-b"] = _FakeClient({"svc-b": 0})  # noqa: SLF001
 
     assert backend.service_worker_liveness() == {"svc-a": 2, "svc-b": 0}
+    assert backend.resource_worker_liveness() == {("service", "svc-a"): 2, ("service", "svc-b"): 0}
     backend.stop_service(service_id="svc-a", reason="owner heartbeat timeout")
 
     assert ("stop_service", {"service_id": "svc-a", "reason": "owner heartbeat timeout"}) in calls
     assert any(name == "close" for name, _kwargs in calls)
     assert "svc-a" not in backend._service_clients  # noqa: SLF001
     assert backend.service_worker_liveness() == {"svc-b": 0}
+    assert backend.resource_worker_liveness() == {("service", "svc-b"): 0}
 
 
 def test_executor_backend_interface_exposes_service_stop_reason_and_liveness():
@@ -172,6 +174,7 @@ def test_executor_backend_interface_exposes_service_stop_reason_and_liveness():
     assert "reason" in stop_signature.parameters
     assert stop_signature.parameters["reason"].default == ""
     assert hasattr(SubprocessExecutorBackend, "service_worker_liveness")
+    assert hasattr(SubprocessExecutorBackend, "resource_worker_liveness")
 
 
 def test_create_executor_backend_rejects_embedded():
