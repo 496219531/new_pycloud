@@ -261,6 +261,8 @@ class TaskPoolState:
     managed_globals_digest: str = ""
     executor_ready: bool = False
     alive_workers: int = 0
+    degraded: bool = False
+    last_liveness_missing_report_at: float = 0.0
     task_count: int = 0
     timing_metrics: Dict[str, object] = field(default_factory=dict)
     returned_count: int = 0
@@ -278,7 +280,7 @@ class TaskPoolState:
             if in_flight is not None
             else max(0, normalized_received - normalized_returned)
         )
-        alive_workers = max(0, int(self.alive_workers or self.worker_count or 0)) if self.is_running() else 0
+        alive_workers = max(0, int(self.alive_workers or 0)) if self.is_running() else 0
         return WorkerResourceSnapshot(
             worker_count=max(0, int(self.worker_count or 0)),
             alive_workers=alive_workers,

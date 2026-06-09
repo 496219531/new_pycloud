@@ -161,6 +161,7 @@ HEARTBEAT_LOCK_WAIT_LOG_SEC = 0.25
 HEARTBEAT_TOTAL_LOG_SEC = 0.5
 EXECUTOR_EVENT_DRAIN_BATCH_SIZE = 128
 SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
+TASK_POOL_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
 
 
 def _path(value: Any = ".") -> Path:
@@ -293,6 +294,7 @@ class NodeControlState(NodeRuntimeBase):
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
         self._service_zero_alive_counts: Dict[str, int] = {}
+        self._task_pool_zero_alive_counts: Dict[str, int] = {}
         self._code_write_locks: Dict[str, threading.Lock] = {}
         self._object_write_locks: Dict[str, threading.Lock] = {}
         self._artifact_method_cache: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str], Dict[str, Tuple[str, str]]] = {}
@@ -602,6 +604,7 @@ class NodeControlState(NodeRuntimeBase):
                 session.status = pb2.SERVICE_STATUS_STOPPED
                 session.executor_ready = False
                 session.alive_workers = 0
+                session.degraded = False
                 session.stop_reason = normalized_reason
                 session.failure_at = fenced_at
                 session.lease_expire_at = fenced_at
@@ -609,11 +612,14 @@ class NodeControlState(NodeRuntimeBase):
                 pool.status = "STOPPED"
                 pool.executor_ready = False
                 pool.alive_workers = 0
+                if hasattr(pool, "degraded"):
+                    pool.degraded = False
                 pool.stop_reason = normalized_reason
                 pool.failure_at = fenced_at
                 pool.lease_expire_at = fenced_at
             self._services.clear()
             self._service_zero_alive_counts.clear()
+            self._task_pool_zero_alive_counts.clear()
             self._task_pools.clear()
             self._pool_tasks.clear()
             self._pool_task_reserved_ids.clear()
@@ -684,7 +690,7 @@ class NodeControlState(NodeRuntimeBase):
         *,
         reason: str,
         async_stop: bool = True,
-    ) -> Optional[Tuple[ExecutorBackend, str]]:
+    ) -> Optional[Tuple[ExecutorBackend, str, str]]:
         stop_executor = None
         if self._executor_host is not None and pool.executor_ready:
             stop_executor = (self._executor_host, str(pool.pool_id))
@@ -697,13 +703,17 @@ class NodeControlState(NodeRuntimeBase):
         stopped_at = utc_now()
         pool.failure_at = stopped_at
         pool.lease_expire_at = stopped_at
+        self._task_pool_zero_alive_counts.pop(str(pool.pool_id or ""), None)
         if stop_executor is not None and async_stop:
             executor_host, pool_id = stop_executor
             self._submit_stop_task_pool(executor_host, pool_id=pool_id, reason=pool.stop_reason)
             return None
-        return stop_executor
+        if stop_executor is None:
+            return None
+        executor_host, pool_id = stop_executor
+        return executor_host, pool_id, pool.stop_reason
 
-    def _stop_task_pool_for_shutdown_locked(self, pool: TaskPoolState, *, reason: str) -> Optional[Tuple[ExecutorBackend, str]]:
+    def _stop_task_pool_for_shutdown_locked(self, pool: TaskPoolState, *, reason: str) -> Optional[Tuple[ExecutorBackend, str, str]]:
         return self._stop_task_pool_resource_locked(pool, reason=reason, async_stop=False)
 
     def _stop_resource_locked(
@@ -712,7 +722,7 @@ class NodeControlState(NodeRuntimeBase):
         kind: str,
         resource_id: str,
         reason: str,
-    ) -> Optional[Tuple[ExecutorBackend, str]]:
+    ) -> Optional[Tuple[ExecutorBackend, str, str]]:
         normalized_kind = str(kind or "").strip()
         normalized_id = str(resource_id or "").strip()
         if normalized_kind == "service":
@@ -2723,14 +2733,14 @@ class NodeControlState(NodeRuntimeBase):
                         ),
                     )
                 ),
-                stop_executor=lambda: executor_host.stop_task_pool(pool_id=pool_id),
+                stop_executor=lambda: executor_host.stop_task_pool(pool_id=pool_id, reason="task pool warmup failed"),
                 reserved_attr="_task_pool_worker_reserved",
                 reserved=reserved,
             )
         except Exception as exc:
             self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             with contextlib.suppress(Exception):
-                executor_host.stop_task_pool(pool_id=pool_id)
+                executor_host.stop_task_pool(pool_id=pool_id, reason=repr(exc))
             self._remember_failed_task_pool_create(
                 pool_id=pool_id,
                 owner_client_id=owner_client_id,
@@ -2812,7 +2822,7 @@ class NodeControlState(NodeRuntimeBase):
         except Exception:
             self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             with contextlib.suppress(Exception):
-                executor_host.stop_task_pool(pool_id=pool_id)
+                executor_host.stop_task_pool(pool_id=pool_id, reason="create task pool failed")
             raise
 
     def submit_pool_tasks(
@@ -3084,8 +3094,8 @@ class NodeControlState(NodeRuntimeBase):
             closed_pool = pool
 
         if stop_executor is not None:
-            executor_host, closed_pool_id = stop_executor
-            self._submit_stop_task_pool(executor_host, pool_id=closed_pool_id, reason=closed_pool.stop_reason)
+            executor_host, closed_pool_id, closed_reason = stop_executor
+            self._submit_stop_task_pool(executor_host, pool_id=closed_pool_id, reason=closed_reason)
         return closed_pool
 
     def cancel_pool_job(
@@ -3163,9 +3173,10 @@ class NodeControlState(NodeRuntimeBase):
             now = utc_now()
             pool.last_heartbeat_at = now
             pool.lease_expire_at = now + timedelta(seconds=pool.heartbeat_timeout_sec)
-            pool.alive_workers = max(0, int(pool.worker_count or 0))
             pool.stop_reason = ""
             pool.failure_at = None
+            if int(pool.alive_workers or 0) > 0 and hasattr(pool, "degraded"):
+                pool.degraded = False
             return pool
         finally:
             total_sec = time.perf_counter() - started_at
@@ -3316,7 +3327,7 @@ class NodeControlState(NodeRuntimeBase):
                 self._stop_service_locked(session, reason=_resource_stop_reason("nodecontrol shutdown"))
 
     def _shutdown_all_task_pools(self) -> None:
-        stop_executors: List[Tuple[ExecutorBackend, str]] = []
+        stop_executors: List[Tuple[ExecutorBackend, str, str]] = []
         with self._lock:
             pools = list(self._task_pools.values())
             for pool in pools:
@@ -3326,9 +3337,9 @@ class NodeControlState(NodeRuntimeBase):
                 )
                 if stop_executor is not None:
                     stop_executors.append(stop_executor)
-        for executor_host, pool_id in stop_executors:
+        for executor_host, pool_id, reason in stop_executors:
             try:
-                executor_host.stop_task_pool(pool_id=pool_id)
+                executor_host.stop_task_pool(pool_id=pool_id, reason=reason)
             except Exception:
                 pass
 
@@ -4400,34 +4411,64 @@ class NodeControlState(NodeRuntimeBase):
             return
         self._clear_deploy_health_block_locked(source="service worker liveness failed")
         seen_service_ids = {str(resource_id or "") for (kind, resource_id) in liveness.keys() if str(kind or "") == "service"}
+        seen_task_pool_ids = {
+            str(resource_id or "")
+            for (kind, resource_id) in liveness.keys()
+            if str(kind or "") in {"task_pool", "taskpool", "pool"}
+        }
         for (kind, resource_id), alive_count in liveness.items():
-            if str(kind or "") != "service":
+            resource_kind = str(kind or "")
+            if resource_kind == "service":
+                service_id = str(resource_id or "")
+                session = self._services.get(str(service_id or ""))
+                if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
+                    continue
+                session.alive_workers = max(0, int(alive_count or 0))
                 continue
-            service_id = str(resource_id or "")
-            session = self._services.get(str(service_id or ""))
-            if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
+            if resource_kind not in {"task_pool", "taskpool", "pool"}:
                 continue
-            session.alive_workers = max(0, int(alive_count or 0))
-        if not seen_service_ids:
-            return
+            pool_id = str(resource_id or "")
+            pool = self._task_pools.get(pool_id)
+            if pool is None or not pool.is_running():
+                continue
+            pool.alive_workers = max(0, int(alive_count or 0))
         now_perf = time.perf_counter()
-        for session in self._services.values():
-            service_id = str(session.service_id or "")
-            if not service_id or service_id in seen_service_ids:
-                continue
-            if session.status != pb2.SERVICE_STATUS_RUNNING or not bool(session.executor_ready):
-                continue
-            previous_alive = max(0, int(session.alive_workers or 0))
-            session.alive_workers = 0
-            last_report = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
-            if now_perf - last_report >= 10.0:
-                session.last_liveness_missing_report_at = now_perf
-                logger.warning(
-                    "[NodeControl] service worker liveness missing service_id=%s service_name=%s previous_alive_workers=%s",
-                    session.service_id,
-                    session.service_name,
-                    previous_alive,
-                )
+        if seen_service_ids:
+            for session in self._services.values():
+                service_id = str(session.service_id or "")
+                if not service_id or service_id in seen_service_ids:
+                    continue
+                if session.status != pb2.SERVICE_STATUS_RUNNING or not bool(session.executor_ready):
+                    continue
+                previous_alive = max(0, int(session.alive_workers or 0))
+                session.alive_workers = 0
+                last_report = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
+                if now_perf - last_report >= 10.0:
+                    session.last_liveness_missing_report_at = now_perf
+                    logger.warning(
+                        "[NodeControl] service worker liveness missing service_id=%s service_name=%s previous_alive_workers=%s",
+                        session.service_id,
+                        session.service_name,
+                        previous_alive,
+                    )
+        if seen_task_pool_ids:
+            for pool in self._task_pools.values():
+                pool_id = str(pool.pool_id or "")
+                if not pool_id or pool_id in seen_task_pool_ids:
+                    continue
+                if not pool.is_running() or not bool(pool.executor_ready):
+                    continue
+                previous_alive = max(0, int(pool.alive_workers or 0))
+                pool.alive_workers = 0
+                last_report = float(getattr(pool, "last_liveness_missing_report_at", 0.0) or 0.0)
+                if now_perf - last_report >= 10.0:
+                    pool.last_liveness_missing_report_at = now_perf
+                    logger.warning(
+                        "[NodeControl] task pool worker liveness missing pool_id=%s pool_name=%s previous_alive_workers=%s",
+                        pool.pool_id,
+                        pool.pool_name,
+                        previous_alive,
+                    )
 
     def _refresh_service_worker_liveness_locked(self) -> None:
         self._refresh_resource_liveness_locked()
@@ -4478,6 +4519,46 @@ class NodeControlState(NodeRuntimeBase):
             ),
         )
 
+    def _handle_task_pool_resource_health_locked(self, pool: TaskPoolState, *, now: datetime) -> None:
+        pool_id = str(pool.pool_id or "")
+        if not pool.is_running():
+            self._task_pool_zero_alive_counts.pop(pool_id, None)
+            return
+
+        if now > pool.lease_expire_at:
+            self._stop_task_pool_resource_locked(
+                pool,
+                reason=_resource_stop_reason("owner heartbeat timeout"),
+                async_stop=True,
+            )
+            return
+
+        has_workers = int(pool.worker_count or 0) > 0
+        has_live_workers = int(pool.alive_workers or 0) > 0
+        if not has_workers or has_live_workers:
+            if hasattr(pool, "degraded"):
+                pool.degraded = False
+            self._task_pool_zero_alive_counts.pop(pool_id, None)
+            return
+
+        count = int(self._task_pool_zero_alive_counts.get(pool_id, 0) or 0) + 1
+        self._task_pool_zero_alive_counts[pool_id] = count
+        if hasattr(pool, "degraded"):
+            pool.degraded = True
+        if count < TASK_POOL_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
+            return
+
+        self._stop_task_pool_resource_locked(
+            pool,
+            reason=_resource_stop_reason(
+                "task pool worker unavailable",
+                resource_kind="task_pool",
+                alive_workers=0,
+                worker_count=int(pool.worker_count or 0),
+            ),
+            async_stop=True,
+        )
+
     def _handle_service_timeouts(self) -> None:
         now = utc_now()
         with self._lock:
@@ -4485,12 +4566,4 @@ class NodeControlState(NodeRuntimeBase):
             for session in self._services.values():
                 self._handle_service_resource_health_locked(session, now=now)
             for pool in self._task_pools.values():
-                if not pool.is_running():
-                    continue
-                if now <= pool.lease_expire_at:
-                    continue
-                self._stop_task_pool_resource_locked(
-                    pool,
-                    reason=_resource_stop_reason("owner heartbeat timeout"),
-                    async_stop=True,
-                )
+                self._handle_task_pool_resource_health_locked(pool, now=now)

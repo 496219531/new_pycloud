@@ -5683,7 +5683,7 @@ def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     state.close()
 
     assert ("stop_service", {"service_id": "svc-close", "reason": "nodecontrol shutdown"}) in calls
-    assert ("stop_task_pool", {"pool_id": "pool-close"}) in calls
+    assert ("stop_task_pool", {"pool_id": "pool-close", "reason": "nodecontrol shutdown"}) in calls
     assert ("close", {"shutdown_timeout_sec": 2.0}) in calls
     assert service.status == pb2.SERVICE_STATUS_STOPPED
     assert service.stop_reason == "nodecontrol shutdown"
@@ -5732,6 +5732,227 @@ def test_close_task_pool_preserves_existing_stop_reason(tmp_path):
 
     assert pool.status == "STOPPED"
     assert pool.stop_reason == "owner heartbeat timeout"
+
+
+def test_task_pool_worker_liveness_drives_degraded_then_stopped(tmp_path):
+    state = NodeControlState(
+        node_id="node-task-pool-liveness-stop",
+        queue_capacity=4,
+        worker_capacity=1,
+        task_pool_worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_liveness_stop"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def resource_worker_liveness(self):
+            return {("task_pool", "pool-dead"): 0, ("task_pool", "pool-live"): 1}
+
+        def stop_task_pool(self, **kwargs):
+            calls.append(kwargs)
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    dead = TaskPoolState(
+        pool_id="pool-dead",
+        owner_client_id="owner",
+        pool_name="pool-dead",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    live = TaskPoolState(
+        pool_id="pool-live",
+        owner_client_id="owner",
+        pool_name="pool-live",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token-live",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._task_pools[dead.pool_id] = dead  # noqa: SLF001
+        state._task_pools[live.pool_id] = live  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert dead.status == "RUNNING"
+        assert dead.alive_workers == 0
+        assert dead.degraded is True
+        assert live.status == "RUNNING"
+        assert live.alive_workers == 1
+
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert dead.status == "STOPPED"
+        assert "task pool worker unavailable" in dead.stop_reason
+        assert dead.failure_at is not None
+        assert dead.alive_workers == 0
+        assert dead.degraded is False
+        assert live.status == "RUNNING"
+        assert live.stop_reason == ""
+        assert calls == [
+            {
+                "pool_id": "pool-dead",
+                "reason": "task pool worker unavailable; owner should redeploy or compensate; alive_workers=0 worker_count=1",
+            }
+        ]
+    finally:
+        state.close()
+
+
+def test_task_pool_worker_liveness_missing_running_pool_counts_as_zero(tmp_path):
+    state = NodeControlState(
+        node_id="node-task-pool-liveness-missing",
+        queue_capacity=4,
+        worker_capacity=1,
+        task_pool_worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_pool_liveness_missing"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def resource_worker_liveness(self):
+            return {("task_pool", "pool-present"): 1}
+
+        def stop_task_pool(self, **kwargs):  # noqa: ARG002
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    missing = TaskPoolState(
+        pool_id="pool-missing",
+        owner_client_id="owner",
+        pool_name="pool-missing",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token-missing",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    present = TaskPoolState(
+        pool_id="pool-present",
+        owner_client_id="owner",
+        pool_name="pool-present",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token-present",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._task_pools[missing.pool_id] = missing  # noqa: SLF001
+        state._task_pools[present.pool_id] = present  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert missing.alive_workers == 0
+        assert missing.degraded is True
+        assert present.alive_workers == 1
+        assert present.degraded is False
+    finally:
+        state.close()
+
+
+def test_task_pool_heartbeat_does_not_mask_zero_worker_liveness(tmp_path):
+    state = NodeControlState(
+        node_id="node-task-pool-heartbeat-liveness",
+        queue_capacity=4,
+        worker_capacity=1,
+        task_pool_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_heartbeat_liveness"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    pool = TaskPoolState(
+        pool_id="pool-heartbeat-liveness",
+        owner_client_id="owner",
+        pool_name="pool-heartbeat-liveness",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=0,
+        degraded=True,
+    )
+    with state._lock:  # noqa: SLF001
+        state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+
+    try:
+        state.heartbeat_task_pool(
+            owner_client_id="owner",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+        )
+
+        assert pool.status == "RUNNING"
+        assert pool.alive_workers == 0
+        assert pool.degraded is True
+        assert pool.stop_reason == ""
+    finally:
+        state.close()
 
 
 def test_nodecontrol_service_call_throttles_code_last_at_touch(tmp_path, monkeypatch):

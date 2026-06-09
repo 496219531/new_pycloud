@@ -187,12 +187,13 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
 def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPoolInfo:
     resource = pool.resource_snapshot(in_flight=in_flight)
     metrics = dict(pool.timing_metrics or {})
+    status = "DEGRADED" if pool.is_running() and bool(getattr(pool, "degraded", False)) else str(pool.status)
     return NodeTaskPoolInfo(
         pool_id=pool.pool_id,
         owner_client_id=pool.owner_client_id,
         pool_name=pool.pool_name,
         code_version=pool.code_version,
-        status=pool.status,
+        status=status,
         worker_count=resource.worker_count,
         alive_workers=resource.alive_workers,
         task_count=pool.task_count,
@@ -211,6 +212,7 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
 
 def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[str, object]:
     resource = pool.resource_snapshot(in_flight=in_flight)
+    status = "DEGRADED" if pool.is_running() and bool(getattr(pool, "degraded", False)) else str(pool.status)
     return {
         "pool_id": pool.pool_id,
         "owner_client_id": pool.owner_client_id,
@@ -220,7 +222,8 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "worker_count": resource.worker_count,
         "alive_workers": resource.alive_workers,
         "heartbeat_timeout_sec": pool.heartbeat_timeout_sec,
-        "status": str(pool.status),
+        "status": status,
+        "degraded": bool(getattr(pool, "degraded", False)),
         "task_count": int(resource.received_count),
         "received_count": int(resource.received_count),
         "returned_count": int(resource.returned_count),
