@@ -703,6 +703,7 @@ class NodeControlState(NodeRuntimeBase):
         stopped_at = utc_now()
         pool.failure_at = stopped_at
         pool.lease_expire_at = stopped_at
+        self._fail_task_pool_tasks_locked(pool, reason=pool.stop_reason, now=stopped_at)
         self._task_pool_zero_alive_counts.pop(str(pool.pool_id or ""), None)
         if stop_executor is not None and async_stop:
             executor_host, pool_id = stop_executor
@@ -737,6 +738,30 @@ class NodeControlState(NodeRuntimeBase):
                 raise KeyError("task pool not found")
             return self._stop_task_pool_resource_locked(pool, reason=reason)
         raise ValueError(f"unsupported resource kind: {kind!r}")
+
+    def _fail_task_pool_tasks_locked(self, pool: TaskPoolState, *, reason: str, now: datetime) -> int:
+        pool_id = str(pool.pool_id or "").strip()
+        if not pool_id:
+            return 0
+        failed_count = 0
+        result_hook = self._pool_result_hook
+        for task in list(self._pool_tasks.values()):
+            if str(task.client_id or "").strip() != pool_id:
+                continue
+            if self._pool_task_is_terminal_status(int(task.status or 0)):
+                continue
+            task.status = pb2.TASK_STATUS_FAILED_INFRA
+            task.finished_at = now
+            task.last_heartbeat_at = now
+            task.result = None
+            task.error_type = "TaskPoolStopped"
+            task.error_message = str(reason or "task pool stopped")
+            pool.returned_count += 1
+            failed_count += 1
+            result_hook.push(pool_id, task.as_result())
+        if failed_count:
+            self._cv.notify_all()
+        return failed_count
 
     @staticmethod
     def _service_stopped_error_payload(session: ServiceSession, *, fallback: str = "service not running") -> Dict[str, object]:
@@ -4276,6 +4301,8 @@ class NodeControlState(NodeRuntimeBase):
                     now = utc_now()
                     task = self._pool_tasks.get(task_id)
                     if task is None or task.attempt != attempt:
+                        continue
+                    if self._pool_task_is_terminal_status(int(task.status or 0)):
                         continue
                     pool = self._task_pools.get(pool_id)
                     if pool is None or str(task.client_id or "").strip() != pool_id:

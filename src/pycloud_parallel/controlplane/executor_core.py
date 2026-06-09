@@ -265,6 +265,33 @@ class ExecutorCore:
             )
         return failed_count
 
+    def _fail_pool_inflight(self, pool_id: str, *, reason: str) -> int:
+        normalized_pool_id = str(pool_id or "").strip()
+        failed_count = 0
+        for future, meta in list(self._inflight.items()):
+            if str(meta.get("kind", "") or "") != "pool":
+                continue
+            if str(meta.get("pool_id", "") or "") != normalized_pool_id:
+                continue
+            self._inflight.pop(future, None)
+            failed_count += 1
+            with contextlib.suppress(Exception):
+                future.cancel()
+            self._emit_event(
+                {
+                    "kind": "pool_task_done",
+                    "pool_id": normalized_pool_id,
+                    "task_id": str(meta.get("task_id", "") or ""),
+                    "attempt": int(meta.get("attempt", 0) or 0),
+                    "status_text": "FAILED_INFRA",
+                    "result": None,
+                    "err_type": "TaskPoolStopped",
+                    "err_message": str(reason or "task pool stopped"),
+                    "timings": {},
+                }
+            )
+        return failed_count
+
     def _drain_stream_meta(self, meta: Dict[str, Any]) -> None:
         request_id = str(meta.get("request_id", "") or "")
         stream_queue = meta.get("stream_queue")
@@ -519,10 +546,12 @@ class ExecutorCore:
 
         if action == "stop_task_pool":
             pool_id = str(payload.get("pool_id", "") or "")
+            reason = str(payload.get("reason", "") or "") or "task pool stopped"
             executor = self._pool_executors.pop(pool_id, None)
             self._pool_workers.pop(pool_id, None)
+            failed_inflight = self._fail_pool_inflight(pool_id, reason=reason)
             self._shutdown_executor(executor, wait=True)
-            self._emit_response(request_id, ok=True)
+            self._emit_response(request_id, ok=True, failed_inflight=failed_inflight)
             return True
 
         if action == "call_service":

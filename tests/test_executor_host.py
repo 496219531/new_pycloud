@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import threading
 import time
 
 import pytest
@@ -127,6 +128,51 @@ def test_executor_core_stop_service_fails_inflight_call_and_stream():
     assert core._stream_state == {}  # noqa: SLF001
 
 
+def test_executor_core_stop_task_pool_fails_inflight_tasks():
+    responses = []
+    events = []
+    core = ExecutorCore(
+        task_worker_capacity=1,
+        emit_response=lambda item: responses.append(dict(item)),
+        emit_event=lambda item: events.append(dict(item)),
+    )
+    future = _NeverDoneFuture()
+    core._pool_workers["pool-stop"] = 1  # noqa: SLF001
+    core._pool_executors["pool-stop"] = None  # noqa: SLF001
+    core._track_inflight(  # noqa: SLF001
+        future,
+        {
+            "kind": "pool",
+            "pool_id": "pool-stop",
+            "task_id": "task-stop",
+            "attempt": 2,
+        },
+    )
+
+    core.handle_request(
+        "req-stop-pool",
+        "stop_task_pool",
+        {"pool_id": "pool-stop", "reason": "owner heartbeat timeout"},
+    )
+
+    assert responses == [{"kind": "response", "request_id": "req-stop-pool", "ok": True, "failed_inflight": 1}]
+    assert events == [
+        {
+            "kind": "pool_task_done",
+            "pool_id": "pool-stop",
+            "task_id": "task-stop",
+            "attempt": 2,
+            "status_text": "FAILED_INFRA",
+            "result": None,
+            "err_type": "TaskPoolStopped",
+            "err_message": "owner heartbeat timeout",
+            "timings": {},
+        }
+    ]
+    assert future.cancelled is True
+    assert core._inflight == {}  # noqa: SLF001
+
+
 def test_create_executor_backend_defaults_to_subprocess_host():
     backend = create_executor_backend(task_worker_capacity=1)
     try:
@@ -151,6 +197,9 @@ def test_subprocess_backend_stop_service_accepts_reason_and_reports_liveness():
         def service_worker_liveness(self):
             return dict(self._liveness)
 
+        def resource_worker_liveness(self):
+            return {("service", key): value for key, value in self._liveness.items()}
+
         def close(self, **kwargs):
             calls.append(("close", kwargs))
 
@@ -167,6 +216,51 @@ def test_subprocess_backend_stop_service_accepts_reason_and_reports_liveness():
     assert "svc-a" not in backend._service_clients  # noqa: SLF001
     assert backend.service_worker_liveness() == {"svc-b": 0}
     assert backend.resource_worker_liveness() == {("service", "svc-b"): 0}
+
+
+def test_subprocess_backend_resource_liveness_includes_task_pools():
+    calls = []
+
+    class _FakeClient:
+        def __init__(self, liveness):
+            self._liveness = dict(liveness)
+
+        def is_alive(self):
+            return True
+
+        def resource_worker_liveness(self):
+            return dict(self._liveness)
+
+        def stop_task_pool(self, **kwargs):
+            calls.append(("stop_task_pool", kwargs))
+
+        def close(self, **kwargs):
+            calls.append(("close", kwargs))
+
+    backend = SubprocessExecutorBackend(task_worker_capacity=1)
+    backend._pool_clients["pool-a"] = _FakeClient({("task_pool", "pool-a"): 2})  # noqa: SLF001
+    backend._pool_clients["pool-b"] = _FakeClient({("pool", "pool-b"): 0})  # noqa: SLF001
+
+    assert backend.resource_worker_liveness() == {("task_pool", "pool-a"): 2, ("task_pool", "pool-b"): 0}
+    backend.stop_task_pool(pool_id="pool-a", reason="owner heartbeat timeout")
+
+    assert ("stop_task_pool", {"pool_id": "pool-a", "reason": "owner heartbeat timeout"}) in calls
+    assert "pool-a" not in backend._pool_clients  # noqa: SLF001
+    assert backend.resource_worker_liveness() == {("task_pool", "pool-b"): 0}
+
+
+def test_executor_host_client_resource_liveness_reads_pool_worker_keys(monkeypatch):
+    client = object.__new__(ExecutorHostClient)
+    client._cv = threading.Condition()  # noqa: SLF001
+    client._worker_pid_sets = {  # noqa: SLF001
+        "service:svc-a": {101, 102},
+        "pool:pool-a": {201},
+        "runtime:rt-a": {301},
+    }
+
+    monkeypatch.setattr("pycloud_parallel.controlplane.executor_host._pid_alive", lambda pid: int(pid) in {101, 201})
+
+    assert client.resource_worker_liveness() == {("service", "svc-a"): 1, ("task_pool", "pool-a"): 1}
 
 
 def test_executor_backend_interface_exposes_service_stop_reason_and_liveness():

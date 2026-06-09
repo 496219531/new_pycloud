@@ -198,7 +198,23 @@ class SubprocessExecutorBackend:
         return out
 
     def resource_worker_liveness(self) -> Dict[Tuple[str, str], int]:
-        return {("service", str(service_id)): int(alive) for service_id, alive in self.service_worker_liveness().items()}
+        out: Dict[Tuple[str, str], int] = {}
+        for service_id, alive in self.service_worker_liveness().items():
+            out[("service", str(service_id))] = int(alive)
+        for pool_id, client in list(self._pool_clients.items()):
+            if client is None or not client.is_alive():
+                out[("task_pool", str(pool_id))] = 0
+                continue
+            resource_liveness = getattr(client, "resource_worker_liveness", None)
+            if callable(resource_liveness):
+                for (kind, resource_id), alive in resource_liveness().items():
+                    normalized_kind = str(kind or "")
+                    if normalized_kind in {"pool", "taskpool"}:
+                        normalized_kind = "task_pool"
+                    out[(normalized_kind, str(resource_id))] = int(alive)
+                continue
+            out[("task_pool", str(pool_id))] = 0
+        return out
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         self._ensure_pool_client(pool_id).create_task_pool(pool_id=pool_id, worker_count=worker_count)

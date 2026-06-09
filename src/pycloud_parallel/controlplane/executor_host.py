@@ -367,7 +367,21 @@ class ExecutorHostClient:
         return out
 
     def resource_worker_liveness(self) -> Dict[Tuple[str, str], int]:
-        return {("service", str(service_id)): int(alive) for service_id, alive in self.service_worker_liveness().items()}
+        out: Dict[Tuple[str, str], int] = {}
+        with self._cv:
+            for worker_key, pid_set in self._worker_pid_sets.items():
+                if ":" not in worker_key:
+                    continue
+                scope, resource_id = worker_key.split(":", 1)
+                resource_kind = "service" if scope == "service" else "task_pool" if scope == "pool" else ""
+                if not resource_kind:
+                    continue
+                alive = 0
+                for pid in list(pid_set):
+                    if _pid_alive(int(pid)):
+                        alive += 1
+                out[(resource_kind, resource_id)] = alive
+        return out
 
     def create_task_pool(self, *, pool_id: str, worker_count: int) -> None:
         resp = self._request(
@@ -378,7 +392,12 @@ class ExecutorHostClient:
             raise RuntimeError(str(resp.get("error", "create_task_pool failed")))
 
     def stop_task_pool(self, *, pool_id: str, reason: str = "") -> None:
+        worker_key = f"pool:{str(pool_id or '').strip()}"
+        with self._cv:
+            pool_worker_pids = list(self._worker_pid_sets.pop(worker_key, set()))
+            self._worker_pids.difference_update(pool_worker_pids)
         resp = self._request("stop_task_pool", payload={"pool_id": pool_id, "reason": str(reason or "")})
+        self._terminate_worker_pids(pool_worker_pids)
         if not resp.get("ok", False):
             raise RuntimeError(str(resp.get("error", "stop_task_pool failed")))
 

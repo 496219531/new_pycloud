@@ -5738,6 +5738,211 @@ def test_close_task_pool_preserves_existing_stop_reason(tmp_path):
     assert pool.stop_reason == "owner heartbeat timeout"
 
 
+def test_close_task_pool_fails_queued_and_running_tasks(tmp_path):
+    state = NodeControlState(
+        node_id="node-close-pool-fails-tasks",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_close_pool_fails_tasks"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def stop_task_pool(self, **kwargs):
+            calls.append(kwargs)
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    pool = TaskPoolState(
+        pool_id="pool-close-fails-tasks",
+        owner_client_id="owner",
+        pool_name="pool-close-fails-tasks",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    queued = TaskState(
+        task_id="task-queued",
+        client_id=pool.pool_id,
+        job_id="job-close",
+        code_version=pool.code_version,
+        runtime_key="",
+        execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+        payload={},
+        timeout_hint_sec=0,
+        priority=1,
+        status=pb2.TASK_STATUS_QUEUED,
+        attempt=1,
+    )
+    running = TaskState(
+        task_id="task-running",
+        client_id=pool.pool_id,
+        job_id="job-close",
+        code_version=pool.code_version,
+        runtime_key="",
+        execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+        payload={},
+        timeout_hint_sec=0,
+        priority=1,
+        status=pb2.TASK_STATUS_RUNNING,
+        attempt=1,
+        started_at=now,
+        last_heartbeat_at=now,
+    )
+    with state._cv:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+        state._pool_tasks[queued.task_id] = queued  # noqa: SLF001
+        state._pool_tasks[running.task_id] = running  # noqa: SLF001
+
+    try:
+        state.close_task_pool(
+            owner_client_id="owner",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            reason="owner heartbeat timeout",
+        )
+        results, _cursor = state.pull_pool_results(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            limit=10,
+            wait_ms=0,
+            cursor="",
+        )
+
+        assert pool.status == "STOPPED"
+        assert pool.returned_count == 2
+        assert calls == [{"pool_id": pool.pool_id, "reason": "owner heartbeat timeout"}]
+        by_id = {item.task_id: item for item in results}
+        assert set(by_id) == {"task-queued", "task-running"}
+        assert by_id["task-queued"].status == pb2.TASK_STATUS_FAILED_INFRA
+        assert by_id["task-running"].status == pb2.TASK_STATUS_FAILED_INFRA
+        assert by_id["task-queued"].error.type == "TaskPoolStopped"
+        assert by_id["task-running"].error.message == "owner heartbeat timeout"
+    finally:
+        state.close()
+
+
+def test_closed_task_pool_ignores_late_executor_result_for_failed_task(tmp_path):
+    state = NodeControlState(
+        node_id="node-close-pool-late-result",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_close_pool_late_result"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    emitted = {"late": False}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def stop_task_pool(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            if emitted["late"]:
+                return []
+            emitted["late"] = True
+            return [
+                {
+                    "kind": "pool_task_done",
+                    "pool_id": "pool-late-result",
+                    "task_id": "task-running",
+                    "attempt": 1,
+                    "status_text": "SUCCEEDED",
+                    "result": {"late": True},
+                    "err_type": "",
+                    "err_message": "",
+                    "timings": {},
+                }
+            ]
+
+        def close(self, **_kwargs):
+            pass
+
+    pool = TaskPoolState(
+        pool_id="pool-late-result",
+        owner_client_id="owner",
+        pool_name="pool-late-result",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    task = TaskState(
+        task_id="task-running",
+        client_id=pool.pool_id,
+        job_id="job-close",
+        code_version=pool.code_version,
+        runtime_key="",
+        execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+        payload={},
+        timeout_hint_sec=0,
+        priority=1,
+        status=pb2.TASK_STATUS_RUNNING,
+        attempt=1,
+        started_at=now,
+        last_heartbeat_at=now,
+    )
+    with state._cv:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+        state._pool_tasks[task.task_id] = task  # noqa: SLF001
+
+    try:
+        state.close_task_pool(
+            owner_client_id="owner",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            reason="owner heartbeat timeout",
+        )
+        assert pool.returned_count == 1
+        state._drain_executor_events()  # noqa: SLF001
+        assert pool.returned_count == 1
+        results, _cursor = state.pull_pool_results(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            limit=10,
+            wait_ms=0,
+            cursor="",
+        )
+        assert len(results) == 1
+        assert results[0].status == pb2.TASK_STATUS_FAILED_INFRA
+        assert results[0].error.message == "owner heartbeat timeout"
+    finally:
+        state.close()
+
+
 def test_task_pool_worker_liveness_drives_degraded_then_stopped(tmp_path):
     state = NodeControlState(
         node_id="node-task-pool-liveness-stop",
