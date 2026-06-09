@@ -1174,19 +1174,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         return is_retryable_compensation_failure(message, resource_kind="task_pool")
 
     def _after_keepalive_tick(self) -> None:
-        spec = self._compensation_spec
-        if not spec:
-            return
-        now = time.monotonic()
-        desired = max(0, int(spec.get("node_count", 0) or 0))
-        active_count = len(self._active_replica_snapshot())
-        if desired <= 0 or active_count >= desired:
-            return
-        interval_sec = 1.0 if active_count <= 0 else 5.0
-        if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
-            return
-        self._last_compensation_attempt_at = now
-        self._submit_compensation_attempt(
+        self._maybe_submit_compensation_after_tick(
+            self._compensation_spec,
             resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or "")
         )
 

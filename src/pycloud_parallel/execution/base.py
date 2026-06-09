@@ -507,6 +507,20 @@ class ExecutionSessionBase:
             )
             return True
 
+    def _maybe_submit_compensation_after_tick(self, spec: Optional[Dict[str, Any]], *, resource_name: str = "") -> bool:
+        if not spec:
+            return False
+        desired = max(0, int(dict(spec).get("node_count", 0) or 0))
+        active_count = len(self._active_replica_snapshot())
+        if desired <= 0 or active_count >= desired:
+            return False
+        interval_sec = 1.0 if active_count <= 0 else 5.0
+        now = time.monotonic()
+        if now - float(getattr(self, "_last_compensation_attempt_at", 0.0) or 0.0) < interval_sec:
+            return False
+        setattr(self, "_last_compensation_attempt_at", now)
+        return self._submit_compensation_attempt(resource_name=resource_name)
+
     def _active_replica_snapshot(self) -> set[str]:
         lock = getattr(self, "_active_replica_lock", None)
         if lock is None:
