@@ -81,6 +81,49 @@ def test_taskpool_after_keepalive_tick_submits_compensation_async() -> None:
         session._stop_keepalive()  # noqa: SLF001
 
 
+def test_taskpool_after_keepalive_tick_uses_recovery_intervals() -> None:
+    session = TaskPool(pools={}, nodes={}, task_method="run")
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "node_count": 2,
+            "check_interval_sec": 15.0,
+            "infocenter_target": "127.0.0.1:1",
+        }
+    )
+    submitted = []
+    session._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+
+    original_monotonic = time.monotonic
+    try:
+        time.monotonic = lambda: 100.0  # type: ignore[assignment]
+        session._last_compensation_attempt_at = 99.2  # noqa: SLF001
+        session._after_keepalive_tick()  # noqa: SLF001
+        assert submitted == []
+
+        time.monotonic = lambda: 100.3  # type: ignore[assignment]
+        session._after_keepalive_tick()  # noqa: SLF001
+        assert len(submitted) == 1
+
+        session._active_replica_ids = {"node-1"}  # noqa: SLF001
+        session._last_compensation_attempt_at = 196.0  # noqa: SLF001
+        time.monotonic = lambda: 200.0  # type: ignore[assignment]
+        session._after_keepalive_tick()  # noqa: SLF001
+        assert len(submitted) == 1
+
+        time.monotonic = lambda: 201.1  # type: ignore[assignment]
+        session._after_keepalive_tick()  # noqa: SLF001
+        assert len(submitted) == 2
+
+        session._active_replica_ids = {"node-1", "node-2"}  # noqa: SLF001
+        session._last_compensation_attempt_at = 0.0  # noqa: SLF001
+        time.monotonic = lambda: 300.0  # type: ignore[assignment]
+        session._after_keepalive_tick()  # noqa: SLF001
+        assert len(submitted) == 2
+    finally:
+        time.monotonic = original_monotonic  # type: ignore[assignment]
+        session._stop_keepalive()  # noqa: SLF001
+
+
 def test_taskpool_runtime_boundary_does_not_use_service_discovery_surface() -> None:
     text = (ROOT / "src/pycloud_parallel/execution/task_pool.py").read_text(encoding="utf-8")
     assert "service_name=" not in text

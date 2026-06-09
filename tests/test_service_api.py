@@ -4117,68 +4117,54 @@ class TestOwnerServiceFacade:
             release_compensation.set()
             group._stop_keepalive()  # noqa: SLF001
 
-    def test_service_compensation_interval_is_fast_when_no_active_replicas(self):
+    def test_owner_compensation_tick_uses_recovery_intervals(self):
         from pycloud_parallel.execution.service_session import Service
 
         group = Service(
             owner_client_id="owner-demo",
             service_name="demo-service",
-            sessions={"node-1": SimpleNamespace()},
-            nodes={},
-        )
-        group._configure_dynamic_compensation(  # noqa: SLF001
-            {
-                "node_count": 1,
-                "check_interval_sec": 0.01,
-                "infocenter_target": "127.0.0.1:1",
-            }
-        )
-        group._active_replica_ids.clear()  # noqa: SLF001
-        submitted_at: list[float] = []
-
-        def _record_submit(*, resource_name: str = "") -> bool:
-            del resource_name
-            submitted_at.append(time.monotonic())
-            return True
-
-        group._submit_compensation_attempt = _record_submit  # type: ignore[method-assign]
-
-        group._after_keepalive_tick()  # noqa: SLF001
-        time.sleep(0.2)
-        group._after_keepalive_tick()  # noqa: SLF001
-
-        assert len(submitted_at) == 2
-
-    def test_service_compensation_interval_stays_conservative_when_active_exists(self):
-        from pycloud_parallel.execution.service_session import Service
-
-        group = Service(
-            owner_client_id="owner-demo",
-            service_name="demo-service",
-            sessions={"node-1": SimpleNamespace()},
+            sessions={},
             nodes={},
         )
         group._configure_dynamic_compensation(  # noqa: SLF001
             {
                 "node_count": 2,
-                "check_interval_sec": 0.01,
+                "check_interval_sec": 15.0,
                 "infocenter_target": "127.0.0.1:1",
             }
         )
-        submitted_at: list[float] = []
+        submitted = []
+        group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
 
-        def _record_submit(*, resource_name: str = "") -> bool:
-            del resource_name
-            submitted_at.append(time.monotonic())
-            return True
+        original_monotonic = time.monotonic
+        try:
+            time.monotonic = lambda: 100.0  # type: ignore[assignment]
+            group._last_compensation_attempt_at = 99.2  # noqa: SLF001
+            group._after_keepalive_tick()  # noqa: SLF001
+            assert submitted == []
 
-        group._submit_compensation_attempt = _record_submit  # type: ignore[method-assign]
+            time.monotonic = lambda: 100.3  # type: ignore[assignment]
+            group._after_keepalive_tick()  # noqa: SLF001
+            assert len(submitted) == 1
 
-        group._after_keepalive_tick()  # noqa: SLF001
-        time.sleep(0.2)
-        group._after_keepalive_tick()  # noqa: SLF001
+            group._active_replica_ids = {"node-1"}  # noqa: SLF001
+            group._last_compensation_attempt_at = 196.0  # noqa: SLF001
+            time.monotonic = lambda: 200.0  # type: ignore[assignment]
+            group._after_keepalive_tick()  # noqa: SLF001
+            assert len(submitted) == 1
 
-        assert len(submitted_at) == 1
+            time.monotonic = lambda: 201.1  # type: ignore[assignment]
+            group._after_keepalive_tick()  # noqa: SLF001
+            assert len(submitted) == 2
+
+            group._active_replica_ids = {"node-1", "node-2"}  # noqa: SLF001
+            group._last_compensation_attempt_at = 0.0  # noqa: SLF001
+            time.monotonic = lambda: 300.0  # type: ignore[assignment]
+            group._after_keepalive_tick()  # noqa: SLF001
+            assert len(submitted) == 2
+        finally:
+            time.monotonic = original_monotonic  # type: ignore[assignment]
+            group._stop_keepalive()  # noqa: SLF001
 
     def test_owner_keepalive_failed_replica_does_not_count_as_active_while_retrying(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2

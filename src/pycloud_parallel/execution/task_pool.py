@@ -1176,8 +1176,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if not spec:
             return
         now = time.monotonic()
-        interval_floor_sec = 0.1 if not self._active_replica_snapshot() else 5.0
-        interval_sec = max(interval_floor_sec, float(spec.get("check_interval_sec", 15.0) or 15.0))
+        desired = max(0, int(spec.get("node_count", 0) or 0))
+        active_count = len(self._active_replica_snapshot())
+        if desired <= 0 or active_count >= desired:
+            return
+        interval_sec = 1.0 if active_count <= 0 else 5.0
         if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
             return
         self._last_compensation_attempt_at = now
