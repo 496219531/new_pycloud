@@ -79,6 +79,7 @@ class ExecutionSessionBase:
 
     def _init_execution_session_state(self) -> None:
         self._hb_stop = threading.Event()
+        self._hb_wakeup = threading.Event()
         self._hb_thread = None
         self._hb_lock = threading.Lock()
         self._keepalive_seq = 0
@@ -672,6 +673,28 @@ class ExecutionSessionBase:
         self._mark_replica_heartbeat_failure(node_id, replica, exc)
         self._mark_terminal_replica(node_id)
 
+    def _heartbeat_new_replica_before_activate(self, node_id: str, replica: ExecutionReplicaHandle) -> bool:
+        try:
+            self._keepalive_seq += 1
+            self._timed_heartbeat_replica(node_id, replica, seq=self._keepalive_seq)
+            self._mark_replica_heartbeat_success(node_id, replica)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "%s compensation initial heartbeat failed node_instance_id=%s context=%s error=%r",
+                self.kind or "execution",
+                str(node_id or ""),
+                self._replica_log_context(str(node_id or ""), replica),
+                exc,
+            )
+            self._record_heartbeat_failure(str(node_id or ""), replica, exc)
+            return False
+
+    def _wake_keepalive(self) -> None:
+        wakeup = getattr(self, "_hb_wakeup", None)
+        if wakeup is not None:
+            wakeup.set()
+
     def _handle_heartbeat_exception(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
         error_kind = self._classify_heartbeat_error(node_id, replica, exc)
         if error_kind == HeartbeatErrorKind.TERMINAL:
@@ -772,9 +795,14 @@ class ExecutionSessionBase:
                         self._handle_heartbeat_exception(node_id, replica, exc)
 
                 wait_sec = max(0.0, next_tick - time.monotonic())
-                if self._hb_stop.wait(wait_sec):
+                if wait_sec > 0.0:
+                    self._hb_wakeup.wait(wait_sec)
+                    self._hb_wakeup.clear()
+                    if self._hb_stop.is_set():
+                        break
+                elif self._hb_stop.is_set():
                     break
-                next_tick += max(0.1, float(interval_sec))
+                next_tick = time.monotonic() + max(0.1, float(interval_sec))
                 self._keepalive_seq += 1
                 replicas = self.replicas
                 heartbeat_ids = list(self._active_replica_snapshot())
@@ -853,6 +881,7 @@ class ExecutionSessionBase:
                 if hasattr(replica, "last_error"):
                     replica.last_error = ""
             self._hb_stop.clear()
+            self._hb_wakeup.clear()
             wait_sec = self._default_keepalive_interval_sec(interval_sec)
             self._hb_thread = threading.Thread(
                 target=self._keepalive_loop,

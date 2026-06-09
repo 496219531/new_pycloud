@@ -159,6 +159,7 @@ def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
             )
 
         def close(self) -> None:
@@ -266,6 +267,7 @@ def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatc
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
             )
 
         def close(self) -> None:
@@ -338,6 +340,7 @@ def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
         python_version="py3.11",
     )
     created = []
+    heartbeats = []
     closed = []
 
     class _FakeInfoCenter:
@@ -364,6 +367,7 @@ def test_service_compensation_redeploys_retryable_failed_same_node(monkeypatch):
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **kwargs: heartbeats.append(dict(kwargs)) or SimpleNamespace(ok=True, accepted=True),
             )
 
         def close(self) -> None:
@@ -442,6 +446,7 @@ def test_service_compensation_allows_retry_probe_when_no_active_replicas(monkeyp
         python_version="py3.11",
     )
     created = []
+    heartbeats = []
 
     class _FakeInfoCenter:
         def __enter__(self):
@@ -467,6 +472,7 @@ def test_service_compensation_allows_retry_probe_when_no_active_replicas(monkeyp
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **kwargs: heartbeats.append(dict(kwargs)) or SimpleNamespace(ok=True, accepted=True),
             )
 
         def close(self) -> None:
@@ -520,6 +526,7 @@ def test_service_compensation_allows_retry_probe_when_no_active_replicas(monkeyp
 
     assert added == 1
     assert created[0][1]["expected_node_instance_id"] == "node-inst-1"
+    assert heartbeats
     assert group.sessions["node-inst-1"].service_id == "svc-recovered"
     assert "node-inst-1" in group._active_replica_ids  # noqa: SLF001
     assert "node-inst-1" not in group.failures
@@ -580,6 +587,7 @@ def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeyp
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
             )
 
         def close(self) -> None:
@@ -706,6 +714,7 @@ def test_service_compensation_does_not_defer_stale_retry_probe_with_active_repli
                 heartbeat_timeout_sec=30,
                 worker_count=1,
                 status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
             )
 
         def close(self) -> None:
@@ -3441,10 +3450,11 @@ class TestOwnerServiceFacade:
                     service_id="svc-1",
                     service_token="token-1",
                     http_base_url="http://127.0.0.1:18081/svc/svc-1",
-                    heartbeat_timeout_sec=30,
-                    worker_count=1,
-                    status=pb2.SERVICE_STATUS_RUNNING,
-                )
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+            )
 
             def close(self) -> None:
                 return None
@@ -4351,6 +4361,61 @@ class TestOwnerServiceFacade:
             assert group.failed is False
         finally:
             release_compensation.set()
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_keepalive_wakeup_runs_next_tick_without_waiting_full_interval(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 30
+            heartbeat_failure_threshold = 1
+            service_id = "svc-wakeup"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self):
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+
+        group._start_keepalive(interval_sec=10.0)  # noqa: SLF001
+        try:
+            time.sleep(0.1)
+            assert replica.calls == 0
+            group._wake_keepalive()  # noqa: SLF001
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and replica.calls < 1:
+                time.sleep(0.02)
+            assert replica.calls >= 1
+        finally:
             group._stop_keepalive()  # noqa: SLF001
 
     def test_owner_compensation_tick_uses_recovery_intervals(self):

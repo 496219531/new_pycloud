@@ -2215,6 +2215,10 @@ class Service(ServiceExecutionSession):
                         continue
                     if client is None or session is None:
                         continue
+                    if not self._heartbeat_new_replica_before_activate(node_key, session):
+                        with contextlib.suppress(Exception):
+                            client.close()
+                        continue
                     old_client = self._clients.pop(node_key, None)
                     if old_client is not None and old_client is not client:
                         with contextlib.suppress(Exception):
@@ -2223,9 +2227,9 @@ class Service(ServiceExecutionSession):
                     self._clients[node_key] = client
                     self.nodes[node_key] = node
                     self.failures.pop(node_key, None)
-                    self._add_active_replica(node_key)
                     self._breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
+                    self._wake_keepalive()
             if added:
                 self._persist_session_cache()
                 if self._last_managed_globals is not None:

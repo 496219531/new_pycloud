@@ -1313,13 +1313,18 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                             _close_task_pool_replica(old_pool, reason="replace failed task pool replica")
                             with contextlib.suppress(Exception):
                                 old_pool._client.close()  # noqa: SLF001
+                    if not self._heartbeat_new_replica_before_activate(node_key, pool):
+                        _close_task_pool_replica(pool, reason="compensated task pool initial heartbeat failed")
+                        with contextlib.suppress(Exception):
+                            pool._client.close()  # noqa: SLF001
+                        continue
                     self._pools[node_key] = pool
                     self.nodes[node_key] = node
                     self.failures.pop(node_key, None)
-                    self._add_active_replica(node_key)
                     self._active_nodes.add(node_key)
                     self._submit_breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
+                    self._wake_keepalive()
             if added and self._last_managed_globals is not None:
                 self.update_globals(dict(self._last_managed_globals))
             if added:

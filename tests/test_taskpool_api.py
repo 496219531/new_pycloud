@@ -211,6 +211,8 @@ def test_taskpool_open_uses_configured_default_heartbeat_timeout(monkeypatch) ->
                 code_version="sha256:test",
                 worker_count=kwargs["worker_count"],
                 heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                close=lambda reason="": None,
                 _client=SimpleNamespace(close=lambda: None),
             )
 
@@ -305,6 +307,8 @@ def test_taskpool_try_compensate_replicas_adds_newly_available_node(monkeypatch)
                 code_version="sha256:test",
                 worker_count=kwargs["worker_count"],
                 heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                close=lambda reason="": None,
                 _client=SimpleNamespace(close=lambda: None),
             )
 
@@ -407,6 +411,8 @@ def test_taskpool_compensation_uses_active_count_and_skips_failed_node(monkeypat
                 code_version="sha256:test",
                 worker_count=kwargs["worker_count"],
                 heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                close=lambda reason="": None,
                 _client=SimpleNamespace(close=lambda: None),
             )
 
@@ -512,6 +518,8 @@ def test_taskpool_compensation_allows_restarted_node_with_new_instance_id(monkey
                 code_version="sha256:test",
                 worker_count=kwargs["worker_count"],
                 heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                close=lambda reason="": None,
                 _client=SimpleNamespace(close=lambda: None),
             )
 
@@ -581,6 +589,7 @@ def test_taskpool_compensation_allows_retry_probe_when_no_active_replicas(monkey
         credit=32,
     )
     created = []
+    heartbeats = []
 
     class _FakeInfoCenter:
         def __enter__(self):
@@ -607,6 +616,8 @@ def test_taskpool_compensation_allows_retry_probe_when_no_active_replicas(monkey
                 code_version="sha256:test",
                 worker_count=kwargs["worker_count"],
                 heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda **kwargs: heartbeats.append(dict(kwargs)) or SimpleNamespace(ok=True, accepted=True),
+                close=lambda reason="": None,
                 _client=SimpleNamespace(close=lambda: None),
             )
 
@@ -659,6 +670,7 @@ def test_taskpool_compensation_allows_retry_probe_when_no_active_replicas(monkey
 
     assert added == 1
     assert created[0][1]["expected_node_instance_id"] == "node-inst-1"
+    assert heartbeats
     assert session._pools["node-inst-1"].pool_id == "pool-recovered"  # noqa: SLF001
     assert "node-inst-1" in session._active_replica_ids  # noqa: SLF001
     assert "node-inst-1" not in session.failures
@@ -716,6 +728,8 @@ def test_taskpool_compensation_does_not_defer_stale_retry_probe_with_active_repl
                 code_version="sha256:test",
                 worker_count=kwargs["worker_count"],
                 heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+                close=lambda reason="": None,
                 _client=SimpleNamespace(close=lambda: None),
             )
 
