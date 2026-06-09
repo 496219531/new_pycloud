@@ -2077,23 +2077,11 @@ class Service(ServiceExecutionSession):
             active = self._active_replica_snapshot()
             if desired <= 0 or len(active) >= desired:
                 return 0
-            if self._compensation_deferred_by_retry_probe(
-                resource_name=self.service_name,
-                active=active,
-                desired=desired,
-            ):
-                return 0
             recovery_states = self._build_replica_recovery_states(
                 is_retryable_failure=self._is_retryable_compensation_failure,
             )
             failed = {node_id for node_id, state in recovery_states.items() if not state.active}
             retryable_failed = {node_id for node_id, state in recovery_states.items() if state.retryable}
-            failed_by_base_node: Dict[str, str] = {}
-            for node_id in failed:
-                node = self.nodes.get(node_id)
-                base_node_id = str(getattr(node, "node_id", "") or "").strip()
-                if base_node_id:
-                    failed_by_base_node.setdefault(base_node_id, node_id)
             excluded = set(active)
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 discovered_nodes = list(
@@ -2138,14 +2126,22 @@ class Service(ServiceExecutionSession):
                     _node_instance_key_from_node(node) in failed
                     and _node_instance_key_from_node(node) not in retryable_failed
                 )
-                and not (
-                    _node_instance_key_from_node(node) in retryable_failed
-                    and str(getattr(node, "node_id", "") or "").strip()
-                    and failed_by_base_node.get(str(getattr(node, "node_id", "") or "").strip())
-                    not in {"", _node_instance_key_from_node(node)}
-                )
                 and is_admitted_node(node, require_control_addr=True)
             ]
+            current_node_instance_ids = {
+                _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
+            }
+            candidate_node_instance_ids = {
+                _node_instance_key_from_node(node) for node in candidates if _node_instance_key_from_node(node)
+            }
+            if self._compensation_deferred_by_retry_probe(
+                resource_name=self.service_name,
+                active=active,
+                desired=desired,
+                current_node_instance_ids=current_node_instance_ids,
+                candidate_node_instance_ids=candidate_node_instance_ids,
+            ):
+                return 0
             if not candidates:
                 return 0
             missing = max(0, desired - len(active))

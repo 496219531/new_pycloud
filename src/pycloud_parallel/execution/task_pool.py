@@ -1197,12 +1197,6 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 for node_id, state in recovery_states.items()
                 if state.retryable or self._is_retryable_compensation_failure(state.error)
             }
-            if self._compensation_deferred_by_retry_probe(
-                resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or ""),
-                active=active,
-                desired=desired,
-            ):
-                return 0
             if desired <= 0 or len(active) >= desired:
                 return 0
             excluded = active | (failed - retryable_failed)
@@ -1225,6 +1219,20 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 for node in selected_nodes
                 if _node_instance_key_from_node(node) not in excluded
             ]
+            current_node_instance_ids = {
+                _node_instance_key_from_node(node) for node in selected_nodes if _node_instance_key_from_node(node)
+            }
+            candidate_node_instance_ids = {
+                _node_instance_key_from_node(node) for node in candidates if _node_instance_key_from_node(node)
+            }
+            if self._compensation_deferred_by_retry_probe(
+                resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or ""),
+                active=active,
+                desired=desired,
+                current_node_instance_ids=current_node_instance_ids,
+                candidate_node_instance_ids=candidate_node_instance_ids,
+            ):
+                return 0
             if not candidates:
                 return 0
             missing = max(0, desired - len(active))

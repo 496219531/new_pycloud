@@ -638,6 +638,242 @@ def test_service_compensation_allows_restarted_node_with_new_instance_id(monkeyp
     assert "node-inst-old" in group.failures
 
 
+def test_service_compensation_does_not_defer_stale_retry_probe_with_active_replica(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    active_node = SimpleNamespace(
+        node_id="node-2",
+        node_instance_id="node-2-current",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=1,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    old_node = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-1-old",
+        control_addr="127.0.0.1:50061",
+        healthy=False,
+        schedulable=False,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=0,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    new_node = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-1-new",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=1,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    created = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [active_node, new_node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            return SimpleNamespace(
+                service_id="svc-new",
+                service_token="token-new",
+                http_base_url=f"http://{self.target}/svc/demo",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={
+            "node-2-current": SimpleNamespace(
+                service_id="svc-active",
+                http_base_url="http://127.0.0.1:50062/svc/active",
+                heartbeat_timeout_sec=30,
+                failed=False,
+            ),
+            "node-1-old": SimpleNamespace(
+                service_id="svc-old",
+                http_base_url="http://127.0.0.1:50061/svc/old",
+                heartbeat_timeout_sec=30,
+                failed=True,
+            ),
+        },
+        nodes={"node-2-current": active_node, "node-1-old": old_node},
+    )
+    group._discard_active_replica("node-1-old")  # noqa: SLF001
+    group._mark_retry_probe_replica("node-1-old")  # noqa: SLF001
+    group.failures["node-1-old"] = "ConnectionResetError(10054, 'connection reset')"
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 2,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    added = group.try_compensate_replicas()
+
+    assert added == 1
+    assert created[0][1]["expected_node_instance_id"] == "node-1-new"
+    assert "node-1-old" not in group._retry_probe_replica_snapshot()  # noqa: SLF001
+
+
+def test_service_compensation_defers_current_retry_probe_with_active_replica(monkeypatch):
+    active_node = SimpleNamespace(
+        node_id="node-2",
+        node_instance_id="node-2-current",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=1,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    probe_node = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-1-current",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=1,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [active_node, probe_node]
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={
+            "node-2-current": SimpleNamespace(service_id="svc-active", heartbeat_timeout_sec=30, failed=False),
+            "node-1-current": SimpleNamespace(service_id="svc-probe", heartbeat_timeout_sec=30, failed=True),
+        },
+        nodes={"node-2-current": active_node, "node-1-current": probe_node},
+    )
+    group._discard_active_replica("node-1-current")  # noqa: SLF001
+    group._mark_retry_probe_replica("node-1-current")  # noqa: SLF001
+    group.failures["node-1-current"] = "ConnectionResetError(10054, 'connection reset')"
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 2,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    assert group.try_compensate_replicas() == 0
+    assert "node-1-current" in group._retry_probe_replica_snapshot()  # noqa: SLF001
+
+
+def test_service_compensation_retry_probe_ttl_expiry_does_not_defer():
+    node = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-1-current",
+        control_addr="127.0.0.1:50061",
+    )
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={
+            "node-1-current": SimpleNamespace(service_id="svc-probe", heartbeat_timeout_sec=1, failed=True),
+            "node-2-current": SimpleNamespace(service_id="svc-active", heartbeat_timeout_sec=30, failed=False),
+        },
+        nodes={"node-1-current": node},
+    )
+    group._discard_active_replica("node-1-current")  # noqa: SLF001
+    group._mark_retry_probe_replica("node-1-current")  # noqa: SLF001
+    group._retry_probe_entered_at["node-1-current"] = time.monotonic() - 5.0  # noqa: SLF001
+
+    deferred = group._compensation_deferred_by_retry_probe(  # noqa: SLF001
+        resource_name="svc-demo",
+        active={"node-2-current"},
+        desired=2,
+        current_node_instance_ids={"node-1-current", "node-2-current"},
+        candidate_node_instance_ids={"node-1-current"},
+    )
+
+    assert deferred is False
+    assert "node-1-current" not in group._retry_probe_replica_snapshot()  # noqa: SLF001
+
+
 def test_service_compensation_rejects_requested_cordon_or_drain_nodes(monkeypatch):
     node_cordon = SimpleNamespace(
         node_id="node-1",

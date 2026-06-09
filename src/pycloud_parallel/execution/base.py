@@ -91,6 +91,7 @@ class ExecutionSessionBase:
         self._active_replica_ids = set(self.replicas.keys())
         self._terminal_replica_ids = set()
         self._retry_probe_replica_ids = set()
+        self._retry_probe_entered_at: Dict[str, float] = {}
         if hasattr(self, "_active_nodes"):
             self._active_nodes = self._active_replica_ids
         if not hasattr(self, "failed"):
@@ -401,20 +402,25 @@ class ExecutionSessionBase:
             return node_id in getattr(self, "_terminal_replica_ids", set())
 
     def _mark_retry_probe_replica(self, node_id: str) -> None:
+        now = time.monotonic()
         lock = getattr(self, "_active_replica_lock", None)
         if lock is None:
             getattr(self, "_retry_probe_replica_ids", set()).add(node_id)
+            getattr(self, "_retry_probe_entered_at", {})[node_id] = now
             return
         with lock:
             getattr(self, "_retry_probe_replica_ids", set()).add(node_id)
+            getattr(self, "_retry_probe_entered_at", {})[node_id] = now
 
     def _discard_retry_probe_replica(self, node_id: str) -> None:
         lock = getattr(self, "_active_replica_lock", None)
         if lock is None:
             getattr(self, "_retry_probe_replica_ids", set()).discard(node_id)
+            getattr(self, "_retry_probe_entered_at", {}).pop(node_id, None)
             return
         with lock:
             getattr(self, "_retry_probe_replica_ids", set()).discard(node_id)
+            getattr(self, "_retry_probe_entered_at", {}).pop(node_id, None)
 
     def _retry_probe_replica_snapshot(self) -> set[str]:
         lock = getattr(self, "_active_replica_lock", None)
@@ -423,36 +429,139 @@ class ExecutionSessionBase:
         with lock:
             return {str(node_id) for node_id in list(getattr(self, "_retry_probe_replica_ids", set()) or []) if str(node_id)}
 
+    def _retry_probe_ttl_sec(self, node_id: str) -> float:
+        replica = self.replicas.get(str(node_id or ""))
+        heartbeat_timeout = float(getattr(replica, "heartbeat_timeout_sec", 0) or 0)
+        if heartbeat_timeout <= 0.0:
+            heartbeat_timeout = 30.0
+        return max(1.0, min(60.0, heartbeat_timeout))
+
+    def _expire_retry_probe_replicas(self, *, now: Optional[float] = None) -> set[str]:
+        checked_at = time.monotonic() if now is None else float(now)
+        expired: set[str] = set()
+        lock = getattr(self, "_active_replica_lock", None)
+        if lock is None:
+            items = list(getattr(self, "_retry_probe_replica_ids", set()) or [])
+        else:
+            with lock:
+                items = list(getattr(self, "_retry_probe_replica_ids", set()) or [])
+        for node_id in items:
+            normalized = str(node_id or "")
+            if not normalized:
+                continue
+            entered_at = float(getattr(self, "_retry_probe_entered_at", {}).get(normalized, checked_at) or checked_at)
+            age_sec = max(0.0, checked_at - entered_at)
+            ttl_sec = self._retry_probe_ttl_sec(normalized)
+            if age_sec < ttl_sec:
+                continue
+            expired.add(normalized)
+            logger.warning(
+                "%s retry_probe expired node_instance_id=%s age_sec=%.3f ttl_sec=%.3f",
+                self.kind or "execution",
+                normalized,
+                age_sec,
+                ttl_sec,
+            )
+            self._discard_retry_probe_replica(normalized)
+        return expired
+
     def _compensation_deferred_by_retry_probe(
         self,
         *,
         resource_name: str = "",
         active: Optional[set[str]] = None,
         desired: int = 0,
+        current_node_instance_ids: Optional[set[str]] = None,
+        candidate_node_instance_ids: Optional[set[str]] = None,
     ) -> bool:
+        expired_retry_probe = self._expire_retry_probe_replicas()
         retry_probe = self._retry_probe_replica_snapshot()
         if not retry_probe:
             return False
         active_snapshot = {str(node_id) for node_id in list(active or set()) if str(node_id)}
         desired_count = int(desired or 0)
-        if desired_count > 0 and not active_snapshot:
+        current_snapshot = (
+            {str(node_id) for node_id in list(current_node_instance_ids or set()) if str(node_id)}
+            if current_node_instance_ids is not None
+            else set()
+        )
+        candidate_snapshot = (
+            {str(node_id) for node_id in list(candidate_node_instance_ids or set()) if str(node_id)}
+            if candidate_node_instance_ids is not None
+            else set()
+        )
+        stale_retry_probe: set[str] = set()
+        effective_retry_probe = set(retry_probe)
+        if current_node_instance_ids is not None:
+            stale_retry_probe = retry_probe - current_snapshot
+            effective_retry_probe = retry_probe & current_snapshot
+            for node_id in sorted(stale_retry_probe):
+                self._discard_retry_probe_replica(node_id)
+        if candidate_node_instance_ids is not None:
+            candidate_retry_probe = effective_retry_probe & candidate_snapshot
+            candidate_available = candidate_snapshot - effective_retry_probe
+            if candidate_available:
+                logger.warning(
+                    "%s compensation allowed because retry probes do not cover all candidates "
+                    "resource_name=%s retry_probe=%s retry_probe_stale=%s retry_probe_expired=%s "
+                    "current_nodes=%s active=%s desired=%s candidate_nodes=%s",
+                    self.kind or "execution",
+                    str(resource_name or ""),
+                    sorted(effective_retry_probe),
+                    sorted(stale_retry_probe),
+                    sorted(expired_retry_probe),
+                    sorted(current_snapshot),
+                    sorted(active_snapshot),
+                    desired_count,
+                    sorted(candidate_snapshot),
+                )
+                return False
+            effective_retry_probe = candidate_retry_probe
+        if not effective_retry_probe:
             logger.warning(
-                "%s compensation allowed despite heartbeat retry probes because no active replicas remain "
-                "resource_name=%s retry_probe=%s desired=%s",
+                "%s compensation allowed because retry probes are stale "
+                "resource_name=%s retry_probe=%s retry_probe_stale=%s retry_probe_expired=%s "
+                "current_nodes=%s active=%s desired=%s candidate_nodes=%s",
                 self.kind or "execution",
                 str(resource_name or ""),
                 sorted(retry_probe),
+                sorted(stale_retry_probe),
+                sorted(expired_retry_probe),
+                sorted(current_snapshot),
+                sorted(active_snapshot),
                 desired_count,
+                sorted(candidate_snapshot),
+            )
+            return False
+        if desired_count > 0 and not active_snapshot:
+            logger.warning(
+                "%s compensation allowed despite heartbeat retry probes because no active replicas remain "
+                "resource_name=%s retry_probe=%s retry_probe_stale=%s retry_probe_expired=%s "
+                "current_nodes=%s active=%s desired=%s candidate_nodes=%s",
+                self.kind or "execution",
+                str(resource_name or ""),
+                sorted(effective_retry_probe),
+                sorted(stale_retry_probe),
+                sorted(expired_retry_probe),
+                sorted(current_snapshot),
+                sorted(active_snapshot),
+                desired_count,
+                sorted(candidate_snapshot),
             )
             return False
         logger.warning(
             "%s compensation deferred while heartbeat retry probes are pending "
-            "resource_name=%s retry_probe=%s active=%s desired=%s",
+            "resource_name=%s retry_probe=%s retry_probe_stale=%s retry_probe_expired=%s "
+            "current_nodes=%s active=%s desired=%s candidate_nodes=%s",
             self.kind or "execution",
             str(resource_name or ""),
-            sorted(retry_probe),
+            sorted(effective_retry_probe),
+            sorted(stale_retry_probe),
+            sorted(expired_retry_probe),
+            sorted(current_snapshot),
             sorted(active_snapshot),
             desired_count,
+            sorted(candidate_snapshot),
         )
         return True
 
@@ -735,6 +844,7 @@ class ExecutionSessionBase:
                 self._active_replica_ids = set(self.replicas.keys())
                 self._terminal_replica_ids = set()
                 self._retry_probe_replica_ids = set()
+                self._retry_probe_entered_at = {}
             if hasattr(self, "_active_nodes"):
                 self._active_nodes = self._active_replica_ids
             for replica in self.replicas.values():
