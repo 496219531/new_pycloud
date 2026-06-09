@@ -5336,7 +5336,8 @@ def test_stop_service_cleanup_failure_blocks_deploy(tmp_path):
 
         assert service.status == pb2.SERVICE_STATUS_STOPPED
         assert state.can_accept_service_deploy is False
-        assert "service cleanup failed service_id=svc-cleanup-fail" in state.deploy_health_reason
+        assert "service cleanup failed" in state.deploy_health_reason
+        assert "resource_id=svc-cleanup-fail" in state.deploy_health_reason
         assert "taskkill denied" in state.deploy_health_reason
         snapshot = state.registrar_snapshot()
         assert snapshot["accept_service_deploy"] is False

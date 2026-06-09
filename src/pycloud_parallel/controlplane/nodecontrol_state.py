@@ -19,6 +19,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -168,6 +169,27 @@ def _path(value: Any = ".") -> Path:
     return _NATIVE_PATH(value)
 
 
+@dataclass(frozen=True)
+class DeployHealthBlock:
+    source: str
+    reason: str
+    resource_kind: str = ""
+    resource_id: str = ""
+
+    def message(self) -> str:
+        source = str(self.source or "").strip()
+        reason = str(self.reason or "").strip()
+        parts = [part for part in (source, reason) if part]
+        text = ": ".join(parts) if parts else "deploy health blocked"
+        resource_kind = str(self.resource_kind or "").strip()
+        resource_id = str(self.resource_id or "").strip()
+        if resource_kind:
+            text = f"{text} resource_kind={resource_kind}"
+        if resource_id:
+            text = f"{text} resource_id={resource_id}"
+        return text
+
+
 class NodeControlState(NodeRuntimeBase):
     """NodeControl 状态管理。
 
@@ -240,7 +262,7 @@ class NodeControlState(NodeRuntimeBase):
         self._execution_fenced = False
         self._execution_fenced_reason = ""
         self._execution_fenced_at: Optional[datetime] = None
-        self._deploy_health_block_reason = ""
+        self._deploy_health_block: Optional[DeployHealthBlock] = None
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
         self._service_zero_alive_counts: Dict[str, int] = {}
@@ -575,7 +597,7 @@ class NodeControlState(NodeRuntimeBase):
             self._execution_fenced = True
             self._execution_fenced_reason = normalized_reason
             self._execution_fenced_at = fenced_at
-            self._deploy_health_block_reason = normalized_reason
+            self._deploy_health_block = DeployHealthBlock(source="node reset", reason=normalized_reason)
             old_executor = self._executor_host
             self._executor_host = None
             self._cv.notify_all()
@@ -979,27 +1001,64 @@ class NodeControlState(NodeRuntimeBase):
         return (
             bool(getattr(self, "accept_service_deploy", True))
             and not self.execution_fenced
-            and not str(getattr(self, "_deploy_health_block_reason", "") or "").strip()
+            and getattr(self, "_deploy_health_block", None) is None
         )
 
     @property
     def deploy_health_reason(self) -> str:
-        return str(getattr(self, "_deploy_health_block_reason", "") or "").strip()
+        block = getattr(self, "_deploy_health_block", None)
+        if block is None:
+            return ""
+        return block.message()
 
-    def _set_deploy_health_block_locked(self, reason: str) -> None:
-        normalized = str(reason or "").strip()
-        if not normalized:
+    def _set_deploy_health_block_locked(
+        self,
+        reason: str,
+        *,
+        source: str = "",
+        resource_kind: str = "",
+        resource_id: str = "",
+    ) -> None:
+        normalized_reason = str(reason or "").strip()
+        normalized_source = str(source or "").strip()
+        if not normalized_reason and not normalized_source:
             return
-        self._deploy_health_block_reason = normalized
+        if not normalized_source:
+            if ":" in normalized_reason:
+                normalized_source, normalized_reason = normalized_reason.split(":", 1)
+                normalized_source = normalized_source.strip()
+                normalized_reason = normalized_reason.strip()
+            else:
+                normalized_source = normalized_reason
+                normalized_reason = ""
+        self._deploy_health_block = DeployHealthBlock(
+            source=normalized_source,
+            reason=normalized_reason,
+            resource_kind=str(resource_kind or "").strip(),
+            resource_id=str(resource_id or "").strip(),
+        )
 
-    def _clear_deploy_health_block_locked(self, *, reason_prefix: str = "") -> None:
-        current = str(getattr(self, "_deploy_health_block_reason", "") or "").strip()
-        if not current:
+    def _clear_deploy_health_block_locked(
+        self,
+        *,
+        reason_prefix: str = "",
+        source: str = "",
+        resource_kind: str = "",
+        resource_id: str = "",
+    ) -> None:
+        block = getattr(self, "_deploy_health_block", None)
+        if block is None:
+            return
+        if source and block.source != str(source or "").strip():
+            return
+        if resource_kind and block.resource_kind != str(resource_kind or "").strip():
+            return
+        if resource_id and block.resource_id != str(resource_id or "").strip():
             return
         normalized_prefix = str(reason_prefix or "").strip()
-        if normalized_prefix and not current.startswith(normalized_prefix):
+        if normalized_prefix and not block.message().startswith(normalized_prefix):
             return
-        self._deploy_health_block_reason = ""
+        self._deploy_health_block = None
 
     def execution_fence_message(self) -> str:
         reason = str(getattr(self, "_execution_fenced_reason", "") or "").strip() or "unknown"
@@ -1078,7 +1137,7 @@ class NodeControlState(NodeRuntimeBase):
         try:
             self._executor_host = self._create_executor_backend()
         except Exception as exc:
-            self._set_deploy_health_block_locked(f"executor host create failed: {exc!r}")
+            self._set_deploy_health_block_locked(repr(exc), source="executor host create failed")
             raise
 
         rebuild_failures = 0
@@ -1148,10 +1207,13 @@ class NodeControlState(NodeRuntimeBase):
                 pass
         if rebuild_failures:
             self._set_deploy_health_block_locked(
-                f"executor host rebuilt with resource restore failures: {rebuild_failures}"
+                f"resource restore failures: {rebuild_failures}",
+                source="executor host rebuilt",
             )
         else:
-            self._clear_deploy_health_block_locked(reason_prefix="executor host")
+            self._clear_deploy_health_block_locked(source="executor host create failed")
+            self._clear_deploy_health_block_locked(source="executor host crashed")
+            self._clear_deploy_health_block_locked(source="executor host rebuilt")
         return True
 
     def get_object_artifact(self, object_id: str) -> ObjectArtifact:
@@ -3129,10 +3191,19 @@ class NodeControlState(NodeRuntimeBase):
         if self._executor_host is not None:
             try:
                 self._executor_host.stop_service(service_id=session.service_id, reason=stop_reason)
-                self._clear_deploy_health_block_locked(reason_prefix=f"service cleanup failed service_id={session.service_id}")
+                self._clear_deploy_health_block_locked(
+                    source="service cleanup failed",
+                    resource_kind="service",
+                    resource_id=session.service_id,
+                )
             except Exception as exc:
-                reason_text = f"service cleanup failed service_id={session.service_id} reason={exc!r}"
-                self._set_deploy_health_block_locked(reason_text)
+                reason_text = f"service_id={session.service_id} reason={exc!r}"
+                self._set_deploy_health_block_locked(
+                    reason_text,
+                    source="service cleanup failed",
+                    resource_kind="service",
+                    resource_id=session.service_id,
+                )
                 logger.exception("[NodeControl] %s", reason_text)
 
     def _recover_node_managed_service_locked(self, session: ServiceSession) -> bool:
@@ -4087,8 +4158,8 @@ class NodeControlState(NodeRuntimeBase):
                 kind = str(item.get("kind", "") or "")
                 if kind == "executor_host_crash":
                     self._set_deploy_health_block_locked(
-                        "executor host crashed: "
-                        f"{str(item.get('error_type', '') or '')} {str(item.get('error', '') or '')}".strip()
+                        f"{str(item.get('error_type', '') or '')} {str(item.get('error', '') or '')}".strip(),
+                        source="executor host crashed",
                     )
                     logger.error(
                         "[NodeControl] executor host crashed node_id=%s node_instance_id=%s error_type=%s error=%s traceback=%s",
@@ -4247,7 +4318,7 @@ class NodeControlState(NodeRuntimeBase):
         try:
             liveness = self._executor_host.service_worker_liveness()
         except Exception as exc:
-            self._set_deploy_health_block_locked(f"service worker liveness failed: {exc!r}")
+            self._set_deploy_health_block_locked(repr(exc), source="service worker liveness failed")
             logger.warning(
                 "[NodeControl] service worker liveness probe failed node_id=%s node_instance_id=%s err=%r",
                 self.node_id,
@@ -4255,7 +4326,7 @@ class NodeControlState(NodeRuntimeBase):
                 exc,
             )
             return
-        self._clear_deploy_health_block_locked(reason_prefix="service worker liveness failed")
+        self._clear_deploy_health_block_locked(source="service worker liveness failed")
         seen_service_ids = {str(service_id or "") for service_id in liveness.keys()}
         for service_id, alive_count in liveness.items():
             session = self._services.get(str(service_id or ""))
