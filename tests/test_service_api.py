@@ -212,6 +212,123 @@ def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):
     assert created[0][1]["service_name"] == "svc-demo"
 
 
+def test_service_compensation_attaches_each_replica_before_next_create_finishes(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    node_1 = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    node_2 = SimpleNamespace(
+        node_id="node-2",
+        node_instance_id="node-inst-2",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    created = []
+    heartbeats = []
+    second_create_started = threading.Event()
+    release_second_create = threading.Event()
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node_1, node_2]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            node_instance_id = str(kwargs["expected_node_instance_id"])
+            if node_instance_id == "node-inst-2":
+                second_create_started.set()
+                assert release_second_create.wait(2.0)
+
+            def _heartbeat(**_kwargs):
+                heartbeats.append(node_instance_id)
+                return SimpleNamespace(ok=True, accepted=True)
+
+            return SimpleNamespace(
+                service_id=f"svc-{node_instance_id}",
+                service_token="token",
+                http_base_url=f"http://{self.target}/svc/{node_instance_id}",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=_heartbeat,
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(owner_client_id="owner-1", service_name="svc-demo", sessions={}, nodes={})
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 2,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("added", group.try_compensate_replicas()), daemon=True)
+    worker.start()
+    try:
+        assert second_create_started.wait(1.0)
+        assert "node-inst-1" in group.sessions
+        assert "node-inst-1" in group._active_replica_snapshot()  # noqa: SLF001
+        assert heartbeats == ["node-inst-1"]
+    finally:
+        release_second_create.set()
+        worker.join(2.0)
+    assert not worker.is_alive()
+    assert result["added"] == 2
+    assert set(group.sessions) == {"node-inst-1", "node-inst-2"}
+    assert heartbeats == ["node-inst-1", "node-inst-2"]
+    assert [item[0] for item in created] == ["127.0.0.1:50061", "127.0.0.1:50062"]
+
+
 def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 

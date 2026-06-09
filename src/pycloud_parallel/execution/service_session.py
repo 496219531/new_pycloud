@@ -2187,33 +2187,38 @@ class Service(ServiceExecutionSession):
                 session.node_id = str(node.node_id or "")
                 return node_key, node, client, session, ""
 
-            create_results = [_create_service_on_node(node) for node in candidates[:missing]]
             added = 0
-            with self._route_lock:
-                for node_key, node, client, session, error_message in create_results:
-                    if error_message:
+            for node in candidates[:missing]:
+                node_key, node, client, session, error_message = _create_service_on_node(node)
+                if error_message:
+                    with self._route_lock:
                         self.failures[node_key] = error_message
-                        category = classify_error(error_message, resource_kind="service").value
-                        _mark_infocenter_node_lost_on_identity_mismatch(
-                            infocenter_factory=_infocenter_client,
-                            infocenter_target=str(spec["infocenter_target"]),
-                            timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0),
-                            node_instance_id=node_key,
-                            error_message=error_message,
-                            reason_prefix="service compensation identity mismatch",
-                        )
-                        logger.warning(
-                            "service dynamic compensation create failed service_name=%s "
-                            "node_id=%s node_instance_id=%s control_addr=%s category=%s err=%s",
-                            self.service_name,
-                            getattr(node, "node_id", ""),
-                            node_key,
-                            getattr(node, "control_addr", ""),
-                            category,
-                            error_message,
-                        )
-                        continue
-                    if client is None or session is None:
+                    category = classify_error(error_message, resource_kind="service").value
+                    _mark_infocenter_node_lost_on_identity_mismatch(
+                        infocenter_factory=_infocenter_client,
+                        infocenter_target=str(spec["infocenter_target"]),
+                        timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0),
+                        node_instance_id=node_key,
+                        error_message=error_message,
+                        reason_prefix="service compensation identity mismatch",
+                    )
+                    logger.warning(
+                        "service dynamic compensation create failed service_name=%s "
+                        "node_id=%s node_instance_id=%s control_addr=%s category=%s err=%s",
+                        self.service_name,
+                        getattr(node, "node_id", ""),
+                        node_key,
+                        getattr(node, "control_addr", ""),
+                        category,
+                        error_message,
+                    )
+                    continue
+                if client is None or session is None:
+                    continue
+                with self._route_lock:
+                    if len(self._active_replica_snapshot()) >= desired:
+                        with contextlib.suppress(Exception):
+                            client.close()
                         continue
                     if not self._heartbeat_new_replica_before_activate(node_key, session):
                         with contextlib.suppress(Exception):

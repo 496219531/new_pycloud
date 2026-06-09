@@ -359,6 +359,117 @@ def test_taskpool_try_compensate_replicas_adds_newly_available_node(monkeypatch)
     assert created[0][1]["pool_name"] == "pool-demo"
 
 
+def test_taskpool_compensation_attaches_each_replica_before_next_create_finishes(monkeypatch) -> None:
+    node_1 = InfoCenterNode(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        capacity=4,
+        queue_capacity=32,
+        queued=0,
+        inflight=0,
+        credit=32,
+    )
+    node_2 = InfoCenterNode(
+        node_instance_id="node-inst-2",
+        node_id="node-2",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        capacity=4,
+        queue_capacity=32,
+        queued=0,
+        inflight=0,
+        credit=32,
+    )
+    created = []
+    heartbeats = []
+    second_create_started = threading.Event()
+    release_second_create = threading.Event()
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            return [node_1, node_2]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            node_instance_id = str(kwargs["expected_node_instance_id"])
+            if node_instance_id == "node-inst-2":
+                second_create_started.set()
+                assert release_second_create.wait(2.0)
+
+            def _heartbeat(**_kwargs):
+                heartbeats.append(node_instance_id)
+                return SimpleNamespace(ok=True, accepted=True)
+
+            return SimpleNamespace(
+                owner_client_id=kwargs["owner_client_id"],
+                pool_id=f"pool-{node_instance_id}",
+                pool_name=kwargs["pool_name"],
+                pool_token="token",
+                code_version="sha256:test",
+                worker_count=kwargs["worker_count"],
+                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                heartbeat=_heartbeat,
+                close=lambda reason="": None,
+                _client=SimpleNamespace(close=lambda: None),
+            )
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    session = TaskPool(pools={}, nodes={}, task_method="run")
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "owner_client_id": "owner-1",
+            "pool_name": "pool-demo",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_task",
+            "entry_callable": "run",
+            "package_format": "py",
+            "managed_global_names": [],
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "node_count": 2,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    result = {}
+    worker = threading.Thread(target=lambda: result.setdefault("added", session.try_compensate_replicas()), daemon=True)
+    worker.start()
+    try:
+        assert second_create_started.wait(1.0)
+        assert "node-inst-1" in session.node_instance_ids
+        assert "node-inst-1" in session._active_replica_snapshot()  # noqa: SLF001
+        assert heartbeats == ["node-inst-1"]
+    finally:
+        release_second_create.set()
+        worker.join(2.0)
+    assert not worker.is_alive()
+    assert result["added"] == 2
+    assert set(session.node_instance_ids) == {"node-inst-1", "node-inst-2"}
+    assert heartbeats == ["node-inst-1", "node-inst-2"]
+    assert [item[0] for item in created] == ["127.0.0.1:50061", "127.0.0.1:50062"]
+
+
 def test_taskpool_compensation_uses_active_count_and_skips_failed_node(monkeypatch) -> None:
     node_1 = InfoCenterNode(
         node_instance_id="node-inst-1",

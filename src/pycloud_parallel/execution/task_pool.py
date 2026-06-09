@@ -1270,11 +1270,12 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 pool.node_id = str(node.node_id or "")
                 return node_key, node, pool, ""
 
-            created: List[Tuple[str, InfoCenterNode, NativeTaskPoolClient]] = []
+            added = 0
             for node in candidates[:missing]:
                 node_key, node, pool, error_message = _create_pool_on_node(node)
                 if error_message:
-                    self.failures[node_key] = error_message
+                    with self._pool_lock:
+                        self.failures[node_key] = error_message
                     category = classify_error(error_message, resource_kind="task_pool").value
                     _mark_infocenter_node_lost_on_identity_mismatch(
                         infocenter_factory=_infocenter_client,
@@ -1295,13 +1296,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         error_message,
                     )
                     continue
-                if pool is not None:
-                    created.append((node_key, node, pool))
-            if not created:
-                return 0
-            added = 0
-            with self._pool_lock:
-                for node_key, node, pool in created:
+                if pool is None:
+                    continue
+                with self._pool_lock:
+                    if len(self._active_replica_snapshot()) >= desired:
+                        _close_task_pool_replica(pool, reason="extra compensated task pool")
+                        with contextlib.suppress(Exception):
+                            pool._client.close()  # noqa: SLF001
+                        continue
                     if node_key in self._pools:
                         if node_key in active or node_key not in retryable_failed:
                             _close_task_pool_replica(pool, reason="duplicate compensated task pool")
