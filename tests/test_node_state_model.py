@@ -4929,7 +4929,7 @@ def test_service_zero_alive_workers_stops_only_that_service(tmp_path):
             calls.append(("stop_service", kwargs))
 
         def service_worker_liveness(self):
-            return {"svc-dead-workers": 0, "svc-healthy": 1}
+            return {"svc-dead-workers": 0, "svc-still-running": 1}
 
         def drain_events(self):
             return []
@@ -5090,6 +5090,97 @@ def test_service_worker_liveness_drives_degraded_then_stopped(tmp_path):
         assert "service worker unavailable" in probe.stop_reason
         assert other.status == pb2.SERVICE_STATUS_RUNNING
         assert calls
+    finally:
+        state.close()
+
+
+def test_service_worker_liveness_missing_running_service_counts_as_zero(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-liveness-missing",
+        queue_capacity=4,
+        worker_capacity=2,
+        service_worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_liveness_missing"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        monitor_interval_sec=1,
+    )
+    now = utc_now()
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def service_worker_liveness(self):
+            return {"svc-present": 1}
+
+        def stop_service(self, **kwargs):
+            calls.append(("stop_service", kwargs))
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    missing = ServiceSession(
+        service_id="svc-missing",
+        owner_client_id="owner",
+        service_name="svc-missing",
+        code_version="sha256:missing",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-missing",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    present = ServiceSession(
+        service_id="svc-present",
+        owner_client_id="owner",
+        service_name="svc-present",
+        code_version="sha256:present",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token-present",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("demo", "run")},
+    )
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[missing.service_id] = missing  # noqa: SLF001
+        state._services[present.service_id] = present  # noqa: SLF001
+
+    try:
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert missing.status == pb2.SERVICE_STATUS_RUNNING
+        assert missing.alive_workers == 0
+        assert missing.degraded is True
+        assert present.status == pb2.SERVICE_STATUS_RUNNING
+        assert present.alive_workers == 1
+
+        state._handle_service_timeouts()  # noqa: SLF001
+        state._handle_service_timeouts()  # noqa: SLF001
+        assert missing.status == pb2.SERVICE_STATUS_STOPPED
+        assert "service worker unavailable" in missing.stop_reason
+        assert present.status == pb2.SERVICE_STATUS_RUNNING
+        assert calls and calls[0][1]["service_id"] == "svc-missing"
     finally:
         state.close()
 

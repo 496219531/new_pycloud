@@ -4256,11 +4256,32 @@ class NodeControlState(NodeRuntimeBase):
             )
             return
         self._clear_deploy_health_block_locked(reason_prefix="service worker liveness failed")
+        seen_service_ids = {str(service_id or "") for service_id in liveness.keys()}
         for service_id, alive_count in liveness.items():
             session = self._services.get(str(service_id or ""))
             if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
                 continue
             session.alive_workers = max(0, int(alive_count or 0))
+        if not seen_service_ids:
+            return
+        now_perf = time.perf_counter()
+        for session in self._services.values():
+            service_id = str(session.service_id or "")
+            if not service_id or service_id in seen_service_ids:
+                continue
+            if session.status != pb2.SERVICE_STATUS_RUNNING or not bool(session.executor_ready):
+                continue
+            previous_alive = max(0, int(session.alive_workers or 0))
+            session.alive_workers = 0
+            last_report = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
+            if now_perf - last_report >= 10.0:
+                session.last_liveness_missing_report_at = now_perf
+                logger.warning(
+                    "[NodeControl] service worker liveness missing service_id=%s service_name=%s previous_alive_workers=%s",
+                    session.service_id,
+                    session.service_name,
+                    previous_alive,
+                )
 
     def _handle_service_timeouts(self) -> None:
         now = utc_now()

@@ -148,6 +148,7 @@ class ServiceSession:
     queued: int = 0
     alive_workers: int = 0
     degraded: bool = False
+    last_liveness_missing_report_at: float = 0.0
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
