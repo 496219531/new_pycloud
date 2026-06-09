@@ -1181,7 +1181,9 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
             return
         self._last_compensation_attempt_at = now
-        self.try_compensate_replicas()
+        self._submit_compensation_attempt(
+            resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or "")
+        )
 
     def try_compensate_replicas(self) -> int:
         spec = self._compensation_spec

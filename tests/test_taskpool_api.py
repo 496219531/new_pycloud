@@ -3,6 +3,8 @@ from __future__ import annotations
 """Tests for the V1 task-pool-facing API helpers."""
 
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
@@ -47,6 +49,36 @@ def test_taskpool_route_summary_reports_fixed_routes():
             "owner_client_id": "owner-1",
         }
     ]
+
+
+def test_taskpool_after_keepalive_tick_submits_compensation_async() -> None:
+    session = TaskPool(pools={}, nodes={}, task_method="run")
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "node_count": 1,
+            "check_interval_sec": 0.05,
+            "infocenter_target": "127.0.0.1:1",
+        }
+    )
+    compensation_started = threading.Event()
+    release_compensation = threading.Event()
+
+    def _slow_compensation() -> int:
+        compensation_started.set()
+        release_compensation.wait(0.5)
+        return 0
+
+    session.try_compensate_replicas = _slow_compensation  # type: ignore[method-assign]
+
+    started = time.monotonic()
+    try:
+        session._after_keepalive_tick()  # noqa: SLF001
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.2
+        assert compensation_started.wait(1.0)
+    finally:
+        release_compensation.set()
+        session._stop_keepalive()  # noqa: SLF001
 
 
 def test_taskpool_runtime_boundary_does_not_use_service_discovery_surface() -> None:

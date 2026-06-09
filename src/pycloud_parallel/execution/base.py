@@ -29,6 +29,7 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 logger = logging.getLogger(__name__)
 SLOW_HEARTBEAT_LOG_SEC = 2.0
+SLOW_COMPENSATION_LOG_SEC = 2.0
 STATUS_LOG_FETCH_TIMEOUT_SEC = 1.0
 STALE_HEARTBEAT_PENDING_PER_REPLICA = 2
 
@@ -83,6 +84,9 @@ class ExecutionSessionBase:
         self._keepalive_seq = 0
         self._keepalive_failure_counts = {}
         self._keepalive_retry_forever = bool(getattr(self, "_keepalive_retry_forever", False))
+        self._compensation_executor_lock = threading.Lock()
+        self._compensation_executor: Optional[ThreadPoolExecutor] = None
+        self._compensation_future: Optional[Future] = None
         self._active_replica_lock = threading.RLock()
         self._active_replica_ids = set(self.replicas.keys())
         self._terminal_replica_ids = set()
@@ -452,6 +456,57 @@ class ExecutionSessionBase:
         )
         return True
 
+    def _run_compensation_attempt(self, *, resource_name: str = "") -> int:
+        started_at = time.monotonic()
+        added = 0
+        try:
+            compensate = getattr(self, "try_compensate_replicas", None)
+            if not callable(compensate):
+                return 0
+            added = int(compensate() or 0)
+            return added
+        except Exception:
+            logger.exception(
+                "%s compensation failed resource_name=%s",
+                self.kind or "execution",
+                str(resource_name or ""),
+            )
+            return 0
+        finally:
+            elapsed_sec = time.monotonic() - started_at
+            if elapsed_sec >= SLOW_COMPENSATION_LOG_SEC:
+                logger.warning(
+                    "%s compensation slow resource_name=%s elapsed_sec=%.3f added=%s",
+                    self.kind or "execution",
+                    str(resource_name or ""),
+                    elapsed_sec,
+                    added,
+                )
+
+    def _submit_compensation_attempt(self, *, resource_name: str = "") -> bool:
+        if self._is_execution_closed() or self._hb_stop.is_set():
+            return False
+        with self._compensation_executor_lock:
+            future = self._compensation_future
+            if future is not None:
+                if not future.done():
+                    return False
+                with contextlib.suppress(Exception):
+                    future.result()
+                self._compensation_future = None
+            executor = self._compensation_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"{self.kind or 'execution'}-comp",
+                )
+                self._compensation_executor = executor
+            self._compensation_future = executor.submit(
+                self._run_compensation_attempt,
+                resource_name=resource_name,
+            )
+            return True
+
     def _active_replica_snapshot(self) -> set[str]:
         lock = getattr(self, "_active_replica_lock", None)
         if lock is None:
@@ -697,6 +752,15 @@ class ExecutionSessionBase:
             for replica in self.replicas.values():
                 setattr(replica, "_hb_thread", None)
                 setattr(replica, "_hb_lock", self._hb_lock)
+        with self._compensation_executor_lock:
+            future = self._compensation_future
+            if future is not None and not future.done():
+                future.cancel()
+            self._compensation_future = None
+            executor = self._compensation_executor
+            self._compensation_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _sync_failures_from_replicas(self) -> None:
         for node_id, replica in self.replicas.items():

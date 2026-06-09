@@ -2070,7 +2070,7 @@ class Service(ServiceExecutionSession):
         if now - float(self._last_compensation_attempt_at or 0.0) < interval_sec:
             return
         self._last_compensation_attempt_at = now
-        self.try_compensate_replicas()
+        self._submit_compensation_attempt(resource_name=self.service_name)
 
     def try_compensate_replicas(self) -> int:
         spec = self._compensation_spec

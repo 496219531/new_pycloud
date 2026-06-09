@@ -3933,6 +3933,78 @@ class TestOwnerServiceFacade:
         finally:
             group._stop_keepalive()  # noqa: SLF001
 
+    def test_owner_keepalive_continues_while_compensation_is_running(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            service_id = "svc-running"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self):
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+        group._configure_dynamic_compensation(  # noqa: SLF001
+            {
+                "node_count": 2,
+                "check_interval_sec": 0.05,
+                "infocenter_target": "127.0.0.1:1",
+            }
+        )
+        compensation_started = threading.Event()
+        release_compensation = threading.Event()
+
+        def _slow_compensation():
+            compensation_started.set()
+            release_compensation.wait(0.6)
+            return 0
+
+        group.try_compensate_replicas = _slow_compensation  # type: ignore[method-assign]
+
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            assert compensation_started.wait(1.0)
+            calls_when_compensation_started = replica.calls
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and replica.calls < calls_when_compensation_started + 2:
+                time.sleep(0.02)
+            assert replica.calls >= calls_when_compensation_started + 2
+            assert group.failed is False
+        finally:
+            release_compensation.set()
+            group._stop_keepalive()  # noqa: SLF001
+
     def test_owner_keepalive_failed_replica_does_not_count_as_active_while_retrying(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
         from pycloud_parallel.execution.service_session import Service
