@@ -190,6 +190,33 @@ class DeployHealthBlock:
         return text
 
 
+def _resource_stop_reason(
+    reason: str,
+    *,
+    resource_kind: str = "",
+    alive_workers: Optional[int] = None,
+    worker_count: Optional[int] = None,
+    detail: str = "",
+) -> str:
+    normalized = str(reason or "").strip()
+    if normalized == "owner heartbeat timeout":
+        return "owner heartbeat timeout"
+    if normalized == "nodecontrol shutdown":
+        return "nodecontrol shutdown"
+    if normalized == "executor host crashed":
+        suffix = str(detail or "").strip()
+        return f"executor host crashed: {suffix}" if suffix else "executor host crashed"
+    if normalized in {"service worker unavailable", "task pool worker unavailable"}:
+        if str(resource_kind or "").strip() == "task_pool":
+            base = "task pool worker unavailable; owner should redeploy or compensate"
+        else:
+            base = "service worker unavailable; owner should redeploy or compensate"
+        if alive_workers is not None and worker_count is not None:
+            return f"{base}; alive_workers={max(0, int(alive_workers or 0))} worker_count={max(0, int(worker_count or 0))}"
+        return base
+    return normalized or "resource stopped"
+
+
 class NodeControlState(NodeRuntimeBase):
     """NodeControl 状态管理。
 
@@ -3250,14 +3277,17 @@ class NodeControlState(NodeRuntimeBase):
             sessions = list(self._services.values())
         for session in sessions:
             with self._lock:
-                self._stop_service_locked(session, reason="nodecontrol shutdown")
+                self._stop_service_locked(session, reason=_resource_stop_reason("nodecontrol shutdown"))
 
     def _shutdown_all_task_pools(self) -> None:
         stop_executors: List[Tuple[ExecutorBackend, str]] = []
         with self._lock:
             pools = list(self._task_pools.values())
             for pool in pools:
-                stop_executor = self._stop_task_pool_for_shutdown_locked(pool, reason="nodecontrol shutdown")
+                stop_executor = self._stop_task_pool_for_shutdown_locked(
+                    pool,
+                    reason=_resource_stop_reason("nodecontrol shutdown"),
+                )
                 if stop_executor is not None:
                     stop_executors.append(stop_executor)
         for executor_host, pool_id in stop_executors:
@@ -4383,7 +4413,7 @@ class NodeControlState(NodeRuntimeBase):
                         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
                 else:
                     if now > session.lease_expire_at:
-                        self._stop_service_locked(session, reason="owner heartbeat timeout")
+                        self._stop_service_locked(session, reason=_resource_stop_reason("owner heartbeat timeout"))
                         continue
                     if int(session.worker_count or 0) > 0 and int(session.alive_workers or 0) <= 0:
                         count = int(self._service_zero_alive_counts.get(session.service_id, 0) or 0) + 1
@@ -4391,12 +4421,16 @@ class NodeControlState(NodeRuntimeBase):
                         session.degraded = True
                         if count >= SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
                             self._stop_service_locked(
-                                session,
-                                reason=(
-                                    "service worker unavailable; owner should redeploy or compensate; "
-                                    f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
-                                ),
-                            )
+                    session,
+                    reason=(
+                        _resource_stop_reason(
+                            "service worker unavailable",
+                            resource_kind="service",
+                            alive_workers=0,
+                            worker_count=int(session.worker_count or 0),
+                        )
+                    ),
+                )
                     else:
                         session.degraded = False
                         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
@@ -4410,6 +4444,6 @@ class NodeControlState(NodeRuntimeBase):
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
-                pool.stop_reason = "owner heartbeat timeout"
+                pool.stop_reason = _resource_stop_reason("owner heartbeat timeout")
                 pool.failure_at = now
                 pool.lease_expire_at = now
