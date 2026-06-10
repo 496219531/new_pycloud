@@ -1490,8 +1490,7 @@ class NodeControlState(NodeRuntimeBase):
     ) -> Dict[str, Tuple[str, str]]:
         executor_host = self._executor_host
         if executor_host is not None and executor_host.is_alive() and hasattr(executor_host, "prepare_artifact"):
-            resp = executor_host.prepare_artifact(
-                artifact_spec={
+            artifact_spec = {
                     "artifact_path": artifact.path,
                     "entry_module": artifact.entry_module,
                     "package_format": artifact.package_format,
@@ -1502,11 +1501,56 @@ class NodeControlState(NodeRuntimeBase):
                     "export_decorator": artifact.export_decorator,
                     "entry_callable": artifact.entry_callable,
                     "managed_global_names": list(managed_global_names or ()),
-                },
-                timeout_sec=60.0,
-                scope=prepare_scope,
-                key=prepare_key,
-            )
+                    "prepare_scope": str(prepare_scope or ""),
+                    "prepare_key": str(prepare_key or ""),
+            }
+            prepare_started_at = time.perf_counter()
+            try:
+                resp = executor_host.prepare_artifact(
+                    artifact_spec=artifact_spec,
+                    timeout_sec=60.0,
+                    scope=prepare_scope,
+                    key=prepare_key,
+                )
+            except Exception as exc:
+                elapsed_sec = time.perf_counter() - prepare_started_at
+                logger.warning(
+                    "node artifact prepare request failed scope=%s key=%s code_version=%s artifact_path=%s "
+                    "entry_module=%s entry_callable=%s package_format=%s dependency_policy_mode=%s "
+                    "dependency_path=%s managed_global_count=%s elapsed_sec=%.3f err=%r",
+                    str(prepare_scope or ""),
+                    str(prepare_key or ""),
+                    str(artifact.code_version or ""),
+                    str(artifact.path or ""),
+                    str(artifact.entry_module or ""),
+                    str(artifact.entry_callable or ""),
+                    str(artifact.package_format or ""),
+                    str(artifact.dependency_policy_mode or ""),
+                    str(dependency_path or ""),
+                    len(tuple(managed_global_names or ())),
+                    elapsed_sec,
+                    exc,
+                )
+                raise
+            elapsed_sec = time.perf_counter() - prepare_started_at
+            if elapsed_sec >= 2.0:
+                logger.warning(
+                    "node artifact prepare request slow scope=%s key=%s code_version=%s artifact_path=%s "
+                    "entry_module=%s entry_callable=%s package_format=%s dependency_policy_mode=%s "
+                    "dependency_path=%s managed_global_count=%s elapsed_sec=%.3f ok=%s",
+                    str(prepare_scope or ""),
+                    str(prepare_key or ""),
+                    str(artifact.code_version or ""),
+                    str(artifact.path or ""),
+                    str(artifact.entry_module or ""),
+                    str(artifact.entry_callable or ""),
+                    str(artifact.package_format or ""),
+                    str(artifact.dependency_policy_mode or ""),
+                    str(dependency_path or ""),
+                    len(tuple(managed_global_names or ())),
+                    elapsed_sec,
+                    bool(resp.get("ok", False)),
+                )
             if not resp.get("ok", False):
                 error = str(resp.get("error", "artifact prepare failed") or "artifact prepare failed")
                 if bool(resp.get("user_error", False)):

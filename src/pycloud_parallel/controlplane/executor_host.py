@@ -293,8 +293,9 @@ class ExecutorHostClient:
     def _request(self, action: str, *, payload: Optional[Dict[str, Any]] = None, timeout_sec: float = 10.0) -> Dict[str, Any]:
         if self._closed and action != "shutdown":
             raise RuntimeError("executor host is closed")
-        request_id = self._send_request(action, payload=payload)
-        return self._wait_response(request_id, action=action, timeout_sec=timeout_sec)
+        request_payload = dict(payload or {})
+        request_id = self._send_request(action, payload=request_payload)
+        return self._wait_response(request_id, action=action, timeout_sec=timeout_sec, payload=request_payload)
 
     def _send_request(self, action: str, *, payload: Optional[Dict[str, Any]] = None) -> str:
         if self._closed and action != "shutdown":
@@ -305,7 +306,7 @@ class ExecutorHostClient:
         self._request_q.put({"request_id": request_id, "action": action, "payload": dict(payload or {})})
         return request_id
 
-    def _wait_response(self, request_id: str, *, action: str, timeout_sec: float) -> Dict[str, Any]:
+    def _wait_response(self, request_id: str, *, action: str, timeout_sec: float, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         deadline = time.monotonic() + max(0.1, float(timeout_sec))
         with self._cv:
             while request_id not in self._responses:
@@ -313,6 +314,21 @@ class ExecutorHostClient:
                 if remaining <= 0:
                     self._responses.pop(request_id, None)
                     self._expired_requests.add(request_id)
+                    request_payload = dict(payload or {})
+                    artifact_payload = request_payload if action == "prepare_artifact" else {}
+                    logger.warning(
+                        "executor host request timed out action=%s request_id=%s timeout_sec=%.3f "
+                        "scope=%s key=%s artifact_path=%s entry_module=%s package_format=%s dependency_policy_mode=%s",
+                        action,
+                        request_id,
+                        max(0.1, float(timeout_sec)),
+                        str(artifact_payload.get("prepare_scope", "") or ""),
+                        str(artifact_payload.get("prepare_key", "") or ""),
+                        str(artifact_payload.get("artifact_path", "") or ""),
+                        str(artifact_payload.get("entry_module", "") or ""),
+                        str(artifact_payload.get("package_format", "") or ""),
+                        str(artifact_payload.get("dependency_policy_mode", "") or ""),
+                    )
                     raise TimeoutError(f"executor host request timed out: {action}")
                 if not self._process.is_alive():
                     raise RuntimeError(

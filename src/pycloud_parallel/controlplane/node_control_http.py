@@ -73,6 +73,19 @@ logger = logging.getLogger(__name__)
 MAX_NODE_CONTROL_HTTP_BODY_BYTES = get_node_control_http_body_limit_bytes()
 
 
+def _is_client_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+        return True
+    text = repr(exc).lower()
+    return (
+        "broken pipe" in text
+        or "connectionabortederror" in text
+        or "connectionreseterror" in text
+        or "winerror 10053" in text
+        or "winerror 10054" in text
+    )
+
+
 def _restart_current_process_delayed(delay_sec: float = 1.0) -> None:
     def _restart() -> None:
         time.sleep(max(0.1, float(delay_sec)))
@@ -1070,7 +1083,23 @@ class NodeControlHttpServer:
                 self.send_header("Content-Length", str(len(raw or b"")))
                 self.end_headers()
                 if raw:
-                    self.wfile.write(raw)
+                    try:
+                        self.wfile.write(raw)
+                    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
+                        if _is_client_disconnect_error(exc):
+                            logger.warning(
+                                "NodeControl HTTP client disconnected before response write method=%s path=%s "
+                                "node_id=%s node_instance_id=%s status_code=%s bytes=%s err=%r",
+                                self.command,
+                                self.path,
+                                app.state.node_id,
+                                app.state.node_instance_id,
+                                int(status_code),
+                                len(raw or b""),
+                                exc,
+                            )
+                            return
+                        raise
 
             def _send_stream(self, response: StreamingHttpResponse) -> None:
                 self.send_response(int(response.status_code or 200))

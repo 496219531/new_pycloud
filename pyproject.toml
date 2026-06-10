@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # 项目元信息：名称、版本、Python 版本要求以及基础依赖。
 [project]
 name = "pycloud-parallel"
-version = "0.3.0"
+version = "0.3.2"
 description = "Cluster-first task/service orchestration with HTTP control plane."
 readme = "README.md"
 requires-python = ">=3.8"

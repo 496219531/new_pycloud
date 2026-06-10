@@ -89,6 +89,12 @@ def prepare_artifact_in_host(args: Dict[str, Any]) -> Dict[str, Any]:
     package_format = str(args.get("package_format", "") or "")
     dependency_path = str(args.get("dependency_path", "") or "")
     entry_callable = str(args.get("entry_callable", "") or "")
+    started_at = time.perf_counter()
+    scope = str(args.get("prepare_scope", "") or "")
+    key = str(args.get("prepare_key", "") or "")
+    dependency_policy_mode = str(args.get("dependency_policy_mode", "") or "")
+    managed_global_count = len(tuple(args.get("managed_global_names", ()) or ()))
+    export_methods_count = len(tuple(args.get("export_methods", ()) or ()))
     try:
         module, _router, method_info = _load_callable_router(
             artifact_path,
@@ -105,8 +111,45 @@ def prepare_artifact_in_host(args: Dict[str, Any]) -> Dict[str, Any]:
             missing = [name for name in managed_global_names if not hasattr(module, name)]
             if missing:
                 raise ValueError(f"managed globals not found in entry module: {missing}")
+        elapsed_sec = time.perf_counter() - started_at
+        if elapsed_sec >= 2.0:
+            logger.warning(
+                "executor artifact prepare slow scope=%s key=%s artifact_path=%s entry_module=%s "
+                "entry_callable=%s package_format=%s dependency_policy_mode=%s dependency_path=%s "
+                "managed_global_count=%s export_methods_count=%s method_count=%s elapsed_sec=%.3f",
+                scope,
+                key,
+                artifact_path,
+                entry_module,
+                entry_callable,
+                package_format,
+                dependency_policy_mode,
+                dependency_path,
+                managed_global_count,
+                export_methods_count,
+                len(method_info or {}),
+                elapsed_sec,
+            )
         return {"ok": True, "methods": dict(method_info)}
     except Exception as exc:
+        elapsed_sec = time.perf_counter() - started_at
+        logger.warning(
+            "executor artifact prepare failed scope=%s key=%s artifact_path=%s entry_module=%s "
+            "entry_callable=%s package_format=%s dependency_policy_mode=%s dependency_path=%s "
+            "managed_global_count=%s export_methods_count=%s elapsed_sec=%.3f err=%r",
+            scope,
+            key,
+            artifact_path,
+            entry_module,
+            entry_callable,
+            package_format,
+            dependency_policy_mode,
+            dependency_path,
+            managed_global_count,
+            export_methods_count,
+            elapsed_sec,
+            exc,
+        )
         if _is_user_artifact_error(exc):
             return {
                 "ok": False,
