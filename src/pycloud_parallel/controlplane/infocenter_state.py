@@ -408,7 +408,27 @@ class InfoCenterState:
         node_key = str(getattr(state, "node_instance_id", "") or "").strip()
         if not node_key:
             return
-        for name in previous_names or ():
+        self._remove_node_services_index_locked(state, previous_names=previous_names)
+        current_names = {
+            str(svc.service_name or "").strip()
+            for svc in state.services.values()
+            if str(svc.service_name or "").strip()
+        }
+        for normalized_name in current_names:
+            self._services_by_name.setdefault(normalized_name, set()).add(node_key)
+
+    def _remove_node_services_index_locked(self, state: NodeState, *, previous_names: Optional[Iterable[str]] = None) -> None:
+        node_key = str(getattr(state, "node_instance_id", "") or "").strip()
+        if not node_key:
+            return
+        names = previous_names
+        if names is None:
+            names = (
+                str(svc.service_name or "").strip()
+                for svc in state.services.values()
+                if str(svc.service_name or "").strip()
+            )
+        for name in names:
             normalized_name = str(name or "").strip()
             if not normalized_name:
                 continue
@@ -418,13 +438,6 @@ class InfoCenterState:
             members.discard(node_key)
             if not members:
                 self._services_by_name.pop(normalized_name, None)
-        current_names = {
-            str(svc.service_name or "").strip()
-            for svc in state.services.values()
-            if str(svc.service_name or "").strip()
-        }
-        for normalized_name in current_names:
-            self._services_by_name.setdefault(normalized_name, set()).add(node_key)
 
     def is_instance_fenced(self, node_instance_id: str) -> bool:
         normalized_instance = str(node_instance_id or "").strip()
@@ -482,12 +495,7 @@ class InfoCenterState:
         for key in replaced_keys:
             old_state = self._nodes.pop(key, None)
             if old_state is not None:
-                previous_service_names = {
-                    str(svc.service_name or "").strip()
-                    for svc in old_state.services.values()
-                    if str(svc.service_name or "").strip()
-                }
-                self._reindex_node_services_locked(old_state, previous_names=previous_service_names)
+                self._remove_node_services_index_locked(old_state)
                 self._fence_instance_locked(old_state, reason="node control_addr replaced")
 
     def control_addr_conflicting_instances(
@@ -575,6 +583,7 @@ class InfoCenterState:
         for key in replaced_keys:
             old_state = self._nodes.pop(key, None)
             if old_state is not None:
+                self._remove_node_services_index_locked(old_state)
                 self._fence_instance_locked(old_state, reason="startup service endpoint replaced")
 
     def _effective_service_state_locked(

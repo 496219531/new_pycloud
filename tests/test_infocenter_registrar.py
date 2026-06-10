@@ -787,6 +787,10 @@ def test_startup_service_registration_replaces_same_endpoint_duplicate():
 
     assert [node.node_instance_id for node in nodes] == ["startup-new"]
     assert [route["service_id"] for route in routes] == ["svc-new"]
+    assert info_state.is_instance_fenced("startup-old") is True
+    assert info_state.fenced_instance_reason("startup-old") == "startup service endpoint replaced"
+    assert "startup-old" not in info_state._services_by_name.get("calc_asset_ratio", set())  # noqa: SLF001
+    assert "startup-new" in info_state._services_by_name.get("calc_asset_ratio", set())  # noqa: SLF001
 
 
 def test_startup_service_registration_ignores_stopped_duplicate_service_name():
@@ -881,6 +885,10 @@ def test_infocenter_replaces_existing_node_with_same_control_addr():
 
     assert [node.node_instance_id for node in nodes] == ["node-new-instance"]
     assert [route["service_id"] for route in routes] == ["svc-new"]
+    assert info_state.is_instance_fenced("node-old-instance") is True
+    assert info_state.fenced_instance_reason("node-old-instance") == "node control_addr replaced"
+    assert "node-old-instance" not in info_state._services_by_name.get("calc_asset_ratio", set())  # noqa: SLF001
+    assert "node-new-instance" in info_state._services_by_name.get("calc_asset_ratio", set())  # noqa: SLF001
 
 
 def test_infocenter_http_rejects_new_instance_when_control_addr_serves_old_instance(tmp_path):
@@ -1145,14 +1153,17 @@ def test_node_registrar_handles_fenced_register_response(tmp_path):
         rpc_timeout_sec=5.0,
         exit_on_fence=False,
     )
+    original_instance_id = registrar.node_instance_id
 
     try:
         assert registrar.sync_now() is True
-        info_state.mark_node_lost(node_state.node_instance_id, reason="test lost")
+        info_state.mark_node_lost(original_instance_id, reason="test lost")
         registrar._registered = False  # noqa: SLF001
 
         assert registrar.sync_now() is False
         assert registrar._stop_event.is_set() is True  # noqa: SLF001
+        assert node_state.execution_fenced is True
+        assert registrar.node_instance_id == original_instance_id
         assert node_state.service_report_payloads(include_stopped=True) == []
         assert node_state.task_pool_reports() == {}
     finally:

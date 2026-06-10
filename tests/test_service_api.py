@@ -5342,7 +5342,7 @@ class TestOwnerServiceFacade:
         ), patch.object(
             Service,
             "_inspect_existing_routes",
-            return_value=[(fake_route, stopped_info)],
+            return_value=([(fake_route, stopped_info)], []),
         ), patch(
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
@@ -5448,10 +5448,7 @@ class TestOwnerServiceFacade:
         ), patch.object(
             Service,
             "_inspect_existing_routes",
-            return_value=[(fake_route, running_info)],
-        ), patch(
-            "pycloud_parallel.execution.service_session._node_control_client",
-            _FakeNodeControlClient,
+            return_value=([(fake_route, running_info)], []),
         ), patch(
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
@@ -5607,7 +5604,7 @@ class TestOwnerServiceFacade:
         ), patch.object(
             Service,
             "_inspect_existing_routes",
-            return_value=list(zip(fake_routes, running_infos)),
+            return_value=(list(zip(fake_routes, running_infos)), []),
         ), patch(
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
@@ -5729,7 +5726,7 @@ class TestOwnerServiceFacade:
         ), patch.object(
             Service,
             "_inspect_existing_routes",
-            return_value=[(fake_route, running_info)],
+            return_value=([(fake_route, running_info)], []),
         ), patch(
             "pycloud_parallel.execution.service_session._node_control_client",
             _FakeNodeControlClient,
@@ -5773,6 +5770,171 @@ class TestOwnerServiceFacade:
             assert operations[1][2]["service_name"] == "demo-replace-service"
         finally:
             group.close(end_services=False)
+
+    @staticmethod
+    def _fake_deploy_node(node_instance_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            node_id="node-1",
+            node_instance_id=node_instance_id,
+            control_addr="127.0.0.1:50061",
+            healthy=True,
+            schedulable=True,
+            drain=False,
+            service_worker_available=2,
+            capacity=2,
+            queued=0,
+            python_version="py3.11",
+        )
+
+    @staticmethod
+    def _fake_active_route(service_name: str, node_instance_id: str) -> SimpleNamespace:
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        return SimpleNamespace(
+            service_name=service_name,
+            service_id="svc-old",
+            status=pb2.SERVICE_STATUS_RUNNING,
+            node_id="node-1",
+            node_instance_id=node_instance_id,
+            control_addr="127.0.0.1:50061",
+            http_base_url="http://127.0.0.1:18081/svc/svc-old",
+        )
+
+    @staticmethod
+    def _inspect_redeploy_client(status_error: str, create_calls):
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def get_service_status(self, *, service_id: str):
+                del service_id
+                raise RuntimeError(status_error)
+
+            def create_service_from_bytes(self, **kwargs):
+                create_calls.append(dict(kwargs))
+                from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+                return SimpleNamespace(
+                    service_id="svc-new",
+                    service_token="token-new",
+                    http_base_url="http://127.0.0.1:18081/svc/svc-new",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        return _FakeNodeControlClient
+
+    @staticmethod
+    def _deploy_inspect_reconnect_case(tmp_path, *, service_name: str, timeout_sec: float = 10.0):
+        return Service._deploy_from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            owner_client_id="owner-demo",
+            service_name=service_name,
+            source=b"def run(**_kwargs):\n    return {'ok': True}\n",
+            runtime="py3",
+            entry_module="demo_service",
+            entry_callable="run",
+            timeout_sec=timeout_sec,
+            session_cache_dir=str(tmp_path),
+        )
+
+    def _run_inspect_redeploy_case(
+        self,
+        tmp_path,
+        *,
+        service_name: str,
+        status_error: str,
+        old_instance_id: str,
+        new_instance_id: str,
+    ):
+        old_route = self._fake_active_route(service_name, old_instance_id)
+        new_node = self._fake_deploy_node(new_instance_id)
+        create_calls = []
+        lost_calls = []
+        client_cls = self._inspect_redeploy_client(status_error, create_calls)
+        discovery_results = [
+            ([old_route], [new_node], [new_node]),
+            ([], [new_node], [new_node]),
+        ]
+
+        def _fake_retry(*args, **kwargs):
+            del args, kwargs
+            return discovery_results.pop(0)
+
+        retry_patch = (
+            patch(
+                "pycloud_parallel.execution.service_session._retry_infocenter_request",
+                side_effect=_fake_retry,
+            )
+            if old_instance_id != new_instance_id
+            else patch(
+                "pycloud_parallel.execution.service_session._retry_infocenter_request",
+                return_value=discovery_results[0],
+            )
+        )
+
+        with retry_patch, patch(
+            "pycloud_parallel.execution.service_session._node_control_client",
+            client_cls,
+        ), patch(
+            "pycloud_parallel.execution.service_session._new_node_control_client",
+            client_cls,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ), patch(
+            "pycloud_parallel.execution.service_session._mark_infocenter_node_lost_on_identity_mismatch",
+            side_effect=lambda **kwargs: (lost_calls.append(dict(kwargs)), True)[1],
+        ):
+            group = self._deploy_inspect_reconnect_case(tmp_path, service_name=service_name)
+
+        try:
+            return create_calls, lost_calls
+        finally:
+            group.close(end_services=False)
+
+    def test_deploy_from_infocenter_redeploys_when_inspected_route_is_service_not_found(self, tmp_path):
+        create_calls, lost_calls = self._run_inspect_redeploy_case(
+            tmp_path,
+            service_name="demo-stale-route-service",
+            status_error="service not found",
+            old_instance_id="node-1-inst",
+            new_instance_id="node-1-inst",
+        )
+        assert len(create_calls) == 1
+        assert create_calls[0]["service_name"] == "demo-stale-route-service"
+        assert lost_calls == []
+
+    def test_deploy_from_infocenter_marks_old_instance_lost_after_inspect_identity_mismatch(self, tmp_path):
+        create_calls, lost_calls = self._run_inspect_redeploy_case(
+            tmp_path,
+            service_name="demo-identity-redeploy",
+            status_error="node control_addr instance mismatch",
+            old_instance_id="node-1-old",
+            new_instance_id="node-1-new",
+        )
+        assert len(lost_calls) == 1
+        assert lost_calls[0]["node_instance_id"] == "node-1-old"
+        assert len(create_calls) == 1
+        assert create_calls[0]["expected_node_instance_id"] == "node-1-new"
+
+    def test_deploy_from_infocenter_retries_stale_connection_refused_route_and_redeploys(self, tmp_path):
+        create_calls, lost_calls = self._run_inspect_redeploy_case(
+            tmp_path,
+            service_name="demo-conn-refused-redeploy",
+            status_error="connection refused",
+            old_instance_id="node-1-old",
+            new_instance_id="node-1-new",
+        )
+        assert len(create_calls) == 1
+        assert create_calls[0]["expected_node_instance_id"] == "node-1-new"
+        assert lost_calls == []
 
     def test_inspect_existing_routes_rejects_startup_http_only_route(self):
         from pycloud_parallel.execution.service_session import Service

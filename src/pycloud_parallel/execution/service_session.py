@@ -91,7 +91,7 @@ from pycloud_parallel.execution.deployment_create_helper import (
     run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
 )
-from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
+from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
@@ -352,6 +352,20 @@ class _ServiceSessionFileLock:
                 self._fp = None
                 with _SERVICE_SESSION_LOCK_GUARD:
                     _SERVICE_SESSION_LOCKED_PATHS.discard(normalized)
+
+
+@dataclass(frozen=True)
+class _ExistingRouteInspectFailure:
+    route: InfoCenterServiceRoute
+    category: ErrorCategory
+    message: str
+
+
+_RECOVERABLE_EXISTING_ROUTE_INSPECT_CATEGORIES = {
+    ErrorCategory.SERVICE_TERMINAL,
+    ErrorCategory.IDENTITY_MISMATCH,
+    ErrorCategory.TRANSIENT_NETWORK,
+}
 
 
 def _service_session_cache_file(
@@ -3198,6 +3212,27 @@ class Service(ServiceExecutionSession):
             context="service_owner",
         )
 
+        def _refresh_discovery_after_stale_route_cleanup() -> None:
+            nonlocal existing_routes, discovered_nodes, selected_nodes, discovered_instance_map, effective_policy
+            refreshed = _retry_infocenter_request(
+                _discover_and_select_nodes,
+                timeout_sec=_ready_retry_timeout(timeout_sec, grace_sec=_SERVICE_READY_GRACE_SEC) or timeout_sec,
+                target=infocenter_target,
+                action="service deploy rediscovery after stale route cleanup",
+                retry_interval_sec=_SERVICE_READY_RETRY_INTERVAL_SEC,
+            )
+            if isinstance(refreshed, tuple) and len(refreshed) == 3:
+                existing_routes, discovered_nodes, selected_nodes = refreshed
+            else:
+                existing_routes, discovered_nodes, selected_nodes = _discover_and_select_nodes()
+            discovered_instance_map = {_node_instance_key_from_node(node): node for node in discovered_nodes}
+            effective_policy = _service_effective_policy_for_nodes(
+                selected_nodes,
+                policy_id=normalized_policy_id,
+                requested_mode=serialization_mode,
+                context="service_owner",
+            )
+
         def _dynamic_compensation_spec() -> Dict[str, Any]:
             return {
                 "infocenter_target": infocenter_target,
@@ -3228,146 +3263,79 @@ class Service(ServiceExecutionSession):
             }
 
         if ensure_unique_service_name:
-            active_routes = cls._select_active_routes(existing_routes)
-            if active_routes:
-                existing_infos = cls._inspect_existing_routes(active_routes=active_routes, timeout_sec=timeout_sec)
-                existing_infos = [
-                    (route, info)
-                    for route, info in existing_infos
-                    if cls._is_active_service_status(getattr(info, "status", route.status))
-                ]
+            for _attempt in range(3):
+                active_routes = cls._select_active_routes(existing_routes)
+                if not active_routes:
+                    break
+                existing_infos, inspect_failures = cls._inspect_existing_routes(
+                    active_routes=active_routes,
+                    timeout_sec=timeout_sec,
+                )
+                existing_infos = cls._filter_active_existing_infos(existing_infos)
+                if cls._cleanup_existing_route_inspect_failures(
+                    inspect_failures,
+                    infocenter_target=infocenter_target,
+                    timeout_sec=timeout_sec,
+                ):
+                    _refresh_discovery_after_stale_route_cleanup()
+                    continue
                 if not existing_infos:
                     _emit_owner_notice(
                         f"ignore stale existing routes service_name={effective_service_name}; redeploying fresh replicas"
                     )
-                else:
-                    existing_owners = {info.owner_client_id for _, info in existing_infos}
-                    existing_versions = {info.code_version for _, info in existing_infos}
-                    if len(existing_owners) != 1 or len(existing_versions) != 1:
-                        raise RuntimeError(
-                            f"service_name already exists but active routes are inconsistent: {effective_service_name}"
-                        )
-                    existing_bound_policy_id = _resolve_bound_service_policy_id(
-                        [route for route, _ in existing_infos],
-                        default_policy_id=normalized_policy_id,
-                        context=f"service_name={effective_service_name!r}",
-                    )
-                    if requested_policy_id and requested_policy_id != existing_bound_policy_id:
-                        raise RuntimeError(
-                            f"service_name already exists with deploy-bound policy_id={existing_bound_policy_id!r}; "
-                            f"requested policy_id={requested_policy_id!r} does not match"
-                        )
+                    break
 
-                    existing_owner = next(iter(existing_owners))
-                    existing_code_version = next(iter(existing_versions))
-                    if existing_owner != effective_owner_client_id:
-                        raise RuntimeError(
-                            f"service_name already exists and belongs to another owner: "
-                            f"service_name={effective_service_name}; owner={existing_owner}"
-                        )
+                existing_bound_policy_id, existing_code_version = cls._validate_existing_service_conflict(
+                    service_name=effective_service_name,
+                    owner_client_id=effective_owner_client_id,
+                    existing_infos=existing_infos,
+                    normalized_policy_id=normalized_policy_id,
+                    requested_policy_id=requested_policy_id,
+                )
+                cached_session = _load_service_session_cache(
+                    owner_client_id=effective_owner_client_id,
+                    service_name=effective_service_name,
+                    cache_dir=session_cache_dir,
+                )
 
-                    cached_session = _load_service_session_cache(
+                if existing_code_version == effective_code_version:
+                    group = cls._reuse_existing_same_code_service(
                         owner_client_id=effective_owner_client_id,
                         service_name=effective_service_name,
-                        cache_dir=session_cache_dir,
+                        artifact_code_version=effective_code_version,
+                        cache_payload=cached_session,
+                        reuse_existing_same_code=reuse_existing_same_code,
+                        active_routes=existing_infos,
+                        discovered_node_map=discovered_instance_map,
+                        timeout_sec=timeout_sec,
+                        breaker_enabled=breaker_enabled,
+                        breaker_failure_threshold=breaker_failure_threshold,
+                        breaker_cooldown_sec=breaker_cooldown_sec,
+                        breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+                        session_cache_file=session_cache_file,
+                        policy_id=existing_bound_policy_id,
+                        compensation_spec=_dynamic_compensation_spec(),
                     )
+                    if group is None:
+                        break
+                    return group
 
-                    if existing_code_version == effective_code_version:
-                        if not reuse_existing_same_code:
-                            raise RuntimeError(
-                                f"service_name already exists with same code_version: {effective_service_name}; "
-                                "set reuse_existing_same_code=True to reuse"
-                            )
-                        if cached_session is None or cached_session.get("artifact_code_version") != effective_code_version:
-                            raise RuntimeError(
-                                f"service_name already exists with same code_version but no reusable local token cache was found: "
-                                f"{effective_service_name}"
-                            )
-                        try:
-                            session_cache_lock = _acquire_service_session_lock_with_retry(
-                                session_cache_file,
-                                timeout_sec=timeout_sec,
-                                action=(
-                                    "another local deploy process is already active for "
-                                    f"owner_client_id={effective_owner_client_id!r} service_name={effective_service_name!r}"
-                                ),
-                            )
-                        except RuntimeError as exc:
-                            raise RuntimeError(str(exc)) from exc
-                        try:
-                            group = cls._reuse_existing_group(
-                                owner_client_id=effective_owner_client_id,
-                                service_name=effective_service_name,
-                                artifact_code_version=effective_code_version,
-                                cache_payload=cached_session,
-                                active_routes=existing_infos,
-                                discovered_node_map=discovered_instance_map,
-                                timeout_sec=timeout_sec,
-                                breaker_enabled=breaker_enabled,
-                                breaker_failure_threshold=breaker_failure_threshold,
-                                breaker_cooldown_sec=breaker_cooldown_sec,
-                                breaker_max_cooldown_sec=breaker_max_cooldown_sec,
-                                session_cache_file=session_cache_file,
-                                session_cache_lock=session_cache_lock,
-                                policy_id=existing_bound_policy_id,
-                                compensation_spec=_dynamic_compensation_spec(),
-                            )
-                        except RuntimeError as exc:
-                            if "service is stopped" not in str(exc):
-                                raise
-                            session_cache_lock = None
-                            with contextlib.suppress(Exception):
-                                session_cache_file.unlink()
-                            _emit_owner_notice(
-                                f"reuse existing service skipped because cached route stopped: {effective_service_name}; redeploying"
-                            )
-                        else:
-                            _emit_owner_notice(
-                                f"reuse existing service service_name={effective_service_name} "
-                                f"routes={_format_route_summary(group.route_summary())}"
-                            )
-                            return group
-
-                    else:
-                        if not replace_existing_if_code_changed:
-                            raise RuntimeError(
-                                f"service_name already exists with different code_version and is still running: "
-                                f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}; "
-                                "stop the active service first, then redeploy with the same service_name"
-                            )
-                        if cached_session is None:
-                            raise RuntimeError(
-                                f"service_name already exists with different code_version but no local token cache was found: "
-                                f"{effective_service_name}; existing={existing_code_version}; incoming={effective_code_version}"
-                            )
-                        try:
-                            session_cache_lock = _acquire_service_session_lock_with_retry(
-                                session_cache_file,
-                                timeout_sec=timeout_sec,
-                                action=(
-                                    "another local deploy process is already active for "
-                                    f"owner_client_id={effective_owner_client_id!r} service_name={effective_service_name!r}"
-                                ),
-                            )
-                        except RuntimeError as exc:
-                            raise RuntimeError(str(exc)) from exc
-                        try:
-                            cls._end_existing_group(
-                                owner_client_id=effective_owner_client_id,
-                                cache_payload=cached_session,
-                                active_routes=existing_infos,
-                                timeout_sec=timeout_sec,
-                                reason="replace service with new code_version",
-                            )
-                        except Exception:
-                            session_cache_lock.close()
-                            session_cache_lock = None
-                            raise
-                        session_cache_lock.clear()
-                        _emit_owner_notice(
-                            f"stopped existing service before replace service_name={effective_service_name} "
-                            f"existing={existing_code_version} incoming={effective_code_version}"
-                        )
+                session_cache_lock = cls._replace_existing_changed_code_service(
+                    owner_client_id=effective_owner_client_id,
+                    service_name=effective_service_name,
+                    existing_code_version=existing_code_version,
+                    incoming_code_version=effective_code_version,
+                    cache_payload=cached_session,
+                    replace_existing_if_code_changed=replace_existing_if_code_changed,
+                    active_routes=existing_infos,
+                    timeout_sec=timeout_sec,
+                    session_cache_file=session_cache_file,
+                )
+                break
+            else:
+                raise RuntimeError(
+                    f"service_name still has active routes after stale route cleanup retries: {effective_service_name}"
+                )
 
         try:
             if session_cache_lock is None:
@@ -3669,14 +3637,262 @@ class Service(ServiceExecutionSession):
         ]
 
     @classmethod
+    def _filter_active_existing_infos(
+        cls,
+        existing_infos: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
+    ) -> List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]]:
+        return [
+            (route, info)
+            for route, info in existing_infos
+            if cls._is_active_service_status(getattr(info, "status", route.status))
+        ]
+
+    @classmethod
+    def _cleanup_existing_route_inspect_failures(
+        cls,
+        failures: Sequence[_ExistingRouteInspectFailure],
+        *,
+        infocenter_target: str,
+        timeout_sec: float,
+    ) -> bool:
+        if not failures:
+            return False
+        hard_failures = [
+            failure
+            for failure in failures
+            if failure.category not in _RECOVERABLE_EXISTING_ROUTE_INSPECT_CATEGORIES
+        ]
+        if hard_failures:
+            raise RuntimeError(
+                "failed to inspect existing active service routes: "
+                f"{ { _node_instance_key_from_route(item.route): item.message for item in hard_failures } }"
+            )
+
+        refresh_required = False
+        for failure in failures:
+            route_key = _node_instance_key_from_route(failure.route)
+            if failure.category == ErrorCategory.IDENTITY_MISMATCH:
+                _mark_infocenter_node_lost_on_identity_mismatch(
+                    infocenter_factory=_infocenter_client,
+                    infocenter_target=infocenter_target,
+                    timeout_sec=timeout_sec,
+                    node_instance_id=route_key,
+                    error_message=failure.message,
+                    reason_prefix="service inspect identity mismatch",
+                )
+                refresh_required = True
+            elif failure.category == ErrorCategory.TRANSIENT_NETWORK:
+                with contextlib.suppress(Exception):
+                    with _infocenter_client(infocenter_target, timeout_sec=timeout_sec) as infocenter:
+                        infocenter.mark_node_lost(
+                            route_key,
+                            reason=f"service inspect route unavailable: {failure.message}",
+                        )
+                refresh_required = True
+        return refresh_required
+
+    @classmethod
+    def _validate_existing_service_conflict(
+        cls,
+        *,
+        service_name: str,
+        owner_client_id: str,
+        existing_infos: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
+        normalized_policy_id: str,
+        requested_policy_id: str,
+    ) -> Tuple[str, str]:
+        existing_owners = {info.owner_client_id for _, info in existing_infos}
+        existing_versions = {info.code_version for _, info in existing_infos}
+        if len(existing_owners) != 1 or len(existing_versions) != 1:
+            raise RuntimeError(f"service_name already exists but active routes are inconsistent: {service_name}")
+        existing_bound_policy_id = _resolve_bound_service_policy_id(
+            [route for route, _ in existing_infos],
+            default_policy_id=normalized_policy_id,
+            context=f"service_name={service_name!r}",
+        )
+        if requested_policy_id and requested_policy_id != existing_bound_policy_id:
+            raise RuntimeError(
+                f"service_name already exists with deploy-bound policy_id={existing_bound_policy_id!r}; "
+                f"requested policy_id={requested_policy_id!r} does not match"
+            )
+        existing_owner = next(iter(existing_owners))
+        if existing_owner != owner_client_id:
+            raise RuntimeError(
+                f"service_name already exists and belongs to another owner: "
+                f"service_name={service_name}; owner={existing_owner}"
+            )
+        return existing_bound_policy_id, next(iter(existing_versions))
+
+    @classmethod
+    def _reuse_existing_same_code_service(
+        cls,
+        *,
+        owner_client_id: str,
+        service_name: str,
+        artifact_code_version: str,
+        cache_payload: Optional[Dict[str, object]],
+        reuse_existing_same_code: bool,
+        active_routes: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
+        discovered_node_map: Dict[str, InfoCenterNode],
+        timeout_sec: float,
+        breaker_enabled: bool,
+        breaker_failure_threshold: int,
+        breaker_cooldown_sec: float,
+        breaker_max_cooldown_sec: float,
+        session_cache_file: Path,
+        policy_id: str,
+        compensation_spec: Dict[str, Any],
+    ) -> Optional["Service"]:
+        if not reuse_existing_same_code:
+            raise RuntimeError(
+                f"service_name already exists with same code_version: {service_name}; "
+                "set reuse_existing_same_code=True to reuse"
+            )
+        if cache_payload is None or cache_payload.get("artifact_code_version") != artifact_code_version:
+            raise RuntimeError(
+                f"service_name already exists with same code_version but no reusable local token cache was found: "
+                f"{service_name}"
+            )
+        try:
+            session_cache_lock = _acquire_service_session_lock_with_retry(
+                session_cache_file,
+                timeout_sec=timeout_sec,
+                action=(
+                    "another local deploy process is already active for "
+                    f"owner_client_id={owner_client_id!r} service_name={service_name!r}"
+                ),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc)) from exc
+        try:
+            group = cls._reuse_existing_group(
+                owner_client_id=owner_client_id,
+                service_name=service_name,
+                artifact_code_version=artifact_code_version,
+                cache_payload=cache_payload,
+                active_routes=active_routes,
+                discovered_node_map=discovered_node_map,
+                timeout_sec=timeout_sec,
+                breaker_enabled=breaker_enabled,
+                breaker_failure_threshold=breaker_failure_threshold,
+                breaker_cooldown_sec=breaker_cooldown_sec,
+                breaker_max_cooldown_sec=breaker_max_cooldown_sec,
+                session_cache_file=session_cache_file,
+                session_cache_lock=session_cache_lock,
+                policy_id=policy_id,
+                compensation_spec=compensation_spec,
+            )
+        except RuntimeError as exc:
+            if "service is stopped" not in str(exc):
+                raise
+            with contextlib.suppress(Exception):
+                session_cache_file.unlink()
+            _emit_owner_notice(
+                f"reuse existing service skipped because cached route stopped: {service_name}; redeploying"
+            )
+            return None
+        _emit_owner_notice(
+            f"reuse existing service service_name={service_name} "
+            f"routes={_format_route_summary(group.route_summary())}"
+        )
+        return group
+
+    @classmethod
+    def _replace_existing_changed_code_service(
+        cls,
+        *,
+        owner_client_id: str,
+        service_name: str,
+        existing_code_version: str,
+        incoming_code_version: str,
+        cache_payload: Optional[Dict[str, object]],
+        replace_existing_if_code_changed: bool,
+        active_routes: Sequence[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]],
+        timeout_sec: float,
+        session_cache_file: Path,
+    ) -> _ServiceSessionFileLock:
+        if not replace_existing_if_code_changed:
+            raise RuntimeError(
+                f"service_name already exists with different code_version and is still running: "
+                f"{service_name}; existing={existing_code_version}; incoming={incoming_code_version}; "
+                "stop the active service first, then redeploy with the same service_name"
+            )
+        if cache_payload is None:
+            raise RuntimeError(
+                f"service_name already exists with different code_version but no local token cache was found: "
+                f"{service_name}; existing={existing_code_version}; incoming={incoming_code_version}"
+            )
+        try:
+            session_cache_lock = _acquire_service_session_lock_with_retry(
+                session_cache_file,
+                timeout_sec=timeout_sec,
+                action=(
+                    "another local deploy process is already active for "
+                    f"owner_client_id={owner_client_id!r} service_name={service_name!r}"
+                ),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(str(exc)) from exc
+        try:
+            cls._end_existing_group(
+                owner_client_id=owner_client_id,
+                cache_payload=cache_payload,
+                active_routes=active_routes,
+                timeout_sec=timeout_sec,
+                reason="replace service with new code_version",
+            )
+        except Exception:
+            session_cache_lock.close()
+            raise
+        session_cache_lock.clear()
+        _emit_owner_notice(
+            f"stopped existing service before replace service_name={service_name} "
+            f"existing={existing_code_version} incoming={incoming_code_version}"
+        )
+        return session_cache_lock
+
+    @classmethod
+    def _inspect_existing_route_status(
+        cls,
+        route: InfoCenterServiceRoute,
+        *,
+        timeout_sec: float,
+    ) -> Tuple[Optional[pb2.ServiceStatusInfo], Optional[_ExistingRouteInspectFailure]]:
+        control_addr = str(getattr(route, "control_addr", "") or "").strip()
+        wait_timeout = _ready_retry_timeout(timeout_sec, grace_sec=_SERVICE_READY_GRACE_SEC)
+        deadline = time.monotonic() + wait_timeout if wait_timeout > 0.0 else 0.0
+        last_exc: Optional[Exception] = None
+        while True:
+            client = _node_control_client(control_addr, timeout_sec=timeout_sec)
+            try:
+                return client.get_service_status(service_id=route.service_id), None
+            except Exception as exc:
+                last_exc = exc
+                category = classify_error(exc, resource_kind="service")
+                if category != ErrorCategory.TRANSIENT_NETWORK:
+                    break
+                if wait_timeout <= 0.0 or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(_SERVICE_READY_RETRY_INTERVAL_SEC, max(0.05, deadline - time.monotonic())))
+            finally:
+                client.close()
+        if last_exc is None:
+            return None, None
+        return None, _ExistingRouteInspectFailure(
+            route=route,
+            category=classify_error(last_exc, resource_kind="service"),
+            message=repr(last_exc),
+        )
+
+    @classmethod
     def _inspect_existing_routes(
         cls,
         *,
         active_routes: Sequence[InfoCenterServiceRoute],
         timeout_sec: float,
-    ) -> List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]]:
+    ) -> Tuple[List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]], List[_ExistingRouteInspectFailure]]:
         out: List[Tuple[InfoCenterServiceRoute, pb2.ServiceStatusInfo]] = []
-        failures: Dict[str, str] = {}
+        failures: List[_ExistingRouteInspectFailure] = []
         http_only_routes: Dict[str, str] = {}
         for route in active_routes:
             route_key = _node_instance_key_from_route(route)
@@ -3688,22 +3904,17 @@ class Service(ServiceExecutionSession):
                     f"http_base_url={str(getattr(route, 'http_base_url', '') or '') or '-'}"
                 )
                 continue
-            client = _node_control_client(control_addr, timeout_sec=timeout_sec)
-            try:
-                info = client.get_service_status(service_id=route.service_id)
+            info, failure = cls._inspect_existing_route_status(route, timeout_sec=timeout_sec)
+            if info is not None:
                 out.append((route, info))
-            except Exception as exc:
-                failures[route_key] = repr(exc)
-            finally:
-                client.close()
+            if failure is not None:
+                failures.append(failure)
         if http_only_routes:
             raise RuntimeError(
                 "service_name already exists as startup/http-only service route; "
                 f"Service.deploy cannot inspect or reuse routes without control_addr: {http_only_routes}"
             )
-        if failures:
-            raise RuntimeError(f"failed to inspect existing active service routes: {failures}")
-        return out
+        return out, failures
 
     @classmethod
     def _reuse_existing_group(

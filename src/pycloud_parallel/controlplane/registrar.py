@@ -381,13 +381,14 @@ class NodeInfoCenterRegistrar:
         if close_lost:
             self._close_state_if_registration_lost(reason or "node_instance_id fenced")
         should_exit_or_restart = self.exit_on_fence and bool(exit_host)
+        fence_reason = f"{str(reason or 'node_instance_id fenced')} new_instance_required=True"
         if should_exit_or_restart and self.restart_on_fence:
             logger.warning(
                 "[Registrar] restarting NodeControl host after fence node_id=%s node_instance_id=%s delay_sec=%.3f reason=%s",
                 self.node_id,
                 self.node_instance_id,
                 self.exit_delay_sec,
-                str(reason or "node_instance_id fenced"),
+                fence_reason,
             )
             self._restart_callback(self.exit_delay_sec)
         elif should_exit_or_restart:
@@ -396,7 +397,7 @@ class NodeInfoCenterRegistrar:
                 self.node_id,
                 self.node_instance_id,
                 self.exit_delay_sec,
-                str(reason or "node_instance_id fenced"),
+                fence_reason,
             )
             self._exit_callback(self.exit_delay_sec)
         else:
@@ -404,7 +405,7 @@ class NodeInfoCenterRegistrar:
                 "[Registrar] NodeControl host exit after fence skipped node_id=%s node_instance_id=%s reason=%s",
                 self.node_id,
                 self.node_instance_id,
-                str(reason or "node_instance_id fenced"),
+                fence_reason,
             )
 
     def _self_fence_if_lease_expired(self, reason: str) -> bool:
