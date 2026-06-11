@@ -49,7 +49,7 @@ from pycloud_parallel.controlplane.node_object_http import (
     HttpNodeObjectClient,
     NodeObjectHttpApp,
 )
-from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
+from pycloud_parallel.controlplane.nodecontrol_state import CreateRequestStillCreating, NodeControlState
 from pycloud_parallel.controlplane.payload_transport import decode_payload_from_transport, decode_result_from_transport, encode_payload_for_transport
 from pycloud_parallel.controlplane.replica_client import NativeTaskPoolClient, ServiceSessionClient
 from pycloud_parallel.controlplane.serialization import (
@@ -558,6 +558,8 @@ class NodeControlHttpApp:
                 chunks=[blob],
                 create_request_id=str(payload.get("create_request_id", "") or ""),
             )
+        except CreateRequestStillCreating as exc:
+            return self._err(409, f"{exc.__class__.__name__}: {exc}")
         except Exception as exc:
             return self._err(400, f"{exc.__class__.__name__}: {exc}")
         self._notify()
@@ -602,6 +604,8 @@ class NodeControlHttpApp:
             )
         except ValueError as exc:
             return self._err(400, str(exc))
+        except CreateRequestStillCreating as exc:
+            return self._err(409, f"{exc.__class__.__name__}: {exc}")
         except Exception as exc:
             return self._err(500, repr(exc))
         self._notify()

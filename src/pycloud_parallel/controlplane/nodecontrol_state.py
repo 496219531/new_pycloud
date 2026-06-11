@@ -163,6 +163,7 @@ EXECUTOR_EVENT_DRAIN_BATCH_SIZE = 128
 SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
 TASK_POOL_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
 CREATE_REQUEST_WAIT_TIMEOUT_SEC = 300.0
+CREATE_REQUEST_MAX_RECORDS_PER_KIND = 200
 
 
 def _path(value: Any = ".") -> Path:
@@ -201,6 +202,10 @@ class _CreateRequestRecord:
     error: str = ""
     created_at_monotonic: float = field(default_factory=time.monotonic)
     updated_at_monotonic: float = field(default_factory=time.monotonic)
+
+
+class CreateRequestStillCreating(TimeoutError):
+    """Raised when a duplicate create request is still owned by the first caller."""
 
 
 def _create_request_fingerprint(kind: str, fields: Dict[str, object]) -> str:
@@ -778,6 +783,7 @@ class NodeControlState(NodeRuntimeBase):
         pool.lease_expire_at = stopped_at
         self._fail_task_pool_tasks_locked(pool, reason=pool.stop_reason, now=stopped_at)
         self._task_pool_zero_alive_counts.pop(str(pool.pool_id or ""), None)
+        self._drop_create_requests_for_resource_locked(kind="task_pool", resource_id=pool.pool_id)
         if stop_executor is not None and async_stop:
             executor_host, pool_id = stop_executor
             self._submit_stop_task_pool(executor_host, pool_id=pool_id, reason=pool.stop_reason)
@@ -2649,6 +2655,62 @@ class NodeControlState(NodeRuntimeBase):
             return self._task_pool_create_requests
         raise ValueError(f"unknown create request kind: {kind!r}")
 
+    def _create_request_resource_exists_locked(self, *, kind: str, resource_id: str) -> bool:
+        normalized_kind = str(kind or "").strip()
+        normalized_id = str(resource_id or "").strip()
+        if not normalized_id:
+            return False
+        if normalized_kind == "service":
+            session = self._services.get(normalized_id)
+            return bool(session is not None and session.status != pb2.SERVICE_STATUS_STOPPED)
+        if normalized_kind == "task_pool":
+            pool = self._task_pools.get(normalized_id)
+            return bool(pool is not None and str(pool.status or "").upper() != "STOPPED")
+        return False
+
+    def _prune_create_requests_locked(self, kind: str = "") -> None:
+        kinds = [str(kind or "").strip()] if str(kind or "").strip() else ["service", "task_pool"]
+        for current_kind in kinds:
+            table = self._create_request_table_locked(current_kind)
+            if not table:
+                continue
+            for request_id, record in list(table.items()):
+                if record.status == "SUCCEEDED":
+                    if not self._create_request_resource_exists_locked(kind=current_kind, resource_id=record.resource_id):
+                        table.pop(request_id, None)
+                        continue
+            overflow = len(table) - CREATE_REQUEST_MAX_RECORDS_PER_KIND
+            if overflow <= 0:
+                continue
+            removable = sorted(
+                (
+                    (rid, rec)
+                    for rid, rec in table.items()
+                    if rec.status != "CREATING"
+                ),
+                key=lambda item: float(item[1].updated_at_monotonic or item[1].created_at_monotonic or 0.0),
+            )
+            for request_id, _record in removable[:overflow]:
+                table.pop(request_id, None)
+            overflow = len(table) - CREATE_REQUEST_MAX_RECORDS_PER_KIND
+            if overflow <= 0:
+                continue
+            stale_creating = sorted(
+                table.items(),
+                key=lambda item: float(item[1].updated_at_monotonic or item[1].created_at_monotonic or 0.0),
+            )
+            for request_id, _record in stale_creating[:overflow]:
+                table.pop(request_id, None)
+
+    def _drop_create_requests_for_resource_locked(self, *, kind: str, resource_id: str) -> None:
+        normalized_id = str(resource_id or "").strip()
+        if not normalized_id:
+            return
+        table = self._create_request_table_locked(kind)
+        for request_id, record in list(table.items()):
+            if record.status == "SUCCEEDED" and str(record.resource_id or "").strip() == normalized_id:
+                table.pop(request_id, None)
+
     def _begin_create_request_locked(
         self,
         *,
@@ -2659,6 +2721,7 @@ class NodeControlState(NodeRuntimeBase):
         normalized_id = str(create_request_id or "").strip()
         if not normalized_id:
             return None, True
+        self._prune_create_requests_locked(kind)
         table = self._create_request_table_locked(kind)
         record = table.get(normalized_id)
         if record is None:
@@ -2690,6 +2753,7 @@ class NodeControlState(NodeRuntimeBase):
             record.resource_id = str(resource_id or "")
             record.error = ""
             record.updated_at_monotonic = time.monotonic()
+            self._prune_create_requests_locked(kind)
             self._cv.notify_all()
 
     def _fail_create_request(
@@ -2711,6 +2775,7 @@ class NodeControlState(NodeRuntimeBase):
                 record.status = "FAILED"
                 record.error = repr(error)
                 record.updated_at_monotonic = time.monotonic()
+                self._prune_create_requests_locked(kind)
                 self._cv.notify_all()
 
     def _wait_for_create_request_result(
@@ -2741,7 +2806,7 @@ class NodeControlState(NodeRuntimeBase):
                     raise RuntimeError(f"{kind} create_request_id failed: {record.error or 'unknown error'}")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(f"{kind} create_request_id still creating")
+                    raise CreateRequestStillCreating(f"{kind} create_request_id still creating")
                 self._cv.wait(timeout=min(1.0, remaining))
 
     def create_service(
@@ -3767,6 +3832,7 @@ class NodeControlState(NodeRuntimeBase):
         session.failure_at = stopped_at
         session.lease_expire_at = stopped_at
         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
+        self._drop_create_requests_for_resource_locked(kind="service", resource_id=session.service_id)
         if stop_executor is None:
             return None
         executor_host, service_id, stop_reason = stop_executor

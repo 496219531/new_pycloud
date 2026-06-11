@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient, NodeControlHttpServer
-from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
+from pycloud_parallel.controlplane.node_control_http import HttpNodeControlClient, NodeControlHttpServer, _message_to_dict
+from pycloud_parallel.controlplane.nodecontrol_state import CreateRequestStillCreating, NodeControlState
 from pycloud_parallel.controlplane.serialization import encode_transport_payload_bytes
 from pycloud_parallel.controlplane.serialization import dict_to_struct, struct_to_dict
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
@@ -268,6 +269,97 @@ def test_http_create_taskpool_request_id_is_idempotent(tmp_path):
             assert second.pool_id == first.pool_id
             assert second.pool_token == first.pool_token
             assert len(state.task_pool_reports()) == 1
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_service_still_creating_returns_409(tmp_path):
+    server, state = _start_http_node(tmp_path)
+
+    def _still_creating(**_kwargs):
+        raise CreateRequestStillCreating("service create_request_id still creating")
+
+    state.create_service = _still_creating
+    meta = pb2.CreateServiceMeta(
+        owner_client_id="owner-http-create-wait",
+        service_name="svc-http-create-wait",
+        sha256="sha256:abc",
+        runtime="py3",
+        entry_module="svc_http_create_wait",
+        entry_callable="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        package_format="py",
+    )
+    payload = {
+        "meta": _message_to_dict(meta),
+        "code_b64": base64.b64encode(b"def run(**_kwargs):\n    return {'ok': True}\n").decode("ascii"),
+        "create_request_id": "http-service-still-creating-1",
+    }
+    try:
+        req = Request(
+            f"{server.base_url}/services",
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            data=json.dumps(payload).encode("utf-8"),
+        )
+        try:
+            urlopen(req, timeout=5.0)
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 409
+            assert body["ok"] is False
+            assert "still creating" in body["error"]
+        else:
+            raise AssertionError("expected HTTP 409")
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_taskpool_still_creating_returns_409(tmp_path):
+    server, state = _start_http_node(tmp_path)
+
+    def _still_creating(**_kwargs):
+        raise CreateRequestStillCreating("task_pool create_request_id still creating")
+
+    state.create_task_pool = _still_creating
+    meta = pb2.CreateTaskPoolMeta(
+        owner_client_id="owner-http-create-wait",
+        pool_name="pool-http-create-wait",
+        sha256="sha256:abc",
+        runtime="py3",
+        entry_module="pool_http_create_wait",
+        entry_callable="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        package_format="py",
+    )
+    payload = {
+        "meta": _message_to_dict(meta),
+        "code_b64": base64.b64encode(b"def run(**_kwargs):\n    return {'ok': True}\n").decode("ascii"),
+        "create_request_id": "http-taskpool-still-creating-1",
+    }
+    try:
+        req = Request(
+            f"{server.base_url}/taskpools",
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            data=json.dumps(payload).encode("utf-8"),
+        )
+        try:
+            urlopen(req, timeout=5.0)
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            assert exc.code == 409
+            assert body["ok"] is False
+            assert "still creating" in body["error"]
+        else:
+            raise AssertionError("expected HTTP 409")
     finally:
         server.stop()
         state.close()

@@ -51,6 +51,7 @@ from pycloud_parallel.controlplane.node.results import (
     _resolve_single_data_ref,
 )
 from pycloud_parallel.controlplane.pickle_stable_v1 import stable_pickle_loads
+from pycloud_parallel.controlplane import nodecontrol_state as nodecontrol_state_mod
 from pycloud_parallel.controlplane.nodecontrol_state import NodeControlState
 from pycloud_parallel.controlplane.replica_client import ServiceSessionClient
 from pycloud_parallel.controlplane.serialization import (
@@ -500,6 +501,131 @@ def test_task_pool_create_request_id_rejects_fingerprint_collision(tmp_path):
                 chunks=[blob],
                 create_request_id="create-request-collision-1",
             )
+    finally:
+        state.close()
+
+
+def test_task_pool_failed_create_request_id_is_pruned_only_by_capacity(tmp_path, monkeypatch):
+    monkeypatch.setattr(nodecontrol_state_mod, "CREATE_REQUEST_MAX_RECORDS_PER_KIND", 3)
+    state = NodeControlState(
+        node_id="node-pool-create-failed-capacity",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_create_failed_capacity"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        task_pool_worker_capacity=1,
+    )
+    fail_create = True
+    create_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **_kwargs):
+            return {"ok": True, "methods": {"run": ("run", "")}}
+
+        def create_task_pool(self, **kwargs):
+            create_calls.append(kwargs)
+            if fail_create:
+                raise RuntimeError("temporary create failure")
+
+        def preload_pool(self, **_kwargs):
+            return 1
+
+        def stop_task_pool(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        kwargs = dict(
+            owner_client_id="owner-idem",
+            pool_name="pool-idem-failed-capacity",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_idem_failed_capacity",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="create-request-failed-capacity-1",
+        )
+
+        with pytest.raises(RuntimeError, match="temporary create failure"):
+            state.create_task_pool(**kwargs)
+        with pytest.raises(RuntimeError, match="create_request_id failed"):
+            state.create_task_pool(**kwargs)
+
+        assert len(create_calls) == 1
+        base_record = state._task_pool_create_requests["create-request-failed-capacity-1"]  # noqa: SLF001
+        base_record.updated_at_monotonic = 1.0
+        with state._lock:  # noqa: SLF001
+            for index in range(3):
+                state._task_pool_create_requests[f"extra-failed-{index}"] = nodecontrol_state_mod._CreateRequestRecord(  # noqa: SLF001
+                    kind="task_pool",
+                    fingerprint=f"extra-{index}",
+                    status="FAILED",
+                    error="extra failure",
+                    updated_at_monotonic=10.0 + index,
+                )
+        fail_create = False
+        pool = state.create_task_pool(**kwargs)
+
+        assert pool.pool_name == "pool-idem-failed-capacity"
+        assert len(create_calls) == 2
+        assert state._task_pool_create_requests["create-request-failed-capacity-1"].status == "SUCCEEDED"  # noqa: SLF001
+        assert len(state._task_pool_create_requests) <= 3  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_task_pool_succeeded_create_request_id_is_removed_when_pool_stops(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-create-stop-prune",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_create_stop_prune"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-idem",
+            pool_name="pool-idem-stop-prune",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_idem_stop_prune",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="create-request-stop-prune-1",
+        )
+
+        assert "create-request-stop-prune-1" in state._task_pool_create_requests  # noqa: SLF001
+        state.close_task_pool(
+            owner_client_id="owner-idem",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            reason="test close",
+        )
+
+        assert "create-request-stop-prune-1" not in state._task_pool_create_requests  # noqa: SLF001
     finally:
         state.close()
 
@@ -3708,6 +3834,72 @@ def test_service_create_request_id_rejects_fingerprint_collision(tmp_path):
         state.create_service(**kwargs)
         with pytest.raises(RuntimeError, match="create_request_id collision"):
             state.create_service(**{**kwargs, "worker_count": 2})
+    finally:
+        state.close()
+
+
+def test_service_succeeded_create_request_id_is_removed_when_service_stops(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-create-stop-prune",
+        queue_capacity=4,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_service_create_stop_prune"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        service_worker_capacity=2,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **_kwargs):
+            return {"ok": True, "methods": {"serve": ("serve", "")}}
+
+        def create_service(self, **_kwargs):
+            pass
+
+        def preload_service(self, **_kwargs):
+            return 1
+
+        def stop_service(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-service",
+            service_name="svc-idem-stop-prune",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_idem_stop_prune",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-create-request-stop-prune-1",
+        )
+
+        assert "service-create-request-stop-prune-1" in state._service_create_requests  # noqa: SLF001
+        state.end_service(
+            owner_client_id="owner-service",
+            service_id=session.service_id,
+            service_token=session.service_token,
+            reason="test close",
+        )
+
+        assert "service-create-request-stop-prune-1" not in state._service_create_requests  # noqa: SLF001
     finally:
         state.close()
 
