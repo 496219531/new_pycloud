@@ -1544,6 +1544,7 @@ class InfoCenterHttpServer:
                         )
                         return
                     metrics_raw = payload.get("metrics") or {}
+                    inventory_included = _coerce_bool(payload.get("inventory_included", True), default=True)
                     node = state.heartbeat_record(
                         node_instance_id=node_instance_id,
                         node_id=str(payload.get("node_id", "")).strip(),
@@ -1557,10 +1558,14 @@ class InfoCenterHttpServer:
                             mem_percent=float(metrics_raw.get("mem_percent", 0.0) or 0.0),
                         ),
                         metadata=dict(payload.get("metadata") or {}),
-                        services=_parse_services(payload.get("services")),
-                        task_pools=_parse_task_pools(payload.get("task_pools")),
+                        services=_parse_services(payload.get("services")) if inventory_included else None,
+                        task_pools=_parse_task_pools(payload.get("task_pools")) if inventory_included else None,
                         python_version=str(payload.get("python_version", "") or ""),
-                        active_runtimes=[str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()],
+                        active_runtimes=(
+                            [str(x).strip() for x in (payload.get("active_runtimes") or []) if str(x).strip()]
+                            if inventory_included
+                            else None
+                        ),
                         service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
                         service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
                         task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),

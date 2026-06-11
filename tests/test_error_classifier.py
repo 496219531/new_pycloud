@@ -56,7 +56,7 @@ def test_classify_error_categories(message, resource_kind, expected):
 @pytest.mark.parametrize(
     "error",
     [
-        TimeoutError("heartbeat pending for 3.000s"),
+        TimeoutError("heartbeat pending queued_wait_sec=0.000 rpc_running_sec=3.000"),
         ConnectionResetError(10054, "connection reset"),
         URLError(ConnectionRefusedError("temporarily unavailable")),
     ],

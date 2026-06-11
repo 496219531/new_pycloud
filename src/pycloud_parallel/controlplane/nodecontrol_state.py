@@ -300,6 +300,7 @@ class NodeControlState(NodeRuntimeBase):
         self._artifact_method_cache: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str], Dict[str, Tuple[str, str]]] = {}
         self._code_last_at_touch_lock = threading.Lock()
         self._code_last_at_touch_times: Dict[str, float] = {}
+        self._executor_rebuild_in_progress = False
 
         # 检测并保存当前 Python 版本
         self._python_version = f"py{sys.version_info.major}.{sys.version_info.minor}"
@@ -675,9 +676,54 @@ class NodeControlState(NodeRuntimeBase):
 
         def _stop() -> None:
             try:
+                self._wait_until_nodecontrol_lock_released(operation="stop_task_pool")
                 executor_host.stop_task_pool(pool_id=normalized, reason=stop_reason)
             except Exception:
                 logger.exception("[NodeControl] async stop_task_pool failed pool_id=%s", normalized)
+
+        try:
+            self._cleanup_executor.submit(_stop)
+        except RuntimeError:
+            _stop()
+
+    def _wait_until_nodecontrol_lock_released(self, *, operation: str, timeout_sec: float = 2.0) -> None:
+        started_at = time.perf_counter()
+        while self._lock.locked() and not self._stop_event.is_set():
+            if time.perf_counter() - started_at >= max(0.0, float(timeout_sec)):
+                logger.warning(
+                    "nodecontrol deferred executor operation still waiting for lock operation=%s wait_sec=%.3f",
+                    str(operation or ""),
+                    time.perf_counter() - started_at,
+                )
+                return
+            time.sleep(0.001)
+
+    def _submit_stop_service(self, executor_host: ExecutorBackend, *, service_id: str, reason: str = "") -> None:
+        normalized = str(service_id or "").strip()
+        if not normalized:
+            return
+        stop_reason = str(reason or "").strip()
+
+        def _stop() -> None:
+            try:
+                self._wait_until_nodecontrol_lock_released(operation="stop_service")
+                executor_host.stop_service(service_id=normalized, reason=stop_reason)
+                with self._lock:
+                    self._clear_deploy_health_block_locked(
+                        source="service cleanup failed",
+                        resource_kind="service",
+                        resource_id=normalized,
+                    )
+            except Exception as exc:
+                reason_text = f"service_id={normalized} reason={exc!r}"
+                with self._lock:
+                    self._set_deploy_health_block_locked(
+                        reason_text,
+                        source="service cleanup failed",
+                        resource_kind="service",
+                        resource_id=normalized,
+                    )
+                logger.exception("[NodeControl] %s", reason_text)
 
         try:
             self._cleanup_executor.submit(_stop)
@@ -1173,6 +1219,71 @@ class NodeControlState(NodeRuntimeBase):
     def _executor_host_alive_locked(self) -> bool:
         return self._executor_host is not None and self._executor_host.is_alive()
 
+    def _log_nodecontrol_slow_path(
+        self,
+        *,
+        operation: str,
+        started_at: float,
+        lock_wait_sec: float = 0.0,
+        lock_held_sec: float = 0.0,
+        executor_rpc_sec: float = 0.0,
+        artifact_prepare_sec: float = 0.0,
+        extra: str = "",
+    ) -> None:
+        total_sec = time.perf_counter() - started_at
+        if (
+            total_sec < HEARTBEAT_TOTAL_LOG_SEC
+            and lock_wait_sec < HEARTBEAT_LOCK_WAIT_LOG_SEC
+            and lock_held_sec < HEARTBEAT_LOCK_WAIT_LOG_SEC
+            and executor_rpc_sec < HEARTBEAT_TOTAL_LOG_SEC
+            and artifact_prepare_sec < HEARTBEAT_TOTAL_LOG_SEC
+        ):
+            return
+        logger.warning(
+            "nodecontrol slow path operation=%s node_id=%s node_instance_id=%s total_sec=%.3f "
+            "lock_wait_sec=%.3f lock_held_sec=%.3f executor_rpc_sec=%.3f artifact_prepare_sec=%.3f %s",
+            str(operation or ""),
+            self.node_id,
+            self.node_instance_id,
+            total_sec,
+            max(0.0, float(lock_wait_sec or 0.0)),
+            max(0.0, float(lock_held_sec or 0.0)),
+            max(0.0, float(executor_rpc_sec or 0.0)),
+            max(0.0, float(artifact_prepare_sec or 0.0)),
+            str(extra or ""),
+        )
+
+    def _executor_restore_targets_locked(self) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+        services: List[Dict[str, object]] = []
+        for session in self._services.values():
+            if session.status != pb2.SERVICE_STATUS_RUNNING or not session.executor_ready:
+                continue
+            services.append(
+                {
+                    "session": session,
+                    "service_id": session.service_id,
+                    "worker_count": int(session.worker_count),
+                    "code_version": session.code_version,
+                    "managed_global_names": tuple(session.managed_global_names or ()),
+                    "artifact": self._get_live_code_artifact_locked(session.code_version),
+                }
+            )
+        pools: List[Dict[str, object]] = []
+        for pool in self._task_pools.values():
+            if not pool.is_running() or not pool.executor_ready:
+                continue
+            pools.append(
+                {
+                    "pool": pool,
+                    "pool_id": pool.pool_id,
+                    "worker_count": int(pool.worker_count),
+                    "code_version": pool.code_version,
+                    "managed_global_names": tuple(pool.managed_global_names or ()),
+                    "artifact": self._get_live_code_artifact_locked(pool.code_version),
+                }
+            )
+        return services, pools
+
     def _delete_object_artifact_locked(self, object_id: str) -> None:
         artifact = self._objects.pop(object_id, None)
         if artifact is None:
@@ -1226,44 +1337,110 @@ class NodeControlState(NodeRuntimeBase):
             self._delete_object_artifact_locked(normalized)
         return True
 
-    def _ensure_executor_host_alive_locked(self, *, now: Optional[datetime] = None) -> bool:
+    def _ensure_executor_host_alive(self, *, now: Optional[datetime] = None) -> bool:
         if not self._executor_host_required():
             return False
-        if self._executor_host_alive_locked():
-            return False
-
         current_time = now or utc_now()
-        old_host = self._executor_host
-        try:
-            self._executor_host = self._create_executor_backend()
-        except Exception as exc:
-            self._set_deploy_health_block_locked(repr(exc), source="executor host create failed")
-            raise
+        with self._lock:
+            if not self._executor_host_required() or self._executor_host_alive_locked():
+                return False
+            if self._executor_rebuild_in_progress:
+                return False
+            old_host = self._executor_host
+            service_targets, pool_targets = self._executor_restore_targets_locked()
+            self._executor_host = None
+            self._executor_rebuild_in_progress = True
 
+        create_started_at = time.perf_counter()
+        try:
+            new_host = self._create_executor_backend()
+        except Exception as exc:
+            with self._lock:
+                self._executor_rebuild_in_progress = False
+                if self._executor_host is None:
+                    self._executor_host = old_host
+                self._set_deploy_health_block_locked(repr(exc), source="executor host create failed")
+                self._cv.notify_all()
+            raise
+        executor_create_sec = time.perf_counter() - create_started_at
+
+        service_results: List[Tuple[Dict[str, object], Optional[Exception]]] = []
+        pool_results: List[Tuple[Dict[str, object], Optional[Exception]]] = []
+        artifact_prepare_sec = 0.0
         rebuild_failures = 0
-        for session in self._services.values():
-            if session.status != pb2.SERVICE_STATUS_RUNNING or not session.executor_ready:
-                continue
+        for target in service_targets:
             try:
-                artifact = self._get_live_code_artifact_locked(session.code_version)
+                artifact = target.get("artifact")
                 if artifact is None:
                     raise KeyError("code artifact not found")
+                prepare_started_at = time.perf_counter()
                 self._ensure_artifact_ready(
                     artifact,
                     dependency_policy_mode=artifact.dependency_policy_mode,
                     dependency_allowlist=artifact.dependency_allowlist,
-                    managed_global_names=session.managed_global_names,
+                    managed_global_names=target.get("managed_global_names", ()),
                     prepare_scope="service",
-                    prepare_key=session.service_id,
+                    prepare_key=str(target.get("service_id", "") or ""),
                 )
-                self._executor_host.create_service(
-                    service_id=session.service_id,
-                    worker_count=session.worker_count,
+                artifact_prepare_sec += time.perf_counter() - prepare_started_at
+                new_host.create_service(
+                    service_id=str(target.get("service_id", "") or ""),
+                    worker_count=int(target.get("worker_count", 0) or 0),
                 )
-                session.alive_workers = session.worker_count
-                session.degraded = False
             except Exception as exc:
                 rebuild_failures += 1
+                service_results.append((target, exc))
+            else:
+                service_results.append((target, None))
+        for target in pool_targets:
+            try:
+                artifact = target.get("artifact")
+                if artifact is None:
+                    raise KeyError("code artifact not found")
+                prepare_started_at = time.perf_counter()
+                self._ensure_artifact_ready(
+                    artifact,
+                    dependency_policy_mode=artifact.dependency_policy_mode,
+                    dependency_allowlist=artifact.dependency_allowlist,
+                    managed_global_names=target.get("managed_global_names", ()),
+                    prepare_scope="pool",
+                    prepare_key=str(target.get("pool_id", "") or ""),
+                )
+                artifact_prepare_sec += time.perf_counter() - prepare_started_at
+                new_host.create_task_pool(
+                    pool_id=str(target.get("pool_id", "") or ""),
+                    worker_count=int(target.get("worker_count", 0) or 0),
+                )
+            except Exception as exc:
+                rebuild_failures += 1
+                pool_results.append((target, exc))
+            else:
+                pool_results.append((target, None))
+
+        if old_host is not None:
+            try:
+                old_host.close()
+            except Exception:
+                pass
+
+        with self._lock:
+            if self.execution_fenced:
+                with contextlib.suppress(Exception):
+                    new_host.close()
+                self._executor_rebuild_in_progress = False
+                self._cv.notify_all()
+                return False
+            self._executor_host = new_host
+            for target, exc in service_results:
+                session = target.get("session")
+                service_id = str(target.get("service_id", "") or "")
+                if self._services.get(service_id) is not session:
+                    continue
+                assert isinstance(session, ServiceSession)
+                if exc is None:
+                    session.alive_workers = session.worker_count
+                    session.degraded = False
+                    continue
                 session.executor_ready = False
                 session.alive_workers = 0
                 session.degraded = False
@@ -1271,49 +1448,46 @@ class NodeControlState(NodeRuntimeBase):
                 session.stop_reason = f"executor host restart failed: {exc!r}"
                 session.failure_at = current_time
                 session.lease_expire_at = current_time
-        for pool in self._task_pools.values():
-            if not pool.is_running() or not pool.executor_ready:
-                continue
-            try:
-                artifact = self._get_live_code_artifact_locked(pool.code_version)
-                if artifact is None:
-                    raise KeyError("code artifact not found")
-                self._ensure_artifact_ready(
-                    artifact,
-                    dependency_policy_mode=artifact.dependency_policy_mode,
-                    dependency_allowlist=artifact.dependency_allowlist,
-                    managed_global_names=pool.managed_global_names,
-                    prepare_scope="pool",
-                    prepare_key=pool.pool_id,
-                )
-                self._executor_host.create_task_pool(
-                    pool_id=pool.pool_id,
-                    worker_count=pool.worker_count,
-                )
-                pool.alive_workers = pool.worker_count
-            except Exception as exc:
-                rebuild_failures += 1
+            for target, exc in pool_results:
+                pool = target.get("pool")
+                pool_id = str(target.get("pool_id", "") or "")
+                if self._task_pools.get(pool_id) is not pool:
+                    continue
+                assert isinstance(pool, TaskPoolState)
+                if exc is None:
+                    pool.alive_workers = pool.worker_count
+                    continue
                 pool.executor_ready = False
                 pool.alive_workers = 0
                 pool.status = "STOPPED"
                 pool.stop_reason = f"executor host restart failed: {exc!r}"
                 pool.failure_at = current_time
                 pool.lease_expire_at = current_time
-
-        if old_host is not None:
-            try:
-                old_host.close()
-            except Exception:
-                pass
-        if rebuild_failures:
-            self._set_deploy_health_block_locked(
-                f"resource restore failures: {rebuild_failures}",
-                source="executor host rebuilt",
+            if rebuild_failures:
+                self._set_deploy_health_block_locked(
+                    f"resource restore failures: {rebuild_failures}",
+                    source="executor host rebuilt",
+                )
+            else:
+                self._clear_deploy_health_block_locked(source="executor host create failed")
+                self._clear_deploy_health_block_locked(source="executor host crashed")
+                self._clear_deploy_health_block_locked(source="executor host rebuilt")
+            self._executor_rebuild_in_progress = False
+            self._cv.notify_all()
+        total_sec = time.perf_counter() - create_started_at
+        if total_sec >= HEARTBEAT_TOTAL_LOG_SEC:
+            logger.warning(
+                "executor host rebuild slow node_id=%s node_instance_id=%s total_sec=%.3f "
+                "executor_rpc_sec=%.3f artifact_prepare_sec=%.3f restored_services=%s restored_task_pools=%s failures=%s",
+                self.node_id,
+                self.node_instance_id,
+                total_sec,
+                executor_create_sec,
+                artifact_prepare_sec,
+                len(service_targets),
+                len(pool_targets),
+                rebuild_failures,
             )
-        else:
-            self._clear_deploy_health_block_locked(source="executor host create failed")
-            self._clear_deploy_health_block_locked(source="executor host crashed")
-            self._clear_deploy_health_block_locked(source="executor host rebuilt")
         return True
 
     def get_object_artifact(self, object_id: str) -> ObjectArtifact:
@@ -2321,6 +2495,7 @@ class NodeControlState(NodeRuntimeBase):
         )
         with self._lock:
             self._services[service_id] = session
+        self.request_infocenter_sync()
 
     def _remember_failed_task_pool_create(
         self,
@@ -2362,6 +2537,7 @@ class NodeControlState(NodeRuntimeBase):
         )
         with self._lock:
             self._task_pools[pool_id] = pool
+        self.request_infocenter_sync()
 
     def _reserve_worker_slots_for_create(
         self,
@@ -2373,6 +2549,7 @@ class NodeControlState(NodeRuntimeBase):
         exhausted_message: str,
         now: datetime,
     ) -> Tuple[int, Any]:
+        self._ensure_executor_host_alive(now=now)
         with self._lock:
             reserved_workers = max(0, int(getattr(self, reserved_attr, 0) or 0))
             available_workers = max(0, int(capacity) - int(active_worker_count + reserved_workers))
@@ -2380,7 +2557,6 @@ class NodeControlState(NodeRuntimeBase):
                 raise RuntimeError(exhausted_message)
             actual_workers = min(max(1, int(requested_workers or 1)), available_workers)
             setattr(self, reserved_attr, reserved_workers + actual_workers)
-            self._ensure_executor_host_alive_locked(now=now)
             executor_host = self._executor_host
         if executor_host is None:
             self._release_reserved_worker_slots(reserved_attr=reserved_attr, reserved=actual_workers)
@@ -2641,6 +2817,7 @@ class NodeControlState(NodeRuntimeBase):
                 self._services[service_id] = session
                 self._service_zero_alive_counts.pop(service_id, None)
             self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
+            self.request_infocenter_sync()
             return session
         except Exception as exc:
             self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
@@ -2887,6 +3064,7 @@ class NodeControlState(NodeRuntimeBase):
                     managed_global_names=pool.managed_global_names,
                 )
             self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
+            self.request_infocenter_sync()
             return pool
         except Exception:
             self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
@@ -3165,6 +3343,7 @@ class NodeControlState(NodeRuntimeBase):
         if stop_executor is not None:
             executor_host, closed_pool_id, closed_reason = stop_executor
             self._submit_stop_task_pool(executor_host, pool_id=closed_pool_id, reason=closed_reason)
+        self.request_infocenter_sync()
         return closed_pool
 
     def cancel_pool_job(
@@ -3315,12 +3494,22 @@ class NodeControlState(NodeRuntimeBase):
             return session
 
     def _stop_service_locked(self, session: ServiceSession, *, reason: str) -> None:
-        self._stop_service_resource_locked(session, reason=reason)
+        self._stop_service_resource_locked(session, reason=reason, async_stop=True)
+        self.request_infocenter_sync()
 
-    def _stop_service_resource_locked(self, session: ServiceSession, *, reason: str) -> None:
+    def _stop_service_resource_locked(
+        self,
+        session: ServiceSession,
+        *,
+        reason: str,
+        async_stop: bool = True,
+    ) -> Optional[Tuple[ExecutorBackend, str, str]]:
         if session.status == pb2.SERVICE_STATUS_STOPPED:
-            return
+            return None
         stop_reason = str(reason or "owner requested").strip() or "owner requested"
+        stop_executor = None
+        if self._executor_host is not None and session.executor_ready:
+            stop_executor = (self._executor_host, str(session.service_id or ""), stop_reason)
         session.status = pb2.SERVICE_STATUS_DRAINING
         session.executor_ready = False
         session.stop_reason = stop_reason
@@ -3331,23 +3520,13 @@ class NodeControlState(NodeRuntimeBase):
         session.failure_at = stopped_at
         session.lease_expire_at = stopped_at
         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
-        if self._executor_host is not None:
-            try:
-                self._executor_host.stop_service(service_id=session.service_id, reason=stop_reason)
-                self._clear_deploy_health_block_locked(
-                    source="service cleanup failed",
-                    resource_kind="service",
-                    resource_id=session.service_id,
-                )
-            except Exception as exc:
-                reason_text = f"service_id={session.service_id} reason={exc!r}"
-                self._set_deploy_health_block_locked(
-                    reason_text,
-                    source="service cleanup failed",
-                    resource_kind="service",
-                    resource_id=session.service_id,
-                )
-                logger.exception("[NodeControl] %s", reason_text)
+        if stop_executor is None:
+            return None
+        executor_host, service_id, stop_reason = stop_executor
+        if async_stop:
+            self._submit_stop_service(executor_host, service_id=service_id, reason=stop_reason)
+            return None
+        return stop_executor
 
     def _recover_node_managed_service_locked(self, session: ServiceSession) -> bool:
         if self._executor_host is None:
@@ -3389,11 +3568,28 @@ class NodeControlState(NodeRuntimeBase):
             return False
 
     def _shutdown_all_services(self) -> None:
+        stop_executors: List[Tuple[ExecutorBackend, str, str]] = []
         with self._lock:
             sessions = list(self._services.values())
-        for session in sessions:
-            with self._lock:
-                self._stop_service_locked(session, reason=_resource_stop_reason("nodecontrol shutdown"))
+            for session in sessions:
+                stop_executor = self._stop_service_resource_locked(
+                    session,
+                    reason=_resource_stop_reason("nodecontrol shutdown"),
+                    async_stop=False,
+                )
+                if stop_executor is not None:
+                    stop_executors.append(stop_executor)
+        for executor_host, service_id, reason in stop_executors:
+            try:
+                executor_host.stop_service(service_id=service_id, reason=reason)
+                with self._lock:
+                    self._clear_deploy_health_block_locked(
+                        source="service cleanup failed",
+                        resource_kind="service",
+                        resource_id=service_id,
+                    )
+            except Exception:
+                pass
 
     def _shutdown_all_task_pools(self) -> None:
         stop_executors: List[Tuple[ExecutorBackend, str, str]] = []
@@ -3438,6 +3634,7 @@ class NodeControlState(NodeRuntimeBase):
         requested_method = str(method or "").strip()
         if not requested_method:
             return 400, {"ok": False, "error": "method is required"}
+        self._ensure_executor_host_alive()
         with self._lock:
             session = self._services.get(service_id)
             if session is None:
@@ -3451,7 +3648,6 @@ class NodeControlState(NodeRuntimeBase):
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
-            self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, self._service_stopped_error_payload(session, fallback="service executor stopped")
             session.request_count += 1
@@ -3688,6 +3884,7 @@ class NodeControlState(NodeRuntimeBase):
         requested_method = str(method or "").strip()
         if not requested_method:
             return 400, {"ok": False, "error": "method is required"}
+        self._ensure_executor_host_alive()
         with self._lock:
             session = self._services.get(service_id)
             if session is None:
@@ -3701,7 +3898,6 @@ class NodeControlState(NodeRuntimeBase):
             artifact = self._codes.get(session.code_version)
             if artifact is None:
                 return 500, {"ok": False, "error": "artifact missing"}
-            self._ensure_executor_host_alive_locked()
             if not session.executor_ready or self._executor_host is None:
                 return 409, self._service_stopped_error_payload(session, fallback="service executor stopped")
             session.request_count += 1
@@ -3916,7 +4112,11 @@ class NodeControlState(NodeRuntimeBase):
         values: Dict[str, Any],
         serialization_mode: str = "",
     ) -> Tuple[str, List[str]]:
+        started_at = time.perf_counter()
+        lock_wait_started_at = started_at
         with self._lock:
+            lock_wait_sec = time.perf_counter() - lock_wait_started_at
+            lock_held_started_at = time.perf_counter()
             session = self._services.get(service_id)
             if session is None:
                 raise KeyError("service not found")
@@ -3929,28 +4129,45 @@ class NodeControlState(NodeRuntimeBase):
             state = self._ensure_service_managed_globals_state_locked(session)
             if state is None:
                 raise ValueError("service artifact did not declare managed globals")
-            globals_digest, updated_names = self._update_managed_globals_state(
-                state,
-                values=values,
-                serialization_mode=serialization_mode,
-            )
-            session.managed_globals_scope_dir = state.scope_dir
-            session.managed_globals_digest = globals_digest
             executor_host = self._executor_host
             service_id = session.service_id
             worker_count = session.worker_count
+            method_name = next(iter(session.methods.keys()), artifact.entry_callable)
             service_executor_ready = bool(session.is_running() and session.executor_ready)
+            lock_held_sec = time.perf_counter() - lock_held_started_at
+        serialize_started_at = time.perf_counter()
+        globals_digest, updated_names = self._update_managed_globals_state(
+            state,
+            values=values,
+            serialization_mode=serialization_mode,
+        )
+        serialize_sec = time.perf_counter() - serialize_started_at
+        with self._lock:
+            current_session = self._services.get(service_id)
+            if current_session is session:
+                current_session.managed_globals_scope_dir = state.scope_dir
+                current_session.managed_globals_digest = globals_digest
         if artifact is None or executor_host is None or not service_executor_ready:
+            self._log_nodecontrol_slow_path(
+                operation="update_service_globals",
+                started_at=started_at,
+                lock_wait_sec=lock_wait_sec,
+                lock_held_sec=lock_held_sec,
+                artifact_prepare_sec=serialize_sec,
+                extra=f"service_id={service_id}",
+            )
             return globals_digest, updated_names
+        warmup_started_at = time.perf_counter()
         try:
             self._warmup_service_managed_globals(
                 artifact=artifact,
                 service_id=service_id,
                 worker_count=worker_count,
-                method_name=next(iter(session.methods.keys()), artifact.entry_callable),
+                method_name=method_name,
                 state=state,
                 globals_digest=globals_digest,
             )
+            executor_rpc_sec = time.perf_counter() - warmup_started_at
         except RuntimeError as exc:
             message = str(exc)
             if "service executor" not in message:
@@ -3960,10 +4177,20 @@ class NodeControlState(NodeRuntimeBase):
                 artifact=artifact,
                 service_id=service_id,
                 worker_count=worker_count,
-                method_name=next(iter(session.methods.keys()), artifact.entry_callable),
+                method_name=method_name,
                 state=state,
                 globals_digest=globals_digest,
             )
+            executor_rpc_sec = time.perf_counter() - warmup_started_at
+        self._log_nodecontrol_slow_path(
+            operation="update_service_globals",
+            started_at=started_at,
+            lock_wait_sec=lock_wait_sec,
+            lock_held_sec=lock_held_sec,
+            executor_rpc_sec=executor_rpc_sec,
+            artifact_prepare_sec=serialize_sec,
+            extra=f"service_id={service_id}",
+        )
         return globals_digest, updated_names
 
     def update_runtime_globals(
@@ -3976,10 +4203,14 @@ class NodeControlState(NodeRuntimeBase):
         values: Dict[str, Any],
         serialization_mode: str = "",
     ) -> Tuple[str, List[str]]:
+        started_at = time.perf_counter()
         normalized_client_id = str(client_id or "").strip()
         normalized_code_version = str(code_version or "").strip()
         normalized_runtime_key = str(runtime_key or normalized_code_version).strip() or normalized_code_version
+        lock_wait_started_at = started_at
         with self._lock:
+            lock_wait_sec = time.perf_counter() - lock_wait_started_at
+            lock_held_started_at = time.perf_counter()
             artifact = self._get_live_code_artifact_locked(normalized_code_version)
             if artifact is None:
                 raise KeyError("code artifact not found")
@@ -3999,32 +4230,50 @@ class NodeControlState(NodeRuntimeBase):
             )
             if state is None:
                 raise ValueError("task artifact did not declare managed globals")
-            globals_digest, updated_names = self._update_managed_globals_state(
-                state,
-                values=values,
-                serialization_mode=serialization_mode,
-            )
-            self._runtime_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = state
             executor_host = self._executor_host
             pool = self._task_pools.get(normalized_client_id)
+            pool_id = str(pool.pool_id or "") if pool is not None else ""
             if pool is not None:
-                pool.managed_globals_scope_dir = state.scope_dir
-                pool.managed_globals_digest = globals_digest
+                method_name = pool.task_method
+            else:
+                method_name = artifact.entry_callable
             worker_count = int(pool.worker_count if pool is not None else self.worker_capacity)
+            lock_held_sec = time.perf_counter() - lock_held_started_at
+        serialize_started_at = time.perf_counter()
+        globals_digest, updated_names = self._update_managed_globals_state(
+            state,
+            values=values,
+            serialization_mode=serialization_mode,
+        )
+        serialize_sec = time.perf_counter() - serialize_started_at
+        with self._lock:
+            self._runtime_managed_globals[(normalized_client_id, normalized_code_version, normalized_runtime_key)] = state
+            current_pool = self._task_pools.get(normalized_client_id)
+            if current_pool is pool and current_pool is not None:
+                current_pool.managed_globals_scope_dir = state.scope_dir
+                current_pool.managed_globals_digest = globals_digest
         if artifact is None or executor_host is None:
+            self._log_nodecontrol_slow_path(
+                operation="update_runtime_globals",
+                started_at=started_at,
+                lock_wait_sec=lock_wait_sec,
+                lock_held_sec=lock_held_sec,
+                artifact_prepare_sec=serialize_sec,
+                extra=f"client_id={normalized_client_id}",
+            )
             return globals_digest, updated_names
         warmup_started = time.monotonic()
         if pool is not None:
             self._warmup_pool_managed_globals(
                 artifact=artifact,
-                pool_id=pool.pool_id,
+                pool_id=pool_id,
                 worker_count=worker_count,
-                method_name=artifact.entry_callable,
+                method_name=method_name,
                 state=state,
                 globals_digest=globals_digest,
             )
             with self._lock:
-                current_pool = self._task_pools.get(pool.pool_id)
+                current_pool = self._task_pools.get(pool_id)
                 if current_pool is not None:
                     self._record_task_pool_lifecycle_timing_locked(
                         current_pool,
@@ -4036,7 +4285,7 @@ class NodeControlState(NodeRuntimeBase):
                 artifact,
                 object_dir=self._object_dir,
                 work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
-                method_name=artifact.entry_callable,
+                method_name=method_name,
                 payload={},
                 payload_mode="task_submit",
                 managed_globals_scope_dir=state.scope_dir,
@@ -4050,6 +4299,15 @@ class NodeControlState(NodeRuntimeBase):
                 worker_count=worker_count,
                 execute_spec=execute_spec,
             )
+        self._log_nodecontrol_slow_path(
+            operation="update_runtime_globals",
+            started_at=started_at,
+            lock_wait_sec=lock_wait_sec,
+            lock_held_sec=lock_held_sec,
+            executor_rpc_sec=time.monotonic() - warmup_started,
+            artifact_prepare_sec=serialize_sec,
+            extra=f"client_id={normalized_client_id}",
+        )
         return globals_digest, updated_names
 
     def _service_status_http(self, service_id: str) -> Tuple[int, Dict[str, object]]:
@@ -4195,7 +4453,13 @@ class NodeControlState(NodeRuntimeBase):
             )
         return out
 
-    def registrar_snapshot(self, *, include_stopped: bool = True, runtime_limit: int = 10) -> Dict[str, object]:
+    def registrar_snapshot(
+        self,
+        *,
+        include_stopped: bool = True,
+        runtime_limit: int = 10,
+        include_inventory: bool = True,
+    ) -> Dict[str, object]:
         with self._lock:
             service_rows = [
                 (session, self._service_inflight_locked(session))
@@ -4237,7 +4501,7 @@ class NodeControlState(NodeRuntimeBase):
                 for runtime_key, (running, queued_count, last_used) in runtime_stats.items()
             ]
             runtime_rows.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3]))
-            service_timing_metadata = self._collect_registrar_timing_metadata_locked()
+            service_timing_metadata = self._collect_registrar_timing_metadata_locked() if include_inventory else {}
             service_worker_used = active_service_workers + max(0, int(self._service_worker_reserved))
             task_pool_worker_used = active_task_pool_workers + max(0, int(self._task_pool_worker_reserved))
         return {
@@ -4245,20 +4509,21 @@ class NodeControlState(NodeRuntimeBase):
             "service_reports": [
                 _build_service_report_payload(session, in_flight=in_flight)
                 for session, in_flight in service_rows
-            ],
+            ] if include_inventory else [],
             "task_pool_reports": [
                 _build_task_pool_info(pool, in_flight=in_flight)
                 for pool, in_flight in task_pool_rows
-            ],
+            ] if include_inventory else [],
             "active_runtimes": [
                 runtime_key
                 for _running, _queued, _last_used, runtime_key in runtime_rows[: max(1, int(runtime_limit))]
-            ],
+            ] if include_inventory else [],
             "service_worker_capacity": self.service_worker_capacity,
             "service_worker_used": service_worker_used,
             "task_pool_worker_capacity": self.task_pool_worker_capacity,
             "task_pool_worker_used": task_pool_worker_used,
-            "service_timing_metadata": service_timing_metadata,
+            "service_timing_metadata": service_timing_metadata if include_inventory else {},
+            "inventory_included": bool(include_inventory),
             "execution_fenced": bool(getattr(self, "_execution_fenced", False)),
             "accept_service_deploy": self.can_accept_service_deploy,
             "deploy_health_reason": self.deploy_health_reason,
@@ -4281,11 +4546,12 @@ class NodeControlState(NodeRuntimeBase):
 
     def _drain_executor_events(self) -> None:
         drain_started_at = time.perf_counter()
+        self._ensure_executor_host_alive()
         with self._cv:
-            self._ensure_executor_host_alive_locked()
-            if self._executor_host is None:
-                return
-            events = self._executor_host.drain_events()
+            executor_host = self._executor_host
+        if executor_host is None:
+            return
+        events = executor_host.drain_events()
         if len(events) > EXECUTOR_EVENT_DRAIN_BATCH_SIZE:
             logger.warning(
                 "executor event drain batch large node_id=%s node_instance_id=%s event_count=%s batch_size=%s",
@@ -4450,8 +4716,7 @@ class NodeControlState(NodeRuntimeBase):
     def _dispatch_loop(self) -> None:
         while not self._stop_event.is_set():
             self._drain_executor_events()
-            with self._cv:
-                rebuilt = self._ensure_executor_host_alive_locked()
+            rebuilt = self._ensure_executor_host_alive()
             if rebuilt:
                 self._drain_executor_events()
             self._stop_event.wait(self.executor_poll_interval_sec)
@@ -4460,25 +4725,31 @@ class NodeControlState(NodeRuntimeBase):
         while not self._stop_event.wait(self.monitor_interval_sec):
             self._handle_service_timeouts()
 
-    def _refresh_resource_liveness_locked(self) -> None:
-        if self._executor_host is None:
-            return
+    def _fetch_resource_liveness(self) -> Tuple[Optional[Dict[Tuple[str, str], int]], Optional[str]]:
+        with self._lock:
+            executor_host = self._executor_host
+        if executor_host is None:
+            return None, None
         try:
-            if hasattr(self._executor_host, "resource_worker_liveness"):
-                liveness = self._executor_host.resource_worker_liveness()
+            if hasattr(executor_host, "resource_worker_liveness"):
+                liveness = executor_host.resource_worker_liveness()
             else:
                 liveness = {
                     ("service", str(service_id)): int(alive)
-                    for service_id, alive in self._executor_host.service_worker_liveness().items()
+                    for service_id, alive in executor_host.service_worker_liveness().items()
                 }
         except Exception as exc:
-            self._set_deploy_health_block_locked(repr(exc), source="service worker liveness failed")
             logger.warning(
                 "[NodeControl] service worker liveness probe failed node_id=%s node_instance_id=%s err=%r",
                 self.node_id,
                 self.node_instance_id,
                 exc,
             )
+            return None, repr(exc)
+        return liveness, None
+
+    def _apply_resource_liveness_locked(self, liveness: Dict[Tuple[str, str], int]) -> None:
+        if not liveness:
             return
         self._clear_deploy_health_block_locked(source="service worker liveness failed")
         seen_service_ids = {str(resource_id or "") for (kind, resource_id) in liveness.keys() if str(kind or "") == "service"}
@@ -4540,9 +4811,6 @@ class NodeControlState(NodeRuntimeBase):
                         pool.pool_name,
                         previous_alive,
                     )
-
-    def _refresh_service_worker_liveness_locked(self) -> None:
-        self._refresh_resource_liveness_locked()
 
     def _handle_service_resource_health_locked(self, session: ServiceSession, *, now: datetime) -> None:
         service_id = str(session.service_id or "")
@@ -4631,10 +4899,28 @@ class NodeControlState(NodeRuntimeBase):
         )
 
     def _handle_service_timeouts(self) -> None:
+        started_at = time.perf_counter()
         now = utc_now()
+        liveness_started_at = time.perf_counter()
+        liveness, liveness_error = self._fetch_resource_liveness()
+        executor_rpc_sec = time.perf_counter() - liveness_started_at
+        lock_wait_started_at = time.perf_counter()
         with self._lock:
-            self._refresh_resource_liveness_locked()
+            lock_wait_sec = time.perf_counter() - lock_wait_started_at
+            lock_held_started_at = time.perf_counter()
+            if liveness_error:
+                self._set_deploy_health_block_locked(liveness_error, source="service worker liveness failed")
+            elif liveness is not None:
+                self._apply_resource_liveness_locked(liveness)
             for session in self._services.values():
                 self._handle_service_resource_health_locked(session, now=now)
             for pool in self._task_pools.values():
                 self._handle_task_pool_resource_health_locked(pool, now=now)
+            lock_held_sec = time.perf_counter() - lock_held_started_at
+        self._log_nodecontrol_slow_path(
+            operation="handle_service_timeouts",
+            started_at=started_at,
+            lock_wait_sec=lock_wait_sec,
+            lock_held_sec=lock_held_sec,
+            executor_rpc_sec=executor_rpc_sec,
+        )

@@ -942,14 +942,18 @@ class InfoCenterState:
                 for svc in state.services.values()
                 if str(svc.service_name or "").strip()
             }
-            incoming_services, incoming_task_pools = self._with_failure_timestamps(
-                incoming_services=dict(services or {}),
-                incoming_task_pools=dict(task_pools or {}),
-                previous_state=state,
-                now=now,
-            )
-            state.services = incoming_services
-            state.task_pools = incoming_task_pools
+            inventory_updated = services is not None or task_pools is not None
+            if inventory_updated:
+                incoming_services, incoming_task_pools = self._with_failure_timestamps(
+                    incoming_services=dict(state.services if services is None else services),
+                    incoming_task_pools=dict(state.task_pools if task_pools is None else task_pools),
+                    previous_state=state,
+                    now=now,
+                )
+                if services is not None:
+                    state.services = incoming_services
+                if task_pools is not None:
+                    state.task_pools = incoming_task_pools
             if python_version:
                 state.python_version = str(python_version).strip()
             if active_runtimes is not None:
@@ -977,7 +981,8 @@ class InfoCenterState:
             if capability is not None:
                 state.capability = capability
             self._apply_profile_locked(state)
-            self._reindex_node_services_locked(state, previous_names=previous_service_names)
+            if services is not None:
+                self._reindex_node_services_locked(state, previous_names=previous_service_names)
             return state
 
     def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:

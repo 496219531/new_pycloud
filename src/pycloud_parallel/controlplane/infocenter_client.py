@@ -446,6 +446,7 @@ class InfoCenterClient:
         services: Optional[Sequence[object]] = None,
         task_pools: Optional[Sequence[Dict[str, object]]] = None,
         active_runtimes: Optional[Sequence[str]] = None,
+        inventory_included: bool = True,
         service_worker_capacity: int = 0,
         service_worker_used: int = 0,
         task_pool_worker_capacity: int = 0,
@@ -478,29 +479,36 @@ class InfoCenterClient:
                     "stop_reason": str(getattr(item, "stop_reason", "") or ""),
                 }
             )
+        payload = {
+            "node_id": node_id,
+            "node_instance_id": str(node_instance_id or "").strip(),
+            "healthy": bool(healthy),
+            "metrics": dict(metrics or {}),
+            "metadata": dict(metadata or {}),
+            "inventory_included": bool(inventory_included),
+            "python_version": str(python_version or "").strip(),
+            "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
+            "service_worker_used": max(0, int(service_worker_used or 0)),
+            "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
+            "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
+            "accept_service_deploy": bool(accept_service_deploy),
+            "capability": (capability or NodeCapability()).to_dict(),
+        }
+        if bool(inventory_included):
+            payload.update(
+                {
+                    "services": serialized_services,
+                    "task_pools": list(task_pools or []),
+                    "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
+                }
+            )
         return http_json_request(
             base_url=self.base_url,
             path="/nodes/heartbeat",
             method="POST",
             timeout_sec=self.timeout_sec,
             raise_on_error_response=False,
-            payload={
-                "node_id": node_id,
-                "node_instance_id": str(node_instance_id or "").strip(),
-                "healthy": bool(healthy),
-                "metrics": dict(metrics or {}),
-                "metadata": dict(metadata or {}),
-                "services": serialized_services,
-                "task_pools": list(task_pools or []),
-                "python_version": str(python_version or "").strip(),
-                "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],
-                "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
-                "service_worker_used": max(0, int(service_worker_used or 0)),
-                "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
-                "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
-                "accept_service_deploy": bool(accept_service_deploy),
-                "capability": (capability or NodeCapability()).to_dict(),
-            },
+            payload=payload,
         )
 
     def list_nodes(

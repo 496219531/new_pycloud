@@ -434,6 +434,55 @@ def test_list_service_routes_uses_service_name_index_for_filtered_lookup():
     assert visited == ["node-a-inst"]
 
 
+def test_infocenter_light_heartbeat_preserves_existing_inventory():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-light-inst",
+        node_id="node-light",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=16,
+        services={
+            "svc-light": NodeServiceState(
+                service_name="svc-light",
+                service_id="svc-light",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                http_base_url="http://127.0.0.1:18080/svc/svc-light",
+            )
+        },
+        task_pools={
+            "pool-light": NodeTaskPoolInfo(
+                pool_id="pool-light",
+                owner_client_id="owner",
+                pool_name="pool-light",
+                code_version="sha256:pool",
+                status="RUNNING",
+                worker_count=1,
+                alive_workers=1,
+            )
+        },
+        active_runtimes=["py3.11"],
+    )
+
+    node = info_state.heartbeat_record(
+        node_instance_id="node-light-inst",
+        node_id="node-light",
+        healthy=True,
+        services=None,
+        task_pools=None,
+        active_runtimes=None,
+        service_worker_used=1,
+        task_pool_worker_used=1,
+    )
+
+    assert node is not None
+    assert set(node.services) == {"svc-light"}
+    assert set(node.task_pools) == {"pool-light"}
+    assert node.active_runtimes == ["py3.11"]
+
+
 def test_ops_page_merges_duplicate_services_across_node_records_with_same_endpoint():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     for idx, instance_id in enumerate(("node-dup-a", "node-dup-b"), start=1):

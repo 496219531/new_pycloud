@@ -143,6 +143,7 @@ class NodeInfoCenterRegistrar:
         metadata: Optional[Dict[str, str]] = None,
         fallback_heartbeat_sec: int = 10,
         rpc_timeout_sec: float = 5.0,
+        inventory_sync_interval_sec: float = 30.0,
         exit_on_fence: Optional[bool] = None,
         exit_delay_sec: Optional[float] = None,
         exit_callback: Optional[Callable[[float], None]] = None,
@@ -162,6 +163,7 @@ class NodeInfoCenterRegistrar:
         self.metadata = dict(metadata or {})
         self.fallback_heartbeat_sec = max(1, int(fallback_heartbeat_sec))
         self.rpc_timeout_sec = max(0.5, float(rpc_timeout_sec))
+        self.inventory_sync_interval_sec = max(1.0, float(inventory_sync_interval_sec or 30.0))
         self.restart_on_fence = (
             _env_bool("PYCLOUD_NODE_RESTART_ON_FENCE", False)
             if restart_on_fence is None
@@ -182,6 +184,8 @@ class NodeInfoCenterRegistrar:
         self._next_hb_sec = self.fallback_heartbeat_sec
         self._lease_ttl_sec = max(self.fallback_heartbeat_sec * 3, self.fallback_heartbeat_sec + 1)
         self._last_successful_sync_at = 0.0
+        self._last_inventory_sync_at = 0.0
+        self._force_inventory_sync = True
         self._sync_lock = threading.RLock()
         self._closing = False
         self._state_closed_after_lost = False
@@ -193,6 +197,8 @@ class NodeInfoCenterRegistrar:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        if getattr(self.state, "_infocenter_registrar", None) is None:
+            setattr(self.state, "_infocenter_registrar", self)
         self._stop_event.clear()
         self._wake_event.clear()
         self._thread = threading.Thread(target=self._loop, name=f"node-registrar-{self.node_id}", daemon=True)
@@ -217,6 +223,8 @@ class NodeInfoCenterRegistrar:
             self._thread = None
         with self._sync_lock:
             self._client.close()
+        if getattr(self.state, "_infocenter_registrar", None) is self:
+            setattr(self.state, "_infocenter_registrar", None)
 
     def _mark_lost_before_close(self) -> None:
         with self._sync_lock:
@@ -239,7 +247,7 @@ class NodeInfoCenterRegistrar:
                 self.node_instance_id,
             )
         try:
-            self._heartbeat_once()
+            self._heartbeat_once(force_inventory=True)
         except Exception as exc:
             if _is_expected_connect_failure(exc):
                 logger.warning(
@@ -340,6 +348,8 @@ class NodeInfoCenterRegistrar:
             return False
 
     def request_sync(self) -> None:
+        with self._sync_lock:
+            self._force_inventory_sync = True
         self._wake_event.set()
 
     def _close_state_if_registration_lost(self, reason: str) -> None:
@@ -472,7 +482,7 @@ class NodeInfoCenterRegistrar:
         return True, detailed_reason, elapsed_since_success, lease_ttl
 
     def _register_once(self) -> bool:
-        snapshot = self.state.registrar_snapshot(include_stopped=True, runtime_limit=10)
+        snapshot = self.state.registrar_snapshot(include_stopped=True, runtime_limit=10, include_inventory=True)
         metadata = dict(self.metadata)
         metadata.update(snapshot.get("service_timing_metadata", {}))
         metadata["pycloud_version"] = self._pycloud_version()
@@ -553,6 +563,8 @@ class NodeInfoCenterRegistrar:
             self._next_hb_sec = max(1, int(resp.get("heartbeat_interval_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
             self._lease_ttl_sec = max(1, int(resp.get("lease_ttl_sec", self._lease_ttl_sec) or self._lease_ttl_sec))
             self._last_successful_sync_at = time.monotonic()
+            self._last_inventory_sync_at = self._last_successful_sync_at
+            self._force_inventory_sync = False
         logger.info(
             "[Registrar] node register node_id=%s node_instance_id=%s control_addr=%s hb=%s service_count=%d task_pool_count=%d",
             self.node_id,
@@ -564,8 +576,17 @@ class NodeInfoCenterRegistrar:
         )
         return True
 
-    def _heartbeat_once(self) -> bool:
-        snapshot = self.state.registrar_snapshot(include_stopped=True, runtime_limit=10)
+    def _heartbeat_once(self, *, force_inventory: bool = False) -> bool:
+        now_monotonic = time.monotonic()
+        with self._sync_lock:
+            include_inventory = bool(force_inventory) or bool(self._force_inventory_sync) or (
+                now_monotonic - float(self._last_inventory_sync_at or 0.0) >= self.inventory_sync_interval_sec
+            )
+        snapshot = self.state.registrar_snapshot(
+            include_stopped=True,
+            runtime_limit=10,
+            include_inventory=include_inventory,
+        )
         metrics = dict(snapshot.get("metrics") or {})
         metadata = dict(self.metadata)
         metadata.update(snapshot.get("service_timing_metadata", {}))
@@ -620,6 +641,7 @@ class NodeInfoCenterRegistrar:
             services=service_reports,
             task_pools=task_pools,
             active_runtimes=active_runtimes,
+            inventory_included=include_inventory,
             service_worker_capacity=self.state.service_worker_capacity,
             service_worker_used=int(snapshot.get("service_worker_used", 0) or 0),
             task_pool_worker_capacity=self.state.task_pool_worker_capacity,
@@ -652,6 +674,9 @@ class NodeInfoCenterRegistrar:
             self._next_hb_sec = max(1, int(resp.get("next_heartbeat_in_sec", self.fallback_heartbeat_sec) or self.fallback_heartbeat_sec))
             self._lease_ttl_sec = max(1, int(resp.get("lease_ttl_sec", self._lease_ttl_sec) or self._lease_ttl_sec))
             self._last_successful_sync_at = time.monotonic()
+            if include_inventory:
+                self._last_inventory_sync_at = self._last_successful_sync_at
+                self._force_inventory_sync = False
         return True
 
     def _loop(self) -> None:

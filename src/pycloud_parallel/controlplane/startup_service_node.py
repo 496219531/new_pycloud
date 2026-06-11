@@ -528,10 +528,23 @@ class StartupServiceNode(NodeControlState):
             *NodeControlState.service_report_payloads(self, include_stopped=include_stopped),
         ]
 
-    def registrar_snapshot(self, *, include_stopped: bool = True, runtime_limit: int = 10) -> dict[str, Any]:
-        snapshot = dict(NodeControlState.registrar_snapshot(self, include_stopped=include_stopped, runtime_limit=runtime_limit))
+    def registrar_snapshot(
+        self,
+        *,
+        include_stopped: bool = True,
+        runtime_limit: int = 10,
+        include_inventory: bool = True,
+    ) -> dict[str, Any]:
+        snapshot = dict(
+            NodeControlState.registrar_snapshot(
+                self,
+                include_stopped=include_stopped,
+                runtime_limit=runtime_limit,
+                include_inventory=include_inventory,
+            )
+        )
         snapshot["service_reports"] = [
-            *NodeRuntimeBase.startup_service_report_payloads(self),
+            *(NodeRuntimeBase.startup_service_report_payloads(self) if include_inventory else []),
             *list(snapshot.get("service_reports") or []),
         ]
         return snapshot

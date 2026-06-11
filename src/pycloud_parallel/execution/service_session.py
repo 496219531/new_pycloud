@@ -2234,7 +2234,12 @@ class Service(ServiceExecutionSession):
                         with contextlib.suppress(Exception):
                             client.close()
                         continue
-                    if not self._heartbeat_new_replica_before_activate(node_key, session):
+                if not self._heartbeat_new_replica_before_activate(node_key, session, activate=False):
+                    with contextlib.suppress(Exception):
+                        client.close()
+                    continue
+                with self._route_lock:
+                    if len(self._active_replica_snapshot()) >= desired:
                         with contextlib.suppress(Exception):
                             client.close()
                         continue
@@ -2245,6 +2250,7 @@ class Service(ServiceExecutionSession):
                     self.sessions[node_key] = session
                     self._clients[node_key] = client
                     self.nodes[node_key] = node
+                    self._mark_replica_heartbeat_success(node_key, session)
                     self.failures.pop(node_key, None)
                     self._breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1

@@ -750,6 +750,11 @@ class NodeRuntimeBase:
     def infocenter_registered(self) -> bool:
         return self._infocenter_registrar is not None
 
+    def request_infocenter_sync(self) -> None:
+        registrar = self._infocenter_registrar
+        if registrar is not None:
+            registrar.request_sync()
+
     def advertise_http_addr(self) -> str:
         parsed = urlparse(str(self.service_http_base_url or ""))
         if parsed.hostname and parsed.port:
@@ -884,17 +889,24 @@ class NodeRuntimeBase:
         del include_stopped
         return self.startup_service_report_payloads()
 
-    def registrar_snapshot(self, *, include_stopped: bool = True, runtime_limit: int = 10) -> Dict[str, object]:
+    def registrar_snapshot(
+        self,
+        *,
+        include_stopped: bool = True,
+        runtime_limit: int = 10,
+        include_inventory: bool = True,
+    ) -> Dict[str, object]:
         return {
             "metrics": self.metrics(),
-            "service_reports": self.service_report_payloads(include_stopped=include_stopped),
-            "task_pool_reports": list(self.task_pool_reports().values()),
-            "active_runtimes": self.active_runtime_keys(limit=runtime_limit),
+            "service_reports": self.service_report_payloads(include_stopped=include_stopped) if include_inventory else [],
+            "task_pool_reports": list(self.task_pool_reports().values()) if include_inventory else [],
+            "active_runtimes": self.active_runtime_keys(limit=runtime_limit) if include_inventory else [],
             "service_worker_capacity": self.service_worker_capacity,
             "service_worker_used": self.service_worker_used(),
             "task_pool_worker_capacity": self.task_pool_worker_capacity,
             "task_pool_worker_used": self.task_pool_worker_used(),
-            "service_timing_metadata": self.service_timing_metadata(),
+            "service_timing_metadata": self.service_timing_metadata() if include_inventory else {},
+            "inventory_included": bool(include_inventory),
         }
 
     def _mounted_service(self, service_id: str) -> Optional[StaticServiceMount]:

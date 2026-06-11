@@ -24,6 +24,15 @@ from pycloud_parallel.execution.service_session import Service
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _wait_until(predicate, *, timeout_sec: float = 2.0, interval_sec: float = 0.01) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval_sec)
+    return bool(predicate())
+
+
 def _build_service_entry_module(tmp_path, monkeypatch):
     package_name = "demo_service_pkg_entry"
     sys.modules.pop(package_name, None)
@@ -327,6 +336,92 @@ def test_service_compensation_attaches_each_replica_before_next_create_finishes(
     assert set(group.sessions) == {"node-inst-1", "node-inst-2"}
     assert heartbeats == ["node-inst-1", "node-inst-2"]
     assert [item[0] for item in created] == ["127.0.0.1:50061", "127.0.0.1:50062"]
+
+
+def test_service_compensation_initial_heartbeat_runs_outside_route_lock(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    node = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    group = Service(owner_client_id="owner-1", service_name="svc-demo", sessions={}, nodes={})
+    heartbeat_called = threading.Event()
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            node_instance_id = str(kwargs["expected_node_instance_id"])
+
+            def _heartbeat(**_kwargs):
+                assert not group._route_lock.locked()  # noqa: SLF001
+                heartbeat_called.set()
+                return SimpleNamespace(ok=True, accepted=True)
+
+            return SimpleNamespace(
+                service_id=f"svc-{node_instance_id}",
+                service_token="token",
+                http_base_url=f"http://{self.target}/svc/{node_instance_id}",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=_heartbeat,
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    assert group.try_compensate_replicas() == 1
+    assert heartbeat_called.is_set()
+    assert "node-inst-1" in group.sessions
+    assert "node-inst-1" in group._active_replica_snapshot()  # noqa: SLF001
 
 
 def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatch):
@@ -4533,6 +4628,209 @@ class TestOwnerServiceFacade:
                 time.sleep(0.02)
             assert replica.calls >= 1
         finally:
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_replica_log_context_does_not_probe_remote_status_by_default(self):
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            service_id = "svc-log-context"
+            service_name = "svc-log-context"
+            heartbeat_timeout_sec = 30
+            failed = False
+            last_error = "previous"
+
+            def lease(self):
+                return SimpleNamespace(last_heartbeat_at="local-hb", lease_expire_at="local-expire")
+
+            def get_status(self):
+                raise AssertionError("diagnostic context must not synchronously call get_status")
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+
+        context = group._replica_log_context("node-1", replica)  # noqa: SLF001
+
+        assert context["node_instance_id"] == "node-1"
+        assert context["service_id"] == "svc-log-context"
+        assert context["last_heartbeat_at"] == "local-hb"
+        assert "remote_status" not in context
+        assert "remote_status_error" not in context
+
+    def test_replica_log_context_can_probe_remote_status_when_debug_enabled(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            service_id = "svc-log-context-debug"
+            service_name = "svc-log-context-debug"
+            heartbeat_timeout_sec = 30
+            failed = False
+            last_error = ""
+
+            def lease(self):
+                return SimpleNamespace(last_heartbeat_at="local-hb", lease_expire_at="local-expire")
+
+            def get_status(self):
+                return SimpleNamespace(
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                    worker_count=2,
+                    task_count=0,
+                    service_name="svc-log-context-debug",
+                )
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+        group._heartbeat_remote_diagnostics = True  # noqa: SLF001
+
+        context = group._replica_log_context("node-1", replica)  # noqa: SLF001
+
+        assert context["remote_status"] == str(pb2.SERVICE_STATUS_RUNNING)
+        assert context["remote_worker_count"] == 2
+        assert context["remote_service_name"] == "svc-log-context-debug"
+
+    def test_owner_keepalive_large_replica_set_limits_queue_and_reports_tick_metrics(self, caplog):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        release_slow = threading.Event()
+        first_late_call = threading.Event()
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 1
+            heartbeat_rpc_timeout_sec = 0.2
+            heartbeat_failure_threshold = 1
+            service_id = "svc-large"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self, node_id: str, *, slow: bool):
+                self.node_id = node_id
+                self.slow = slow
+                self.calls = 0
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                self.calls += 1
+                if self.node_id == "node-050":
+                    first_late_call.set()
+                if self.slow:
+                    release_slow.wait(5.0)
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replicas = {
+            f"node-{idx:03d}": _Replica(f"node-{idx:03d}", slow=idx < 30)
+            for idx in range(100)
+        }
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions=replicas,
+            nodes={},
+        )
+
+        caplog.set_level("INFO", logger="pycloud_parallel.execution.base")
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            assert first_late_call.wait(timeout=1.0)
+            assert _wait_until(
+                lambda: any(
+                    "keepalive tick metrics" in record.getMessage()
+                    and "node_count=100" in record.getMessage()
+                    and "queued_not_started=" in record.getMessage()
+                    for record in caplog.records
+                )
+            )
+        finally:
+            release_slow.set()
+            group._stop_keepalive()  # noqa: SLF001
+
+    def test_owner_keepalive_does_not_submit_more_than_worker_capacity_per_tick(self, caplog):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        release = threading.Event()
+
+        class _Replica:
+            kind = "service"
+            heartbeat_timeout_sec = 5
+            heartbeat_failure_threshold = 1
+            service_id = "svc-capped"
+            service_token = "token"
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def __init__(self):
+                self._hb_lock = threading.Lock()
+                self._hb_thread = None
+
+            def heartbeat(self, **_kwargs):
+                release.wait(1.0)
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replicas = {f"node-{idx:03d}": _Replica() for idx in range(20)}
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions=replicas,
+            nodes={},
+        )
+        group._heartbeat_worker_count = 4  # noqa: SLF001
+
+        caplog.set_level("INFO", logger="pycloud_parallel.execution.base")
+        group._start_keepalive(interval_sec=0.05)  # noqa: SLF001
+        try:
+            assert _wait_until(
+                lambda: any(
+                    "keepalive tick metrics" in record.getMessage()
+                    and "node_count=20" in record.getMessage()
+                    and "submitted=4" in record.getMessage()
+                    for record in caplog.records
+                )
+            )
+        finally:
+            release.set()
             group._stop_keepalive()  # noqa: SLF001
 
     def test_owner_compensation_tick_uses_recovery_intervals(self):

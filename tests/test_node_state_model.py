@@ -9,6 +9,7 @@ import math
 import os
 import sys
 import tarfile
+import threading
 import time
 import types
 import warnings
@@ -67,6 +68,15 @@ from pycloud_parallel.execution.support import _prepare_code_blob
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 _materialize_downloaded_result = client_transport_mod._materialize_downloaded_result
+
+
+def _wait_until(predicate, *, timeout_sec: float = 2.0, interval_sec: float = 0.01) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval_sec)
+    return bool(predicate())
 
 
 def _object_upload_source_blob(source):
@@ -3809,6 +3819,55 @@ def test_update_service_globals_triggers_warmup_with_worker_pids(tmp_path, monke
         state.close()
 
 
+def test_update_service_globals_serializes_outside_nodecontrol_lock(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-svc-managed-lock",
+        queue_capacity=16,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_managed_lock"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    try:
+        blob = b"A = None\ndef run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-a",
+            service_name="svc-lock",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_managed_lock",
+            entry_callable="run",
+            package_format="py",
+            managed_global_names=["A"],
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+        original = state._update_managed_globals_state  # noqa: SLF001
+
+        def _assert_unlocked(*args, **kwargs):
+            assert not state._lock.locked()  # noqa: SLF001
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(state, "_update_managed_globals_state", _assert_unlocked)
+
+        digest_a, updated = state.update_service_globals(
+            owner_client_id="owner-a",
+            service_id=session.service_id,
+            service_token=session.service_token,
+            values={"A": 10},
+        )
+
+        assert digest_a
+        assert updated == ["A"]
+    finally:
+        state.close()
+
+
 def test_task_pool_keeps_instance_managed_global_names(tmp_path):
     state = NodeControlState(
         node_id="node-pool-managed-01",
@@ -4680,8 +4739,7 @@ def test_nodecontrol_reset_fences_execution_until_process_restart(tmp_path):
         assert snapshot["execution_fenced"] is True
         assert snapshot["accept_service_deploy"] is False
 
-        with state._cv:  # noqa: SLF001
-            state._ensure_executor_host_alive_locked()  # noqa: SLF001
+        state._ensure_executor_host_alive()  # noqa: SLF001
         assert state._executor_host is None  # noqa: SLF001
 
         blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
@@ -4750,6 +4808,50 @@ def test_nodecontrol_reset_closes_executor_with_fence_timeout(tmp_path):
         assert calls == [("close", {"shutdown_timeout_sec": 8.0})]
         assert state._executor_host is None  # noqa: SLF001
         assert state.execution_fenced is True
+    finally:
+        state.close()
+
+
+def test_executor_rebuild_creates_backend_outside_nodecontrol_lock(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-rebuild-unlocked",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_rebuild_unlocked"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+
+    class _DeadExecutorHost:
+        def is_alive(self):
+            return False
+
+        def close(self, **_kwargs):
+            return None
+
+    class _NewExecutorHost:
+        def is_alive(self):
+            return True
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    try:
+        with state._lock:  # noqa: SLF001
+            state._executor_host = _DeadExecutorHost()  # noqa: SLF001
+
+        def _create_executor_backend():
+            assert not state._lock.locked()  # noqa: SLF001
+            return _NewExecutorHost()
+
+        monkeypatch.setattr(state, "_create_executor_backend", _create_executor_backend)
+
+        assert state._ensure_executor_host_alive() is True  # noqa: SLF001
+        assert state._executor_host.is_alive() is True  # noqa: SLF001
     finally:
         state.close()
 
@@ -4896,6 +4998,7 @@ def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tm
         assert state.execution_fenced is False
         assert state.can_accept_service_deploy is True
         assert state.service_worker_used() == 1
+        assert _wait_until(lambda: bool(calls))
         assert calls == [("stop_service", {"service_id": "svc-expired", "reason": "owner heartbeat timeout"})]
 
         code, body = state.call_service(
@@ -4908,6 +5011,44 @@ def test_owner_heartbeat_timeout_stops_only_target_service_and_reports_reason(tm
         assert code == 409
         assert body["error"] == "owner heartbeat timeout"
         assert body["stop_reason"] == "owner heartbeat timeout"
+    finally:
+        state.close()
+
+
+def test_monitor_liveness_probe_runs_outside_nodecontrol_lock(tmp_path):
+    state = NodeControlState(
+        node_id="node-liveness-unlocked",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_liveness_unlocked"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    probe_called = threading.Event()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def resource_worker_liveness(self):
+            assert not state._lock.locked()  # noqa: SLF001
+            probe_called.set()
+            return {}
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    try:
+        with state._lock:  # noqa: SLF001
+            state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert probe_called.is_set()
     finally:
         state.close()
 
@@ -4994,6 +5135,7 @@ def test_service_zero_alive_workers_stops_only_that_service(tmp_path):
         assert state.execution_fenced is False
         assert state.can_accept_service_deploy is True
         assert state.service_worker_used() == 1
+        assert _wait_until(lambda: bool(calls))
         assert calls == [
             (
                 "stop_service",
@@ -5093,7 +5235,7 @@ def test_service_worker_liveness_drives_degraded_then_stopped(tmp_path):
         assert probe.status == pb2.SERVICE_STATUS_STOPPED
         assert "service worker unavailable" in probe.stop_reason
         assert other.status == pb2.SERVICE_STATUS_RUNNING
-        assert calls
+        assert _wait_until(lambda: bool(calls))
     finally:
         state.close()
 
@@ -5184,7 +5326,8 @@ def test_service_worker_liveness_missing_running_service_counts_as_zero(tmp_path
         assert missing.status == pb2.SERVICE_STATUS_STOPPED
         assert "service worker unavailable" in missing.stop_reason
         assert present.status == pb2.SERVICE_STATUS_RUNNING
-        assert calls and calls[0][1]["service_id"] == "svc-missing"
+        assert _wait_until(lambda: bool(calls))
+        assert calls[0][1]["service_id"] == "svc-missing"
     finally:
         state.close()
 
@@ -5348,6 +5491,7 @@ def test_startup_managed_service_recovery_failure_stops_service(tmp_path, monkey
         assert service.degraded is False
         assert service.failure_at is not None
         assert service.stop_reason == "startup service recovery failed: code artifact not found"
+        assert _wait_until(lambda: bool(stop_calls))
         assert stop_calls == [
             {
                 "service_id": "svc-startup-recover-fail",
@@ -5415,6 +5559,7 @@ def test_stop_service_cleanup_failure_blocks_deploy(tmp_path):
         state._handle_service_timeouts()  # noqa: SLF001
 
         assert service.status == pb2.SERVICE_STATUS_STOPPED
+        assert _wait_until(lambda: state.can_accept_service_deploy is False)
         assert state.can_accept_service_deploy is False
         assert "service cleanup failed" in state.deploy_health_reason
         assert "resource_id=svc-cleanup-fail" in state.deploy_health_reason
@@ -5568,8 +5713,7 @@ def test_executor_host_rebuild_restores_service_deploy_health(tmp_path, monkeypa
         state._set_deploy_health_block_locked("executor host crashed: RuntimeError old")  # noqa: SLF001
 
     try:
-        with state._cv:  # noqa: SLF001
-            rebuilt = state._ensure_executor_host_alive_locked()  # noqa: SLF001
+        rebuilt = state._ensure_executor_host_alive()  # noqa: SLF001
 
         assert rebuilt is True
         assert created == [True]
@@ -5694,6 +5838,71 @@ def test_nodecontrol_close_stops_service_and_taskpool_executors(tmp_path):
     assert pool.status == "STOPPED"
     assert pool.stop_reason == "nodecontrol shutdown"
     assert state._executor_host is None  # noqa: SLF001
+
+
+def test_service_stop_calls_executor_outside_nodecontrol_lock(tmp_path):
+    state = NodeControlState(
+        node_id="node-stop-service-unlocked",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_stop_service_unlocked"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    stop_called = threading.Event()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def stop_service(self, **kwargs):
+            assert not state._lock.locked()  # noqa: SLF001
+            assert kwargs == {"service_id": "svc-stop-unlocked", "reason": "owner requested"}
+            stop_called.set()
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    service = ServiceSession(
+        service_id="svc-stop-unlocked",
+        owner_client_id="owner",
+        service_name="svc-stop-unlocked",
+        code_version="sha256:svc",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="svc-token",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={},
+    )
+
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        state.end_service(
+            owner_client_id="owner",
+            service_id=service.service_id,
+            service_token=service.service_token,
+            reason="owner requested",
+        )
+
+        assert stop_called.wait(timeout=2.0)
+        assert service.status == pb2.SERVICE_STATUS_STOPPED
+    finally:
+        state.close()
 
 
 def test_close_task_pool_preserves_existing_stop_reason(tmp_path):
@@ -6029,6 +6238,7 @@ def test_task_pool_worker_liveness_drives_degraded_then_stopped(tmp_path):
         assert dead.degraded is False
         assert live.status == "RUNNING"
         assert live.stop_reason == ""
+        assert _wait_until(lambda: bool(calls))
         assert calls == [
             {
                 "pool_id": "pool-dead",
