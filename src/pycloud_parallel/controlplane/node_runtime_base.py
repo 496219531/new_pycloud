@@ -30,6 +30,8 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
+STARTUP_SERVICE_STATUS_FAILURE_GRACE_SEC = 30.0
+
 
 def _invoke_python_callable(
     fn: Callable[..., object],
@@ -83,6 +85,7 @@ class StaticServiceMount:
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
     status_payload: Dict[str, object] = field(default_factory=dict)
+    mounted_at_monotonic: float = field(default_factory=time.monotonic)
 
 
 class NodeRuntimeBase:
@@ -177,10 +180,16 @@ class NodeRuntimeBase:
                 elif str(raw_failure_at or "").strip():
                     failure_at = failure_at or datetime.now(timezone.utc)
             except Exception as exc:
-                status = int(pb2.SERVICE_STATUS_STOPPED)
-                alive_workers = 0
-                stop_reason = f"startup service status failed: {exc!r}"
-                failure_at = failure_at or datetime.now(timezone.utc)
+                if time.monotonic() - float(getattr(mount, "mounted_at_monotonic", 0.0) or 0.0) < STARTUP_SERVICE_STATUS_FAILURE_GRACE_SEC:
+                    status = int(pb2.SERVICE_STATUS_STARTING)
+                    alive_workers = max(1, int(mount.worker_count or 1))
+                    stop_reason = f"startup service status initializing: {exc!r}"
+                    failure_at = None
+                else:
+                    status = int(pb2.SERVICE_STATUS_STOPPED)
+                    alive_workers = 0
+                    stop_reason = f"startup service status failed: {exc!r}"
+                    failure_at = failure_at or datetime.now(timezone.utc)
                 mount.status_payload = {}
         if status == int(pb2.SERVICE_STATUS_RUNNING):
             stop_reason = ""
@@ -298,6 +307,7 @@ class NodeRuntimeBase:
         last_digest = ""
         for mount in mounts:
             last_digest = self._apply_startup_service_globals(mount, values)
+        self.request_infocenter_sync()
         return last_digest
 
     def apply_managed_globals(

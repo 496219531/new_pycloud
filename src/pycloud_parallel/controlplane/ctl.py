@@ -881,22 +881,66 @@ def _wait_node_registered(
     return False
 
 
+def _json_bool(value: object, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
 def _wait_service_registered(infocenter_target: str, service_name: str, timeout_sec: float) -> bool:
     target = str(infocenter_target or "").strip()
     if not target.startswith(("http://", "https://")):
         target = f"http://{target}"
-    url = (
+    normalized_service_name = str(service_name or "").strip()
+    routes_url = (
         f"{target.rstrip('/')}/services/routes"
-        f"?service_name={quote(str(service_name or '').strip(), safe='')}&healthy_only=true&limit=100"
+        f"?service_name={quote(normalized_service_name, safe='')}&healthy_only=true&limit=100"
     )
+    nodes_url = f"{target.rstrip('/')}/nodes?healthy_only=false&limit=500"
     deadline = time.time() + max(0.1, float(timeout_sec))
     while time.time() < deadline:
         try:
-            with urlopen(url, timeout=1.0) as resp:
+            with urlopen(routes_url, timeout=1.0) as resp:
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             routes = data.get("routes") or []
             if any(isinstance(item, dict) for item in routes):
                 return True
+        except Exception:
+            pass
+        try:
+            with urlopen(nodes_url, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+            for node in data.get("nodes") or []:
+                if not isinstance(node, dict) or not _json_bool(node.get("healthy"), default=True):
+                    continue
+                for service in node.get("services") or []:
+                    if not isinstance(service, dict):
+                        continue
+                    if str(service.get("service_name", "") or "").strip() != normalized_service_name:
+                        continue
+                    status_text = str(service.get("status_text", "") or "").strip().lower()
+                    resource_health = str(service.get("resource_health", "") or "").strip().lower()
+                    status_value = int(service.get("status", 0) or 0)
+                    alive_workers = int(service.get("alive_workers", service.get("worker_count", 0)) or 0)
+                    http_base_url = str(service.get("http_base_url", "") or "").strip()
+                    if (
+                        alive_workers > 0
+                        and http_base_url
+                        and (
+                            resource_health in {"", "running"}
+                            or status_text == "running"
+                            or status_value == 2
+                        )
+                    ):
+                        return True
         except Exception:
             pass
         time.sleep(0.2)

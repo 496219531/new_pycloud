@@ -4857,7 +4857,10 @@ def test_executor_rebuild_creates_backend_outside_nodecontrol_lock(tmp_path, mon
 
 
 def test_startup_service_report_tracks_local_status_failure_and_recovery():
-    from pycloud_parallel.controlplane.node_runtime_base import NodeRuntimeBase
+    from pycloud_parallel.controlplane.node_runtime_base import (
+        NodeRuntimeBase,
+        STARTUP_SERVICE_STATUS_FAILURE_GRACE_SEC,
+    )
 
     runtime = NodeRuntimeBase(
         node_id="startup-status-node",
@@ -4895,6 +4898,15 @@ def test_startup_service_report_tracks_local_status_failure_and_recovery():
 
     failed = runtime.startup_service_report_payloads()[0]
     assert failed["service_id"] == "startup-svc"
+    assert failed["status"] == pb2.SERVICE_STATUS_STARTING
+    assert failed["status_text"] == "SERVICE_STATUS_STARTING"
+    assert failed["alive_workers"] == 1
+    assert "worker process exited" in failed["stop_reason"]
+    assert failed["failure_at"] == ""
+    assert mount.failure_at is None
+
+    mount.mounted_at_monotonic -= STARTUP_SERVICE_STATUS_FAILURE_GRACE_SEC + 1.0
+    failed = runtime.startup_service_report_payloads()[0]
     assert failed["status"] == pb2.SERVICE_STATUS_STOPPED
     assert failed["status_text"] == "SERVICE_STATUS_STOPPED"
     assert failed["alive_workers"] == 0

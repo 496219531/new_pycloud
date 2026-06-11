@@ -778,6 +778,95 @@ def test_wait_ready_with_pid_fails_when_process_exits(monkeypatch):
     assert ctl._wait_ready_with_pid(12345, 0.2, lambda: False) is False
 
 
+def test_wait_service_registered_accepts_running_service_in_node_report(monkeypatch):
+    class _Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    def _fake_urlopen(url, timeout=0.0):  # noqa: ARG001
+        text = str(url)
+        if "/services/routes" in text:
+            return _Response({"routes": []})
+        if "/nodes" in text:
+            return _Response(
+                {
+                    "nodes": [
+                        {
+                            "healthy": True,
+                            "services": [
+                                {
+                                    "service_name": "job-orchestrator",
+                                    "status": 2,
+                                    "resource_health": "running",
+                                    "alive_workers": 1,
+                                    "http_base_url": "http://127.0.0.1:50053/svc/svc-1",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(text)
+
+    monkeypatch.setattr(ctl, "urlopen", _fake_urlopen)
+
+    assert ctl._wait_service_registered("127.0.0.1:50051", "job-orchestrator", 0.1) is True
+
+
+def test_wait_service_registered_rejects_stopped_service_in_node_report(monkeypatch):
+    class _Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    def _fake_urlopen(url, timeout=0.0):  # noqa: ARG001
+        text = str(url)
+        if "/services/routes" in text:
+            return _Response({"routes": []})
+        if "/nodes" in text:
+            return _Response(
+                {
+                    "nodes": [
+                        {
+                            "healthy": True,
+                            "services": [
+                                {
+                                    "service_name": "job-orchestrator",
+                                    "status": 4,
+                                    "resource_health": "stopped",
+                                    "alive_workers": 0,
+                                    "http_base_url": "http://127.0.0.1:50053/svc/svc-1",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(text)
+
+    monkeypatch.setattr(ctl, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(ctl.time, "sleep", lambda *_args: None)
+
+    assert ctl._wait_service_registered("127.0.0.1:50051", "job-orchestrator", 0.1) is False
+
+
 def test_cmd_dev_start_uses_env_override_for_node_worker_capacity(tmp_path, monkeypatch):
     parser = ctl.build_parser()
     args = parser.parse_args(

@@ -261,6 +261,7 @@ class JobOrchestratorServer:
             policy_id=self.job_orch_policy_id,
             package_format="module",
             managed_global_names=JOB_ORCHESTRATOR_MANAGED_GLOBALS,
+            initial_globals=self._managed_globals(),
             tags=self.tags,
             metadata={"component": "job-orchestrator"},
             queue_capacity=self.queue_capacity,
@@ -278,6 +279,9 @@ class JobOrchestratorServer:
             base_url=self.base_url,
             service_id=self.service_id,
         )
+        request_sync = getattr(self._node, "request_infocenter_sync", None)
+        if callable(request_sync):
+            request_sync()
 
     def stop(self, grace: int = 0) -> None:
         del grace

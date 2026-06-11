@@ -241,6 +241,8 @@ def test_startup_service_node_updates_python_module_managed_globals(tmp_path, mo
     monkeypatch.syspath_prepend(str(tmp_path))
 
     node = StartupServiceNode(node_id="startup-only", service_http_bind="")
+    sync_requests = []
+    node._infocenter_registrar = SimpleNamespace(request_sync=lambda: sync_requests.append("sync"))  # noqa: SLF001
     mount = node.mount_python_module_service(
         service_name="startup-cfg",
         entry_module="startup_cfg",
@@ -261,6 +263,7 @@ def test_startup_service_node_updates_python_module_managed_globals(tmp_path, mo
     assert body["data"]["cfg"] == {"mode": "fast"}
     assert body["data"]["service_id"] == mount.service_id
     assert body["data"]["context_service_id"] == mount.service_id
+    assert sync_requests == ["sync"]
 
 
 def test_startup_service_node_applies_pending_managed_globals_on_mount(tmp_path, monkeypatch) -> None:
@@ -339,11 +342,13 @@ def test_nodecontrol_and_job_orchestrator_start_uses_service_startup(monkeypatch
 
     calls = {}
     globals_updates = []
+    sync_requests = []
 
     fake_node = SimpleNamespace(
         _local_service_id=server.service_id,
         service_http_base_url="http://127.0.0.1:50053",
         update_globals=lambda values, service_id="": globals_updates.append((service_id, values)),
+        request_infocenter_sync=lambda: sync_requests.append("sync"),
         close=lambda: None,
     )
     fake_module = SimpleNamespace(
@@ -371,6 +376,8 @@ def test_nodecontrol_and_job_orchestrator_start_uses_service_startup(monkeypatch
     assert startup_kwargs["service_id"] == server.service_id
     assert startup_kwargs["worker_count"] == 1
     assert startup_kwargs["policy_id"] == server.job_orch_policy_id
+    assert startup_kwargs["initial_globals"]["service_id"] == server.service_id
+    assert startup_kwargs["initial_globals"]["service_name"] == "job-orchestrator"
     assert startup_kwargs["queue_capacity"] == 123
     assert startup_kwargs["version"] == "job-orch-test-version"
     assert startup_kwargs["start"] is True
@@ -379,6 +386,7 @@ def test_nodecontrol_and_job_orchestrator_start_uses_service_startup(monkeypatch
     assert globals_updates[0][1]["service_name"] == "job-orchestrator"
     assert calls["module_start"]["controlplane_target"] == "127.0.0.1:50051"
     assert calls["module_start"]["base_url"] == "http://127.0.0.1:50053"
+    assert sync_requests == ["sync"]
 
 
 def test_job_orchestrator_instances_have_independent_startup_service_ids() -> None:
