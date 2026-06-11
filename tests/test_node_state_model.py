@@ -5832,7 +5832,7 @@ def test_service_worker_liveness_drives_degraded_then_stopped(tmp_path):
         state.close()
 
 
-def test_service_worker_liveness_missing_running_service_counts_as_zero(tmp_path):
+def test_service_worker_liveness_missing_running_service_is_ignored(tmp_path):
     state = NodeControlState(
         node_id="node-service-liveness-missing",
         queue_capacity=4,
@@ -5906,20 +5906,15 @@ def test_service_worker_liveness_missing_running_service_counts_as_zero(tmp_path
         state._services[present.service_id] = present  # noqa: SLF001
 
     try:
-        state._handle_service_timeouts()  # noqa: SLF001
+        for _idx in range(3):
+            state._handle_service_timeouts()  # noqa: SLF001
+
         assert missing.status == pb2.SERVICE_STATUS_RUNNING
-        assert missing.alive_workers == 0
-        assert missing.degraded is True
+        assert missing.alive_workers == 1
+        assert missing.degraded is False
         assert present.status == pb2.SERVICE_STATUS_RUNNING
         assert present.alive_workers == 1
-
-        state._handle_service_timeouts()  # noqa: SLF001
-        state._handle_service_timeouts()  # noqa: SLF001
-        assert missing.status == pb2.SERVICE_STATUS_STOPPED
-        assert "service worker unavailable" in missing.stop_reason
-        assert present.status == pb2.SERVICE_STATUS_RUNNING
-        assert _wait_until(lambda: bool(calls))
-        assert calls[0][1]["service_id"] == "svc-missing"
+        assert calls == []
     finally:
         state.close()
 
@@ -6841,7 +6836,7 @@ def test_task_pool_worker_liveness_drives_degraded_then_stopped(tmp_path):
         state.close()
 
 
-def test_task_pool_worker_liveness_missing_running_pool_counts_as_zero(tmp_path):
+def test_task_pool_worker_liveness_missing_running_pool_is_ignored(tmp_path):
     state = NodeControlState(
         node_id="node-task-pool-liveness-missing",
         queue_capacity=4,
@@ -6909,10 +6904,12 @@ def test_task_pool_worker_liveness_missing_running_pool_counts_as_zero(tmp_path)
         state._task_pools[present.pool_id] = present  # noqa: SLF001
 
     try:
-        state._handle_service_timeouts()  # noqa: SLF001
+        for _idx in range(3):
+            state._handle_service_timeouts()  # noqa: SLF001
 
-        assert missing.alive_workers == 0
-        assert missing.degraded is True
+        assert missing.status == "RUNNING"
+        assert missing.alive_workers == 1
+        assert missing.degraded is False
         assert present.alive_workers == 1
         assert present.degraded is False
     finally:

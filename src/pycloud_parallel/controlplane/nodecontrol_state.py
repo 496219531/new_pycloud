@@ -5062,15 +5062,7 @@ class NodeControlState(NodeRuntimeBase):
         return liveness, None
 
     def _apply_resource_liveness_locked(self, liveness: Dict[Tuple[str, str], int]) -> None:
-        if not liveness:
-            return
         self._clear_deploy_health_block_locked(source="service worker liveness failed")
-        seen_service_ids = {str(resource_id or "") for (kind, resource_id) in liveness.keys() if str(kind or "") == "service"}
-        seen_task_pool_ids = {
-            str(resource_id or "")
-            for (kind, resource_id) in liveness.keys()
-            if str(kind or "") in {"task_pool", "taskpool", "pool"}
-        }
         for (kind, resource_id), alive_count in liveness.items():
             resource_kind = str(kind or "")
             if resource_kind == "service":
@@ -5087,43 +5079,6 @@ class NodeControlState(NodeRuntimeBase):
             if pool is None or not pool.is_running():
                 continue
             pool.alive_workers = max(0, int(alive_count or 0))
-        now_perf = time.perf_counter()
-        if seen_service_ids:
-            for session in self._services.values():
-                service_id = str(session.service_id or "")
-                if not service_id or service_id in seen_service_ids:
-                    continue
-                if session.status != pb2.SERVICE_STATUS_RUNNING or not bool(session.executor_ready):
-                    continue
-                previous_alive = max(0, int(session.alive_workers or 0))
-                session.alive_workers = 0
-                last_report = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
-                if now_perf - last_report >= 10.0:
-                    session.last_liveness_missing_report_at = now_perf
-                    logger.warning(
-                        "[NodeControl] service worker liveness missing service_id=%s service_name=%s previous_alive_workers=%s",
-                        session.service_id,
-                        session.service_name,
-                        previous_alive,
-                    )
-        if seen_task_pool_ids:
-            for pool in self._task_pools.values():
-                pool_id = str(pool.pool_id or "")
-                if not pool_id or pool_id in seen_task_pool_ids:
-                    continue
-                if not pool.is_running() or not bool(pool.executor_ready):
-                    continue
-                previous_alive = max(0, int(pool.alive_workers or 0))
-                pool.alive_workers = 0
-                last_report = float(getattr(pool, "last_liveness_missing_report_at", 0.0) or 0.0)
-                if now_perf - last_report >= 10.0:
-                    pool.last_liveness_missing_report_at = now_perf
-                    logger.warning(
-                        "[NodeControl] task pool worker liveness missing pool_id=%s pool_name=%s previous_alive_workers=%s",
-                        pool.pool_id,
-                        pool.pool_name,
-                        previous_alive,
-                    )
 
     def _handle_service_resource_health_locked(self, session: ServiceSession, *, now: datetime) -> None:
         service_id = str(session.service_id or "")
