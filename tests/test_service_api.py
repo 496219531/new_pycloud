@@ -3965,6 +3965,77 @@ class TestOwnerServiceFacade:
             for client in group._clients.values():  # noqa: SLF001
                 client.close()
 
+    def test_deploy_from_infocenter_defaults_compensation_target_to_min_success_nodes(self, tmp_path):
+        from pycloud_parallel.execution.service_session import Service
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+        nodes = [
+            SimpleNamespace(
+                node_id="node-1",
+                node_instance_id="node-1-inst",
+                control_addr="127.0.0.1:50061",
+                healthy=True,
+                schedulable=True,
+                drain=False,
+                accept_service_deploy=True,
+                service_worker_available=2,
+                capacity=2,
+                queued=0,
+                python_version="py3.11",
+            )
+        ]
+
+        class _FakeNodeControlClient:
+            def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+                self.target = target
+                self.timeout_sec = timeout_sec
+
+            def create_service_from_bytes(self, **_kwargs):
+                return SimpleNamespace(
+                    service_id="svc-node-1",
+                    service_token="token-node-1",
+                    http_base_url=f"http://{self.target}/svc/demo",
+                    heartbeat_timeout_sec=30,
+                    worker_count=1,
+                    status=pb2.SERVICE_STATUS_RUNNING,
+                )
+
+            def close(self) -> None:
+                return None
+
+        with patch(
+            "pycloud_parallel.execution.service_session._retry_infocenter_request",
+            return_value=((), nodes),
+        ), patch(
+            "pycloud_parallel.controlplane.node_control_client.NodeControlClient",
+            _FakeNodeControlClient,
+        ), patch.object(
+            Service,
+            "_persist_session_cache",
+            lambda self: None,
+        ), patch.object(
+            Service,
+            "_start_keepalive",
+            lambda self, interval_sec=None: None,
+        ):
+            group = Service._deploy_from_infocenter(
+                infocenter_target="127.0.0.1:50051",
+                owner_client_id="owner-demo",
+                service_name="demo-default-compensation-service",
+                source=b"def run(**_kwargs):\n    return {'ok': True}\n",
+                entry_module="demo_service",
+                entry_callable="run",
+                min_success_nodes=1,
+                session_cache_dir=str(tmp_path),
+            )
+
+        try:
+            assert group._compensation_spec is not None  # noqa: SLF001
+            assert group._compensation_spec["node_count"] == 1  # noqa: SLF001
+        finally:
+            for client in group._clients.values():  # noqa: SLF001
+                client.close()
+
     def test_deploy_from_infocenter_rediscover_restarted_node_after_transient_create_failure(self, tmp_path):
         from pycloud_parallel.execution.service_session import Service
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2

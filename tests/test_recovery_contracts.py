@@ -230,6 +230,136 @@ def test_service_compensation_defers_while_retry_probe_pending(monkeypatch) -> N
     assert captured == []
 
 
+def test_service_compensation_prunes_stale_retry_probe_owner_replica(monkeypatch) -> None:
+    from pycloud_parallel import Service
+
+    node = _node(instance_id="node-inst-new")
+    captured: list[dict[str, object]] = []
+    closed: list[str] = []
+
+    class _InfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node]
+
+    class _OldClient:
+        target = "127.0.0.1:50061"
+
+        def close(self) -> None:
+            closed.append("old")
+
+    class _NodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            captured.append(dict(kwargs))
+            return SimpleNamespace(
+                kind="service",
+                service_id="svc-new",
+                service_token="token-new",
+                http_base_url=f"http://{self.target}/svc/svc-new",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda: pb2.HeartbeatServiceResponse(ok=True, accepted=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _InfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _NodeControlClient)
+
+    service = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-inst-old": SimpleNamespace(kind="service", failed=True, last_error="cannot connect")},
+        nodes={"node-inst-old": _node(instance_id="node-inst-old")},
+        _clients={"node-inst-old": _OldClient()},
+    )
+    service._configure_dynamic_compensation(_service_compensation_spec())  # noqa: SLF001
+    service._discard_active_replica("node-inst-old")  # noqa: SLF001
+    service._mark_retry_probe_replica("node-inst-old")  # noqa: SLF001
+
+    assert service.try_compensate_replicas() == 1
+    assert set(service.sessions) == {"node-inst-new"}
+    assert [route["node_instance_id"] for route in service.route_summary()] == ["node-inst-new"]
+    assert captured[0]["expected_node_instance_id"] == "node-inst-new"
+    assert closed == ["old"]
+
+
+def test_service_compensation_redeploys_same_node_after_service_terminal(monkeypatch) -> None:
+    from pycloud_parallel import Service
+
+    node = _node(instance_id="node-inst-1")
+    captured: list[dict[str, object]] = []
+    closed: list[str] = []
+
+    class _InfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node]
+
+    class _OldClient:
+        target = "127.0.0.1:50061"
+
+        def close(self) -> None:
+            closed.append("old")
+
+    class _NodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def create_service_from_bytes(self, **kwargs):
+            captured.append(dict(kwargs))
+            return SimpleNamespace(
+                kind="service",
+                service_id="svc-new",
+                service_token="token-new",
+                http_base_url=f"http://{self.target}/svc/svc-new",
+                worker_count=1,
+                heartbeat_timeout_sec=30,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda: pb2.HeartbeatServiceResponse(ok=True, accepted=True),
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _InfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _NodeControlClient)
+
+    old_session = SimpleNamespace(kind="service", failed=False, last_error="", status=pb2.SERVICE_STATUS_RUNNING)
+    service = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-inst-1": old_session},
+        nodes={"node-inst-1": node},
+        _clients={"node-inst-1": _OldClient()},
+    )
+    service._configure_dynamic_compensation(_service_compensation_spec())  # noqa: SLF001
+    service._record_terminal_heartbeat_failure("node-inst-1", old_session, RuntimeError("service is stopped"))  # noqa: SLF001
+
+    assert "node-inst-1" not in service.failures
+    assert service.try_compensate_replicas() == 1
+    assert set(service.sessions) == {"node-inst-1"}
+    assert captured[0]["expected_node_instance_id"] == "node-inst-1"
+    assert closed == ["old"]
+
+
 def test_taskpool_compensation_create_fences_expected_node_instance(monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 

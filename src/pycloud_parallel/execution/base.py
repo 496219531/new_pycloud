@@ -722,6 +722,10 @@ class ExecutionSessionBase:
         self._keepalive_failure_counts[node_id] = self._heartbeat_failure_threshold(node_id, replica)
         self._mark_replica_heartbeat_failure(node_id, replica, exc)
         self._mark_terminal_replica(node_id)
+        hook = getattr(self, "_on_terminal_replica_failure", None)
+        if callable(hook):
+            with contextlib.suppress(Exception):
+                hook(node_id, replica, exc)
 
     def _heartbeat_new_replica_before_activate(
         self,

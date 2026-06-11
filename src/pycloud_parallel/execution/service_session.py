@@ -2065,6 +2065,66 @@ class Service(ServiceExecutionSession):
     def routes(self) -> List[Dict[str, object]]:
         return self.route_summary()
 
+    def _remove_owner_replica(self, node_key: str, *, reason: str = "", clear_failure: bool = False) -> None:
+        normalized = str(node_key or "").strip()
+        if not normalized:
+            return
+        client = None
+        removed = False
+        with self._route_lock:
+            removed = normalized in self.sessions or normalized in self._clients or normalized in self.nodes
+            self.sessions.pop(normalized, None)
+            client = self._clients.pop(normalized, None)
+            self.nodes.pop(normalized, None)
+            self._breaker_states.pop(normalized, None)
+            self._discard_active_replica(normalized)
+            self._discard_retry_probe_replica(normalized)
+            if clear_failure:
+                self.failures.pop(normalized, None)
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+        if removed:
+            logger.warning(
+                "service owner replica removed service_name=%s node_instance_id=%s reason=%s",
+                self.service_name,
+                normalized,
+                str(reason or "").strip(),
+            )
+            if self.sessions:
+                self._persist_session_cache()
+            else:
+                self._clear_session_cache()
+
+    def _on_terminal_replica_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        del replica
+        category = classify_error(exc, resource_kind="service")
+        self._remove_owner_replica(
+            str(node_id or ""),
+            reason=repr(exc),
+            clear_failure=category == ErrorCategory.SERVICE_TERMINAL,
+        )
+
+    def _prune_stale_owner_replicas(
+        self,
+        *,
+        current_node_instance_ids: set[str],
+        active: set[str],
+    ) -> set[str]:
+        current = {str(node_id) for node_id in current_node_instance_ids if str(node_id)}
+        active_snapshot = {str(node_id) for node_id in active if str(node_id)}
+        removed: set[str] = set()
+        retry_probe = self._retry_probe_replica_snapshot()
+        for node_key in list(self.sessions.keys()):
+            normalized = str(node_key or "").strip()
+            if not normalized or normalized in current:
+                continue
+            if normalized in active_snapshot and normalized not in retry_probe and not self._is_terminal_replica(normalized):
+                continue
+            self._remove_owner_replica(normalized, reason="node instance not present in current InfoCenter discovery")
+            removed.add(normalized)
+        return removed
+
     def _configure_dynamic_compensation(self, spec: Dict[str, Any]) -> None:
         desired = max(0, int(spec.get("node_count", 0) or 0))
         if desired <= 0:
@@ -2145,6 +2205,15 @@ class Service(ServiceExecutionSession):
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
             }
+            pruned_owner_replicas = self._prune_stale_owner_replicas(
+                current_node_instance_ids=current_node_instance_ids,
+                active=active,
+            )
+            if pruned_owner_replicas:
+                active = self._active_replica_snapshot()
+                excluded -= pruned_owner_replicas
+                failed = {node_id for node_id in failed if node_id not in pruned_owner_replicas}
+                retryable_failed = {node_id for node_id in retryable_failed if node_id not in pruned_owner_replicas}
             candidate_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in candidates if _node_instance_key_from_node(node)
             }
@@ -3011,8 +3080,13 @@ class Service(ServiceExecutionSession):
         requested_node_ids = [str(node_id).strip() for node_id in (node_ids or []) if str(node_id).strip()]
         requested_node_instance_ids = [str(node_id).strip() for node_id in (node_instance_ids or []) if str(node_id).strip()]
         desired_node_count = max(0, int(node_count or 0))
-        compensation_target_count = desired_node_count or len(requested_node_instance_ids) or len(requested_node_ids)
         required_success_nodes = max(1, int(min_success_nodes))
+        compensation_target_count = (
+            desired_node_count
+            or len(requested_node_instance_ids)
+            or len(requested_node_ids)
+            or required_success_nodes
+        )
         discovery_limit = max(
             1,
             int(node_limit),
