@@ -128,6 +128,8 @@ def test_service_compensation_create_fences_expected_node_instance(monkeypatch) 
 
     assert service.try_compensate_replicas() == 1
     assert captured[0]["expected_node_instance_id"] == "node-inst-1"
+    assert captured[0]["create_request_id"]
+    assert "node-inst-1" in str(captured[0]["create_request_id"])
 
 
 def test_service_compensation_identity_mismatch_marks_node_lost(monkeypatch) -> None:
@@ -402,5 +404,9 @@ def test_recovery_public_api_signature_snapshot() -> None:
 
     assert "expected_node_instance_id" in taskpool_params
     assert taskpool_params["expected_node_instance_id"].default == ""
+    assert "create_request_id" in taskpool_params
+    assert taskpool_params["create_request_id"].default == ""
     assert "expected_node_instance_id" in service_params
     assert service_params["expected_node_instance_id"].default == ""
+    assert "create_request_id" in service_params
+    assert service_params["create_request_id"].default == ""

@@ -556,6 +556,7 @@ class NodeControlHttpApp:
                 heartbeat_timeout_sec=meta.heartbeat_timeout_sec,
                 idle_ttl_sec=meta.idle_ttl_sec,
                 chunks=[blob],
+                create_request_id=str(payload.get("create_request_id", "") or ""),
             )
         except Exception as exc:
             return self._err(400, f"{exc.__class__.__name__}: {exc}")
@@ -597,6 +598,7 @@ class NodeControlHttpApp:
                 idle_ttl_sec=meta.idle_ttl_sec,
                 expose_http=meta.expose_http,
                 chunks=[blob],
+                create_request_id=str(payload.get("create_request_id", "") or ""),
             )
         except ValueError as exc:
             return self._err(400, str(exc))
@@ -1379,6 +1381,7 @@ class HttpNodeControlClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         api_token: str = "",
         expected_node_instance_id: str = "",
+        create_request_id: str = "",
     ) -> NativeTaskPoolClient:
         import hashlib
 
@@ -1418,6 +1421,8 @@ class HttpNodeControlClient:
         payload = {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")}
         if str(expected_node_instance_id or "").strip():
             payload["expected_node_instance_id"] = str(expected_node_instance_id or "").strip()
+        if str(create_request_id or "").strip():
+            payload["create_request_id"] = str(create_request_id or "").strip()
         if initial_globals:
             payload["initial_globals"] = encode_payload_for_transport(
                 dict(initial_globals),
@@ -1470,6 +1475,7 @@ class HttpNodeControlClient:
         chunk_size: int = OBJECT_CHUNK_SIZE_BYTES,
         api_token: str = "",
         expected_node_instance_id: str = "",
+        create_request_id: str = "",
     ) -> ServiceSessionClient:
         import hashlib
 
@@ -1512,6 +1518,8 @@ class HttpNodeControlClient:
         payload = {"meta": _message_to_dict(meta), "code_b64": base64.b64encode(bytes(blob)).decode("ascii")}
         if str(expected_node_instance_id or "").strip():
             payload["expected_node_instance_id"] = str(expected_node_instance_id or "").strip()
+        if str(create_request_id or "").strip():
+            payload["create_request_id"] = str(create_request_id or "").strip()
         if initial_globals:
             payload["initial_globals"] = encode_payload_for_transport(
                 dict(initial_globals),

@@ -19,7 +19,7 @@ import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -162,6 +162,7 @@ HEARTBEAT_TOTAL_LOG_SEC = 0.5
 EXECUTOR_EVENT_DRAIN_BATCH_SIZE = 128
 SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
 TASK_POOL_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
+CREATE_REQUEST_WAIT_TIMEOUT_SEC = 300.0
 
 
 def _path(value: Any = ".") -> Path:
@@ -189,6 +190,28 @@ class DeployHealthBlock:
         if resource_id:
             text = f"{text} resource_id={resource_id}"
         return text
+
+
+@dataclass
+class _CreateRequestRecord:
+    kind: str
+    fingerprint: str
+    status: str = "CREATING"
+    resource_id: str = ""
+    error: str = ""
+    created_at_monotonic: float = field(default_factory=time.monotonic)
+    updated_at_monotonic: float = field(default_factory=time.monotonic)
+
+
+def _create_request_fingerprint(kind: str, fields: Dict[str, object]) -> str:
+    raw = json.dumps(
+        {"kind": str(kind or ""), "fields": fields},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=repr,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _resource_stop_reason(
@@ -287,6 +310,8 @@ class NodeControlState(NodeRuntimeBase):
         self._services: Dict[str, ServiceSession] = {}
         self._pool_result_hook = InMemoryResultHook()
         self._task_pools: Dict[str, TaskPoolState] = {}
+        self._service_create_requests: Dict[str, _CreateRequestRecord] = {}
+        self._task_pool_create_requests: Dict[str, _CreateRequestRecord] = {}
         self._execution_fenced = False
         self._execution_fenced_reason = ""
         self._execution_fenced_at: Optional[datetime] = None
@@ -619,9 +644,11 @@ class NodeControlState(NodeRuntimeBase):
                 pool.failure_at = fenced_at
                 pool.lease_expire_at = fenced_at
             self._services.clear()
+            self._service_create_requests.clear()
             self._service_zero_alive_counts.clear()
             self._task_pool_zero_alive_counts.clear()
             self._task_pools.clear()
+            self._task_pool_create_requests.clear()
             self._pool_tasks.clear()
             self._pool_task_reserved_ids.clear()
             self._client_code_tokens.clear()
@@ -2614,6 +2641,109 @@ class NodeControlState(NodeRuntimeBase):
                 f"service_name={normalized_name!r} existing_service_id={existing.service_id!r}"
             )
 
+    def _create_request_table_locked(self, kind: str) -> Dict[str, _CreateRequestRecord]:
+        normalized = str(kind or "").strip()
+        if normalized == "service":
+            return self._service_create_requests
+        if normalized == "task_pool":
+            return self._task_pool_create_requests
+        raise ValueError(f"unknown create request kind: {kind!r}")
+
+    def _begin_create_request_locked(
+        self,
+        *,
+        kind: str,
+        create_request_id: str,
+        fingerprint: str,
+    ) -> Tuple[Optional[_CreateRequestRecord], bool]:
+        normalized_id = str(create_request_id or "").strip()
+        if not normalized_id:
+            return None, True
+        table = self._create_request_table_locked(kind)
+        record = table.get(normalized_id)
+        if record is None:
+            record = _CreateRequestRecord(kind=str(kind or "").strip(), fingerprint=str(fingerprint or ""))
+            table[normalized_id] = record
+            return record, True
+        if record.fingerprint != str(fingerprint or ""):
+            raise RuntimeError(f"{kind} create_request_id collision")
+        return record, False
+
+    def _finish_create_request(
+        self,
+        *,
+        kind: str,
+        create_request_id: str,
+        fingerprint: str,
+        resource_id: str,
+    ) -> None:
+        normalized_id = str(create_request_id or "").strip()
+        if not normalized_id:
+            return
+        with self._cv:
+            table = self._create_request_table_locked(kind)
+            record = table.get(normalized_id)
+            if record is None:
+                record = _CreateRequestRecord(kind=str(kind or "").strip(), fingerprint=str(fingerprint or ""))
+                table[normalized_id] = record
+            record.status = "SUCCEEDED"
+            record.resource_id = str(resource_id or "")
+            record.error = ""
+            record.updated_at_monotonic = time.monotonic()
+            self._cv.notify_all()
+
+    def _fail_create_request(
+        self,
+        *,
+        kind: str,
+        create_request_id: str,
+        error: BaseException,
+    ) -> None:
+        normalized_id = str(create_request_id or "").strip()
+        if not normalized_id:
+            return
+        with self._cv:
+            table = self._create_request_table_locked(kind)
+            record = table.get(normalized_id)
+            if record is not None:
+                if record.status == "SUCCEEDED":
+                    return
+                record.status = "FAILED"
+                record.error = repr(error)
+                record.updated_at_monotonic = time.monotonic()
+                self._cv.notify_all()
+
+    def _wait_for_create_request_result(
+        self,
+        *,
+        kind: str,
+        create_request_id: str,
+        fingerprint: str,
+        lookup: Callable[[str], Optional[Any]],
+    ) -> Any:
+        normalized_id = str(create_request_id or "").strip()
+        deadline = time.monotonic() + CREATE_REQUEST_WAIT_TIMEOUT_SEC
+        with self._cv:
+            while True:
+                table = self._create_request_table_locked(kind)
+                record = table.get(normalized_id)
+                if record is None:
+                    raise RuntimeError(f"{kind} create_request_id record missing")
+                if record.fingerprint != str(fingerprint or ""):
+                    raise RuntimeError(f"{kind} create_request_id collision")
+                if record.status == "SUCCEEDED":
+                    resource = lookup(record.resource_id)
+                    if resource is not None:
+                        return resource
+                    table.pop(normalized_id, None)
+                    raise RuntimeError(f"{kind} create_request_id result missing")
+                if record.status == "FAILED":
+                    raise RuntimeError(f"{kind} create_request_id failed: {record.error or 'unknown error'}")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{kind} create_request_id still creating")
+                self._cv.wait(timeout=min(1.0, remaining))
+
     def create_service(
         self,
         *,
@@ -2638,6 +2768,7 @@ class NodeControlState(NodeRuntimeBase):
         expose_http: bool,
         chunks: Iterable[bytes],
         service_id: str = "",
+        create_request_id: str = "",
     ) -> ServiceSession:
         if bool(getattr(self, "_execution_fenced", False)):
             raise RuntimeError(self.execution_fence_message())
@@ -2649,11 +2780,57 @@ class NodeControlState(NodeRuntimeBase):
         normalized_managed_global_names = _normalize_managed_global_names(
             [*(managed_global_names or ()), *((initial_globals or {}).keys())]
         )
-        service_id = str(service_id or "").strip() or uuid.uuid4().hex
+        requested_service_id = str(service_id or "").strip()
+        create_request_fingerprint = _create_request_fingerprint(
+            "service",
+            {
+                "owner_client_id": str(owner_client_id or ""),
+                "service_name": str(service_name or ""),
+                "sha256": str(sha256 or ""),
+                "runtime": str(runtime or ""),
+                "entry_module": str(entry_module or ""),
+                "entry_callable": str(entry_callable or ""),
+                "package_format": str(package_format or ""),
+                "export_mode": str(export_mode or ""),
+                "export_methods": [str(item) for item in (export_methods or ())],
+                "export_decorator": str(export_decorator or ""),
+                "dependency_policy_mode": str(dependency_policy_mode or ""),
+                "dependency_allowlist": [str(item) for item in (dependency_allowlist or ())],
+                "managed_global_names": list(normalized_managed_global_names),
+                "initial_globals": initial_globals or {},
+                "policy_id": str(policy_id or "").strip().lower() or "default_safe",
+                "worker_count": int(worker_count or self.service_default_worker_count or 1),
+                "heartbeat_timeout_sec": int(heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec or 30),
+                "idle_ttl_sec": int(idle_ttl_sec or 0),
+                "expose_http": bool(expose_http),
+                "service_id": requested_service_id,
+            },
+        )
+        normalized_create_request_id = str(create_request_id or "").strip()
+        should_create = True
+        if normalized_create_request_id:
+            with self._cv:
+                _record, should_create = self._begin_create_request_locked(
+                    kind="service",
+                    create_request_id=normalized_create_request_id,
+                    fingerprint=create_request_fingerprint,
+                )
+            if not should_create:
+                return self._wait_for_create_request_result(
+                    kind="service",
+                    create_request_id=normalized_create_request_id,
+                    fingerprint=create_request_fingerprint,
+                    lookup=lambda resource_id: self._services.get(resource_id),
+                )
+        service_id = requested_service_id or uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
         effective_service_name = str(service_name or f"service-{service_id[:8]}").strip() or f"service-{service_id[:8]}"
-        with self._lock:
-            self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
+        try:
+            with self._lock:
+                self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
+        except Exception as exc:
+            self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
+            raise
 
         try:
             artifact, cached_artifact = self.put_code(
@@ -2696,6 +2873,7 @@ class NodeControlState(NodeRuntimeBase):
                 managed_global_names=normalized_managed_global_names,
                 reason=repr(exc),
             )
+            self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
             raise
 
         requested_workers = max(1, worker_count or self.service_default_worker_count)
@@ -2705,25 +2883,33 @@ class NodeControlState(NodeRuntimeBase):
         http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
         initial_status = pb2.SERVICE_STATUS_RUNNING
 
-        with self._lock:
-            self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
-            active = sum(
-                max(0, int(session.worker_count))
-                for session in self._services.values()
-                if session.status in (
-                    pb2.SERVICE_STATUS_STARTING,
-                    pb2.SERVICE_STATUS_RUNNING,
-                    pb2.SERVICE_STATUS_DRAINING,
+        try:
+            with self._lock:
+                self._ensure_service_name_available_locked(service_name=effective_service_name, service_id=service_id)
+                active = sum(
+                    max(0, int(session.worker_count))
+                    for session in self._services.values()
+                    if session.status in (
+                        pb2.SERVICE_STATUS_STARTING,
+                        pb2.SERVICE_STATUS_RUNNING,
+                        pb2.SERVICE_STATUS_DRAINING,
+                    )
                 )
+        except Exception as exc:
+            self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
+            raise
+        try:
+            actual_workers, executor_host = self._reserve_worker_slots_for_create(
+                capacity=int(self.service_worker_capacity),
+                reserved_attr="_service_worker_reserved",
+                active_worker_count=active,
+                requested_workers=requested_workers,
+                exhausted_message="service worker capacity exhausted",
+                now=now,
             )
-        actual_workers, executor_host = self._reserve_worker_slots_for_create(
-            capacity=int(self.service_worker_capacity),
-            reserved_attr="_service_worker_reserved",
-            active_worker_count=active,
-            requested_workers=requested_workers,
-            exhausted_message="service worker capacity exhausted",
-            now=now,
-        )
+        except Exception as exc:
+            self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
+            raise
         reserved = actual_workers
         try:
             self._create_executor_session_skeleton(
@@ -2767,6 +2953,7 @@ class NodeControlState(NodeRuntimeBase):
                     f"service_id={service_id!r} workers={actual_workers}: {exc!r}"
                 ),
             )
+            self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
             raise RuntimeError(
                 f"service executor create/preload failed service_name={effective_service_name!r} "
                 f"service_id={service_id!r} workers={actual_workers}: {exc}"
@@ -2816,6 +3003,12 @@ class NodeControlState(NodeRuntimeBase):
             with self._lock:
                 self._services[service_id] = session
                 self._service_zero_alive_counts.pop(service_id, None)
+            self._finish_create_request(
+                kind="service",
+                create_request_id=normalized_create_request_id,
+                fingerprint=create_request_fingerprint,
+                resource_id=service_id,
+            )
             self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
             self.request_infocenter_sync()
             return session
@@ -2837,6 +3030,7 @@ class NodeControlState(NodeRuntimeBase):
                 managed_global_names=normalized_managed_global_names,
                 reason=repr(exc),
             )
+            self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
             raise
 
     def update_globals(
@@ -2891,6 +3085,7 @@ class NodeControlState(NodeRuntimeBase):
         heartbeat_timeout_sec: int,
         idle_ttl_sec: int,
         chunks: Iterable[bytes],
+        create_request_id: str = "",
     ) -> TaskPoolState:
         if bool(getattr(self, "_execution_fenced", False)):
             raise RuntimeError(self.execution_fence_message())
@@ -2899,6 +3094,41 @@ class NodeControlState(NodeRuntimeBase):
         normalized_managed_global_names = _normalize_managed_global_names(
             [*(managed_global_names or ()), *((initial_globals or {}).keys())]
         )
+        create_request_fingerprint = _create_request_fingerprint(
+            "task_pool",
+            {
+                "owner_client_id": str(owner_client_id or ""),
+                "pool_name": str(pool_name or ""),
+                "sha256": str(sha256 or ""),
+                "runtime": str(runtime or ""),
+                "entry_module": str(entry_module or ""),
+                "entry_callable": str(entry_callable or ""),
+                "package_format": str(package_format or ""),
+                "dependency_policy_mode": str(dependency_policy_mode or ""),
+                "dependency_allowlist": [str(item) for item in (dependency_allowlist or ())],
+                "managed_global_names": list(normalized_managed_global_names),
+                "initial_globals": initial_globals or {},
+                "worker_count": int(worker_count or self.worker_capacity or 1),
+                "heartbeat_timeout_sec": int(heartbeat_timeout_sec or 30),
+                "idle_ttl_sec": int(idle_ttl_sec or 0),
+            },
+        )
+        normalized_create_request_id = str(create_request_id or "").strip()
+        should_create = True
+        if normalized_create_request_id:
+            with self._cv:
+                _record, should_create = self._begin_create_request_locked(
+                    kind="task_pool",
+                    create_request_id=normalized_create_request_id,
+                    fingerprint=create_request_fingerprint,
+                )
+            if not should_create:
+                return self._wait_for_create_request_result(
+                    kind="task_pool",
+                    create_request_id=normalized_create_request_id,
+                    fingerprint=create_request_fingerprint,
+                    lookup=lambda resource_id: self._task_pools.get(resource_id),
+                )
         pool_id = uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
         try:
@@ -2940,24 +3170,33 @@ class NodeControlState(NodeRuntimeBase):
                 managed_global_names=normalized_managed_global_names,
                 reason=repr(exc),
             )
+            self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
             raise
 
         requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
         now = utc_now()
-        with self._lock:
-            active = sum(
-                max(0, int(pool.worker_count))
-                for pool in self._task_pools.values()
-                if str(pool.status or "").strip().upper() == "RUNNING"
+        try:
+            with self._lock:
+                active = sum(
+                    max(0, int(pool.worker_count))
+                    for pool in self._task_pools.values()
+                    if str(pool.status or "").strip().upper() == "RUNNING"
+                )
+        except Exception as exc:
+            self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
+            raise
+        try:
+            actual_workers, executor_host = self._reserve_worker_slots_for_create(
+                capacity=int(self.task_pool_worker_capacity),
+                reserved_attr="_task_pool_worker_reserved",
+                active_worker_count=active,
+                requested_workers=requested_workers,
+                exhausted_message="task pool worker capacity exhausted",
+                now=now,
             )
-        actual_workers, executor_host = self._reserve_worker_slots_for_create(
-            capacity=int(self.task_pool_worker_capacity),
-            reserved_attr="_task_pool_worker_reserved",
-            active_worker_count=active,
-            requested_workers=requested_workers,
-            exhausted_message="task pool worker capacity exhausted",
-            now=now,
-        )
+        except Exception as exc:
+            self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
+            raise
         reserved = actual_workers
         try:
             executor_create_ms = self._create_executor_session_skeleton(
@@ -3000,6 +3239,7 @@ class NodeControlState(NodeRuntimeBase):
                 managed_global_names=normalized_managed_global_names,
                 reason=repr(exc),
             )
+            self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
             raise
         try:
             pool = TaskPoolState(
@@ -3063,13 +3303,20 @@ class NodeControlState(NodeRuntimeBase):
                     runtime_key=pool.pool_id,
                     managed_global_names=pool.managed_global_names,
                 )
+            self._finish_create_request(
+                kind="task_pool",
+                create_request_id=normalized_create_request_id,
+                fingerprint=create_request_fingerprint,
+                resource_id=pool_id,
+            )
             self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             self.request_infocenter_sync()
             return pool
-        except Exception:
+        except Exception as exc:
             self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
             with contextlib.suppress(Exception):
                 executor_host.stop_task_pool(pool_id=pool_id, reason="create task pool failed")
+            self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
             raise
 
     def submit_pool_tasks(

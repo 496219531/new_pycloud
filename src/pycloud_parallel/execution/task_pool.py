@@ -77,7 +77,7 @@ from pycloud_parallel.execution.deployment_create_helper import (
     run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
 )
-from pycloud_parallel.execution.error_classifier import classify_error, is_retryable_compensation_failure
+from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
 from pycloud_parallel.execution.scheduler import (
     SchedulerCandidate,
     SchedulerState,
@@ -100,6 +100,16 @@ from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 logger = logging.getLogger(__name__)
+
+
+def _taskpool_create_rpc_timeout_sec(timeout_sec: float) -> float:
+    try:
+        overall = float(timeout_sec or 0.0)
+    except (TypeError, ValueError):
+        overall = 0.0
+    if overall <= 0.0:
+        return 30.0
+    return max(10.0, min(30.0, overall * 3.0))
 
 
 def _resolve_owner_api_token(api_token: str = "") -> str:
@@ -4015,6 +4025,7 @@ def _build_task_pool_from_infocenter(
     dependency_allowlist = list(prepared_artifact.dependency_allowlist)
     managed_global_names = list(prepared_artifact.managed_global_names)
     effective_heartbeat_timeout_sec = get_taskpool_heartbeat_timeout_sec(heartbeat_timeout_sec)
+    create_rpc_timeout_sec = _taskpool_create_rpc_timeout_sec(timeout_sec)
 
     effective_owner = str(owner_client_id or f"client-{_get_local_ip()}").strip()
     requested_count = max(0, int(node_count or 0))
@@ -4050,6 +4061,22 @@ def _build_task_pool_from_infocenter(
             action="task pool node discovery",
         )
 
+    def _current_healthy_node_keys() -> set[str]:
+        try:
+            with _infocenter_client(infocenter_target, timeout_sec=max(0.5, min(5.0, float(timeout_sec or 0.0)))) as infocenter:
+                return {
+                    _node_instance_key_from_node(node)
+                    for node in infocenter.list_nodes(healthy_only=True, tags=tags, limit=node_limit)
+                    if _node_instance_key_from_node(node)
+                }
+        except Exception as exc:
+            logger.info(
+                "task pool create recovery could not refresh healthy node snapshot pool_name=%s err=%r",
+                pool_name or "",
+                exc,
+            )
+            return set()
+
     selected_nodes = _select_candidate_nodes()
     if not selected_nodes:
         raise RuntimeError("no task pool nodes selected from InfoCenter")
@@ -4058,6 +4085,8 @@ def _build_task_pool_from_infocenter(
     desired_nodes = selected_nodes[:required_success_nodes]
     fallback_nodes = selected_nodes[required_success_nodes:] if not explicit_node_selection else []
     effective_pool_name = str(pool_name or f"task-pool-{uuid.uuid4().hex[:10]}").strip()
+    create_request_namespace = uuid.uuid4().hex
+    create_request_ids: Dict[str, str] = {}
     effective_policy = resolve_effective_policy(
         get_policy_profile(policy_id or get_default_policy_id_for_binding("taskpool_default")),
         requested_mode=serialization_mode,
@@ -4067,7 +4096,12 @@ def _build_task_pool_from_infocenter(
 
     def _create_pool_on_node(node: InfoCenterNode) -> Tuple[InfoCenterNode, NativeTaskPoolClient]:
         target = _node_control_target_for_node(node)
-        client = _new_node_control_client(target, timeout_sec=timeout_sec)
+        client = _new_node_control_client(target, timeout_sec=create_rpc_timeout_sec)
+        node_key = _node_instance_key_from_node(node)
+        create_request_id = create_request_ids.setdefault(
+            node_key,
+            f"taskpool-create:{effective_owner}:{effective_pool_name}:{create_request_namespace}:{node_key}",
+        )
         node_worker_count = max(1, int(worker_count or 1))
         node_available = int(getattr(node, "task_pool_worker_available", 0) or 0)
         if node_available > 0:
@@ -4090,6 +4124,7 @@ def _build_task_pool_from_infocenter(
                 chunk_size=chunk_size,
                 api_token=effective_api_token,
                 expected_node_instance_id=_node_instance_key_from_node(node),
+                create_request_id=create_request_id,
             )
         except Exception:
             with contextlib.suppress(Exception):
@@ -4131,6 +4166,7 @@ def _build_task_pool_from_infocenter(
                 )
                 continue
             if item.created is not None:
+                create_failures.pop(node_key, None)
                 created.append(item.created)
 
     _record_create_results(desired_nodes)
@@ -4175,11 +4211,45 @@ def _build_task_pool_from_infocenter(
             tried_node_keys = set(create_failures.keys()) | {
                 _node_instance_key_from_node(node) for node, _pool in created
             }
-            retry_nodes = [
+            fresh_retry_nodes = [
                 node
                 for node in retry_nodes
                 if _node_instance_key_from_node(node) not in tried_node_keys
             ]
+            if fresh_retry_nodes:
+                retry_nodes = fresh_retry_nodes
+            else:
+                current_healthy_node_keys = _current_healthy_node_keys()
+                transient_retry_nodes = [
+                    node
+                    for node in retry_nodes
+                    if _node_instance_key_from_node(node) in current_healthy_node_keys
+                    and classify_error(
+                        create_failures.get(_node_instance_key_from_node(node), ""),
+                        resource_kind="task_pool",
+                    )
+                    == ErrorCategory.TRANSIENT_NETWORK
+                    and _node_instance_key_from_node(node)
+                    not in {_node_instance_key_from_node(created_node) for created_node, _pool in created}
+                ]
+                if not transient_retry_nodes:
+                    logger.info(
+                        "task pool create recovery will not retry unchanged transient nodes "
+                        "because no same node_instance_id is healthy pool_name=%s attempt=%s "
+                        "retry_candidates=%s current_healthy_nodes=%s",
+                        effective_pool_name,
+                        retry_attempt,
+                        _summarize_discovered_nodes(retry_nodes),
+                        sorted(current_healthy_node_keys),
+                    )
+                    return
+                retry_nodes = transient_retry_nodes
+                _emit_taskpool_notice(
+                    "open retrying unchanged transient task pool nodes "
+                    f"pool_name={effective_pool_name} attempt={retry_attempt} "
+                    f"required={required_success_nodes} "
+                    f"candidates={_summarize_discovered_nodes(retry_nodes)}"
+                )
             if not retry_nodes:
                 return
             all_selected_nodes.extend(retry_nodes)

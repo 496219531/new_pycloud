@@ -2192,6 +2192,12 @@ class Service(ServiceExecutionSession):
                         chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
                         api_token=str(spec.get("api_token", "") or ""),
                         expected_node_instance_id=node_key,
+                        create_request_id=str(
+                            spec.setdefault("create_request_ids", {}).setdefault(
+                                node_key,
+                                f"service-compensate:{self.owner_client_id}:{self.service_name}:{spec.get('create_request_namespace', '')}:{node_key}",
+                            )
+                        ),
                     )
                 except Exception as exc:
                     with contextlib.suppress(Exception):
@@ -3266,6 +3272,8 @@ class Service(ServiceExecutionSession):
                 "node_limit": node_limit,
                 "timeout_sec": timeout_sec,
                 "api_token": effective_api_token,
+                "create_request_namespace": uuid.uuid4().hex,
+                "create_request_ids": {},
             }
 
         if ensure_unique_service_name:
@@ -3360,6 +3368,8 @@ class Service(ServiceExecutionSession):
             clients: Dict[str, Any] = {}
             nodes: Dict[str, InfoCenterNode] = {}
             failures: Dict[str, str] = {}
+            create_request_namespace = uuid.uuid4().hex
+            create_request_ids: Dict[str, str] = {}
 
             def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]:
                 node_key = _node_instance_key_from_node(node)
@@ -3393,6 +3403,10 @@ class Service(ServiceExecutionSession):
                         chunk_size=chunk_size,
                         api_token=effective_api_token,
                         expected_node_instance_id=node_key,
+                        create_request_id=create_request_ids.setdefault(
+                            node_key,
+                            f"service-create:{effective_owner_client_id}:{effective_service_name}:{create_request_namespace}:{node_key}",
+                        ),
                     )
                 except Exception as exc:
                     client.close()

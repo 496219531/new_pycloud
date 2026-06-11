@@ -3997,6 +3997,7 @@ class TestOwnerServiceFacade:
         )
         discovery_calls = {"count": 0}
         expected_node_instance_ids = []
+        create_request_ids = []
 
         class _FakeInfoCenter:
             def __enter__(self):
@@ -4022,6 +4023,7 @@ class TestOwnerServiceFacade:
             def create_service_from_bytes(self, **kwargs):
                 expected_node_instance_id = kwargs.get("expected_node_instance_id")
                 expected_node_instance_ids.append(expected_node_instance_id)
+                create_request_ids.append(kwargs.get("create_request_id"))
                 if expected_node_instance_id == "node-1-old":
                     raise RuntimeError("cannot connect to 127.0.0.1:50061")
                 return SimpleNamespace(
@@ -4071,6 +4073,9 @@ class TestOwnerServiceFacade:
         try:
             assert discovery_calls["count"] >= 2
             assert expected_node_instance_ids == ["node-1-old", "node-1-new"]
+            assert all(create_request_ids)
+            assert "node-1-old" in str(create_request_ids[0])
+            assert "node-1-new" in str(create_request_ids[1])
             assert list(group.nodes.keys()) == ["node-1-new"]
             assert group.failures["node-1-old"] == "RuntimeError('cannot connect to 127.0.0.1:50061')"
         finally:

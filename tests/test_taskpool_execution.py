@@ -1406,6 +1406,214 @@ def test_task_pool_from_infocenter_retries_transient_discovery_failure(monkeypat
         session.close()
 
 
+def test_task_pool_from_infocenter_create_uses_longer_rpc_timeout(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    node = SimpleNamespace(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    seen_timeouts = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def select_task_nodes(self, **_kwargs):
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+            seen_timeouts.append(timeout_sec)
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            return SimpleNamespace(
+                owner_client_id=kwargs["owner_client_id"],
+                pool_id="pool-node-1",
+                pool_name=kwargs["pool_name"],
+                pool_token="token",
+                code_version="sha256:test",
+                worker_count=kwargs["worker_count"],
+                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+                pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+                heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+                cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
+                close=lambda reason="": None,
+                _client=self,
+            )
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    session = TaskPool._from_infocenter(
+        infocenter_target="127.0.0.1:50051",
+        job_id="job-create-rpc-timeout",
+        source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+        entry_module="task_demo",
+        entry_callable="run",
+        worker_count=1,
+        node_count=1,
+        timeout_sec=10.0,
+    )
+    try:
+        assert seen_timeouts == [30.0]
+    finally:
+        session.close()
+
+
+def test_task_pool_from_infocenter_retries_same_instance_after_transient_create_timeout(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    node = SimpleNamespace(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    calls = {"create": 0, "select": 0}
+    create_request_ids = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **kwargs):
+            assert kwargs["healthy_only"] is True
+            return [node]
+
+        def select_task_nodes(self, **_kwargs):
+            calls["select"] += 1
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **kwargs):
+            calls["create"] += 1
+            create_request_ids.append(kwargs.get("create_request_id"))
+            if calls["create"] == 1:
+                raise TimeoutError("timed out")
+            return SimpleNamespace(
+                owner_client_id=kwargs["owner_client_id"],
+                pool_id="pool-node-1",
+                pool_name=kwargs["pool_name"],
+                pool_token="token",
+                code_version="sha256:test",
+                worker_count=kwargs["worker_count"],
+                heartbeat_timeout_sec=kwargs["heartbeat_timeout_sec"],
+                submit_tasks=lambda tasks, job_id="": pb2.SubmitTasksResponse(ok=True, accepted=[], rejected=[]),
+                pull_results=lambda limit=100, wait_ms=0, cursor="": pb2.PullResultsResponse(ok=True, results=[], next_cursor=""),
+                heartbeat=lambda seq=0: pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=15),
+                cancel_job=lambda job_id="", reason="": pb2.CancelJobResponse(ok=True),
+                close=lambda reason="": None,
+                _client=self,
+            )
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    session = TaskPool._from_infocenter(
+        infocenter_target="127.0.0.1:50051",
+        job_id="job-same-instance-transient-retry",
+        source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+        entry_module="task_demo",
+        entry_callable="run",
+        worker_count=1,
+        node_count=1,
+        timeout_sec=1.0,
+    )
+    try:
+        assert session.node_instance_ids == ["node-inst-1"]
+        assert calls["select"] >= 2
+        assert calls["create"] == 2
+        assert create_request_ids[0]
+        assert create_request_ids[0] == create_request_ids[1]
+        assert "node-inst-1" not in session.failures
+    finally:
+        session.close()
+
+
+def test_task_pool_from_infocenter_does_not_retry_same_instance_after_disconnect(monkeypatch) -> None:
+    from pycloud_parallel import TaskPool
+
+    node = SimpleNamespace(
+        node_instance_id="node-inst-1",
+        node_id="node-1",
+        control_addr="127.0.0.1:50061",
+        task_pool_worker_available=2,
+        task_pool_worker_capacity=2,
+    )
+    calls = {"create": 0, "select": 0, "list_nodes": 0}
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **kwargs):
+            assert kwargs["healthy_only"] is True
+            calls["list_nodes"] += 1
+            return []
+
+        def select_task_nodes(self, **_kwargs):
+            calls["select"] += 1
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+            self.timeout_sec = timeout_sec
+
+        def close(self):
+            return None
+
+        def create_task_pool_from_bytes(self, **_kwargs):
+            calls["create"] += 1
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.task_pool._new_node_control_client", _FakeNodeControlClient)
+
+    with pytest.raises(RuntimeError, match="task pool create failed"):
+        TaskPool._from_infocenter(
+            infocenter_target="127.0.0.1:50051",
+            job_id="job-same-instance-disconnected",
+            source=b"def run(value=0, **_kwargs):\n    return {'value': value}\n",
+            entry_module="task_demo",
+            entry_callable="run",
+            worker_count=1,
+            node_count=1,
+            timeout_sec=1.0,
+        )
+
+    assert calls["select"] >= 2
+    assert calls["list_nodes"] >= 1
+    assert calls["create"] == 1
+
+
 def test_task_pool_from_infocenter_does_not_rediscover_permanent_create_failure(monkeypatch) -> None:
     from pycloud_parallel import TaskPool
 

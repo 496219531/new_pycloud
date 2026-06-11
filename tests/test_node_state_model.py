@@ -325,6 +325,185 @@ def test_task_pool_artifact_validation_runs_in_executor_host_not_node(tmp_path):
         sys.modules.pop(module_name, None)
 
 
+def test_task_pool_create_request_id_is_idempotent(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-create-idempotent",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_create_idempotent"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+
+        first = state.create_task_pool(
+            owner_client_id="owner-idem",
+            pool_name="pool-idem",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_idem_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="create-request-1",
+        )
+        second = state.create_task_pool(
+            owner_client_id="owner-idem",
+            pool_name="pool-idem",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_idem_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="create-request-1",
+        )
+
+        assert second.pool_id == first.pool_id
+        assert second.pool_token == first.pool_token
+        assert len(state.task_pool_reports()) == 1
+    finally:
+        state.close()
+
+
+def test_task_pool_create_request_id_waits_for_inflight_create(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-create-inflight",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_create_inflight"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        task_pool_worker_capacity=2,
+    )
+    create_entered = threading.Event()
+    release_create = threading.Event()
+    create_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **_kwargs):
+            return {"ok": True, "methods": {"run": ("run", "")}}
+
+        def create_task_pool(self, **kwargs):
+            create_calls.append(kwargs)
+            create_entered.set()
+            assert release_create.wait(5)
+
+        def preload_pool(self, **_kwargs):
+            return 1
+
+        def stop_task_pool(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        kwargs = dict(
+            owner_client_id="owner-idem",
+            pool_name="pool-idem-inflight",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_idem_inflight",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="create-request-inflight-1",
+        )
+        results = []
+        errors = []
+
+        def _create():
+            try:
+                results.append(state.create_task_pool(**kwargs))
+            except Exception as exc:  # pragma: no cover - easier failure diagnostics
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=_create)
+        first_thread.start()
+        assert create_entered.wait(5)
+        second_thread = threading.Thread(target=_create)
+        second_thread.start()
+        time.sleep(0.05)
+        release_create.set()
+        first_thread.join(5)
+        second_thread.join(5)
+
+        assert errors == []
+        assert len(results) == 2
+        assert results[0].pool_id == results[1].pool_id
+        assert len(create_calls) == 1
+        assert len(state.task_pool_reports()) == 1
+    finally:
+        release_create.set()
+        state.close()
+
+
+def test_task_pool_create_request_id_rejects_fingerprint_collision(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-create-collision",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_create_collision"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value)}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        state.create_task_pool(
+            owner_client_id="owner-idem",
+            pool_name="pool-idem",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_idem_demo",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="create-request-collision-1",
+        )
+        with pytest.raises(RuntimeError, match="create_request_id collision"):
+            state.create_task_pool(
+                owner_client_id="owner-idem",
+                pool_name="pool-idem",
+                sha256=f"sha256:{digest}",
+                runtime="py3",
+                entry_module="pool_idem_demo",
+                entry_callable="run",
+                package_format="py",
+                worker_count=2,
+                heartbeat_timeout_sec=30,
+                idle_ttl_sec=0,
+                chunks=[blob],
+                create_request_id="create-request-collision-1",
+            )
+    finally:
+        state.close()
+
+
 def test_task_pool_artifact_prepare_is_cached_between_put_and_create(tmp_path):
     state = NodeControlState(
         node_id="node-prepare-cache",
@@ -3320,6 +3499,215 @@ def test_create_service_preloads_entry_module_for_spawn_workers(tmp_path, monkey
         assert preload["execute_spec"]["method_name"] == "serve"
         assert preload["execute_spec"]["payload_mode"] == "http_call"
         assert preload["execute_spec"]["warmup_only"] is True
+    finally:
+        state.close()
+
+
+def test_service_create_request_id_is_idempotent(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-create-idempotent",
+        queue_capacity=4,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_service_create_idempotent"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        service_worker_capacity=2,
+    )
+    calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **_kwargs):
+            return {"ok": True, "methods": {"serve": ("serve", "")}}
+
+        def create_service(self, **kwargs):
+            calls.append(("create", kwargs))
+
+        def preload_service(self, **_kwargs):
+            return 1
+
+        def stop_service(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        kwargs = dict(
+            owner_client_id="owner-service",
+            service_name="svc-idem",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_idem",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-create-request-1",
+        )
+        first = state.create_service(**kwargs)
+        second = state.create_service(**kwargs)
+
+        assert second.service_id == first.service_id
+        assert second.service_token == first.service_token
+        assert len(calls) == 1
+        assert len(state.service_reports()) == 1
+    finally:
+        state.close()
+
+
+def test_service_create_request_id_waits_for_inflight_create(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-create-inflight",
+        queue_capacity=4,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_service_create_inflight"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        service_worker_capacity=2,
+    )
+    create_entered = threading.Event()
+    release_create = threading.Event()
+    create_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **_kwargs):
+            return {"ok": True, "methods": {"serve": ("serve", "")}}
+
+        def create_service(self, **kwargs):
+            create_calls.append(kwargs)
+            create_entered.set()
+            assert release_create.wait(5)
+
+        def preload_service(self, **_kwargs):
+            return 1
+
+        def stop_service(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        kwargs = dict(
+            owner_client_id="owner-service",
+            service_name="svc-idem-inflight",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_idem_inflight",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-create-request-inflight-1",
+        )
+        results = []
+        errors = []
+
+        def _create():
+            try:
+                results.append(state.create_service(**kwargs))
+            except Exception as exc:  # pragma: no cover - easier failure diagnostics
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=_create)
+        first_thread.start()
+        assert create_entered.wait(5)
+        second_thread = threading.Thread(target=_create)
+        second_thread.start()
+        time.sleep(0.05)
+        release_create.set()
+        first_thread.join(5)
+        second_thread.join(5)
+
+        assert errors == []
+        assert len(results) == 2
+        assert results[0].service_id == results[1].service_id
+        assert len(create_calls) == 1
+        assert len(state.service_reports()) == 1
+    finally:
+        release_create.set()
+        state.close()
+
+
+def test_service_create_request_id_rejects_fingerprint_collision(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-create-collision",
+        queue_capacity=4,
+        worker_capacity=2,
+        artifact_dir=str(tmp_path / "code_cache_service_create_collision"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+        service_worker_capacity=2,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def prepare_artifact(self, **_kwargs):
+            return {"ok": True, "methods": {"serve": ("serve", "")}}
+
+        def create_service(self, **_kwargs):
+            pass
+
+        def preload_service(self, **_kwargs):
+            return 1
+
+        def stop_service(self, **_kwargs):
+            pass
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            pass
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def serve(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        kwargs = dict(
+            owner_client_id="owner-service",
+            service_name="svc-idem",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="service_idem",
+            entry_callable="serve",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-create-request-collision-1",
+        )
+        state.create_service(**kwargs)
+        with pytest.raises(RuntimeError, match="create_request_id collision"):
+            state.create_service(**{**kwargs, "worker_count": 2})
     finally:
         state.close()
 

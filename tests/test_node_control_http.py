@@ -199,6 +199,80 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
         state.close()
 
 
+def test_http_create_service_request_id_is_idempotent(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) + 1}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            first = client.create_service_from_bytes(
+                owner_client_id="owner-http-idem",
+                service_name="svc-http-idem",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_http_idem",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                expose_http=False,
+                create_request_id="http-service-create-idem-1",
+            )
+            second = client.create_service_from_bytes(
+                owner_client_id="owner-http-idem",
+                service_name="svc-http-idem",
+                blob=blob,
+                runtime="py3",
+                entry_module="svc_http_idem",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                expose_http=False,
+                create_request_id="http-service-create-idem-1",
+            )
+
+            assert second.service_id == first.service_id
+            assert second.service_token == first.service_token
+            assert len(state.service_reports()) == 1
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_taskpool_request_id_is_idempotent(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) * 2}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            first = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http-idem",
+                pool_name="pool-http-idem",
+                blob=blob,
+                runtime="py3",
+                entry_module="pool_http_idem",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                create_request_id="http-taskpool-create-idem-1",
+            )
+            second = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http-idem",
+                pool_name="pool-http-idem",
+                blob=blob,
+                runtime="py3",
+                entry_module="pool_http_idem",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                create_request_id="http-taskpool-create-idem-1",
+            )
+
+            assert second.pool_id == first.pool_id
+            assert second.pool_token == first.pool_token
+            assert len(state.task_pool_reports()) == 1
+    finally:
+        server.stop()
+        state.close()
+
+
 def test_http_taskpool_submit_closed_pool_returns_structured_error(tmp_path):
     server, state = _start_http_node(tmp_path)
     blob = b"def run(value=0, **_kwargs):\n    return {'value': int(value) * 2}\n"
