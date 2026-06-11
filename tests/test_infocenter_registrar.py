@@ -366,12 +366,105 @@ def test_ops_snapshot_returns_partial_table_fragments():
     snapshot = _render_ops_snapshot(info_state)
 
     assert snapshot["ok"] is True
+    assert snapshot["content_key"]
     fragments = snapshot["fragments"]
     assert "node-snapshot" in fragments["ops-nodes-body"]
     assert "svc 0/0" in fragments["ops-nodes-body"]
     assert "svc-snapshot" not in fragments["ops-nodes-body"]
     assert "svc-snapshot" in fragments["ops-services-body"]
     assert "<tbody" not in fragments["ops-nodes-body"]
+
+
+def test_ops_snapshot_content_key_ignores_lightweight_heartbeat():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-heartbeat-inst",
+        node_id="node-heartbeat",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-heartbeat": NodeServiceState(
+                service_name="svc-heartbeat",
+                service_id="svc-heartbeat",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                lease_expire_at=datetime(2026, 6, 1, 8, 0, 30, tzinfo=timezone.utc),
+                http_base_url="http://127.0.0.1:18081/svc/svc-heartbeat",
+            )
+        },
+    )
+    before = _render_ops_snapshot(info_state)
+
+    info_state.heartbeat_record(
+        node_instance_id="node-heartbeat-inst",
+        node_id="node-heartbeat",
+        healthy=True,
+        services={
+            "svc-heartbeat": NodeServiceState(
+                service_name="svc-heartbeat",
+                service_id="svc-heartbeat",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                lease_expire_at=datetime(2026, 6, 1, 8, 1, 0, tzinfo=timezone.utc),
+                http_base_url="http://127.0.0.1:18081/svc/svc-heartbeat",
+            )
+        },
+    )
+    after_heartbeat = _render_ops_snapshot(info_state)
+
+    assert before["content_key"] == after_heartbeat["content_key"]
+    assert before["fragments"]["ops-services-body"] != after_heartbeat["fragments"]["ops-services-body"]
+
+
+def test_ops_snapshot_content_key_changes_for_resource_state_change():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-resource-inst",
+        node_id="node-resource",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-resource": NodeServiceState(
+                service_name="svc-resource",
+                service_id="svc-resource",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                lease_expire_at=datetime(2026, 6, 1, 8, 0, 30, tzinfo=timezone.utc),
+                http_base_url="http://127.0.0.1:18081/svc/svc-resource",
+            )
+        },
+    )
+    before = _render_ops_snapshot(info_state)
+
+    info_state.heartbeat_record(
+        node_instance_id="node-resource-inst",
+        node_id="node-resource",
+        healthy=True,
+        services={
+            "svc-resource": NodeServiceState(
+                service_name="svc-resource",
+                service_id="svc-resource",
+                status=pb2.SERVICE_STATUS_STOPPED,
+                resource_health="stopped",
+                worker_count=2,
+                alive_workers=0,
+                lease_expire_at=datetime(2026, 6, 1, 8, 1, 0, tzinfo=timezone.utc),
+                stop_reason="owner heartbeat timeout",
+            )
+        },
+    )
+    after_stopped = _render_ops_snapshot(info_state)
+
+    assert before["content_key"] != after_stopped["content_key"]
 
 
 def test_list_service_routes_uses_service_name_index_for_filtered_lookup():

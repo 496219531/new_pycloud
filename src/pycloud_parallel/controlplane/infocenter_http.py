@@ -3,6 +3,7 @@ from __future__ import annotations
 """HTTP + JSON server for InfoCenter control-plane and lightweight ops UI."""
 
 import errno
+import hashlib
 import os
 import html
 import json
@@ -575,6 +576,103 @@ def _serialize_node(state) -> Dict[str, object]:
     }
 
 
+def _ops_snapshot_content_key(nodes: List[object], *, job_summary: Optional[Dict[str, object]] = None) -> str:
+    payload: Dict[str, object] = {
+        "nodes": [],
+        "job_queue": job_summary or {},
+    }
+    for node in sorted(nodes, key=lambda item: (str(getattr(item, "node_id", "") or ""), str(getattr(item, "node_instance_id", "") or ""))):
+        metrics = getattr(node, "metrics", None)
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        node_payload: Dict[str, object] = {
+            "node_instance_id": str(getattr(node, "node_instance_id", "") or ""),
+            "node_id": str(getattr(node, "node_id", "") or ""),
+            "control_addr": str(getattr(node, "control_addr", "") or ""),
+            "healthy": bool(getattr(node, "healthy", False)),
+            "schedulable": bool(getattr(node, "schedulable", False)),
+            "drain": bool(getattr(node, "drain", False)),
+            "reason": str(getattr(node, "reason", "") or ""),
+            "capacity": int(getattr(node, "capacity", 0) or 0),
+            "queue_capacity": int(getattr(node, "queue_capacity", 0) or 0),
+            "queued": int(getattr(metrics, "queued", 0) or 0),
+            "inflight": int(getattr(metrics, "inflight", 0) or 0),
+            "running": int(getattr(metrics, "running", 0) or 0),
+            "credit": int(getattr(metrics, "credit", 0) or 0),
+            "python_version": str(getattr(node, "python_version", "") or ""),
+            "active_runtimes": list(getattr(node, "active_runtimes", []) or []),
+            "tags": list(getattr(node, "tags", []) or []),
+            "profile_key": str(getattr(node, "profile_key", "") or ""),
+            "managed_tags": list(getattr(node, "managed_tags", []) or []),
+            "capability_tags": list(getattr(node, "capability_tags", []) or []),
+            "legacy_node_tags": list(getattr(node, "legacy_node_tags", []) or []),
+            "profile_enabled": bool(getattr(node, "profile_enabled", True)),
+            "profile_notes": str(getattr(node, "profile_notes", "") or ""),
+            "version": str(getattr(node, "version", "") or ""),
+            "metadata": metadata,
+            "service_worker_capacity": int(getattr(node, "service_worker_capacity", 0) or 0),
+            "service_worker_used": int(getattr(node, "service_worker_used", 0) or 0),
+            "task_pool_worker_capacity": int(getattr(node, "task_pool_worker_capacity", 0) or 0),
+            "task_pool_worker_used": int(getattr(node, "task_pool_worker_used", 0) or 0),
+            "accept_service_deploy": bool(getattr(node, "accept_service_deploy", True)),
+            "services": [],
+            "task_pools": [],
+        }
+        for svc in sorted(getattr(node, "services", {}).values(), key=lambda item: (str(getattr(item, "service_name", "") or ""), str(getattr(item, "service_id", "") or ""))):
+            node_payload["services"].append(
+                {
+                    "service_name": str(getattr(svc, "service_name", "") or ""),
+                    "service_id": str(getattr(svc, "service_id", "") or ""),
+                    "status": int(getattr(svc, "status", 0) or 0),
+                    "policy_id": str(getattr(svc, "policy_id", "") or ""),
+                    "owner_client_id": str(getattr(svc, "owner_client_id", "") or ""),
+                    "code_version": str(getattr(svc, "code_version", "") or ""),
+                    "entry_module": str(getattr(svc, "entry_module", "") or ""),
+                    "entry_callable": str(getattr(svc, "entry_callable", "") or ""),
+                    "serialization_mode": str(getattr(svc, "serialization_mode", "") or ""),
+                    "status_text": str(getattr(svc, "status_text", "") or ""),
+                    "resource_health": str(getattr(svc, "resource_health", "") or ""),
+                    "degraded": bool(getattr(svc, "degraded", False)),
+                    "worker_count": int(getattr(svc, "worker_count", 0) or 0),
+                    "alive_workers": int(getattr(svc, "alive_workers", 0) or 0),
+                    "in_flight": int(getattr(svc, "in_flight", 0) or 0),
+                    "received_count": int(getattr(svc, "received_count", 0) or 0),
+                    "returned_count": int(getattr(svc, "returned_count", 0) or 0),
+                    "ema_child_invoke_ms": float(getattr(svc, "ema_child_invoke_ms", 0.0) or 0.0),
+                    "ema_samples": int(getattr(svc, "ema_samples", 0) or 0),
+                    "http_base_url": str(getattr(svc, "http_base_url", "") or ""),
+                    "stop_reason": str(getattr(svc, "stop_reason", "") or ""),
+                    "failure_at": _dt_text(getattr(svc, "failure_at", "")) if getattr(svc, "failure_at", None) is not None else "",
+                }
+            )
+        for pool in sorted(getattr(node, "task_pools", {}).values(), key=lambda item: (str(getattr(item, "pool_name", "") or ""), str(getattr(item, "pool_id", "") or ""))):
+            node_payload["task_pools"].append(
+                {
+                    "pool_id": str(getattr(pool, "pool_id", "") or ""),
+                    "owner_client_id": str(getattr(pool, "owner_client_id", "") or ""),
+                    "pool_name": str(getattr(pool, "pool_name", "") or ""),
+                    "code_version": str(getattr(pool, "code_version", "") or ""),
+                    "status": str(getattr(pool, "status", "") or ""),
+                    "resource_health": str(getattr(pool, "resource_health", "") or ""),
+                    "degraded": bool(getattr(pool, "degraded", False)),
+                    "worker_count": int(getattr(pool, "worker_count", 0) or 0),
+                    "alive_workers": int(getattr(pool, "alive_workers", 0) or 0),
+                    "task_count": int(getattr(pool, "task_count", 0) or 0),
+                    "inflight": int(getattr(pool, "inflight", 0) or 0),
+                    "received_count": int(getattr(pool, "received_count", 0) or 0),
+                    "returned_count": int(getattr(pool, "returned_count", 0) or 0),
+                    "ema_child_invoke_ms": float(getattr(pool, "ema_child_invoke_ms", 0.0) or 0.0),
+                    "ema_samples": int(getattr(pool, "ema_samples", 0) or 0),
+                    "created_at": _dt_text(getattr(pool, "created_at", "")),
+                    "stop_reason": str(getattr(pool, "stop_reason", "") or ""),
+                    "failure_reason": str(getattr(pool, "failure_reason", "") or ""),
+                    "failure_at": _dt_text(getattr(pool, "failure_at", "")) if getattr(pool, "failure_at", None) is not None else "",
+                }
+            )
+        payload["nodes"].append(node_payload)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _parse_form_body(body: bytes) -> Dict[str, str]:
     raw = body.decode("utf-8") if body else ""
     parsed = parse_qs(raw, keep_blank_values=True)
@@ -838,8 +936,10 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     waiting_job_rows: List[tuple] = []
     current_job_timing: Dict[str, object] = {}
     queue_timing: Dict[str, object] = {}
+    job_summary: Dict[str, object] = {}
     if job_queue is not None:
         summary = dict(job_queue.summary() or {})
+        job_summary = summary
         current_job_timing = dict(summary.get("current_job_timing") or {})
         queue_timing = dict(summary.get("timing") or {})
         job_queue_rows.append(
@@ -1215,9 +1315,11 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         f"{_ops_metric_card('Jobs', total_waiting_jobs, f'waiting, {total_recent_jobs} recent')}"
         "</div>"
     )
+    content_key = _ops_snapshot_content_key(nodes, job_summary=job_summary)
     if _snapshot_only:
         return {
             "ok": True,
+            "content_key": content_key,
             "fragments": {
                 "ops-nodes-body": node_body,
                 "ops-job-queue-body": job_queue_body,
@@ -1333,6 +1435,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "applyDensity(getDensity());"
         "if(densityBtn){densityBtn.addEventListener('click',function(){const show=!document.body.classList.contains('show-details');setDensity(show);applyDensity(show);});}"
         "const ids=['ops-nodes-body','ops-job-queue-body','ops-job-timing-body','ops-recent-jobs-body','ops-waiting-jobs-body','ops-services-body','ops-pools-body'];"
+        f"let lastOpsContentKey={json.dumps(content_key)};"
         "function card(label,value,sub){return '<div class=\"metric-card\"><div class=\"metric-glow\"></div><div class=\"metric-label\">'+label+'</div><div class=\"metric-value\">'+value+'</div><div class=\"metric-sub\">'+sub+'</div></div>';}"
         "function updateOverview(data){const el=document.getElementById('ops-overview');if(!el||!data.metrics){return;}const m=data.metrics;el.innerHTML=card('Nodes',m.nodes||'-','healthy / total')+card('Services',m.services||'-','routable / known')+card('Task Pools',m.task_pools||'-','in-flight '+(m.pool_inflight||0))+card('Jobs',m.jobs||'-','waiting, '+(m.recent_jobs||0)+' recent');}"
         "async function refreshOps(){"
@@ -1340,6 +1443,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "try{const resp=await fetch('/ops/snapshot',{cache:'no-store',headers:{'Accept':'application/json'}});"
         "if(!resp.ok){throw new Error('http '+resp.status);}"
         "const data=await resp.json();if(!data.ok){throw new Error(data.error||'snapshot failed');}"
+        "if(data.content_key&&lastOpsContentKey===data.content_key){if(status){status.textContent='auto_refresh_sec=5 mode=partial heartbeat_ignored='+new Date().toLocaleTimeString();}return;}"
+        "if(data.content_key){lastOpsContentKey=data.content_key;}"
         "updateOverview(data);const fragments=data.fragments||{};"
         "ids.forEach(function(id){const el=document.getElementById(id);if(el&&Object.prototype.hasOwnProperty.call(fragments,id)){el.innerHTML=fragments[id];}});"
         "if(status){status.textContent='auto_refresh_sec=5 mode=partial last_update='+new Date().toLocaleTimeString();}"
