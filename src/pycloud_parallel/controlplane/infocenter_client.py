@@ -366,6 +366,43 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
     return out
 
 
+def _serialize_service_report_item(item: object) -> Dict[str, object]:
+    return {
+        "service_name": str(getattr(item, "service_name", "") or ""),
+        "service_id": str(getattr(item, "service_id", "") or ""),
+        "status": int(getattr(item, "status", 0) or 0),
+        "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
+        "owner_client_id": str(getattr(item, "owner_client_id", "") or ""),
+        "code_version": str(getattr(item, "code_version", "") or ""),
+        "entry_module": str(getattr(item, "entry_module", "") or ""),
+        "entry_callable": str(getattr(item, "entry_callable", "") or ""),
+        "serialization_mode": str(getattr(item, "serialization_mode", "") or ""),
+        "status_text": str(getattr(item, "status_text", "") or ""),
+        "resource_health": str(getattr(item, "resource_health", "") or ""),
+        "degraded": _coerce_bool(getattr(item, "degraded", False), default=False),
+        "worker_count": int(getattr(item, "worker_count", 0) or 0),
+        "alive_workers": int(getattr(item, "alive_workers", 0) or 0),
+        "in_flight": int(getattr(item, "in_flight", 0) or 0),
+        "http_base_url": str(getattr(item, "http_base_url", "") or ""),
+        "stop_reason": str(getattr(item, "stop_reason", "") or ""),
+        "failure_at": (
+            getattr(item, "failure_at", None).isoformat()
+            if getattr(item, "failure_at", None) is not None
+            else ""
+        ),
+        "readiness": str(getattr(item, "readiness", "") or ""),
+        "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(item, "create_stage", "") or ""),
+        "operation_id": str(getattr(item, "operation_id", "") or ""),
+        "operation_updated_at": (
+            getattr(item, "operation_updated_at", None).isoformat()
+            if getattr(item, "operation_updated_at", None) is not None
+            else ""
+        ),
+        "signal_cursor": int(getattr(item, "signal_cursor", 0) or 0),
+    }
+
+
 class InfoCenterClient:
     """Low-level HTTP client for InfoCenter."""
 
@@ -417,33 +454,7 @@ class InfoCenterClient:
             if isinstance(item, dict):
                 serialized_services.append(dict(item))
                 continue
-            serialized_services.append(
-                {
-                    "service_name": str(item.service_name),
-                    "service_id": str(item.service_id),
-                    "status": int(item.status),
-                    "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
-                    "owner_client_id": str(getattr(item, "owner_client_id", "") or ""),
-                    "code_version": str(getattr(item, "code_version", "") or ""),
-                    "entry_module": str(getattr(item, "entry_module", "") or ""),
-                    "entry_callable": str(getattr(item, "entry_callable", "") or ""),
-                    "serialization_mode": str(getattr(item, "serialization_mode", "") or ""),
-                    "worker_count": int(item.worker_count),
-                    "alive_workers": int(item.alive_workers),
-                    "in_flight": int(item.in_flight),
-                    "http_base_url": str(item.http_base_url),
-                    "stop_reason": str(getattr(item, "stop_reason", "") or ""),
-                    "readiness": str(getattr(item, "readiness", "") or ""),
-                    "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
-                    "create_stage": str(getattr(item, "create_stage", "") or ""),
-                    "operation_id": str(getattr(item, "operation_id", "") or ""),
-                    "operation_updated_at": (
-                        getattr(item, "operation_updated_at", None).isoformat()
-                        if getattr(item, "operation_updated_at", None) is not None
-                        else ""
-                    ),
-                }
-            )
+            serialized_services.append(_serialize_service_report_item(item))
         return http_json_request(
             base_url=self.base_url,
             path="/nodes/register",
@@ -498,33 +509,7 @@ class InfoCenterClient:
             if isinstance(item, dict):
                 serialized_services.append(dict(item))
                 continue
-            serialized_services.append(
-                {
-                    "service_name": str(item.service_name),
-                    "service_id": str(item.service_id),
-                    "status": int(item.status),
-                    "policy_id": str(getattr(item, "policy_id", "") or "default_safe"),
-                    "owner_client_id": str(getattr(item, "owner_client_id", "") or ""),
-                    "code_version": str(getattr(item, "code_version", "") or ""),
-                    "entry_module": str(getattr(item, "entry_module", "") or ""),
-                    "entry_callable": str(getattr(item, "entry_callable", "") or ""),
-                    "serialization_mode": str(getattr(item, "serialization_mode", "") or ""),
-                    "worker_count": int(item.worker_count),
-                    "alive_workers": int(item.alive_workers),
-                    "in_flight": int(item.in_flight),
-                    "http_base_url": str(item.http_base_url),
-                    "stop_reason": str(getattr(item, "stop_reason", "") or ""),
-                    "readiness": str(getattr(item, "readiness", "") or ""),
-                    "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
-                    "create_stage": str(getattr(item, "create_stage", "") or ""),
-                    "operation_id": str(getattr(item, "operation_id", "") or ""),
-                    "operation_updated_at": (
-                        getattr(item, "operation_updated_at", None).isoformat()
-                        if getattr(item, "operation_updated_at", None) is not None
-                        else ""
-                    ),
-                }
-            )
+            serialized_services.append(_serialize_service_report_item(item))
         payload = {
             "node_id": node_id,
             "node_instance_id": str(node_instance_id or "").strip(),

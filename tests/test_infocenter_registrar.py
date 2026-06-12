@@ -923,6 +923,56 @@ def test_infocenter_client_preserves_resource_readiness_fields():
     assert routes[0].operation_updated_at == op_time
 
 
+def test_infocenter_client_serializes_object_service_reports_with_readiness_fields(monkeypatch):
+    captured = {}
+
+    def _fake_http_json_request(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "accepted": True}
+
+    monkeypatch.setattr(
+        "pycloud_parallel.controlplane.infocenter_client.http_json_request",
+        _fake_http_json_request,
+    )
+    op_time = datetime(2026, 6, 1, 8, 0, 20, tzinfo=timezone.utc)
+    service = SimpleNamespace(
+        service_name="svc-object-report",
+        service_id="svc-object-report",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        status_text="RUNNING",
+        resource_health="running",
+        degraded=False,
+        worker_count=2,
+        alive_workers=2,
+        in_flight=1,
+        http_base_url="http://127.0.0.1:18081/svc/svc-object-report",
+        readiness="initializing",
+        readiness_reason="warmup",
+        create_stage="warmup",
+        operation_id="create-svc-object-report",
+        operation_updated_at=op_time,
+        signal_cursor=42,
+    )
+
+    client = InfoCenterClient("127.0.0.1:50051", timeout_sec=2.0)
+    client.register_node(
+        node_id="node-object-report",
+        node_instance_id="node-object-report-1",
+        control_addr="http://127.0.0.1:50061",
+        services=[service],
+    )
+
+    payload = captured["payload"]
+    item = payload["services"][0]
+    assert item["readiness"] == "initializing"
+    assert item["readiness_reason"] == "warmup"
+    assert item["create_stage"] == "warmup"
+    assert item["operation_id"] == "create-svc-object-report"
+    assert item["operation_updated_at"] == op_time.isoformat()
+    assert item["signal_cursor"] == 42
+    assert item["resource_health"] == "running"
+
+
 def test_infocenter_preserves_failure_timestamp_across_heartbeats():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_state.register_node_record(
