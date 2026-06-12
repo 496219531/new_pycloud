@@ -46,7 +46,7 @@ def test_resource_signal_latest_returns_latest_resource_state():
     assert latest.state == "ready"
 
 
-def test_resource_signal_coalesce_does_not_drop_failure_or_progress():
+def test_resource_signal_incremental_stream_ignores_heartbeat():
     store = ResourceSignalStore(maxlen=10)
 
     store.publish(ResourceSignal(resource_kind="service", resource_id="svc-1", signal_type="progress", state="prepare"))
@@ -56,7 +56,7 @@ def test_resource_signal_coalesce_does_not_drop_failure_or_progress():
 
     signals = store.since(0, limit=10)
 
-    assert [signal.signal_type for signal in signals].count("heartbeat") == 1
+    assert not any(signal.signal_type == "heartbeat" for signal in signals)
     assert any(signal.signal_type == "progress" for signal in signals)
     assert any(signal.signal_type == "failure" for signal in signals)
 

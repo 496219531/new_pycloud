@@ -1110,6 +1110,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._compensation_spec: Optional[Dict[str, Any]] = None
         self._compensation_lock = threading.Lock()
         self._last_compensation_attempt_at = 0.0
+        self._last_compensation_decision_log_at = 0.0
         self._last_managed_globals: Optional[Dict[str, object]] = None
         self._async_globals_lock = threading.Lock()
         self._async_globals_executor: Optional[ThreadPoolExecutor] = None
@@ -1298,6 +1299,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 )
             list_nodes_sec += time.monotonic() - list_started_at
             select_started_at = time.monotonic()
+            raw_candidate_node_ids = [_node_instance_key_from_node(node) for node in selected_nodes if _node_instance_key_from_node(node)]
             candidates = [
                 node
                 for node in selected_nodes
@@ -1315,6 +1317,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         for node in candidates
                         if str(getattr(node, "node_id", "") or "").strip() not in active_node_ids
                     ]
+            else:
+                active_node_ids = set()
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in selected_nodes if _node_instance_key_from_node(node)
             }
@@ -1330,6 +1334,24 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             ):
                 return 0
             if not candidates:
+                now_log = time.monotonic()
+                if now_log - float(self._last_compensation_decision_log_at or 0.0) >= 60.0:
+                    self._last_compensation_decision_log_at = now_log
+                    logger.info(
+                        "task pool compensation skipped pool_name=%s active=%s active_node_ids=%s "
+                        "desired=%s candidate_nodes=%s candidates_after_active_filter=%s retry_probe=%s "
+                        "failed=%s retryable_failed=%s skipped_reason=%s",
+                        str(spec.get("pool_name", "") or getattr(self, "pool_name", "") or getattr(self, "job_id", "") or ""),
+                        sorted(active),
+                        sorted(active_node_ids),
+                        desired,
+                        sorted(raw_candidate_node_ids),
+                        sorted(candidate_node_instance_ids),
+                        sorted(self._retry_probe_replica_snapshot()),
+                        sorted(failed),
+                        sorted(retryable_failed),
+                        "no eligible candidate",
+                    )
                 return 0
             missing = max(0, desired - len(active))
             select_candidates_sec += time.monotonic() - select_started_at

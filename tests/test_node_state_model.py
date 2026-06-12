@@ -553,11 +553,13 @@ def test_nodecontrol_task_pool_create_signals_and_heartbeat_stays_lightweight(tm
             chunks=[blob],
         )
 
+        cursor_before = pool.signal_cursor
         state.heartbeat_task_pool(
             owner_client_id="owner-signals",
             pool_id=pool.pool_id,
             pool_token=pool.pool_token,
         )
+        assert pool.signal_cursor == cursor_before
         signals = state.list_resource_signals(since=0, limit=20)["signals"]
         assert any(item["resource_id"] == pool.pool_id and item["signal_type"] == "readiness" for item in signals)
         assert not any(item["resource_id"] == pool.pool_id and item["signal_type"] == "heartbeat" for item in signals)
@@ -668,6 +670,139 @@ def test_nodecontrol_task_pool_create_wait_ready_false_returns_before_warmup(tmp
             )
     finally:
         release_artifact_ready.set()
+        state.close()
+
+
+def test_nodecontrol_service_async_create_executor_failure_marks_failed_and_releases_reservation(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-async-create-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_create_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            raise RuntimeError("executor create failed")
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-async-fail",
+            service_name="svc-async-fail",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async_fail",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-create-fail-1",
+            wait_ready=False,
+        )
+
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="service", resource_id=session.service_id)["readiness"] == "failed",
+            timeout_sec=3.0,
+        )
+        progress = state.get_resource_progress(resource_kind="service", resource_id=session.service_id)
+        assert progress["readiness"] == "failed"
+        assert progress["stage"] == "create_failed"
+        assert progress["operation_id"] == "service-async-create-fail-1"
+        assert progress["operation_status"] == "failed"
+        assert "executor create failed" in progress["readiness_reason"]
+        assert state._service_create_requests["service-async-create-fail-1"].status == "FAILED"  # noqa: SLF001
+        assert state._service_worker_reserved == 0  # noqa: SLF001
+        report = state.service_report_payloads(include_stopped=True)[0]
+        assert report["readiness"] == "failed"
+        assert "executor create failed" in report["readiness_reason"]
+    finally:
+        state.close()
+
+
+def test_nodecontrol_task_pool_async_create_executor_failure_marks_failed_and_releases_reservation(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-async-create-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        task_pool_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_async_create_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **_kwargs):
+            raise RuntimeError("pool executor create failed")
+
+        def stop_task_pool(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool-async-fail",
+            pool_name="pool-async-fail",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_async_fail",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="pool-async-create-fail-1",
+            wait_ready=False,
+        )
+
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)["readiness"] == "failed",
+            timeout_sec=3.0,
+        )
+        progress = state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)
+        assert progress["readiness"] == "failed"
+        assert progress["stage"] == "create_failed"
+        assert progress["operation_id"] == "pool-async-create-fail-1"
+        assert progress["operation_status"] == "failed"
+        assert "pool executor create failed" in progress["readiness_reason"]
+        assert state._task_pool_create_requests["pool-async-create-fail-1"].status == "FAILED"  # noqa: SLF001
+        assert state._task_pool_worker_reserved == 0  # noqa: SLF001
+        report = state.task_pool_reports()[pool.pool_id]
+        assert report.readiness == "failed"
+        assert "pool executor create failed" in report.readiness_reason
+    finally:
         state.close()
 
 
@@ -6218,7 +6353,7 @@ def test_service_worker_liveness_drives_degraded_then_stopped(tmp_path):
         state.close()
 
 
-def test_service_worker_liveness_missing_running_service_is_ignored(tmp_path):
+def test_service_worker_liveness_missing_running_service_degrades_then_stops(tmp_path):
     state = NodeControlState(
         node_id="node-service-liveness-missing",
         queue_capacity=4,
@@ -6292,15 +6427,36 @@ def test_service_worker_liveness_missing_running_service_is_ignored(tmp_path):
         state._services[present.service_id] = present  # noqa: SLF001
 
     try:
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert missing.status == pb2.SERVICE_STATUS_RUNNING
+        assert missing.alive_workers == 0
+        assert missing.degraded is True
+        assert missing.last_liveness_missing_report_at > 0
+        assert present.status == pb2.SERVICE_STATUS_RUNNING
+        assert present.alive_workers == 1
+        assert present.degraded is False
+
         for _idx in range(3):
             state._handle_service_timeouts()  # noqa: SLF001
 
-        assert missing.status == pb2.SERVICE_STATUS_RUNNING
-        assert missing.alive_workers == 1
+        assert missing.status == pb2.SERVICE_STATUS_STOPPED
+        assert "service worker unavailable" in missing.stop_reason
+        assert missing.alive_workers == 0
         assert missing.degraded is False
         assert present.status == pb2.SERVICE_STATUS_RUNNING
         assert present.alive_workers == 1
-        assert calls == []
+        assert present.degraded is False
+        assert _wait_until(lambda: bool(calls))
+        assert calls == [
+            (
+                "stop_service",
+                {
+                    "service_id": "svc-missing",
+                    "reason": "service worker unavailable; owner should redeploy or compensate; alive_workers=0 worker_count=1",
+                },
+            )
+        ]
     finally:
         state.close()
 
@@ -7222,7 +7378,7 @@ def test_task_pool_worker_liveness_drives_degraded_then_stopped(tmp_path):
         state.close()
 
 
-def test_task_pool_worker_liveness_missing_running_pool_is_ignored(tmp_path):
+def test_task_pool_worker_liveness_missing_running_pool_degrades_then_stops(tmp_path):
     state = NodeControlState(
         node_id="node-task-pool-liveness-missing",
         queue_capacity=4,
@@ -7233,6 +7389,7 @@ def test_task_pool_worker_liveness_missing_running_pool_is_ignored(tmp_path):
         enable_service_session=False,
     )
     now = utc_now()
+    calls = []
 
     class _FakeExecutorHost:
         def is_alive(self):
@@ -7241,8 +7398,8 @@ def test_task_pool_worker_liveness_missing_running_pool_is_ignored(tmp_path):
         def resource_worker_liveness(self):
             return {("task_pool", "pool-present"): 1}
 
-        def stop_task_pool(self, **kwargs):  # noqa: ARG002
-            return None
+        def stop_task_pool(self, **kwargs):
+            calls.append(kwargs)
 
         def drain_events(self):
             return []
@@ -7290,14 +7447,31 @@ def test_task_pool_worker_liveness_missing_running_pool_is_ignored(tmp_path):
         state._task_pools[present.pool_id] = present  # noqa: SLF001
 
     try:
+        state._handle_service_timeouts()  # noqa: SLF001
+
+        assert missing.status == "RUNNING"
+        assert missing.alive_workers == 0
+        assert missing.degraded is True
+        assert missing.last_liveness_missing_report_at > 0
+        assert present.alive_workers == 1
+        assert present.degraded is False
+
         for _idx in range(3):
             state._handle_service_timeouts()  # noqa: SLF001
 
-        assert missing.status == "RUNNING"
-        assert missing.alive_workers == 1
+        assert missing.status == "STOPPED"
+        assert "task pool worker unavailable" in missing.stop_reason
+        assert missing.alive_workers == 0
         assert missing.degraded is False
         assert present.alive_workers == 1
         assert present.degraded is False
+        assert _wait_until(lambda: bool(calls))
+        assert calls == [
+            {
+                "pool_id": "pool-missing",
+                "reason": "task pool worker unavailable; owner should redeploy or compensate; alive_workers=0 worker_count=1",
+            }
+        ]
     finally:
         state.close()
 

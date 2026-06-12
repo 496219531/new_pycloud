@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-"""Lightweight resource progress/readiness signal primitives."""
+"""Lightweight resource progress/readiness signal primitives.
+
+ResourceSignalStore is for long-running resource operations, not lease traffic:
+progress/failure/stop are retained as an operation log, readiness is coalesced
+as the current routing gate, and heartbeat must stay outside this store.
+"""
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
@@ -9,7 +14,7 @@ import threading
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 
-RESOURCE_SIGNAL_COALESCE_TYPES = {"heartbeat", "readiness"}
+RESOURCE_SIGNAL_COALESCE_TYPES = {"readiness"}
 RESOURCE_SIGNAL_RETAIN_TYPES = {"progress", "failure", "stop"}
 
 
@@ -100,7 +105,7 @@ class ResourceSignalStore:
             signal_type = str(published.signal_type or "")
             if signal_type in RESOURCE_SIGNAL_COALESCE_TYPES:
                 self._coalesced_index[(published.resource_kind, published.resource_id, signal_type)] = published
-            else:
+            elif signal_type in RESOURCE_SIGNAL_RETAIN_TYPES:
                 self._signals.append(published)
             self._trim_locked()
             return published.seq

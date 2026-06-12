@@ -2015,6 +2015,7 @@ class Service(ServiceExecutionSession):
     _compensation_spec: Optional[Dict[str, Any]] = field(default=None, repr=False)
     _compensation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _last_compensation_attempt_at: float = field(default=0.0, repr=False)
+    _last_compensation_decision_log_at: float = field(default=0.0, repr=False)
     _last_managed_globals: Optional[Dict[str, object]] = field(default=None, repr=False)
     _async_globals_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _async_globals_executor: Optional[ThreadPoolExecutor] = field(default=None, repr=False)
@@ -2267,6 +2268,7 @@ class Service(ServiceExecutionSession):
                         _node_instance_key_from_node(node),
                     )
                 )
+            raw_candidate_node_ids = [_node_instance_key_from_node(node) for node in candidate_nodes if _node_instance_key_from_node(node)]
             candidates = [
                 node
                 for node in candidate_nodes
@@ -2289,6 +2291,8 @@ class Service(ServiceExecutionSession):
                         for node in candidates
                         if str(getattr(node, "node_id", "") or "").strip() not in active_node_ids
                     ]
+            else:
+                active_node_ids = set()
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
             }
@@ -2313,6 +2317,24 @@ class Service(ServiceExecutionSession):
             ):
                 return 0
             if not candidates:
+                now_log = time.monotonic()
+                if now_log - float(self._last_compensation_decision_log_at or 0.0) >= 60.0:
+                    self._last_compensation_decision_log_at = now_log
+                    logger.info(
+                        "service compensation skipped service_name=%s active=%s active_node_ids=%s "
+                        "desired=%s candidate_nodes=%s candidates_after_active_filter=%s retry_probe=%s "
+                        "failed=%s retryable_failed=%s skipped_reason=%s",
+                        self.service_name,
+                        sorted(active),
+                        sorted(active_node_ids),
+                        desired,
+                        sorted(raw_candidate_node_ids),
+                        sorted(candidate_node_instance_ids),
+                        sorted(self._retry_probe_replica_snapshot()),
+                        sorted(failed),
+                        sorted(retryable_failed),
+                        "no eligible candidate",
+                    )
                 return 0
             missing = max(0, desired - len(active))
             select_candidates_sec += time.monotonic() - select_started_at

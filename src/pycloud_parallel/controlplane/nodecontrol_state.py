@@ -1358,6 +1358,8 @@ class NodeControlState(NodeRuntimeBase):
                 if getattr(resource, "operation_updated_at", None) is not None
                 else latest_operation.updated_at.isoformat() if latest_operation is not None else ""
             ),
+            "operation_status": str(latest_operation.status if latest_operation is not None else ""),
+            "operation_error": str(latest_operation.error if latest_operation is not None else ""),
             "status": int(getattr(resource, "status", 0) or 0) if kind == "service" else str(getattr(resource, "status", "") or ""),
             "stop_reason": str(getattr(resource, "stop_reason", "") or ""),
             "failure_at": failure_at.isoformat() if failure_at is not None else "",
@@ -6015,10 +6017,12 @@ class NodeControlState(NodeRuntimeBase):
 
     def _apply_resource_liveness_locked(self, liveness: Dict[Tuple[str, str], int]) -> None:
         self._clear_deploy_health_block_locked(source="service worker liveness failed")
+        seen: set[Tuple[str, str]] = set()
         for (kind, resource_id), alive_count in liveness.items():
             resource_kind = str(kind or "")
             if resource_kind == "service":
                 service_id = str(resource_id or "")
+                seen.add(("service", service_id))
                 session = self._services.get(str(service_id or ""))
                 if session is None or session.status == pb2.SERVICE_STATUS_STOPPED:
                     continue
@@ -6027,10 +6031,52 @@ class NodeControlState(NodeRuntimeBase):
             if resource_kind not in {"task_pool", "taskpool", "pool"}:
                 continue
             pool_id = str(resource_id or "")
+            seen.add(("task_pool", pool_id))
             pool = self._task_pools.get(pool_id)
             if pool is None or not pool.is_running():
                 continue
             pool.alive_workers = max(0, int(alive_count or 0))
+        now_monotonic = time.monotonic()
+        for service_id, session in self._services.items():
+            if ("service", str(service_id or "")) in seen:
+                continue
+            if (
+                session.status == pb2.SERVICE_STATUS_RUNNING
+                and bool(getattr(session, "executor_ready", False))
+                and int(getattr(session, "worker_count", 0) or 0) > 0
+            ):
+                session.alive_workers = 0
+                last_report_at = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
+                if now_monotonic - last_report_at >= 60.0:
+                    session.last_liveness_missing_report_at = now_monotonic
+                    logger.warning(
+                        "[NodeControl] resource worker liveness missing treated as unhealthy "
+                        "node_id=%s node_instance_id=%s resource_kind=service resource_id=%s worker_count=%s",
+                        self.node_id,
+                        self.node_instance_id,
+                        service_id,
+                        int(getattr(session, "worker_count", 0) or 0),
+                    )
+        for pool_id, pool in self._task_pools.items():
+            if ("task_pool", str(pool_id or "")) in seen:
+                continue
+            if (
+                pool.is_running()
+                and bool(getattr(pool, "executor_ready", False))
+                and int(getattr(pool, "worker_count", 0) or 0) > 0
+            ):
+                pool.alive_workers = 0
+                last_report_at = float(getattr(pool, "last_liveness_missing_report_at", 0.0) or 0.0)
+                if now_monotonic - last_report_at >= 60.0:
+                    pool.last_liveness_missing_report_at = now_monotonic
+                    logger.warning(
+                        "[NodeControl] resource worker liveness missing treated as unhealthy "
+                        "node_id=%s node_instance_id=%s resource_kind=task_pool resource_id=%s worker_count=%s",
+                        self.node_id,
+                        self.node_instance_id,
+                        pool_id,
+                        int(getattr(pool, "worker_count", 0) or 0),
+                    )
 
     def _handle_service_resource_health_locked(self, session: ServiceSession, *, now: datetime) -> None:
         service_id = str(session.service_id or "")
