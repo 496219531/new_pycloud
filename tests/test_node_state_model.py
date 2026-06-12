@@ -806,6 +806,180 @@ def test_nodecontrol_task_pool_async_create_executor_failure_marks_failed_and_re
         state.close()
 
 
+def test_nodecontrol_subprocess_service_async_create_heartbeats_then_routes_when_ready(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-async-real-backend",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_real_backend"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    artifact_ready_started = threading.Event()
+    release_artifact_ready = threading.Event()
+    original_ensure_artifact_ready = state._ensure_artifact_ready  # noqa: SLF001
+
+    def _slow_ensure_artifact_ready(*args, **kwargs):
+        artifact_ready_started.set()
+        release_artifact_ready.wait(timeout=5.0)
+        return original_ensure_artifact_ready(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_ensure_artifact_ready", _slow_ensure_artifact_ready)
+    try:
+        blob = (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': int(value), 'ready': True}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-service-async-real",
+            service_name="svc-async-real",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async_real_backend",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-real-1",
+            wait_ready=False,
+        )
+
+        assert artifact_ready_started.wait(timeout=2.0)
+        assert session.readiness == "initializing"
+        hb = state.heartbeat_service(
+            owner_client_id="owner-service-async-real",
+            service_id=session.service_id,
+            service_token=session.service_token,
+        )
+        assert hb.readiness == "initializing"
+        code, body = state.call_service(
+            service_id=session.service_id,
+            method="run",
+            payload={"value": 7},
+            service_token=session.service_token,
+            timeout_sec=1.0,
+        )
+        assert code == 409
+        assert body["error"] == "service initializing"
+        assert body["readiness"] == "initializing"
+
+        release_artifact_ready.set()
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="service", resource_id=session.service_id)["readiness"] == "ready",
+            timeout_sec=8.0,
+        )
+        code, body = state.call_service(
+            service_id=session.service_id,
+            method="run",
+            payload={"value": 7},
+            service_token=session.service_token,
+            timeout_sec=5.0,
+        )
+        assert code == 200
+        assert body["ok"] is True
+        assert body["data"] == {"value": 7, "ready": True}
+    finally:
+        release_artifact_ready.set()
+        state.close()
+
+
+def test_nodecontrol_subprocess_task_pool_async_create_rejects_until_ready_then_runs(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-async-real-backend",
+        queue_capacity=4,
+        worker_capacity=1,
+        task_pool_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_async_real_backend"),
+        enable_internal_executor=True,
+        enable_service_session=False,
+        executor_poll_interval_sec=0.02,
+    )
+    artifact_ready_started = threading.Event()
+    release_artifact_ready = threading.Event()
+    original_ensure_artifact_ready = state._ensure_artifact_ready  # noqa: SLF001
+
+    def _slow_ensure_artifact_ready(*args, **kwargs):
+        artifact_ready_started.set()
+        release_artifact_ready.wait(timeout=5.0)
+        return original_ensure_artifact_ready(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_ensure_artifact_ready", _slow_ensure_artifact_ready)
+    try:
+        blob = (
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': int(value), 'square': int(value) * int(value)}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool-async-real",
+            pool_name="pool-async-real",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_async_real_backend",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="pool-async-real-1",
+            wait_ready=False,
+        )
+
+        assert artifact_ready_started.wait(timeout=2.0)
+        hb = state.heartbeat_task_pool(
+            owner_client_id="owner-pool-async-real",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+        )
+        assert hb.readiness == "initializing"
+        with pytest.raises(RuntimeError, match="task pool initializing"):
+            state.submit_pool_tasks(
+                pool_id=pool.pool_id,
+                pool_token=pool.pool_token,
+                tasks=[pb2.TaskSubmitItem(task_id="pool-async-real-init", payload=dict_to_struct({"value": 3}))],
+            )
+
+        release_artifact_ready.set()
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)["readiness"] == "ready",
+            timeout_sec=8.0,
+        )
+        accepted, rejected = state.submit_pool_tasks(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            tasks=[pb2.TaskSubmitItem(task_id="pool-async-real-ready", payload=dict_to_struct({"value": 3}))],
+            job_id="job-pool-async-real",
+        )
+        assert len(accepted) == 1
+        assert not rejected
+        results = []
+        deadline = time.time() + 8.0
+        while time.time() < deadline and not results:
+            state._drain_executor_events()  # noqa: SLF001
+            results, _cursor = state.pull_pool_results(
+                pool_id=pool.pool_id,
+                pool_token=pool.pool_token,
+                limit=10,
+                wait_ms=0,
+                cursor="",
+            )
+            if not results:
+                time.sleep(0.05)
+        assert len(results) == 1
+        assert results[0].status == pb2.TASK_STATUS_SUCCEEDED
+        assert struct_to_dict(results[0].result) == {"value": 3, "square": 9}
+    finally:
+        release_artifact_ready.set()
+        state.close()
+
+
 def test_task_pool_artifact_validation_runs_in_executor_host_not_node(tmp_path):
     module_name = "node_should_not_import_entry_module_demo"
     sys.modules.pop(module_name, None)

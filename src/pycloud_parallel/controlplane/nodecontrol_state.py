@@ -862,6 +862,19 @@ class NodeControlState(NodeRuntimeBase):
 
     @staticmethod
     def _service_stopped_error_payload(session: ServiceSession, *, fallback: str = "service not running") -> Dict[str, object]:
+        readiness = str(getattr(session, "readiness", "") or "").strip().lower()
+        if readiness and readiness != "ready" and session.status != pb2.SERVICE_STATUS_STOPPED:
+            reason = str(getattr(session, "readiness_reason", "") or "").strip()
+            stage = str(getattr(session, "create_stage", "") or "").strip()
+            return {
+                "ok": False,
+                "error": f"service {readiness}",
+                "stop_reason": str(getattr(session, "stop_reason", "") or "").strip(),
+                "status": int(session.status),
+                "readiness": readiness,
+                "readiness_reason": reason,
+                "create_stage": stage,
+            }
         stop_reason = str(getattr(session, "stop_reason", "") or "").strip()
         error = stop_reason or str(fallback or "service not running")
         return {
@@ -869,6 +882,9 @@ class NodeControlState(NodeRuntimeBase):
             "error": error,
             "stop_reason": stop_reason,
             "status": int(session.status),
+            "readiness": str(getattr(session, "readiness", "") or "").strip(),
+            "readiness_reason": str(getattr(session, "readiness_reason", "") or "").strip(),
+            "create_stage": str(getattr(session, "create_stage", "") or "").strip(),
         }
 
     @property
