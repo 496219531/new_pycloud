@@ -524,7 +524,14 @@ class ExecutorCore:
                 payload=args,
             )
 
-            def _consume_background_result(done_future, *, call_kind: str = kind, call_label: str = label) -> None:
+            def _consume_background_result(
+                done_future,
+                *,
+                call_kind: str = kind,
+                call_key: str = key,
+                call_label: str = label,
+                call_executor: ProcessPoolExecutor = current_executor,
+            ) -> None:
                 try:
                     status_text, _result, err_type, err_message, _timings = unpack_subprocess_result(done_future.result())
                 except Exception as exc:
@@ -539,6 +546,7 @@ class ExecutorCore:
                         err_type,
                         err_message,
                     )
+                self._emit_executor_workers(scope=call_kind, key=call_key, executor=call_executor)
 
             future.add_done_callback(_consume_background_result)
         self._emit_executor_workers(scope=kind, key=key, executor=current_executor)

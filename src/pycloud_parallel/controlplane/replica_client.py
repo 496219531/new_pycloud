@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Replica-scoped client handles for service sessions and task pools."""
 
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
@@ -66,6 +67,7 @@ class NativeTaskPoolClient:
     pool_token: str
     code_version: str
     worker_count: int
+    alive_workers: int = 0
     heartbeat_timeout_sec: int = 30
     pool_name: str = ""
     idle_ttl_sec: int = 0
@@ -198,6 +200,12 @@ class NativeTaskPoolClient:
         self.lease_expire_at = now + timedelta(seconds=max(1, int(self.heartbeat_timeout_sec or 0)))
         self.failed = False
         self.last_error = ""
+        heartbeat_resource = getattr(self._client, "last_heartbeat_resource", None)
+        with contextlib.suppress(Exception):
+            if isinstance(heartbeat_resource, dict) and "alive_workers" in heartbeat_resource:
+                self.alive_workers = max(0, int(heartbeat_resource.get("alive_workers", 0) or 0))
+            elif hasattr(resp, "alive_workers"):
+                self.alive_workers = max(0, int(getattr(resp, "alive_workers", 0) or 0))
         return resp
 
     def cancel_job(self, *, job_id: str, reason: str = "") -> pb2.CancelJobResponse:
@@ -267,6 +275,7 @@ class ServiceSessionClient:
     heartbeat_timeout_sec: int
     worker_count: int
     status: int
+    alive_workers: int = 0
     code_version: str = ""
     service_name: str = ""
     idle_ttl_sec: int = 0
@@ -366,6 +375,12 @@ class ServiceSessionClient:
         self.status = resp.status
         self.failed = False
         self.last_error = ""
+        heartbeat_resource = getattr(self._client, "last_heartbeat_resource", None)
+        with contextlib.suppress(Exception):
+            if isinstance(heartbeat_resource, dict) and "alive_workers" in heartbeat_resource:
+                self.alive_workers = max(0, int(heartbeat_resource.get("alive_workers", 0) or 0))
+            elif hasattr(resp, "alive_workers"):
+                self.alive_workers = max(0, int(getattr(resp, "alive_workers", 0) or 0))
         now = _utc_now()
         self.last_heartbeat_at = now
         self.lease_expire_at = now + timedelta(seconds=max(1, int(self.heartbeat_timeout_sec or 0)))

@@ -128,6 +128,35 @@ def test_taskpool_after_keepalive_tick_uses_recovery_intervals() -> None:
         session._stop_keepalive()  # noqa: SLF001
 
 
+def test_taskpool_zero_alive_does_not_drive_owner_compensation() -> None:
+    pool = SimpleNamespace(
+        pool_id="pool-zero",
+        pool_name="pool-zero",
+        owner_client_id="owner",
+        worker_count=1,
+        alive_workers=0,
+        heartbeat_timeout_sec=30,
+    )
+    session = TaskPool(pools={"node-1": pool}, nodes={}, task_method="run")
+    session._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "node_count": 1,
+            "infocenter_target": "127.0.0.1:1",
+        }
+    )
+    submitted = []
+    session._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+
+    try:
+        session._mark_replica_heartbeat_success("node-1", pool)  # noqa: SLF001
+        assert session._active_replica_snapshot() == {"node-1"}  # noqa: SLF001
+        for _idx in range(3):
+            session._after_keepalive_tick()  # noqa: SLF001
+        assert submitted == []
+    finally:
+        session._stop_keepalive()  # noqa: SLF001
+
+
 def test_taskpool_runtime_boundary_does_not_use_service_discovery_surface() -> None:
     text = (ROOT / "src/pycloud_parallel/execution/task_pool.py").read_text(encoding="utf-8")
     assert "service_name=" not in text

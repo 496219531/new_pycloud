@@ -490,6 +490,62 @@ def test_executor_core_background_submit_falls_back_to_spawn_when_fork_fails(mon
         core.close()
 
 
+def test_executor_core_background_completion_reemits_worker_pids(monkeypatch):
+    class _FakeExecutor:
+        def __init__(self, max_workers, mp_context):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+            self._processes = {}
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    class _FakeFuture:
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+        def result(self):
+            return ("SUCCEEDED", {"warmed": True}, "", "", {})
+
+    class _FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+    monkeypatch.setattr(executor_core_mod, "ProcessPoolExecutor", _FakeExecutor)
+    fake_future = _FakeFuture()
+
+    def _fake_submit(executor, _payload):
+        executor._processes = {1: _FakeProcess(4242)}
+        return fake_future
+
+    monkeypatch.setattr(executor_core_mod, "submit_callable_to_worker", _fake_submit)
+
+    core = ExecutorCore(task_worker_capacity=1)
+    try:
+        emitted = []
+        monkeypatch.setattr(core, "_emit_event", lambda item: emitted.append(dict(item)))
+
+        assert core.handle_request("create", "create_service", {"service_id": "svc-reemit", "worker_count": 1})
+        assert core.handle_request("warmup", "warmup_service", {"service_id": "svc-reemit", "fanout": 1})
+
+        pid_events = [item for item in emitted if item.get("kind") == "executor_worker_pids"]
+        assert pid_events
+        emitted.clear()
+
+        fake_future.callback(fake_future)
+
+        assert emitted == [
+            {
+                "kind": "executor_worker_pids",
+                "scope": "service",
+                "key": "svc-reemit",
+                "worker_pids": [4242],
+            }
+        ]
+    finally:
+        core.close()
+
+
 @pytest.mark.parametrize("backend_cls", [SubprocessExecutorBackend])
 def test_executor_backend_service_call_roundtrip(tmp_path, backend_cls):
     state, artifact = _seed_artifact(

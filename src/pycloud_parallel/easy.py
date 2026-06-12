@@ -122,7 +122,7 @@ def serve_node(
         tags=[item for item in tags if item],
         version=node_version,
         metadata={"role": "compute-node"},
-        exit_on_fence=True,
+        exit_on_fence=False,
     )
     registrar_holder["value"] = registrar
 

@@ -408,8 +408,6 @@ def _service_resource_health_text(*, node_healthy: bool, service_status: int, al
         return "stopped"
     if str(stop_reason or "").strip():
         return "failed"
-    if int(alive_workers or 0) <= 0:
-        return "degraded"
     return "running"
 
 
@@ -428,7 +426,7 @@ def _task_pool_resource_health_text(
         return "stopped"
     if str(stop_reason or "").strip():
         return "failed"
-    if normalized == "DEGRADED" or _coerce_bool(degraded, default=False) or int(alive_workers or 0) <= 0:
+    if normalized == "DEGRADED" or _coerce_bool(degraded, default=False):
         return "degraded"
     return "running"
 
@@ -1592,88 +1590,19 @@ class InfoCenterHttpServer:
                     if payload is None:
                         return
                     node_instance_id = str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip()
-                    if state.is_instance_fenced(node_instance_id):
-                        fence_reason = state.fenced_instance_reason(node_instance_id)
-                        self._send_json(
-                            200,
-                            {
-                                "ok": False,
-                                "accepted": False,
-                                "reset_required": True,
-                                "new_instance_required": True,
-                                "lease_ttl_sec": state.lease_ttl_sec,
-                                "reason": fence_reason or "node_instance_id fenced",
-                                "error": "node_instance_id fenced",
-                            },
-                        )
-                        return
                     control_addr = str(payload.get("control_addr", "")).strip()
                     conflicts = state.control_addr_conflicting_instances(
                         node_instance_id=node_instance_id,
                         control_addr=control_addr,
                     )
                     if conflicts and control_addr:
-                        status_error = ""
-                        try:
-                            with NodeControlClient(control_addr, timeout_sec=0.35) as client:
-                                status = client.node_status()
-                        except Exception as exc:
-                            status = {}
-                            status_error = repr(exc)
-                        actual_instance_id = str(status.get("node_instance_id", "") or "").strip()
-                        if actual_instance_id and actual_instance_id != node_instance_id:
-                            logger.warning(
-                                "rejecting node registration because control_addr is served by another instance "
-                                "control_addr=%s expected_node_instance_id=%s actual_node_instance_id=%s conflicts=%s",
-                                control_addr,
-                                node_instance_id,
-                                actual_instance_id,
-                                [str(getattr(item, "node_instance_id", "") or "") for item in conflicts],
-                            )
-                            self._send_json(
-                                200,
-                                {
-                                    "ok": False,
-                                    "accepted": False,
-                                    "reset_required": True,
-                                    "new_instance_required": True,
-                                    "reason": (
-                                        "node control_addr is still served by another node instance; "
-                                        f"control_addr={control_addr} "
-                                        f"expected_node_instance_id={node_instance_id} "
-                                        f"actual_node_instance_id={actual_instance_id} "
-                                        f"actual_node_id={str(status.get('node_id', '') or '-')}"
-                                    ),
-                                    "error": "node control_addr instance mismatch",
-                                },
-                            )
-                            return
-                        if not actual_instance_id:
-                            logger.warning(
-                                "rejecting node registration because control_addr conflicts and status probe "
-                                "did not confirm replacement control_addr=%s expected_node_instance_id=%s "
-                                "conflicts=%s status_error=%s",
-                                control_addr,
-                                node_instance_id,
-                                [str(getattr(item, "node_instance_id", "") or "") for item in conflicts],
-                                status_error or "empty node status",
-                            )
-                            self._send_json(
-                                200,
-                                {
-                                    "ok": False,
-                                    "accepted": False,
-                                    "reset_required": False,
-                                    "retryable": True,
-                                    "lease_ttl_sec": state.lease_ttl_sec,
-                                    "reason": (
-                                        "node control_addr conflicts with an existing instance and status probe "
-                                        "did not confirm this replacement; retry after the old NodeControl exits"
-                                    ),
-                                    "error": "node control_addr replacement not confirmed",
-                                },
-                            )
-                            return
+                        logger.warning(
+                            "accepting node registration with replacement control_addr discovery update "
+                            "control_addr=%s node_instance_id=%s conflicts=%s",
+                            control_addr,
+                            node_instance_id,
+                            [str(getattr(item, "node_instance_id", "") or "") for item in conflicts],
+                        )
                     try:
                         node = state.register_node_record(
                             node_instance_id=node_instance_id,
@@ -1718,21 +1647,10 @@ class InfoCenterHttpServer:
                     if payload is None:
                         return
                     node_instance_id = str(payload.get("node_instance_id", "")).strip() or str(payload.get("node_id", "")).strip()
-                    if state.is_instance_fenced(node_instance_id):
-                        fence_reason = state.fenced_instance_reason(node_instance_id)
-                        self._send_json(
-                            200,
-                            {
-                                "ok": False,
-                                "accepted": False,
-                                "reset_required": True,
-                                "new_instance_required": True,
-                                "lease_ttl_sec": state.lease_ttl_sec,
-                                "reason": fence_reason or "node_instance_id fenced",
-                                "error": "node_instance_id fenced",
-                            },
-                        )
-                        return
+                    was_known = any(
+                        str(getattr(item, "node_instance_id", "") or "").strip() == node_instance_id
+                        for item in state.list_nodes(healthy_only=False, tags=(), limit=10000)
+                    )
                     metrics_raw = payload.get("metrics") or {}
                     inventory_included = _coerce_bool(payload.get("inventory_included", True), default=True)
                     node = state.heartbeat_record(
@@ -1776,6 +1694,7 @@ class InfoCenterHttpServer:
                             "accepted": True,
                             "next_heartbeat_in_sec": state.heartbeat_interval_sec,
                             "lease_ttl_sec": state.lease_ttl_sec,
+                            "inventory_required": bool(not was_known and not inventory_included),
                         },
                     )
                     return

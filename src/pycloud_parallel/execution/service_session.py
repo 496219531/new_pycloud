@@ -2222,6 +2222,7 @@ class Service(ServiceExecutionSession):
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
             active = self._active_replica_snapshot()
+            deployed_active = self._active_replica_snapshot()
             if desired <= 0 or len(active) >= desired:
                 return 0
             recovery_states = self._build_replica_recovery_states(
@@ -2229,7 +2230,7 @@ class Service(ServiceExecutionSession):
             )
             failed = {node_id for node_id, state in recovery_states.items() if not state.active}
             retryable_failed = {node_id for node_id, state in recovery_states.items() if state.retryable}
-            excluded = set(active)
+            excluded = set(deployed_active)
             list_started_at = time.monotonic()
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 discovered_nodes = list(
@@ -2279,10 +2280,10 @@ class Service(ServiceExecutionSession):
                 )
                 and is_admitted_node(node, require_control_addr=True)
             ]
-            if active:
+            if deployed_active:
                 active_node_ids = {
                     str(getattr(self.nodes.get(node_key), "node_id", "") or "").strip()
-                    for node_key in active
+                    for node_key in deployed_active
                 }
                 active_node_ids.discard("")
                 if active_node_ids:
@@ -2302,6 +2303,7 @@ class Service(ServiceExecutionSession):
             )
             if pruned_owner_replicas:
                 active = self._active_replica_snapshot()
+                deployed_active = self._active_replica_snapshot()
                 excluded -= pruned_owner_replicas
                 failed = {node_id for node_id in failed if node_id not in pruned_owner_replicas}
                 retryable_failed = {node_id for node_id in retryable_failed if node_id not in pruned_owner_replicas}
@@ -2661,7 +2663,7 @@ class Service(ServiceExecutionSession):
             enable_service_session=True,
             service_default_worker_count=effective_worker_count,
         )
-        node.close_on_registration_lost = True
+        node.close_on_registration_lost = False
         node.install_interrupt_shutdown_handlers()
         try:
             node.service_http_bind = service_http_bind
@@ -4238,6 +4240,7 @@ class Service(ServiceExecutionSession):
                         ),
                     ),
                     worker_count=max(1, int(cached_node.get("worker_count", 0) or info.worker_count or route.worker_count or 1)),
+                    alive_workers=max(0, int(getattr(info, "alive_workers", 0) or route.alive_workers or info.worker_count or route.worker_count or 1)),
                     status=hb.status or info.status,
                     service_name=str(info.service_name or route.service_name or ""),
                     node_instance_id=str(route_key or ""),

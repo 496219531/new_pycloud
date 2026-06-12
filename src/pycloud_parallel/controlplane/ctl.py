@@ -1459,8 +1459,6 @@ def _start_node(
     _log("INFO", f"Starting {name} on {control_bind} (HTTP: {service_http_bind}, workers: {worker_capacity})...")
     token_args = ["--api-token", str(api_token)] if str(api_token or "").strip() else []
     node_env = dict(extra_env or {})
-    node_env["PYCLOUD_NODE_EXIT_ON_FENCE"] = "1"
-    node_env["PYCLOUD_NODE_RESTART_ON_FENCE"] = "1"
     pid = _spawn_server(
         root,
         _logs_dir(root) / f"{name}.log",
@@ -1571,8 +1569,6 @@ def _start_standalone_node(
     if str(api_token or "").strip():
         args.extend(["--api-token", str(api_token)])
     node_env = dict(extra_env or {})
-    node_env["PYCLOUD_NODE_EXIT_ON_FENCE"] = "1"
-    node_env["PYCLOUD_NODE_RESTART_ON_FENCE"] = "1"
     pid = _spawn_server(root, _logs_dir(root) / f"{node_id}.log", args, extra_env=node_env, debug=debug)
     if not _wait_ready_with_pid(pid, 15.0, lambda: _wait_http_ready(service_http_bind, 0.2)):
         _remove_pid(_pid_file(root, node_id))

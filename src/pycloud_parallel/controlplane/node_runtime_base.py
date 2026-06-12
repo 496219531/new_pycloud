@@ -788,7 +788,7 @@ class NodeRuntimeBase:
         version: str = "",
         metadata: Optional[Dict[str, str]] = None,
         heartbeat_sec: int = 10,
-        rpc_timeout_sec: float = 5.0,
+        rpc_timeout_sec: float = 1.0,
     ) -> None:
         target = str(infocenter_target or "").strip()
         if not target:
@@ -817,7 +817,7 @@ class NodeRuntimeBase:
             version=version,
             metadata=effective_metadata,
             fallback_heartbeat_sec=max(1, int(heartbeat_sec or 1)),
-            rpc_timeout_sec=max(0.5, float(rpc_timeout_sec or 0.5)),
+            rpc_timeout_sec=max(0.1, float(rpc_timeout_sec or 0.1)),
             exit_on_fence=False,
         )
         self._infocenter_registrar = registrar

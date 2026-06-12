@@ -1270,6 +1270,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
             active = self._active_replica_snapshot()
+            deployed_active = self._active_replica_snapshot()
             recovery_states = self._build_replica_recovery_states(
                 is_retryable_failure=self._is_retryable_compensation_failure,
             )
@@ -1281,7 +1282,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             }
             if desired <= 0 or len(active) >= desired:
                 return 0
-            excluded = active | (failed - retryable_failed)
+            excluded = deployed_active | (failed - retryable_failed)
             list_started_at = time.monotonic()
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 selected_nodes = list(
@@ -1305,10 +1306,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 for node in selected_nodes
                 if _node_instance_key_from_node(node) not in excluded
             ]
-            if active:
+            if deployed_active:
                 active_node_ids = {
                     str(getattr(self.nodes.get(node_key), "node_id", "") or "").strip()
-                    for node_key in active
+                    for node_key in deployed_active
                 }
                 active_node_ids.discard("")
                 if active_node_ids:
@@ -4633,6 +4634,7 @@ def _build_local_taskpool_session(
         pool_token=adapter.pool_token,
         code_version=adapter.code_version,
         worker_count=adapter.worker_count,
+        alive_workers=max(0, int(getattr(adapter, "alive_workers", 0) or adapter.worker_count or 0)),
         heartbeat_timeout_sec=adapter.heartbeat_timeout_sec,
         pool_name=adapter.pool_name,
         idle_ttl_sec=adapter.idle_ttl_sec,

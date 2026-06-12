@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """InfoCenter route and node models plus the low-level HTTP client."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import math
@@ -133,6 +133,7 @@ class InfoCenterNode:
     schedulable: bool = True
     drain: bool = False
     reason: str = ""
+    metadata: Dict[str, str] = field(default_factory=dict)
     capability: NodeCapability = NodeCapability()
     loaded_services: Tuple[str, ...] = ()
     services: Tuple[InfoCenterNodeService, ...] = ()
@@ -354,12 +355,13 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                 task_pool_worker_used=int(item.get("task_pool_worker_used", 0) or 0),
                 task_pool_worker_available=int(item.get("task_pool_worker_available", 0) or 0),
                 accept_service_deploy=_coerce_bool(item.get("accept_service_deploy"), default=True),
-                schedulable=bool(item.get("schedulable", True)),
-                drain=bool(item.get("drain", False)),
-                reason=str(item.get("reason", "") or ""),
-                capability=NodeCapability.from_dict(item.get("capability")),
-                loaded_services=tuple(item.get("loaded_services") or ()),
-                services=tuple(services),
+                  schedulable=bool(item.get("schedulable", True)),
+                  drain=bool(item.get("drain", False)),
+                  reason=str(item.get("reason", "") or ""),
+                  metadata={str(k): str(v) for k, v in dict(item.get("metadata") or {}).items()},
+                  capability=NodeCapability.from_dict(item.get("capability")),
+                  loaded_services=tuple(item.get("loaded_services") or ()),
+                  services=tuple(services),
                 task_pools=tuple(task_pools),
             )
         )

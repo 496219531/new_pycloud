@@ -363,10 +363,7 @@ class NodeControlHttpApp:
                         "node": {
                             "node_id": str(getattr(self.state, "node_id", "") or ""),
                             "node_instance_id": str(getattr(self.state, "node_instance_id", "") or ""),
-                            "execution_fenced": bool(snapshot.get("execution_fenced", False)),
                             "accept_service_deploy": bool(snapshot.get("accept_service_deploy", True)),
-                            "execution_fenced_reason": str(snapshot.get("execution_fenced_reason", "") or ""),
-                            "execution_fenced_at": str(snapshot.get("execution_fenced_at", "") or ""),
                             "metrics": dict(snapshot.get("metrics") or {}),
                             "active_runtimes": list(snapshot.get("active_runtimes") or []),
                             "service_count": len(list(snapshot.get("service_reports") or [])),
@@ -800,6 +797,7 @@ class NodeControlHttpApp:
                 "ok": True,
                 "accepted": True,
                 "next_heartbeat_in_sec": max(1, pool.heartbeat_timeout_sec // 2),
+                "alive_workers": int(getattr(pool, "alive_workers", 0) or 0),
                 "readiness": str(getattr(pool, "readiness", "") or ""),
                 "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
                 "create_stage": str(getattr(pool, "create_stage", "") or ""),
@@ -1033,6 +1031,7 @@ class NodeControlHttpApp:
                 "accepted": True,
                 "status": int(session.status),
                 "next_heartbeat_in_sec": max(1, session.heartbeat_timeout_sec // 2),
+                "alive_workers": int(getattr(session, "alive_workers", 0) or 0),
                 "readiness": str(getattr(session, "readiness", "") or ""),
                 "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
                 "create_stage": str(getattr(session, "create_stage", "") or ""),
@@ -1226,6 +1225,7 @@ class HttpNodeControlClient:
         self.timeout_sec = max(0.1, float(timeout_sec))
         self.api_token = str(api_token or "").strip()
         self._object_client: Optional[HttpNodeObjectClient] = None
+        self.last_heartbeat_resource: Dict[str, int] = {}
 
     def _api_headers(self, api_token: str = "") -> Dict[str, str]:
         token = str(api_token or self.api_token or "").strip()
@@ -1509,6 +1509,7 @@ class HttpNodeControlClient:
             pool_token=str(data.get("pool_token", "")),
             code_version=str(data.get("code_version", "")),
             worker_count=int(data.get("worker_count", 0) or 0),
+            alive_workers=int(data.get("alive_workers", data.get("worker_count", 0)) or 0),
             heartbeat_timeout_sec=int(data.get("heartbeat_timeout_sec", 0) or 0),
             pool_name=str(pool_name or ""),
             idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
@@ -1617,6 +1618,7 @@ class HttpNodeControlClient:
             http_base_url=str(data.get("http_base_url", "")),
             heartbeat_timeout_sec=int(data.get("heartbeat_timeout_sec", 0) or 0),
             worker_count=int(data.get("worker_count", 0) or 0),
+            alive_workers=int(data.get("alive_workers", data.get("worker_count", 0)) or 0),
             status=int(data.get("status", 0) or 0),
             readiness=str(data.get("readiness", "") or ""),
             readiness_reason=str(data.get("readiness_reason", "") or ""),
@@ -1712,6 +1714,7 @@ class HttpNodeControlClient:
             {"owner_client_id": owner_client_id, "pool_token": pool_token, "seq": int(seq)},
             timeout_sec=timeout_sec,
         )
+        self.last_heartbeat_resource = {"alive_workers": max(0, int(data.get("alive_workers", 0) or 0))}
         return _parse_message(pb2.HeartbeatTaskPoolResponse, data)
 
     def cancel_pool_job(self, *, pool_id: str, pool_token: str, job_id: str, reason: str = "") -> pb2.CancelJobResponse:
@@ -1908,6 +1911,7 @@ class HttpNodeControlClient:
             {"owner_client_id": owner_client_id, "service_token": service_token, "seq": int(seq)},
             timeout_sec=timeout_sec,
         )
+        self.last_heartbeat_resource = {"alive_workers": max(0, int(data.get("alive_workers", 0) or 0))}
         return _parse_message(pb2.HeartbeatServiceResponse, data)
 
     def end_service(self, *, owner_client_id: str, service_id: str, service_token: str, reason: str = "") -> pb2.EndServiceResponse:

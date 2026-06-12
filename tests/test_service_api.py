@@ -425,6 +425,34 @@ def test_service_compensation_attaches_each_replica_before_next_create_finishes(
     assert [item[0] for item in created] == ["127.0.0.1:50061", "127.0.0.1:50062"]
 
 
+def test_service_zero_alive_does_not_drive_owner_compensation() -> None:
+    replica = SimpleNamespace(
+        service_id="svc-zero",
+        service_name="svc-zero",
+        worker_count=1,
+        alive_workers=0,
+        heartbeat_timeout_sec=30,
+    )
+    group = Service(owner_client_id="owner-1", service_name="svc-zero", sessions={"node-1": replica}, nodes={})
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "node_count": 1,
+            "infocenter_target": "127.0.0.1:1",
+        }
+    )
+    submitted = []
+    group._submit_compensation_attempt = lambda **kwargs: submitted.append(kwargs) or True  # type: ignore[method-assign]  # noqa: SLF001
+
+    try:
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+        assert group._active_replica_snapshot() == {"node-1"}  # noqa: SLF001
+        for _idx in range(3):
+            group._after_keepalive_tick()  # noqa: SLF001
+        assert submitted == []
+    finally:
+        group._stop_keepalive()  # noqa: SLF001
+
+
 def test_service_compensation_initial_heartbeat_runs_outside_route_lock(monkeypatch):
     from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
@@ -3069,7 +3097,7 @@ def test_service_startup_registers_infocenter_when_target_is_set(tmp_path, monke
                 "rpc_timeout_sec": 5.0,
             }
         ]
-        assert node.close_on_registration_lost is True
+        assert node.close_on_registration_lost is False
     finally:
         node.close()
 
@@ -5338,7 +5366,6 @@ class TestOwnerServiceFacade:
         finally:
             group._stop_keepalive()  # noqa: SLF001
 
-
     def test_owner_keepalive_late_success_does_not_reactivate_removed_service_replica(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
         from pycloud_parallel.execution.service_session import Service
@@ -5426,6 +5453,7 @@ class TestOwnerServiceFacade:
         assert "node-1" not in group._active_replica_ids  # noqa: SLF001
         assert replica.failed is False
         assert replica.last_error == ""
+
     def test_owner_calls_skip_failed_inactive_replica(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
         from pycloud_parallel.execution.service_session import Service

@@ -2701,7 +2701,6 @@ def test_native_task_pool_session_transient_timeout_keeps_retrying_replica() -> 
         session.close()
 
 
-
 def test_native_task_pool_late_success_does_not_reactivate_removed_replica() -> None:
     from pycloud_parallel import TaskPool
 
@@ -2737,6 +2736,7 @@ def test_native_task_pool_late_success_does_not_reactivate_removed_replica() -> 
     assert pool.last_error == "timeout"
     session.close()
 
+
 def test_native_task_pool_late_failure_does_not_probe_removed_replica() -> None:
     from pycloud_parallel import TaskPool
 
@@ -2768,6 +2768,7 @@ def test_native_task_pool_late_failure_does_not_probe_removed_replica() -> None:
     assert pool.failed is False
     assert pool.last_error == ""
     session.close()
+
 
 def test_native_task_pool_session_started_stuck_heartbeat_does_not_block_retry() -> None:
     from pycloud_parallel import TaskPool

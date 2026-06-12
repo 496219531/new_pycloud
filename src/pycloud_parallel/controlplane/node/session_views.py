@@ -114,7 +114,7 @@ def _task_pool_resource_health(pool: TaskPoolState, *, alive_workers: int) -> st
         return "stopped"
     if str(pool.stop_reason or "").strip():
         return "failed"
-    if bool(getattr(pool, "degraded", False)) or int(alive_workers or 0) <= 0:
+    if bool(getattr(pool, "degraded", False)):
         return "degraded"
     return "running"
 

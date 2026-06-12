@@ -140,7 +140,7 @@ def test_shared_service_and_task_pool_view_builders_use_resource_snapshot():
     assert failed_pool_status["failure_at"] == pool_failure_at
 
 
-def test_task_pool_zero_alive_reports_degraded_without_worker_fallback():
+def test_task_pool_explicit_degraded_reports_degraded_without_worker_fallback():
     now = _utc_now()
     pool = TaskPoolState(
         pool_id="pool-degraded",

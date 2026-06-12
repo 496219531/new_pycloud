@@ -1156,6 +1156,25 @@ def test_discovery_route_cache_route_failure_opens_breaker_immediately():
         cache.stop()
 
 
+def test_discovery_route_cache_zero_alive_does_not_open_breaker():
+    cache = _DiscoveryRouteCache(
+        infocenter_target="127.0.0.1:50051",
+        timeout_sec=5.0,
+        failure_threshold=1,
+        open_sec=5.0,
+    )
+    route = replace(_demo_route(), alive_workers=0)
+    try:
+        cache._snapshots["svc-demo"] = _ServiceRouteSnapshot(service_name="svc-demo", routes=[route])  # noqa: SLF001
+
+        selected = cache.select_route("svc-demo")
+
+        assert selected.service_id == route.service_id
+        assert cache.select_route("svc-demo").service_id == route.service_id
+    finally:
+        cache.stop()
+
+
 def test_discovery_service_client_call_uses_http_payload_policy(monkeypatch):
     route = _demo_route()
     captured = {}

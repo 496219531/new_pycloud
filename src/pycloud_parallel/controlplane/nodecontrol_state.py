@@ -160,14 +160,13 @@ from pycloud_parallel.runtime.errors import normalize_invoke_error
 logger = logging.getLogger(__name__)
 _NATIVE_PATH = type(Path())
 NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC = 2.0
-NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC = 8.0
 _CODE_LAST_AT_TOUCH_INTERVAL_SEC = 60.0
 _CODE_LAST_AT_TOUCH_MAX_ENTRIES = 10000
 HEARTBEAT_LOCK_WAIT_LOG_SEC = 0.25
 HEARTBEAT_TOTAL_LOG_SEC = 0.5
 EXECUTOR_EVENT_DRAIN_BATCH_SIZE = 128
-SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
-TASK_POOL_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD = 3
+RESOURCE_LIVENESS_ENABLED = False
+RESOURCE_LIVENESS_REFRESH_INTERVAL_SEC = 200.0
 CREATE_REQUEST_WAIT_TIMEOUT_SEC = 300.0
 CREATE_REQUEST_MAX_RECORDS_PER_KIND = 200
 
@@ -228,9 +227,6 @@ def _create_request_fingerprint(kind: str, fields: Dict[str, object]) -> str:
 def _resource_stop_reason(
     reason: str,
     *,
-    resource_kind: str = "",
-    alive_workers: Optional[int] = None,
-    worker_count: Optional[int] = None,
     detail: str = "",
 ) -> str:
     normalized = str(reason or "").strip()
@@ -241,14 +237,6 @@ def _resource_stop_reason(
     if normalized == "executor host crashed":
         suffix = str(detail or "").strip()
         return f"executor host crashed: {suffix}" if suffix else "executor host crashed"
-    if normalized in {"service worker unavailable", "task pool worker unavailable"}:
-        if str(resource_kind or "").strip() == "task_pool":
-            base = "task pool worker unavailable; owner should redeploy or compensate"
-        else:
-            base = "service worker unavailable; owner should redeploy or compensate"
-        if alive_workers is not None and worker_count is not None:
-            return f"{base}; alive_workers={max(0, int(alive_workers or 0))} worker_count={max(0, int(worker_count or 0))}"
-        return base
     return normalized or "resource stopped"
 
 
@@ -325,14 +313,10 @@ class NodeControlState(NodeRuntimeBase):
         self._task_pool_create_requests: Dict[str, _CreateRequestRecord] = {}
         self._resource_signals = ResourceSignalStore(maxlen=2000)
         self._resource_operation_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nodecontrol-resource-op")
-        self._execution_fenced = False
-        self._execution_fenced_reason = ""
-        self._execution_fenced_at: Optional[datetime] = None
         self._deploy_health_block: Optional[DeployHealthBlock] = None
         self._service_worker_reserved = 0
         self._task_pool_worker_reserved = 0
-        self._service_zero_alive_counts: Dict[str, int] = {}
-        self._task_pool_zero_alive_counts: Dict[str, int] = {}
+        self._last_resource_liveness_refresh_at = 0.0
         self._code_write_locks: Dict[str, threading.Lock] = {}
         self._object_write_locks: Dict[str, threading.Lock] = {}
         self._artifact_method_cache: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], str, str], Dict[str, Tuple[str, str]]] = {}
@@ -629,80 +613,6 @@ class NodeControlState(NodeRuntimeBase):
                 raise PermissionError("owner_client_id mismatch")
             self._require_service_token(session, service_token)
 
-    def reset_execution_state(self, *, reason: str = "node instance reset required") -> str:
-        old_executor = None
-        node_instance_id = str(self.node_instance_id or "")
-        fenced_at = utc_now()
-        normalized_reason = str(reason or "node instance reset required").strip() or "node instance reset required"
-        with self._lock:
-            service_count = len(self._services)
-            task_pool_count = len(self._task_pools)
-            pool_task_count = len(self._pool_tasks)
-            code_token_count = len(self._client_code_tokens)
-            managed_global_count = len(self._client_code_managed_globals)
-            for session in self._services.values():
-                session.status = pb2.SERVICE_STATUS_STOPPED
-                session.executor_ready = False
-                session.alive_workers = 0
-                session.degraded = False
-                session.stop_reason = normalized_reason
-                session.failure_at = fenced_at
-                session.lease_expire_at = fenced_at
-            for pool in self._task_pools.values():
-                pool.status = "STOPPED"
-                pool.executor_ready = False
-                pool.alive_workers = 0
-                if hasattr(pool, "degraded"):
-                    pool.degraded = False
-                pool.stop_reason = normalized_reason
-                pool.failure_at = fenced_at
-                pool.lease_expire_at = fenced_at
-            self._services.clear()
-            self._service_create_requests.clear()
-            self._service_zero_alive_counts.clear()
-            self._task_pool_zero_alive_counts.clear()
-            self._task_pools.clear()
-            self._task_pool_create_requests.clear()
-            self._pool_tasks.clear()
-            self._pool_task_reserved_ids.clear()
-            self._client_code_tokens.clear()
-            self._client_code_managed_globals.clear()
-            self._service_worker_reserved = 0
-            self._task_pool_worker_reserved = 0
-            self._execution_fenced = True
-            self._execution_fenced_reason = normalized_reason
-            self._execution_fenced_at = fenced_at
-            self._deploy_health_block = DeployHealthBlock(source="node reset", reason=normalized_reason)
-            old_executor = self._executor_host
-            self._executor_host = None
-            self._cv.notify_all()
-        if old_executor is not None:
-            with contextlib.suppress(Exception):
-                old_executor.close(shutdown_timeout_sec=NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC)
-        logger.warning(
-            "[NodeControl] execution state reset node_id=%s node_instance_id=%s fenced_at=%s reason=%s",
-            self.node_id,
-            node_instance_id,
-            fenced_at.isoformat(),
-            normalized_reason,
-        )
-        logger.warning(
-            "[NodeControl] execution fence cleanup node_id=%s node_instance_id=%s "
-            "services_cleared=%d task_pools_cleared=%d pool_tasks_cleared=%d "
-            "code_tokens_cleared=%d managed_globals_cleared=%d executor_closed=%s "
-            "executor_shutdown_timeout_sec=%.3f",
-            self.node_id,
-            node_instance_id,
-            service_count,
-            task_pool_count,
-            pool_task_count,
-            code_token_count,
-            managed_global_count,
-            "yes" if old_executor is not None else "no",
-            NODECONTROL_FENCE_EXECUTOR_SHUTDOWN_TIMEOUT_SEC,
-        )
-        return node_instance_id
-
     def _create_executor_backend(self) -> ExecutorBackend:
         return create_executor_backend(
             executor_backend=self.executor_backend,
@@ -793,7 +703,6 @@ class NodeControlState(NodeRuntimeBase):
         pool.failure_at = stopped_at
         pool.lease_expire_at = stopped_at
         self._fail_task_pool_tasks_locked(pool, reason=pool.stop_reason, now=stopped_at)
-        self._task_pool_zero_alive_counts.pop(str(pool.pool_id or ""), None)
         self._drop_create_requests_for_resource_locked(kind="task_pool", resource_id=pool.pool_id)
         self._publish_resource_signal_locked(
             resource_kind="task_pool",
@@ -1399,19 +1308,12 @@ class NodeControlState(NodeRuntimeBase):
             return self._resource_progress_snapshot_locked(resource_kind=resource_kind, resource_id=resource_id)
 
     def _executor_host_required(self) -> bool:
-        return (not bool(getattr(self, "_execution_fenced", False))) and bool(
-            self.enable_internal_executor or self.enable_service_session
-        )
-
-    @property
-    def execution_fenced(self) -> bool:
-        return bool(getattr(self, "_execution_fenced", False))
+        return bool(self.enable_internal_executor or self.enable_service_session)
 
     @property
     def can_accept_service_deploy(self) -> bool:
         return (
             bool(getattr(self, "accept_service_deploy", True))
-            and not self.execution_fenced
             and getattr(self, "_deploy_health_block", None) is None
         )
 
@@ -1470,16 +1372,6 @@ class NodeControlState(NodeRuntimeBase):
         if normalized_prefix and not block.message().startswith(normalized_prefix):
             return
         self._deploy_health_block = None
-
-    def execution_fence_message(self) -> str:
-        reason = str(getattr(self, "_execution_fenced_reason", "") or "").strip() or "unknown"
-        fenced_at = getattr(self, "_execution_fenced_at", None)
-        fenced_at_text = fenced_at.isoformat() if isinstance(fenced_at, datetime) else "unknown"
-        return (
-            "node instance execution is fenced; this NodeControl host should exit and a fresh process must create a new node_instance_id; "
-            f"node_id={self.node_id} node_instance_id={self.node_instance_id} "
-            f"fenced_at={fenced_at_text} reason={reason}"
-        )
 
     def _executor_host_alive_locked(self) -> bool:
         return self._executor_host is not None and self._executor_host.is_alive()
@@ -1689,12 +1581,6 @@ class NodeControlState(NodeRuntimeBase):
                 pass
 
         with self._lock:
-            if self.execution_fenced:
-                with contextlib.suppress(Exception):
-                    new_host.close()
-                self._executor_rebuild_in_progress = False
-                self._cv.notify_all()
-                return False
             self._executor_host = new_host
             for target, exc in service_results:
                 session = target.get("session")
@@ -3097,8 +2983,6 @@ class NodeControlState(NodeRuntimeBase):
         create_request_id: str = "",
         wait_ready: bool = True,
     ) -> ServiceSession:
-        if bool(getattr(self, "_execution_fenced", False)):
-            raise RuntimeError(self.execution_fence_message())
         if not self.can_accept_service_deploy:
             reason = self.deploy_health_reason or "service deploy is disabled"
             raise RuntimeError(f"service deploy is disabled: {reason}")
@@ -3195,7 +3079,6 @@ class NodeControlState(NodeRuntimeBase):
             )
             with self._lock:
                 self._services[service_id] = session
-                self._service_zero_alive_counts.pop(service_id, None)
                 self._publish_resource_progress_locked(
                     resource_kind="service",
                     resource_id=service_id,
@@ -3414,7 +3297,6 @@ class NodeControlState(NodeRuntimeBase):
                 session.managed_globals_digest = managed_state.globals_digest
             with self._lock:
                 self._services[service_id] = session
-                self._service_zero_alive_counts.pop(service_id, None)
                 self._publish_resource_progress_locked(
                     resource_kind="service",
                     resource_id=service_id,
@@ -4007,8 +3889,6 @@ class NodeControlState(NodeRuntimeBase):
         create_request_id: str = "",
         wait_ready: bool = True,
     ) -> TaskPoolState:
-        if bool(getattr(self, "_execution_fenced", False)):
-            raise RuntimeError(self.execution_fence_message())
         if not owner_client_id:
             raise ValueError("owner_client_id is required")
         normalized_managed_global_names = _normalize_managed_global_names(
@@ -4796,7 +4676,6 @@ class NodeControlState(NodeRuntimeBase):
         stopped_at = utc_now()
         session.failure_at = stopped_at
         session.lease_expire_at = stopped_at
-        self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
         self._drop_create_requests_for_resource_locked(kind="service", resource_id=session.service_id)
         self._publish_resource_signal_locked(
             resource_kind="service",
@@ -4812,45 +4691,6 @@ class NodeControlState(NodeRuntimeBase):
             self._submit_stop_service(executor_host, service_id=service_id, reason=stop_reason)
             return None
         return stop_executor
-
-    def _recover_node_managed_service_locked(self, session: ServiceSession) -> bool:
-        if self._executor_host is None:
-            return False
-        artifact = self._get_live_code_artifact_locked(session.code_version)
-        if artifact is None:
-            session.stop_reason = "startup service recovery failed: code artifact not found"
-            return False
-        try:
-            self._ensure_artifact_ready(
-                artifact,
-                dependency_policy_mode=artifact.dependency_policy_mode,
-                dependency_allowlist=artifact.dependency_allowlist,
-                managed_global_names=session.managed_global_names,
-                prepare_scope="service",
-                prepare_key=session.service_id,
-            )
-            self._executor_host.create_service(service_id=session.service_id, worker_count=session.worker_count)
-            session.executor_ready = True
-            session.alive_workers = max(1, int(session.worker_count or 1))
-            session.degraded = False
-            session.stop_reason = ""
-            session.failure_at = None
-            self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
-            logger.warning(
-                "[NodeControl] startup service executor recovered service_id=%s service_name=%s worker_count=%s",
-                session.service_id,
-                session.service_name,
-                session.worker_count,
-            )
-            return True
-        except Exception as exc:
-            session.stop_reason = f"startup service recovery failed: {exc!r}"
-            logger.exception(
-                "[NodeControl] startup service executor recovery failed service_id=%s service_name=%s",
-                session.service_id,
-                session.service_name,
-            )
-            return False
 
     def _shutdown_all_services(self) -> None:
         stop_executors: List[Tuple[ExecutorBackend, str, str]] = []
@@ -5809,15 +5649,8 @@ class NodeControlState(NodeRuntimeBase):
             "task_pool_worker_used": task_pool_worker_used,
             "service_timing_metadata": service_timing_metadata if include_inventory else {},
             "inventory_included": bool(include_inventory),
-            "execution_fenced": bool(getattr(self, "_execution_fenced", False)),
             "accept_service_deploy": self.can_accept_service_deploy,
             "deploy_health_reason": self.deploy_health_reason,
-            "execution_fenced_reason": str(getattr(self, "_execution_fenced_reason", "") or ""),
-            "execution_fenced_at": (
-                self._execution_fenced_at.isoformat()
-                if isinstance(getattr(self, "_execution_fenced_at", None), datetime)
-                else ""
-            ),
         }
 
     @property
@@ -6011,8 +5844,14 @@ class NodeControlState(NodeRuntimeBase):
             self._handle_service_timeouts()
 
     def _fetch_resource_liveness(self) -> Tuple[Optional[Dict[Tuple[str, str], int]], Optional[str]]:
+        if not RESOURCE_LIVENESS_ENABLED:
+            return None, None
         with self._lock:
             executor_host = self._executor_host
+            now_monotonic = time.monotonic()
+            if now_monotonic - float(self._last_resource_liveness_refresh_at or 0.0) < RESOURCE_LIVENESS_REFRESH_INTERVAL_SEC:
+                return None, None
+            self._last_resource_liveness_refresh_at = now_monotonic
         if executor_host is None:
             return None, None
         try:
@@ -6025,7 +5864,7 @@ class NodeControlState(NodeRuntimeBase):
                 }
         except Exception as exc:
             logger.warning(
-                "[NodeControl] service worker liveness probe failed node_id=%s node_instance_id=%s err=%r",
+                "[NodeControl] resource worker liveness refresh failed node_id=%s node_instance_id=%s err=%r",
                 self.node_id,
                 self.node_instance_id,
                 exc,
@@ -6034,7 +5873,6 @@ class NodeControlState(NodeRuntimeBase):
         return liveness, None
 
     def _apply_resource_liveness_locked(self, liveness: Dict[Tuple[str, str], int]) -> None:
-        self._clear_deploy_health_block_locked(source="service worker liveness failed")
         seen: set[Tuple[str, str]] = set()
         for (kind, resource_id), alive_count in liveness.items():
             resource_kind = str(kind or "")
@@ -6063,17 +5901,17 @@ class NodeControlState(NodeRuntimeBase):
                 and bool(getattr(session, "executor_ready", False))
                 and int(getattr(session, "worker_count", 0) or 0) > 0
             ):
-                session.alive_workers = 0
                 last_report_at = float(getattr(session, "last_liveness_missing_report_at", 0.0) or 0.0)
                 if now_monotonic - last_report_at >= 60.0:
                     session.last_liveness_missing_report_at = now_monotonic
                     logger.warning(
-                        "[NodeControl] resource worker liveness missing treated as unhealthy "
-                        "node_id=%s node_instance_id=%s resource_kind=service resource_id=%s worker_count=%s",
+                        "[NodeControl] resource worker liveness missing "
+                        "node_id=%s node_instance_id=%s resource_kind=service resource_id=%s worker_count=%s alive_workers=%s",
                         self.node_id,
                         self.node_instance_id,
                         service_id,
                         int(getattr(session, "worker_count", 0) or 0),
+                        int(getattr(session, "alive_workers", 0) or 0),
                     )
         for pool_id, pool in self._task_pools.items():
             if ("task_pool", str(pool_id or "")) in seen:
@@ -6083,69 +5921,32 @@ class NodeControlState(NodeRuntimeBase):
                 and bool(getattr(pool, "executor_ready", False))
                 and int(getattr(pool, "worker_count", 0) or 0) > 0
             ):
-                pool.alive_workers = 0
                 last_report_at = float(getattr(pool, "last_liveness_missing_report_at", 0.0) or 0.0)
                 if now_monotonic - last_report_at >= 60.0:
                     pool.last_liveness_missing_report_at = now_monotonic
                     logger.warning(
-                        "[NodeControl] resource worker liveness missing treated as unhealthy "
-                        "node_id=%s node_instance_id=%s resource_kind=task_pool resource_id=%s worker_count=%s",
+                        "[NodeControl] resource worker liveness missing "
+                        "node_id=%s node_instance_id=%s resource_kind=task_pool resource_id=%s worker_count=%s alive_workers=%s",
                         self.node_id,
                         self.node_instance_id,
                         pool_id,
                         int(getattr(pool, "worker_count", 0) or 0),
+                        int(getattr(pool, "alive_workers", 0) or 0),
                     )
 
     def _handle_service_resource_health_locked(self, session: ServiceSession, *, now: datetime) -> None:
-        service_id = str(session.service_id or "")
         if session.status != pb2.SERVICE_STATUS_RUNNING:
-            self._service_zero_alive_counts.pop(service_id, None)
             return
 
         if not bool(getattr(session, "node_managed", False)) and now > session.lease_expire_at:
             self._stop_service_locked(session, reason=_resource_stop_reason("owner heartbeat timeout"))
             return
 
-        has_workers = int(session.worker_count or 0) > 0
-        has_live_workers = int(session.alive_workers or 0) > 0
-        if not has_workers or has_live_workers:
+        if int(session.alive_workers or 0) > 0:
             session.degraded = False
-            self._service_zero_alive_counts.pop(service_id, None)
-            return
-
-        count = int(self._service_zero_alive_counts.get(service_id, 0) or 0) + 1
-        self._service_zero_alive_counts[service_id] = count
-        session.degraded = True
-        if count < SERVICE_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
-            return
-
-        if bool(getattr(session, "node_managed", False)):
-            recovered = self._recover_node_managed_service_locked(session)
-            if not recovered:
-                self._stop_service_locked(
-                    session,
-                    reason=(
-                        str(session.stop_reason or "").strip()
-                        or "startup service worker unavailable; "
-                        f"alive_workers=0 worker_count={int(session.worker_count or 0)}"
-                    ),
-                )
-            return
-
-        self._stop_service_locked(
-            session,
-            reason=_resource_stop_reason(
-                "service worker unavailable",
-                resource_kind="service",
-                alive_workers=0,
-                worker_count=int(session.worker_count or 0),
-            ),
-        )
 
     def _handle_task_pool_resource_health_locked(self, pool: TaskPoolState, *, now: datetime) -> None:
-        pool_id = str(pool.pool_id or "")
         if not pool.is_running():
-            self._task_pool_zero_alive_counts.pop(pool_id, None)
             return
 
         if now > pool.lease_expire_at:
@@ -6156,31 +5957,8 @@ class NodeControlState(NodeRuntimeBase):
             )
             return
 
-        has_workers = int(pool.worker_count or 0) > 0
-        has_live_workers = int(pool.alive_workers or 0) > 0
-        if not has_workers or has_live_workers:
-            if hasattr(pool, "degraded"):
-                pool.degraded = False
-            self._task_pool_zero_alive_counts.pop(pool_id, None)
-            return
-
-        count = int(self._task_pool_zero_alive_counts.get(pool_id, 0) or 0) + 1
-        self._task_pool_zero_alive_counts[pool_id] = count
-        if hasattr(pool, "degraded"):
-            pool.degraded = True
-        if count < TASK_POOL_ZERO_ALIVE_WORKER_FAILURE_THRESHOLD:
-            return
-
-        self._stop_task_pool_resource_locked(
-            pool,
-            reason=_resource_stop_reason(
-                "task pool worker unavailable",
-                resource_kind="task_pool",
-                alive_workers=0,
-                worker_count=int(pool.worker_count or 0),
-            ),
-            async_stop=True,
-        )
+        if int(pool.alive_workers or 0) > 0 and hasattr(pool, "degraded"):
+            pool.degraded = False
 
     def _handle_service_timeouts(self) -> None:
         started_at = time.perf_counter()
@@ -6193,7 +5971,7 @@ class NodeControlState(NodeRuntimeBase):
             lock_wait_sec = time.perf_counter() - lock_wait_started_at
             lock_held_started_at = time.perf_counter()
             if liveness_error:
-                self._set_deploy_health_block_locked(liveness_error, source="service worker liveness failed")
+                pass
             elif liveness is not None:
                 self._apply_resource_liveness_locked(liveness)
             for session in self._services.values():

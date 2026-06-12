@@ -1180,6 +1180,29 @@ def test_gateway_route_cache_route_failure_opens_breaker_immediately():
         cache.stop()
 
 
+def test_gateway_route_cache_zero_alive_does_not_open_breaker():
+    route = replace(_gateway_route_variant(1, service_name="svc-gateway-cache"), alive_workers=0)
+
+    class _StaticSource:
+        def list_service_routes(self, *, service_name: str, healthy_only: bool, limit: int):
+            del service_name, healthy_only, limit
+            return [route]
+
+    cache = GatewayRouteCache(
+        source=_StaticSource(),
+        refresh_interval_sec=60.0,
+        failure_threshold=1,
+        open_sec=5.0,
+    )
+    try:
+        selected = cache.select_route("svc-gateway-cache", force_refresh=True)
+
+        assert selected.service_id == route.service_id
+        assert cache.select_route("svc-gateway-cache").service_id == route.service_id
+    finally:
+        cache.stop()
+
+
 def test_gateway_call_failover_tries_all_candidate_routes():
     routes = [_gateway_route_variant(i) for i in range(1, 5)]
     route_cache = _SequenceRouteCache(routes)

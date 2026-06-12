@@ -1782,7 +1782,7 @@ def test_command_for_pid_on_windows_falls_back_to_tasklist_when_shell_missing(mo
     monkeypatch.setattr(
         ctl.subprocess,
         "run",
-        lambda cmd, capture_output, text, check: SimpleNamespace(stdout='"python.exe","4321","Console","1","12,000 K"\n')
+        lambda cmd, capture_output, text, check, **_kwargs: SimpleNamespace(stdout='"python.exe","4321","Console","1","12,000 K"\n')
         if cmd[:3] == ["tasklist", "/FO", "CSV"]
         else (_ for _ in ()).throw(AssertionError(f"unexpected command: {cmd!r}")),
     )
@@ -1906,7 +1906,7 @@ def test_cmd_start_node_uses_explicit_target_and_local_advertise(tmp_path, monke
     ]
 
 
-def test_start_standalone_node_enables_managed_fence_exit(tmp_path, monkeypatch):
+def test_start_standalone_node_does_not_enable_managed_fence_exit(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
@@ -1942,11 +1942,11 @@ def test_start_standalone_node_enables_managed_fence_exit(tmp_path, monkeypatch)
     )
 
     extra_env = captured["extra_env"]
-    assert extra_env["PYCLOUD_NODE_EXIT_ON_FENCE"] == "1"
-    assert extra_env["PYCLOUD_NODE_RESTART_ON_FENCE"] == "1"
+    assert "PYCLOUD_NODE_EXIT_ON_FENCE" not in extra_env
+    assert "PYCLOUD_NODE_RESTART_ON_FENCE" not in extra_env
 
 
-def test_start_dev_node_enables_managed_fence_restart(tmp_path, monkeypatch):
+def test_start_dev_node_does_not_enable_managed_fence_restart(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(ctl, "_assert_bind_available", lambda _bind: None)
@@ -1977,8 +1977,8 @@ def test_start_dev_node_enables_managed_fence_restart(tmp_path, monkeypatch):
     )
 
     extra_env = captured["extra_env"]
-    assert extra_env["PYCLOUD_NODE_EXIT_ON_FENCE"] == "1"
-    assert extra_env["PYCLOUD_NODE_RESTART_ON_FENCE"] == "1"
+    assert "PYCLOUD_NODE_EXIT_ON_FENCE" not in extra_env
+    assert "PYCLOUD_NODE_RESTART_ON_FENCE" not in extra_env
 
 
 def test_cmd_start_node_passes_api_token_to_server(tmp_path, monkeypatch):

@@ -381,25 +381,12 @@ class InfoCenterState:
         now: Optional[datetime] = None,
         reason: str = "",
     ) -> None:
-        node_instance_id = str(getattr(state, "node_instance_id", "") or "").strip()
-        if not node_instance_id:
-            return
-        normalized_reason = str(reason or "node_instance_id fenced")
-        existing = self._fenced_instances.get(node_instance_id)
-        if existing is not None and str(getattr(existing, "reason", "") or "").strip():
-            if normalized_reason == "node heartbeat timeout":
-                return
-        fenced_at = now or utc_now()
-        self._fenced_instances[node_instance_id] = FencedNodeInstance(
-            node_instance_id=node_instance_id,
-            fenced_at=fenced_at,
-            reason=normalized_reason,
-        )
+        del state, now, reason
+        return
 
     def _fence_if_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> None:
         current_time = now or utc_now()
         if self._node_is_stale_locked(state, now=current_time):
-            self._fence_instance_locked(state, now=current_time, reason="node heartbeat timeout")
             state.healthy = False
             state.schedulable = False
             state.reason = str(state.reason or "node heartbeat timeout")
@@ -440,19 +427,12 @@ class InfoCenterState:
                 self._services_by_name.pop(normalized_name, None)
 
     def is_instance_fenced(self, node_instance_id: str) -> bool:
-        normalized_instance = str(node_instance_id or "").strip()
-        if not normalized_instance:
-            return False
-        with self._lock:
-            return normalized_instance in self._fenced_instances
+        del node_instance_id
+        return False
 
     def fenced_instance_reason(self, node_instance_id: str) -> str:
-        normalized_instance = str(node_instance_id or "").strip()
-        if not normalized_instance:
-            return ""
-        with self._lock:
-            entry = self._fenced_instances.get(normalized_instance)
-            return str(getattr(entry, "reason", "") or "") if entry is not None else ""
+        del node_instance_id
+        return ""
 
     def _data_ref_is_expired_locked(self, entry: DataRegistryEntry, *, now: Optional[datetime] = None) -> bool:
         current_time = now or utc_now()
@@ -657,8 +637,6 @@ class InfoCenterState:
             )
             incoming_metadata = dict(metadata or {})
             incoming_services = dict(services or {})
-            if normalized_instance_id in self._fenced_instances:
-                raise ValueError("node_instance_id fenced")
             self._validate_startup_service_names_locked(
                 node_instance_id=normalized_instance_id,
                 control_addr=control_addr,
@@ -765,9 +743,7 @@ class InfoCenterState:
                     if str(item.get("node_instance_id", "") or "").strip()
                 ],
             ]
-            fenced_ids = [instance_id for instance_id in instance_ids if instance_id in self._fenced_instances]
-            if fenced_ids:
-                raise ValueError(f"node_instance_id fenced: {', '.join(sorted(set(fenced_ids)))}")
+            del instance_ids
             self._prune_expired_data_refs_locked(now=now)
             existing = self._data_refs.get(entry.ref_id)
             if existing is not None:
@@ -926,9 +902,15 @@ class InfoCenterState:
         with self._lock:
             state = self._nodes.get(normalized_instance_id)
             if state is None:
-                return None
-            if normalized_instance_id in self._fenced_instances:
-                return None
+                state = NodeState(
+                    node_instance_id=normalized_instance_id,
+                    node_id=node_id,
+                    control_addr="",
+                    capacity=1,
+                    queue_capacity=1,
+                    python_version=str(python_version or "").strip(),
+                )
+                self._nodes[normalized_instance_id] = state
             state.node_instance_id = normalized_instance_id
             state.node_id = str(node_id or state.node_id or "").strip() or normalized_instance_id
             state.healthy = bool(healthy)
@@ -1126,9 +1108,17 @@ class InfoCenterState:
             if healthy_only:
                 if normalized_scope == "call":
                     readiness = str(getattr(svc, "readiness", "") or "").strip().lower()
+                    explicit_resource_health = str(getattr(svc, "resource_health", "") or "").strip().lower()
+                    explicit_status_text = str(getattr(svc, "status_text", "") or "").strip().upper()
+                    explicit_degraded = (
+                        explicit_resource_health in {"degraded", "failed", "stopped", "node_lost"}
+                        or explicit_status_text == "DEGRADED"
+                        or bool(getattr(svc, "degraded", False))
+                        or bool(str(getattr(svc, "stop_reason", "") or "").strip())
+                    )
                     if (
                         not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain))
-                        or int(effective_alive or 0) <= 0
+                        or explicit_degraded
                         or (readiness and readiness != "ready")
                     ):
                         continue
@@ -1155,8 +1145,6 @@ class InfoCenterState:
             if not resource_health:
                 if int(effective_status) == int(pb2.SERVICE_STATUS_STOPPED):
                     resource_health = "stopped"
-                elif int(effective_alive or 0) <= 0:
-                    resource_health = "degraded"
                 else:
                     resource_health = "running"
             reported_status_text = str(getattr(svc, "status_text", "") or status_text or "")
