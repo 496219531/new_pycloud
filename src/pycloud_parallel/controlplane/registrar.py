@@ -514,6 +514,15 @@ class NodeInfoCenterRegistrar:
                 "stop_reason": str(getattr(item, "stop_reason", getattr(item, "failure_reason", "")) or ""),
                 "failure_reason": str(getattr(item, "failure_reason", "") or ""),
                 "failure_at": item.failure_at.isoformat() if getattr(item, "failure_at", None) is not None else "",
+                "readiness": str(getattr(item, "readiness", "") or ""),
+                "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
+                "create_stage": str(getattr(item, "create_stage", "") or ""),
+                "operation_id": str(getattr(item, "operation_id", "") or ""),
+                "operation_updated_at": (
+                    getattr(item, "operation_updated_at", None).isoformat()
+                    if getattr(item, "operation_updated_at", None) is not None
+                    else ""
+                ),
                 "created_at": item.created_at.isoformat(),
                 "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
                 "lease_expire_at": item.lease_expire_at.isoformat(),
@@ -619,6 +628,15 @@ class NodeInfoCenterRegistrar:
                 "stop_reason": str(getattr(item, "stop_reason", getattr(item, "failure_reason", "")) or ""),
                 "failure_reason": str(getattr(item, "failure_reason", "") or ""),
                 "failure_at": item.failure_at.isoformat() if getattr(item, "failure_at", None) is not None else "",
+                "readiness": str(getattr(item, "readiness", "") or ""),
+                "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
+                "create_stage": str(getattr(item, "create_stage", "") or ""),
+                "operation_id": str(getattr(item, "operation_id", "") or ""),
+                "operation_updated_at": (
+                    getattr(item, "operation_updated_at", None).isoformat()
+                    if getattr(item, "operation_updated_at", None) is not None
+                    else ""
+                ),
                 "created_at": item.created_at.isoformat(),
                 "last_heartbeat_at": item.last_heartbeat_at.isoformat(),
                 "lease_expire_at": item.lease_expire_at.isoformat(),

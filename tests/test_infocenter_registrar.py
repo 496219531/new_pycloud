@@ -14,7 +14,13 @@ from urllib.request import Request, urlopen
 import pytest
 
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterClient
-from pycloud_parallel.controlplane.infocenter_http import InfoCenterHttpServer, _render_ops_page, _render_ops_snapshot, _reorder_job_via_http
+from pycloud_parallel.controlplane.infocenter_http import (
+    InfoCenterHttpServer,
+    _render_ops_page,
+    _render_ops_snapshot,
+    _reorder_job_via_http,
+    _serialize_node,
+)
 from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeState, NodeTaskPoolInfo
 from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
@@ -779,6 +785,142 @@ def test_degraded_service_route_is_not_healthy_call_route():
     assert all_routes[0]["status"] == pb2.SERVICE_STATUS_RUNNING
     assert all_routes[0]["resource_health"] == "degraded"
     assert healthy_routes == []
+
+
+def test_initializing_service_route_is_not_healthy_call_route_but_owner_visible():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    op_time = datetime(2026, 6, 1, 8, 0, 20, tzinfo=timezone.utc)
+    info_state.register_node_record(
+        node_instance_id="node-initializing-route-1",
+        node_id="node-initializing-route",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-initializing": NodeServiceState(
+                service_name="calc_asset_ratio",
+                service_id="svc-initializing",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                readiness="initializing",
+                readiness_reason="warmup connecting public_data_source",
+                create_stage="warmup",
+                operation_id="create-svc-initializing",
+                operation_updated_at=op_time,
+                http_base_url="http://127.0.0.1:18081/svc/svc-initializing",
+            )
+        },
+        task_pools={
+            "pool-initializing": NodeTaskPoolInfo(
+                pool_id="pool-initializing",
+                owner_client_id="owner-1",
+                pool_name="calc-pool",
+                code_version="sha256:test",
+                status="RUNNING",
+                resource_health="running",
+                worker_count=2,
+                alive_workers=2,
+                readiness="initializing",
+                readiness_reason="prepare artifact",
+                create_stage="prepare_artifact",
+                operation_id="create-pool-initializing",
+                operation_updated_at=op_time,
+            )
+        },
+    )
+
+    all_routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=False, limit=10)
+    call_routes = info_state.list_service_routes(service_name="calc_asset_ratio", healthy_only=True, limit=10)
+    owner_routes = info_state.list_service_routes(
+        service_name="calc_asset_ratio",
+        healthy_only=True,
+        route_scope="owner_command",
+        limit=10,
+    )
+    serialized = _serialize_node(info_state.list_nodes(healthy_only=False, tags=[], limit=10)[0])
+    raw = _render_ops_page(info_state)
+    snapshot = _render_ops_snapshot(info_state)
+
+    assert len(all_routes) == 1
+    assert all_routes[0]["readiness"] == "initializing"
+    assert all_routes[0]["create_stage"] == "warmup"
+    assert all_routes[0]["operation_id"] == "create-svc-initializing"
+    assert all_routes[0]["operation_updated_at"] == op_time
+    assert call_routes == []
+    assert len(owner_routes) == 1
+    assert owner_routes[0]["readiness"] == "initializing"
+    assert serialized["services"][0]["readiness"] == "initializing"
+    assert serialized["services"][0]["create_stage"] == "warmup"
+    assert serialized["services"][0]["operation_id"] == "create-svc-initializing"
+    assert serialized["task_pools"][0]["readiness"] == "initializing"
+    assert serialized["task_pools"][0]["create_stage"] == "prepare_artifact"
+    assert "warmup connecting public_data_source" in raw
+    assert ">initializing</span>" in raw
+    assert "prepare_artifact" in raw
+    assert snapshot["content_key"]
+
+
+def test_infocenter_client_preserves_resource_readiness_fields():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    op_time = datetime(2026, 6, 1, 8, 0, 20, tzinfo=timezone.utc)
+    info_state.register_node_record(
+        node_instance_id="node-readiness-client-1",
+        node_id="node-readiness-client",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        services={
+            "svc-readiness-client": NodeServiceState(
+                service_name="svc-readiness-client",
+                service_id="svc-readiness-client",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=1,
+                alive_workers=1,
+                readiness="ready",
+                readiness_reason="",
+                create_stage="ready",
+                operation_id="create-svc-client",
+                operation_updated_at=op_time,
+                http_base_url="http://127.0.0.1:18081/svc/svc-readiness-client",
+            )
+        },
+        task_pools={
+            "pool-readiness-client": NodeTaskPoolInfo(
+                pool_id="pool-readiness-client",
+                owner_client_id="owner-1",
+                pool_name="pool-readiness-client",
+                code_version="sha256:test",
+                status="RUNNING",
+                worker_count=1,
+                alive_workers=1,
+                readiness="ready",
+                create_stage="ready",
+                operation_id="create-pool-client",
+                operation_updated_at=op_time,
+            )
+        },
+    )
+    server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    server.start()
+    try:
+        client = InfoCenterClient(server.base_url, timeout_sec=2.0)
+        nodes = client.list_nodes(healthy_only=False, limit=10)
+        routes = client.list_service_routes(service_name="svc-readiness-client", healthy_only=True, limit=10)
+    finally:
+        server.stop()
+
+    assert nodes[0].services[0].readiness == "ready"
+    assert nodes[0].services[0].create_stage == "ready"
+    assert nodes[0].services[0].operation_id == "create-svc-client"
+    assert nodes[0].services[0].operation_updated_at == op_time
+    assert nodes[0].task_pools[0].readiness == "ready"
+    assert nodes[0].task_pools[0].operation_id == "create-pool-client"
+    assert routes[0].readiness == "ready"
+    assert routes[0].create_stage == "ready"
+    assert routes[0].operation_id == "create-svc-client"
+    assert routes[0].operation_updated_at == op_time
 
 
 def test_infocenter_preserves_failure_timestamp_across_heartbeats():

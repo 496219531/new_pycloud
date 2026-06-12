@@ -70,6 +70,11 @@ class InfoCenterNodeService:
     http_base_url: str = ""
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
+    readiness: str = ""
+    readiness_reason: str = ""
+    create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +96,11 @@ class InfoCenterNodeTaskPool:
     stop_reason: str = ""
     failure_reason: str = ""
     failure_at: Optional[datetime] = None
+    readiness: str = ""
+    readiness_reason: str = ""
+    create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +169,14 @@ class InfoCenterServiceRoute:
     entry_module: str = ""
     entry_callable: str = ""
     serialization_mode: str = ""
+    resource_health: str = ""
+    readiness: str = ""
+    readiness_reason: str = ""
+    create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
+    stop_reason: str = ""
+    failure_at: Optional[datetime] = None
 
 
 @dataclass
@@ -274,6 +292,11 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     http_base_url=str(svc.get("http_base_url", "") or ""),
                     stop_reason=str(svc.get("stop_reason", svc.get("failure_reason", "")) or ""),
                     failure_at=_parse_optional_dt(svc.get("failure_at")),
+                    readiness=str(svc.get("readiness", "") or ""),
+                    readiness_reason=str(svc.get("readiness_reason", "") or ""),
+                    create_stage=str(svc.get("create_stage", "") or ""),
+                    operation_id=str(svc.get("operation_id", "") or ""),
+                    operation_updated_at=_parse_optional_dt(svc.get("operation_updated_at")),
                 )
             )
         task_pools = []
@@ -297,6 +320,11 @@ def _deserialize_infocenter_nodes(items: Sequence[object]) -> list[InfoCenterNod
                     stop_reason=str(pool.get("stop_reason", pool.get("failure_reason", "")) or ""),
                     failure_reason=str(pool.get("failure_reason", pool.get("stop_reason", "")) or ""),
                     failure_at=_parse_optional_dt(pool.get("failure_at")),
+                    readiness=str(pool.get("readiness", "") or ""),
+                    readiness_reason=str(pool.get("readiness_reason", "") or ""),
+                    create_stage=str(pool.get("create_stage", "") or ""),
+                    operation_id=str(pool.get("operation_id", "") or ""),
+                    operation_updated_at=_parse_optional_dt(pool.get("operation_updated_at")),
                 )
             )
         out.append(
@@ -405,6 +433,15 @@ class InfoCenterClient:
                     "in_flight": int(item.in_flight),
                     "http_base_url": str(item.http_base_url),
                     "stop_reason": str(getattr(item, "stop_reason", "") or ""),
+                    "readiness": str(getattr(item, "readiness", "") or ""),
+                    "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
+                    "create_stage": str(getattr(item, "create_stage", "") or ""),
+                    "operation_id": str(getattr(item, "operation_id", "") or ""),
+                    "operation_updated_at": (
+                        getattr(item, "operation_updated_at", None).isoformat()
+                        if getattr(item, "operation_updated_at", None) is not None
+                        else ""
+                    ),
                 }
             )
         return http_json_request(
@@ -477,6 +514,15 @@ class InfoCenterClient:
                     "in_flight": int(item.in_flight),
                     "http_base_url": str(item.http_base_url),
                     "stop_reason": str(getattr(item, "stop_reason", "") or ""),
+                    "readiness": str(getattr(item, "readiness", "") or ""),
+                    "readiness_reason": str(getattr(item, "readiness_reason", "") or ""),
+                    "create_stage": str(getattr(item, "create_stage", "") or ""),
+                    "operation_id": str(getattr(item, "operation_id", "") or ""),
+                    "operation_updated_at": (
+                        getattr(item, "operation_updated_at", None).isoformat()
+                        if getattr(item, "operation_updated_at", None) is not None
+                        else ""
+                    ),
                 }
             )
         payload = {
@@ -728,6 +774,14 @@ class InfoCenterClient:
                     entry_module=str(item.get("entry_module", "") or ""),
                     entry_callable=str(item.get("entry_callable", "") or ""),
                     serialization_mode=str(item.get("serialization_mode", "") or ""),
+                    resource_health=str(item.get("resource_health", "") or ""),
+                    readiness=str(item.get("readiness", "") or ""),
+                    readiness_reason=str(item.get("readiness_reason", "") or ""),
+                    create_stage=str(item.get("create_stage", "") or ""),
+                    operation_id=str(item.get("operation_id", "") or ""),
+                    operation_updated_at=_parse_optional_dt(item.get("operation_updated_at")),
+                    stop_reason=str(item.get("stop_reason", "") or ""),
+                    failure_at=_parse_optional_dt(item.get("failure_at")),
                 )
             )
         return out

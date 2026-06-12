@@ -152,6 +152,12 @@ def _parse_services(payload: object) -> Dict[str, NodeServiceState]:
             http_base_url=str(item.get("http_base_url", "") or ""),
             stop_reason=str(item.get("stop_reason", item.get("failure_reason", "")) or ""),
             failure_at=_parse_optional_dt(item.get("failure_at") or item.get("failure_at_ts")),
+            readiness=str(item.get("readiness", "") or ""),
+            readiness_reason=str(item.get("readiness_reason", "") or ""),
+            create_stage=str(item.get("create_stage", "") or ""),
+            operation_id=str(item.get("operation_id", "") or ""),
+            operation_updated_at=_parse_optional_dt(item.get("operation_updated_at") or item.get("operation_updated_at_ts")),
+            signal_cursor=max(0, int(item.get("signal_cursor", 0) or 0)),
         )
     return out
 
@@ -216,6 +222,26 @@ def _merge_services_for_display(services: List[NodeServiceState]) -> List[Dict[s
                 ),
                 "duplicate_count": duplicate_count,
                 "service_ids": [str(item.service_id or "") for item in ordered],
+                "readiness": str(getattr(primary, "readiness", "") or ""),
+                "readiness_reason": "; ".join(
+                    sorted(
+                        {
+                            str(getattr(item, "readiness_reason", "") or "").strip()
+                            for item in ordered
+                            if str(getattr(item, "readiness_reason", "") or "").strip()
+                        }
+                    )
+                ),
+                "create_stage": str(getattr(primary, "create_stage", "") or ""),
+                "operation_id": str(getattr(primary, "operation_id", "") or ""),
+                "operation_updated_at": max(
+                    (
+                        item.operation_updated_at
+                        for item in ordered
+                        if getattr(item, "operation_updated_at", None) is not None
+                    ),
+                    default=None,
+                ),
             }
         )
     return merged
@@ -348,6 +374,12 @@ def _parse_task_pools(payload: object) -> Dict[str, NodeTaskPoolInfo]:
             stop_reason=str(item.get("stop_reason", item.get("failure_reason", "")) or ""),
             failure_reason=str(item.get("failure_reason", item.get("stop_reason", "")) or ""),
             failure_at=_parse_optional_dt(item.get("failure_at") or item.get("failure_at_ts")),
+            readiness=str(item.get("readiness", "") or ""),
+            readiness_reason=str(item.get("readiness_reason", "") or ""),
+            create_stage=str(item.get("create_stage", "") or ""),
+            operation_id=str(item.get("operation_id", "") or ""),
+            operation_updated_at=_parse_optional_dt(item.get("operation_updated_at") or item.get("operation_updated_at_ts")),
+            signal_cursor=max(0, int(item.get("signal_cursor", 0) or 0)),
         )
     return out
 
@@ -473,6 +505,15 @@ def _serialize_service(service: NodeServiceState, *, node_healthy: bool = True) 
             alive_workers=alive_workers,
             stop_reason=service.stop_reason,
         ),
+        "readiness": str(getattr(service, "readiness", "") or ""),
+        "readiness_reason": str(getattr(service, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(service, "create_stage", "") or ""),
+        "operation_id": str(getattr(service, "operation_id", "") or ""),
+        "operation_updated_at": (
+            _dt_text(getattr(service, "operation_updated_at", None))
+            if getattr(service, "operation_updated_at", None) is not None
+            else ""
+        ),
         "policy_id": str(service.policy_id or "").strip().lower() or "default_safe",
         "owner_client_id": str(getattr(service, "owner_client_id", "") or ""),
         "code_version": str(getattr(service, "code_version", "") or ""),
@@ -554,6 +595,15 @@ def _serialize_node(state) -> Dict[str, object]:
                     stop_reason=getattr(pool, "stop_reason", "") or getattr(pool, "failure_reason", ""),
                     degraded=getattr(pool, "degraded", False),
                 ),
+                "readiness": str(getattr(pool, "readiness", "") or ""),
+                "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
+                "create_stage": str(getattr(pool, "create_stage", "") or ""),
+                "operation_id": str(getattr(pool, "operation_id", "") or ""),
+                "operation_updated_at": (
+                    _dt_text(getattr(pool, "operation_updated_at", None))
+                    if getattr(pool, "operation_updated_at", None) is not None
+                    else ""
+                ),
                 "degraded": bool(getattr(pool, "degraded", False)),
                 "worker_count": int(pool.worker_count),
                 "alive_workers": int(pool.alive_workers if state.healthy else 0),
@@ -631,6 +681,15 @@ def _ops_snapshot_content_key(nodes: List[object], *, job_summary: Optional[Dict
                     "serialization_mode": str(getattr(svc, "serialization_mode", "") or ""),
                     "status_text": str(getattr(svc, "status_text", "") or ""),
                     "resource_health": str(getattr(svc, "resource_health", "") or ""),
+                    "readiness": str(getattr(svc, "readiness", "") or ""),
+                    "readiness_reason": str(getattr(svc, "readiness_reason", "") or ""),
+                    "create_stage": str(getattr(svc, "create_stage", "") or ""),
+                    "operation_id": str(getattr(svc, "operation_id", "") or ""),
+                    "operation_updated_at": (
+                        _dt_text(getattr(svc, "operation_updated_at", ""))
+                        if getattr(svc, "operation_updated_at", None) is not None
+                        else ""
+                    ),
                     "degraded": bool(getattr(svc, "degraded", False)),
                     "worker_count": int(getattr(svc, "worker_count", 0) or 0),
                     "alive_workers": int(getattr(svc, "alive_workers", 0) or 0),
@@ -653,6 +712,15 @@ def _ops_snapshot_content_key(nodes: List[object], *, job_summary: Optional[Dict
                     "code_version": str(getattr(pool, "code_version", "") or ""),
                     "status": str(getattr(pool, "status", "") or ""),
                     "resource_health": str(getattr(pool, "resource_health", "") or ""),
+                    "readiness": str(getattr(pool, "readiness", "") or ""),
+                    "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
+                    "create_stage": str(getattr(pool, "create_stage", "") or ""),
+                    "operation_id": str(getattr(pool, "operation_id", "") or ""),
+                    "operation_updated_at": (
+                        _dt_text(getattr(pool, "operation_updated_at", ""))
+                        if getattr(pool, "operation_updated_at", None) is not None
+                        else ""
+                    ),
                     "degraded": bool(getattr(pool, "degraded", False)),
                     "worker_count": int(getattr(pool, "worker_count", 0) or 0),
                     "alive_workers": int(getattr(pool, "alive_workers", 0) or 0),
@@ -1124,6 +1192,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(pool.owner_client_id)}</td>"
                 f"<td>{_ops_status_badge(pool.status)}</td>"
                 f"<td>{_ops_status_badge(pool_resource_health)}</td>"
+                f"<td>{_ops_status_badge(str(getattr(pool, 'readiness', '') or '-'))}</td>"
+                f"<td>{html.escape(str(getattr(pool, 'create_stage', '') or '-'))}</td>"
                 f"<td>{pool.worker_count}</td>"
                 f"<td>{pool_alive_workers}</td>"
                 f"<td>{pool.task_count}</td>"
@@ -1141,6 +1211,7 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
                 f"<td>{html.escape(_dt_text(pool.created_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.last_heartbeat_at))}</td>"
                 f"<td>{html.escape(_dt_text(pool.lease_expire_at))}</td>"
+                f"<td>{html.escape(str(getattr(pool, 'readiness_reason', '') or '-'))}</td>"
                 f"<td>{html.escape(_failure_text_with_time(pool_stop_reason, getattr(pool, 'failure_at', None)))}</td>"
                 "</tr>"
             ))
@@ -1247,6 +1318,17 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         ]
         stop_reason = "; ".join(sorted({text for text in stop_reasons if text and text != "-"}))
         max_alive_workers = max(int(entry["item"].get("alive_workers", 0) or 0) for entry in ordered) if any_healthy else 0
+        readiness = str(item.get("readiness", "") or "-")
+        create_stage = str(item.get("create_stage", "") or "-")
+        readiness_reason = "; ".join(
+            sorted(
+                {
+                    str(entry["item"].get("readiness_reason", "") or "").strip()
+                    for entry in ordered
+                    if str(entry["item"].get("readiness_reason", "") or "").strip()
+                }
+            )
+        )
         resource_health = str(item.get("resource_health", "") or "") or _service_resource_health_text(
             node_healthy=any_healthy,
             service_status=int(item["status"]),
@@ -1263,6 +1345,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{_ops_bool_badge(any_healthy)}</td>"
             f"<td>{_ops_status_badge(_effective_service_status_text(node_healthy=any_healthy, service_status=int(item['status'])))}</td>"
             f"<td>{_ops_status_badge(resource_health)}</td>"
+            f"<td>{_ops_status_badge(readiness)}</td>"
+            f"<td>{html.escape(create_stage)}</td>"
             f"<td>{max(int(entry['item'].get('worker_count', 0) or 0) for entry in ordered)}</td>"
             f"<td>{max_alive_workers}</td>"
             f"<td>{max(int(entry['item'].get('in_flight', 0) or 0) for entry in ordered) if any_healthy else 0}</td>"
@@ -1273,15 +1357,16 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
             f"<td>{html.escape(str(timing.get('avg_child_invoke_ms', timing.get('avg_invoke_ms', '-'))))}</td>"
             f"<td>{html.escape(str(timing.get('avg_child_encode_ms', '-')))}</td>"
             f"<td>{html.escape(_dt_text(max(entry['item'].get('lease_expire_at', utc_now()) for entry in ordered)))}</td>"
+            f"<td>{html.escape(readiness_reason or '-')}</td>"
             f"<td>{html.escape(stop_reason or '-')}</td>"
             f"<td>{html.escape(str(item['http_base_url']) or '-')}</td>"
             "</tr>"
         )
     node_body = "\n".join(node_rows) or "<tr><td colspan='31'>no nodes</td></tr>"
-    service_body = "\n".join(service_rows) or "<tr><td colspan='19'>no services</td></tr>"
+    service_body = "\n".join(service_rows) or "<tr><td colspan='22'>no services</td></tr>"
     pool_entries.sort(key=lambda item: item[0], reverse=True)
     pool_rows = [row for _created_at, row in pool_entries]
-    pool_body = "\n".join(pool_rows) or "<tr><td colspan='23'>no task pools</td></tr>"
+    pool_body = "\n".join(pool_rows) or "<tr><td colspan='28'>no task pools</td></tr>"
     job_queue_body = "\n".join(job_queue_rows) or "<tr><td colspan='11'>no job queues</td></tr>"
     recent_job_rows.sort(key=lambda item: item[0], reverse=True)
     recent_job_body = "\n".join(row for _sort_key, row in recent_job_rows) or "<tr><td colspan='8'>no recent jobs</td></tr>"
@@ -1353,15 +1438,15 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
     recent_job_headers = ["owner", "instance_id", "job_id", "status", "submitted_at", "finished_at", "final_result", "error"]
     waiting_job_headers = ["owner", "instance_id", "job_id", "priority", "submitted_at", "position", "actions"]
     service_headers = [
-        "node_id", "instance_id", "service_name", "service_id", "node_healthy", "status", "resource", "workers", "alive", "in_flight",
+        "node_id", "instance_id", "service_name", "service_id", "node_healthy", "status", "resource", "readiness", "stage", "workers", "alive", "in_flight",
         "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
-        "lease_expire_at", "failure_reason", "http_base_url",
+        "lease_expire_at", "readiness_reason", "failure_reason", "http_base_url",
     ]
     pool_headers = [
-        "node_id", "instance_id", "pool_name", "pool_id", "owner_client_id", "status", "resource", "workers", "alive", "tasks", "in_flight",
+        "node_id", "instance_id", "pool_name", "pool_id", "owner_client_id", "status", "resource", "readiness", "stage", "workers", "alive", "tasks", "in_flight",
         "calls", "errors", "avg_total_ms", "avg_child_decode_ms", "avg_child_invoke_ms", "avg_child_encode_ms",
         "last_executor_create_ms", "avg_warmup_ms", "executor_rebuild_count", "code_version", "created_at",
-        "last_heartbeat_at", "lease_expire_at", "failure_reason",
+        "last_heartbeat_at", "lease_expire_at", "readiness_reason", "failure_reason",
     ]
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -1384,8 +1469,8 @@ def _render_ops_page(state: InfoCenterState, job_queue: Optional[JobQueueManager
         "body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(4),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(5),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(7),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(8),body:not(.show-details) .ops-table--job-timing :is(th,td):nth-child(n+11):nth-child(-n+15){display:none;}"
         "body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(2),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(7),body:not(.show-details) .ops-table--recent-jobs :is(th,td):nth-child(8){display:none;}"
         "body:not(.show-details) .ops-table--waiting-jobs :is(th,td):nth-child(2){display:none;}"
-        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+14):nth-child(-n+17),body:not(.show-details) .ops-table--services :is(th,td):nth-child(19){display:none;}"
-        "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+15):nth-child(-n+24){display:none;}"
+        "body:not(.show-details) .ops-table--services :is(th,td):nth-child(2),body:not(.show-details) .ops-table--services :is(th,td):nth-child(4),body:not(.show-details) .ops-table--services :is(th,td):nth-child(n+16):nth-child(-n+19),body:not(.show-details) .ops-table--services :is(th,td):nth-child(22){display:none;}"
+        "body:not(.show-details) .ops-table--pools :is(th,td):nth-child(2),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(4),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(5),body:not(.show-details) .ops-table--pools :is(th,td):nth-child(n+17):nth-child(-n+27){display:none;}"
         "body:not(.show-details) .ops-table{min-width:900px;}body.show-details .ops-table{min-width:1120px;}.density-toggle{border-color:rgba(34,211,238,.35);color:#cffafe;background:rgba(8,47,73,.5);}.density-toggle:hover{border-color:rgba(34,211,238,.72);background:rgba(14,116,144,.36);}.density-hint{color:#8fb2d9;font-size:12px;width:100%;text-align:right;}"
         ".badge{display:inline-flex;align-items:center;min-height:21px;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:800;line-height:1.2;border:1px solid transparent;white-space:nowrap;box-shadow:0 1px 0 rgba(255,255,255,.06) inset;}.badge-good{background:var(--good-bg);color:var(--good);border-color:rgba(74,222,128,.2);}.badge-warn{background:var(--warn-bg);color:var(--warn);border-color:rgba(251,191,36,.22);}.badge-bad{background:var(--bad-bg);color:var(--bad);border-color:rgba(251,113,133,.22);}.badge-neutral{background:var(--neutral-bg);color:var(--neutral);border-color:rgba(203,213,225,.14);}"
         ".stale-row{background:rgba(127,29,29,.24)!important;color:#fecaca;}form{margin:0;}td form{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;}button{appearance:none;border:1px solid rgba(148,163,184,.28);border-radius:9px;background:rgba(15,23,42,.9);color:#dbeafe;padding:5px 9px;margin:2px;font:inherit;font-size:12px;cursor:pointer;transition:.12s ease;}button:hover{transform:translateY(-1px);border-color:rgba(96,165,250,.72);color:#fff;background:rgba(37,99,235,.3);}input,select{border:1px solid rgba(148,163,184,.28);border-radius:9px;padding:5px 7px;font:inherit;font-size:12px;background:#08111f;color:var(--text);max-width:190px;}input::placeholder{color:#64748b;}"
@@ -1994,6 +2079,16 @@ class InfoCenterHttpServer:
                     for item in routes:
                         row = dict(item)
                         row["lease_expire_at"] = _dt_text(item["lease_expire_at"])
+                        row["operation_updated_at"] = (
+                            _dt_text(item.get("operation_updated_at"))
+                            if item.get("operation_updated_at") is not None
+                            else ""
+                        )
+                        row["failure_at"] = (
+                            _dt_text(item.get("failure_at"))
+                            if item.get("failure_at") is not None
+                            else ""
+                        )
                         serialized.append(row)
                     self._send_json(200, {"ok": True, "routes": serialized})
                     return

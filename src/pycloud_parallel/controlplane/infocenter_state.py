@@ -1125,9 +1125,11 @@ class InfoCenterState:
             )
             if healthy_only:
                 if normalized_scope == "call":
+                    readiness = str(getattr(svc, "readiness", "") or "").strip().lower()
                     if (
                         not is_call_route(healthy=is_healthy, service_status=effective_status, node_drain=bool(state.drain))
                         or int(effective_alive or 0) <= 0
+                        or (readiness and readiness != "ready")
                     ):
                         continue
                 elif normalized_scope == "owner_command":
@@ -1171,6 +1173,11 @@ class InfoCenterState:
                     "service_status": effective_status,
                     "status_text": reported_status_text,
                     "resource_health": resource_health,
+                    "readiness": str(getattr(svc, "readiness", "") or ""),
+                    "readiness_reason": str(getattr(svc, "readiness_reason", "") or ""),
+                    "create_stage": str(getattr(svc, "create_stage", "") or ""),
+                    "operation_id": str(getattr(svc, "operation_id", "") or ""),
+                    "operation_updated_at": getattr(svc, "operation_updated_at", None),
                     "stop_reason": str(getattr(svc, "stop_reason", "") or ""),
                     "failure_at": getattr(svc, "failure_at", None),
                     "policy_id": str(svc.policy_id or "").strip().lower() or "default_safe",
