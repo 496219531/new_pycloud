@@ -3625,7 +3625,6 @@ class NodeControlState(NodeRuntimeBase):
                     reserved_attr="_service_worker_reserved",
                     reserved=reserved,
                 )
-                reserved = 0
                 with self._lock:
                     current = self._services.get(service.service_id)
                     if current is None or current.status == pb2.SERVICE_STATUS_STOPPED:
@@ -3639,6 +3638,8 @@ class NodeControlState(NodeRuntimeBase):
                     current.failure_at = None
                     current.methods = method_info
                     managed_state = self._ensure_service_managed_globals_state_locked(current)
+                self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
+                reserved = 0
                 if managed_state is not None and initial_globals:
                     with self._lock:
                         self._publish_resource_progress_locked(
@@ -3851,7 +3852,6 @@ class NodeControlState(NodeRuntimeBase):
                     reserved_attr="_task_pool_worker_reserved",
                     reserved=reserved,
                 )
-                reserved = 0
                 with self._lock:
                     current = self._task_pools.get(pool.pool_id)
                     if current is None or str(current.status or "").upper() == "STOPPED":
@@ -3871,6 +3871,8 @@ class NodeControlState(NodeRuntimeBase):
                         runtime_key=current.pool_id,
                         allowed_names=current.managed_global_names,
                     )
+                self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
+                reserved = 0
                 if managed_state is not None and initial_globals:
                     with self._lock:
                         self._publish_resource_progress_locked(

@@ -806,6 +806,147 @@ def test_nodecontrol_task_pool_async_create_executor_failure_marks_failed_and_re
         state.close()
 
 
+def test_nodecontrol_service_async_create_artifact_failure_marks_failed(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-async-artifact-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        service_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_artifact_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            raise AssertionError("executor should not be reached after artifact failure")
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        state,
+        "_ensure_artifact_ready",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("artifact prepare failed")),
+    )
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-async-artifact-fail",
+            service_name="svc-async-artifact-fail",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async_artifact_fail",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-artifact-fail-1",
+            wait_ready=False,
+        )
+
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="service", resource_id=session.service_id)["readiness"] == "failed",
+            timeout_sec=3.0,
+        )
+        progress = state.get_resource_progress(resource_kind="service", resource_id=session.service_id)
+        assert progress["readiness"] == "failed"
+        assert progress["operation_status"] == "failed"
+        assert "artifact prepare failed" in progress["operation_error"]
+        assert state._service_create_requests["service-async-artifact-fail-1"].status == "FAILED"  # noqa: SLF001
+        assert state._service_worker_reserved == 0  # noqa: SLF001
+    finally:
+        state.close()
+
+
+def test_nodecontrol_task_pool_async_create_globals_warmup_failure_releases_reservation(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-async-globals-fail",
+        queue_capacity=4,
+        worker_capacity=1,
+        task_pool_worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_async_globals_fail"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    stopped = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **_kwargs):
+            return None
+
+        def stop_task_pool(self, **kwargs):
+            stopped.append(kwargs)
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        state,
+        "_warmup_pool_managed_globals",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("globals warmup failed")),
+    )
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = (
+            b"scale = 1\n"
+            b"def run(value=0, **_kwargs):\n"
+            b"    return {'value': int(value)}\n"
+        )
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool-globals-fail",
+            pool_name="pool-globals-fail",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_async_globals_fail",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            managed_global_names=("scale",),
+            initial_globals={"scale": 2},
+            chunks=[blob],
+            create_request_id="pool-async-globals-fail-1",
+            wait_ready=False,
+        )
+
+        assert _wait_until(
+            lambda: state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)["readiness"] == "failed",
+            timeout_sec=3.0,
+        )
+        progress = state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)
+        assert progress["readiness"] == "failed"
+        assert progress["operation_status"] == "failed"
+        assert "globals warmup failed" in progress["operation_error"]
+        assert state._task_pool_create_requests["pool-async-globals-fail-1"].status == "FAILED"  # noqa: SLF001
+        assert state._task_pool_worker_reserved == 0  # noqa: SLF001
+        assert stopped == [{"pool_id": pool.pool_id, "reason": "RuntimeError('globals warmup failed')"}]
+    finally:
+        state.close()
+
+
 def test_nodecontrol_subprocess_service_async_create_heartbeats_then_routes_when_ready(tmp_path, monkeypatch):
     state = NodeControlState(
         node_id="node-service-async-real-backend",
