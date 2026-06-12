@@ -152,16 +152,11 @@ class NodeInfoCenterRegistrar:
         self.fallback_heartbeat_sec = max(1, int(fallback_heartbeat_sec))
         self.rpc_timeout_sec = max(0.1, float(rpc_timeout_sec))
         self.inventory_sync_interval_sec = max(1.0, float(inventory_sync_interval_sec or 30.0))
-        self.restart_on_fence = (
-            _env_bool("PYCLOUD_NODE_RESTART_ON_FENCE", False)
-            if restart_on_fence is None
-            else bool(restart_on_fence)
-        )
-        if exit_on_fence is None:
-            exit_on_fence = _env_bool("PYCLOUD_NODE_EXIT_ON_FENCE", self.restart_on_fence)
-        # Legacy compatibility only: InfoCenter fence/reset advisories no longer
-        # stop, restart, or reset the local NodeControl runtime.
-        self.exit_on_fence = bool(exit_on_fence)
+        # Legacy compatibility only. These constructor arguments used to let
+        # InfoCenter fence advisories stop or restart NodeControl. InfoCenter is
+        # now registry-only, so the values are intentionally ignored.
+        del exit_on_fence, restart_on_fence
+        self.registry_advisory_controls_runtime = False
         self.exit_delay_sec = max(0.0, float(exit_delay_sec if exit_delay_sec is not None else restart_delay_sec or 0.25))
         self._exit_callback = exit_callback
         self._restart_callback = restart_callback

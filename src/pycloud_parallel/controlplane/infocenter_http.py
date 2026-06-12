@@ -1684,7 +1684,7 @@ class InfoCenterHttpServer:
                         capability=_parse_node_capability(payload.get("capability")),
                     )
                     if node is None:
-                        self._send_json(404, {"ok": False, "error": "unknown node"})
+                        self._send_json(400, {"ok": False, "accepted": False, "error": "node identity is required"})
                         return
                     self._send_json(
                         200,

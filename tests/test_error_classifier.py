@@ -23,8 +23,8 @@ from pycloud_parallel.execution.support import (
         ("service not found: demo", "service", ErrorCategory.SERVICE_TERMINAL),
         ("task pool not running", "task_pool", ErrorCategory.TASK_POOL_TERMINAL),
         ("pool not found", "taskpool", ErrorCategory.TASK_POOL_TERMINAL),
-        ("node instance execution is fenced; NodeControl host should exit", "", ErrorCategory.NODE_FENCE),
-        ("node_instance_id fenced", "node", ErrorCategory.NODE_FENCE),
+        ("node instance execution is fenced; NodeControl host should exit", "", ErrorCategory.OLD_INSTANCE_IDENTITY_LOST),
+        ("node_instance_id fenced", "node", ErrorCategory.OLD_INSTANCE_IDENTITY_LOST),
         ("node control_addr instance mismatch", "", ErrorCategory.IDENTITY_MISMATCH),
         (
             "node control_addr is still served by another node instance",

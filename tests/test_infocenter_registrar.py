@@ -1544,6 +1544,40 @@ def test_infocenter_http_accepts_mark_lost_instance_heartbeat_without_reset_requ
         info_server.stop()
 
 
+def test_infocenter_http_accepts_unknown_node_heartbeat_with_inventory_required():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        payload = json.dumps(
+            {
+                "node_id": "node-unknown-http",
+                "node_instance_id": "node-unknown-http-inst",
+                "healthy": True,
+                "inventory_included": False,
+            }
+        ).encode("utf-8")
+        req = Request(
+            f"{info_target}/nodes/heartbeat",
+            method="POST",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=5.0) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+
+        assert body["accepted"] is True
+        assert body["inventory_required"] is True
+        assert "reset_required" not in body
+        assert "new_instance_required" not in body
+        nodes = info_state.list_nodes(healthy_only=False, tags=[], limit=20)
+        assert [node.node_instance_id for node in nodes] == ["node-unknown-http-inst"]
+    finally:
+        info_server.stop()
+
+
 def test_infocenter_client_accepts_mark_lost_instance_node_sync():
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)

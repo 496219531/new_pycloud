@@ -10,7 +10,11 @@ class ErrorCategory(str, Enum):
     UNKNOWN = "unknown"
     SERVICE_TERMINAL = "service_terminal"
     TASK_POOL_TERMINAL = "task_pool_terminal"
-    NODE_FENCE = "node_fence"
+    OLD_INSTANCE_IDENTITY_LOST = "old_instance_identity_lost"
+    # Backward-compatible alias for old error strings. This no longer means the
+    # node should reset or exit; owners treat it as a terminal stale-replica
+    # identity condition.
+    NODE_FENCE = "old_instance_identity_lost"
     IDENTITY_MISMATCH = "identity_mismatch"
     HEARTBEAT = "heartbeat"
     TRANSIENT_NETWORK = "transient_network"
@@ -18,7 +22,7 @@ class ErrorCategory(str, Enum):
     IMPORT_ERROR = "import_error"
 
 
-_NODE_FENCE_MARKERS = (
+_OLD_INSTANCE_IDENTITY_LOST_MARKERS = (
     "node instance execution is fenced",
     "node_instance_id fenced",
     "execution is fenced",
@@ -138,8 +142,8 @@ def classify_error(error_or_message: Any, *, resource_kind: str = "") -> ErrorCa
     if not text:
         return ErrorCategory.UNKNOWN
 
-    if _has_marker(text, _NODE_FENCE_MARKERS):
-        return ErrorCategory.NODE_FENCE
+    if _has_marker(text, _OLD_INSTANCE_IDENTITY_LOST_MARKERS):
+        return ErrorCategory.OLD_INSTANCE_IDENTITY_LOST
     if _has_marker(text, _IDENTITY_MISMATCH_MARKERS):
         return ErrorCategory.IDENTITY_MISMATCH
     if _has_marker(text, _SERVICE_TERMINAL_MARKERS):
@@ -164,7 +168,7 @@ def classify_error(error_or_message: Any, *, resource_kind: str = "") -> ErrorCa
 def is_terminal_heartbeat_error(error_or_message: Any, *, resource_kind: str = "") -> bool:
     category = classify_error(error_or_message, resource_kind=resource_kind)
     return category in {
-        ErrorCategory.NODE_FENCE,
+        ErrorCategory.OLD_INSTANCE_IDENTITY_LOST,
         ErrorCategory.IDENTITY_MISMATCH,
         ErrorCategory.SERVICE_TERMINAL,
         ErrorCategory.TASK_POOL_TERMINAL,
@@ -180,7 +184,7 @@ def is_retryable_compensation_failure(error_or_message: Any, *, resource_kind: s
     }:
         return False
     return category in {
-        ErrorCategory.NODE_FENCE,
+        ErrorCategory.OLD_INSTANCE_IDENTITY_LOST,
         ErrorCategory.IDENTITY_MISMATCH,
         ErrorCategory.SERVICE_TERMINAL,
         ErrorCategory.TASK_POOL_TERMINAL,

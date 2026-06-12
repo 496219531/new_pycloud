@@ -142,6 +142,8 @@ class NodeState:
 
 @dataclass
 class FencedNodeInstance:
+    """Deprecated registry artifact; InfoCenter no longer fences NodeControl."""
+
     node_instance_id: str
     fenced_at: datetime = field(default_factory=utc_now)
     reason: str = ""
