@@ -2209,6 +2209,15 @@ class Service(ServiceExecutionSession):
             return 0
         if not self._compensation_lock.acquire(blocking=False):
             return 0
+        total_started_at = time.monotonic()
+        list_nodes_sec = 0.0
+        select_candidates_sec = 0.0
+        create_rpc_sec = 0.0
+        initial_heartbeat_sec = 0.0
+        route_update_sec = 0.0
+        persist_cache_sec = 0.0
+        async_update_submit_sec = 0.0
+        attempted = 0
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
             active = self._active_replica_snapshot()
@@ -2220,6 +2229,7 @@ class Service(ServiceExecutionSession):
             failed = {node_id for node_id, state in recovery_states.items() if not state.active}
             retryable_failed = {node_id for node_id, state in recovery_states.items() if state.retryable}
             excluded = set(active)
+            list_started_at = time.monotonic()
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 discovered_nodes = list(
                     infocenter.list_nodes(
@@ -2228,6 +2238,8 @@ class Service(ServiceExecutionSession):
                         limit=max(desired, int(spec.get("node_limit", 100) or 100)),
                     )
                 )
+            list_nodes_sec += time.monotonic() - list_started_at
+            select_started_at = time.monotonic()
             requested_instance_ids = [
                 str(item).strip() for item in list(spec.get("node_instance_ids") or ()) if str(item).strip()
             ]
@@ -2303,8 +2315,10 @@ class Service(ServiceExecutionSession):
             if not candidates:
                 return 0
             missing = max(0, desired - len(active))
+            select_candidates_sec += time.monotonic() - select_started_at
 
             def _create_service_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[Any], Optional[ServiceSessionClient], str]:
+                nonlocal create_rpc_sec
                 node_key = _node_instance_key_from_node(node)
                 try:
                     target = _node_control_target_for_node(node)
@@ -2314,6 +2328,7 @@ class Service(ServiceExecutionSession):
                 node_worker_count = max(1, int(spec.get("worker_count", 1) or 1))
                 if int(getattr(node, "service_worker_available", 0) or 0) > 0:
                     node_worker_count = max(1, min(node_worker_count, int(getattr(node, "service_worker_available", 0) or 0)))
+                create_started_at = time.monotonic()
                 try:
                     session = client.create_service_from_bytes(
                         owner_client_id=self.owner_client_id,
@@ -2344,7 +2359,9 @@ class Service(ServiceExecutionSession):
                         ),
                         wait_ready=False,
                     )
+                    create_rpc_sec += time.monotonic() - create_started_at
                 except Exception as exc:
+                    create_rpc_sec += time.monotonic() - create_started_at
                     with contextlib.suppress(Exception):
                         client.close()
                     return node_key, node, None, None, repr(exc)
@@ -2354,6 +2371,7 @@ class Service(ServiceExecutionSession):
 
             added = 0
             for node in candidates[:missing]:
+                attempted += 1
                 node_key, node, client, session, error_message = _create_service_on_node(node)
                 if error_message:
                     with self._route_lock:
@@ -2385,10 +2403,14 @@ class Service(ServiceExecutionSession):
                         with contextlib.suppress(Exception):
                             client.close()
                         continue
+                heartbeat_started_at = time.monotonic()
                 if not self._heartbeat_new_replica_before_activate(node_key, session, activate=False):
+                    initial_heartbeat_sec += time.monotonic() - heartbeat_started_at
                     with contextlib.suppress(Exception):
                         client.close()
                     continue
+                initial_heartbeat_sec += time.monotonic() - heartbeat_started_at
+                route_started_at = time.monotonic()
                 with self._route_lock:
                     if len(self._active_replica_snapshot()) >= desired:
                         with contextlib.suppress(Exception):
@@ -2406,16 +2428,41 @@ class Service(ServiceExecutionSession):
                     self._breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
                     self._wake_keepalive()
+                route_update_sec += time.monotonic() - route_started_at
             if added:
+                persist_started_at = time.monotonic()
                 self._persist_session_cache()
+                persist_cache_sec += time.monotonic() - persist_started_at
                 if self._last_managed_globals is not None:
+                    async_update_started_at = time.monotonic()
                     self._submit_async_update_globals(dict(self._last_managed_globals), reason="compensation")
+                    async_update_submit_sec += time.monotonic() - async_update_started_at
                 _emit_owner_notice(
                     f"dynamic compensation added={added} target_nodes={desired} "
                     f"service_name={self.service_name} routes={_format_route_summary(self.route_summary())}"
                 )
             return added
         finally:
+            total_sec = time.monotonic() - total_started_at
+            if total_sec >= SLOW_COMPENSATION_LOG_SEC:
+                logger.warning(
+                    "service compensation slow service_name=%s desired=%s attempted=%s added=%s "
+                    "list_nodes_sec=%.3f select_candidates_sec=%.3f create_rpc_sec=%.3f "
+                    "initial_heartbeat_sec=%.3f route_update_sec=%.3f persist_cache_sec=%.3f "
+                    "async_update_submit_sec=%.3f total_sec=%.3f",
+                    self.service_name,
+                    max(0, int(spec.get("node_count", 0) or 0)),
+                    attempted,
+                    locals().get("added", 0),
+                    list_nodes_sec,
+                    select_candidates_sec,
+                    create_rpc_sec,
+                    initial_heartbeat_sec,
+                    route_update_sec,
+                    persist_cache_sec,
+                    async_update_submit_sec,
+                    total_sec,
+                )
             self._compensation_lock.release()
 
     @classmethod

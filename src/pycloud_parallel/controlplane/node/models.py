@@ -152,6 +152,8 @@ class ServiceSession:
     readiness: str = "ready"
     readiness_reason: str = ""
     create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
     signal_cursor: int = 0
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
@@ -270,6 +272,8 @@ class TaskPoolState:
     readiness: str = "ready"
     readiness_reason: str = ""
     create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
     signal_cursor: int = 0
     task_count: int = 0
     timing_metrics: Dict[str, object] = field(default_factory=dict)

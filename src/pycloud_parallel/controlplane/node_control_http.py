@@ -219,6 +219,14 @@ def _created_task_pool_response(pool: TaskPoolState) -> Dict[str, object]:
         "owner_client_id": pool.owner_client_id,
         "pool_token": pool.pool_token,
         "readiness": str(getattr(pool, "readiness", "") or ""),
+        "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(pool, "create_stage", "") or ""),
+        "operation_id": str(getattr(pool, "operation_id", "") or ""),
+        "operation_updated_at": (
+            getattr(pool, "operation_updated_at", None).isoformat()
+            if getattr(pool, "operation_updated_at", None) is not None
+            else ""
+        ),
         "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
     }
 
@@ -236,6 +244,14 @@ def _created_service_response(session: ServiceSession) -> Dict[str, object]:
         "http_base_url": session.http_base_url,
         "policy_id": str(session.policy_id or "").strip().lower() or "default_safe",
         "readiness": str(getattr(session, "readiness", "") or ""),
+        "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(session, "create_stage", "") or ""),
+        "operation_id": str(getattr(session, "operation_id", "") or ""),
+        "operation_updated_at": (
+            getattr(session, "operation_updated_at", None).isoformat()
+            if getattr(session, "operation_updated_at", None) is not None
+            else ""
+        ),
         "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
     }
 
@@ -785,6 +801,8 @@ class NodeControlHttpApp:
                 "accepted": True,
                 "next_heartbeat_in_sec": max(1, pool.heartbeat_timeout_sec // 2),
                 "readiness": str(getattr(pool, "readiness", "") or ""),
+                "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
+                "create_stage": str(getattr(pool, "create_stage", "") or ""),
                 "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
                 "resource_epoch": 0,
                 "status": str(pool.status or ""),
@@ -1016,6 +1034,8 @@ class NodeControlHttpApp:
                 "status": int(session.status),
                 "next_heartbeat_in_sec": max(1, session.heartbeat_timeout_sec // 2),
                 "readiness": str(getattr(session, "readiness", "") or ""),
+                "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
+                "create_stage": str(getattr(session, "create_stage", "") or ""),
                 "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
                 "resource_epoch": 0,
             }
@@ -1493,6 +1513,10 @@ class HttpNodeControlClient:
             pool_name=str(pool_name or ""),
             idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
             readiness=str(data.get("readiness", "") or ""),
+            readiness_reason=str(data.get("readiness_reason", "") or ""),
+            create_stage=str(data.get("create_stage", "") or ""),
+            operation_id=str(data.get("operation_id", "") or ""),
+            operation_updated_at=str(data.get("operation_updated_at", "") or ""),
             signal_cursor=int(data.get("signal_cursor", 0) or 0),
             created_at=now,
             last_heartbeat_at=now,
@@ -1595,6 +1619,10 @@ class HttpNodeControlClient:
             worker_count=int(data.get("worker_count", 0) or 0),
             status=int(data.get("status", 0) or 0),
             readiness=str(data.get("readiness", "") or ""),
+            readiness_reason=str(data.get("readiness_reason", "") or ""),
+            create_stage=str(data.get("create_stage", "") or ""),
+            operation_id=str(data.get("operation_id", "") or ""),
+            operation_updated_at=str(data.get("operation_updated_at", "") or ""),
             signal_cursor=int(data.get("signal_cursor", 0) or 0),
             service_name=str(service_name or ""),
             idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),

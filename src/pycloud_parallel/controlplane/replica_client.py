@@ -73,6 +73,10 @@ class NativeTaskPoolClient:
     node_id: str = ""
     status: str = "RUNNING"
     readiness: str = "ready"
+    readiness_reason: str = ""
+    create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: str = ""
     signal_cursor: int = 0
     created_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
@@ -222,6 +226,10 @@ class NativeTaskPoolClient:
             return {}
         data = getter(pool_id=self.pool_id)
         self.readiness = str(data.get("readiness", self.readiness) or "")
+        self.readiness_reason = str(data.get("readiness_reason", self.readiness_reason) or "")
+        self.create_stage = str(data.get("create_stage", data.get("stage", self.create_stage)) or "")
+        self.operation_id = str(data.get("operation_id", self.operation_id) or "")
+        self.operation_updated_at = str(data.get("operation_updated_at", self.operation_updated_at) or "")
         self.signal_cursor = int(data.get("latest_signal_seq", self.signal_cursor) or 0)
         return data
 
@@ -265,6 +273,10 @@ class ServiceSessionClient:
     node_instance_id: str = ""
     node_id: str = ""
     readiness: str = "ready"
+    readiness_reason: str = ""
+    create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: str = ""
     signal_cursor: int = 0
     created_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
@@ -389,6 +401,10 @@ class ServiceSessionClient:
             return {}
         data = getter(service_id=self.service_id)
         self.readiness = str(data.get("readiness", self.readiness) or "")
+        self.readiness_reason = str(data.get("readiness_reason", self.readiness_reason) or "")
+        self.create_stage = str(data.get("create_stage", data.get("stage", self.create_stage)) or "")
+        self.operation_id = str(data.get("operation_id", self.operation_id) or "")
+        self.operation_updated_at = str(data.get("operation_updated_at", self.operation_updated_at) or "")
         self.signal_cursor = int(data.get("latest_signal_seq", self.signal_cursor) or 0)
         return data
 

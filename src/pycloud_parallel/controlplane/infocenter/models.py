@@ -48,6 +48,8 @@ class NodeServiceState:
     readiness: str = ""
     readiness_reason: str = ""
     create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
     signal_cursor: int = 0
 
 
@@ -77,6 +79,8 @@ class NodeTaskPoolInfo:
     readiness: str = ""
     readiness_reason: str = ""
     create_stage: str = ""
+    operation_id: str = ""
+    operation_updated_at: Optional[datetime] = None
     signal_cursor: int = 0
 
 

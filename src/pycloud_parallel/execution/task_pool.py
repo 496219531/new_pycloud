@@ -1258,6 +1258,14 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return 0
         if not self._compensation_lock.acquire(blocking=False):
             return 0
+        total_started_at = time.monotonic()
+        list_nodes_sec = 0.0
+        select_candidates_sec = 0.0
+        create_rpc_sec = 0.0
+        initial_heartbeat_sec = 0.0
+        route_update_sec = 0.0
+        async_update_submit_sec = 0.0
+        attempted = 0
         try:
             desired = max(0, int(spec.get("node_count", 0) or 0))
             active = self._active_replica_snapshot()
@@ -1273,6 +1281,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             if desired <= 0 or len(active) >= desired:
                 return 0
             excluded = active | (failed - retryable_failed)
+            list_started_at = time.monotonic()
             with _infocenter_client(spec["infocenter_target"], timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0)) as infocenter:
                 selected_nodes = list(
                     infocenter.select_task_nodes(
@@ -1287,6 +1296,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         runtime=str(spec.get("runtime", "") or ""),
                     )
                 )
+            list_nodes_sec += time.monotonic() - list_started_at
+            select_started_at = time.monotonic()
             candidates = [
                 node
                 for node in selected_nodes
@@ -1321,13 +1332,17 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             if not candidates:
                 return 0
             missing = max(0, desired - len(active))
+            select_candidates_sec += time.monotonic() - select_started_at
 
             def _create_pool_on_node(node: InfoCenterNode) -> Tuple[str, InfoCenterNode, Optional[NativeTaskPoolClient], str]:
+                nonlocal create_rpc_sec
                 node_key = _node_instance_key_from_node(node)
                 client = None
+                create_started_at = 0.0
                 try:
                     target = _node_control_target_for_node(node)
                     client = _new_node_control_client(target, timeout_sec=float(spec.get("timeout_sec", 10.0) or 10.0))
+                    create_started_at = time.monotonic()
                     pool = client.create_task_pool_from_bytes(
                         owner_client_id=str(spec.get("owner_client_id", "") or ""),
                         pool_name=str(spec.get("pool_name", "") or ""),
@@ -1353,7 +1368,10 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         ),
                         wait_ready=False,
                     )
+                    create_rpc_sec += time.monotonic() - create_started_at
                 except Exception as exc:
+                    if create_started_at > 0.0:
+                        create_rpc_sec += time.monotonic() - create_started_at
                     if client is not None:
                         with contextlib.suppress(Exception):
                             client.close()
@@ -1364,6 +1382,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
 
             added = 0
             for node in candidates[:missing]:
+                attempted += 1
                 node_key, node, pool, error_message = _create_pool_on_node(node)
                 if error_message:
                     with self._pool_lock:
@@ -1407,11 +1426,15 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                             _close_task_pool_replica(old_pool, reason="replace failed task pool replica")
                             with contextlib.suppress(Exception):
                                 old_pool._client.close()  # noqa: SLF001
+                    heartbeat_started_at = time.monotonic()
                     if not self._heartbeat_new_replica_before_activate(node_key, pool):
+                        initial_heartbeat_sec += time.monotonic() - heartbeat_started_at
                         _close_task_pool_replica(pool, reason="compensated task pool initial heartbeat failed")
                         with contextlib.suppress(Exception):
                             pool._client.close()  # noqa: SLF001
                         continue
+                    initial_heartbeat_sec += time.monotonic() - heartbeat_started_at
+                    route_started_at = time.monotonic()
                     self._pools[node_key] = pool
                     self.nodes[node_key] = node
                     self.failures.pop(node_key, None)
@@ -1419,8 +1442,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     self._submit_breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
                     self._wake_keepalive()
+                    route_update_sec += time.monotonic() - route_started_at
             if added and self._last_managed_globals is not None:
+                async_update_started_at = time.monotonic()
                 self._submit_async_update_globals(dict(self._last_managed_globals), reason="compensation")
+                async_update_submit_sec += time.monotonic() - async_update_started_at
             if added:
                 _emit_taskpool_notice(
                     f"dynamic compensation added={added} target_nodes={desired} "
@@ -1428,6 +1454,24 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 )
             return added
         finally:
+            total_sec = time.monotonic() - total_started_at
+            if total_sec >= SLOW_COMPENSATION_LOG_SEC:
+                logger.warning(
+                    "task pool compensation slow pool_name=%s desired=%s attempted=%s added=%s "
+                    "list_nodes_sec=%.3f select_candidates_sec=%.3f create_rpc_sec=%.3f "
+                    "initial_heartbeat_sec=%.3f route_update_sec=%.3f async_update_submit_sec=%.3f total_sec=%.3f",
+                    str(spec.get("pool_name", "") or getattr(self, "pool_name", "") or getattr(self, "job_id", "") or ""),
+                    max(0, int(spec.get("node_count", 0) or 0)),
+                    attempted,
+                    locals().get("added", 0),
+                    list_nodes_sec,
+                    select_candidates_sec,
+                    create_rpc_sec,
+                    initial_heartbeat_sec,
+                    route_update_sec,
+                    async_update_submit_sec,
+                    total_sec,
+                )
             self._compensation_lock.release()
 
     @property

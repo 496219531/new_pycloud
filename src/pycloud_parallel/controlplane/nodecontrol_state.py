@@ -1216,6 +1216,9 @@ class NodeControlState(NodeRuntimeBase):
         resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
         if resource is not None:
             resource.signal_cursor = seq
+            if op_id:
+                resource.operation_id = str(op_id or "")
+                resource.operation_updated_at = utc_now()
         if op_id:
             self._resource_signals.upsert_operation(
                 ResourceOperation(
@@ -1250,6 +1253,9 @@ class NodeControlState(NodeRuntimeBase):
         resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
         if resource is not None:
             resource.create_stage = normalized_stage
+            if op_id:
+                resource.operation_id = str(op_id or "")
+                resource.operation_updated_at = utc_now()
         seq = self._publish_resource_signal_locked(
             resource_kind=kind,
             resource_id=rid,
@@ -1337,12 +1343,24 @@ class NodeControlState(NodeRuntimeBase):
             raise KeyError("resource not found")
         latest = self._resource_signals.latest(kind, rid)
         operations = self._resource_signals.operations_snapshot(resource_kind=kind, resource_id=rid)
+        latest_operation = operations[-1] if operations else None
+        failure_at = getattr(resource, "failure_at", None)
         return {
             "resource_kind": kind,
             "resource_id": rid,
             "readiness": str(getattr(resource, "readiness", "") or ""),
             "readiness_reason": str(getattr(resource, "readiness_reason", "") or ""),
+            "create_stage": str(getattr(resource, "create_stage", "") or ""),
             "stage": str(getattr(resource, "create_stage", "") or ""),
+            "operation_id": str(getattr(resource, "operation_id", "") or (latest_operation.op_id if latest_operation is not None else "") or ""),
+            "operation_updated_at": (
+                getattr(resource, "operation_updated_at", None).isoformat()
+                if getattr(resource, "operation_updated_at", None) is not None
+                else latest_operation.updated_at.isoformat() if latest_operation is not None else ""
+            ),
+            "status": int(getattr(resource, "status", 0) or 0) if kind == "service" else str(getattr(resource, "status", "") or ""),
+            "stop_reason": str(getattr(resource, "stop_reason", "") or ""),
+            "failure_at": failure_at.isoformat() if failure_at is not None else "",
             "latest_signal_seq": int(getattr(resource, "signal_cursor", 0) or 0),
             "updated_at": latest.updated_at.isoformat() if latest is not None else "",
             "reason": str(latest.reason or "") if latest is not None else "",

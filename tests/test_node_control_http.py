@@ -236,8 +236,12 @@ def test_http_resource_signals_and_progress_endpoints(tmp_path):
             signals = client.list_resource_signals(since=0, limit=50)
 
             assert service_progress["readiness"] == "ready"
+            assert service_progress["create_stage"] in {"ready", "create_succeeded"}
+            assert service_progress["status"] == pb2.SERVICE_STATUS_RUNNING
             assert service_progress["latest_signal_seq"] > 0
             assert pool_progress["readiness"] == "ready"
+            assert pool_progress["create_stage"] in {"ready", "create_succeeded"}
+            assert pool_progress["status"] == "RUNNING"
             assert pool_progress["latest_signal_seq"] > 0
             assert any(item["resource_id"] == service.service_id for item in signals["signals"])
             assert any(item["resource_id"] == pool.pool_id for item in signals["signals"])
@@ -276,10 +280,14 @@ def test_http_create_wait_ready_false_returns_progress_before_ready(tmp_path, mo
                 wait_ready=False,
             )
             assert service.readiness == "initializing"
+            assert service.create_stage in {"accepted", "artifact_prepare"}
+            assert service.operation_id == "http-service-async-1"
             assert artifact_ready_started.wait(timeout=2.0)
             service.heartbeat()
             service_progress = client.get_service_progress(service_id=service.service_id)
             assert service_progress["readiness"] == "initializing"
+            assert service_progress["operation_id"] == "http-service-async-1"
+            assert service_progress["operation_updated_at"]
 
             artifact_ready_started.clear()
             pool = client.create_task_pool_from_bytes(
@@ -295,10 +303,14 @@ def test_http_create_wait_ready_false_returns_progress_before_ready(tmp_path, mo
                 wait_ready=False,
             )
             assert pool.readiness == "initializing"
+            assert pool.create_stage in {"accepted", "artifact_prepare"}
+            assert pool.operation_id == "http-pool-async-1"
             assert artifact_ready_started.wait(timeout=2.0)
             pool.heartbeat()
             pool_progress = client.get_task_pool_progress(pool_id=pool.pool_id)
             assert pool_progress["readiness"] == "initializing"
+            assert pool_progress["operation_id"] == "http-pool-async-1"
+            assert pool_progress["operation_updated_at"]
     finally:
         release_artifact_ready.set()
         server.stop()

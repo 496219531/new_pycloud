@@ -144,6 +144,12 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "readiness": str(getattr(session, "readiness", "") or ""),
         "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
         "create_stage": str(getattr(session, "create_stage", "") or ""),
+        "operation_id": str(getattr(session, "operation_id", "") or ""),
+        "operation_updated_at": (
+            getattr(session, "operation_updated_at", None).isoformat()
+            if getattr(session, "operation_updated_at", None) is not None
+            else ""
+        ),
         "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
         "http_base_url": session.http_base_url,
         "methods": sorted(session.methods.keys()),
@@ -198,6 +204,12 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "readiness": str(getattr(session, "readiness", "") or ""),
         "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
         "create_stage": str(getattr(session, "create_stage", "") or ""),
+        "operation_id": str(getattr(session, "operation_id", "") or ""),
+        "operation_updated_at": (
+            getattr(session, "operation_updated_at", None).isoformat()
+            if getattr(session, "operation_updated_at", None) is not None
+            else ""
+        ),
         "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
     }
 
@@ -232,6 +244,8 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
         readiness=str(getattr(pool, "readiness", "") or ""),
         readiness_reason=str(getattr(pool, "readiness_reason", "") or ""),
         create_stage=str(getattr(pool, "create_stage", "") or ""),
+        operation_id=str(getattr(pool, "operation_id", "") or ""),
+        operation_updated_at=getattr(pool, "operation_updated_at", None),
         signal_cursor=int(getattr(pool, "signal_cursor", 0) or 0),
     )
 
@@ -265,6 +279,12 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "readiness": str(getattr(pool, "readiness", "") or ""),
         "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
         "create_stage": str(getattr(pool, "create_stage", "") or ""),
+        "operation_id": str(getattr(pool, "operation_id", "") or ""),
+        "operation_updated_at": (
+            getattr(pool, "operation_updated_at", None).isoformat()
+            if getattr(pool, "operation_updated_at", None) is not None
+            else ""
+        ),
         "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
     }
 
