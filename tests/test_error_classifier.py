@@ -7,6 +7,7 @@ import pytest
 from pycloud_parallel.execution.error_classifier import (
     ErrorCategory,
     classify_error,
+    is_dependency_runtime_error,
     is_retryable_compensation_failure,
     is_terminal_heartbeat_error,
 )
@@ -88,6 +89,12 @@ def test_classify_error_walks_exception_cause_chain():
 
     assert classify_error(error) == ErrorCategory.IMPORT_ERROR
     assert is_retryable_compensation_failure(error) is False
+
+
+def test_dependency_runtime_error_is_narrower_than_permanent_artifact():
+    assert is_dependency_runtime_error(ModuleNotFoundError("No module named 'missing_demo_dep'")) is True
+    assert is_dependency_runtime_error("dependency install failed for missing_demo_dep") is True
+    assert is_dependency_runtime_error("artifact validation failed while loading: method `run` not exported") is False
 
 
 @pytest.mark.parametrize(

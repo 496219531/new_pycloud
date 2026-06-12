@@ -109,7 +109,23 @@ def _service_report_status_text(session: ServiceSession) -> str:
     return _service_status_name(session.status)
 
 
+def _service_resource_health(session: ServiceSession, *, alive_workers: int) -> str:
+    readiness = str(getattr(session, "readiness", "") or "").strip().lower()
+    if readiness == "failed":
+        return "failed"
+    if not session.is_running():
+        return "stopped"
+    if str(session.stop_reason or "").strip():
+        return "failed"
+    if bool(getattr(session, "degraded", False)):
+        return "degraded"
+    return "running"
+
+
 def _task_pool_resource_health(pool: TaskPoolState, *, alive_workers: int) -> str:
+    readiness = str(getattr(pool, "readiness", "") or "").strip().lower()
+    if readiness == "failed":
+        return "failed"
     if not pool.is_running():
         return "stopped"
     if str(pool.stop_reason or "").strip():
@@ -130,6 +146,7 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "code_version": session.code_version,
         "status": int(session.status),
         "status_text": _service_report_status_text(session),
+        "resource_health": _service_resource_health(session, alive_workers=resource.alive_workers),
         "worker_count": resource.worker_count,
         "alive_workers": resource.alive_workers,
         "in_flight": resource.in_flight,
@@ -189,6 +206,7 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "serialization_mode": str(getattr(session, "serialization_mode", "") or ""),
         "status": int(session.status),
         "status_text": _service_report_status_text(session),
+        "resource_health": _service_resource_health(session, alive_workers=resource.alive_workers),
         "worker_count": int(resource.worker_count),
         "alive_workers": int(resource.alive_workers),
         "in_flight": int(resource.in_flight),

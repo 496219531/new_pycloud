@@ -276,7 +276,7 @@ def test_failed_create_task_pool_is_reported_for_ops(tmp_path, monkeypatch):
         report = next(iter(reports.values()))
         assert report.pool_name == "pool-fail"
         assert report.status == "STOPPED"
-        assert report.resource_health == "stopped"
+        assert report.resource_health == "failed"
         assert report.alive_workers == 0
         assert report.inflight == 0
         assert "missing_pkg" in report.stop_reason
@@ -3424,6 +3424,44 @@ def test_execute_payload_keeps_user_permission_error_as_user_failure(tmp_path):
         assert status == "FAILED_USER"
         assert err_type == "PermissionError"
         assert "Access is denied" in err_message
+    finally:
+        state.close()
+
+
+def test_execute_payload_classifies_runtime_import_as_dependency_failure(tmp_path):
+    state = NodeControlState(
+        node_id="node-runtime-dependency-01",
+        artifact_dir=str(tmp_path / "code_cache_runtime_dependency"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    try:
+        blob = b"def run(**_kwargs):\n    import definitely_missing_runtime_pkg\n    return {'ok': True}\n"
+        artifact, _cached = state.put_code(
+            client_id="client-runtime-dependency",
+            sha256="sha256:" + hashlib.sha256(blob).hexdigest(),
+            runtime="py3",
+            entry_module="runtime_dependency_demo",
+            entry_callable="run",
+            package_format="py",
+            export_mode="single",
+            export_methods=["run"],
+            chunks=[blob],
+        )
+
+        status, _result, err_type, err_message, _timings = _execute_payload_in_subprocess(
+            **_build_execute_spec(
+                artifact,
+                object_dir=state.object_dir,
+                method_name="run",
+                payload={},
+                payload_mode="http_call",
+            )
+        )
+
+        assert status == "FAILED_DEPENDENCY"
+        assert err_type == "DependencyError"
+        assert "definitely_missing_runtime_pkg" in err_message
     finally:
         state.close()
 
@@ -7848,6 +7886,111 @@ def test_nodecontrol_service_call_throttles_code_last_at_touch(tmp_path, monkeyp
     assert len(calls) == 1
 
 
+def test_nodecontrol_service_dependency_failure_reports_resource_failed(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-dependency-failed",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_dependency_failed"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    code_version = "sha256:" + "d" * 64
+    artifact = CodeArtifact(
+        code_version=code_version,
+        path=str(tmp_path),
+        runtime="py3",
+        entry_module="dependency_service",
+        entry_callable="run",
+        package_format="py",
+        export_mode="module",
+        export_methods=(),
+        export_decorator="",
+        dependency_policy_mode="safe",
+        dependency_allowlist=(),
+        dependency_path="",
+        size_bytes=1,
+        created_at=now,
+    )
+    service = ServiceSession(
+        service_id="svc-dependency-failed",
+        owner_client_id="owner",
+        service_name="svc-dependency-failed",
+        code_version=code_version,
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        expose_http=False,
+        service_token="token",
+        http_base_url="",
+        status=pb2.SERVICE_STATUS_RUNNING,
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+        methods={"run": ("dependency_service", "run")},
+    )
+    stop_calls = []
+    sync_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def call_service(self, **kwargs):  # noqa: ARG002
+            return {
+                "ok": True,
+                "status_text": "FAILED_DEPENDENCY",
+                "result": None,
+                "err_type": "DependencyError",
+                "err_message": "No module named 'missing_node_dep'",
+            }
+
+        def stop_service(self, **kwargs):
+            stop_calls.append(kwargs)
+
+        def drain_events(self):
+            return []
+
+        def close(self, **kwargs):  # noqa: ARG002
+            return None
+
+    state.request_infocenter_sync = lambda: sync_calls.append(True)  # type: ignore[method-assign]
+    with state._lock:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._codes[code_version] = artifact  # noqa: SLF001
+        state._services[service.service_id] = service  # noqa: SLF001
+
+    try:
+        code, body = state.call_service(
+            service_id=service.service_id,
+            method="run",
+            payload={},
+            service_token=service.service_token,
+            timeout_sec=1.0,
+        )
+        report = state.service_report_payloads(include_stopped=True)[0]
+    finally:
+        state.close()
+
+    assert code == 503
+    assert body["error_type"] == "DependencyError"
+    assert "missing_node_dep" in body["error"]
+    assert service.status == pb2.SERVICE_STATUS_STOPPED
+    assert service.readiness == "failed"
+    assert service.resource_snapshot().alive_workers == 0
+    assert "dependency runtime error" in service.stop_reason
+    assert report["resource_health"] == "failed"
+    assert report["readiness"] == "failed"
+    assert "missing_node_dep" in report["readiness_reason"]
+    assert sync_calls
+    assert _wait_until(lambda: bool(stop_calls))
+    assert stop_calls[0]["service_id"] == service.service_id
+    assert "dependency runtime error" in stop_calls[0]["reason"]
+
+
 def test_nodecontrol_service_stream_reports_stop_reason_from_inflight_stop(tmp_path):
     state = NodeControlState(
         node_id="node-stream-stop-reason",
@@ -8109,6 +8252,116 @@ def test_nodecontrol_discards_late_pool_event_for_stale_pool_id(tmp_path):
         assert results == []
     finally:
         state.close()
+
+
+def test_nodecontrol_task_pool_dependency_failure_reports_resource_failed(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-dependency-failed",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_dependency_failed"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    now = utc_now()
+    stop_calls = []
+    sync_calls = []
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def drain_events(self):
+            return [
+                {
+                    "kind": "pool_task_done",
+                    "pool_id": "pool-dependency-failed",
+                    "task_id": "task-dependency-failed",
+                    "attempt": 1,
+                    "status_text": "FAILED_DEPENDENCY",
+                    "result": None,
+                    "err_type": "DependencyError",
+                    "err_message": "No module named 'missing_pool_dep'",
+                    "timings": {},
+                }
+            ]
+
+        def stop_task_pool(self, **kwargs):
+            stop_calls.append(kwargs)
+
+        def close(self, **_kwargs):
+            return None
+
+    pool = TaskPoolState(
+        pool_id="pool-dependency-failed",
+        owner_client_id="owner",
+        pool_name="pool-dependency-failed",
+        code_version="sha256:pool",
+        task_method="run",
+        worker_count=1,
+        heartbeat_timeout_sec=30,
+        idle_ttl_sec=0,
+        pool_token="pool-token",
+        status="RUNNING",
+        created_at=now,
+        last_heartbeat_at=now,
+        lease_expire_at=now + timedelta(seconds=30),
+        executor_ready=True,
+        alive_workers=1,
+    )
+    task = TaskState(
+        task_id="task-dependency-failed",
+        client_id=pool.pool_id,
+        job_id="job-dependency-failed",
+        code_version="sha256:pool",
+        runtime_key="",
+        execution_mode=pb2.EXECUTION_MODE_PERSISTENT,
+        payload={},
+        timeout_hint_sec=0,
+        priority=1,
+        status=pb2.TASK_STATUS_RUNNING,
+        attempt=1,
+        started_at=now,
+        last_heartbeat_at=now,
+    )
+    state.request_infocenter_sync = lambda: sync_calls.append(True)  # type: ignore[method-assign]
+    with state._cv:  # noqa: SLF001
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        state._task_pools[pool.pool_id] = pool  # noqa: SLF001
+        state._pool_tasks[task.task_id] = task  # noqa: SLF001
+
+    try:
+        state._drain_executor_events()  # noqa: SLF001
+        report = state.task_pool_reports()[pool.pool_id]
+        results, _cursor = state.pull_pool_results(
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+            limit=10,
+            wait_ms=0,
+            cursor="",
+        )
+        pool_status = pool.status
+        pool_readiness = pool.readiness
+        pool_stop_reason = pool.stop_reason
+    finally:
+        state.close()
+
+    assert task.status == pb2.TASK_STATUS_FAILED_INFRA
+    assert task.error_type == "DependencyError"
+    assert "missing_pool_dep" in task.error_message
+    assert pool_status == "STOPPED"
+    assert pool_readiness == "failed"
+    assert "dependency runtime error" in pool_stop_reason
+    assert report.resource_health == "failed"
+    assert report.readiness == "failed"
+    assert "missing_pool_dep" in report.readiness_reason
+    assert len(results) == 1
+    assert results[0].status == pb2.TASK_STATUS_FAILED_INFRA
+    assert results[0].error.type == "DependencyError"
+    assert sync_calls
+    assert _wait_until(lambda: bool(stop_calls))
+    assert stop_calls[0]["pool_id"] == pool.pool_id
+    assert "dependency runtime error" in stop_calls[0]["reason"]
 
 
 def test_infocenter_service_routes_compute_inflight_and_predicted_busy():

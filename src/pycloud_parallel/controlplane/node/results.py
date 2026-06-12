@@ -852,7 +852,7 @@ def _normalize_user_return(
         s = str(v or "SUCCEEDED").strip().upper()
         if s in ("SUCCESS", "OK"):
             return "SUCCEEDED"
-        if s not in ("SUCCEEDED", "FAILED_USER", "FAILED_INFRA"):
+        if s not in ("SUCCEEDED", "FAILED_USER", "FAILED_INFRA", "FAILED_DEPENDENCY"):
             return "SUCCEEDED"
         return s
 

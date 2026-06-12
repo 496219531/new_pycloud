@@ -193,6 +193,21 @@ def is_retryable_compensation_failure(error_or_message: Any, *, resource_kind: s
     }
 
 
+def is_dependency_runtime_error(error_or_message: Any) -> bool:
+    """Return true for node-local dependency/import failures observed at runtime."""
+
+    text = _error_text(error_or_message)
+    return _has_marker(text, _IMPORT_ERROR_MARKERS) or _has_marker(
+        text,
+        (
+            "dependency install failed",
+            "dependency installation failed",
+            "node environment is missing",
+            "missing dependency",
+        ),
+    )
+
+
 def _normalize_resource_kind(resource_kind: str) -> str:
     text = str(resource_kind or "").strip().lower().replace("-", "_")
     if text in {"taskpool", "task_pool", "pool"}:
@@ -257,6 +272,7 @@ def _is_transient_network_error(error_or_message: Any, text: str) -> bool:
 __all__ = [
     "ErrorCategory",
     "classify_error",
+    "is_dependency_runtime_error",
     "is_retryable_compensation_failure",
     "is_terminal_heartbeat_error",
 ]

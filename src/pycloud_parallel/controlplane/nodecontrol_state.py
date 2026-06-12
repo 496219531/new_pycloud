@@ -169,6 +169,7 @@ RESOURCE_LIVENESS_ENABLED = False
 RESOURCE_LIVENESS_REFRESH_INTERVAL_SEC = 200.0
 CREATE_REQUEST_WAIT_TIMEOUT_SEC = 300.0
 CREATE_REQUEST_MAX_RECORDS_PER_KIND = 200
+DEPENDENCY_FAILURE_STATUS = "FAILED_DEPENDENCY"
 
 
 def _path(value: Any = ".") -> Path:
@@ -768,6 +769,70 @@ class NodeControlState(NodeRuntimeBase):
         if failed_count:
             self._cv.notify_all()
         return failed_count
+
+    def _mark_service_dependency_failure_locked(self, session: ServiceSession, *, reason: str) -> None:
+        reason_text = str(reason or "dependency runtime error").strip() or "dependency runtime error"
+        if not reason_text.lower().startswith("dependency runtime error"):
+            reason_text = f"dependency runtime error: {reason_text}"
+        if session.status == pb2.SERVICE_STATUS_STOPPED and str(session.stop_reason or "").strip() == reason_text:
+            return
+        stop_executor = None
+        if self._executor_host is not None and bool(getattr(session, "executor_ready", False)):
+            stop_executor = (self._executor_host, str(session.service_id or ""), reason_text)
+        session.executor_ready = False
+        session.alive_workers = 0
+        session.degraded = False
+        session.status = pb2.SERVICE_STATUS_STOPPED
+        session.readiness = "failed"
+        session.readiness_reason = reason_text
+        session.stop_reason = reason_text
+        session.failure_at = utc_now()
+        session.lease_expire_at = session.failure_at
+        self._drop_create_requests_for_resource_locked(kind="service", resource_id=session.service_id)
+        self._publish_resource_failure_locked(
+            resource_kind="service",
+            resource_id=session.service_id,
+            reason=reason_text,
+            stage="runtime_dependency_failure",
+            payload={"error_category": "dependency"},
+        )
+        if stop_executor is not None:
+            executor_host, service_id, stop_reason = stop_executor
+            self._submit_stop_service(executor_host, service_id=service_id, reason=stop_reason)
+        self.request_infocenter_sync()
+
+    def _mark_task_pool_dependency_failure_locked(self, pool: TaskPoolState, *, reason: str) -> None:
+        reason_text = str(reason or "dependency runtime error").strip() or "dependency runtime error"
+        if not reason_text.lower().startswith("dependency runtime error"):
+            reason_text = f"dependency runtime error: {reason_text}"
+        if str(pool.status or "").upper() == "STOPPED" and str(pool.stop_reason or "").strip() == reason_text:
+            return
+        stop_executor = None
+        if self._executor_host is not None and bool(getattr(pool, "executor_ready", False)):
+            stop_executor = (self._executor_host, str(pool.pool_id or ""), reason_text)
+        pool.executor_ready = False
+        pool.alive_workers = 0
+        if hasattr(pool, "degraded"):
+            pool.degraded = False
+        pool.status = "STOPPED"
+        pool.readiness = "failed"
+        pool.readiness_reason = reason_text
+        pool.stop_reason = reason_text
+        pool.failure_at = utc_now()
+        pool.lease_expire_at = pool.failure_at
+        self._fail_task_pool_tasks_locked(pool, reason=reason_text, now=pool.failure_at)
+        self._drop_create_requests_for_resource_locked(kind="task_pool", resource_id=pool.pool_id)
+        self._publish_resource_failure_locked(
+            resource_kind="task_pool",
+            resource_id=pool.pool_id,
+            reason=reason_text,
+            stage="runtime_dependency_failure",
+            payload={"error_category": "dependency"},
+        )
+        if stop_executor is not None:
+            executor_host, pool_id, stop_reason = stop_executor
+            self._submit_stop_task_pool(executor_host, pool_id=pool_id, reason=stop_reason)
+        self.request_infocenter_sync()
 
     @staticmethod
     def _service_stopped_error_payload(session: ServiceSession, *, fallback: str = "service not running") -> Dict[str, object]:
@@ -4931,6 +4996,39 @@ class NodeControlState(NodeRuntimeBase):
                 "error_type": normalized_error_type,
                 "error": normalized_error_message,
             }
+        if status_text == DEPENDENCY_FAILURE_STATUS:
+            _ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
+                status_text,
+                error_type=err_type,
+                error_message=err_message,
+                user_fallback="user error",
+                infra_fallback="dependency runtime error",
+            )
+            finalize_end = time.perf_counter()
+            with self._lock:
+                session = self._services.get(service_id)
+                if session is not None:
+                    self._record_service_timing_locked(
+                        session,
+                        method=requested_method,
+                        ok=False,
+                        http_status=503,
+                        setup_ms=(setup_end - total_start) * 1000.0,
+                        build_execute_spec_ms=build_execute_spec_ms,
+                        executor_ms=(executor_end - executor_start) * 1000.0,
+                        finalize_ms=(finalize_end - finalize_start) * 1000.0,
+                        total_ms=(finalize_end - total_start) * 1000.0,
+                        subprocess_timings=subprocess_timings,
+                        error_type=normalized_error_type,
+                        error_message=normalized_error_message,
+                    )
+                    self._mark_service_dependency_failure_locked(session, reason=normalized_error_message)
+            return 503, {
+                "ok": False,
+                "method": requested_method,
+                "error_type": normalized_error_type,
+                "error": normalized_error_message,
+            }
         _ok, normalized_error_type, normalized_error_message = normalize_invoke_error(
             status_text,
             error_type=err_type,
@@ -5138,7 +5236,7 @@ class NodeControlState(NodeRuntimeBase):
                     "error_type": normalized_error_type,
                     "error": normalized_error_message,
                 }
-                http_status = 400 if status_text == "FAILED_USER" else 500
+                http_status = 400 if status_text == "FAILED_USER" else 503 if status_text == DEPENDENCY_FAILURE_STATUS else 500
             finalize_end = time.perf_counter()
             with self._lock:
                 session = self._services.get(service_id)
@@ -5159,6 +5257,8 @@ class NodeControlState(NodeRuntimeBase):
                         error_type=(normalized_error_type if status_text != "SUCCEEDED" else ""),
                         error_message=(normalized_error_message if status_text != "SUCCEEDED" else ""),
                     )
+                    if status_text == DEPENDENCY_FAILURE_STATUS:
+                        self._mark_service_dependency_failure_locked(session, reason=normalized_error_message)
             yield self._encode_stream_line(done_event)
 
         return StreamingHttpResponse(status_code=200, body_iter=_iter_stream())
@@ -5749,7 +5849,7 @@ class NodeControlState(NodeRuntimeBase):
                         task.result = None
                         task.error_type = normalized_error_type
                         task.error_message = normalized_error_message
-                    elif status_text == "FAILED_INFRA":
+                    elif status_text in {"FAILED_INFRA", DEPENDENCY_FAILURE_STATUS}:
                         task.status = pb2.TASK_STATUS_FAILED_INFRA
                         task.result = None
                         task.error_type = normalized_error_type
@@ -5783,6 +5883,8 @@ class NodeControlState(NodeRuntimeBase):
                     self._cv.notify_all()
                     if queued_result is not None:
                         result_hook.push(pool_id, queued_result)
+                    if status_text == DEPENDENCY_FAILURE_STATUS:
+                        self._mark_task_pool_dependency_failure_locked(pool, reason=normalized_error_message)
             event_lock_sec = time.perf_counter() - event_lock_started_at
             total_lock_sec += event_lock_sec
             if event_lock_sec >= HEARTBEAT_LOCK_WAIT_LOG_SEC:

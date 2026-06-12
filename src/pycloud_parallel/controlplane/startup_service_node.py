@@ -392,7 +392,7 @@ class StartupServiceNode(NodeControlState):
             text = str(raw or "SUCCEEDED").strip().upper()
             if text in {"SUCCESS", "OK"}:
                 return "SUCCEEDED"
-            if text in {"SUCCEEDED", "FAILED_USER", "FAILED_INFRA"}:
+            if text in {"SUCCEEDED", "FAILED_USER", "FAILED_INFRA", "FAILED_DEPENDENCY"}:
                 return text
             return "SUCCEEDED"
 

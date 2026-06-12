@@ -49,6 +49,16 @@ def test_invoke_error_normalization_is_shared():
     assert error_type == "InfraError"
     assert error_message == "infra failure"
 
+    ok, error_type, error_message = normalize_invoke_error(
+        "FAILED_DEPENDENCY",
+        error_type="",
+        error_message="missing dependency",
+        infra_fallback="infra failure",
+    )
+    assert ok is False
+    assert error_type == "DependencyError"
+    assert error_message == "missing dependency"
+
     ok, error_type, error_message = normalize_invoke_error("SUCCEEDED")
     assert ok is True
     assert error_type == ""

@@ -38,6 +38,8 @@ def classify_service_error(exc: Exception, *, route_failure: bool = False) -> st
     lowered = message.lower()
     if route_failure:
         return ROUTE_UNAVAILABLE
+    if "dependencyerror" in lowered or "failed_dependency" in lowered or "dependency runtime error" in lowered:
+        return REMOTE_INFRA_FAILED
     if "usererror" in lowered or "failed_user" in lowered or "user error" in lowered:
         return REMOTE_USER_FAILED
     if "infraerror" in lowered or "failed_infra" in lowered or "infra failure" in lowered:
@@ -47,7 +49,7 @@ def classify_service_error(exc: Exception, *, route_failure: bool = False) -> st
 
 def classify_task_result_status(status_name: str) -> str:
     normalized = str(status_name or "").strip().upper()
-    if normalized == "FAILED_INFRA":
+    if normalized in {"FAILED_INFRA", "FAILED_DEPENDENCY"}:
         return REMOTE_INFRA_FAILED
     if normalized == "FAILED_USER":
         return REMOTE_USER_FAILED

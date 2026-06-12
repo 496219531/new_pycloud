@@ -67,6 +67,8 @@ def normalize_invoke_error(
     normalized_status = str(status_text or "").strip().upper()
     if normalized_status == "FAILED_USER":
         return False, str(error_type or "UserError"), str(error_message or user_fallback)
+    if normalized_status == "FAILED_DEPENDENCY":
+        return False, str(error_type or "DependencyError"), str(error_message or infra_fallback)
     if normalized_status == "FAILED_INFRA":
         return False, str(error_type or "InfraError"), str(error_message or infra_fallback)
     return True, "", ""

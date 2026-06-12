@@ -51,6 +51,7 @@ from pycloud_parallel.controlplane.serialization import (
     summarize_payload_flow_value,
 )
 from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
+from pycloud_parallel.execution.error_classifier import is_dependency_runtime_error
 from pycloud_parallel.runtime.compat import runtime_mismatch_message_for_current_node
 from pycloud_parallel.runtime.errors import RuntimeMismatchError
 
@@ -1257,6 +1258,20 @@ def _execute_payload_in_subprocess(
                 )
             except Exception as exc:
                 decode_end = time.perf_counter()
+                if is_dependency_runtime_error(exc):
+                    return (
+                        "FAILED_DEPENDENCY",
+                        None,
+                        "DependencyError",
+                        _describe_artifact_error(
+                            exc,
+                            entry_module=entry_module,
+                            entry_callable=entry_callable,
+                            package_format=package_format,
+                            dependency_policy_mode=dependency_policy_mode,
+                        ),
+                        _timings(),
+                    )
                 if _is_user_artifact_error(exc):
                     return (
                         "FAILED_USER",
@@ -1418,11 +1433,11 @@ def _execute_payload_in_subprocess(
                     user_fn_ms = float(timed.get("user_fn_ms", 0.0) or 0.0)
                 else:
                     encode_end = now
-                if isinstance(exc, (ImportError, ModuleNotFoundError)):
+                if is_dependency_runtime_error(exc):
                     return (
-                        "FAILED_USER",
+                        "FAILED_DEPENDENCY",
                         None,
-                        exc.__class__.__name__,
+                        "DependencyError",
                         _describe_user_execution_error(exc, dependency_policy_mode=dependency_policy_mode),
                         _timings(),
                     )

@@ -77,7 +77,12 @@ from pycloud_parallel.execution.deployment_create_helper import (
     run_replica_create_recovery_loop,
     should_retry_replica_create_failures,
 )
-from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
+from pycloud_parallel.execution.error_classifier import (
+    ErrorCategory,
+    classify_error,
+    is_dependency_runtime_error,
+    is_retryable_compensation_failure,
+)
 from pycloud_parallel.execution.scheduler import (
     SchedulerCandidate,
     SchedulerState,
@@ -822,8 +827,10 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
             status = pb2.TASK_STATUS_SUCCEEDED
             if status_text == "FAILED_USER":
                 status = pb2.TASK_STATUS_FAILED_USER
-            elif status_text == "FAILED_INFRA":
+            elif status_text in {"FAILED_INFRA", "FAILED_DEPENDENCY"}:
                 status = pb2.TASK_STATUS_FAILED_INFRA
+                if status_text == "FAILED_DEPENDENCY" and not err_type:
+                    err_type = "DependencyError"
             if isinstance(result, StoredDataArtifact):
                 result = self.data_store.result_ref_from_stored_artifact(result)
             result_kwargs = {
@@ -853,6 +860,16 @@ class _DirectLocalTaskPoolNodeClient(_LocalTaskPoolNodeClient):
                 )[1]
             return pb2.TaskResult(**result_kwargs)
         except Exception as exc:
+            if is_dependency_runtime_error(exc):
+                return pb2.TaskResult(
+                    task_id=task_id,
+                    job_id=job_id,
+                    status=pb2.TASK_STATUS_FAILED_INFRA,
+                    attempt=1,
+                    started_at=dt_to_ts(started_at),
+                    finished_at=dt_to_ts(utc_now()),
+                    error=pb2.TaskError(type="DependencyError", message=str(exc)),
+                )
             return pb2.TaskResult(
                 task_id=task_id,
                 job_id=job_id,
