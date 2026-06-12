@@ -63,6 +63,105 @@ def test_node_registrar_limits_inactive_task_pool_reports():
     assert [item.pool_id for item in limited[3:]] == ["stopped-39", "stopped-38", "stopped-37", "stopped-36", "stopped-35"]
 
 
+def test_node_registrar_registered_heartbeat_runs_in_background(tmp_path, monkeypatch):
+    node_state = NodeControlState(
+        node_id="node-async-registrar",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_async_registrar"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-async-registrar",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.1,
+    )
+    entered = []
+    release = []
+
+    def _slow_heartbeat():
+        entered.append(time.monotonic())
+        while not release:
+            time.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(registrar, "_heartbeat_once", _slow_heartbeat)
+    try:
+        registrar._registered = True  # noqa: SLF001
+        registrar._force_inventory_sync = False  # noqa: SLF001
+        registrar._last_successful_sync_at = time.monotonic()  # noqa: SLF001
+        started = time.monotonic()
+
+        assert registrar._sync_now(sync_heartbeat=False) is True  # noqa: SLF001
+
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.05
+        assert _wait_until(lambda: bool(entered), timeout_sec=1.0, interval_sec=0.01)
+        release.append(True)
+        assert _wait_until(
+            lambda: registrar._heartbeat_future is not None and registrar._heartbeat_future.done(),  # noqa: SLF001
+            timeout_sec=1.0,
+            interval_sec=0.01,
+        )
+        registrar._drain_heartbeat_future()  # noqa: SLF001
+        assert registrar._heartbeat_future is None  # noqa: SLF001
+    finally:
+        registrar.close(mark_lost=False)
+        node_state.close()
+
+
+def test_node_registrar_does_not_stack_pending_background_heartbeats(tmp_path, monkeypatch):
+    node_state = NodeControlState(
+        node_id="node-async-registrar-pending",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_async_registrar_pending"),
+        enable_internal_executor=False,
+        enable_service_session=True,
+        service_http_bind="127.0.0.1:0",
+    )
+    registrar = NodeInfoCenterRegistrar(
+        infocenter_addr="http://127.0.0.1:9",
+        node_id="node-async-registrar-pending",
+        control_addr="127.0.0.1:50061",
+        state=node_state,
+        capacity=1,
+        queue_capacity=4,
+        fallback_heartbeat_sec=1,
+        rpc_timeout_sec=0.1,
+    )
+    calls = []
+    release = []
+
+    def _slow_heartbeat():
+        calls.append(time.monotonic())
+        while not release:
+            time.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(registrar, "_heartbeat_once", _slow_heartbeat)
+    try:
+        registrar._registered = True  # noqa: SLF001
+        registrar._force_inventory_sync = False  # noqa: SLF001
+        registrar._last_successful_sync_at = time.monotonic()  # noqa: SLF001
+
+        assert registrar._sync_now(sync_heartbeat=False) is True  # noqa: SLF001
+        assert registrar._sync_now(sync_heartbeat=False) is False  # noqa: SLF001
+        assert _wait_until(lambda: len(calls) == 1, timeout_sec=1.0, interval_sec=0.01)
+        assert len(calls) == 1
+    finally:
+        release.append(True)
+        registrar.close(mark_lost=False)
+        node_state.close()
+
+
 def test_node_registrar_syncs_service_routes(tmp_path):
     info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
     info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
@@ -1290,7 +1389,7 @@ def test_infocenter_http_accepts_new_instance_when_control_addr_serves_old_insta
             )
 
         assert second["accepted"] is True
-        assert second["reset_required"] is False
+        assert "reset_required" not in second
         nodes = info_state.list_nodes(healthy_only=True, tags=["compute"], limit=20)
         assert [node.node_instance_id for node in nodes] == ["node-same-port-new"]
     finally:
@@ -2649,7 +2748,7 @@ def test_infocenter_accepts_same_control_addr_when_status_probe_unconfirmed(monk
             )
 
         assert second["accepted"] is True
-        assert second["reset_required"] is False
+        assert "reset_required" not in second
         assert "retryable" not in second
         assert "error" not in second
         nodes = info_state.list_nodes(healthy_only=False, tags=[], limit=20)

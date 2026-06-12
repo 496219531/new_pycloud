@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import uuid
+from concurrent.futures import Future
 from typing import Callable, Dict, Iterable, Optional
 from importlib import metadata as importlib_metadata
 from urllib.error import URLError
@@ -178,6 +179,9 @@ class NodeInfoCenterRegistrar:
         self._sync_lock = threading.RLock()
         self._closing = False
         self._state_closed_after_lost = False
+        self._heartbeat_future: Optional[Future] = None
+        self._heartbeat_future_started_at = 0.0
+        self._heartbeat_future_reported_at = 0.0
 
     @staticmethod
     def _pycloud_version() -> str:
@@ -194,14 +198,13 @@ class NodeInfoCenterRegistrar:
         self._thread.start()
 
     def close(self, *, mark_lost: bool = True) -> None:
-        if self._closing:
-            return
-        self._closing = True
-        try:
-            if bool(mark_lost):
+        should_mark_lost = bool(mark_lost) and not self._closing
+        if should_mark_lost:
+            self._closing = True
+            try:
                 self._mark_lost_before_close()
-        finally:
-            self._closing = False
+            finally:
+                self._closing = False
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
@@ -256,77 +259,137 @@ class NodeInfoCenterRegistrar:
                 self._registered = False
 
     def sync_now(self) -> bool:
+        return self._sync_now(sync_heartbeat=True)
+
+    def _sync_now(self, *, sync_heartbeat: bool = True) -> bool:
         if not self._sync_lock.acquire(blocking=False):
             return False
         try:
             was_registered = bool(self._registered)
             should_register = not was_registered
+            force_inventory = bool(self._force_inventory_sync)
         finally:
             self._sync_lock.release()
+        self._drain_heartbeat_future()
+        if was_registered and not should_register and not force_inventory and not sync_heartbeat:
+            return self._submit_heartbeat_async()
         try:
             ok = self._register_once() if should_register else self._heartbeat_once()
             if ok:
                 self._state_closed_after_lost = False
             return ok
         except Exception as exc:
-            if was_registered and _is_unknown_node_error(exc):
-                logger.warning(
-                    "[Registrar] node heartbeat target missing; re-registering node_id=%s node_instance_id=%s "
-                    "infocenter=%s control_addr=%s error=%s",
-                    self.node_id,
-                    self.node_instance_id,
-                    self.infocenter_addr,
-                    self.control_addr or "-",
-                    _error_summary(exc),
-                )
-                with self._sync_lock:
-                    self._registered = False
-                try:
-                    ok = self._register_once()
-                    if ok:
-                        self._state_closed_after_lost = False
-                    return ok
-                except Exception as register_exc:
-                    if _is_expected_connect_failure(register_exc):
-                        logger.warning(
-                            "[Registrar] node re-register after missing heartbeat target deferred "
-                            "node_id=%s node_instance_id=%s error=%s",
-                            self.node_id,
-                            self.node_instance_id,
-                            _error_summary(register_exc),
-                        )
-                        logger.debug("[Registrar] node re-register traceback", exc_info=True)
-                    else:
-                        logger.exception(
-                            "[Registrar] node re-register after missing heartbeat target failed "
-                            "node_id=%s node_instance_id=%s",
-                            self.node_id,
-                            self.node_instance_id,
-                        )
-                    if _is_expected_connect_failure(register_exc):
-                        self._mark_registration_stale_if_lease_expired("infocenter re-register lease expired")
-                    return False
-            if _is_expected_connect_failure(exc):
-                logger.warning(
-                    "[Registrar] node sync deferred node_id=%s node_instance_id=%s should_register=%s error=%s",
-                    self.node_id,
-                    self.node_instance_id,
-                    should_register,
-                    _error_summary(exc),
-                )
-                logger.debug("[Registrar] node sync traceback", exc_info=True)
-            else:
-                logger.exception(
-                    "[Registrar] node sync failed node_id=%s node_instance_id=%s should_register=%s",
-                    self.node_id,
-                    self.node_instance_id,
-                    should_register,
-                )
+            return self._handle_sync_exception(exc, was_registered=was_registered, should_register=should_register)
+
+    def _handle_sync_exception(self, exc: BaseException, *, was_registered: bool, should_register: bool) -> bool:
+        if was_registered and _is_unknown_node_error(exc):
+            logger.warning(
+                "[Registrar] node heartbeat target missing; re-registering node_id=%s node_instance_id=%s "
+                "infocenter=%s control_addr=%s error=%s",
+                self.node_id,
+                self.node_instance_id,
+                self.infocenter_addr,
+                self.control_addr or "-",
+                _error_summary(exc),
+            )
             with self._sync_lock:
                 self._registered = False
-            if _is_expected_connect_failure(exc):
-                self._mark_registration_stale_if_lease_expired("infocenter heartbeat lease expired")
+            try:
+                ok = self._register_once()
+                if ok:
+                    self._state_closed_after_lost = False
+                return ok
+            except Exception as register_exc:
+                if _is_expected_connect_failure(register_exc):
+                    logger.warning(
+                        "[Registrar] node re-register after missing heartbeat target deferred "
+                        "node_id=%s node_instance_id=%s error=%s",
+                        self.node_id,
+                        self.node_instance_id,
+                        _error_summary(register_exc),
+                    )
+                    logger.debug("[Registrar] node re-register traceback", exc_info=True)
+                else:
+                    logger.exception(
+                        "[Registrar] node re-register after missing heartbeat target failed "
+                        "node_id=%s node_instance_id=%s",
+                        self.node_id,
+                        self.node_instance_id,
+                    )
+                if _is_expected_connect_failure(register_exc):
+                    self._mark_registration_stale_if_lease_expired("infocenter re-register lease expired")
+                return False
+        if _is_expected_connect_failure(exc):
+            logger.warning(
+                "[Registrar] node sync deferred node_id=%s node_instance_id=%s should_register=%s error=%s",
+                self.node_id,
+                self.node_instance_id,
+                should_register,
+                _error_summary(exc),
+            )
+            logger.debug("[Registrar] node sync traceback", exc_info=True)
+        else:
+            logger.exception(
+                "[Registrar] node sync failed node_id=%s node_instance_id=%s should_register=%s",
+                self.node_id,
+                self.node_instance_id,
+                should_register,
+            )
+        with self._sync_lock:
+            self._registered = False
+        if _is_expected_connect_failure(exc):
+            self._mark_registration_stale_if_lease_expired("infocenter heartbeat lease expired")
+        return False
+
+    def _drain_heartbeat_future(self) -> None:
+        future = self._heartbeat_future
+        if future is None:
+            return
+        now = time.monotonic()
+        if not future.done():
+            elapsed_sec = max(0.0, now - float(self._heartbeat_future_started_at or now))
+            report_after = max(0.1, float(self.rpc_timeout_sec or 0.1))
+            if elapsed_sec >= report_after and now - float(self._heartbeat_future_reported_at or 0.0) >= report_after:
+                self._heartbeat_future_reported_at = now
+                logger.warning(
+                    "[Registrar] infocenter heartbeat pending node_id=%s node_instance_id=%s "
+                    "elapsed_sec=%.3f rpc_timeout_sec=%.3f",
+                    self.node_id,
+                    self.node_instance_id,
+                    elapsed_sec,
+                    self.rpc_timeout_sec,
+                )
+                self._mark_registration_stale_if_lease_expired("infocenter heartbeat pending")
+            return
+        self._heartbeat_future = None
+        self._heartbeat_future_started_at = 0.0
+        self._heartbeat_future_reported_at = 0.0
+        try:
+            ok = bool(future.result())
+            if ok:
+                self._state_closed_after_lost = False
+        except Exception as exc:
+            self._handle_sync_exception(exc, was_registered=True, should_register=False)
+
+    def _submit_heartbeat_async(self) -> bool:
+        self._drain_heartbeat_future()
+        if self._heartbeat_future is not None and not self._heartbeat_future.done():
             return False
+        self._heartbeat_future_started_at = time.monotonic()
+        self._heartbeat_future_reported_at = 0.0
+        future: Future = Future()
+        self._heartbeat_future = future
+
+        def _run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(self._heartbeat_once())
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        threading.Thread(target=_run, name=f"node-registrar-hb-{self.node_id}", daemon=True).start()
+        return True
 
     def request_sync(self) -> None:
         with self._sync_lock:
@@ -342,7 +405,7 @@ class NodeInfoCenterRegistrar:
         with self._sync_lock:
             self._registered = False
         logger.warning(
-            "[Registrar] registry fence advisory ignored node_id=%s node_instance_id=%s reason=%s",
+            "[Registrar] registry advisory ignored node_id=%s node_instance_id=%s reason=%s",
             self.node_id,
             self.node_instance_id,
             str(reason or "node_instance_id fenced"),
@@ -482,7 +545,7 @@ class NodeInfoCenterRegistrar:
             if bool(resp.get("reset_required", False)):
                 reason = str(resp.get("reason", resp.get("error", "")) or "node_instance_id fenced")
                 logger.warning(
-                    "[Registrar] node register reset advisory ignored node_id=%s node_instance_id=%s "
+                    "[Registrar] node register registry advisory ignored node_id=%s node_instance_id=%s "
                     "infocenter=%s control_addr=%s reason=%s response=%s",
                     self.node_id,
                     self.node_instance_id,
@@ -596,7 +659,7 @@ class NodeInfoCenterRegistrar:
                 logger.warning(
                     "[Registrar] node heartbeat advisory rejected by infocenter; keeping local runtime alive "
                     "node_id=%s node_instance_id=%s "
-                    "infocenter=%s control_addr=%s reset_required=%s reason=%s response=%s",
+                    "infocenter=%s control_addr=%s advisory_reset_required=%s reason=%s response=%s",
                     self.node_id,
                     self.node_instance_id,
                     self.infocenter_addr,
@@ -619,7 +682,7 @@ class NodeInfoCenterRegistrar:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            self.sync_now()
+            self._sync_now(sync_heartbeat=False)
             with self._sync_lock:
                 wait_sec = self._next_hb_sec if self._registered else self.fallback_heartbeat_sec
             self._wake_event.wait(max(1, int(wait_sec)))

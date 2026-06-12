@@ -1635,7 +1635,6 @@ class InfoCenterHttpServer:
                         {
                             "ok": True,
                             "accepted": True,
-                            "reset_required": False,
                             "heartbeat_interval_sec": state.heartbeat_interval_sec,
                             "lease_ttl_sec": state.lease_ttl_sec,
                             "node": _serialize_node(node),

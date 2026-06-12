@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 from pycloud_parallel.data.ref import DataRef, coerce_data_ref
 from pycloud_parallel.controlplane.infocenter.models import (
     DataRegistryEntry,
-    FencedNodeInstance,
     NodeMetricsState,
     NodeCapability,
     NodeProfile,
@@ -101,7 +100,6 @@ class InfoCenterState:
         self._profiles: Dict[str, NodeProfile] = {}
         self._profiles_path = Path(profiles_path).expanduser().resolve() if profiles_path else None
         self._data_refs: Dict[str, DataRegistryEntry] = {}
-        self._fenced_instances: Dict[str, FencedNodeInstance] = {}
         self._load_profiles()
 
     def _node_is_stale_locked(self, state: NodeState, *, now: Optional[datetime] = None) -> bool:
@@ -381,6 +379,11 @@ class InfoCenterState:
         now: Optional[datetime] = None,
         reason: str = "",
     ) -> None:
+        """Deprecated compatibility hook.
+
+        InfoCenter is registry-only and must not issue NodeControl reset/exit
+        directives. Lost/replaced instances are represented by discovery state.
+        """
         del state, now, reason
         return
 
@@ -476,7 +479,6 @@ class InfoCenterState:
             old_state = self._nodes.pop(key, None)
             if old_state is not None:
                 self._remove_node_services_index_locked(old_state)
-                self._fence_instance_locked(old_state, reason="node control_addr replaced")
 
     def control_addr_conflicting_instances(
         self,
