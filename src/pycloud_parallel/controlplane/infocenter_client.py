@@ -517,19 +517,19 @@ class InfoCenterClient:
             "node_instance_id": str(node_instance_id or "").strip(),
             "healthy": bool(healthy),
             "metrics": dict(metrics or {}),
-            "metadata": dict(metadata or {}),
             "inventory_included": bool(inventory_included),
-            "python_version": str(python_version or "").strip(),
-            "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
-            "service_worker_used": max(0, int(service_worker_used or 0)),
-            "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
-            "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
-            "accept_service_deploy": bool(accept_service_deploy),
-            "capability": (capability or NodeCapability()).to_dict(),
         }
         if bool(inventory_included):
             payload.update(
                 {
+                    "metadata": dict(metadata or {}),
+                    "python_version": str(python_version or "").strip(),
+                    "service_worker_capacity": max(0, int(service_worker_capacity or 0)),
+                    "service_worker_used": max(0, int(service_worker_used or 0)),
+                    "task_pool_worker_capacity": max(0, int(task_pool_worker_capacity or 0)),
+                    "task_pool_worker_used": max(0, int(task_pool_worker_used or 0)),
+                    "accept_service_deploy": bool(accept_service_deploy),
+                    "capability": (capability or NodeCapability()).to_dict(),
                     "services": serialized_services,
                     "task_pools": list(task_pools or []),
                     "active_runtimes": [str(x).strip() for x in (active_runtimes or []) if str(x).strip()],

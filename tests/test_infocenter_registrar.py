@@ -21,7 +21,7 @@ from pycloud_parallel.controlplane.infocenter_http import (
     _reorder_job_via_http,
     _serialize_node,
 )
-from pycloud_parallel.controlplane.infocenter.models import NodeServiceState, NodeState, NodeTaskPoolInfo
+from pycloud_parallel.controlplane.infocenter.models import NodeMetricsState, NodeServiceState, NodeState, NodeTaskPoolInfo
 from pycloud_parallel.controlplane.node_control_http import NodeControlHttpServer
 from pycloud_parallel.controlplane.registrar import NodeInfoCenterRegistrar
 from pycloud_parallel.controlplane.runtime_spec import matches_python_runtime, normalize_python_runtime_spec
@@ -525,6 +525,175 @@ def test_ops_snapshot_content_key_ignores_lightweight_heartbeat():
 
     assert before["content_key"] == after_heartbeat["content_key"]
     assert before["fragments"]["ops-services-body"] != after_heartbeat["fragments"]["ops-services-body"]
+
+
+def test_lightweight_node_heartbeat_preserves_resource_inventory():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-light-inventory-inst",
+        node_id="node-light-inventory",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        metadata={"deploy_health_reason": "executor warming"},
+        service_worker_capacity=8,
+        service_worker_used=2,
+        task_pool_worker_capacity=6,
+        task_pool_worker_used=1,
+        services={
+            "svc-light-inventory": NodeServiceState(
+                service_name="svc-light-inventory",
+                service_id="svc-light-inventory",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                resource_health="running",
+                readiness="ready",
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                lease_expire_at=datetime(2026, 6, 1, 8, 0, 30, tzinfo=timezone.utc),
+                http_base_url="http://127.0.0.1:18081/svc/svc-light-inventory",
+            )
+        },
+    )
+    before = _render_ops_snapshot(info_state)
+
+    info_state.heartbeat_record(
+        node_instance_id="node-light-inventory-inst",
+        node_id="node-light-inventory",
+        healthy=True,
+        metrics=NodeMetricsState(queued=0, inflight=0, running=0, credit=32),
+        metadata={"deploy_health_reason": "executor warming"},
+        services=None,
+        task_pools=None,
+        active_runtimes=None,
+        service_worker_capacity=0,
+        service_worker_used=0,
+        task_pool_worker_capacity=0,
+        task_pool_worker_used=0,
+        accept_service_deploy=None,
+    )
+    after = _render_ops_snapshot(info_state)
+
+    node = info_state.list_nodes(healthy_only=False, tags=[], limit=10)[0]
+    assert "svc-light-inventory" in node.services
+    svc = node.services["svc-light-inventory"]
+    assert svc.service_name == "svc-light-inventory"
+    assert svc.resource_health == "running"
+    assert svc.readiness == "ready"
+    assert svc.worker_count == 2
+    assert svc.alive_workers == 2
+    assert svc.http_base_url == "http://127.0.0.1:18081/svc/svc-light-inventory"
+    assert node.metadata.get("deploy_health_reason") == "executor warming"
+    assert node.service_worker_capacity == 8
+    assert node.service_worker_used == 2
+    assert node.task_pool_worker_capacity == 6
+    assert node.task_pool_worker_used == 1
+    assert node.accept_service_deploy is True
+    assert before["content_key"] == after["content_key"]
+    assert "svc-light-inventory" in after["fragments"]["ops-services-body"]
+
+
+def test_legacy_empty_proto_node_heartbeat_preserves_resource_inventory():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_state.register_node_record(
+        node_instance_id="node-proto-light-inst",
+        node_id="node-proto-light",
+        control_addr="127.0.0.1:50061",
+        capacity=4,
+        queue_capacity=32,
+        tags=["compute"],
+        services={
+            "svc-proto-light": NodeServiceState(
+                service_name="svc-proto-light",
+                service_id="svc-proto-light",
+                status=pb2.SERVICE_STATUS_RUNNING,
+                worker_count=2,
+                alive_workers=2,
+                in_flight=1,
+                http_base_url="http://127.0.0.1:18081/svc/svc-proto-light",
+            )
+        },
+    )
+
+    request = pb2.HeartbeatNodeRequest(
+        node_id="node-proto-light",
+        node_instance_id="node-proto-light-inst",
+        healthy=True,
+    )
+    info_state.heartbeat(request)
+
+    node = info_state.list_nodes(healthy_only=False, tags=[], limit=10)[0]
+    assert "svc-proto-light" in node.services
+    assert node.services["svc-proto-light"].http_base_url == "http://127.0.0.1:18081/svc/svc-proto-light"
+
+
+def test_infocenter_client_lightweight_heartbeat_preserves_inventory_fields():
+    info_state = InfoCenterState(lease_ttl_sec=20, heartbeat_interval_sec=1)
+    info_server = InfoCenterHttpServer(bind="127.0.0.1:0", state=info_state)
+    info_server.start()
+    info_target = info_server.base_url
+
+    try:
+        with InfoCenterClient(info_target, timeout_sec=5.0) as client:
+            client.register_node(
+                node_id="node-http-light",
+                node_instance_id="node-http-light-inst",
+                control_addr="127.0.0.1:50061",
+                capacity=4,
+                queue_capacity=32,
+                tags=["compute"],
+                metadata={"deploy_health_reason": "executor warming"},
+                services=[
+                    SimpleNamespace(
+                        service_name="svc-http-light",
+                        service_id="svc-http-light",
+                        status=pb2.SERVICE_STATUS_RUNNING,
+                        resource_health="running",
+                        readiness="ready",
+                        worker_count=2,
+                        alive_workers=2,
+                        in_flight=1,
+                        http_base_url="http://127.0.0.1:18081/svc/svc-http-light",
+                    )
+                ],
+                service_worker_capacity=8,
+                service_worker_used=2,
+                task_pool_worker_capacity=6,
+                task_pool_worker_used=1,
+                accept_service_deploy=False,
+            )
+
+            client.heartbeat_node(
+                node_id="node-http-light",
+                node_instance_id="node-http-light-inst",
+                healthy=True,
+                metrics={"queued": 0, "inflight": 0, "running": 0, "credit": 32},
+                metadata={},
+                services=[],
+                task_pools=[],
+                service_worker_capacity=0,
+                service_worker_used=0,
+                task_pool_worker_capacity=0,
+                task_pool_worker_used=0,
+                accept_service_deploy=True,
+                inventory_included=False,
+            )
+
+        node = info_state.list_nodes(healthy_only=False, tags=[], limit=10)[0]
+        assert node.metadata.get("deploy_health_reason") == "executor warming"
+        assert node.service_worker_capacity == 8
+        assert node.service_worker_used == 2
+        assert node.task_pool_worker_capacity == 6
+        assert node.task_pool_worker_used == 1
+        assert node.accept_service_deploy is False
+        assert "svc-http-light" in node.services
+        svc = node.services["svc-http-light"]
+        assert svc.readiness == "ready"
+        assert svc.resource_health == "running"
+        assert svc.http_base_url == "http://127.0.0.1:18081/svc/svc-http-light"
+    finally:
+        info_server.stop()
 
 
 def test_ops_snapshot_content_key_changes_for_resource_state_change():

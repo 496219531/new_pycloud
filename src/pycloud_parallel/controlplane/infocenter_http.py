@@ -1664,7 +1664,7 @@ class InfoCenterHttpServer:
                             cpu_percent=float(metrics_raw.get("cpu_percent", 0.0) or 0.0),
                             mem_percent=float(metrics_raw.get("mem_percent", 0.0) or 0.0),
                         ),
-                        metadata=dict(payload.get("metadata") or {}),
+                        metadata=dict(payload.get("metadata") or {}) if inventory_included else None,
                         services=_parse_services(payload.get("services")) if inventory_included else None,
                         task_pools=_parse_task_pools(payload.get("task_pools")) if inventory_included else None,
                         python_version=str(payload.get("python_version", "") or ""),
@@ -1673,15 +1673,27 @@ class InfoCenterHttpServer:
                             if inventory_included
                             else None
                         ),
-                        service_worker_capacity=max(0, int(payload.get("service_worker_capacity", 0) or 0)),
-                        service_worker_used=max(0, int(payload.get("service_worker_used", 0) or 0)),
-                        task_pool_worker_capacity=max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)),
-                        task_pool_worker_used=max(0, int(payload.get("task_pool_worker_used", 0) or 0)),
-                        accept_service_deploy=_coerce_bool(
-                            payload.get("accept_service_deploy", (payload.get("metadata") or {}).get("accept_service_deploy")),
-                            default=True,
+                        service_worker_capacity=(
+                            max(0, int(payload.get("service_worker_capacity", 0) or 0)) if inventory_included else 0
                         ),
-                        capability=_parse_node_capability(payload.get("capability")),
+                        service_worker_used=(
+                            max(0, int(payload.get("service_worker_used", 0) or 0)) if inventory_included else 0
+                        ),
+                        task_pool_worker_capacity=(
+                            max(0, int(payload.get("task_pool_worker_capacity", 0) or 0)) if inventory_included else 0
+                        ),
+                        task_pool_worker_used=(
+                            max(0, int(payload.get("task_pool_worker_used", 0) or 0)) if inventory_included else 0
+                        ),
+                        accept_service_deploy=(
+                            _coerce_bool(
+                                payload.get("accept_service_deploy", (payload.get("metadata") or {}).get("accept_service_deploy")),
+                                default=True,
+                            )
+                            if inventory_included
+                            else None
+                        ),
+                        capability=_parse_node_capability(payload.get("capability")) if inventory_included else None,
                     )
                     if node is None:
                         self._send_json(400, {"ok": False, "accepted": False, "error": "node identity is required"})

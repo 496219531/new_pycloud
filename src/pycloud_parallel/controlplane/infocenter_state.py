@@ -942,24 +942,25 @@ class InfoCenterState:
                 state.python_version = str(python_version).strip()
             if active_runtimes is not None:
                 state.active_runtimes = [str(x).strip() for x in active_runtimes if str(x).strip()]
-            if service_worker_capacity > 0:
-                state.service_worker_capacity = max(0, int(service_worker_capacity))
-            state.service_worker_used = max(
-                0,
-                min(
-                    int(service_worker_used or 0),
-                    state.service_worker_capacity or int(service_worker_used or 0),
-                ),
-            )
-            if task_pool_worker_capacity > 0:
-                state.task_pool_worker_capacity = max(0, int(task_pool_worker_capacity))
-            state.task_pool_worker_used = max(
-                0,
-                min(
-                    int(task_pool_worker_used or 0),
-                    state.task_pool_worker_capacity or int(task_pool_worker_used or 0),
-                ),
-            )
+            if inventory_updated:
+                if service_worker_capacity > 0:
+                    state.service_worker_capacity = max(0, int(service_worker_capacity))
+                state.service_worker_used = max(
+                    0,
+                    min(
+                        int(service_worker_used or 0),
+                        state.service_worker_capacity or int(service_worker_used or 0),
+                    ),
+                )
+                if task_pool_worker_capacity > 0:
+                    state.task_pool_worker_capacity = max(0, int(task_pool_worker_capacity))
+                state.task_pool_worker_used = max(
+                    0,
+                    min(
+                        int(task_pool_worker_used or 0),
+                        state.task_pool_worker_capacity or int(task_pool_worker_used or 0),
+                    ),
+                )
             if accept_service_deploy is not None:
                 state.accept_service_deploy = bool(accept_service_deploy)
             if capability is not None:
@@ -970,6 +971,10 @@ class InfoCenterState:
             return state
 
     def heartbeat(self, request: pb2.HeartbeatNodeRequest) -> Optional[NodeState]:
+        # Legacy protobuf heartbeats have no explicit inventory_included flag.
+        # Treat an empty services list as a lightweight lease heartbeat so an
+        # older/lightweight node heartbeat cannot wipe the last full inventory.
+        services = self._parse_services(request.services) if len(request.services) > 0 else None
         return self.heartbeat_record(
             node_instance_id=getattr(request, "node_instance_id", "") or request.node_id,
             node_id=request.node_id,
@@ -982,7 +987,7 @@ class InfoCenterState:
                 cpu_percent=float(request.metrics.cpu_percent),
                 mem_percent=float(request.metrics.mem_percent),
             ),
-            services=self._parse_services(request.services),
+            services=services,
             capability=NodeCapability.from_dict(getattr(request, "capability", None) and {
                 "supported_modes": list(getattr(request.capability, "supported_modes", []) or []),
                 "supports_raw_bytes_payload": bool(
