@@ -72,6 +72,8 @@ class NativeTaskPoolClient:
     node_instance_id: str = ""
     node_id: str = ""
     status: str = "RUNNING"
+    readiness: str = "ready"
+    signal_cursor: int = 0
     created_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
     lease_expire_at: Optional[datetime] = None
@@ -214,6 +216,15 @@ class NativeTaskPoolClient:
         self.lease_expire_at = _timestamp_to_datetime(info.lease_expire_at)
         return info
 
+    def get_progress(self) -> Dict[str, object]:
+        getter = getattr(self._client, "get_task_pool_progress", None)
+        if not callable(getter):
+            return {}
+        data = getter(pool_id=self.pool_id)
+        self.readiness = str(data.get("readiness", self.readiness) or "")
+        self.signal_cursor = int(data.get("latest_signal_seq", self.signal_cursor) or 0)
+        return data
+
     def update_globals_prepared(
         self,
         prepared_values: Dict[str, object],
@@ -253,6 +264,8 @@ class ServiceSessionClient:
     idle_ttl_sec: int = 0
     node_instance_id: str = ""
     node_id: str = ""
+    readiness: str = "ready"
+    signal_cursor: int = 0
     created_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
     lease_expire_at: Optional[datetime] = None
@@ -369,6 +382,15 @@ class ServiceSessionClient:
         self.lease_expire_at = _timestamp_to_datetime(info.lease_expire_at)
         self.status = info.status
         return info
+
+    def get_progress(self) -> Dict[str, object]:
+        getter = getattr(self._client, "get_service_progress", None)
+        if not callable(getter):
+            return {}
+        data = getter(service_id=self.service_id)
+        self.readiness = str(data.get("readiness", self.readiness) or "")
+        self.signal_cursor = int(data.get("latest_signal_seq", self.signal_cursor) or 0)
+        return data
 
     def list_methods(self, *, include_docs: bool = False) -> Sequence[pb2.ServiceMethodInfo]:
         return self._client.list_service_methods(service_id=self.service_id, include_docs=include_docs)

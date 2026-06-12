@@ -141,6 +141,10 @@ def build_service_status_info(session: ServiceSession, *, in_flight: int) -> Dic
         "lease_expire_at": lease_expire_at,
         "stop_reason": str(session.stop_reason or ""),
         "failure_at": getattr(session, "failure_at", None),
+        "readiness": str(getattr(session, "readiness", "") or ""),
+        "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(session, "create_stage", "") or ""),
+        "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
         "http_base_url": session.http_base_url,
         "methods": sorted(session.methods.keys()),
         "timing_metrics": dict(session.timing_metrics or {}),
@@ -191,6 +195,10 @@ def build_service_report_payload(session: ServiceSession, *, in_flight: int) -> 
         "http_base_url": session.http_base_url,
         "stop_reason": str(session.stop_reason or ""),
         "degraded": bool(getattr(session, "degraded", False)),
+        "readiness": str(getattr(session, "readiness", "") or ""),
+        "readiness_reason": str(getattr(session, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(session, "create_stage", "") or ""),
+        "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
     }
 
 
@@ -221,6 +229,10 @@ def build_task_pool_info(pool: TaskPoolState, *, in_flight: int) -> NodeTaskPool
         stop_reason=stop_reason,
         failure_reason=stop_reason,
         failure_at=getattr(pool, "failure_at", None),
+        readiness=str(getattr(pool, "readiness", "") or ""),
+        readiness_reason=str(getattr(pool, "readiness_reason", "") or ""),
+        create_stage=str(getattr(pool, "create_stage", "") or ""),
+        signal_cursor=int(getattr(pool, "signal_cursor", 0) or 0),
     )
 
 
@@ -250,6 +262,10 @@ def build_task_pool_status_info(pool: TaskPoolState, *, in_flight: int) -> Dict[
         "stop_reason": str(pool.stop_reason or ""),
         "failure_reason": str(pool.stop_reason or ""),
         "failure_at": getattr(pool, "failure_at", None),
+        "readiness": str(getattr(pool, "readiness", "") or ""),
+        "readiness_reason": str(getattr(pool, "readiness_reason", "") or ""),
+        "create_stage": str(getattr(pool, "create_stage", "") or ""),
+        "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
     }
 
 

@@ -147,6 +147,12 @@ from pycloud_parallel.controlplane.serialization import (
 )
 from pycloud_parallel.controlplane.serialization_mode import PICKLE_SERIALIZATION_MODES
 from pycloud_parallel.controlplane.state_time import dt_to_ts, utc_now
+from pycloud_parallel.controlplane.resource_signals import (
+    ResourceOperation,
+    ResourceSignal,
+    ResourceSignalStore,
+    signals_to_dicts,
+)
 from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 from pycloud_parallel.runtime.errors import normalize_invoke_error
 
@@ -317,6 +323,8 @@ class NodeControlState(NodeRuntimeBase):
         self._task_pools: Dict[str, TaskPoolState] = {}
         self._service_create_requests: Dict[str, _CreateRequestRecord] = {}
         self._task_pool_create_requests: Dict[str, _CreateRequestRecord] = {}
+        self._resource_signals = ResourceSignalStore(maxlen=2000)
+        self._resource_operation_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nodecontrol-resource-op")
         self._execution_fenced = False
         self._execution_fenced_reason = ""
         self._execution_fenced_at: Optional[datetime] = None
@@ -559,6 +567,7 @@ class NodeControlState(NodeRuntimeBase):
         self.stop_service_gateway()
         self._shutdown_all_services()
         self._shutdown_all_task_pools()
+        self._resource_operation_executor.shutdown(wait=False, cancel_futures=True)
         self._cleanup_executor.shutdown(wait=False, cancel_futures=True)
         if self._executor_host is not None:
             self._executor_host.close(shutdown_timeout_sec=NODECONTROL_SHUTDOWN_EXECUTOR_TIMEOUT_SEC)
@@ -776,6 +785,8 @@ class NodeControlState(NodeRuntimeBase):
         pool.alive_workers = 0
         if hasattr(pool, "degraded"):
             pool.degraded = False
+        pool.readiness = "stopped"
+        pool.readiness_reason = str(reason or "owner requested").strip() or "owner requested"
         pool.status = "STOPPED"
         pool.stop_reason = str(reason or "owner requested").strip() or "owner requested"
         stopped_at = utc_now()
@@ -784,6 +795,13 @@ class NodeControlState(NodeRuntimeBase):
         self._fail_task_pool_tasks_locked(pool, reason=pool.stop_reason, now=stopped_at)
         self._task_pool_zero_alive_counts.pop(str(pool.pool_id or ""), None)
         self._drop_create_requests_for_resource_locked(kind="task_pool", resource_id=pool.pool_id)
+        self._publish_resource_signal_locked(
+            resource_kind="task_pool",
+            resource_id=pool.pool_id,
+            signal_type="stop" if pool.stop_reason != "owner heartbeat timeout" else "failure",
+            state="stopped",
+            reason=pool.stop_reason,
+        )
         if stop_executor is not None and async_stop:
             executor_host, pool_id = stop_executor
             self._submit_stop_task_pool(executor_host, pool_id=pool_id, reason=pool.stop_reason)
@@ -1165,6 +1183,184 @@ class NodeControlState(NodeRuntimeBase):
                 (),
             )
         )
+
+    def _publish_resource_signal_locked(
+        self,
+        *,
+        resource_kind: str,
+        resource_id: str,
+        signal_type: str,
+        state: str = "",
+        reason: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        epoch: int = 0,
+        op_id: str = "",
+        op_type: str = "",
+        op_status: str = "",
+    ) -> int:
+        kind = str(resource_kind or "").strip()
+        rid = str(resource_id or "").strip()
+        normalized_payload = dict(payload or {})
+        seq = self._resource_signals.publish(
+            ResourceSignal(
+                node_instance_id=str(self.node_instance_id or ""),
+                resource_kind=kind,
+                resource_id=rid,
+                epoch=int(epoch or 0),
+                signal_type=str(signal_type or "").strip(),
+                state=str(state or "").strip(),
+                reason=str(reason or "").strip(),
+                payload=normalized_payload,
+            )
+        )
+        resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
+        if resource is not None:
+            resource.signal_cursor = seq
+        if op_id:
+            self._resource_signals.upsert_operation(
+                ResourceOperation(
+                    op_id=str(op_id or ""),
+                    op_type=str(op_type or ""),
+                    resource_kind=kind,
+                    resource_id=rid,
+                    status=str(op_status or state or ""),
+                    stage=str(normalized_payload.get("stage") or ""),
+                    last_signal_seq=seq,
+                    error=str(reason or "") if str(op_status or state or "") == "failed" else "",
+                )
+            )
+        return seq
+
+    def _publish_resource_progress_locked(
+        self,
+        *,
+        resource_kind: str,
+        resource_id: str,
+        stage: str,
+        state: str = "running",
+        reason: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        op_id: str = "",
+        op_type: str = "",
+        op_status: str = "running",
+    ) -> int:
+        kind = str(resource_kind or "").strip()
+        rid = str(resource_id or "").strip()
+        normalized_stage = str(stage or "").strip()
+        resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
+        if resource is not None:
+            resource.create_stage = normalized_stage
+        seq = self._publish_resource_signal_locked(
+            resource_kind=kind,
+            resource_id=rid,
+            signal_type="progress",
+            state=state,
+            reason=reason,
+            payload={"stage": normalized_stage, **dict(payload or {})},
+        )
+        if op_id:
+            self._resource_signals.upsert_operation(
+                ResourceOperation(
+                    op_id=str(op_id or ""),
+                    op_type=str(op_type or ""),
+                    resource_kind=kind,
+                    resource_id=rid,
+                    status=str(op_status or ""),
+                    stage=normalized_stage,
+                    last_signal_seq=seq,
+                )
+            )
+        return seq
+
+    def _publish_resource_readiness_locked(
+        self,
+        *,
+        resource_kind: str,
+        resource_id: str,
+        readiness: str,
+        reason: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        kind = str(resource_kind or "").strip()
+        rid = str(resource_id or "").strip()
+        normalized_readiness = str(readiness or "").strip() or "initializing"
+        resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
+        if resource is not None:
+            resource.readiness = normalized_readiness
+            resource.readiness_reason = str(reason or "").strip()
+        return self._publish_resource_signal_locked(
+            resource_kind=kind,
+            resource_id=rid,
+            signal_type="readiness",
+            state=normalized_readiness,
+            reason=reason,
+            payload=payload,
+        )
+
+    def _publish_resource_failure_locked(
+        self,
+        *,
+        resource_kind: str,
+        resource_id: str,
+        reason: str,
+        stage: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        op_id: str = "",
+        op_type: str = "create",
+    ) -> int:
+        kind = str(resource_kind or "").strip()
+        rid = str(resource_id or "").strip()
+        normalized_stage = str(stage or "").strip()
+        resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
+        if resource is not None:
+            resource.readiness = "failed"
+            resource.readiness_reason = str(reason or "").strip()
+            if normalized_stage:
+                resource.create_stage = normalized_stage
+        return self._publish_resource_signal_locked(
+            resource_kind=kind,
+            resource_id=rid,
+            signal_type="failure",
+            state="failed",
+            reason=reason,
+            payload={"stage": normalized_stage, **dict(payload or {})},
+            op_id=op_id,
+            op_type=op_type,
+            op_status="failed",
+        )
+
+    def _resource_progress_snapshot_locked(self, *, resource_kind: str, resource_id: str) -> Dict[str, Any]:
+        kind = str(resource_kind or "").strip()
+        rid = str(resource_id or "").strip()
+        resource = self._services.get(rid) if kind == "service" else self._task_pools.get(rid) if kind == "task_pool" else None
+        if resource is None:
+            raise KeyError("resource not found")
+        latest = self._resource_signals.latest(kind, rid)
+        operations = self._resource_signals.operations_snapshot(resource_kind=kind, resource_id=rid)
+        return {
+            "resource_kind": kind,
+            "resource_id": rid,
+            "readiness": str(getattr(resource, "readiness", "") or ""),
+            "readiness_reason": str(getattr(resource, "readiness_reason", "") or ""),
+            "stage": str(getattr(resource, "create_stage", "") or ""),
+            "latest_signal_seq": int(getattr(resource, "signal_cursor", 0) or 0),
+            "updated_at": latest.updated_at.isoformat() if latest is not None else "",
+            "reason": str(latest.reason or "") if latest is not None else "",
+            "latest_signal": latest.as_dict() if latest is not None else None,
+            "operations": [operation.as_dict() for operation in operations],
+        }
+
+    def list_resource_signals(self, *, since: int = 0, limit: int = 100) -> Dict[str, Any]:
+        signals = self._resource_signals.since(int(since or 0), limit=max(1, int(limit or 100)))
+        return {
+            "ok": True,
+            "cursor": self._resource_signals.cursor,
+            "signals": signals_to_dicts(signals),
+        }
+
+    def get_resource_progress(self, *, resource_kind: str, resource_id: str) -> Dict[str, Any]:
+        with self._lock:
+            return self._resource_progress_snapshot_locked(resource_kind=resource_kind, resource_id=resource_id)
 
     def _executor_host_required(self) -> bool:
         return (not bool(getattr(self, "_execution_fenced", False))) and bool(
@@ -2756,6 +2952,30 @@ class NodeControlState(NodeRuntimeBase):
             self._prune_create_requests_locked(kind)
             self._cv.notify_all()
 
+    def _accept_create_request(
+        self,
+        *,
+        kind: str,
+        create_request_id: str,
+        fingerprint: str,
+        resource_id: str,
+    ) -> None:
+        normalized_id = str(create_request_id or "").strip()
+        if not normalized_id:
+            return
+        with self._cv:
+            table = self._create_request_table_locked(kind)
+            record = table.get(normalized_id)
+            if record is None:
+                record = _CreateRequestRecord(kind=str(kind or "").strip(), fingerprint=str(fingerprint or ""))
+                table[normalized_id] = record
+            record.status = "CREATING"
+            record.resource_id = str(resource_id or "")
+            record.error = ""
+            record.updated_at_monotonic = time.monotonic()
+            self._prune_create_requests_locked(kind)
+            self._cv.notify_all()
+
     def _fail_create_request(
         self,
         *,
@@ -2785,6 +3005,7 @@ class NodeControlState(NodeRuntimeBase):
         create_request_id: str,
         fingerprint: str,
         lookup: Callable[[str], Optional[Any]],
+        return_creating: bool = False,
     ) -> Any:
         normalized_id = str(create_request_id or "").strip()
         deadline = time.monotonic() + CREATE_REQUEST_WAIT_TIMEOUT_SEC
@@ -2804,6 +3025,10 @@ class NodeControlState(NodeRuntimeBase):
                     raise RuntimeError(f"{kind} create_request_id result missing")
                 if record.status == "FAILED":
                     raise RuntimeError(f"{kind} create_request_id failed: {record.error or 'unknown error'}")
+                if return_creating and str(record.resource_id or "").strip():
+                    resource = lookup(record.resource_id)
+                    if resource is not None:
+                        return resource
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CreateRequestStillCreating(f"{kind} create_request_id still creating")
@@ -2834,6 +3059,7 @@ class NodeControlState(NodeRuntimeBase):
         chunks: Iterable[bytes],
         service_id: str = "",
         create_request_id: str = "",
+        wait_ready: bool = True,
     ) -> ServiceSession:
         if bool(getattr(self, "_execution_fenced", False)):
             raise RuntimeError(self.execution_fence_message())
@@ -2886,6 +3112,7 @@ class NodeControlState(NodeRuntimeBase):
                     create_request_id=normalized_create_request_id,
                     fingerprint=create_request_fingerprint,
                     lookup=lambda resource_id: self._services.get(resource_id),
+                    return_creating=not bool(wait_ready),
                 )
         service_id = requested_service_id or uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
@@ -2896,6 +3123,87 @@ class NodeControlState(NodeRuntimeBase):
         except Exception as exc:
             self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
             raise
+
+        requested_workers = max(1, worker_count or self.service_default_worker_count)
+        actual_hb_timeout = max(5, heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec)
+        actual_idle_ttl = max(0, idle_ttl_sec)
+        now = utc_now()
+        http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
+        initial_status = pb2.SERVICE_STATUS_RUNNING
+
+        if not bool(wait_ready):
+            session = ServiceSession(
+                service_id=service_id,
+                owner_client_id=owner_client_id,
+                service_name=effective_service_name,
+                code_version=str(sha256 or ""),
+                worker_count=requested_workers,
+                heartbeat_timeout_sec=actual_hb_timeout,
+                idle_ttl_sec=actual_idle_ttl,
+                expose_http=bool(expose_http),
+                service_token=token,
+                http_base_url=http_base,
+                status=pb2.SERVICE_STATUS_STARTING,
+                created_at=now,
+                last_heartbeat_at=now,
+                lease_expire_at=now + timedelta(seconds=actual_hb_timeout),
+                token_node_instance_id=str(self.node_instance_id or ""),
+                policy_id=str(policy_id or "").strip().lower() or "default_safe",
+                executor_ready=False,
+                alive_workers=0,
+                degraded=False,
+                readiness="initializing",
+                readiness_reason="create accepted",
+                create_stage="accepted",
+                managed_global_names=normalized_managed_global_names,
+            )
+            with self._lock:
+                self._services[service_id] = session
+                self._service_zero_alive_counts.pop(service_id, None)
+                self._publish_resource_progress_locked(
+                    resource_kind="service",
+                    resource_id=service_id,
+                    stage="accepted",
+                    state="accepted",
+                    op_id=normalized_create_request_id,
+                    op_type="create",
+                    op_status="accepted",
+                )
+                self._publish_resource_readiness_locked(
+                    resource_kind="service",
+                    resource_id=service_id,
+                    readiness="initializing",
+                    reason="create accepted",
+                )
+            self._accept_create_request(
+                kind="service",
+                create_request_id=normalized_create_request_id,
+                fingerprint=create_request_fingerprint,
+                resource_id=service_id,
+            )
+            self._submit_async_service_create(
+                service=session,
+                owner_client_id=owner_client_id,
+                service_name=effective_service_name,
+                sha256=sha256,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=package_format,
+                export_mode=export_mode,
+                export_methods=export_methods,
+                export_decorator=export_decorator,
+                dependency_policy_mode=dependency_policy_mode,
+                dependency_allowlist=dependency_allowlist,
+                managed_global_names=normalized_managed_global_names,
+                initial_globals=initial_globals,
+                chunks=list(chunks),
+                requested_workers=requested_workers,
+                create_request_id=normalized_create_request_id,
+                create_request_fingerprint=create_request_fingerprint,
+            )
+            self.request_infocenter_sync()
+            return session
 
         try:
             artifact, cached_artifact = self.put_code(
@@ -2939,14 +3247,14 @@ class NodeControlState(NodeRuntimeBase):
                 reason=repr(exc),
             )
             self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
+            with self._lock:
+                self._publish_resource_failure_locked(
+                    resource_kind="service",
+                    resource_id=service_id,
+                    reason=repr(exc),
+                    stage="artifact_prepare",
+                )
             raise
-
-        requested_workers = max(1, worker_count or self.service_default_worker_count)
-        actual_hb_timeout = max(5, heartbeat_timeout_sec or self.service_default_heartbeat_timeout_sec)
-        actual_idle_ttl = max(0, idle_ttl_sec)
-        now = utc_now()
-        http_base = f"{self.service_http_base_url}/svc/{service_id}" if (expose_http and self.service_http_base_url) else ""
-        initial_status = pb2.SERVICE_STATUS_RUNNING
 
         try:
             with self._lock:
@@ -3044,6 +3352,9 @@ class NodeControlState(NodeRuntimeBase):
                 executor_ready=True,
                 alive_workers=actual_workers,
                 degraded=False,
+                readiness="ready",
+                readiness_reason="",
+                create_stage="ready",
                 methods=method_info,
                 managed_global_names=normalized_managed_global_names,
             )
@@ -3068,6 +3379,20 @@ class NodeControlState(NodeRuntimeBase):
             with self._lock:
                 self._services[service_id] = session
                 self._service_zero_alive_counts.pop(service_id, None)
+                self._publish_resource_progress_locked(
+                    resource_kind="service",
+                    resource_id=service_id,
+                    stage="create_succeeded",
+                    state="succeeded",
+                    op_id=normalized_create_request_id,
+                    op_type="create",
+                    op_status="succeeded",
+                )
+                self._publish_resource_readiness_locked(
+                    resource_kind="service",
+                    resource_id=service_id,
+                    readiness="ready",
+                )
             self._finish_create_request(
                 kind="service",
                 create_request_id=normalized_create_request_id,
@@ -3096,6 +3421,13 @@ class NodeControlState(NodeRuntimeBase):
                 reason=repr(exc),
             )
             self._fail_create_request(kind="service", create_request_id=normalized_create_request_id, error=exc)
+            with self._lock:
+                self._publish_resource_failure_locked(
+                    resource_kind="service",
+                    resource_id=service_id,
+                    reason=repr(exc),
+                    stage="create_failed",
+                )
             raise
 
     def update_globals(
@@ -3132,6 +3464,490 @@ class NodeControlState(NodeRuntimeBase):
         unique = {digest for digest in digests.values() if str(digest).strip()}
         return next(iter(unique), "") if len(unique) == 1 else next(iter(digests.values()), "")
 
+    def _submit_async_service_create(
+        self,
+        *,
+        service: ServiceSession,
+        owner_client_id: str,
+        service_name: str,
+        sha256: str,
+        runtime: str,
+        entry_module: str,
+        entry_callable: str,
+        package_format: str,
+        export_mode: str,
+        export_methods: Sequence[str],
+        export_decorator: str,
+        dependency_policy_mode: str,
+        dependency_allowlist: Sequence[str],
+        managed_global_names: Sequence[str],
+        initial_globals: Optional[Dict[str, Any]],
+        chunks: Sequence[bytes],
+        requested_workers: int,
+        create_request_id: str,
+        create_request_fingerprint: str,
+    ) -> None:
+        def _run() -> None:
+            artifact: Optional[CodeArtifact] = None
+            cached_artifact = True
+            actual_workers = max(1, int(requested_workers or 1))
+            reserved = 0
+            executor_host: Optional[ExecutorBackend] = None
+            try:
+                with self._lock:
+                    current = self._services.get(service.service_id)
+                    if current is None or current.status == pb2.SERVICE_STATUS_STOPPED:
+                        raise RuntimeError("service create cancelled")
+                    self._publish_resource_progress_locked(
+                        resource_kind="service",
+                        resource_id=service.service_id,
+                        stage="artifact_prepare",
+                        state="running",
+                        op_id=create_request_id,
+                        op_type="create",
+                        op_status="running",
+                    )
+                artifact, cached_artifact = self.put_code(
+                    client_id=owner_client_id,
+                    sha256=sha256,
+                    runtime=runtime,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                    export_mode=export_mode,
+                    export_methods=export_methods,
+                    export_decorator=export_decorator,
+                    dependency_policy_mode=dependency_policy_mode,
+                    dependency_allowlist=dependency_allowlist,
+                    chunks=chunks,
+                    validate_load=False,
+                )
+                method_info = self._ensure_artifact_ready(
+                    artifact,
+                    dependency_policy_mode=dependency_policy_mode,
+                    dependency_allowlist=dependency_allowlist,
+                    managed_global_names=managed_global_names,
+                    prepare_scope="service",
+                    prepare_key=service.service_id,
+                )
+                with self._lock:
+                    current = self._services.get(service.service_id)
+                    if current is None or current.status == pb2.SERVICE_STATUS_STOPPED:
+                        raise RuntimeError("service create cancelled")
+                    current.code_version = artifact.code_version
+                    current.methods = method_info
+                    current.create_stage = "executor_create"
+                    active = sum(
+                        max(0, int(session.worker_count))
+                        for session in self._services.values()
+                        if session.service_id != service.service_id
+                        and session.status in (
+                            pb2.SERVICE_STATUS_STARTING,
+                            pb2.SERVICE_STATUS_RUNNING,
+                            pb2.SERVICE_STATUS_DRAINING,
+                        )
+                        and bool(getattr(session, "executor_ready", False))
+                    )
+                    self._publish_resource_progress_locked(
+                        resource_kind="service",
+                        resource_id=service.service_id,
+                        stage="executor_create",
+                        state="running",
+                        op_id=create_request_id,
+                        op_type="create",
+                        op_status="running",
+                    )
+                actual_workers, executor_host = self._reserve_worker_slots_for_create(
+                    capacity=int(self.service_worker_capacity),
+                    reserved_attr="_service_worker_reserved",
+                    active_worker_count=active,
+                    requested_workers=requested_workers,
+                    exhausted_message="service worker capacity exhausted",
+                    now=utc_now(),
+                )
+                reserved = actual_workers
+                executor_create_ms = self._create_executor_session_skeleton(
+                    create_executor=lambda: executor_host.create_service(service_id=service.service_id, worker_count=actual_workers),
+                    preload_executor=(
+                        None
+                        if not self._preload_after_create_required()
+                        else lambda: executor_host.preload_service(
+                            service_id=service.service_id,
+                            fanout=actual_workers,
+                            execute_spec=_build_execute_spec(
+                                artifact,
+                                object_dir=self._object_dir,
+                                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                                method_name=next(iter(method_info.keys()), artifact.entry_callable),
+                                payload={},
+                                payload_mode="http_call",
+                                warmup_only=True,
+                            ),
+                        )
+                    ),
+                    stop_executor=lambda: executor_host.stop_service(service_id=service.service_id),
+                    reserved_attr="_service_worker_reserved",
+                    reserved=reserved,
+                )
+                reserved = 0
+                with self._lock:
+                    current = self._services.get(service.service_id)
+                    if current is None or current.status == pb2.SERVICE_STATUS_STOPPED:
+                        raise RuntimeError("service create cancelled")
+                    current.worker_count = actual_workers
+                    current.executor_ready = True
+                    current.alive_workers = actual_workers
+                    current.status = pb2.SERVICE_STATUS_RUNNING
+                    current.create_stage = "globals_warmup" if initial_globals else "ready"
+                    current.stop_reason = ""
+                    current.failure_at = None
+                    current.methods = method_info
+                    managed_state = self._ensure_service_managed_globals_state_locked(current)
+                if managed_state is not None and initial_globals:
+                    with self._lock:
+                        self._publish_resource_progress_locked(
+                            resource_kind="service",
+                            resource_id=service.service_id,
+                            stage="globals_warmup",
+                            state="running",
+                            op_id=create_request_id,
+                            op_type="create",
+                            op_status="running",
+                        )
+                    globals_digest, _updated_names = self._update_managed_globals_state(
+                        managed_state,
+                        values=dict(initial_globals),
+                    )
+                    managed_state.globals_digest = globals_digest
+                    self._warmup_service_managed_globals(
+                        artifact=artifact,
+                        service_id=service.service_id,
+                        worker_count=actual_workers,
+                        method_name=next(iter(method_info.keys()), artifact.entry_callable),
+                        state=managed_state,
+                        globals_digest=globals_digest,
+                    )
+                    with self._lock:
+                        current = self._services.get(service.service_id)
+                        if current is not None:
+                            current.managed_globals_scope_dir = managed_state.scope_dir
+                            current.managed_globals_digest = managed_state.globals_digest
+                with self._lock:
+                    current = self._services.get(service.service_id)
+                    if current is None:
+                        raise RuntimeError("service create cancelled")
+                    current.status = pb2.SERVICE_STATUS_RUNNING
+                    current.executor_ready = True
+                    current.alive_workers = actual_workers
+                    current.readiness = "ready"
+                    current.readiness_reason = ""
+                    current.create_stage = "ready"
+                    current.stop_reason = ""
+                    current.failure_at = None
+                    self._publish_resource_progress_locked(
+                        resource_kind="service",
+                        resource_id=service.service_id,
+                        stage="create_succeeded",
+                        state="succeeded",
+                        op_id=create_request_id,
+                        op_type="create",
+                        op_status="succeeded",
+                    )
+                    self._publish_resource_readiness_locked(
+                        resource_kind="service",
+                        resource_id=service.service_id,
+                        readiness="ready",
+                    )
+                self._finish_create_request(
+                    kind="service",
+                    create_request_id=create_request_id,
+                    fingerprint=create_request_fingerprint,
+                    resource_id=service.service_id,
+                )
+                self.request_infocenter_sync()
+            except Exception as exc:
+                if reserved:
+                    self._release_reserved_worker_slots(reserved_attr="_service_worker_reserved", reserved=reserved)
+                if executor_host is not None:
+                    with contextlib.suppress(Exception):
+                        executor_host.stop_service(service_id=service.service_id)
+                if artifact is not None:
+                    with contextlib.suppress(Exception):
+                        self._discard_new_code_artifact(artifact, cached=bool(cached_artifact))
+                with self._lock:
+                    current = self._services.get(service.service_id)
+                    if current is not None:
+                        current.status = pb2.SERVICE_STATUS_STOPPED
+                        current.executor_ready = False
+                        current.alive_workers = 0
+                        current.readiness = "failed"
+                        current.readiness_reason = repr(exc)
+                        current.stop_reason = repr(exc)
+                        current.failure_at = utc_now()
+                        if not current.create_stage:
+                            current.create_stage = "create_failed"
+                    self._publish_resource_failure_locked(
+                        resource_kind="service",
+                        resource_id=service.service_id,
+                        reason=repr(exc),
+                        stage="create_failed",
+                        op_id=create_request_id,
+                        op_type="create",
+                    )
+                self._fail_create_request(kind="service", create_request_id=create_request_id, error=exc)
+                self.request_infocenter_sync()
+
+        self._resource_operation_executor.submit(_run)
+
+    def _submit_async_task_pool_create(
+        self,
+        *,
+        pool: TaskPoolState,
+        owner_client_id: str,
+        pool_name: str,
+        sha256: str,
+        runtime: str,
+        entry_module: str,
+        entry_callable: str,
+        package_format: str,
+        dependency_policy_mode: str,
+        dependency_allowlist: Sequence[str],
+        managed_global_names: Sequence[str],
+        initial_globals: Optional[Dict[str, Any]],
+        chunks: Sequence[bytes],
+        requested_workers: int,
+        create_request_id: str,
+        create_request_fingerprint: str,
+    ) -> None:
+        def _run() -> None:
+            artifact: Optional[CodeArtifact] = None
+            cached_artifact = True
+            actual_workers = max(1, int(requested_workers or 1))
+            reserved = 0
+            executor_host: Optional[ExecutorBackend] = None
+            try:
+                with self._lock:
+                    current = self._task_pools.get(pool.pool_id)
+                    if current is None or str(current.status or "").upper() == "STOPPED":
+                        raise RuntimeError("task pool create cancelled")
+                    self._publish_resource_progress_locked(
+                        resource_kind="task_pool",
+                        resource_id=pool.pool_id,
+                        stage="artifact_prepare",
+                        state="running",
+                        op_id=create_request_id,
+                        op_type="create",
+                        op_status="running",
+                    )
+                artifact, cached_artifact = self.put_code(
+                    client_id=owner_client_id,
+                    sha256=sha256,
+                    runtime=runtime,
+                    entry_module=entry_module,
+                    entry_callable=entry_callable,
+                    package_format=package_format,
+                    export_mode="single",
+                    export_methods=[entry_callable],
+                    dependency_policy_mode=dependency_policy_mode,
+                    dependency_allowlist=dependency_allowlist,
+                    chunks=chunks,
+                    validate_load=False,
+                )
+                self._ensure_artifact_ready(
+                    artifact,
+                    dependency_policy_mode=dependency_policy_mode,
+                    dependency_allowlist=dependency_allowlist,
+                    managed_global_names=managed_global_names,
+                    prepare_scope="pool",
+                    prepare_key=pool.pool_id,
+                )
+                with self._lock:
+                    current = self._task_pools.get(pool.pool_id)
+                    if current is None or str(current.status or "").upper() == "STOPPED":
+                        raise RuntimeError("task pool create cancelled")
+                    current.code_version = artifact.code_version
+                    current.create_stage = "executor_create"
+                    active = sum(
+                        max(0, int(existing.worker_count))
+                        for existing in self._task_pools.values()
+                        if existing.pool_id != pool.pool_id
+                        and str(existing.status or "").strip().upper() == "RUNNING"
+                        and bool(getattr(existing, "executor_ready", False))
+                    )
+                    self._publish_resource_progress_locked(
+                        resource_kind="task_pool",
+                        resource_id=pool.pool_id,
+                        stage="executor_create",
+                        state="running",
+                        op_id=create_request_id,
+                        op_type="create",
+                        op_status="running",
+                    )
+                actual_workers, executor_host = self._reserve_worker_slots_for_create(
+                    capacity=int(self.task_pool_worker_capacity),
+                    reserved_attr="_task_pool_worker_reserved",
+                    active_worker_count=active,
+                    requested_workers=requested_workers,
+                    exhausted_message="task pool worker capacity exhausted",
+                    now=utc_now(),
+                )
+                reserved = actual_workers
+                executor_create_ms = self._create_executor_session_skeleton(
+                    create_executor=lambda: executor_host.create_task_pool(pool_id=pool.pool_id, worker_count=actual_workers),
+                    preload_executor=(
+                        None
+                        if not self._preload_after_create_required()
+                        else lambda: executor_host.preload_pool(
+                            pool_id=pool.pool_id,
+                            fanout=actual_workers,
+                            execute_spec=_build_execute_spec(
+                                artifact,
+                                object_dir=self._object_dir,
+                                work_dir=_code_data_dir(self._artifact_dir, code_version=artifact.code_version),
+                                method_name=str(entry_callable or "run").strip() or "run",
+                                payload={},
+                                payload_mode="task_submit",
+                                warmup_only=True,
+                            ),
+                        )
+                    ),
+                    stop_executor=lambda: executor_host.stop_task_pool(pool_id=pool.pool_id, reason="task pool warmup failed"),
+                    reserved_attr="_task_pool_worker_reserved",
+                    reserved=reserved,
+                )
+                reserved = 0
+                with self._lock:
+                    current = self._task_pools.get(pool.pool_id)
+                    if current is None or str(current.status or "").upper() == "STOPPED":
+                        raise RuntimeError("task pool create cancelled")
+                    current.worker_count = actual_workers
+                    current.executor_ready = True
+                    current.alive_workers = actual_workers
+                    current.status = "RUNNING"
+                    current.code_version = artifact.code_version
+                    current.task_method = str(entry_callable or "run").strip() or "run"
+                    current.create_stage = "globals_warmup" if initial_globals else "ready"
+                    current.stop_reason = ""
+                    current.failure_at = None
+                    managed_state = self._ensure_runtime_managed_globals_state_locked(
+                        client_id=current.pool_id,
+                        code_version=current.code_version,
+                        runtime_key=current.pool_id,
+                        allowed_names=current.managed_global_names,
+                    )
+                if managed_state is not None and initial_globals:
+                    with self._lock:
+                        self._publish_resource_progress_locked(
+                            resource_kind="task_pool",
+                            resource_id=pool.pool_id,
+                            stage="globals_warmup",
+                            state="running",
+                            op_id=create_request_id,
+                            op_type="create",
+                            op_status="running",
+                        )
+                    globals_digest, _updated_names = self._update_managed_globals_state(
+                        managed_state,
+                        values=dict(initial_globals),
+                    )
+                    managed_state.globals_digest = globals_digest
+                    self._warmup_pool_managed_globals(
+                        artifact=artifact,
+                        pool_id=pool.pool_id,
+                        worker_count=actual_workers,
+                        method_name=str(entry_callable or "run").strip() or "run",
+                        state=managed_state,
+                        globals_digest=globals_digest,
+                    )
+                    with self._lock:
+                        current = self._task_pools.get(pool.pool_id)
+                        if current is not None:
+                            current.managed_globals_scope_dir = managed_state.scope_dir
+                            current.managed_globals_digest = managed_state.globals_digest
+                with self._lock:
+                    current = self._task_pools.get(pool.pool_id)
+                    if current is None:
+                        raise RuntimeError("task pool create cancelled")
+                    current.status = "RUNNING"
+                    current.executor_ready = True
+                    current.alive_workers = actual_workers
+                    current.readiness = "ready"
+                    current.readiness_reason = ""
+                    current.create_stage = "ready"
+                    current.stop_reason = ""
+                    current.failure_at = None
+                    self._record_task_pool_lifecycle_timing_locked(
+                        current,
+                        metric="executor_create",
+                        elapsed_ms=executor_create_ms,
+                    )
+                    self._register_client_code_token_locked(
+                        client_id=current.pool_id,
+                        code_version=current.code_version,
+                        code_token=current.pool_token,
+                    )
+                    self._register_client_code_managed_globals_locked(
+                        client_id=current.pool_id,
+                        code_version=current.code_version,
+                        runtime_key=current.pool_id,
+                        managed_global_names=current.managed_global_names,
+                    )
+                    self._publish_resource_progress_locked(
+                        resource_kind="task_pool",
+                        resource_id=pool.pool_id,
+                        stage="create_succeeded",
+                        state="succeeded",
+                        op_id=create_request_id,
+                        op_type="create",
+                        op_status="succeeded",
+                    )
+                    self._publish_resource_readiness_locked(
+                        resource_kind="task_pool",
+                        resource_id=pool.pool_id,
+                        readiness="ready",
+                    )
+                self._finish_create_request(
+                    kind="task_pool",
+                    create_request_id=create_request_id,
+                    fingerprint=create_request_fingerprint,
+                    resource_id=pool.pool_id,
+                )
+                self.request_infocenter_sync()
+            except Exception as exc:
+                if reserved:
+                    self._release_reserved_worker_slots(reserved_attr="_task_pool_worker_reserved", reserved=reserved)
+                if executor_host is not None:
+                    with contextlib.suppress(Exception):
+                        executor_host.stop_task_pool(pool_id=pool.pool_id, reason=repr(exc))
+                if artifact is not None:
+                    with contextlib.suppress(Exception):
+                        self._discard_new_code_artifact(artifact, cached=bool(cached_artifact))
+                with self._cv:
+                    current = self._task_pools.get(pool.pool_id)
+                    if current is not None:
+                        current.status = "STOPPED"
+                        current.executor_ready = False
+                        current.alive_workers = 0
+                        current.readiness = "failed"
+                        current.readiness_reason = repr(exc)
+                        current.stop_reason = repr(exc)
+                        current.failure_at = utc_now()
+                        if not current.create_stage:
+                            current.create_stage = "create_failed"
+                        self._fail_task_pool_tasks_locked(current, reason=repr(exc), now=current.failure_at)
+                    self._publish_resource_failure_locked(
+                        resource_kind="task_pool",
+                        resource_id=pool.pool_id,
+                        reason=repr(exc),
+                        stage="create_failed",
+                        op_id=create_request_id,
+                        op_type="create",
+                    )
+                self._fail_create_request(kind="task_pool", create_request_id=create_request_id, error=exc)
+                self.request_infocenter_sync()
+
+        self._resource_operation_executor.submit(_run)
+
     def create_task_pool(
         self,
         *,
@@ -3151,6 +3967,7 @@ class NodeControlState(NodeRuntimeBase):
         idle_ttl_sec: int,
         chunks: Iterable[bytes],
         create_request_id: str = "",
+        wait_ready: bool = True,
     ) -> TaskPoolState:
         if bool(getattr(self, "_execution_fenced", False)):
             raise RuntimeError(self.execution_fence_message())
@@ -3193,9 +4010,80 @@ class NodeControlState(NodeRuntimeBase):
                     create_request_id=normalized_create_request_id,
                     fingerprint=create_request_fingerprint,
                     lookup=lambda resource_id: self._task_pools.get(resource_id),
+                    return_creating=not bool(wait_ready),
                 )
         pool_id = uuid.uuid4().hex
         token = secrets.token_urlsafe(24)
+        requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
+        now = utc_now()
+
+        if not bool(wait_ready):
+            pool = TaskPoolState(
+                pool_id=pool_id,
+                owner_client_id=owner_client_id,
+                pool_name=str(pool_name or f"task-pool-{pool_id[:8]}"),
+                code_version=str(sha256 or ""),
+                task_method=str(entry_callable or "run").strip() or "run",
+                worker_count=requested_workers,
+                heartbeat_timeout_sec=max(5, int(heartbeat_timeout_sec or 30)),
+                idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+                pool_token=token,
+                status="RUNNING",
+                created_at=now,
+                last_heartbeat_at=now,
+                lease_expire_at=now + timedelta(seconds=max(5, int(heartbeat_timeout_sec or 30))),
+                token_node_instance_id=str(self.node_instance_id or ""),
+                managed_global_names=normalized_managed_global_names,
+                executor_ready=False,
+                alive_workers=0,
+                readiness="initializing",
+                readiness_reason="create accepted",
+                create_stage="accepted",
+                task_count=0,
+            )
+            with self._lock:
+                self._task_pools[pool_id] = pool
+                self._publish_resource_progress_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    stage="accepted",
+                    state="accepted",
+                    op_id=normalized_create_request_id,
+                    op_type="create",
+                    op_status="accepted",
+                )
+                self._publish_resource_readiness_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    readiness="initializing",
+                    reason="create accepted",
+                )
+            self._accept_create_request(
+                kind="task_pool",
+                create_request_id=normalized_create_request_id,
+                fingerprint=create_request_fingerprint,
+                resource_id=pool_id,
+            )
+            self._submit_async_task_pool_create(
+                pool=pool,
+                owner_client_id=owner_client_id,
+                pool_name=str(pool_name or f"task-pool-{pool_id[:8]}"),
+                sha256=sha256,
+                runtime=runtime,
+                entry_module=entry_module,
+                entry_callable=entry_callable,
+                package_format=package_format,
+                dependency_policy_mode=dependency_policy_mode,
+                dependency_allowlist=dependency_allowlist,
+                managed_global_names=normalized_managed_global_names,
+                initial_globals=initial_globals,
+                chunks=list(chunks),
+                requested_workers=requested_workers,
+                create_request_id=normalized_create_request_id,
+                create_request_fingerprint=create_request_fingerprint,
+            )
+            self.request_infocenter_sync()
+            return pool
         try:
             artifact, cached_artifact = self.put_code(
                 client_id=owner_client_id,
@@ -3236,10 +4124,15 @@ class NodeControlState(NodeRuntimeBase):
                 reason=repr(exc),
             )
             self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
+            with self._lock:
+                self._publish_resource_failure_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    reason=repr(exc),
+                    stage="artifact_prepare",
+                )
             raise
 
-        requested_workers = max(1, int(worker_count or self.worker_capacity or 1))
-        now = utc_now()
         try:
             with self._lock:
                 active = sum(
@@ -3305,6 +4198,13 @@ class NodeControlState(NodeRuntimeBase):
                 reason=repr(exc),
             )
             self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
+            with self._lock:
+                self._publish_resource_failure_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    reason=repr(exc),
+                    stage="executor_create",
+                )
             raise
         try:
             pool = TaskPoolState(
@@ -3325,6 +4225,9 @@ class NodeControlState(NodeRuntimeBase):
                 managed_global_names=normalized_managed_global_names,
                 executor_ready=True,
                 alive_workers=actual_workers,
+                readiness="ready",
+                readiness_reason="",
+                create_stage="ready",
                 task_count=0,
             )
             managed_state = self._ensure_runtime_managed_globals_state_locked(
@@ -3368,6 +4271,20 @@ class NodeControlState(NodeRuntimeBase):
                     runtime_key=pool.pool_id,
                     managed_global_names=pool.managed_global_names,
                 )
+                self._publish_resource_progress_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    stage="create_succeeded",
+                    state="succeeded",
+                    op_id=normalized_create_request_id,
+                    op_type="create",
+                    op_status="succeeded",
+                )
+                self._publish_resource_readiness_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    readiness="ready",
+                )
             self._finish_create_request(
                 kind="task_pool",
                 create_request_id=normalized_create_request_id,
@@ -3382,6 +4299,13 @@ class NodeControlState(NodeRuntimeBase):
             with contextlib.suppress(Exception):
                 executor_host.stop_task_pool(pool_id=pool_id, reason="create task pool failed")
             self._fail_create_request(kind="task_pool", create_request_id=normalized_create_request_id, error=exc)
+            with self._lock:
+                self._publish_resource_failure_locked(
+                    resource_kind="task_pool",
+                    resource_id=pool_id,
+                    reason=repr(exc),
+                    stage="create_failed",
+                )
             raise
 
     def submit_pool_tasks(
@@ -3410,6 +4334,9 @@ class NodeControlState(NodeRuntimeBase):
             self._require_pool_token(pool, pool_token)
             if pool.status != "RUNNING":
                 raise RuntimeError("task pool not running")
+            readiness = str(getattr(pool, "readiness", "") or "").strip().lower()
+            if readiness and readiness != "ready":
+                raise RuntimeError(f"task pool {readiness}")
             artifact = self._codes.get(pool.code_version)
             if artifact is None:
                 raise RuntimeError("code artifact missing")
@@ -3768,8 +4695,6 @@ class NodeControlState(NodeRuntimeBase):
                 raise RuntimeError("service is stopped")
             session.last_heartbeat_at = now
             session.lease_expire_at = now + timedelta(seconds=session.heartbeat_timeout_sec)
-            if session.status == pb2.SERVICE_STATUS_STARTING:
-                session.status = pb2.SERVICE_STATUS_RUNNING
             session.stop_reason = ""
             session.failure_at = None
             if int(session.alive_workers or 0) > 0:
@@ -3827,12 +4752,21 @@ class NodeControlState(NodeRuntimeBase):
         session.stop_reason = stop_reason
         session.alive_workers = 0
         session.degraded = False
+        session.readiness = "stopped"
+        session.readiness_reason = stop_reason
         session.status = pb2.SERVICE_STATUS_STOPPED
         stopped_at = utc_now()
         session.failure_at = stopped_at
         session.lease_expire_at = stopped_at
         self._service_zero_alive_counts.pop(str(session.service_id or ""), None)
         self._drop_create_requests_for_resource_locked(kind="service", resource_id=session.service_id)
+        self._publish_resource_signal_locked(
+            resource_kind="service",
+            resource_id=session.service_id,
+            signal_type="stop" if stop_reason != "owner heartbeat timeout" else "failure",
+            state="stopped",
+            reason=stop_reason,
+        )
         if stop_executor is None:
             return None
         executor_host, service_id, stop_reason = stop_executor

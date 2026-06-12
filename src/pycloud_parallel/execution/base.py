@@ -674,7 +674,7 @@ class ExecutionSessionBase:
         active_count = len(self._active_replica_snapshot())
         if desired <= 0 or active_count >= desired:
             return False
-        interval_sec = 1.0 if active_count <= 0 else 5.0
+        interval_sec = 1.0 if active_count <= 0 else 60.0
         now = time.monotonic()
         if now - float(getattr(self, "_last_compensation_attempt_at", 0.0) or 0.0) < interval_sec:
             return False

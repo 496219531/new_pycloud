@@ -45,6 +45,10 @@ class NodeServiceState:
     http_base_url: str = ""
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
+    readiness: str = ""
+    readiness_reason: str = ""
+    create_stage: str = ""
+    signal_cursor: int = 0
 
 
 @dataclass
@@ -70,6 +74,10 @@ class NodeTaskPoolInfo:
     stop_reason: str = ""
     failure_reason: str = ""
     failure_at: Optional[datetime] = None
+    readiness: str = ""
+    readiness_reason: str = ""
+    create_stage: str = ""
+    signal_cursor: int = 0
 
 
 @dataclass

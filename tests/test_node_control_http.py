@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -196,6 +197,110 @@ def test_http_create_taskpool_submit_pull_heartbeat_close(tmp_path):
             assert pool.get_status().pool_id == pool.pool_id
             assert pool.close().accepted is True
     finally:
+        server.stop()
+        state.close()
+
+
+def test_http_resource_signals_and_progress_endpoints(tmp_path):
+    server, state = _start_http_node(tmp_path)
+    service_blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+    pool_blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            service = client.create_service_from_bytes(
+                owner_client_id="owner-http-signals",
+                service_name="svc-http-signals",
+                blob=service_blob,
+                runtime="py3",
+                entry_module="svc_http_signals",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                expose_http=False,
+            )
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http-signals",
+                pool_name="pool-http-signals",
+                blob=pool_blob,
+                runtime="py3",
+                entry_module="pool_http_signals",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+            )
+            service.heartbeat()
+            pool.heartbeat()
+
+            service_progress = client.get_service_progress(service_id=service.service_id)
+            pool_progress = client.get_task_pool_progress(pool_id=pool.pool_id)
+            signals = client.list_resource_signals(since=0, limit=50)
+
+            assert service_progress["readiness"] == "ready"
+            assert service_progress["latest_signal_seq"] > 0
+            assert pool_progress["readiness"] == "ready"
+            assert pool_progress["latest_signal_seq"] > 0
+            assert any(item["resource_id"] == service.service_id for item in signals["signals"])
+            assert any(item["resource_id"] == pool.pool_id for item in signals["signals"])
+    finally:
+        server.stop()
+        state.close()
+
+
+def test_http_create_wait_ready_false_returns_progress_before_ready(tmp_path, monkeypatch):
+    server, state = _start_http_node(tmp_path)
+    artifact_ready_started = threading.Event()
+    release_artifact_ready = threading.Event()
+    original_ensure_artifact_ready = state._ensure_artifact_ready  # noqa: SLF001
+
+    def _slow_ensure_artifact_ready(*args, **kwargs):
+        artifact_ready_started.set()
+        release_artifact_ready.wait(timeout=5.0)
+        return original_ensure_artifact_ready(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_ensure_artifact_ready", _slow_ensure_artifact_ready)
+    service_blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+    pool_blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+    try:
+        with HttpNodeControlClient(server.base_url, timeout_sec=10.0) as client:
+            service = client.create_service_from_bytes(
+                owner_client_id="owner-http-async",
+                service_name="svc-http-async",
+                blob=service_blob,
+                runtime="py3",
+                entry_module="svc_http_async",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                expose_http=False,
+                create_request_id="http-service-async-1",
+                wait_ready=False,
+            )
+            assert service.readiness == "initializing"
+            assert artifact_ready_started.wait(timeout=2.0)
+            service.heartbeat()
+            service_progress = client.get_service_progress(service_id=service.service_id)
+            assert service_progress["readiness"] == "initializing"
+
+            artifact_ready_started.clear()
+            pool = client.create_task_pool_from_bytes(
+                owner_client_id="owner-http-async",
+                pool_name="pool-http-async",
+                blob=pool_blob,
+                runtime="py3",
+                entry_module="pool_http_async",
+                entry_callable="run",
+                package_format="py",
+                worker_count=1,
+                create_request_id="http-pool-async-1",
+                wait_ready=False,
+            )
+            assert pool.readiness == "initializing"
+            assert artifact_ready_started.wait(timeout=2.0)
+            pool.heartbeat()
+            pool_progress = client.get_task_pool_progress(pool_id=pool.pool_id)
+            assert pool_progress["readiness"] == "initializing"
+    finally:
+        release_artifact_ready.set()
         server.stop()
         state.close()
 

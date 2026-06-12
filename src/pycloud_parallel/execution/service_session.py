@@ -6,7 +6,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone, timedelta
 import asyncio
 import contextlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import importlib
 import inspect
 import io
@@ -92,7 +92,7 @@ from pycloud_parallel.execution.deployment_create_helper import (
     should_retry_replica_create_failures,
 )
 from pycloud_parallel.execution.error_classifier import ErrorCategory, classify_error, is_retryable_compensation_failure
-from pycloud_parallel.execution.base import ExecutionItem, ServiceExecutionSession
+from pycloud_parallel.execution.base import ExecutionItem, SLOW_COMPENSATION_LOG_SEC, ServiceExecutionSession
 from pycloud_parallel.execution.call_proxy import _BroadcastProxy, _CallProxy
 from pycloud_parallel.execution.scheduler import (
     SERVICE_DEFAULT,
@@ -2016,6 +2016,11 @@ class Service(ServiceExecutionSession):
     _compensation_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _last_compensation_attempt_at: float = field(default=0.0, repr=False)
     _last_managed_globals: Optional[Dict[str, object]] = field(default=None, repr=False)
+    _async_globals_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _async_globals_executor: Optional[ThreadPoolExecutor] = field(default=None, repr=False)
+    _async_globals_future: Optional[Future] = field(default=None, repr=False)
+    _pending_globals_values: Optional[Dict[str, object]] = field(default=None, repr=False)
+    _pending_globals_reason: str = field(default="", repr=False)
     _keepalive_retry_forever: bool = field(default=False, repr=False)
     serialization_mode: str = ""
     policy_id: InitVar[str] = ""
@@ -2140,6 +2145,64 @@ class Service(ServiceExecutionSession):
     def _after_keepalive_tick(self) -> None:
         self._maybe_submit_compensation_after_tick(self._compensation_spec, resource_name=self.service_name)
 
+    def _submit_async_update_globals(self, values: Dict[str, object], *, reason: str = "") -> bool:
+        if not values or self._closed:
+            return False
+        values_to_schedule = dict(values or {})
+        reason_to_schedule = str(reason or "background")
+
+        def _schedule_locked(run_values: Dict[str, object], run_reason: str) -> bool:
+            executor = self._async_globals_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="service-async-globals")
+                self._async_globals_executor = executor
+
+            def _run() -> None:
+                started_at = time.monotonic()
+                try:
+                    self.update_globals(dict(run_values or {}))
+                except Exception as exc:
+                    with self._route_lock:
+                        self.failures[f"async_update_globals:{str(run_reason or 'background')}"] = repr(exc)
+                    logger.warning(
+                        "service async update_globals failed service_name=%s reason=%s err=%r",
+                        self.service_name,
+                        str(run_reason or ""),
+                        exc,
+                    )
+                finally:
+                    elapsed = time.monotonic() - started_at
+                    if elapsed >= SLOW_COMPENSATION_LOG_SEC:
+                        logger.warning(
+                            "service async update_globals slow service_name=%s reason=%s elapsed_sec=%.3f",
+                            self.service_name,
+                            str(run_reason or ""),
+                            elapsed,
+                        )
+                    with self._async_globals_lock:
+                        self._async_globals_future = None
+                        pending_values = self._pending_globals_values
+                        pending_reason = self._pending_globals_reason
+                        self._pending_globals_values = None
+                        self._pending_globals_reason = ""
+                        if pending_values and not self._closed:
+                            _schedule_locked(dict(pending_values), pending_reason or "pending")
+
+            self._async_globals_future = executor.submit(_run)
+            return True
+
+        with self._async_globals_lock:
+            future = self._async_globals_future
+            if future is not None:
+                if not future.done():
+                    self._pending_globals_values = values_to_schedule
+                    self._pending_globals_reason = reason_to_schedule
+                    return True
+                with contextlib.suppress(Exception):
+                    future.result()
+                self._async_globals_future = None
+            return _schedule_locked(values_to_schedule, reason_to_schedule)
+
     def try_compensate_replicas(self) -> int:
         spec = self._compensation_spec
         if not spec or self._closed:
@@ -2202,6 +2265,18 @@ class Service(ServiceExecutionSession):
                 )
                 and is_admitted_node(node, require_control_addr=True)
             ]
+            if active:
+                active_node_ids = {
+                    str(getattr(self.nodes.get(node_key), "node_id", "") or "").strip()
+                    for node_key in active
+                }
+                active_node_ids.discard("")
+                if active_node_ids:
+                    candidates = [
+                        node
+                        for node in candidates
+                        if str(getattr(node, "node_id", "") or "").strip() not in active_node_ids
+                    ]
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in discovered_nodes if _node_instance_key_from_node(node)
             }
@@ -2267,6 +2342,7 @@ class Service(ServiceExecutionSession):
                                 f"service-compensate:{self.owner_client_id}:{self.service_name}:{spec.get('create_request_namespace', '')}:{node_key}",
                             )
                         ),
+                        wait_ready=False,
                     )
                 except Exception as exc:
                     with contextlib.suppress(Exception):
@@ -2333,7 +2409,7 @@ class Service(ServiceExecutionSession):
             if added:
                 self._persist_session_cache()
                 if self._last_managed_globals is not None:
-                    self.update_globals(dict(self._last_managed_globals))
+                    self._submit_async_update_globals(dict(self._last_managed_globals), reason="compensation")
                 _emit_owner_notice(
                     f"dynamic compensation added={added} target_nodes={desired} "
                     f"service_name={self.service_name} routes={_format_route_summary(self.route_summary())}"
@@ -4686,6 +4762,17 @@ class Service(ServiceExecutionSession):
         excluded = exclude or set()
         normalized_strategy, profile = resolve_service_strategy(strategy)
         active_replica_ids = self._active_replica_snapshot() if hasattr(self, "_active_replica_ids") else None
+
+        def _refresh_readiness(session: object) -> str:
+            get_progress = getattr(session, "get_progress", None)
+            if callable(get_progress):
+                with contextlib.suppress(Exception):
+                    progress = get_progress()
+                    if isinstance(progress, dict) and "readiness" in progress:
+                        with contextlib.suppress(Exception):
+                            setattr(session, "readiness", str(progress.get("readiness") or ""))
+            return str(getattr(session, "readiness", "ready") or "ready").strip().lower()
+
         all_candidates = [
             nid
             for nid in sorted(self.sessions.keys())
@@ -4697,12 +4784,29 @@ class Service(ServiceExecutionSession):
             breaker_state, allowed = self._breaker_candidate_state(node_id)
             if not allowed:
                 continue
+            readiness = str(getattr(self.sessions.get(node_id), "readiness", "ready") or "ready").strip().lower()
+            if not refresh_status and readiness and readiness != "ready":
+                continue
             state_rank[node_id] = 0 if breaker_state == "closed" else 1
             candidates.append(node_id)
         if not candidates:
-            raise RuntimeError("no available service node (all candidates may be open-circuit)")
+            raise RuntimeError("no available service node (all candidates may be initializing, failed, or open-circuit)")
 
         if normalized_strategy == "round_robin":
+            if refresh_status:
+                ready_candidates = []
+                for node_id in candidates:
+                    session = self.sessions[node_id]
+                    try:
+                        info = session.get_status()
+                        readiness = _refresh_readiness(session)
+                    except Exception:
+                        continue
+                    if info.status == pb2.SERVICE_STATUS_RUNNING and (not readiness or readiness == "ready"):
+                        ready_candidates.append(node_id)
+                candidates = ready_candidates
+                if not candidates:
+                    raise RuntimeError("service initializing: no ready service replica")
             probe_candidates = [node_id for node_id in candidates if state_rank.get(node_id, 0) > 0]
             ranked_candidates = sorted(probe_candidates or candidates, key=lambda node_id: node_id)
             with self._route_lock:
@@ -4719,9 +4823,12 @@ class Service(ServiceExecutionSession):
             if refresh_status:
                 try:
                     info = session.get_status()
+                    readiness = _refresh_readiness(session)
                 except Exception:
                     continue
                 if info.status != pb2.SERVICE_STATUS_RUNNING:
+                    continue
+                if readiness and readiness != "ready":
                     continue
             in_flight = int(info.in_flight if info is not None else 0)
             alive_workers = int(info.alive_workers if info is not None else session.worker_count)
@@ -4735,6 +4842,9 @@ class Service(ServiceExecutionSession):
                     alive_workers,
                 )
             )
+
+        if not scheduler_candidates:
+            raise RuntimeError("service initializing: no ready service replica")
 
         if normalized_strategy == "least_inflight":
             for node_id, state_score, _predicted_busy, in_flight, alive_workers in scheduler_candidates:
@@ -5027,6 +5137,11 @@ class Service(ServiceExecutionSession):
                 self._async_call_executor.shutdown(wait=False, cancel_futures=True)
             self._async_call_executor = None
             self._async_call_executor_capacity = 0
+        if self._async_globals_executor is not None:
+            with contextlib.suppress(Exception):
+                self._async_globals_executor.shutdown(wait=False, cancel_futures=True)
+            self._async_globals_executor = None
+            self._async_globals_future = None
         if end_services:
             self.end(reason=reason)
         for client in self._clients.values():

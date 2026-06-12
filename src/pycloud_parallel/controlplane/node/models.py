@@ -149,6 +149,10 @@ class ServiceSession:
     alive_workers: int = 0
     degraded: bool = False
     last_liveness_missing_report_at: float = 0.0
+    readiness: str = "ready"
+    readiness_reason: str = ""
+    create_stage: str = ""
+    signal_cursor: int = 0
     stop_reason: str = ""
     failure_at: Optional[datetime] = None
     methods: Dict[str, Tuple[str, str]] = field(default_factory=dict)
@@ -263,6 +267,10 @@ class TaskPoolState:
     alive_workers: int = 0
     degraded: bool = False
     last_liveness_missing_report_at: float = 0.0
+    readiness: str = "ready"
+    readiness_reason: str = ""
+    create_stage: str = ""
+    signal_cursor: int = 0
     task_count: int = 0
     timing_metrics: Dict[str, object] = field(default_factory=dict)
     returned_count: int = 0

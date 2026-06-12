@@ -17,7 +17,7 @@ from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from google.protobuf import json_format
@@ -218,6 +218,8 @@ def _created_task_pool_response(pool: TaskPoolState) -> Dict[str, object]:
         "heartbeat_timeout_sec": pool.heartbeat_timeout_sec,
         "owner_client_id": pool.owner_client_id,
         "pool_token": pool.pool_token,
+        "readiness": str(getattr(pool, "readiness", "") or ""),
+        "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
     }
 
 
@@ -233,6 +235,8 @@ def _created_service_response(session: ServiceSession) -> Dict[str, object]:
         "service_token": session.service_token,
         "http_base_url": session.http_base_url,
         "policy_id": str(session.policy_id or "").strip().lower() or "default_safe",
+        "readiness": str(getattr(session, "readiness", "") or ""),
+        "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
     }
 
 
@@ -361,12 +365,24 @@ class NodeControlHttpApp:
             if len(parts) == 2 and parts[0] == "taskpools" and parts[1]:
                 info = self.state.task_pool_status_info(parts[1])
                 return self._ok({"ok": True, "pool": _task_pool_status_to_dict(info)})
+            if parts == ["signals"]:
+                query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                return self._ok(
+                    self.state.list_resource_signals(
+                        since=int(query.get("since", 0) or 0),
+                        limit=int(query.get("limit", 100) or 100),
+                    )
+                )
+            if len(parts) == 3 and parts[0] == "taskpools" and parts[2] == "progress":
+                return self._ok({"ok": True, **self.state.get_resource_progress(resource_kind="task_pool", resource_id=parts[1])})
             if len(parts) == 3 and parts[0] == "services" and parts[2] == "methods":
                 include_docs = "include_docs=true" in str(parsed.query).lower()
                 methods = self.state.list_service_methods(parts[1])
                 if not include_docs:
                     methods = [dict(item, doc="") for item in methods]
                 return self._ok({"ok": True, "service_id": parts[1], "methods": methods})
+            if len(parts) == 3 and parts[0] == "services" and parts[2] == "progress":
+                return self._ok({"ok": True, **self.state.get_resource_progress(resource_kind="service", resource_id=parts[1])})
             if len(parts) == 3 and parts[0] == "services" and parts[2] == "status":
                 return self._ok({"ok": True, "service": _service_status_to_dict(self.state.service_status_info(parts[1]))})
         except KeyError as exc:
@@ -557,6 +573,7 @@ class NodeControlHttpApp:
                 idle_ttl_sec=meta.idle_ttl_sec,
                 chunks=[blob],
                 create_request_id=str(payload.get("create_request_id", "") or ""),
+                wait_ready=bool(payload.get("wait_ready", True)),
             )
         except CreateRequestStillCreating as exc:
             return self._err(409, f"{exc.__class__.__name__}: {exc}")
@@ -601,6 +618,7 @@ class NodeControlHttpApp:
                 expose_http=meta.expose_http,
                 chunks=[blob],
                 create_request_id=str(payload.get("create_request_id", "") or ""),
+                wait_ready=bool(payload.get("wait_ready", True)),
             )
         except ValueError as exc:
             return self._err(400, str(exc))
@@ -761,7 +779,17 @@ class NodeControlHttpApp:
             return self._err(401, str(exc))
         except RuntimeError as exc:
             return self._err(409, str(exc))
-        return self._ok({"ok": True, "accepted": True, "next_heartbeat_in_sec": max(1, pool.heartbeat_timeout_sec // 2)})
+        return self._ok(
+            {
+                "ok": True,
+                "accepted": True,
+                "next_heartbeat_in_sec": max(1, pool.heartbeat_timeout_sec // 2),
+                "readiness": str(getattr(pool, "readiness", "") or ""),
+                "signal_cursor": int(getattr(pool, "signal_cursor", 0) or 0),
+                "resource_epoch": 0,
+                "status": str(pool.status or ""),
+            }
+        )
 
     def _cancel_pool_job(self, pool_id: str, payload: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
         try:
@@ -981,7 +1009,17 @@ class NodeControlHttpApp:
         except RuntimeError as exc:
             return self._err(409, str(exc))
         self._notify()
-        return self._ok({"ok": True, "accepted": True, "status": int(session.status), "next_heartbeat_in_sec": max(1, session.heartbeat_timeout_sec // 2)})
+        return self._ok(
+            {
+                "ok": True,
+                "accepted": True,
+                "status": int(session.status),
+                "next_heartbeat_in_sec": max(1, session.heartbeat_timeout_sec // 2),
+                "readiness": str(getattr(session, "readiness", "") or ""),
+                "signal_cursor": int(getattr(session, "signal_cursor", 0) or 0),
+                "resource_epoch": 0,
+            }
+        )
 
     def _ok(self, data: Dict[str, object]) -> Tuple[int, Dict[str, str], bytes]:
         return 200, {"Content-Type": "application/json; charset=utf-8"}, _json_bytes(data)
@@ -1386,6 +1424,7 @@ class HttpNodeControlClient:
         api_token: str = "",
         expected_node_instance_id: str = "",
         create_request_id: str = "",
+        wait_ready: bool = True,
     ) -> NativeTaskPoolClient:
         import hashlib
 
@@ -1427,6 +1466,8 @@ class HttpNodeControlClient:
             payload["expected_node_instance_id"] = str(expected_node_instance_id or "").strip()
         if str(create_request_id or "").strip():
             payload["create_request_id"] = str(create_request_id or "").strip()
+        if not bool(wait_ready):
+            payload["wait_ready"] = False
         if initial_globals:
             payload["initial_globals"] = encode_payload_for_transport(
                 dict(initial_globals),
@@ -1451,6 +1492,8 @@ class HttpNodeControlClient:
             heartbeat_timeout_sec=int(data.get("heartbeat_timeout_sec", 0) or 0),
             pool_name=str(pool_name or ""),
             idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
+            readiness=str(data.get("readiness", "") or ""),
+            signal_cursor=int(data.get("signal_cursor", 0) or 0),
             created_at=now,
             last_heartbeat_at=now,
             lease_expire_at=now + timedelta(seconds=max(1, int(data.get("heartbeat_timeout_sec", 0) or 0))),
@@ -1480,6 +1523,7 @@ class HttpNodeControlClient:
         api_token: str = "",
         expected_node_instance_id: str = "",
         create_request_id: str = "",
+        wait_ready: bool = True,
     ) -> ServiceSessionClient:
         import hashlib
 
@@ -1524,6 +1568,8 @@ class HttpNodeControlClient:
             payload["expected_node_instance_id"] = str(expected_node_instance_id or "").strip()
         if str(create_request_id or "").strip():
             payload["create_request_id"] = str(create_request_id or "").strip()
+        if not bool(wait_ready):
+            payload["wait_ready"] = False
         if initial_globals:
             payload["initial_globals"] = encode_payload_for_transport(
                 dict(initial_globals),
@@ -1548,6 +1594,8 @@ class HttpNodeControlClient:
             heartbeat_timeout_sec=int(data.get("heartbeat_timeout_sec", 0) or 0),
             worker_count=int(data.get("worker_count", 0) or 0),
             status=int(data.get("status", 0) or 0),
+            readiness=str(data.get("readiness", "") or ""),
+            signal_cursor=int(data.get("signal_cursor", 0) or 0),
             service_name=str(service_name or ""),
             idle_ttl_sec=max(0, int(idle_ttl_sec or 0)),
             created_at=now,
@@ -1704,6 +1752,12 @@ class HttpNodeControlClient:
         data = self._json("GET", f"/taskpools/{quote(str(pool_id), safe='')}", None)
         return _parse_message(pb2.TaskPoolStatusInfo, data.get("pool", {}))
 
+    def list_resource_signals(self, *, since: int = 0, limit: int = 100) -> Dict[str, object]:
+        return self._json("GET", f"/signals?since={int(since or 0)}&limit={int(limit or 100)}", None)
+
+    def get_task_pool_progress(self, *, pool_id: str) -> Dict[str, object]:
+        return self._json("GET", f"/taskpools/{quote(str(pool_id), safe='')}/progress", None)
+
     def list_service_methods(self, *, service_id: str, include_docs: bool = False) -> Sequence[pb2.ServiceMethodInfo]:
         data = self._json("GET", f"/services/{quote(str(service_id), safe='')}/methods?include_docs={'true' if include_docs else 'false'}", None)
         return [_parse_message(pb2.ServiceMethodInfo, item) for item in (data.get("methods") or [])]
@@ -1835,6 +1889,9 @@ class HttpNodeControlClient:
     def get_service_status(self, *, service_id: str) -> pb2.ServiceStatusInfo:
         data = self._json("GET", f"/services/{quote(str(service_id), safe='')}/status", None)
         return _parse_message(pb2.ServiceStatusInfo, data.get("service", {}))
+
+    def get_service_progress(self, *, service_id: str) -> Dict[str, object]:
+        return self._json("GET", f"/services/{quote(str(service_id), safe='')}/progress", None)
 
     def _binary_json(
         self,

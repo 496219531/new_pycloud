@@ -285,6 +285,392 @@ def test_failed_create_task_pool_is_reported_for_ops(tmp_path, monkeypatch):
         state.close()
 
 
+def test_nodecontrol_service_create_and_stop_publish_resource_signals(tmp_path):
+    state = NodeControlState(
+        node_id="node-service-signals",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_signals"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            return None
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-signals",
+            service_name="svc-signals",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_signals",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        progress = state.get_resource_progress(resource_kind="service", resource_id=session.service_id)
+        assert progress["readiness"] == "ready"
+        assert progress["stage"] == "create_succeeded"
+        assert progress["latest_signal_seq"] > 0
+
+        state.end_service(
+            owner_client_id="owner-signals",
+            service_id=session.service_id,
+            service_token=session.service_token,
+            reason="test stop",
+        )
+        stopped = state.get_resource_progress(resource_kind="service", resource_id=session.service_id)
+        assert stopped["readiness"] == "stopped"
+        assert stopped["readiness_reason"] == "test stop"
+        assert stopped["latest_signal"]["signal_type"] == "stop"
+    finally:
+        state.close()
+
+
+def test_nodecontrol_service_create_wait_ready_false_returns_before_warmup(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-async-create",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_create"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    artifact_ready_started = threading.Event()
+    release_artifact_ready = threading.Event()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            return None
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    original_ensure_artifact_ready = state._ensure_artifact_ready  # noqa: SLF001
+
+    def _slow_ensure_artifact_ready(*args, **kwargs):
+        artifact_ready_started.set()
+        release_artifact_ready.wait(timeout=5.0)
+        return original_ensure_artifact_ready(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_ensure_artifact_ready", _slow_ensure_artifact_ready)
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-async",
+            service_name="svc-async",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-create-1",
+            wait_ready=False,
+        )
+
+        assert session.readiness == "initializing"
+        assert session.status == pb2.SERVICE_STATUS_STARTING
+        assert artifact_ready_started.wait(timeout=2.0)
+        progress = state.get_resource_progress(resource_kind="service", resource_id=session.service_id)
+        assert progress["readiness"] == "initializing"
+        assert progress["stage"] in {"accepted", "artifact_prepare"}
+
+        hb = state.heartbeat_service(
+            owner_client_id="owner-async",
+            service_id=session.service_id,
+            service_token=session.service_token,
+        )
+        assert hb.service_id == session.service_id
+        assert hb.readiness == "initializing"
+
+        duplicate = state.create_service(
+            owner_client_id="owner-async",
+            service_name="svc-async",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-create-1",
+            wait_ready=False,
+        )
+        assert duplicate.service_id == session.service_id
+    finally:
+        release_artifact_ready.set()
+        state.close()
+
+
+def test_nodecontrol_service_create_wait_ready_false_returns_before_put_code(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-async-put-code",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_async_put_code"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    put_code_started = threading.Event()
+    release_put_code = threading.Event()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            return None
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    original_put_code = state.put_code
+
+    def _slow_put_code(*args, **kwargs):
+        put_code_started.set()
+        release_put_code.wait(timeout=5.0)
+        return original_put_code(*args, **kwargs)
+
+    monkeypatch.setattr(state, "put_code", _slow_put_code)
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        started = time.monotonic()
+        session = state.create_service(
+            owner_client_id="owner-async-put-code",
+            service_name="svc-async-put-code",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_async_put_code",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+            create_request_id="service-async-put-code-1",
+            wait_ready=False,
+        )
+
+        assert time.monotonic() - started < 0.5
+        assert session.readiness == "initializing"
+        assert put_code_started.wait(timeout=2.0)
+        progress = state.get_resource_progress(resource_kind="service", resource_id=session.service_id)
+        assert progress["readiness"] == "initializing"
+    finally:
+        release_put_code.set()
+        state.close()
+
+
+def test_nodecontrol_task_pool_create_signals_and_heartbeat_stays_lightweight(tmp_path):
+    state = NodeControlState(
+        node_id="node-pool-signals",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_signals"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **_kwargs):
+            return None
+
+        def stop_task_pool(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-signals",
+            pool_name="pool-signals",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_signals",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        state.heartbeat_task_pool(
+            owner_client_id="owner-signals",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+        )
+        signals = state.list_resource_signals(since=0, limit=20)["signals"]
+        assert any(item["resource_id"] == pool.pool_id and item["signal_type"] == "readiness" for item in signals)
+        assert not any(item["resource_id"] == pool.pool_id and item["signal_type"] == "heartbeat" for item in signals)
+        progress = state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)
+        assert progress["readiness"] == "ready"
+        assert progress["latest_signal_seq"] == pool.signal_cursor
+    finally:
+        state.close()
+
+
+def test_nodecontrol_task_pool_create_wait_ready_false_returns_before_warmup(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-async-create",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_async_create"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    artifact_ready_started = threading.Event()
+    release_artifact_ready = threading.Event()
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **_kwargs):
+            return None
+
+        def stop_task_pool(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    original_ensure_artifact_ready = state._ensure_artifact_ready  # noqa: SLF001
+
+    def _slow_ensure_artifact_ready(*args, **kwargs):
+        artifact_ready_started.set()
+        release_artifact_ready.wait(timeout=5.0)
+        return original_ensure_artifact_ready(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_ensure_artifact_ready", _slow_ensure_artifact_ready)
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool-async",
+            pool_name="pool-async",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_async",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="pool-async-create-1",
+            wait_ready=False,
+        )
+
+        assert pool.readiness == "initializing"
+        assert pool.status == "RUNNING"
+        assert artifact_ready_started.wait(timeout=2.0)
+        progress = state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)
+        assert progress["readiness"] == "initializing"
+        assert progress["stage"] in {"accepted", "artifact_prepare"}
+
+        hb = state.heartbeat_task_pool(
+            owner_client_id="owner-pool-async",
+            pool_id=pool.pool_id,
+            pool_token=pool.pool_token,
+        )
+        assert hb.pool_id == pool.pool_id
+        assert hb.readiness == "initializing"
+
+        duplicate = state.create_task_pool(
+            owner_client_id="owner-pool-async",
+            pool_name="pool-async",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_async",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+            create_request_id="pool-async-create-1",
+            wait_ready=False,
+        )
+        assert duplicate.pool_id == pool.pool_id
+        with pytest.raises(RuntimeError, match="task pool initializing"):
+            state.submit_pool_tasks(
+                pool_id=pool.pool_id,
+                pool_token=pool.pool_token,
+                tasks=[
+                    pb2.TaskSubmitItem(
+                        task_id="task-init",
+                        payload=dict_to_struct({"value": 1}),
+                    )
+                ],
+            )
+    finally:
+        release_artifact_ready.set()
+        state.close()
+
+
 def test_task_pool_artifact_validation_runs_in_executor_host_not_node(tmp_path):
     module_name = "node_should_not_import_entry_module_demo"
     sys.modules.pop(module_name, None)

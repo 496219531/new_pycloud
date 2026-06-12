@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import contextlib
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -59,7 +59,7 @@ from pycloud_parallel.controlplane.serialization import (
     struct_to_python,
 )
 from pycloud_parallel.controlplane.task_backend import _TaskPoolCallProxy
-from pycloud_parallel.execution.base import ExecutionItem, TaskExecutionSession
+from pycloud_parallel.execution.base import ExecutionItem, SLOW_COMPENSATION_LOG_SEC, TaskExecutionSession
 from pycloud_parallel.execution.failover import (
     CandidateBreakerState,
     REMOTE_INFRA_FAILED,
@@ -1111,6 +1111,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
         self._compensation_lock = threading.Lock()
         self._last_compensation_attempt_at = 0.0
         self._last_managed_globals: Optional[Dict[str, object]] = None
+        self._async_globals_lock = threading.Lock()
+        self._async_globals_executor: Optional[ThreadPoolExecutor] = None
+        self._async_globals_future: Optional[Future] = None
+        self._pending_globals_values: Optional[Dict[str, object]] = None
+        self._pending_globals_reason = ""
         self.task_retry_count = 0
         self.task_retry_success_count = 0
         self.task_retry_exhausted_count = 0
@@ -1189,6 +1194,64 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             resource_name=str(getattr(self, "pool_name", "") or getattr(self, "job_id", "") or "")
         )
 
+    def _submit_async_update_globals(self, values: Dict[str, object], *, reason: str = "") -> bool:
+        if not values or self._closed:
+            return False
+        values_to_schedule = dict(values or {})
+        reason_to_schedule = str(reason or "background")
+
+        def _schedule_locked(run_values: Dict[str, object], run_reason: str) -> bool:
+            executor = self._async_globals_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="taskpool-async-globals")
+                self._async_globals_executor = executor
+
+            def _run() -> None:
+                started_at = time.monotonic()
+                try:
+                    self.update_globals(dict(run_values or {}))
+                except Exception as exc:
+                    with self._pool_lock:
+                        self.failures[f"async_update_globals:{str(run_reason or 'background')}"] = repr(exc)
+                    logger.warning(
+                        "task pool async update_globals failed pool_name=%s reason=%s err=%r",
+                        getattr(self, "pool_name", ""),
+                        str(run_reason or ""),
+                        exc,
+                    )
+                finally:
+                    elapsed = time.monotonic() - started_at
+                    if elapsed >= SLOW_COMPENSATION_LOG_SEC:
+                        logger.warning(
+                            "task pool async update_globals slow pool_name=%s reason=%s elapsed_sec=%.3f",
+                            getattr(self, "pool_name", ""),
+                            str(run_reason or ""),
+                            elapsed,
+                        )
+                    with self._async_globals_lock:
+                        self._async_globals_future = None
+                        pending_values = self._pending_globals_values
+                        pending_reason = self._pending_globals_reason
+                        self._pending_globals_values = None
+                        self._pending_globals_reason = ""
+                        if pending_values and not self._closed:
+                            _schedule_locked(dict(pending_values), pending_reason or "pending")
+
+            self._async_globals_future = executor.submit(_run)
+            return True
+
+        with self._async_globals_lock:
+            future = self._async_globals_future
+            if future is not None:
+                if not future.done():
+                    self._pending_globals_values = values_to_schedule
+                    self._pending_globals_reason = reason_to_schedule
+                    return True
+                with contextlib.suppress(Exception):
+                    future.result()
+                self._async_globals_future = None
+            return _schedule_locked(values_to_schedule, reason_to_schedule)
+
     def try_compensate_replicas(self) -> int:
         spec = self._compensation_spec
         if not spec or self._closed:
@@ -1229,6 +1292,18 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                 for node in selected_nodes
                 if _node_instance_key_from_node(node) not in excluded
             ]
+            if active:
+                active_node_ids = {
+                    str(getattr(self.nodes.get(node_key), "node_id", "") or "").strip()
+                    for node_key in active
+                }
+                active_node_ids.discard("")
+                if active_node_ids:
+                    candidates = [
+                        node
+                        for node in candidates
+                        if str(getattr(node, "node_id", "") or "").strip() not in active_node_ids
+                    ]
             current_node_instance_ids = {
                 _node_instance_key_from_node(node) for node in selected_nodes if _node_instance_key_from_node(node)
             }
@@ -1270,6 +1345,13 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                         chunk_size=max(1, int(spec.get("chunk_size", OBJECT_CHUNK_SIZE_BYTES) or OBJECT_CHUNK_SIZE_BYTES)),
                         api_token=str(spec.get("api_token", "") or ""),
                         expected_node_instance_id=node_key,
+                        create_request_id=str(
+                            spec.setdefault("create_request_ids", {}).setdefault(
+                                node_key,
+                                f"taskpool-compensate:{spec.get('owner_client_id', '')}:{spec.get('pool_name', '')}:{spec.get('create_request_namespace', '')}:{node_key}",
+                            )
+                        ),
+                        wait_ready=False,
                     )
                 except Exception as exc:
                     if client is not None:
@@ -1338,7 +1420,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     added += 1
                     self._wake_keepalive()
             if added and self._last_managed_globals is not None:
-                self.update_globals(dict(self._last_managed_globals))
+                self._submit_async_update_globals(dict(self._last_managed_globals), reason="compensation")
             if added:
                 _emit_taskpool_notice(
                     f"dynamic compensation added={added} target_nodes={desired} "
@@ -3924,6 +4006,11 @@ class _TaskPoolSessionBase(TaskExecutionSession):
             return
         self._closed = True
         self._stop_keepalive()
+        if self._async_globals_executor is not None:
+            with contextlib.suppress(Exception):
+                self._async_globals_executor.shutdown(wait=False, cancel_futures=True)
+            self._async_globals_executor = None
+            self._async_globals_future = None
         close_reason = str(reason or "task pool session close")
         for pool in self._pools.values():
             _close_task_pool_replica(pool, reason=close_reason)

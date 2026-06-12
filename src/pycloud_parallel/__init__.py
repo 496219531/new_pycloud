@@ -18,7 +18,7 @@ _API_DEP_HINT = (
     'Reinstall with `pip install pycloud-parallel` (or avoid `--no-deps`).'
 )
 
-__version__ = "0.3.2"
+__version__ = "0.3.7"
 
 
 def _import_api() -> Any:

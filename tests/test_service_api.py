@@ -19,6 +19,7 @@ import pytest
 from pycloud_parallel.controlplane.artifact import Artifact
 from pycloud_parallel.controlplane.infocenter_client import InfoCenterNode
 from pycloud_parallel.execution.service_session import Service
+from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -219,6 +220,92 @@ def test_service_try_compensate_replicas_adds_newly_available_node(monkeypatch):
     assert set(group.sessions) == {"node-inst-1", "node-inst-2"}
     assert created[0][0] == "127.0.0.1:50062"
     assert created[0][1]["service_name"] == "svc-demo"
+
+
+def test_service_compensation_skips_when_no_new_node_is_available(monkeypatch):
+    node_1 = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    node_2 = SimpleNamespace(
+        node_id="node-2",
+        node_instance_id="node-inst-2",
+        control_addr="127.0.0.1:50062",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    created = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node_1, node_2]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            del timeout_sec
+            self.target = target
+
+        def create_service_from_bytes(self, **kwargs):
+            created.append((self.target, dict(kwargs)))
+            raise AssertionError("compensation should not create on active nodes")
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={
+            "node-inst-1": SimpleNamespace(service_id="svc-1", service_token="token", heartbeat_timeout_sec=30, worker_count=1),
+            "node-inst-2": SimpleNamespace(service_id="svc-2", service_token="token", heartbeat_timeout_sec=30, worker_count=1),
+        },
+        nodes={"node-inst-1": node_1, "node-inst-2": node_2},
+    )
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 3,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    assert group.try_compensate_replicas() == 0
+    assert created == []
 
 
 def test_service_compensation_attaches_each_replica_before_next_create_finishes(monkeypatch):
@@ -422,6 +509,166 @@ def test_service_compensation_initial_heartbeat_runs_outside_route_lock(monkeypa
     assert heartbeat_called.is_set()
     assert "node-inst-1" in group.sessions
     assert "node-inst-1" in group._active_replica_snapshot()  # noqa: SLF001
+
+
+def test_service_compensation_submits_async_globals_without_blocking(monkeypatch):
+    from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+
+    node = SimpleNamespace(
+        node_id="node-1",
+        node_instance_id="node-inst-1",
+        control_addr="127.0.0.1:50061",
+        healthy=True,
+        schedulable=True,
+        drain=False,
+        accept_service_deploy=True,
+        service_worker_available=2,
+        capacity=2,
+        queued=0,
+        python_version="py3.11",
+    )
+    async_updates = []
+
+    class _FakeInfoCenter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def list_nodes(self, **_kwargs):
+            return [node]
+
+    class _FakeNodeControlClient:
+        def __init__(self, target: str, *, timeout_sec: float = 10.0) -> None:
+            self.target = target
+
+        def create_service_from_bytes(self, **kwargs):
+            return SimpleNamespace(
+                service_id="svc-new",
+                service_token="token",
+                http_base_url=f"http://{self.target}/svc/new",
+                heartbeat_timeout_sec=30,
+                worker_count=1,
+                status=pb2.SERVICE_STATUS_RUNNING,
+                heartbeat=lambda **_kwargs: SimpleNamespace(ok=True, accepted=True),
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._infocenter_client", lambda *args, **kwargs: _FakeInfoCenter())
+    monkeypatch.setattr("pycloud_parallel.execution.service_session._new_node_control_client", _FakeNodeControlClient)
+
+    group = Service(owner_client_id="owner-1", service_name="svc-demo", sessions={}, nodes={})
+    group._last_managed_globals = {"value": 1}  # noqa: SLF001
+    monkeypatch.setattr(group, "update_globals", lambda _values: (_ for _ in ()).throw(AssertionError("must be async")))
+    monkeypatch.setattr(
+        group,
+        "_submit_async_update_globals",
+        lambda values, *, reason="": async_updates.append((dict(values), reason)) or True,
+    )
+    group._configure_dynamic_compensation(  # noqa: SLF001
+        {
+            "infocenter_target": "127.0.0.1:50051",
+            "blob": b"def run(**_kwargs): return {'ok': True}\n",
+            "runtime": "py3",
+            "entry_module": "demo_service",
+            "entry_callable": "run",
+            "package_format": "py",
+            "export_mode": "all",
+            "export_methods": [],
+            "managed_global_names": [],
+            "policy_id": "default_safe",
+            "worker_count": 1,
+            "heartbeat_timeout_sec": 30,
+            "idle_ttl_sec": 0,
+            "expose_http": True,
+            "node_count": 1,
+            "node_limit": 10,
+            "timeout_sec": 1.0,
+        }
+    )
+
+    assert group.try_compensate_replicas() == 1
+    assert async_updates == [({"value": 1}, "compensation")]
+    assert "node-inst-1" in group.sessions
+
+
+def test_service_async_update_globals_keeps_latest_pending(monkeypatch):
+    group = Service(owner_client_id="owner-1", service_name="svc-demo", sessions={}, nodes={})
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def _update(values):
+        calls.append(dict(values))
+        if values.get("value") == 1:
+            started.set()
+            release.wait(timeout=5.0)
+        return "digest"
+
+    monkeypatch.setattr(group, "update_globals", _update)
+    try:
+        assert group._submit_async_update_globals({"value": 1}, reason="first") is True  # noqa: SLF001
+        assert started.wait(timeout=2.0)
+        assert group._submit_async_update_globals({"value": 2}, reason="middle") is True  # noqa: SLF001
+        assert group._submit_async_update_globals({"value": 3}, reason="latest") is True  # noqa: SLF001
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and len(calls) < 2:
+            time.sleep(0.01)
+        assert calls == [{"value": 1}, {"value": 3}]
+    finally:
+        release.set()
+        group.close(end_services=False)
+
+
+def test_service_call_balanced_skips_initializing_replica():
+    ready = SimpleNamespace(
+        readiness="ready",
+        worker_count=1,
+        get_status=lambda: SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1),
+        get_progress=lambda: {"readiness": "ready"},
+        call=lambda method, payload, **_kwargs: {"node": "ready", "method": method, "payload": payload},
+    )
+    initializing = SimpleNamespace(
+        readiness="initializing",
+        worker_count=1,
+        get_status=lambda: SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1),
+        get_progress=lambda: {"readiness": "initializing"},
+        call=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("initializing replica must not be called")),
+    )
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-ready": ready, "node-init": initializing},
+        nodes={},
+    )
+
+    node_id, response = group.call_balanced("run", {"value": 1}, refresh_status=True)
+
+    assert node_id == "node-ready"
+    assert response["node"] == "ready"
+
+
+def test_service_call_balanced_all_initializing_has_clear_error():
+    initializing = SimpleNamespace(
+        readiness="initializing",
+        worker_count=1,
+        get_status=lambda: SimpleNamespace(status=pb2.SERVICE_STATUS_RUNNING, in_flight=0, alive_workers=1),
+        get_progress=lambda: {"readiness": "initializing"},
+        call=lambda *_args, **_kwargs: {"unexpected": True},
+    )
+    group = Service(
+        owner_client_id="owner-1",
+        service_name="svc-demo",
+        sessions={"node-init": initializing},
+        nodes={},
+    )
+
+    with pytest.raises(RuntimeError, match="initializing|no ready"):
+        group.call_balanced("run", {}, refresh_status=True)
 
 
 def test_service_compensation_uses_active_count_and_skips_failed_node(monkeypatch):
@@ -4945,7 +5192,11 @@ class TestOwnerServiceFacade:
             group._after_keepalive_tick()  # noqa: SLF001
             assert len(submitted) == 1
 
-            time.monotonic = lambda: 201.1  # type: ignore[assignment]
+            time.monotonic = lambda: 255.9  # type: ignore[assignment]
+            group._after_keepalive_tick()  # noqa: SLF001
+            assert len(submitted) == 1
+
+            time.monotonic = lambda: 256.1  # type: ignore[assignment]
             group._after_keepalive_tick()  # noqa: SLF001
             assert len(submitted) == 2
 
