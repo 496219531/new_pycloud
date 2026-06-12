@@ -348,6 +348,62 @@ def test_nodecontrol_service_create_and_stop_publish_resource_signals(tmp_path):
         state.close()
 
 
+def test_nodecontrol_sync_service_create_lease_starts_when_ready(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-service-ready-lease",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_service_ready_lease"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=25)
+    current_time = {"value": t0}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_service(self, **_kwargs):
+            current_time["value"] = t1
+
+        def stop_service(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(nodecontrol_state_mod, "utc_now", lambda: current_time["value"])
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        session = state.create_service(
+            owner_client_id="owner-ready-lease",
+            service_name="svc-ready-lease",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="svc_ready_lease",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            expose_http=False,
+            chunks=[blob],
+        )
+
+        assert session.created_at == t0
+        assert session.last_heartbeat_at == t1
+        assert session.lease_expire_at == t1 + timedelta(seconds=30)
+    finally:
+        state.close()
+
+
 def test_nodecontrol_service_create_wait_ready_false_returns_before_warmup(tmp_path, monkeypatch):
     state = NodeControlState(
         node_id="node-service-async-create",
@@ -566,6 +622,61 @@ def test_nodecontrol_task_pool_create_signals_and_heartbeat_stays_lightweight(tm
         progress = state.get_resource_progress(resource_kind="task_pool", resource_id=pool.pool_id)
         assert progress["readiness"] == "ready"
         assert progress["latest_signal_seq"] == pool.signal_cursor
+    finally:
+        state.close()
+
+
+def test_nodecontrol_sync_task_pool_create_lease_starts_when_ready(tmp_path, monkeypatch):
+    state = NodeControlState(
+        node_id="node-pool-ready-lease",
+        queue_capacity=4,
+        worker_capacity=1,
+        artifact_dir=str(tmp_path / "code_cache_pool_ready_lease"),
+        enable_internal_executor=False,
+        enable_service_session=False,
+    )
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=25)
+    current_time = {"value": t0}
+
+    class _FakeExecutorHost:
+        def is_alive(self):
+            return True
+
+        def create_task_pool(self, **_kwargs):
+            current_time["value"] = t1
+
+        def stop_task_pool(self, **_kwargs):
+            return None
+
+        def drain_events(self):
+            return []
+
+        def close(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(nodecontrol_state_mod, "utc_now", lambda: current_time["value"])
+    try:
+        state._executor_host = _FakeExecutorHost()  # noqa: SLF001
+        blob = b"def run(**_kwargs):\n    return {'ok': True}\n"
+        digest = hashlib.sha256(blob).hexdigest()
+        pool = state.create_task_pool(
+            owner_client_id="owner-pool-ready-lease",
+            pool_name="pool-ready-lease",
+            sha256=f"sha256:{digest}",
+            runtime="py3",
+            entry_module="pool_ready_lease",
+            entry_callable="run",
+            package_format="py",
+            worker_count=1,
+            heartbeat_timeout_sec=30,
+            idle_ttl_sec=0,
+            chunks=[blob],
+        )
+
+        assert pool.created_at == t0
+        assert pool.last_heartbeat_at == t1
+        assert pool.lease_expire_at == t1 + timedelta(seconds=30)
     finally:
         state.close()
 

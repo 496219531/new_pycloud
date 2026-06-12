@@ -241,6 +241,11 @@ def _resource_stop_reason(
     return normalized or "resource stopped"
 
 
+def _refresh_resource_lease(resource: object, *, now: datetime) -> None:
+    resource.last_heartbeat_at = now
+    resource.lease_expire_at = now + timedelta(seconds=max(1, int(getattr(resource, "heartbeat_timeout_sec", 0) or 0)))
+
+
 class NodeControlState(NodeRuntimeBase):
     """NodeControl 状态管理。
 
@@ -3360,6 +3365,8 @@ class NodeControlState(NodeRuntimeBase):
                     )
                 session.managed_globals_scope_dir = managed_state.scope_dir
                 session.managed_globals_digest = managed_state.globals_digest
+            ready_at = utc_now()
+            _refresh_resource_lease(session, now=ready_at)
             with self._lock:
                 self._services[service_id] = session
                 self._publish_resource_progress_locked(
@@ -4236,6 +4243,8 @@ class NodeControlState(NodeRuntimeBase):
                     )
                 pool.managed_globals_scope_dir = managed_state.scope_dir
                 pool.managed_globals_digest = managed_state.globals_digest
+            ready_at = utc_now()
+            _refresh_resource_lease(pool, now=ready_at)
             with self._lock:
                 self._task_pools[pool_id] = pool
                 self._record_task_pool_lifecycle_timing_locked(
