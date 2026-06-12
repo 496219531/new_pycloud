@@ -2701,6 +2701,74 @@ def test_native_task_pool_session_transient_timeout_keeps_retrying_replica() -> 
         session.close()
 
 
+
+def test_native_task_pool_late_success_does_not_reactivate_removed_replica() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        kind = "task_pool"
+        pool_id = "pool-old"
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+        heartbeat_failure_threshold = 1
+        failed = True
+        last_error = "timeout"
+        status = "RUNNING"
+
+        def heartbeat(self, *, seq: int = 0):
+            del seq
+            return pb2.HeartbeatTaskPoolResponse(ok=True, accepted=True, next_heartbeat_in_sec=1)
+
+    pool = _Pool()
+    session = TaskPool(
+        pools={"node-flaky": pool},
+        nodes={},
+        task_method="run",
+        job_id="job-late-success",
+    )
+    session._discard_active_replica("node-flaky")  # noqa: SLF001
+    session._discard_retry_probe_replica("node-flaky")  # noqa: SLF001
+
+    session._mark_replica_heartbeat_success("node-flaky", pool)  # noqa: SLF001
+
+    assert "node-flaky" not in session._active_replica_ids  # noqa: SLF001
+    assert pool.failed is True
+    assert pool.last_error == "timeout"
+    session.close()
+
+def test_native_task_pool_late_failure_does_not_probe_removed_replica() -> None:
+    from pycloud_parallel import TaskPool
+
+    class _Pool:
+        kind = "task_pool"
+        pool_id = "pool-old"
+        owner_client_id = "owner"
+        code_version = "sha256:test"
+        heartbeat_timeout_sec = 1
+        heartbeat_failure_threshold = 1
+        failed = False
+        last_error = ""
+        status = "RUNNING"
+
+    pool = _Pool()
+    session = TaskPool(
+        pools={"node-flaky": pool},
+        nodes={},
+        task_method="run",
+        job_id="job-late-failure",
+    )
+    session._discard_active_replica("node-flaky")  # noqa: SLF001
+    session._discard_retry_probe_replica("node-flaky")  # noqa: SLF001
+
+    session._record_heartbeat_failure("node-flaky", pool, TimeoutError("late timeout"))  # noqa: SLF001
+
+    assert "node-flaky" not in session._retry_probe_replica_ids  # noqa: SLF001
+    assert "node-flaky" not in session._active_replica_ids  # noqa: SLF001
+    assert pool.failed is False
+    assert pool.last_error == ""
+    session.close()
+
 def test_native_task_pool_session_started_stuck_heartbeat_does_not_block_retry() -> None:
     from pycloud_parallel import TaskPool
 

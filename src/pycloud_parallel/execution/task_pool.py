@@ -1449,7 +1449,7 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                             with contextlib.suppress(Exception):
                                 old_pool._client.close()  # noqa: SLF001
                     heartbeat_started_at = time.monotonic()
-                    if not self._heartbeat_new_replica_before_activate(node_key, pool):
+                    if not self._heartbeat_new_replica_before_activate(node_key, pool, activate=False):
                         initial_heartbeat_sec += time.monotonic() - heartbeat_started_at
                         _close_task_pool_replica(pool, reason="compensated task pool initial heartbeat failed")
                         with contextlib.suppress(Exception):
@@ -1459,8 +1459,8 @@ class _TaskPoolSessionBase(TaskExecutionSession):
                     route_started_at = time.monotonic()
                     self._pools[node_key] = pool
                     self.nodes[node_key] = node
+                    self._mark_replica_heartbeat_success(node_key, pool, allow_new=True)
                     self.failures.pop(node_key, None)
-                    self._active_nodes.add(node_key)
                     self._submit_breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
                     self._wake_keepalive()

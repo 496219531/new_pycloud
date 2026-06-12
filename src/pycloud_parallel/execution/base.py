@@ -358,7 +358,42 @@ class ExecutionSessionBase:
                     elapsed,
                 )
 
-    def _mark_replica_heartbeat_success(self, node_id: str, replica: ExecutionReplicaHandle) -> None:
+    def _replica_resource_key(self, node_id: str, replica: ExecutionReplicaHandle) -> Tuple[str, str, str]:
+        kind = str(getattr(replica, "kind", "") or self.kind or "").strip()
+        resource_id = str(getattr(replica, "service_id", "") or getattr(replica, "pool_id", "") or "").strip()
+        return kind, resource_id, str(node_id or "").strip()
+
+    def _is_current_replica(self, node_id: str, replica: ExecutionReplicaHandle) -> bool:
+        normalized = str(node_id or "").strip()
+        if not normalized:
+            return False
+        current = self.replicas.get(normalized)
+        if current is not replica:
+            return False
+        return self._replica_resource_key(normalized, current) == self._replica_resource_key(normalized, replica)
+
+    def _can_accept_heartbeat_success(self, node_id: str, replica: ExecutionReplicaHandle, *, allow_new: bool = False) -> bool:
+        if not self._is_current_replica(node_id, replica):
+            return False
+        if allow_new:
+            return True
+        normalized = str(node_id or "").strip()
+        return normalized in self._active_replica_snapshot() or normalized in self._retry_probe_replica_snapshot()
+
+    def _mark_replica_heartbeat_success(
+        self,
+        node_id: str,
+        replica: ExecutionReplicaHandle,
+        *,
+        allow_new: bool = False,
+    ) -> None:
+        if not self._can_accept_heartbeat_success(node_id, replica, allow_new=allow_new):
+            logger.warning(
+                "%s keepalive heartbeat success ignored for untrusted replica context=%s",
+                self.kind or "execution",
+                self._replica_log_context(str(node_id or ""), replica),
+            )
+            return
         self._keepalive_failure_counts.pop(node_id, None)
         self._discard_terminal_replica(node_id)
         self._discard_retry_probe_replica(node_id)
@@ -370,6 +405,8 @@ class ExecutionSessionBase:
         self._add_active_replica(node_id)
 
     def _mark_replica_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        if not self._is_current_replica(node_id, replica):
+            return
         message = repr(exc)
         self.failures[node_id] = message
         if hasattr(replica, "failed"):
@@ -383,6 +420,8 @@ class ExecutionSessionBase:
         self._discard_active_replica(node_id)
 
     def _mark_replica_heartbeat_probe_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        if not self._is_current_replica(node_id, replica):
+            return
         message = repr(exc)
         self.failures[node_id] = message
         if hasattr(replica, "failed"):
@@ -707,6 +746,8 @@ class ExecutionSessionBase:
             self._active_replica_ids.discard(node_id)
 
     def _record_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        if not self._can_accept_heartbeat_success(node_id, replica):
+            return
         count = int(self._keepalive_failure_counts.get(node_id, 0) or 0) + 1
         self._keepalive_failure_counts[node_id] = count
         error_kind = self._classify_heartbeat_error(node_id, replica, exc)
@@ -719,6 +760,8 @@ class ExecutionSessionBase:
             self._mark_retry_probe_replica(node_id)
 
     def _record_terminal_heartbeat_failure(self, node_id: str, replica: ExecutionReplicaHandle, exc: Exception) -> None:
+        if not self._can_accept_heartbeat_success(node_id, replica):
+            return
         self._keepalive_failure_counts[node_id] = self._heartbeat_failure_threshold(node_id, replica)
         self._mark_replica_heartbeat_failure(node_id, replica, exc)
         self._mark_terminal_replica(node_id)
@@ -738,7 +781,7 @@ class ExecutionSessionBase:
             self._keepalive_seq += 1
             self._timed_heartbeat_replica(node_id, replica, seq=self._keepalive_seq)
             if activate:
-                self._mark_replica_heartbeat_success(node_id, replica)
+                self._mark_replica_heartbeat_success(node_id, replica, allow_new=True)
             return True
         except Exception as exc:
             logger.warning(

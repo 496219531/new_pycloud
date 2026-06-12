@@ -5338,6 +5338,94 @@ class TestOwnerServiceFacade:
         finally:
             group._stop_keepalive()  # noqa: SLF001
 
+
+    def test_owner_keepalive_late_success_does_not_reactivate_removed_service_replica(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            service_id = "svc-old"
+            service_token = "token"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            failed = True
+            last_error = "timeout"
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def heartbeat(self, **_kwargs):
+                return SimpleNamespace(ok=True, accepted=True, status=pb2.SERVICE_STATUS_RUNNING)
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+        group._discard_active_replica("node-1")  # noqa: SLF001
+        group._discard_retry_probe_replica("node-1")  # noqa: SLF001
+
+        group._mark_replica_heartbeat_success("node-1", replica)  # noqa: SLF001
+
+        assert "node-1" not in group._active_replica_ids  # noqa: SLF001
+        assert replica.failed is True
+        assert replica.last_error == "timeout"
+
+    def test_owner_keepalive_late_failure_does_not_probe_removed_service_replica(self):
+        from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
+        from pycloud_parallel.execution.service_session import Service
+
+        class _Replica:
+            kind = "service"
+            service_id = "svc-old"
+            service_token = "token"
+            heartbeat_timeout_sec = 1
+            heartbeat_failure_threshold = 1
+            failed = False
+            last_error = ""
+            status = pb2.SERVICE_STATUS_RUNNING
+
+            def snapshot(self, **kwargs):
+                return SimpleNamespace(**kwargs, alive=not self.failed)
+
+            def lease(self):
+                return None
+
+            def identity(self):
+                return SimpleNamespace()
+
+            def binding(self):
+                return SimpleNamespace()
+
+        replica = _Replica()
+        group = Service(
+            owner_client_id="owner-demo",
+            service_name="demo-service",
+            sessions={"node-1": replica},
+            nodes={},
+        )
+        group._discard_active_replica("node-1")  # noqa: SLF001
+        group._discard_retry_probe_replica("node-1")  # noqa: SLF001
+
+        group._record_heartbeat_failure("node-1", replica, TimeoutError("late timeout"))  # noqa: SLF001
+
+        assert "node-1" not in group._retry_probe_replica_ids  # noqa: SLF001
+        assert "node-1" not in group._active_replica_ids  # noqa: SLF001
+        assert replica.failed is False
+        assert replica.last_error == ""
     def test_owner_calls_skip_failed_inactive_replica(self):
         from pycloud_parallel.proto.v1 import pycloud_v1_pb2 as pb2
         from pycloud_parallel.execution.service_session import Service

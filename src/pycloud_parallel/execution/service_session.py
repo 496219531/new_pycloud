@@ -2445,7 +2445,7 @@ class Service(ServiceExecutionSession):
                     self.sessions[node_key] = session
                     self._clients[node_key] = client
                     self.nodes[node_key] = node
-                    self._mark_replica_heartbeat_success(node_key, session)
+                    self._mark_replica_heartbeat_success(node_key, session, allow_new=True)
                     self.failures.pop(node_key, None)
                     self._breaker_states.setdefault(node_key, CandidateBreakerState())
                     added += 1
